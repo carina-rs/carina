@@ -40,7 +40,9 @@ pub struct DeferredSummaryForPlan {
     pub entries: Vec<DeferredSummaryEntry>,
 }
 
-pub fn deferred_summary_for_plan<S, V: crate::resource::PlanValueKind>(plan: &Plan<S, V>) -> DeferredSummaryForPlan {
+pub fn deferred_summary_for_plan<S, V: crate::resource::PlanValueKind>(
+    plan: &Plan<S, V>,
+) -> DeferredSummaryForPlan {
     let entries = plan
         .effects()
         .iter()
@@ -82,15 +84,9 @@ pub fn deferred_for_source<S>(
     crate::value::format_value(&template.iterable)
 }
 
-pub fn deferred_for_verb<S,D,V: crate::resource::PlanValueKind>(
-    plan: &Plan<S,V>,
-    template: &crate::parser::DeferredForExpression<
-        S,
-        V,
-        V::Template,
-        AbsoluteBindingAddress,
-        D,
-    >,
+pub fn deferred_for_verb<S, D, V: crate::resource::PlanValueKind>(
+    plan: &Plan<S, V>,
+    template: &crate::parser::DeferredForExpression<S, V, V::Template, AbsoluteBindingAddress, D>,
 ) -> &'static str {
     let roots = template.root_bindings();
     if plan.effects().iter().any(|effect| {
@@ -1001,10 +997,10 @@ mod tests {
             temporary_name: None,
             permanent_name_override: None,
             consumer_updates: Default::default(),
-            previous_attributes: HashMap::from([(
+            previous_attributes: crate::test_support::snapshot_attributes(HashMap::from([(
                 "cidr_block".to_string(),
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-            )]),
+            )])),
         });
 
         let graph = build_dependency_graph(&plan);

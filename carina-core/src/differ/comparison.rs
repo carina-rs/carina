@@ -10,15 +10,15 @@ use crate::provider::{InitializedProvider, NestedWriteOnlyRecord, ReferenceScope
 use crate::references::{ReferenceOperand, ReferenceSide};
 use crate::resource::{
     ApplyTimeUnknown, CanonicalComparisonAttributes, ConcreteValue, DeferredValue,
-    InterpolationPart, MaskedComparisonAttributes, ResolvedIgnoreChanges, SavedValueViews, SnapshotValue as Value, SnapshotLeaf,
-    ValueString, merge_with_saved, value_at_leaf,
+    InterpolationPart, MaskedComparisonAttributes, ResolvedIgnoreChanges, SavedValueViews,
+    SnapshotValue as Value, ValueString, merge_with_saved, value_at_leaf,
 };
 use crate::schema::{
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema, DslTransform,
     LeafPath, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms, TypeIdentity,
     empty_defs_for_schema_walks,
 };
-use crate::value::{PersistedValue, canonical_secret_hash_material, contains_secret};
+use crate::value::{PersistedValue, contains_secret};
 
 /// Scope and schema forms resolved from one initialized provider. This is not
 /// a comparison context: callers must explicitly choose planning or observation.
@@ -109,7 +109,9 @@ impl ReferenceEquality for PlanningEquality<'_> {
         ty: &AttributeType,
         defs: &BTreeMap<String, AttributeType>,
     ) {
-        let Ok(value) = value.to_value_at("comparison.secret") else { return; };
+        let Ok(value) = value.to_value_at("comparison.secret") else {
+            return;
+        };
         if let Err(error) = crate::references::validate_secret_operand(
             self.0.resource,
             &value,
@@ -759,7 +761,11 @@ impl<R: ReferenceEquality> ComparisonContext<'_, R> {
 // rows agree with `find_changed_attributes`' own verdict. Reusing it
 // — never reimplementing — is the carina#3073 fix; a second equality
 // notion is precisely the drift this avoids.
-pub(crate) fn type_aware_equal<R: ReferenceEquality, P: crate::resource::StateValueLeaf, Q: crate::resource::StateValueLeaf>(
+pub(crate) fn type_aware_equal<
+    R: ReferenceEquality,
+    P: crate::resource::StateValueLeaf,
+    Q: crate::resource::StateValueLeaf,
+>(
     a: &crate::resource::Value<P>,
     b: &crate::resource::Value<Q>,
     attr_type: Option<&AttributeType>,
@@ -1262,8 +1268,11 @@ fn is_type_default(
 ///
 fn secret_matches_state(inner: &Value, state_value: &Value) -> bool {
     if state_value.secret_hash().is_some() {
-        return inner.to_value_at("comparison.secret").ok()
-            .and_then(|inner| state_value.verify_secret(&inner).ok()).unwrap_or(false);
+        return inner
+            .to_value_at("comparison.secret")
+            .ok()
+            .and_then(|inner| state_value.verify_secret(&inner).ok())
+            .unwrap_or(false);
     }
 
     // Case 2: State has plain-text value (from provider read / --refresh=true).
@@ -1351,7 +1360,6 @@ fn contains_pending_reread(value: &Value) -> bool {
         | Value::Deferred(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
-            
             | DeferredValue::Unknown(_),
         ) => false,
         Value::Deferred(DeferredValue::Placeholder(_)) => false,
@@ -1585,7 +1593,6 @@ fn has_observable_content(value: &Value) -> bool {
         | Value::Concrete(ConcreteValue::Float(_))
         | Value::Concrete(ConcreteValue::Bool(_))
         | Value::Concrete(ConcreteValue::Duration(_))
-        
         | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::Coalesce { .. })

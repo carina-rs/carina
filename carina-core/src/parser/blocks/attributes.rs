@@ -206,6 +206,7 @@ fn register_argument_binding(
         | crate::parser::TypeExpr::Float
         | crate::parser::TypeExpr::Duration
         | crate::parser::TypeExpr::Simple(_)
+        | crate::parser::TypeExpr::UnloadedSchemaType(_)
         | crate::parser::TypeExpr::List(_)
         | crate::parser::TypeExpr::Map(_)
         | crate::parser::TypeExpr::DottedUnresolved(_)

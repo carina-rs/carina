@@ -108,13 +108,18 @@ where
         .and_then(|call| call.source_file().parent())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| Path::new(".").to_path_buf());
-    carina_core::module_resolver::resolve_modules_with_providerless_config(
-        carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
-        &base_dir,
+    carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
-        &carina_core::schema::SchemaRegistry::new(),
+        |session| {
+            carina_core::module_resolver::resolve_modules_with_providerless_config(
+                carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
+                &base_dir,
+                session,
+                &carina_core::schema::SchemaRegistry::new(),
+            )
+            .expect("test fixture crosses module resolution")
+        },
     )
-    .expect("test fixture crosses module resolution")
 }
 
 fn resolve_file_for_test<E>(
@@ -364,10 +369,15 @@ fn mock_http_ready_config(
         unresolved_attributes: IndexMap::new(),
         binding: None,
     });
-    let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
-        &parsed,
-        &HashMap::new(),
+    let resolved = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
+        |session| {
+            carina_core::parser::resolve_provider_attributes_with_remote(
+                &parsed,
+                &HashMap::new(),
+                session,
+            )
+        },
     )
     .expect("mock HTTP provider config must resolve");
     carina_core::executor::prepare_provider_ready_config(
@@ -417,6 +427,9 @@ async fn execute_mock_http_plan(
     let outcome = carina_core::executor::execute_live_plan(
         provider,
         carina_core::executor::LiveExecutionInput {
+            provider_context: carina_core::parser::ProviderContext::clone(
+                &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            ),
             plan,
             provider_check_inputs: carina_core::executor::ProviderCheckInputs::Authored,
             compositions: &[],
@@ -893,19 +906,29 @@ fn resolved_provider_configs(
         .clone()
         .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("test provider configuration must contain no parser placeholders");
-    carina_core::parser::resolve_provider_attributes_with_remote(
-        &parsed,
-        &HashMap::new(),
+    carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
+        |session| {
+            carina_core::parser::resolve_provider_attributes_with_remote(
+                &parsed,
+                &HashMap::new(),
+                session,
+            )
+        },
     )
     .expect("test provider configs must resolve")
 }
 
 fn empty_resolved_provider_configs() -> carina_core::parser::ResolvedProviderConfigs {
-    carina_core::parser::resolve_provider_attributes_with_remote(
-        &carina_core::parser::ExpandedInferredFile::default(),
-        &HashMap::new(),
+    carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
+        |session| {
+            carina_core::parser::resolve_provider_attributes_with_remote(
+                &carina_core::parser::ExpandedInferredFile::default(),
+                &HashMap::new(),
+                session,
+            )
+        },
     )
     .expect("empty provider configs must resolve")
 }
@@ -1009,11 +1032,17 @@ for account_id in orgs.accounts {
         &ProviderContext::default(),
     )
     .expect("parse saved-plan loop provenance fixture");
-    let parsed = carina_core::module_resolver::resolve_modules_providerless(
-        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        Path::new("."),
+    let parsed = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            carina_core::module_resolver::resolve_modules_providerless(
+                carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                Path::new("."),
+                session,
+            )
+            .expect("cross the deferred-body resolution seam")
+        },
     )
-    .expect("cross the deferred-body resolution seam")
     .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("saved-plan loop fixture must contain only loop slots");
 
@@ -1536,10 +1565,15 @@ fn checked_exports(
     params: &[carina_core::parser::ExpandedInferredExportParam],
 ) -> carina_core::validation::ExportsCheckedPreApply<carina_core::parser::ExpandedInferredExportParam>
 {
-    carina_core::validation::check_export_values_pre_apply(
-        params,
-        &carina_core::binding_index::ResolvedBindings::default(),
+    carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            carina_core::validation::check_export_values_pre_apply(
+                params,
+                &carina_core::binding_index::ResolvedBindings::default(),
+                session,
+            )
+        },
     )
     .expect("test exports must pass the secret boundary")
 }
@@ -1568,10 +1602,15 @@ fn saved_provider_configs(
 ) -> carina_core::parser::SavedProviderConfigs {
     let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers = configs;
-    let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
-        &parsed,
-        &HashMap::new(),
+    let resolved = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
+        |session| {
+            carina_core::parser::resolve_provider_attributes_with_remote(
+                &parsed,
+                &HashMap::new(),
+                session,
+            )
+        },
     )
     .expect("test provider configs must resolve");
     carina_core::parser::SavedProviderConfigs::from(&resolved)
@@ -1696,7 +1735,10 @@ fn saved_plan_import_rehydration_respects_current_provider_instance() {
         to_span: None,
         id: string_value("provider-id"),
     }];
-    let identifiers = import_identifiers_from_current_config(&plan, &parsed);
+    let identifiers = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| import_identifiers_from_current_config(&plan, &parsed, session),
+    );
 
     assert!(
         !identifiers.contains_key(&planned_id),
@@ -1796,6 +1838,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
             plan_file: Path::new("plan.json"),
             source_dir: tmp.path(),
         },
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
     );
 
     let error = result.expect_err(
@@ -1820,6 +1863,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
             plan_file: Path::new("plan.json"),
             source_dir: tmp.path(),
         },
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
     )
     .expect_err("an unreadable live call source must fail with its typed identity error");
     let AppError::CompositionSourceIdentity(identity_error) = error else {
@@ -4076,10 +4120,15 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         .clone()
         .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("module data-source fixture has no parser placeholders");
-    let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
-        &expanded,
-        &HashMap::new(),
+    let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
+        |session| {
+            carina_core::parser::resolve_provider_attributes_with_remote(
+                &expanded,
+                &HashMap::new(),
+                session,
+            )
+        },
     )
     .expect("module data-source provider configs must resolve");
     let validated = validated_resolved_apply_config_for_test(&wiring, &parsed, &unresolved_parsed);
@@ -4946,13 +4995,18 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
     )
     .expect("load plan fixture")
     .parsed;
-    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-        parsed,
-        &downstream,
+    let parsed = carina_core::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
-        &SchemaRegistry::new(),
+        |session| {
+            carina_core::module_resolver::resolve_modules_with_providerless_config(
+                parsed,
+                &downstream,
+                session,
+                &SchemaRegistry::new(),
+            )
+            .expect("test fixture crosses module resolution")
+        },
     )
-    .expect("test fixture crosses module resolution")
     .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("saved-plan provider fixture has no parser placeholders");
     let plan_inputs = load_and_resolve_provider_configs(
@@ -5175,19 +5229,25 @@ fn apply_emits_legacy_override_warning_to_stderr() {
     let remote_bindings = HashMap::new();
     let wait_aliases = Vec::new();
     let projected_state = crate::wiring::ProjectedStateRead::for_test_unmoved(Some(&state));
-    let (override_aware, _) = OverrideAwareResources::build_pair_with_stability(
-        &canonical_resources_for_test(vec![resource], &SchemaRegistry::new()),
-        &projected_state,
-        LivePreApplyInputs {
-            managed: &[],
-            compositions: &[],
-            managed_current: &current_states,
-            data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &remote_bindings,
-            wait_aliases: &wait_aliases,
+    let (override_aware, _) = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            OverrideAwareResources::build_pair_with_stability(
+                &canonical_resources_for_test(vec![resource], &SchemaRegistry::new()),
+                &projected_state,
+                LivePreApplyInputs {
+                    managed: &[],
+                    compositions: &[],
+                    managed_current: &current_states,
+                    data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
+                    remote_bindings: &remote_bindings,
+                    wait_aliases: &wait_aliases,
+                },
+                &HashMap::new(),
+                OverrideAwareBuildMode::Apply,
+                session,
+            )
         },
-        &HashMap::new(),
-        OverrideAwareBuildMode::Apply,
     )
     .expect("override-aware resources should build");
 
@@ -7280,6 +7340,7 @@ async fn bootstrap_declared_state_bucket(
         provider,
         resource.clone(),
         BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
             backend,
             parsed: &parsed,
             provider_configs: &provider_configs,
@@ -7549,6 +7610,7 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
         &provider,
         resource,
         BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
             backend: backend.as_ref(),
             parsed: &parsed,
             provider_configs: &provider_configs,
@@ -7622,6 +7684,7 @@ async fn state_bucket_provider_error_keeps_typed_terminal_error() {
         &provider,
         resource,
         BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
             backend: backend.as_ref(),
             parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
@@ -7678,6 +7741,7 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
         &provider,
         resource,
         BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
             backend: backend.as_ref(),
             parsed: &parsed,
             provider_configs: &provider_configs,
@@ -7732,6 +7796,7 @@ async fn bootstrap_created_failure_seeds_observed_state_before_error() {
         &provider,
         resource,
         BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
             backend: backend.as_ref(),
             parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
@@ -7819,6 +7884,7 @@ async fn bootstrap_unobserved_created_failure_seeds_identifier_and_partial_read_
         &provider,
         resource,
         BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
             backend: backend.as_ref(),
             parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
@@ -7911,6 +7977,7 @@ async fn bootstrap_in_flight_failure_seeds_pending_state_before_error() {
         &provider,
         resource,
         BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
             backend: backend.as_ref(),
             parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
@@ -7978,6 +8045,7 @@ async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
         &provider,
         resource,
         BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
             backend: &BootstrapWriteFailureBackend,
             parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
@@ -9593,7 +9661,13 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
             wait_aliases: &[],
         },
     );
-    resolve_managed_refs_with_state_and_remote(&mut sorted_resources, &bindings).unwrap();
+    carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            resolve_managed_refs_with_state_and_remote(&mut sorted_resources, &bindings, session)
+        },
+    )
+    .unwrap();
 
     let export_params = vec![ExportParameter::for_test(
         "role_arn".to_string(),
@@ -9904,11 +9978,17 @@ mod apply_deferred_for_parity {
             &ProviderContext::default(),
         )
         .expect("parse");
-        carina_core::module_resolver::resolve_modules_providerless(
-            carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
+        carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                carina_core::module_resolver::resolve_modules_providerless(
+                    carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    std::path::Path::new("."),
+                    session,
+                )
+                .expect("cross the deferred-body resolution seam")
+            },
         )
-        .expect("cross the deferred-body resolution seam")
     }
 
     fn comparison_schemas() -> SchemaRegistry {

@@ -95,14 +95,14 @@ impl Provider for TableProvider {
         for op in &request.patch().ops {
             match op.sent_value() {
                 Some(value) => {
-                    attributes.insert(op.key().into(), value.clone());
+                    attributes.insert(op.key().into(), (value.clone()).to_snapshot());
                 }
                 None => {
                     attributes.remove(op.key());
                 }
             }
         }
-        let state = AppliedState::from_identifier(id.clone(), identifier.clone(), attributes);
+        let state = AppliedState::from_snapshot_parts(id.clone(), identifier.clone(), attributes);
         self.updates.lock().unwrap().push(request);
         Box::pin(async move { Ok(UpdateOutcome::success(state)) })
     }
@@ -917,7 +917,7 @@ async fn round8_whole_batch_errors_are_cached_for_each_value_and_judged_on_use()
             &fixture.registry,
             std::slice::from_ref(&other),
         ));
-    fixture.saved = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+    fixture.saved = crate::test_support::raw_saved_attrs(HashMap::from([(
         id.clone(),
         HashMap::from([("key".into(), string("alias/unused-saved"))]),
     )]))
@@ -1002,7 +1002,7 @@ async fn round8_unused_secret_values_are_never_requested_or_rejected_by_enumerat
                 SECRET,
             )))
         };
-        fixture.saved = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+        fixture.saved = crate::test_support::raw_saved_attrs(HashMap::from([(
             fixture.desired[0].id.clone(),
             HashMap::from([("key".into(), value)]),
         )]))
@@ -1131,10 +1131,12 @@ async fn round8_write_only_record_values_are_enumerated_independently_of_saved_a
     fixture.saved = RawSavedAttrs::from_persisted(
         HashMap::from([(
             id.clone(),
-            PersistedAttributes::from_typed_persisted_wire_values(HashMap::from([(
-                "key".into(),
-                config(None),
-            )]))
+            PersistedAttributes::from_typed_persisted_wire_values(
+                crate::test_support::snapshot_attributes(HashMap::from([(
+                    "key".into(),
+                    config(None),
+                )])),
+            )
             .unwrap(),
         )]),
         HashMap::from([(id, record)]),
@@ -1482,7 +1484,7 @@ async fn accepted_write_only_reference_fallback_uses_the_same_identity_rules() {
         false,
     );
     fixture.registry.insert("test", schema(false, true));
-    fixture.saved = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+    fixture.saved = crate::test_support::raw_saved_attrs(HashMap::from([(
         fixture.desired[0].id.clone(),
         HashMap::from([("key".into(), string("key/a"))]),
     )]))
@@ -1498,7 +1500,7 @@ async fn accepted_write_only_reference_fallback_uses_the_same_identity_rules() {
     assert!(fixture.plan(&witness).unwrap().effects().is_empty());
     assert_eq!(
         fixture.saved.get(&fixture.desired[0].id).unwrap()["key"],
-        string("key/a")
+        (string("key/a")).to_snapshot()
     );
 }
 
@@ -1793,7 +1795,7 @@ fn reset_values(fixture: &mut Fixture, desired: Value, current: Value, saved: Va
         &fixture.registry,
         &[resource.clone()],
     );
-    fixture.saved = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+    fixture.saved = crate::test_support::raw_saved_attrs(HashMap::from([(
         resource.id,
         HashMap::from([("key".into(), saved)]),
     )]))
@@ -1859,7 +1861,7 @@ fn encryption_fixture(desired_key: Value, ignored: bool) -> Fixture {
         &[resource.clone()],
     );
     fixture.saved =
-        RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(resource.id, attributes)]))
+        crate::test_support::raw_saved_attrs(HashMap::from([(resource.id, attributes)]))
             .lift(&fixture.registry);
     fixture
 }
@@ -2165,6 +2167,9 @@ async fn round3_apply_concrete_plan_reference_reresolves_without_widening_equiva
         let outcome = crate::executor::execute_live_plan(
             &fixture.router,
             LiveExecutionInput {
+                provider_context: crate::parser::ProviderContext::clone(
+                    &crate::parser::LoadedProviderContext::empty_for_test(),
+                ),
                 plan: &plan,
                 provider_check_inputs: ProviderCheckInputs::PlanNormalized {
                     resource_origins: &origins,
@@ -2318,10 +2323,14 @@ async fn round3_reference_list_writeback_preserves_authored_fields_across_alias_
         .unwrap();
     let carried = crate::explicit::build_carried_from_resource_for_stored_values(
         fixture.desired[0].as_resource(),
-        fixture.saved.get(&fixture.desired[0].id).unwrap(),
+        &crate::test_support::available_attributes(
+            fixture.saved.get(&fixture.desired[0].id).unwrap().clone(),
+        ),
         &prior,
         &match fixture.current[&fixture.desired[0].id].current() {
-            Current::Present(current) => current.state().attributes.clone(),
+            Current::Present(current) => {
+                crate::test_support::available_attributes(current.state().attributes.clone())
+            }
             _ => unreachable!(),
         },
         Some(comparison.owner_schema().schema().as_schema()),
@@ -2343,10 +2352,14 @@ async fn round3_reference_list_writeback_preserves_authored_fields_across_alias_
     let calls_before = fixture.calls.lock().unwrap().len();
     let fallback = crate::explicit::build_carried_from_resource_for_stored_values(
         fixture.desired[0].as_resource(),
-        fixture.saved.get(&fixture.desired[0].id).unwrap(),
+        &crate::test_support::available_attributes(
+            fixture.saved.get(&fixture.desired[0].id).unwrap().clone(),
+        ),
         &prior,
         &match fixture.current[&fixture.desired[0].id].current() {
-            Current::Present(current) => current.state().attributes.clone(),
+            Current::Present(current) => {
+                crate::test_support::available_attributes(current.state().attributes.clone())
+            }
             _ => unreachable!(),
         },
         Some(comparison.owner_schema().schema().as_schema()),
@@ -2605,7 +2618,8 @@ fn round2_reference_validation_is_offline_for_declarations_and_annotations() {
     let schemas = factory.schemas();
     let factories: Arc<Vec<Box<dyn ProviderFactory>>> = Arc::new(vec![Box::new(factory)]);
     let custom_types = provider_custom_types_from_factories(factories);
-    let owned = OwnedTypeIdentity::provider("test", identity());
+    let owned =
+        OwnedTypeIdentity::provider("test", identity(), crate::schema::RefinedScalarKind::String);
     custom_types
         .validate(
             CustomTypeValidationTarget::Annotation(&owned),
@@ -3297,8 +3311,13 @@ async fn round4_omitted_write_only_list_reference_is_still_a_desired_operand() {
     fixture.saved = RawSavedAttrs::from_persisted(
         HashMap::from([(
             target.id.clone(),
-            PersistedAttributes::from_typed_persisted_wire_values(accepted.into_iter().collect())
-                .unwrap(),
+            PersistedAttributes::from_typed_persisted_wire_values(
+                accepted
+                    .into_iter()
+                    .map(|(key, value)| (key, value.to_snapshot()))
+                    .collect(),
+            )
+            .unwrap(),
         )]),
         HashMap::from([(target.id.clone(), record)]),
     )
@@ -3700,8 +3719,13 @@ async fn round5_projected_write_only_reference_is_still_a_desired_operand() {
     fixture.saved = RawSavedAttrs::from_persisted(
         HashMap::from([(
             id.clone(),
-            PersistedAttributes::from_typed_persisted_wire_values(accepted.into_iter().collect())
-                .unwrap(),
+            PersistedAttributes::from_typed_persisted_wire_values(
+                accepted
+                    .into_iter()
+                    .map(|(key, value)| (key, value.to_snapshot()))
+                    .collect(),
+            )
+            .unwrap(),
         )]),
         HashMap::from([(id.clone(), record)]),
     )

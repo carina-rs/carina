@@ -525,6 +525,7 @@ pub fn evaluate_live_pending_constraints(
     compositions: &[LiveComposition],
     bindings: &ResolvedBindings,
     terminal: bool,
+    session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Vec<ModuleConstraintFailure> {
     evaluate_pending_constraint_views(
         compositions
@@ -532,6 +533,7 @@ pub fn evaluate_live_pending_constraints(
             .map(crate::resource::CompositionRuntimeRef::Live),
         bindings,
         terminal,
+        session,
     )
 }
 
@@ -539,6 +541,7 @@ pub fn evaluate_saved_pending_constraints(
     compositions: &[crate::resource::SavedComposition<crate::resource::NoPlaceholder>],
     bindings: &ResolvedBindings,
     terminal: bool,
+    session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Vec<ModuleConstraintFailure> {
     evaluate_pending_constraint_views(
         compositions
@@ -546,6 +549,7 @@ pub fn evaluate_saved_pending_constraints(
             .map(crate::resource::CompositionRuntimeRef::Saved),
         bindings,
         terminal,
+        session,
     )
 }
 
@@ -553,6 +557,7 @@ fn evaluate_pending_constraint_views<'a>(
     compositions: impl IntoIterator<Item = crate::resource::CompositionRuntimeRef<'a>>,
     bindings: &ResolvedBindings,
     terminal: bool,
+    session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Vec<ModuleConstraintFailure> {
     let mut failures = Vec::new();
 
@@ -567,6 +572,7 @@ fn evaluate_pending_constraint_views<'a>(
                     constraint.expression(),
                     bindings,
                     &mut resolution_errors,
+                    session,
                 ),
                 message: constraint.message.clone(),
             })
@@ -578,12 +584,12 @@ fn evaluate_pending_constraint_views<'a>(
         let mut resolved_arguments = HashMap::new();
         for (name, argument) in composition.arguments() {
             if raw_arguments.contains(name) {
-                match crate::resolver::resolve_ref_value(argument, bindings) {
+                match crate::resolver::resolve_ref_value(argument, bindings, session) {
                     Ok(value) => {
                         resolved_arguments.insert(name.clone(), value);
                     }
                     Err(error) => {
-                        resolution_errors.insert(name.clone(), error);
+                        resolution_errors.insert(name.clone(), error.to_string());
                         resolved_arguments.insert(name.clone(), argument.clone());
                     }
                 }
@@ -666,27 +672,32 @@ fn resolve_bound_constraint_values(
     expression: &ValidateExpr,
     bindings: &ResolvedBindings,
     errors: &mut HashMap<String, String>,
+    session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> ValidateExpr {
     match expression {
         ValidateExpr::BoundArgument {
             argument,
             operand,
             value,
-        } => match crate::resolver::resolve_ref_value(value, bindings) {
+        } => match crate::resolver::resolve_ref_value(value, bindings, session) {
             Ok(value) => ValidateExpr::BoundArgument {
                 argument: argument.clone(),
                 operand: operand.clone(),
                 value,
             },
             Err(error) => {
-                errors.insert(argument.clone(), error);
+                errors.insert(argument.clone(), error.to_string());
                 expression.clone()
             }
         },
         ValidateExpr::Compare { lhs, op, rhs } => ValidateExpr::Compare {
-            lhs: Box::new(resolve_bound_constraint_values(lhs, bindings, errors)),
+            lhs: Box::new(resolve_bound_constraint_values(
+                lhs, bindings, errors, session,
+            )),
             op: op.clone(),
-            rhs: Box::new(resolve_bound_constraint_values(rhs, bindings, errors)),
+            rhs: Box::new(resolve_bound_constraint_values(
+                rhs, bindings, errors, session,
+            )),
         },
         ValidateExpr::IntegerArithmetic {
             lhs,
@@ -694,27 +705,41 @@ fn resolve_bound_constraint_values(
             rhs,
             operator_span,
         } => ValidateExpr::IntegerArithmetic {
-            lhs: Box::new(resolve_bound_constraint_values(lhs, bindings, errors)),
+            lhs: Box::new(resolve_bound_constraint_values(
+                lhs, bindings, errors, session,
+            )),
             op: *op,
-            rhs: Box::new(resolve_bound_constraint_values(rhs, bindings, errors)),
+            rhs: Box::new(resolve_bound_constraint_values(
+                rhs, bindings, errors, session,
+            )),
             operator_span: *operator_span,
         },
         ValidateExpr::And(lhs, rhs) => ValidateExpr::And(
-            Box::new(resolve_bound_constraint_values(lhs, bindings, errors)),
-            Box::new(resolve_bound_constraint_values(rhs, bindings, errors)),
+            Box::new(resolve_bound_constraint_values(
+                lhs, bindings, errors, session,
+            )),
+            Box::new(resolve_bound_constraint_values(
+                rhs, bindings, errors, session,
+            )),
         ),
         ValidateExpr::Or(lhs, rhs) => ValidateExpr::Or(
-            Box::new(resolve_bound_constraint_values(lhs, bindings, errors)),
-            Box::new(resolve_bound_constraint_values(rhs, bindings, errors)),
+            Box::new(resolve_bound_constraint_values(
+                lhs, bindings, errors, session,
+            )),
+            Box::new(resolve_bound_constraint_values(
+                rhs, bindings, errors, session,
+            )),
         ),
         ValidateExpr::Not(inner) => ValidateExpr::Not(Box::new(resolve_bound_constraint_values(
-            inner, bindings, errors,
+            inner, bindings, errors, session,
         ))),
         ValidateExpr::FunctionCall { name, args } => ValidateExpr::FunctionCall {
             name: name.clone(),
             args: args
                 .iter()
-                .map(|argument| resolve_bound_constraint_values(argument, bindings, errors))
+                .map(|argument| {
+                    resolve_bound_constraint_values(argument, bindings, errors, session)
+                })
                 .collect(),
         },
         ValidateExpr::Bool(_)
@@ -1214,10 +1239,10 @@ mod tests {
 
     type ValidateExpr = crate::parser::ValidateExpr<crate::resource::NoPlaceholder>;
 
-    fn redacted_secret() -> Value {
-        Value::Deferred(DeferredValue::RedactedSecret {
-            hash: crate::resource::RedactedSecretHash::generate(b"validation-test"),
-        })
+    fn secret_value() -> Value {
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("validation-test".into()),
+        ))))
     }
 
     fn length_at_least(variable: &str, minimum: i64) -> ValidateExpr {
@@ -1388,7 +1413,7 @@ mod tests {
                 "list".to_string(),
                 Value::Concrete(ConcreteValue::StringList(vec!["a".into(), "b".into()])),
             ),
-            ("secret".to_string(), redacted_secret()),
+            ("secret".to_string(), secret_value()),
         ])));
         assert_eq!(
             format_constraint_actual(&nested),
@@ -1442,7 +1467,7 @@ mod tests {
                 "dotted_text".to_string(),
                 Value::Concrete(ConcreteValue::String("aws.Region.us_east_1".into())),
             ),
-            ("secret_hash".to_string(), redacted_secret()),
+            ("secret_hash".to_string(), secret_value()),
         ]);
 
         assert_eq!(

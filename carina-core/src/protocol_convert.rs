@@ -35,7 +35,8 @@ use crate::provider::{
 };
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, RedactedSecretHash, Resource, ResourceId,
-    ResourceIdentity, ResourceIdentityError, ResourceIdentityState, State, Value, SnapshotValue, SnapshotLeaf, SnapshotState,
+    ResourceIdentity, ResourceIdentityError, ResourceIdentityState, SnapshotLeaf, SnapshotState,
+    SnapshotValue, State, Value,
 };
 use crate::schema::{
     AttributeSchema as DraftAttributeSchema, AttributeSchemaParts,
@@ -75,12 +76,22 @@ fn protocol_to_field_group(group: &protocol::FieldGroup) -> Result<FieldGroup, S
     })
 }
 
+/// A key or index locating a nested value in a provider input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WirePathSegment {
+    Key(String),
+    Index(usize),
+    /// The failing value is inside an opaque secret; its inner path is hidden.
+    Secret,
+}
+
 /// A core value or type cannot be represented by the provider protocol.
 #[derive(Debug)]
 pub enum ProtocolConvertError {
     NonFiniteFloat,
     DurationOutOfRange,
     InvalidRedactedSecretDigest,
+    UnavailableSecret(crate::resource::UnavailableSecretError),
     NonWireValue {
         variant: &'static str,
     },
@@ -119,6 +130,10 @@ pub enum ProtocolConvertError {
         context: String,
         source: Box<ProtocolConvertError>,
     },
+    ValuePath {
+        segment: WirePathSegment,
+        error: Box<ProtocolConvertError>,
+    },
 }
 
 impl fmt::Display for ProtocolConvertError {
@@ -129,6 +144,7 @@ impl fmt::Display for ProtocolConvertError {
             }
             Self::DurationOutOfRange => formatter
                 .write_str("duration in seconds does not fit the provider protocol integer domain"),
+            Self::UnavailableSecret(error) => fmt::Display::fmt(error, formatter),
             Self::InvalidRedactedSecretDigest => {
                 formatter.write_str("persisted state contains an invalid redacted-secret digest")
             }
@@ -186,6 +202,11 @@ impl fmt::Display for ProtocolConvertError {
                 context,
                 source: _source,
             } => formatter.write_str(context),
+            Self::ValuePath { segment, .. } => match segment {
+                WirePathSegment::Key(key) => write!(formatter, "map key `{key}`"),
+                WirePathSegment::Index(index) => write!(formatter, "list index {index}"),
+                WirePathSegment::Secret => formatter.write_str("secret value"),
+            },
         }
     }
 }
@@ -197,9 +218,11 @@ impl Error for ProtocolConvertError {
                 context: _context,
                 source,
             } => Some(source.as_ref()),
+            Self::ValuePath { error, .. } => Some(error.as_ref()),
             Self::NonFiniteFloat => None,
             Self::DurationOutOfRange => None,
             Self::InvalidRedactedSecretDigest => None,
+            Self::UnavailableSecret(error) => error.source(),
             Self::NonWireValue { variant: _variant } => None,
             Self::NonWireAttributeType { kind: _kind } => None,
             Self::ValidatorWithoutIdentity { kind: _kind } => None,
@@ -231,6 +254,44 @@ impl Error for ProtocolConvertError {
 }
 
 impl ProtocolConvertError {
+    /// Structured container path, in outermost-to-innermost order.
+    pub fn value_path(&self) -> Vec<WirePathSegment> {
+        match self {
+            Self::ValuePath { segment, error } => {
+                let mut path = vec![segment.clone()];
+                path.extend(error.value_path());
+                path
+            }
+            Self::Context { source, .. } => source.value_path(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The typed conversion reason beneath contextual wrappers.
+    #[cfg(test)]
+    pub fn leaf_error(&self) -> &Self {
+        match self {
+            Self::ValuePath { error, .. } => error.leaf_error(),
+            Self::Context { source, .. } => source.leaf_error(),
+            error => error,
+        }
+    }
+
+    pub(crate) fn into_leaf_error(self) -> Self {
+        match self {
+            Self::ValuePath { error, .. } => error.into_leaf_error(),
+            Self::Context { source, .. } => source.into_leaf_error(),
+            error => error,
+        }
+    }
+
+    pub(crate) fn at_value_path(self, segment: WirePathSegment) -> Self {
+        Self::ValuePath {
+            segment,
+            error: Box::new(self),
+        }
+    }
+
     fn context(self, context: impl Into<String>) -> Self {
         Self::Context {
             context: context.into(),
@@ -709,6 +770,9 @@ pub fn attribute_type_to_protocol(
     attribute_type: &AttributeType,
 ) -> Result<protocol::AttributeType, ProtocolConvertError> {
     match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => Err(ProtocolConvertError::NonWireAttributeType {
+            kind: "UnloadedSchemaType",
+        }),
         RawShape::Reference {
             identity,
             pattern,
@@ -1818,7 +1882,7 @@ pub fn try_core_to_protocol_value(value: &Value) -> Result<protocol::Value, Prot
                 .enumerate()
                 .map(|(index, value)| {
                     try_core_to_protocol_value(value)
-                        .map_err(|error| error.context(format!("list index {index}")))
+                        .map_err(|error| error.at_value_path(WirePathSegment::Index(index)))
                 })
                 .collect::<Result<_, _>>()?,
         )),
@@ -1834,7 +1898,7 @@ pub fn try_core_to_protocol_value(value: &Value) -> Result<protocol::Value, Prot
                 .map(|(key, value)| {
                     try_core_to_protocol_value(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.context(format!("map key `{key}`")))
+                        .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
                 })
                 .collect::<Result<_, _>>()?,
         )),
@@ -1844,7 +1908,7 @@ pub fn try_core_to_protocol_value(value: &Value) -> Result<protocol::Value, Prot
     }
 }
 
-fn deferred_value_variant(value: &DeferredValue) -> &'static str {
+fn deferred_value_variant<P: crate::resource::ValueKind>(value: &DeferredValue<P>) -> &'static str {
     match value {
         DeferredValue::ModuleIf(_) => "ModuleIf",
         DeferredValue::ResourceRef { path: _path } => "ResourceRef",
@@ -1875,7 +1939,7 @@ fn deferred_value_variant(value: &DeferredValue) -> &'static str {
         DeferredValue::Access(_access) => "Access",
         DeferredValue::Secret(_inner) => "Secret",
         DeferredValue::Unknown(_reason) => "Unknown",
-        DeferredValue::Placeholder(never) => match *never {},
+        DeferredValue::Placeholder(_leaf) => "Placeholder",
     }
 }
 
@@ -1903,7 +1967,7 @@ pub fn protocol_to_core_value(value: &protocol::Value) -> Result<Value, Protocol
                 .enumerate()
                 .map(|(index, value)| {
                     protocol_to_core_value(value)
-                        .map_err(|error| error.context(format!("list index {index}")))
+                        .map_err(|error| error.at_value_path(WirePathSegment::Index(index)))
                 })
                 .collect::<Result<_, _>>()?,
         ))),
@@ -1913,7 +1977,7 @@ pub fn protocol_to_core_value(value: &protocol::Value) -> Result<Value, Protocol
                 .map(|(key, value)| {
                     protocol_to_core_value(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.context(format!("map key `{key}`")))
+                        .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
                 })
                 .collect::<Result<IndexMap<_, _>, _>>()?,
         ))),
@@ -1952,7 +2016,7 @@ pub fn protocol_schema_default_to_core(
                 .enumerate()
                 .map(|(index, value)| {
                     protocol_schema_default_to_core(value)
-                        .map_err(|error| error.context(format!("list index {index}")))
+                        .map_err(|error| error.at_value_path(WirePathSegment::Index(index)))
                 })
                 .collect::<Result<_, _>>()?,
         ))),
@@ -1962,7 +2026,7 @@ pub fn protocol_schema_default_to_core(
                 .map(|(key, value)| {
                     protocol_schema_default_to_core(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.context(format!("map key `{key}`")))
+                        .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
                 })
                 .collect::<Result<IndexMap<_, _>, _>>()?,
         ))),
@@ -1978,7 +2042,7 @@ pub fn try_core_to_protocol_value_map(
         .map(|(key, value)| {
             try_core_to_protocol_value(value)
                 .map(|converted| (key.clone(), converted))
-                .map_err(|error| error.context(format!("map key `{key}`")))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
         })
         .collect()
 }
@@ -1992,7 +2056,7 @@ pub fn protocol_to_core_value_map(
         .map(|(key, value)| {
             protocol_to_core_value(value)
                 .map(|converted| (key.clone(), converted))
-                .map_err(|error| error.context(format!("map key `{key}`")))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
         })
         .collect()
 }
@@ -2032,7 +2096,7 @@ pub fn try_core_to_protocol_persisted_value(
                 .enumerate()
                 .map(|(index, value)| {
                     try_core_to_protocol_persisted_value(value)
-                        .map_err(|error| error.context(format!("list index {index}")))
+                        .map_err(|error| error.at_value_path(WirePathSegment::Index(index)))
                 })
                 .collect::<Result<_, _>>()?,
         )),
@@ -2050,7 +2114,7 @@ pub fn try_core_to_protocol_persisted_value(
                 .map(|(key, value)| {
                     try_core_to_protocol_persisted_value(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.context(format!("map key `{key}`")))
+                        .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
                 })
                 .collect::<Result<_, _>>()?,
         )),
@@ -2058,7 +2122,7 @@ pub fn try_core_to_protocol_persisted_value(
             protocol::PersistedValue::RedactedSecret(hash.encoded_digest()),
         ),
         Value::Deferred(deferred) => Err(ProtocolConvertError::NonWireValue {
-            variant: match deferred { DeferredValue::Placeholder(SnapshotLeaf::Expression(never)) => match *never {}, _ => "DeferredValue" },
+            variant: deferred_value_variant(deferred),
         }),
     }
 }
@@ -2083,7 +2147,9 @@ pub fn protocol_to_core_persisted_value(
         protocol::PersistedValue::RedactedSecret(digest) => {
             let hash = RedactedSecretHash::from_encoded_digest(digest)
                 .ok_or(ProtocolConvertError::InvalidRedactedSecretDigest)?;
-            Ok(Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { hash })))
+            Ok(Value::Deferred(DeferredValue::Placeholder(
+                SnapshotLeaf::RedactedSecret { hash },
+            )))
         }
         protocol::PersistedValue::StringList(values) => Ok(Value::Concrete(
             ConcreteValue::StringList(values.iter().cloned().map(Into::into).collect()),
@@ -2094,7 +2160,7 @@ pub fn protocol_to_core_persisted_value(
                 .enumerate()
                 .map(|(index, value)| {
                     protocol_to_core_persisted_value(value)
-                        .map_err(|error| error.context(format!("list index {index}")))
+                        .map_err(|error| error.at_value_path(WirePathSegment::Index(index)))
                 })
                 .collect::<Result<_, _>>()?,
         ))),
@@ -2104,7 +2170,7 @@ pub fn protocol_to_core_persisted_value(
                 .map(|(key, value)| {
                     protocol_to_core_persisted_value(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.context(format!("map key `{key}`")))
+                        .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
                 })
                 .collect::<Result<IndexMap<_, _>, _>>()?,
         ))),
@@ -2120,7 +2186,7 @@ pub fn try_core_to_protocol_persisted_value_map(
         .map(|(key, value)| {
             try_core_to_protocol_persisted_value(value)
                 .map(|converted| (key.clone(), converted))
-                .map_err(|error| error.context(format!("map key `{key}`")))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
         })
         .collect()
 }
@@ -2134,7 +2200,7 @@ pub fn protocol_to_core_persisted_value_map(
         .map(|(key, value)| {
             protocol_to_core_persisted_value(value)
                 .map(|converted| (key.clone(), converted))
-                .map_err(|error| error.context(format!("map key `{key}`")))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
         })
         .collect()
 }
@@ -2455,7 +2521,17 @@ pub fn try_applied_state_to_protocol(
     Ok(protocol::AppliedState {
         id: resource_id_to_protocol(id),
         identifier: identifier.clone(),
-        attributes: try_core_to_protocol_value_map(attributes)?,
+        attributes: attributes
+            .iter()
+            .map(|(key, value)| {
+                let value = value
+                    .to_value_at(format!("{id}.{key}"))
+                    .map_err(ProtocolConvertError::UnavailableSecret)?;
+                try_core_to_protocol_value(&value)
+                    .map(|value| (key.clone(), value))
+                    .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
+            })
+            .collect::<Result<_, _>>()?,
     })
 }
 
@@ -2563,7 +2639,7 @@ fn protocol_applied_persisted_state_to_core(
         identifier,
         attributes,
     } = state;
-    Ok(AppliedState::from_identifier(
+    Ok(AppliedState::from_snapshot_parts(
         protocol_to_resource_id(id),
         identifier.clone(),
         protocol_to_core_persisted_value_map(attributes)?,
@@ -3338,14 +3414,12 @@ mod tests {
         let digest = format!("argon2-legacy:73616c74:{}", "ab".repeat(32));
         let hash =
             RedactedSecretHash::from_encoded_digest(&digest).expect("fixture digest must be valid");
-        let value = Value::Deferred(DeferredValue::RedactedSecret { hash });
-
-        assert!(matches!(
-            try_core_to_protocol_value(&value),
-            Err(ProtocolConvertError::NonWireValue {
-                variant: "RedactedSecret"
-            })
+        let value = crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+            crate::resource::SnapshotLeaf::RedactedSecret { hash },
         ));
+
+        let unavailable = value.to_value_at("state.password").unwrap_err();
+        assert_eq!(unavailable.path(), "state.password");
 
         let encoded = try_core_to_protocol_persisted_value(&value)
             .expect("persisted positions may carry a redacted secret");
@@ -3414,6 +3488,94 @@ mod tests {
         }
     }
 
+    fn assert_complete_value_path(error: ProtocolConvertError) {
+        assert_eq!(
+            error.value_path(),
+            vec![
+                WirePathSegment::Key("root".into()),
+                WirePathSegment::Index(0),
+                WirePathSegment::Key("leaf".into()),
+            ]
+        );
+        assert!(matches!(
+            error.leaf_error(),
+            ProtocolConvertError::NonFiniteFloat
+        ));
+        let mut messages = Vec::new();
+        let mut current: Option<&dyn std::error::Error> = Some(&error);
+        while let Some(error) = current {
+            messages.push(error.to_string());
+            current = error.source();
+        }
+        assert_eq!(
+            messages,
+            [
+                "map key `root`",
+                "list index 0",
+                "map key `leaf`",
+                "non-finite float cannot cross the provider protocol",
+            ]
+        );
+    }
+
+    #[test]
+    fn ordinary_value_converters_keep_complete_structured_paths() {
+        let core = HashMap::from([(
+            "root".into(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(IndexMap::from([(
+                    "leaf".into(),
+                    Value::Concrete(ConcreteValue::Float(f64::NAN)),
+                )])),
+            )])),
+        )]);
+        let wire = BTreeMap::from([(
+            "root".into(),
+            protocol::Value::List(vec![protocol::Value::Map(BTreeMap::from([(
+                "leaf".into(),
+                protocol::Value::Float(f64::NAN),
+            )]))]),
+        )]);
+        for error in [
+            try_core_to_protocol_value_map(&core).unwrap_err(),
+            protocol_to_core_value_map(&wire).unwrap_err(),
+            protocol_to_core_value(&protocol::Value::Map(wire.clone())).unwrap_err(),
+            protocol_schema_default_to_core(&protocol::Value::Map(wire)).unwrap_err(),
+        ] {
+            assert_complete_value_path(error);
+        }
+    }
+
+    #[test]
+    fn persisted_value_converters_keep_complete_structured_paths() {
+        let core = HashMap::from([(
+            "root".into(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(IndexMap::from([(
+                    "leaf".into(),
+                    Value::Concrete(ConcreteValue::Float(f64::NAN)),
+                )])),
+            )])),
+        )]);
+        let wire = BTreeMap::from([(
+            "root".into(),
+            protocol::PersistedValue::List(vec![protocol::PersistedValue::Map(BTreeMap::from([
+                ("leaf".into(), protocol::PersistedValue::Float(f64::NAN)),
+            ]))]),
+        )]);
+        for error in [
+            try_core_to_protocol_persisted_value_map(&core).unwrap_err(),
+            try_core_to_protocol_persisted_value(&Value::Concrete(ConcreteValue::Map(
+                core.into_iter().collect(),
+            )))
+            .unwrap_err(),
+            protocol_to_core_persisted_value_map(&wire).unwrap_err(),
+            protocol_to_core_persisted_value(&protocol::PersistedValue::Map(wire)).unwrap_err(),
+        ] {
+            assert_complete_value_path(error);
+        }
+    }
+
     #[test]
     fn schema_default_projection_rejects_non_wire_values_and_every_non_finite_float() {
         for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -3439,6 +3601,8 @@ mod tests {
             name: "fixture".to_string(),
             params: Vec::new(),
             return_type: None,
+            return_type_span: None,
+            annotation_source_file: None,
             local_lets: Vec::new(),
             body: crate::parser::UserFunctionBody {
                 value: Value::Concrete(ConcreteValue::Int(1)),
@@ -3459,9 +3623,6 @@ mod tests {
             crate::resource::AccessMissPolicy::Defer,
         )
         .expect("unknown field access must remain deferred");
-        let digest = format!("argon2-legacy:73616c74:{}", "ab".repeat(32));
-        let hash =
-            RedactedSecretHash::from_encoded_digest(&digest).expect("fixture digest must be valid");
         let non_wire = [
             Value::Concrete(ConcreteValue::enum_identifier("test.Mode.enabled")),
             crate::resource::AuthoredValue::resource_ref("source", "value", Vec::new())
@@ -3503,7 +3664,6 @@ mod tests {
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
                 ConcreteValue::String("secret".into()),
             )))),
-            Value::Deferred(DeferredValue::RedactedSecret { hash }),
             Value::Deferred(DeferredValue::Unknown(
                 crate::resource::ApplyTimeUnknown::UpstreamAllExports {
                     binding: absolute_binding("upstream"),
@@ -4277,6 +4437,9 @@ mod tests {
             let decoded_wire: protocol::AttributeType = serde_json::from_str(&json).unwrap();
             let decoded = protocol_to_attribute_type(&decoded_wire).unwrap();
             let (decoded_identity, has_callback) = match decoded.raw_shape() {
+                RawShape::UnloadedSchemaType(_) => {
+                    panic!("builtin wire type must have a loaded declaration")
+                }
                 RawShape::Reference {
                     identity,
                     pattern: _pattern,

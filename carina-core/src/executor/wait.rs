@@ -25,7 +25,7 @@ use crate::provider::{
 };
 #[cfg(test)]
 use crate::provider::{ReadOutcome, fixture_read_outcome_for_identifier};
-use crate::resource::{Current, ResolvedResourceId, ResourceId, State, Value};
+use crate::resource::{Current, ResolvedResourceId, ResourceId, SnapshotState as State};
 use crate::shutdown::{CleanupAwareLoop, CleanupInterrupted, LoopStep};
 use crate::value::format_value_user_facing;
 use crate::wait::predicate::WaitPredicate;
@@ -149,11 +149,12 @@ pub enum WaitOutcome {
     Abandoned,
     Unsatisfiable(UnsatisfiableReason),
     Timeout {
-        last_attrs: HashMap<String, Value>,
+        last_attrs: HashMap<String, crate::resource::SnapshotValue>,
         elapsed: Duration,
     },
     NotFound(ProviderError),
     ReadFailed(ProviderError),
+    UnavailableSecret(crate::resource::UnavailableSecretError),
 }
 
 /// Why a wait condition cannot become true.
@@ -217,6 +218,7 @@ pub(super) fn wait_failure(
                 target_id, elapsed, observed
             ))
         }
+        WaitOutcome::UnavailableSecret(error) => super::EffectFailureKind::execution(error),
         WaitOutcome::NotFound(error) | WaitOutcome::ReadFailed(error) => {
             super::EffectFailureKind::provider(error)
         }
@@ -229,7 +231,7 @@ pub(super) fn wait_failure(
     }
 }
 
-fn format_wait_last_attrs(last_attrs: &HashMap<String, Value>) -> String {
+fn format_wait_last_attrs(last_attrs: &HashMap<String, crate::resource::SnapshotValue>) -> String {
     let mut keys: Vec<_> = last_attrs.keys().collect();
     keys.sort();
     if keys.is_empty() {
@@ -820,7 +822,11 @@ pub(super) async fn execute_wait_effect_with_heartbeat_cadence<S>(
                 last_heartbeat_at = Some(now);
             }
 
-            if until.evaluate(&state.attributes) {
+            let inputs = match crate::wait::evaluation_inputs(until, &state.attributes) {
+                Ok(inputs) => inputs,
+                Err(error) => return Some(WaitOutcome::UnavailableSecret(error)),
+            };
+            if until.evaluate(&inputs) {
                 return Some(WaitOutcome::Satisfied { state });
             }
             let elapsed = start.elapsed();
@@ -907,7 +913,7 @@ mod tests {
         let id = ResourceId::with_identity("test.resource", "target");
         let managed_current = HashMap::from([(
             id.clone(),
-            Current::from_state(
+            Current::from_snapshot(
                 State::existing(id.clone(), HashMap::new()).with_identifier("managed-id"),
             ),
         )]);
@@ -997,9 +1003,9 @@ mod tests {
         fn read_data_source(
             &self,
             resource: &crate::provider::ProviderReadyDataSource,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
             let id = resource.id.clone();
-            Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+            Box::pin(async move { Ok(crate::resource::State::existing(id, HashMap::new())) })
         }
 
         fn create(
@@ -1524,7 +1530,7 @@ mod tests {
     fn wait_timeout_failure_message_handles_unknown_and_deferred_attrs() {
         let target = ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
         let outcome = WaitOutcome::Timeout {
-            last_attrs: HashMap::from([
+            last_attrs: crate::test_support::snapshot_attributes(HashMap::from([
                 (
                     "status".to_string(),
                     Value::Deferred(DeferredValue::Unknown(
@@ -1538,7 +1544,7 @@ mod tests {
                     "target".to_string(),
                     Value::root_resource_ref("vpc", "id", vec![]),
                 ),
-            ]),
+            ])),
             elapsed: Duration::from_secs(1),
         };
 

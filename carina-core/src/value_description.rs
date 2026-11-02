@@ -51,9 +51,7 @@ impl ValueDescription {
                 "unavailable function result".to_string()
             }
             Value::Deferred(DeferredValue::Access(_)) => "access expression".to_string(),
-            Value::Deferred(DeferredValue::Secret(_) ) => {
-                "secret".to_string()
-            }
+            Value::Deferred(DeferredValue::Secret(_)) => "secret".to_string(),
             Value::Deferred(DeferredValue::Unknown(_)) => "unknown".to_string(),
             Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
                 format!("placeholder ({placeholder})")
@@ -83,11 +81,12 @@ mod tests {
     }
 
     #[test]
-    fn typed_persisted_secret_is_masked() {
-        let value: Value = Value::Deferred(crate::resource::DeferredValue::RedactedSecret {
-            hash: crate::resource::RedactedSecretHash::generate(b"description-test"),
-        });
-
-        assert_eq!(ValueDescription::of(&value).to_string(), "secret");
+    fn typed_persisted_secret_is_unavailable_to_type_description() {
+        let value: crate::resource::SnapshotValue = crate::resource::SnapshotValue::redacted(
+            crate::resource::RedactedSecretHash::generate(b"description-test"),
+        );
+        let error = value.to_value_at("state.description").unwrap_err();
+        assert_eq!(error.path(), "state.description");
+        assert_eq!(crate::value::format_value(&value), "(secret)");
     }
 }

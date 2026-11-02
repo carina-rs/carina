@@ -671,69 +671,78 @@ pub(crate) fn resolve_export_values_post_apply<D>(
     carina_core::validation::CheckedExportValues<carina_core::parser::ExpandedInferredExportParam>,
     AppError,
 > {
-    use carina_core::binding_index::ResolvedBindings;
-    use carina_core::resolver::resolve_live_composition_refs_post_apply;
+    crate::wiring::settle_type_checks(
+        carina_core::validation::deferred_types::TypeCheckSession::run(
+            input.provider_context,
+            |session| {
+                use carina_core::binding_index::ResolvedBindings;
+                use carina_core::resolver::resolve_live_composition_refs_post_apply;
 
-    // Step 1: the post-apply state view was assembled by
-    // [`PostApplyStates::from_current_and_state`] before this call.
-    // See that type's doc-comment for the merge rule that pins
-    // carina#3266 (data-source survives) and carina#3271 (state
-    // refresh path uses the same shape).
+                // Step 1: the post-apply state view was assembled by
+                // [`PostApplyStates::from_current_and_state`] before this call.
+                // See that type's doc-comment for the merge rule that pins
+                // carina#3266 (data-source survives) and carina#3271 (state
+                // refresh path uses the same shape).
 
-    // compositions: fresh clone of the **pre-resolve** snapshot. Their
-    // attributes still carry `ResourceRef`s, so the post-apply
-    // resolver below can pick up the post-apply state values for
-    // any managed sibling that was Replaced during apply
-    // (#3169 / #3177).
-    let mut compositions: Vec<carina_core::resource::LiveComposition> =
-        input.pre_resolve_compositions.to_vec();
+                // compositions: fresh clone of the **pre-resolve** snapshot. Their
+                // attributes still carry `ResourceRef`s, so the post-apply
+                // resolver below can pick up the post-apply state values for
+                // any managed sibling that was Replaced during apply
+                // (#3169 / #3177).
+                let mut compositions: Vec<carina_core::resource::LiveComposition> =
+                    input.pre_resolve_compositions.to_vec();
 
-    // Step 3: build the bindings view from the managed slice plus
-    // post-apply states, **with data sources but no compositions yet**.
-    // The compositions' attribute maps still hold pre-apply
-    // `ResourceRef`s and need to be re-resolved against the
-    // post-apply state in Step 4; only after that re-resolution can
-    // they be layered into the bindings view. We use `pre_apply`
-    // with `compositions: &[]` here, then call
-    // `layer_live_compositions_post_apply` once the re-resolution is done.
-    // (carina#3181, carina#3248)
-    let plan_input_current = carina_core::resource::into_plan_input_current_map(
-        input.post_apply_states.managed_current().clone(),
-        input.schemas,
-        input.sorted_resources,
-    );
-    let mut bindings =
-        ResolvedBindings::pre_apply_live(carina_core::binding_index::LivePreApplyInputs {
-            managed: input.sorted_resources,
-            compositions: &[],
-            managed_current: &plan_input_current,
-            data_source_values: input.post_apply_states.data_source_values(),
-            remote_bindings: &HashMap::new(),
-            wait_aliases: input.wait_aliases,
-        });
+                // Step 3: build the bindings view from the managed slice plus
+                // post-apply states, **with data sources but no compositions yet**.
+                // The compositions' attribute maps still hold pre-apply
+                // `ResourceRef`s and need to be re-resolved against the
+                // post-apply state in Step 4; only after that re-resolution can
+                // they be layered into the bindings view. We use `pre_apply`
+                // with `compositions: &[]` here, then call
+                // `layer_live_compositions_post_apply` once the re-resolution is done.
+                // (carina#3181, carina#3248)
+                let plan_input_current = carina_core::resource::into_plan_input_current_map(
+                    input.post_apply_states.managed_current().clone(),
+                    input.schemas,
+                    input.sorted_resources,
+                );
+                let mut bindings = ResolvedBindings::pre_apply_live(
+                    carina_core::binding_index::LivePreApplyInputs {
+                        managed: input.sorted_resources,
+                        compositions: &[],
+                        managed_current: &plan_input_current,
+                        data_source_values: input.post_apply_states.data_source_values(),
+                        remote_bindings: &HashMap::new(),
+                        wait_aliases: input.wait_aliases,
+                    },
+                );
 
-    // Step 4: re-resolve each composition's attributes against the
-    // post-apply bindings view. After this, a composition's
-    // `role_arn = role.arn` no longer holds the pre-apply
-    // `ResourceRef`; it holds the post-apply concrete value.
-    resolve_live_composition_refs_post_apply(&mut compositions, &bindings)?;
+                // Step 4: re-resolve each composition's attributes against the
+                // post-apply bindings view. After this, a composition's
+                // `role_arn = role.arn` no longer holds the pre-apply
+                // `ResourceRef`; it holds the post-apply concrete value.
+                resolve_live_composition_refs_post_apply(&mut compositions, &bindings, session)?;
 
-    // Step 5: layer the re-resolved compositions onto the bindings view.
-    // Now `exports { foo = some_module.role_arn }` resolves against
-    // a binding whose `role_arn` is the post-apply value.
-    bindings.layer_live_compositions_post_apply(&compositions)?;
+                // Step 5: layer the re-resolved compositions onto the bindings view.
+                // Now `exports { foo = some_module.role_arn }` resolves against
+                // a binding whose `role_arn` is the post-apply value.
+                bindings.layer_live_compositions_post_apply(&compositions)?;
 
-    // Step 6: resolve the export expressions against the combined
-    // view. The input is already checked at the pre-apply boundary, but a
-    // reference can become concrete only after a successful mutation. Run the
-    // same constructor again so the post-apply value is checked before the
-    // serializer can observe it.
-    carina_core::validation::resolve_export_values_post_apply(
-        input.export_params,
-        &bindings,
-        input.provider_context,
+                // Step 6: resolve the export expressions against the combined
+                // view. The input is already checked at the pre-apply boundary, but a
+                // reference can become concrete only after a successful mutation. Run the
+                // same constructor again so the post-apply value is checked before the
+                // serializer can observe it.
+                carina_core::validation::resolve_export_values_post_apply(
+                    input.export_params,
+                    &bindings,
+                    session,
+                )
+                .map_err(AppError::Validation)
+            },
+        ),
+        AppError::Validation,
     )
-    .map_err(AppError::Validation)
 }
 
 /// Convert post-apply checked export values into the state writeback shape.
@@ -7407,17 +7416,25 @@ mod apply_state_save_tests {
             .iter()
             .map(|resource| resource.as_resource().clone())
             .collect();
-        crate::wiring::add_state_block_effects(
-            &mut plan,
-            &state_blocks,
-            &state_file_for_wiring,
-            &[(
-                ResolvedResourceId::new(from_id.clone()),
-                ResolvedResourceId::new(id.clone()),
-            )],
-            &raw_sorted_resources,
-            &bindings,
-            &unresolved_upstreams,
+        carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                crate::wiring::add_state_block_effects(
+                    &mut plan,
+                    &state_blocks,
+                    &state_file_for_wiring,
+                    &[(
+                        ResolvedResourceId::new(from_id.clone()),
+                        ResolvedResourceId::new(id.clone()),
+                    )],
+                    &raw_sorted_resources,
+                    crate::wiring::StateBlockEvaluationContext {
+                        bindings: &bindings,
+                        unresolved_upstream_bindings: &unresolved_upstreams,
+                        session,
+                    },
+                )
+            },
         );
 
         assert_eq!(
@@ -7595,10 +7612,15 @@ mod export_writeback_tests {
             &DataSourceValues::empty(),
             &state,
         );
-        let checked = carina_core::validation::check_export_values_pre_apply(
-            export_params,
-            &carina_core::binding_index::ResolvedBindings::default(),
+        let checked = carina_core::validation::deferred_types::with_session_for_test(
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                carina_core::validation::check_export_values_pre_apply(
+                    export_params,
+                    &carina_core::binding_index::ResolvedBindings::default(),
+                    session,
+                )
+            },
         )
         .expect("test exports must pass the secret boundary");
         let values = resolve_export_values_post_apply(ResolveExportValuesPostApplyInput::<
@@ -7655,10 +7677,15 @@ mod export_writeback_tests {
             vec![],
         );
         let export_params = [export_param("computed", reference.clone())];
-        let checked = carina_core::validation::check_export_values_pre_apply(
-            &export_params,
-            &carina_core::binding_index::ResolvedBindings::default(),
+        let checked = carina_core::validation::deferred_types::with_session_for_test(
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                carina_core::validation::check_export_values_pre_apply(
+                    &export_params,
+                    &carina_core::binding_index::ResolvedBindings::default(),
+                    session,
+                )
+            },
         )
         .expect("test export must pass the secret boundary");
         let post_apply_states = PostApplyStates::from_current_and_state(

@@ -233,9 +233,7 @@ fn format_value(value: &Value) -> String {
                 }
             }
         }
-        Value::Deferred(DeferredValue::Secret(_) ) => {
-            "(secret)".to_string()
-        }
+        Value::Deferred(DeferredValue::Secret(_)) => "(secret)".to_string(),
         Value::Deferred(DeferredValue::Unknown(reason)) => crate::value::render_unknown(reason),
         Value::Deferred(DeferredValue::Placeholder(placeholder)) => placeholder.to_string(),
     }
@@ -606,7 +604,6 @@ impl RootConfigSignature {
                 // Unknown is upstream-deferred and carries no resource-binding edge.
             }
 
-
             Value::Deferred(DeferredValue::Placeholder(_)) => {}
         }
     }
@@ -898,6 +895,7 @@ impl ModuleSignature {
             | TypeExpr::Float
             | TypeExpr::Duration
             | TypeExpr::Simple(_)
+            | TypeExpr::UnloadedSchemaType(_)
             | TypeExpr::Ref(_)
             | TypeExpr::DottedUnresolved(_)
             | TypeExpr::SchemaType { .. }
@@ -916,6 +914,7 @@ impl ModuleSignature {
             | TypeExpr::List(_)
             | TypeExpr::Map(_)
             | TypeExpr::Simple(_)
+            | TypeExpr::UnloadedSchemaType(_)
             | TypeExpr::SchemaType { .. }
             | TypeExpr::Struct { .. }
             | TypeExpr::StringLiteral(_)
@@ -1256,8 +1255,6 @@ impl ModuleSignature {
                 // Other unknowns are upstream-deferred and carry no
                 // resource-binding edge.
             }
-
-
         }
     }
 
@@ -1412,6 +1409,7 @@ impl ModuleSignature {
             | TypeExpr::Float
             | TypeExpr::Duration
             | TypeExpr::Simple(_)
+            | TypeExpr::UnloadedSchemaType(_)
             | TypeExpr::SchemaType { .. }
             | TypeExpr::StringLiteral(_)
             | TypeExpr::Union(_) => format!("{}{}{}", c.green, type_expr, c.reset),

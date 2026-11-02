@@ -662,7 +662,6 @@ fn value_type_name<B: BindingAddress>(value: &Value<NoPlaceholder, B>) -> &'stat
         Value::Deferred(DeferredValue::Access(_)) => "Access",
         Value::Deferred(DeferredValue::Secret(_)) => "Secret",
 
-
         Value::Deferred(DeferredValue::Unknown(_)) => "Unknown",
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
@@ -809,7 +808,9 @@ mod tests {
     #[test]
     fn decrypt_accepts_a_secret_from_another_decrypt_without_double_wrapping() {
         let config = ProviderContext {
-            decryptor: Some(Box::new(|ciphertext, _| Ok(format!("plain:{ciphertext}")))),
+            decryptor: Some(std::sync::Arc::new(|ciphertext, _| {
+                Ok(format!("plain:{ciphertext}"))
+            })),
             resource_types: Default::default(),
             ..ProviderContext::default()
         };

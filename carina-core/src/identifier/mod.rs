@@ -288,7 +288,6 @@ fn value_has_authored_plan_time_expression<P: PlaceholderKind, B: BindingAddress
         Value::Deferred(DeferredValue::Secret(_)) => false,
         Value::Deferred(
             DeferredValue::Unavailable { .. }
-            
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => false,
@@ -307,7 +306,7 @@ enum IdentityPathInput<'a, P: PlaceholderKind, B: BindingAddress> {
 }
 
 /// Missing roots or fields are absent; an unavailable ancestor shape is an error.
-fn value_at_identity_path<'a, P: PlaceholderKind, B: BindingAddress>(
+fn value_at_identity_path<'a, P: crate::resource::ValueKind, B: BindingAddress>(
     root: Option<&'a Value<P, B>>,
     path: &IdentityPath,
 ) -> Result<Option<&'a Value<P, B>>, ()> {
@@ -1599,7 +1598,7 @@ pub fn reconcile_prefixed_names(
 ///
 /// Unlike `format!("{:?}", value)`, this ensures Map entries are sorted by key,
 /// so the output is consistent across runs (HashMap iteration order is random).
-fn deterministic_value_string<P: PlaceholderKind, B: BindingAddress>(
+fn deterministic_value_string<P: crate::resource::ValueKind, B: BindingAddress>(
     value: &Value<P, B>,
 ) -> String {
     match value {
@@ -1700,7 +1699,6 @@ fn deterministic_value_string<P: PlaceholderKind, B: BindingAddress>(
             format!("Secret({})", deterministic_value_string(inner))
         }
 
-
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             use crate::resource::ApplyTimeUnknown;
             // Variant labels feed identity hashes; keep them stable across Rust renames.
@@ -1723,6 +1721,17 @@ fn deterministic_value_string<P: PlaceholderKind, B: BindingAddress>(
                     }
                 },
             }
+        }
+        Value::Deferred(DeferredValue::Placeholder(placeholder))
+            if placeholder.redacted_secret_hash().is_some() =>
+        {
+            format!(
+                "RedactedSecret(_secret:{})",
+                placeholder
+                    .redacted_secret_hash()
+                    .expect("checked hash leaf")
+                    .encoded_digest()
+            )
         }
         Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
             format!("Placeholder({placeholder})")
@@ -2805,11 +2814,11 @@ impl AnonymousIdStateInfo {
     /// identity fields. Schema-declared identity values use each name
     /// override's original value, so callers do not need to distinguish a
     /// temporary unique name from the resource's authored identity.
-    pub fn try_from_state_row(
+    pub fn try_from_state_row<P: crate::resource::StateValueLeaf>(
         origin_id: ResolvedResourceId,
         projected_id: Option<ResolvedResourceId>,
         schema: &ValidatedResourceSchema,
-        attributes: &HashMap<String, Value>,
+        attributes: &HashMap<String, Value<P>>,
         name_overrides: &HashMap<String, NameOverride>,
     ) -> Option<Self> {
         Self::try_from_comparable_values(
@@ -2906,10 +2915,13 @@ enum StateIdentityValue {
 }
 
 impl StateIdentityValue {
-    fn at_path(root: Option<&Value>, path: &IdentityPath) -> Self {
+    fn at_path(root: Option<&crate::resource::SnapshotValue>, path: &IdentityPath) -> Self {
         match value_at_identity_path(root, path) {
             Ok(None) => Self::Absent,
-            Ok(Some(value)) => ResolvedCreateOnlyValue::from_value(value.clone())
+            Ok(Some(value)) => value
+                .to_value_at(path.to_string())
+                .ok()
+                .and_then(ResolvedCreateOnlyValue::from_value)
                 .map(Self::Comparable)
                 .unwrap_or(Self::Uncomparable),
             Err(()) => Self::Uncomparable,
@@ -2918,12 +2930,15 @@ impl StateIdentityValue {
 }
 
 impl StateRowIdentityValues {
-    fn from_state_row(
+    fn from_state_row<P: crate::resource::StateValueLeaf>(
         schema: &ValidatedResourceSchema,
-        observed_attributes: &HashMap<String, Value>,
+        observed_attributes: &HashMap<String, Value<P>>,
         name_overrides: &HashMap<String, NameOverride>,
     ) -> Self {
-        let mut canonical = observed_attributes.clone();
+        let mut canonical = observed_attributes
+            .iter()
+            .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
+            .collect::<HashMap<_, _>>();
         let identity_attributes = schema
             .identity_paths()
             .iter()
@@ -2946,7 +2961,7 @@ impl StateRowIdentityValues {
                 }
             }
         }
-        crate::value::canonicalize_state_attribute_map_with_schema(
+        crate::value::canonicalize_snapshot_attribute_map_with_schema(
             &mut canonical,
             schema.as_schema(),
         );
@@ -3441,7 +3456,7 @@ fn resolve_deferred_create_only_value(
             BindingCompleteness::Complete,
         );
     }
-    match crate::resolver::resolve_ref_value_status(value, &bindings).ok()? {
+    match crate::resolver::project_ref_value_status(value, &bindings).ok()? {
         crate::resolver::ValueResolution::Present(resolved) => Some(resolved),
         crate::resolver::ValueResolution::Absent | crate::resolver::ValueResolution::Unknown(_) => {
             None
@@ -3774,12 +3789,15 @@ pub struct StateCreateOnlyValues {
 impl StateCreateOnlyValues {
     /// Canonicalize and select create-only values from observed state-side
     /// attributes. Missing or non-comparable attributes remain absent.
-    pub fn from_state_attributes(
+    pub fn from_state_attributes<P: crate::resource::StateValueLeaf>(
         schema: &ValidatedResourceSchema,
-        observed_attributes: &HashMap<String, Value>,
+        observed_attributes: &HashMap<String, Value<P>>,
     ) -> Self {
-        let mut canonical = observed_attributes.clone();
-        crate::value::canonicalize_state_attribute_map_with_schema(
+        let mut canonical = observed_attributes
+            .iter()
+            .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
+            .collect::<HashMap<_, _>>();
+        crate::value::canonicalize_snapshot_attribute_map_with_schema(
             &mut canonical,
             schema.as_schema(),
         );
@@ -3790,7 +3808,7 @@ impl StateCreateOnlyValues {
             .filter_map(|attribute| {
                 canonical
                     .get(attribute)
-                    .cloned()
+                    .and_then(|value| value.to_value_at(format!("state.{attribute}")).ok())
                     .and_then(ResolvedCreateOnlyValue::from_value)
                     .map(|value| (attribute.to_string(), value))
             })

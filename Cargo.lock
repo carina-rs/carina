@@ -1241,8 +1241,10 @@ dependencies = [
  "carina-plugin-bindings-provider",
  "carina-provider-protocol",
  "http 1.4.0",
+ "indexmap 2.13.0",
  "serde",
  "serde_json",
+ "tokio",
  "wasi 0.14.7+wasi-0.2.4",
 ]
 

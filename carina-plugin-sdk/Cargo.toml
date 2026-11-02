@@ -19,6 +19,7 @@ aws-smithy-types = { version = "1", optional = true }
 carina-core = { path = "../carina-core" }
 carina-provider-protocol = { path = "../carina-provider-protocol" }
 http = { version = "1", optional = true }
+indexmap = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wasi = { version = "0.14", optional = true }
@@ -34,6 +35,7 @@ aws-smithy-types = "1"
 http = "1"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
 wasi = "0.14"
 aws-smithy-runtime-api = { version = "1", features = ["client", "http-1x"] }
 aws-smithy-types = "1"

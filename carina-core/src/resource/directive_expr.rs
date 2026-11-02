@@ -1,7 +1,7 @@
 //! Authored lifecycle settings exist only before the value-expansion boundary.
 
-use crate::resource::ValueKind;
 use super::*;
+use crate::resource::ValueKind;
 use std::convert::Infallible;
 
 // The directive names and typed assignment API have one definition. Every
@@ -50,7 +50,10 @@ pub trait SerializableDirectivePhase<B: BindingAddress>:
 }
 impl<B: BindingAddress> SerializableDirectivePhase<B> for NoPlaceholder {}
 impl<B: BindingAddress> SerializableDirectivePhase<B> for LoopSlot {}
-impl<B: BindingAddress, P: PlaceholderKind + SerializableDirectivePhase<B>> SerializableDirectivePhase<B> for SnapshotLeaf<P> {}
+impl<B: BindingAddress, P: PlaceholderKind + SerializableDirectivePhase<B>>
+    SerializableDirectivePhase<B> for SnapshotLeaf<P>
+{
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct DirectiveArgumentSources(#[serde(with = "directive_sources")] Vec<DiagnosticSourceSpan>);
@@ -549,8 +552,7 @@ fn loop_expression_is_local<P: PlaceholderKind, B: BindingAddress>(value: &Value
             | DeferredValue::Coalesce { .. }
             | DeferredValue::ModuleIf(_)
             | DeferredValue::Unavailable { .. }
-            | DeferredValue::Secret(_)
-            ,
+            | DeferredValue::Secret(_),
         ) => false,
     }
 }
@@ -574,9 +576,7 @@ fn directive_value_kind<P: PlaceholderKind, B: BindingAddress>(value: &Value<P, 
             "got a resource reference (unknown until apply)".into()
         }
         Value::Deferred(DeferredValue::Unknown(_)) => "unknown until apply".into(),
-        Value::Deferred(DeferredValue::Secret(_) ) => {
-            "got a secret value".into()
-        }
+        Value::Deferred(DeferredValue::Secret(_)) => "got a secret value".into(),
         Value::Deferred(_) => "got a deferred expression".into(),
     }
 }
@@ -1195,6 +1195,7 @@ impl<B: BindingAddress> Directives<B, LoopSlot> {
                             key,
                             value,
                             AccessMissPolicy::Error,
+                            None,
                         )
                     })
             {

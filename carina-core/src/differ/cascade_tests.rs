@@ -29,6 +29,7 @@ fn state(id: &ResourceId, attrs: &[(&str, Value)], identifier: &str) -> State {
         attrs
             .iter()
             .map(|(key, value)| ((*key).to_string(), value.clone()))
+            .map(|(key, value)| (key, value.to_snapshot()))
             .collect(),
     )
     .with_identifier(identifier)
@@ -839,10 +840,15 @@ fn binding_identity_collision_fixture() -> BindingIdentityCollisionFixture {
         &crate::parser::ProviderContext::default(),
     )
     .expect("multi-file collision fixture parses");
-    let parsed = crate::module_resolver::resolve_modules_providerless(parsed, &directory)
-        .expect("multi-file collision fixture crosses root expansion")
-        .into_expanded(&crate::schema::SchemaRegistry::new())
-        .expect("collision fixture contains no parser placeholders");
+    let parsed = crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            crate::module_resolver::resolve_modules_providerless(parsed, &directory, session)
+                .expect("multi-file collision fixture crosses root expansion")
+        },
+    )
+    .into_expanded(&crate::schema::SchemaRegistry::new())
+    .expect("collision fixture contains no parser placeholders");
     let mut unresolved = parsed.resources;
 
     let anonymous = unresolved

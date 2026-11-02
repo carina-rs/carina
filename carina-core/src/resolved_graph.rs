@@ -419,7 +419,6 @@ fn rewrite_handle_output_refs<P: PlaceholderKind>(
         )
         | Value::Deferred(
             DeferredValue::BindingRef { .. }
-            
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => Ok(value.clone()),

@@ -47,12 +47,13 @@ use carina_core::provider::{
 };
 #[cfg(test)]
 use carina_core::resource::Resource;
-use carina_core::resource::{ResourceId, ResourceIdentityState, State, Value};
+#[cfg(test)]
+use carina_core::resource::Value;
+use carina_core::resource::{ResourceId, ResourceIdentityState, State};
 use carina_core::schema::{
     CompletionValue, TypeIdentity, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
     ValidatedResourceSchema,
 };
-use carina_core::value::SerializationError;
 use carina_core::wait::BindingPattern;
 use carina_core::wait::predicate::AttrPath;
 use carina_provider_resolver::{
@@ -174,15 +175,6 @@ pub trait AwsCredentialSource: Send + Sync + 'static {
 /// and preflight it before returning.
 pub trait AwsCredentialProvisioner: Send + Sync {
     fn provision(&self) -> BoxFuture<'_, Result<Arc<dyn AwsCredentialSource>, AwsCredentialError>>;
-}
-
-/// Lift a `SerializationError` from a synchronous `core_to_wit_*` call into
-/// the async `BoxFuture` shape used by `Provider`, preserving its typed cause.
-fn early_provider_err<T: 'static>(
-    operation: &'static str,
-    error: SerializationError,
-) -> BoxFuture<'static, ProviderResult<T>> {
-    Box::pin(async move { Err(wasm_value_encode_provider_error(operation, error)) })
 }
 
 #[derive(Debug)]
@@ -906,7 +898,6 @@ enum WasmProviderInstanceError {
         operation: &'static str,
         source: WallBudgetExceeded,
     },
-    InitializeValueEncode(SerializationError),
     InitializeCall(wasmtime::Error),
     Initialize(ProviderError),
     InitializeReferenceScope(proto::ReferenceScopeError),
@@ -933,9 +924,6 @@ impl WasmProviderInstanceError {
             WasmProviderInstanceError::InfoCall(error) => wasm_trap_provider_error("info", error),
             WasmProviderInstanceError::WallBudgetExceeded { operation, source } => {
                 wall_budget_provider_error(operation, source)
-            }
-            WasmProviderInstanceError::InitializeValueEncode(error) => {
-                wasm_value_encode_provider_error("initialize", error)
             }
             WasmProviderInstanceError::InitializeCall(error) => {
                 wasm_trap_provider_error("initialize", error)
@@ -4941,7 +4929,7 @@ impl WasmProviderFactory {
 
     async fn create_initialized_instance(
         &self,
-        attributes: &IndexMap<String, Value>,
+        config: &ProviderReadyConfig,
     ) -> Result<InitializedWasmInstance, WasmProviderInstanceError> {
         // This is the credentialed runtime instance (it calls
         // `initialize` and then read/create/update/delete). The kind was
@@ -4974,8 +4962,7 @@ impl WasmProviderFactory {
             self.http_test_route.clone(),
         )
         .await?;
-        let wit_attrs = wasm_convert::core_to_wit_value_map(attributes)
-            .map_err(WasmProviderInstanceError::InitializeValueEncode)?;
+        let wit_attrs = wasm_convert::checked_attributes_to_wit(config.wire_attributes());
         let initialize_result = live
             .store
             .call(|store| live.bindings.call_initialize(store, &wit_attrs))
@@ -5013,14 +5000,14 @@ impl WasmProviderFactory {
     async fn get_or_create_shared_instance(
         &self,
         binding: Option<&str>,
-        attributes: &IndexMap<String, Value>,
+        config: &ProviderReadyConfig,
     ) -> Result<Arc<FailFastInstance>, WasmProviderInstanceError> {
         let key: Option<String> = binding.map(|s| s.to_string());
         let mut guard = self.shared_instances.lock().await;
         if let Some(instance) = guard.get(&key) {
             return Ok(Arc::clone(instance));
         }
-        let initialized = self.create_initialized_instance(attributes).await?;
+        let initialized = self.create_initialized_instance(config).await?;
         let instance = FailFastInstance::new(initialized);
         #[cfg(any(test, feature = "test-utils"))]
         let instance = instance.with_observer_for_test(self.poll_observer.clone());
@@ -5343,8 +5330,7 @@ impl ProviderFactory for WasmProviderFactory {
         &self,
         attributes: &CanonicalProviderConfigAttributes,
     ) -> ProviderResult<()> {
-        let wit_attrs = wasm_convert::core_to_wit_value_map(attributes.attributes())
-            .map_err(|error| wasm_value_encode_provider_error("validate_config", error))?;
+        let wit_attrs = wasm_convert::checked_attributes_to_wit(attributes.wire_attributes());
         let context = self.init_instance.validate_config_context(&wit_attrs);
 
         tokio::task::block_in_place(|| {
@@ -5403,14 +5389,15 @@ impl ProviderFactory for WasmProviderFactory {
         config: &ProviderReadyConfig,
         initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
-        let attrs = config.attributes().clone();
+        // The validated config witness shares its immutable payload; no deep clone.
+        let config = config.clone();
         let binding = binding.map(|s| s.to_string());
         Box::pin(async move {
             // Provider init rejections still surface their user-actionable
             // message verbatim (for example, allowed_account_ids mismatch;
             // see #2407). Instantiation failures take the typed mapper path.
             let instance = self
-                .get_or_create_shared_instance(binding.as_deref(), &attrs)
+                .get_or_create_shared_instance(binding.as_deref(), &config)
                 .await
                 .map_err(|error| {
                     error.into_provider_error_with(&self.instantiation_error_mapper)
@@ -5442,11 +5429,12 @@ impl ProviderFactory for WasmProviderFactory {
         binding: Option<&str>,
         config: &ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
-        let attrs = config.attributes().clone();
+        // The validated config witness shares its immutable payload; no deep clone.
+        let config = config.clone();
         let binding = binding.map(|s| s.to_string());
         Box::pin(async move {
             let instance = self
-                .get_or_create_shared_instance(binding.as_deref(), &attrs)
+                .get_or_create_shared_instance(binding.as_deref(), &config)
                 .await
                 .map_err(|error| {
                     error.into_provider_error_with(&self.instantiation_error_mapper)
@@ -6857,14 +6845,7 @@ impl WasmProvider {
         attempt: CreateAttempt,
     ) -> Result<CreateProgress, CreateFailure> {
         let wit_id = wasm_convert::core_to_wit_resource_id(&id);
-        let wit_request = match wasm_convert::core_to_wit_create_request(&request) {
-            Ok(request) => request,
-            Err(error) => {
-                return Err(attempt.untracked(
-                    wasm_value_encode_provider_error("create", error).for_resource(id),
-                ));
-            }
-        };
+        let wit_request = wasm_convert::core_to_wit_create_request(&request);
         let call_id = wit_id.clone();
         let call_request = wit_request.clone();
         let locked = match self.instance.acquire("create").await {
@@ -7095,14 +7076,7 @@ impl WasmProvider {
         let (resume, create_request) = request.into_parts();
         let id = resume.id().clone();
         let wit_id = wasm_convert::core_to_wit_resource_id(&id);
-        let wit_request = match wasm_convert::core_to_wit_create_request(&create_request) {
-            Ok(request) => request,
-            Err(error) => {
-                return Err(resume.preserve(
-                    wasm_value_encode_provider_error("resume_create", error).for_resource(id),
-                ));
-            }
-        };
+        let wit_request = wasm_convert::core_to_wit_create_request(&create_request);
         // Persisted resume state has no scheduling metadata, while WIT requires
         // both fields. This operation-phase placeholder allows saved read-back
         // tokens to resume with an identifier: SDK dispatch only rejects a
@@ -7403,11 +7377,7 @@ impl Provider for WasmProvider {
         &self,
         resource: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        let wit_resource =
-            match wasm_convert::core_data_source_to_wit_resource(resource.as_inner().as_inner()) {
-                Ok(v) => v,
-                Err(e) => return early_provider_err("read_data_source", e),
-            };
+        let wit_resource = wasm_convert::core_data_source_to_wit_resource(resource);
         let id = resource.id.clone();
         Box::pin(async move {
             let locked = self.instance.acquire("read_data_source").await?;
@@ -7993,12 +7963,50 @@ mod tests {
     use super::*;
     use carina_core::provider::SentRecord;
     use carina_core::resource::{ConcreteValue, Current, DeferredValue, ModuleSource};
+
     use std::borrow::Cow;
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use wasm_encoder::{Component as EncoderComponent, CustomSection};
     use wasmtime::component::ResourceTable;
     use wasmtime_wasi::WasiCtxView;
+
+    fn empty_ready_config(factory: &WasmProviderFactory) -> ProviderReadyConfig {
+        prepare_test_config(factory, IndexMap::new())
+            .expect("empty test configuration passes the provider boundary")
+    }
+
+    fn prepare_test_config(
+        factory: &WasmProviderFactory,
+        attributes: IndexMap<String, Value>,
+    ) -> Result<ProviderReadyConfig, carina_core::executor::ProviderConfigPreparationError> {
+        carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+                parsed.providers = vec![carina_core::parser::ProviderConfig {
+                    name: factory.name().to_string(),
+                    attributes,
+                    default_tags: IndexMap::new(),
+                    source: None,
+                    version: None,
+                    revision: None,
+                    unresolved_attributes: IndexMap::new(),
+                    binding: None,
+                }];
+                let configs = carina_core::parser::resolve_provider_attributes_with_remote(
+                    &parsed,
+                    &HashMap::new(),
+                    type_checks,
+                )
+                .expect("test configuration resolves");
+                carina_core::executor::prepare_provider_ready_config(
+                    factory,
+                    configs.iter().next().unwrap(),
+                )
+            },
+        )
+    }
 
     #[test]
     fn normalization_operation_wrapper_preserves_sources_and_renders_float_once() {
@@ -8448,15 +8456,42 @@ mod tests {
     }
 
     fn boundary_resource() -> (ResourceId, wit_types::ResourceId, wit_types::CreateRequest) {
-        let id = ResourceId::with_provider_identity("mock", "test.Resource", "main", None);
-        let mut resource = Resource::from_id(id.clone());
-        resource.set_attr("name", test_string_value("example"));
-        let wit_id = wasm_convert::core_to_wit_resource_id(&id);
-        let wit_request = wit_types::CreateRequest {
-            res: wasm_convert::core_to_wit_resource(&resource)
-                .expect("boundary fixture must encode"),
-        };
-        (id, wit_id, wit_request)
+        carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let id = ResourceId::with_provider_identity("mock", "test.Resource", "main", None);
+                let mut resource = Resource::from_id(id.clone());
+                resource.set_attr("name", test_string_value("example"));
+                let wit_id = wasm_convert::core_to_wit_resource_id(&id);
+                let bindings = carina_core::binding_index::ResolvedBindings::default();
+                let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+                let schemas = carina_core::schema::SchemaRegistry::new();
+                let context = carina_core::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &carina_core::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                // This fixture uses a ready no-op normalizer, so preparation has no
+                // pending I/O and can be polled once in both sync and async tests.
+                let mut prepare = std::pin::pin!(carina_core::executor::prepare_create_request(
+                    resource, &context
+                ));
+                let std::task::Poll::Ready(request) = prepare
+                    .as_mut()
+                    .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                else {
+                    panic!("no-op fixture preparation must complete immediately")
+                };
+                let wit_request = wasm_convert::core_to_wit_create_request(
+                    &request.expect("checked boundary fixture"),
+                );
+                (id, wit_id, wit_request)
+            },
+        )
     }
 
     fn sent_name_only() -> Sent {
@@ -8671,49 +8706,60 @@ mod tests {
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = carina_core::schema::SchemaRegistry::new();
-        let preparation = carina_core::executor::ProviderPreparationContext::new(
-            &bindings,
-            &module_gate,
-            &[],
-            &carina_core::provider::NoopNormalizer,
-            &[],
-            &schemas,
+        let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+            Arc::new(Vec::new()),
+            schemas.clone(),
         );
-        let request = carina_core::executor::prepare_create_request(resource, &preparation)
-            .await
-            .expect("fixture resource passes provider preparation");
-        let (create, _cancellation) =
-            carina_core::executor::dispatch_create(&PendingFixtureProvider, &id, request);
-        let failure = create.await.expect_err("fixture create remains pending");
-        let pending = match failure.into_kind() {
-            CreateFailureKind::InFlight {
-                pending,
-                error: _error,
-            } => pending
-                .into_fresh()
-                .unwrap_or_else(|_| panic!("fixture provider returned a persisted continuation")),
-            CreateFailureKind::Created {
-                created: _created,
-                error,
-            } => {
-                panic!("fixture create was created: {error}")
-            }
-            CreateFailureKind::Untracked(error) => {
-                panic!("fixture create was not pending: {error}")
-            }
-            CreateFailureKind::OutcomeUnknown { unknown, error } => {
-                panic!(
-                    "fixture create outcome was unknown for {}: {error}",
-                    unknown.id()
-                )
-            }
-        };
-        PendingCreate {
-            id,
-            wit_id,
-            wit_request,
-            pending,
-        }
+        carina_core::validation::deferred_types::with_session_for_test_async(
+            provider_types.provider_context(),
+            async |type_checks| {
+                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &carina_core::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                let request =
+                    carina_core::executor::prepare_create_request(resource, &preparation).await;
+                let request = request.expect("fixture resource passes provider preparation");
+                let (create, _cancellation) =
+                    carina_core::executor::dispatch_create(&PendingFixtureProvider, &id, request);
+                let failure = create.await.expect_err("fixture create remains pending");
+                let pending = match failure.into_kind() {
+                    CreateFailureKind::InFlight {
+                        pending,
+                        error: _error,
+                    } => pending.into_fresh().unwrap_or_else(|_| {
+                        panic!("fixture provider returned a persisted continuation")
+                    }),
+                    CreateFailureKind::Created {
+                        created: _created,
+                        error,
+                    } => {
+                        panic!("fixture create was created: {error}")
+                    }
+                    CreateFailureKind::Untracked(error) => {
+                        panic!("fixture create was not pending: {error}")
+                    }
+                    CreateFailureKind::OutcomeUnknown { unknown, error } => {
+                        panic!(
+                            "fixture create outcome was unknown for {}: {error}",
+                            unknown.id()
+                        )
+                    }
+                };
+                PendingCreate {
+                    id,
+                    wit_id,
+                    wit_request,
+                    pending,
+                }
+            },
+        )
+        .await
     }
 
     fn pending_create_without_identifier() -> PendingCreate {
@@ -8789,21 +8835,33 @@ mod tests {
         let normalizer = carina_core::provider::NoopNormalizer;
         let factories = [];
         let schemas = carina_core::schema::SchemaRegistry::new();
-        let context = carina_core::executor::ProviderPreparationContext::new(
-            &bindings,
-            &gate,
-            &provider_configs,
-            &normalizer,
-            &factories,
-            &schemas,
+        let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
+            Arc::new(Vec::new()),
+            schemas.clone(),
         );
-        let request = carina_core::executor::prepare_create_request(resource, &context)
-            .await
-            .expect("resume fixture request must pass provider preparation");
-        let (resume, _request) = ResumeCreateRequest::for_test(pending, request)
-            .expect("resume fixture route must match")
-            .into_parts();
-        resume
+        carina_core::validation::deferred_types::with_session_for_test_async(
+            provider_types.provider_context(),
+            async |type_checks| {
+                let context = carina_core::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &provider_configs,
+                    &normalizer,
+                    &factories,
+                    &schemas,
+                    type_checks,
+                );
+                let request =
+                    carina_core::executor::prepare_create_request(resource, &context).await;
+                let request =
+                    request.expect("resume fixture request must pass provider preparation");
+                let (resume, _request) = ResumeCreateRequest::for_test(pending, request)
+                    .expect("resume fixture route must match")
+                    .into_parts();
+                resume
+            },
+        )
+        .await
     }
 
     fn assert_original_polled_record(
@@ -9722,7 +9780,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn normalizer_guest_boundary_decode_error_is_structured_and_reentrant() {
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
         let wasm_path = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
@@ -9746,7 +9804,7 @@ mod tests {
         .await
         .expect("mock WASM provider should load");
         let instance = factory
-            .get_or_create_shared_instance(None, &IndexMap::new())
+            .get_or_create_shared_instance(None, &empty_ready_config(&factory))
             .await
             .expect("mock WASM provider should initialize");
         let malformed = version_checked_bindings::WitDesiredResource {
@@ -12150,26 +12208,39 @@ mod tests {
         );
     }
 
-    #[test]
-    fn initialization_value_encode_failure_keeps_typed_internal_error() {
-        let mapper: ProviderInstantiationErrorMapper =
-            Arc::new(default_provider_instantiation_error_mapper);
-        let provider_error =
-            WasmProviderInstanceError::InitializeValueEncode(SerializationError::NonFiniteFloat {
-                value: f64::NAN,
-                context: carina_core::value::SerializationContext::WasmBoundary,
-            })
-            .into_provider_error_with(&mapper);
-
-        assert_eq!(provider_error.variant_name(), "internal");
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initialization_values_fail_at_shared_wire_preparation_before_instance_creation() {
+        let factory = rebuildable_state_test_factory()
+            .await
+            .expect("mock WASM fixture is required");
+        let error = prepare_test_config(
+            &factory,
+            IndexMap::from([(
+                "extra".into(),
+                Value::Concrete(ConcreteValue::Float(f64::NAN)),
+            )]),
+        )
+        .unwrap_err();
+        let carina_core::executor::ProviderConfigPreparationError::Wire(wire) = &error else {
+            panic!("expected shared wire rejection: {error}")
+        };
+        assert!(matches!(
+            wire.conversion_error(),
+            carina_core::protocol_convert::ProtocolConvertError::NonFiniteFloat
+        ));
+        assert_eq!(wire.attribute(), "extra");
         assert_eq!(
-            provider_error.detail().context(),
-            "failed to encode a WASM provider boundary value"
+            wire.target(),
+            &carina_core::provider::ProviderWireTarget::Configuration {
+                provider: "mock".into()
+            }
         );
         assert_eq!(
-            provider_error.to_string(),
-            "failed to encode a WASM provider boundary value: in operation initialize: cannot serialize at WASM provider boundary: non-finite float NaN"
+            error.to_string(),
+            "provider mock configuration: attribute `extra` cannot cross the provider wire: non-finite float cannot cross the provider protocol"
         );
+        assert!(std::error::Error::source(&error).is_none());
+        assert!(factory.shared_instances.lock().await.is_empty());
     }
 
     #[test]
@@ -12575,7 +12646,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn returned_trap_poison_is_classified_inside_call() {
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
         let wasm_path = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
@@ -12599,7 +12670,7 @@ mod tests {
         .await
         .expect("mock WASM provider should load");
         let instance = factory
-            .get_or_create_shared_instance(None, &IndexMap::new())
+            .get_or_create_shared_instance(None, &empty_ready_config(&factory))
             .await
             .expect("mock WASM provider should initialize");
 

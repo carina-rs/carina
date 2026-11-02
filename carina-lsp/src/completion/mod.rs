@@ -34,6 +34,24 @@ pub struct CompletionProvider {
     custom_type_names: Vec<String>,
 }
 
+struct CompletionTypeCheckSink {
+    authoritative: bool,
+}
+impl carina_core::validation::deferred_types::ProviderTypeCheckSink for CompletionTypeCheckSink {
+    fn record(
+        &mut self,
+        diagnostic: carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic,
+    ) {
+        match diagnostic {
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning) => eprintln!("completion type check: {}", warning.message),
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => {
+                eprintln!("completion type check: {}", error.message);
+                self.authoritative = false;
+            }
+        }
+    }
+}
+
 impl CompletionProvider {
     pub fn new(
         schemas: Arc<SchemaRegistry>,
@@ -77,9 +95,31 @@ impl CompletionProvider {
         doc: &Document,
         position: Position,
         base_path: Option<&Path>,
+        catalog: &carina_core::parser::ProviderContext,
+    ) -> Vec<CompletionItem> {
+        let terminal =
+            carina_core::validation::deferred_types::TypeCheckSession::run(catalog, |session| {
+                self.complete_in_session(doc, position, base_path, session)
+            });
+        let mut sink = CompletionTypeCheckSink {
+            authoritative: true,
+        };
+        let items = terminal.publish(&mut sink);
+        if sink.authoritative {
+            items
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn complete_in_session(
+        &self,
+        doc: &Document,
+        position: Position,
+        base_path: Option<&Path>,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
         let text = doc.text();
-        let provider_ctx = doc.provider_context();
 
         // A module resource-handle output preserves the underlying resource
         // schema for postfix access. Detect the depth-2 shape before the
@@ -94,7 +134,10 @@ impl CompletionProvider {
         // would treat `<key>` as the binding and decline). #2041.
         if let Some(m) = detect_upstream_state_depth2_dot(&text, position, base_path) {
             return self.upstream_state_depth2_dot_completions(
-                &m.binding, &m.key, &m.partial, &m.source, position, base_path,
+                &m,
+                position,
+                base_path,
+                provider_ctx,
             );
         }
 
@@ -106,8 +149,14 @@ impl CompletionProvider {
         if let Some((binding, partial, source)) =
             detect_upstream_state_dot(&text, position, base_path)
         {
-            return self
-                .upstream_state_dot_completions(&binding, &partial, &source, position, base_path);
+            return self.upstream_state_dot_completions(
+                &binding,
+                &partial,
+                &source,
+                position,
+                base_path,
+                provider_ctx,
+            );
         }
 
         // Without this branch the surrounding string-literal context
@@ -149,7 +198,13 @@ impl CompletionProvider {
             CompletionContext::AfterEqualsInExports {
                 type_expr_text,
                 in_nested,
-            } => self.exports_value_completions(&type_expr_text, in_nested, &text, base_path),
+            } => self.exports_value_completions(
+                provider_ctx,
+                &type_expr_text,
+                in_nested,
+                &text,
+                base_path,
+            ),
             CompletionContext::AfterEqualsInModuleCall {
                 module_name,
                 arg_name,

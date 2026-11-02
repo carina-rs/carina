@@ -652,13 +652,18 @@ fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validatio
     let schemas = loaded_providers.schemas();
     let parsed = carina_core::config_loader::parse_directory(&fixture.caller, provider_context)
         .expect("parse directory-scoped fixture");
-    let parsed = carina_core::module_resolver::resolve_modules_with_config(
-        parsed,
-        carina_core::config_loader::get_base_dir(&fixture.caller),
+    let parsed = carina_core::validation::deferred_types::with_session_for_test(
         provider_context,
-        schemas.schemas(),
-    )
-    .expect("expand module call");
+        |session| {
+            carina_core::module_resolver::resolve_modules_with_config(
+                parsed,
+                carina_core::config_loader::get_base_dir(&fixture.caller),
+                session,
+                schemas.schemas(),
+            )
+            .expect("expand module call")
+        },
+    );
 
     // Exercise the same post-expansion inference + ref-validation seam used by
     // CLI validation, where both stages can otherwise report this one typo.
@@ -666,8 +671,11 @@ fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validatio
         carina_core::validation::inference::infer_export_params_with_loaded_provider_schemas(
             &parsed, schemas,
         );
-    let bindings =
-        carina_core::binding_index::BindingIndex::from_parsed(&parsed, schemas.schemas());
+    let bindings = carina_core::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        schemas.schemas(),
+        &carina_core::parser::ProviderContext::default(),
+    );
     let mut diagnostics = carina_core::validation::inference::attached_inference_failures(
         inferred_exports.checked_exports(),
     )

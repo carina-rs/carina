@@ -862,7 +862,10 @@ impl Borrow<ResourceId> for ResolvedResourceId {
     serialize = "S: Serialize + Clone, P: ValueKind + Serialize, Directives<AbsoluteBindingAddress, P>: Serialize",
     deserialize = "S: Deserialize<'de>, P: ValueKind + Deserialize<'de>, Directives<AbsoluteBindingAddress, P>: Deserialize<'de>"
 ))]
-#[serde(try_from = "ResolvedResourceWire<S, P>", into = "ResolvedResourceWire<S, P>")]
+#[serde(
+    try_from = "ResolvedResourceWire<S, P>",
+    into = "ResolvedResourceWire<S, P>"
+)]
 pub struct ResolvedResource<S = ModuleSource, P: ValueKind = NoPlaceholder> {
     resource: Resource<S, P, AbsoluteBindingAddress, ()>,
     value_dependencies: ResolvedDependencies,
@@ -873,7 +876,10 @@ pub struct ResolvedResource<S = ModuleSource, P: ValueKind = NoPlaceholder> {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(bound(serialize = "S: Serialize, P: ValueKind + Serialize, Directives<AbsoluteBindingAddress, P>: Serialize", deserialize = "S: Deserialize<'de>, P: ValueKind + Deserialize<'de>, Directives<AbsoluteBindingAddress, P>: Deserialize<'de>"))]
+#[serde(bound(
+    serialize = "S: Serialize, P: ValueKind + Serialize, Directives<AbsoluteBindingAddress, P>: Serialize",
+    deserialize = "S: Deserialize<'de>, P: ValueKind + Deserialize<'de>, Directives<AbsoluteBindingAddress, P>: Deserialize<'de>"
+))]
 #[serde(from = "SchemaUnresolvedResource<S, P>")]
 struct ResolvedResourceWire<S, P: ValueKind> {
     #[serde(flatten)]
@@ -901,7 +907,10 @@ struct ResolvedResourceWire<S, P: ValueKind> {
 /// Saved-plan resource whose identity and dependencies are resolved but whose
 /// authored `ignore_changes` paths still await fingerprint-checked schemas.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(bound(serialize = "S: Serialize, P: ValueKind + Serialize, Directives<AbsoluteBindingAddress, P>: Serialize", deserialize = "S: Deserialize<'de>, P: ValueKind + Deserialize<'de>, Directives<AbsoluteBindingAddress, P>: Deserialize<'de>"))]
+#[serde(bound(
+    serialize = "S: Serialize, P: ValueKind + Serialize, Directives<AbsoluteBindingAddress, P>: Serialize",
+    deserialize = "S: Deserialize<'de>, P: ValueKind + Deserialize<'de>, Directives<AbsoluteBindingAddress, P>: Deserialize<'de>"
+))]
 #[serde(from = "ResourceWithDependenciesWire<S, P>")]
 pub struct SchemaUnresolvedResource<S = SavedModuleSource, P: ValueKind = NoPlaceholder> {
     #[serde(flatten)]
@@ -930,7 +939,9 @@ pub struct SchemaUnresolvedResource<S = SavedModuleSource, P: ValueKind = NoPlac
 /// A flattened Resource buffers its fields before decoding them, which loses
 /// locations such as `Create.binding` when a checked address rejects a value.
 #[derive(Deserialize)]
-#[serde(bound(deserialize = "S: Deserialize<'de>, P: ValueKind + Deserialize<'de>, Directives<AbsoluteBindingAddress, P>: Deserialize<'de>"))]
+#[serde(bound(
+    deserialize = "S: Deserialize<'de>, P: ValueKind + Deserialize<'de>, Directives<AbsoluteBindingAddress, P>: Deserialize<'de>"
+))]
 struct ResourceWithDependenciesWire<S, P: ValueKind> {
     id: ResourceId,
     attributes: IndexMap<String, Value<P>>,
@@ -1233,7 +1244,6 @@ impl<S> ResolvedResource<S> {
         )?;
         index.resolve_resource(resource, schemas)
     }
-
 }
 
 impl ResolvedResource {
@@ -1337,9 +1347,7 @@ impl<S, P: ValueKind> ResolvedResource<S, P> {
     }
 
     /// Try to construct; returns `None` if identity is pending.
-    pub fn try_new(
-        resource: Resource<S, P, AbsoluteBindingAddress, ()>,
-    ) -> Option<Self> {
+    pub fn try_new(resource: Resource<S, P, AbsoluteBindingAddress, ()>) -> Option<Self> {
         match resource.id.identity_state() {
             ResourceIdentityState::Pending(_) => None,
             ResourceIdentityState::Resolved(_) => Some(Self::new(resource)),
@@ -1515,12 +1523,12 @@ impl<S, P: ValueKind> From<ResolvedResource<S, P>> for Resource<S, P, AbsoluteBi
     }
 }
 
-impl<S, P: ValueKind> TryFrom<Resource<S, P, AbsoluteBindingAddress, ()>> for ResolvedResource<S, P> {
+impl<S, P: ValueKind> TryFrom<Resource<S, P, AbsoluteBindingAddress, ()>>
+    for ResolvedResource<S, P>
+{
     type Error = String;
 
-    fn try_from(
-        resource: Resource<S, P, AbsoluteBindingAddress, ()>,
-    ) -> Result<Self, Self::Error> {
+    fn try_from(resource: Resource<S, P, AbsoluteBindingAddress, ()>) -> Result<Self, Self::Error> {
         if !resolved_ignore_changes_match(&resource) {
             return Err("ignore_changes requires schema resolution".to_string());
         }
@@ -2985,10 +2993,7 @@ impl<'de> Deserialize<'de> for ValueString {
 /// Concrete-axis variants: values that carry their own runtime type
 /// and are safe to type-check at validate time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ConcreteValue<
-    P: ValueKind = NoPlaceholder,
-    B: BindingAddress = AbsoluteBindingAddress,
-> {
+pub enum ConcreteValue<P: ValueKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress> {
     String(ValueString),
     /// An enum identifier — a value written in the DSL as a bare
     /// identifier (`tcp`) or namespaced identifier
@@ -3765,10 +3770,7 @@ impl fmt::Display for UnavailableReason {
 /// Deferred-axis variants: placeholders that resolve later
 /// (apply time, upstream load, function evaluation).
 #[derive(Clone)]
-pub enum DeferredValue<
-    P: ValueKind = NoPlaceholder,
-    B: BindingAddress = AbsoluteBindingAddress,
-> {
+pub enum DeferredValue<P: ValueKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress> {
     /// A value-level `if` whose condition depends on a reusable module
     /// argument. Module expansion selects a branch after call-site
     /// substitution; it cannot cross the expansion boundary.
@@ -3877,10 +3879,7 @@ enum LoopAccessDisplayRoot {
 }
 
 #[derive(Clone)]
-pub struct AccessExpr<
-    P: ValueKind = NoPlaceholder,
-    B: BindingAddress = AbsoluteBindingAddress,
-> {
+pub struct AccessExpr<P: ValueKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress> {
     base: Box<Value<P, B>>,
     step: PathSegment,
     source_line: usize,
@@ -4092,8 +4091,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 | ConcreteValue::Bool(_)
                 | ConcreteValue::Duration(_)
                 | ConcreteValue::StringList(_),
-            )
-            => true,
+            ) => true,
             Value::Deferred(
                 DeferredValue::ModuleIf(_)
                 | DeferredValue::ResourceRef { .. }
@@ -4228,7 +4226,9 @@ where
                 "raw secret values cannot be serialized; redact or materialize them at the typed boundary",
             )),
             Self::Placeholder(placeholder) if placeholder.redacted_secret_hash().is_some() => {
-                let hash = placeholder.redacted_secret_hash().expect("guarded hash leaf");
+                let hash = placeholder
+                    .redacted_secret_hash()
+                    .expect("guarded hash leaf");
                 let value: SerializableDeferredValue<'_, P, B> =
                     SerializableDeferredValue::RedactedSecret { hash };
                 value.serialize(serializer)
@@ -4324,9 +4324,9 @@ where
                 }
             }
             DeserializableDeferredValue::Secret(inner) => Ok(Self::Secret(inner)),
-            DeserializableDeferredValue::RedactedSecret { hash } => {
-                P::from_redacted_secret(hash).map(Self::Placeholder).map_err(serde::de::Error::custom)
-            }
+            DeserializableDeferredValue::RedactedSecret { hash } => P::from_redacted_secret(hash)
+                .map(Self::Placeholder)
+                .map_err(serde::de::Error::custom),
             DeserializableDeferredValue::Unknown(DeserializableUnknown::ApplyTime(reason)) => {
                 Ok(Self::Unknown(reason))
             }
@@ -4454,7 +4454,9 @@ where
             }
             DeserializableValue::Secret(value) => Value::Deferred(DeferredValue::Secret(value)),
             DeserializableValue::RedactedSecret { hash } => {
-                Value::Deferred(DeferredValue::Placeholder(P::from_redacted_secret(hash).map_err(serde::de::Error::custom)?))
+                Value::Deferred(DeferredValue::Placeholder(
+                    P::from_redacted_secret(hash).map_err(serde::de::Error::custom)?,
+                ))
             }
             DeserializableValue::Unknown(DeserializableUnknown::ApplyTime(reason)) => {
                 Value::Deferred(DeferredValue::Unknown(reason))
@@ -4735,14 +4737,6 @@ impl RedactedSecretHash {
             }
         }
     }
-}
-
-pub(crate) fn legacy_secret_identity_material(hash: &RedactedSecretHash) -> String {
-    format!(
-        "{}{}",
-        RedactedSecretHash::STATE_MARKER_PREFIX,
-        hash.encoded_digest()
-    )
 }
 
 /// Parsers and rewrites for state formats that encoded secret identity in
@@ -5986,11 +5980,17 @@ impl std::fmt::Display for ParserPlaceholder {
     }
 }
 
+/// The authority that can establish a parser/template placeholder's type.
+#[doc(hidden)]
+pub enum PlaceholderTypeAuthority<'a> {
+    Binding(&'a str),
+    AwaitingSubstitution,
+    MissingExpression,
+}
+
 /// Internal behavior shared by the three stage marker types.
 #[doc(hidden)]
-pub trait ValueKind:
-    Clone + PartialEq + fmt::Debug + fmt::Display + serde::Serialize
-{
+pub trait ValueKind: Clone + PartialEq + fmt::Debug + fmt::Display + serde::Serialize {
     /// Lifecycle settings follow the same authored-to-expanded phase as values.
     type DirectiveBool<B: BindingAddress>: Clone + fmt::Debug + PartialEq + Default + Send + Sync;
     type DirectivePreventDestroy<B: BindingAddress>: Clone
@@ -6015,20 +6015,22 @@ pub trait ValueKind:
     }
 
     fn from_redacted_secret(_hash: RedactedSecretHash) -> Result<Self, &'static str>
-    where Self: Sized,
+    where
+        Self: Sized,
     {
         Err("redacted secret is historical evidence; decode it as SnapshotValue")
     }
 
-    fn make_directive_sources_relative(_directives: &mut Directives<AbsoluteBindingAddress,Self>, _root: &Path) where Self: Sized {}
+    fn make_directive_sources_relative(
+        _directives: &mut Directives<AbsoluteBindingAddress, Self>,
+        _root: &Path,
+    ) where
+        Self: Sized,
+    {
+    }
 
     fn module_argument_name(&self) -> Option<&str> {
         None
-    }
-
-    /// Lexical binding whose declared type can prove this parser slot's type.
-    fn inference_binding_name(&self) -> Option<&str> {
-        self.module_argument_name()
     }
 
     fn loop_slot(&self) -> Option<LoopSlot> {
@@ -6065,10 +6067,30 @@ mod evaluable_leaf {
 
 /// A leaf permitted in evaluation, validation, and expansion inputs.
 /// Snapshot leaves cannot implement this sealed trait.
-pub trait PlaceholderKind: ValueKind + evaluable_leaf::Sealed {}
-impl PlaceholderKind for NoPlaceholder {}
-impl PlaceholderKind for ParserPlaceholder {}
-impl PlaceholderKind for LoopSlot {}
+pub trait PlaceholderKind: ValueKind + evaluable_leaf::Sealed {
+    fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_>;
+}
+impl PlaceholderKind for NoPlaceholder {
+    fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_> {
+        match *self {}
+    }
+}
+impl PlaceholderKind for ParserPlaceholder {
+    fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_> {
+        match self {
+            Self::FnParam { name } | Self::FnLocal { name } | Self::ModuleArgument { name, .. } => {
+                PlaceholderTypeAuthority::Binding(name)
+            }
+            Self::Loop(_) => PlaceholderTypeAuthority::AwaitingSubstitution,
+            Self::EmptyInterpolation { .. } => PlaceholderTypeAuthority::MissingExpression,
+        }
+    }
+}
+impl PlaceholderKind for LoopSlot {
+    fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_> {
+        PlaceholderTypeAuthority::AwaitingSubstitution
+    }
+}
 
 impl ValueKind for NoPlaceholder {
     type DirectiveBool<B: BindingAddress> = bool;
@@ -6113,7 +6135,10 @@ impl ValueKind for LoopSlot {
         directive_expr::rebind_loop_directives(directives, resolve)
     }
 
-    fn make_directive_sources_relative(directives: &mut Directives<AbsoluteBindingAddress,Self>, root: &Path) {
+    fn make_directive_sources_relative(
+        directives: &mut Directives<AbsoluteBindingAddress, Self>,
+        root: &Path,
+    ) {
         directives.make_sources_relative(root);
     }
 
@@ -6166,15 +6191,6 @@ impl ValueKind for ParserPlaceholder {
         }
     }
 
-    fn inference_binding_name(&self) -> Option<&str> {
-        match self {
-            Self::FnParam { name } | Self::FnLocal { name } | Self::ModuleArgument { name, .. } => {
-                Some(name)
-            }
-            Self::Loop(_) | Self::EmptyInterpolation { .. } => None,
-        }
-    }
-
     fn loop_slot(&self) -> Option<LoopSlot> {
         match self {
             Self::Loop(slot) => Some(*slot),
@@ -6209,7 +6225,10 @@ impl ValueKind for ParserPlaceholder {
 impl<P: ValueKind, B: BindingAddress> Value<P, B> {
     /// Clone this value into the placeholder-free stage, returning `None` if
     /// any placeholder remains anywhere in the tree.
-    pub fn to_expanded(&self) -> Option<Value<NoPlaceholder, B>> where P: PlaceholderKind {
+    pub fn to_expanded(&self) -> Option<Value<NoPlaceholder, B>>
+    where
+        P: PlaceholderKind,
+    {
         self.clone()
             .try_map_placeholder::<NoPlaceholder, ()>(&mut |_placeholder| Err(()))
             .ok()
@@ -6585,10 +6604,8 @@ where
 
 /// A part of a string interpolation expression
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum InterpolationPart<
-    P: ValueKind = NoPlaceholder,
-    B: BindingAddress = AbsoluteBindingAddress,
-> {
+pub enum InterpolationPart<P: ValueKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress>
+{
     /// Literal text segment
     Literal(ValueString),
     /// An expression to be evaluated and converted to string
@@ -7120,14 +7137,20 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
     /// unchanged. The transformation is idempotent.
     ///
     /// See #2227.
-    pub fn canonicalize(mut self) -> Value<P, B> where P: PlaceholderKind {
+    pub fn canonicalize(mut self) -> Value<P, B>
+    where
+        P: PlaceholderKind,
+    {
         self.canonicalize_in_place();
         self
     }
 
     /// In-place variant of [`Self::canonicalize`]. Useful when the caller
     /// only has a `&mut Value` (e.g. inside `IndexMap::values_mut()`).
-    pub fn canonicalize_in_place(&mut self) where P: PlaceholderKind {
+    pub fn canonicalize_in_place(&mut self)
+    where
+        P: PlaceholderKind,
+    {
         match self {
             Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
                 **deferred = deferred.map(|value| {
@@ -7322,8 +7345,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
             | Value::Concrete(ConcreteValue::Bool(_))
             | Value::Concrete(ConcreteValue::Duration(_))
             | Value::Concrete(ConcreteValue::StringList(_))
-            | Value::Deferred(DeferredValue::BindingRef { .. })
-            => {}
+            | Value::Deferred(DeferredValue::BindingRef { .. }) => {}
             // `Value::Unknown` is what a previously-unresolved
             // `ResourceRef` was *replaced with* by `stamp_unresolved_upstream`.
             // It carries an `AccessPath` for display, but it is no longer
@@ -7394,8 +7416,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
             | Value::Concrete(ConcreteValue::Bool(_))
             | Value::Concrete(ConcreteValue::Duration(_))
             | Value::Concrete(ConcreteValue::StringList(_))
-            | Value::Deferred(DeferredValue::ResourceRef { .. })
-            => {}
+            | Value::Deferred(DeferredValue::ResourceRef { .. }) => {}
             // `Value::Unknown` is what a previously-unresolved reference was
             // *replaced with* by stamping passes. It is no longer a live
             // reference to walk.
@@ -7727,7 +7748,6 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 inner.hash_into(hasher);
             }
 
-
             Value::Deferred(DeferredValue::Unknown(reason)) => {
                 // `Value::Unknown` reaches `merge_lists_hashed` → this
                 // function whenever a list element is unresolved. Hash
@@ -7750,9 +7770,12 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 }
             }
             Value::Deferred(DeferredValue::Placeholder(leaf)) => {
-                if let Some(hash) = leaf.redacted_secret_hash() { hash.hash(hasher); }
-                else { leaf.to_string().hash(hasher); }
-            },
+                if let Some(hash) = leaf.redacted_secret_hash() {
+                    hash.hash(hasher);
+                } else {
+                    leaf.to_string().hash(hasher);
+                }
+            }
         }
     }
 }
@@ -7807,10 +7830,7 @@ const HASH_THRESHOLD: usize = 20;
 ///
 /// For small lists (< 20 elements), uses O(n^2) matching.
 /// For large lists, uses hash-based bucketing to achieve O(n) average case.
-fn lists_equal<P: ValueKind, B: BindingAddress>(
-    a: &[Value<P, B>],
-    b: &[Value<P, B>],
-) -> bool {
+fn lists_equal<P: ValueKind, B: BindingAddress>(a: &[Value<P, B>], b: &[Value<P, B>]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -7991,10 +8011,7 @@ impl PreventDestroy {
     serialize = "B: Serialize, P: SerializableDirectivePhase<B>, P::DirectiveBool<B>: Serialize, P::DirectivePreventDestroy<B>: Serialize",
     deserialize = "B: Deserialize<'de>, P: SerializableDirectivePhase<B>, P::DirectiveBool<B>: Deserialize<'de>, P::DirectivePreventDestroy<B>: Deserialize<'de>"
 ))]
-pub struct Directives<
-    B: BindingAddress = AbsoluteBindingAddress,
-    P: ValueKind = NoPlaceholder,
-> {
+pub struct Directives<B: BindingAddress = AbsoluteBindingAddress, P: ValueKind = NoPlaceholder> {
     /// If true, force-delete the resource (e.g., non-empty S3 buckets)
     #[serde(default)]
     pub force_delete: P::DirectiveBool<B>,
@@ -10521,7 +10538,9 @@ impl Current {
         Self::Absent(AbsentState(SnapshotState::not_found(id)))
     }
 
-    pub fn from_state(state: State) -> Self { Self::from_snapshot(state.into()) }
+    pub fn from_state(state: State) -> Self {
+        Self::from_snapshot(state.into())
+    }
 
     pub fn from_snapshot(state: SnapshotState) -> Self {
         if !state.exists {
@@ -10672,8 +10691,14 @@ impl Current {
 /// typed identifier as authoritative instead of re-validating the raw field.
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
-pub fn fixture_present_current(state: impl Into<SnapshotState>, identifier: AppliedIdentifier) -> Current {
-    Current::Present(PresentResourceState { state: state.into(), identifier })
+pub fn fixture_present_current(
+    state: impl Into<SnapshotState>,
+    identifier: AppliedIdentifier,
+) -> Current {
+    Current::Present(PresentResourceState {
+        state: state.into(),
+        identifier,
+    })
 }
 
 /// Managed current state after plan-only canonicalization and unknown
@@ -10731,7 +10756,12 @@ pub(crate) struct UnschematizedComparisonAttributes(HashMap<String, SnapshotValu
 
 impl UnschematizedComparisonAttributes {
     pub(crate) fn new<P: StateValueLeaf>(attributes: HashMap<String, Value<P>>) -> Self {
-        Self(attributes.into_iter().map(|(key,value)| (key,state_value_snapshot(&value))).collect())
+        Self(
+            attributes
+                .into_iter()
+                .map(|(key, value)| (key, state_value_snapshot(&value)))
+                .collect(),
+        )
     }
 }
 
@@ -10742,7 +10772,10 @@ impl CanonicalComparisonAttributes {
         attributes: HashMap<String, Value<P>>,
         schema: &crate::schema::CompiledResourceSchema,
     ) -> Self {
-        let mut attributes: HashMap<_,_> = attributes.into_iter().map(|(key,value)| (key,state_value_snapshot(&value))).collect();
+        let mut attributes: HashMap<_, _> = attributes
+            .into_iter()
+            .map(|(key, value)| (key, state_value_snapshot(&value)))
+            .collect();
         let secrets = attributes
             .iter()
             .filter(|(_, value)| crate::value::contains_secret(value))
@@ -10758,7 +10791,10 @@ impl CanonicalComparisonAttributes {
         attributes: HashMap<String, Value<P>>,
         schema: &crate::schema::CompiledResourceSchema,
     ) -> Self {
-        let mut attributes: HashMap<_,_> = attributes.into_iter().map(|(key,value)| (key,state_value_snapshot(&value))).collect();
+        let mut attributes: HashMap<_, _> = attributes
+            .into_iter()
+            .map(|(key, value)| (key, state_value_snapshot(&value)))
+            .collect();
         crate::value::canonicalize_snapshot_attribute_map_with_schema(&mut attributes, schema);
         Self { attributes }
     }
@@ -10945,18 +10981,18 @@ pub fn plan_input_current_map_from_refs<'a, S: 'a, D: 'a>(
 }
 
 #[cfg(test)]
-pub(crate) fn current_map_from_states(
-    states: HashMap<ResourceId, State>,
+pub(crate) fn current_map_from_states<P: StateValueLeaf>(
+    states: HashMap<ResourceId, State<P>>,
 ) -> HashMap<ResourceId, Current> {
     states
         .into_iter()
-        .map(|(id, state)| (id, Current::from_state(state)))
+        .map(|(id, state)| (id, Current::from_snapshot(state.to_snapshot())))
         .collect()
 }
 
 #[cfg(test)]
-pub(crate) fn into_plan_input_current_map_from_states(
-    states: HashMap<ResourceId, State>,
+pub(crate) fn into_plan_input_current_map_from_states<P: StateValueLeaf>(
+    states: HashMap<ResourceId, State<P>>,
     registry: &crate::schema::SchemaRegistry,
     resources: &[Resource],
 ) -> HashMap<ResourceId, PlanInputCurrent> {
@@ -10996,8 +11032,14 @@ impl<P: ValueKind> State<P> {
     }
 
     pub fn existing(id: ResourceId, attributes: HashMap<String, Value<P>>) -> Self {
-        Self { id, identifier: None, attributes, exists: true,
-            dependency_bindings: PersistedDestroyDependencies::default(), partial_read: None }
+        Self {
+            id,
+            identifier: None,
+            attributes,
+            exists: true,
+            dependency_bindings: PersistedDestroyDependencies::default(),
+            partial_read: None,
+        }
     }
 
     pub fn with_identifier(mut self, identifier: impl Into<String>) -> Self {
@@ -11058,7 +11100,10 @@ pub use leaf_node::{CompositionNotALeaf, LeafNode, expand_to_leaves};
 pub use persistent_id::{EphemeralId, NodeId, PersistentId};
 
 mod snapshot;
-pub use snapshot::{PlanValueKind, StateValueLeaf, SnapshotSelectionError, SnapshotLeaf, SnapshotValue, UnavailableSecretError};
+pub use snapshot::{
+    PlanValueKind, SnapshotLeaf, SnapshotSelectionError, SnapshotValue, StateValueLeaf,
+    UnavailableSecretError,
+};
 
 pub(crate) use snapshot::state_value_snapshot;
 
@@ -11066,4 +11111,4 @@ pub type SnapshotState = State<SnapshotLeaf>;
 
 pub(crate) use snapshot::{plan_directives, template_directives};
 
-pub(crate) use snapshot::{snapshot_directives, expression_directives};
+pub(crate) use snapshot::{expression_directives, snapshot_directives};

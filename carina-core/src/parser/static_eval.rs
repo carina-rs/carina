@@ -145,7 +145,6 @@ fn classify_non_static_if_condition(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Unavailable { .. }
-            
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => IfConditionDependency::Runtime,
@@ -370,6 +369,7 @@ pub(crate) fn evaluate_static_value(
                 functions,
                 &evaluated_args,
                 config,
+                None,
                 line,
             )
         }
@@ -414,7 +414,6 @@ pub(crate) fn evaluate_static_value(
             | DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Coalesce { .. }
-            
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => Ok(value),

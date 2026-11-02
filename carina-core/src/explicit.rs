@@ -12,7 +12,7 @@ use crate::differ::{ComparisonContext, ReferenceEquality};
 use crate::provider::SentDesiredAttributes;
 use crate::resource::{
     CanonicalComparisonAttributes, ConcreteValue, ListElementPairing, MaskedComparisonAttributes,
-    Resource, Value, pair_list_elements, pair_list_elements_with_uniqueness,
+    Resource, StateValueLeaf, Value, pair_list_elements, pair_list_elements_with_uniqueness,
 };
 use crate::schema::{
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
@@ -1102,9 +1102,11 @@ pub fn build_from_value(value: &Value) -> ExplicitFields {
     }
 }
 
-fn build_from_value_for_stored_value<R: ReferenceEquality>(
-    desired: &Value,
-    stored: Option<&Value>,
+// State-writeback shape metadata may contain historical hash leaves. These
+// walkers inspect containers and compare snapshots; they never evaluate them.
+fn build_from_value_for_stored_value<P: StateValueLeaf, Q: StateValueLeaf, R: ReferenceEquality>(
+    desired: &Value<P>,
+    stored: Option<&Value<Q>>,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
     basis: StoredValueAuthoringBasis,
@@ -1170,7 +1172,7 @@ fn build_from_value_for_stored_value<R: ReferenceEquality>(
     }
 }
 
-fn build_legacy_list(items: &[Value]) -> ExplicitFields {
+fn build_legacy_list<P: StateValueLeaf>(items: &[Value<P>]) -> ExplicitFields {
     ExplicitFields::List {
         element: Box::new(
             items
@@ -1181,7 +1183,7 @@ fn build_legacy_list(items: &[Value]) -> ExplicitFields {
     }
 }
 
-fn build_from_value_conservatively(value: &Value) -> ExplicitFields {
+fn build_from_value_conservatively<P: StateValueLeaf>(value: &Value<P>) -> ExplicitFields {
     match value {
         Value::Concrete(ConcreteValue::Map(fields)) => ExplicitFields::Struct {
             children: fields
@@ -1361,7 +1363,13 @@ impl ProjectionDesiredValue<'_> {
                     .get(key)
                     .map_or(Self::Absent, |value| Self::Present(value, child_path))
             }
-            Self::Present(value, _) if !value.is_fully_resolved() => Self::Conservative,
+            Self::Present(value, _)
+                if !value
+                    .to_value_at("desired")
+                    .is_ok_and(|value| value.is_fully_resolved()) =>
+            {
+                Self::Conservative
+            }
             Self::Present(_, _) | Self::Absent => Self::Absent,
             Self::Conservative => Self::Conservative,
         }
@@ -1704,7 +1712,12 @@ fn project_value_inner<R: ReferenceEquality>(
                 ProjectionDesiredValue::Present(
                     Value::Concrete(ConcreteValue::List(desired_items)),
                     desired_path,
-                ) if desired_items.iter().all(Value::is_fully_resolved) => {
+                ) if desired_items.iter().all(|value| {
+                    value
+                        .to_value_at("desired")
+                        .is_ok_and(|value| value.is_fully_resolved())
+                }) =>
+                {
                     // Pair in the normal desired -> current direction so each
                     // desired element claims at most one current element. A
                     // lower-scoring current candidate left unclaimed by that
@@ -1748,7 +1761,11 @@ fn project_value_inner<R: ReferenceEquality>(
                     }
                     desired_by_current
                 }
-                ProjectionDesiredValue::Present(value, _) if !value.is_fully_resolved() => {
+                ProjectionDesiredValue::Present(value, _)
+                    if !value
+                        .to_value_at("desired")
+                        .is_ok_and(|value| value.is_fully_resolved()) =>
+                {
                     vec![ProjectionDesiredValue::Conservative; items.len()]
                 }
                 ProjectionDesiredValue::Conservative => {
@@ -1848,7 +1865,10 @@ fn project_value_inner<R: ReferenceEquality>(
     }
 }
 
-fn project_legacy_list_items(items: Vec<crate::resource::SnapshotValue>, element: &ExplicitFields) -> ProjectedValue {
+fn project_legacy_list_items(
+    items: Vec<crate::resource::SnapshotValue>,
+    element: &ExplicitFields,
+) -> ProjectedValue {
     ProjectedValue {
         origins: crate::differ::OperandOrigins::new(),
         value: Value::Concrete(ConcreteValue::List(
@@ -1865,7 +1885,10 @@ fn project_legacy_list_items(items: Vec<crate::resource::SnapshotValue>, element
 
 /// Preserve the historical union semantics for legacy [`ExplicitFields::List`]
 /// records, which do not carry element identity.
-fn project_legacy_value(value: crate::resource::SnapshotValue, explicit: &ExplicitFields) -> crate::resource::SnapshotValue {
+fn project_legacy_value(
+    value: crate::resource::SnapshotValue,
+    explicit: &ExplicitFields,
+) -> crate::resource::SnapshotValue {
     match explicit {
         ExplicitFields::Leaf | ExplicitFields::Unrecorded | ExplicitFields::WholeValue { .. } => {
             value
@@ -1938,8 +1961,8 @@ mod tests {
         defs: &BTreeMap<String, AttributeType>,
     ) -> Vec<Option<usize>>
     where
-        D: std::borrow::Borrow<Value>,
-        S: std::borrow::Borrow<Value>,
+        D: crate::resource::ComparisonItem,
+        S: crate::resource::ComparisonItem,
     {
         crate::resource::pair_list_elements(
             desired,
@@ -1990,6 +2013,8 @@ mod tests {
         .collect::<HashMap<_, _>>()
         .remove(&key)
         .expect("projected test value")
+        .to_value_at("projection fixture")
+        .expect("fixture values are available")
     }
 
     fn project(value: Value, explicit: &ExplicitFields) -> Value {
@@ -2025,6 +2050,8 @@ mod tests {
         .collect::<HashMap<_, _>>()
         .remove(&key)
         .expect("projected test value")
+        .to_value_at("projection fixture")
+        .expect("fixture values are available")
     }
 
     fn project_attributes(
@@ -2049,6 +2076,7 @@ mod tests {
         .current()
         .into_attributes()
         .into_iter()
+        .map(|(key, value)| (key, crate::test_support::available_value(&value)))
         .collect()
     }
 
@@ -3485,19 +3513,25 @@ mod tests {
             element: Box::new(union),
         };
         let legacy_projected = project(value.clone(), &legacy);
-        let Value::Concrete(ConcreteValue::List(items)) = legacy_projected else {
+        let crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(items)) =
+            legacy_projected
+        else {
             panic!("expected projected list");
         };
         assert_eq!(items.len(), 3);
         let sentinels: Vec<&str> = items
             .iter()
             .map(|item| {
-                let Value::Concrete(ConcreteValue::Map(fields)) = item else {
+                let crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(fields)) =
+                    item
+                else {
                     panic!("expected projected map");
                 };
                 assert_eq!(fields.len(), 3);
                 assert!(!fields.contains_key("server"));
-                let Some(Value::Concrete(ConcreteValue::String(sentinel))) = fields.get("sentinel")
+                let Some(crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                    sentinel,
+                ))) = fields.get("sentinel")
                 else {
                     panic!("expected sentinel string");
                 };
@@ -3574,16 +3608,17 @@ mod tests {
         ];
 
         for stored in &stored_cases {
+            let stored_snapshot = stored.as_ref().map(Value::to_snapshot);
             let projected = project_value(
-                current.clone(),
-                stored.as_ref(),
+                current.to_snapshot(),
+                stored_snapshot.as_ref(),
                 ProjectionDesiredValue::Conservative,
                 &explicit,
                 None,
                 empty_defs_for_schema_walks(),
                 &crate::differ::exact_comparison_context_for_tests(),
             );
-            assert_eq!(projected.value, expected);
+            assert_eq!(projected.value, (expected).to_snapshot());
 
             let ProjectedAuthoring::LegacyList { element } = projected.authoring else {
                 panic!("unaligned ListElements must use legacy-list authoring");
@@ -3609,8 +3644,8 @@ mod tests {
         };
 
         let projected = project_value(
-            current,
-            Some(&stored),
+            (current).to_snapshot(),
+            Some(&(stored).to_snapshot()),
             ProjectionDesiredValue::Conservative,
             &explicit,
             None,
@@ -3619,10 +3654,11 @@ mod tests {
         );
         assert_eq!(
             projected.value,
-            Value::Concrete(ConcreteValue::List(vec![
+            (Value::Concrete(ConcreteValue::List(vec![
                 union_projection_item("duplicate", false),
                 union_projection_item("unmatched", false),
-            ]))
+            ])))
+            .to_snapshot()
         );
 
         let ProjectedAuthoring::AlignedList { elements } = projected.authoring else {

@@ -34,8 +34,9 @@ use crate::parser::{ProviderConfig, StateBlockAddress};
 pub use crate::resource::ProviderDirectiveSchema;
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, PartialReadMarker, PendingReRead,
-    PreventDestroyResolution, PreventDestroySource, ProviderResource, Resource, ResourceId, State,
-    Value, ValueString,
+    PreventDestroyResolution, PreventDestroySource, ProviderResource, Resource, ResourceId,
+    SnapshotState, SnapshotValue, State, StateValueLeaf, UnavailableSecretError, Value,
+    ValueString,
 };
 #[cfg(test)]
 use crate::resource::{DataSource, RedactedSecretHash};
@@ -53,6 +54,10 @@ use crate::wait::predicate::AttrPath;
 pub use crate::executor::provider_ready::{
     CanonicalProviderConfigAttributes, ProviderReady, ProviderReadyConfig, ProviderReadyDataSource,
     ProviderReadyResource,
+};
+pub use crate::provider_wire::{
+    ProviderWireError, ProviderWirePayload, ProviderWireTarget, ResourceWirePayload,
+    WireAttributes, WirePatchOp, WireReady, WireValue,
 };
 
 /// Construct a validated provider identifier for fixtures shared by workspace
@@ -730,24 +735,27 @@ impl SentAttributes {
 /// still contain unresolved expressions.
 #[derive(Debug, Clone)]
 pub struct SentDesiredAttributes<'a> {
-    attributes: Vec<(&'a String, &'a Value)>,
+    attributes: Vec<(&'a String, SnapshotValue)>,
     sent: SentAttributes,
 }
 
 impl<'a> SentDesiredAttributes<'a> {
-    pub(crate) fn new(
-        attributes: impl IntoIterator<Item = (&'a String, &'a Value)>,
+    pub(crate) fn new<P: StateValueLeaf + 'a>(
+        attributes: impl IntoIterator<Item = (&'a String, &'a Value<P>)>,
         sent: SentAttributes,
     ) -> Self {
         Self {
-            attributes: attributes.into_iter().collect(),
+            attributes: attributes
+                .into_iter()
+                .map(|(key, value)| (key, crate::resource::state_value_snapshot(value)))
+                .collect(),
             sent,
         }
     }
 
     /// Provider-ready desired values retained by the accepted operation.
-    pub fn values(&self) -> impl Iterator<Item = (&String, &Value)> {
-        self.attributes.iter().map(|(key, value)| (*key, *value))
+    pub fn values(&self) -> impl Iterator<Item = (&String, &SnapshotValue)> {
+        self.attributes.iter().map(|(key, value)| (*key, value))
     }
 
     /// Whether this operation sent `attribute` with a desired value.
@@ -810,9 +818,8 @@ pub struct ReadRequest;
 /// provider-side state; `patch` carries the user's intended changes plus any
 /// desired, updatable write-only values that must be reasserted alongside an
 /// update. The patch is the sole source of truth for what the provider should
-/// write — there is no separate `to: Resource` because exposing the full
-/// desired resource invites providers to touch fields the user never specified
-/// (the root cause of `carina-rs/carina#2559`).
+/// write. No desired resource or validation view is available outside the
+/// checked patch (see #2559).
 ///
 /// External callers cannot assemble an update request from raw state and
 /// patch data; the private witness is supplied only by the checked provider
@@ -836,27 +843,39 @@ pub struct ReadRequest;
 ///     request.patch = replacement;
 /// }
 /// ```
+///
+/// An update request cannot expose a desired resource or validation view:
+///
+/// ```compile_fail,E0599
+/// use carina_core::provider::UpdateRequest;
+/// fn bypass(request: &UpdateRequest) { let _ = request.resource(); }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use carina_core::provider::UpdateRequest;
+/// fn bypass(request: &UpdateRequest) { let _ = request.validation_inputs(); }
+/// ```
 #[derive(Debug, Clone)]
 pub struct UpdateRequest {
-    /// Current provider-side state. May be used for read-modify-write
-    /// paths or for resolving server-assigned identifiers; MUST NOT be
-    /// used to derive additional fields to write back.
-    from: State,
+    /// Current provider-side state for read-modify-write paths and resolving
+    /// server-assigned identifiers.
+    from: SnapshotState,
     /// Structured description of the user's intended change and any write-only
     /// values reasserted alongside it.
-    patch: UpdatePatch,
-    /// Effective directives resolved from the desired resource's schema.
+    patch: WireReady<UpdatePatch>,
+    /// Effective directives resolved from the managed resource schema.
     directives: ProviderDirectives,
 }
 
 impl UpdateRequest {
     pub(crate) fn checked(
-        from: State,
+        from: SnapshotState,
         changed_attributes: &[String],
         resource: &ProviderReadyResource,
         schema: &ResourceSchema,
-    ) -> Result<Self, IgnoredWriteOnlyValueError> {
+    ) -> Result<Self, crate::executor::ProviderPreparationError> {
         let patch = build_update_patch(changed_attributes, resource, &from, schema)?;
+        let patch = WireReady::try_new(patch, ProviderWireTarget::Resource(resource.id.clone()))?;
         Ok(Self {
             from,
             patch,
@@ -865,13 +884,18 @@ impl UpdateRequest {
     }
 
     /// Current provider-side state.
-    pub fn from(&self) -> &State {
+    pub fn from(&self) -> &SnapshotState {
         &self.from
     }
 
     /// Patch derived from the checked desired resource.
     pub fn patch(&self) -> &UpdatePatch {
-        &self.patch
+        self.patch.as_inner()
+    }
+
+    /// The checked projection consumed by provider transport adapters.
+    pub fn wire_patch(&self) -> &[WirePatchOp] {
+        self.patch.wire()
     }
 
     /// Effective directives resolved while the desired resource crossed the
@@ -1087,6 +1111,15 @@ impl IgnoredWriteOnlyValueError {
     }
 }
 
+/// A patch cannot contain historical hash evidence.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum UpdatePatchError {
+    #[error(transparent)]
+    IgnoredWriteOnly(#[from] IgnoredWriteOnlyValueError),
+    #[error(transparent)]
+    UnavailableSecret(#[from] UnavailableSecretError),
+}
+
 impl PatchOp {
     /// Top-level attribute name. Nested-field patches are a future extension.
     pub fn key(&self) -> &str {
@@ -1139,24 +1172,24 @@ impl UpdatePatch {
 /// let schema = ResourceSchema::new("test");
 /// let _patch = build_update_patch(&[], &resource, &state, &schema);
 /// ```
-pub fn build_update_patch(
+pub fn build_update_patch<P: StateValueLeaf>(
     changed_attributes: &[String],
     to: &ProviderReadyResource,
-    from: &State,
+    from: &State<P>,
     schema: &ResourceSchema,
-) -> Result<UpdatePatch, IgnoredWriteOnlyValueError> {
+) -> Result<UpdatePatch, UpdatePatchError> {
     plan_update_patch(changed_attributes, to.as_inner(), from, schema)
 }
 
 /// Decide every update operation from one resolved desired/current pair.
 /// Planning discards the returned patch after validating it; apply retains it
 /// as the provider request payload.
-pub(crate) fn plan_update_patch<S>(
+pub(crate) fn plan_update_patch<S, P: StateValueLeaf>(
     changed_attributes: &[String],
     to: &crate::resource::ResolvedResource<S>,
-    from: &State,
+    from: &State<P>,
     schema: &ResourceSchema,
-) -> Result<UpdatePatch, IgnoredWriteOnlyValueError> {
+) -> Result<UpdatePatch, UpdatePatchError> {
     let ignore_changes = to.ignore_changes();
     let to = to.as_resource();
     let mut patched_keys = HashSet::new();
@@ -1178,11 +1211,19 @@ pub(crate) fn plan_update_patch<S>(
                 .for_attribute(key)
                 .find(|path| path.is_write_only())
         {
-            return Err(ignored_write_only_error(&to.id, key, path));
+            return Err(ignored_write_only_error(&to.id, key, path).into());
         }
-        let sent_value = value.map(|value| {
-            ignore_changes.with_observed_readable_leaves(key, value, from.attributes.get(key))
-        });
+        let observed = from
+            .attributes
+            .get(key)
+            .map(crate::resource::state_value_snapshot);
+        let sent_value = value
+            .map(|value| {
+                ignore_changes
+                    .with_observed_readable_leaves(key, value, observed.as_ref())
+                    .to_value_at(format!("{}.{}", to.id, key))
+            })
+            .transpose()?;
         match (sent_value, in_from) {
             (Some(value), false) => ops.push(PatchOp::Add {
                 key: key.clone(),
@@ -1221,7 +1262,7 @@ pub(crate) fn plan_update_patch<S>(
                 continue;
             }
             if let Some(path) = ignored_write_only.first() {
-                return Err(ignored_write_only_error(&to.id, key, path));
+                return Err(ignored_write_only_error(&to.id, key, path).into());
             }
         } else if !ignored_write_only.is_empty() {
             let desired_write_only = schema.write_only_leaf_projection(key, value);
@@ -1231,15 +1272,20 @@ pub(crate) fn plan_update_patch<S>(
             {
                 continue;
             }
-            return Err(ignored_write_only_error(&to.id, key, ignored_write_only[0]));
+            return Err(ignored_write_only_error(&to.id, key, ignored_write_only[0]).into());
         }
         reasserts.push(PatchOp::Reassert {
             key: key.clone(),
-            value: ignore_changes.with_observed_readable_leaves(
-                key,
-                value,
-                from.attributes.get(key),
-            ),
+            value: ignore_changes
+                .with_observed_readable_leaves(
+                    key,
+                    value,
+                    from.attributes
+                        .get(key)
+                        .map(crate::resource::state_value_snapshot)
+                        .as_ref(),
+                )
+                .to_value_at(format!("{}.{}", to.id, key))?,
         });
     }
     reasserts.sort_by(|left, right| left.key().cmp(right.key()));
@@ -1299,14 +1345,28 @@ impl SavedAttrs {
         self.0.get(id)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&ResourceId, &HashMap<String, crate::resource::SnapshotValue>)> {
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &ResourceId,
+            &HashMap<String, crate::resource::SnapshotValue>,
+        ),
+    > {
         self.0.iter()
     }
 }
 
 impl<'a> IntoIterator for &'a SavedAttrs {
-    type Item = (&'a ResourceId, &'a HashMap<String, crate::resource::SnapshotValue>);
-    type IntoIter = std::collections::hash_map::Iter<'a, ResourceId, HashMap<String, crate::resource::SnapshotValue>>;
+    type Item = (
+        &'a ResourceId,
+        &'a HashMap<String, crate::resource::SnapshotValue>,
+    );
+    type IntoIter = std::collections::hash_map::Iter<
+        'a,
+        ResourceId,
+        HashMap<String, crate::resource::SnapshotValue>,
+    >;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.iter()
@@ -1559,8 +1619,6 @@ impl PersistedAttributes {
     /// Return the opaque hash for a top-level persisted secret attribute.
     pub fn redacted_secret_hash(&self, key: &str) -> Option<crate::resource::RedactedSecretHash> {
         match self.get(key)? {
-
-
             _ => None,
         }
     }
@@ -1843,7 +1901,13 @@ fn hash_provider_view_as_secret(
     let plaintext = provider_value
         .decode_value()
         .ok_or_else(|| "cannot hash null provider secret".to_string())?;
-    crate::value::persist_secret_json(&plaintext.to_value_at("provider secret").map_err(|error|error.to_string())?, previous).map_err(|error| error.to_string())
+    crate::value::persist_secret_json(
+        &plaintext
+            .to_value_at("provider secret")
+            .map_err(|error| error.to_string())?,
+        previous,
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Saved attributes decoded from persisted state but not yet reconciled
@@ -1996,7 +2060,10 @@ impl AppliedState {
         Ok(Self {
             id,
             identifier: AppliedIdentifier::new(identifier)?,
-            attributes: attributes.into_iter().map(|(key,value)| (key,crate::resource::state_value_snapshot(&value))).collect(),
+            attributes: attributes
+                .into_iter()
+                .map(|(key, value)| (key, crate::resource::state_value_snapshot(&value)))
+                .collect(),
         })
     }
 
@@ -2008,12 +2075,23 @@ impl AppliedState {
         Self {
             id,
             identifier,
-            attributes: attributes.into_iter().map(|(key,value)| (key,crate::resource::state_value_snapshot(&value))).collect(),
+            attributes: attributes
+                .into_iter()
+                .map(|(key, value)| (key, crate::resource::state_value_snapshot(&value)))
+                .collect(),
         }
     }
 
-    pub fn from_snapshot_parts(id: ResourceId, identifier: AppliedIdentifier, attributes: HashMap<String,crate::resource::SnapshotValue>) -> Self {
-        Self { id,identifier,attributes }
+    pub fn from_snapshot_parts(
+        id: ResourceId,
+        identifier: AppliedIdentifier,
+        attributes: HashMap<String, crate::resource::SnapshotValue>,
+    ) -> Self {
+        Self {
+            id,
+            identifier,
+            attributes,
+        }
     }
 
     pub fn id(&self) -> &ResourceId {
@@ -2028,7 +2106,13 @@ impl AppliedState {
         &self.attributes
     }
 
-    pub fn into_parts(self) -> (ResourceId, AppliedIdentifier, HashMap<String, crate::resource::SnapshotValue>) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        ResourceId,
+        AppliedIdentifier,
+        HashMap<String, crate::resource::SnapshotValue>,
+    ) {
         (self.id, self.identifier, self.attributes)
     }
 
@@ -2076,24 +2160,26 @@ impl ReadOutcome {
 
 /// Convert a generic state fixture into the typed managed-read outcome.
 #[cfg(test)]
-pub(crate) fn fixture_read_outcome(state: State) -> ReadOutcome {
+pub(crate) fn fixture_read_outcome<P: StateValueLeaf>(state: State<P>) -> ReadOutcome {
     if !state.exists {
         return ReadOutcome::not_found(state.id);
     }
     let identifier = state
         .identifier
         .expect("existing read fixture must carry a provider identifier");
-    ReadOutcome::found(
-        AppliedState::new(state.id, identifier, state.attributes)
+    ReadOutcome::found(AppliedState::from_snapshot_parts(
+        state.id,
+        AppliedIdentifier::new(identifier)
             .expect("existing read fixture identifier must be non-empty"),
-    )
+        crate::test_support::snapshot_attributes(state.attributes),
+    ))
 }
 
 /// Convert a generic state fixture into a managed-read outcome, using the
 /// provider identifier supplied to the read when the fixture omits one.
 #[cfg(test)]
-pub(crate) fn fixture_read_outcome_for_identifier(
-    state: State,
+pub(crate) fn fixture_read_outcome_for_identifier<P: StateValueLeaf>(
+    state: State<P>,
     identifier: &AppliedIdentifier,
 ) -> ReadOutcome {
     if !state.exists {
@@ -2104,10 +2190,10 @@ pub(crate) fn fixture_read_outcome_for_identifier(
             .expect("existing read fixture identifier must be non-empty"),
         None => identifier.clone(),
     };
-    ReadOutcome::found(AppliedState::from_identifier(
+    ReadOutcome::found(AppliedState::from_snapshot_parts(
         state.id,
         identifier,
-        state.attributes,
+        crate::test_support::snapshot_attributes(state.attributes),
     ))
 }
 
@@ -2809,7 +2895,7 @@ impl ObservedCreate {
 
     /// Materialize only the provider observation for runtime publication.
     /// Sent desired values are intentionally excluded.
-    pub fn observed_state(&self) -> State {
+    pub fn observed_state(&self) -> SnapshotState {
         let attributes = match &self.observation {
             CreateObservation::Observed(state) => state.attributes().clone(),
             CreateObservation::Unobserved(_reason) => HashMap::new(),
@@ -3685,7 +3771,7 @@ impl CompletedResume {
     fn new(pending: InFlightCreate, identifier: AppliedIdentifier, state: AppliedState) -> Self {
         let (_state_id, _observed_identifier, attributes) = state.into_parts();
         let state =
-            AppliedState::from_identifier(pending.id().clone(), identifier.clone(), attributes);
+            AppliedState::from_snapshot_parts(pending.id().clone(), identifier.clone(), attributes);
         Self(observed_from_resume(
             pending,
             identifier,
@@ -3701,7 +3787,7 @@ impl CompletedResume {
         self.0.identifier()
     }
 
-    pub fn observed_state(&self) -> State {
+    pub fn observed_state(&self) -> SnapshotState {
         self.0.observed_state()
     }
 
@@ -3756,7 +3842,7 @@ impl PartialResume {
         &self.diagnostic
     }
 
-    pub fn observed_state(&self) -> State {
+    pub fn observed_state(&self) -> SnapshotState {
         self.diagnostic
             .clone()
             .into_state_for_writeback(self.completed.observed_state())
@@ -3773,7 +3859,14 @@ impl PartialResume {
         }
     }
 
-    pub(crate) fn into_parts(self) -> (ObservedCreate, State, PartialReadDiagnostic, ReadBackEnd) {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ObservedCreate,
+        SnapshotState,
+        PartialReadDiagnostic,
+        ReadBackEnd,
+    ) {
         let Self {
             completed,
             diagnostic,
@@ -4772,7 +4865,7 @@ impl CreateOutcome {
     }
 
     /// Consume the outcome and produce a State ready for writeback.
-    pub(crate) fn into_state_for_writeback(self) -> State {
+    pub(crate) fn into_state_for_writeback(self) -> SnapshotState {
         match self.kind {
             CreateOutcomeKind::Success { state } => state.into_state_for_writeback(),
             CreateOutcomeKind::PartialSuccess { state, diagnostic } => {
@@ -4834,7 +4927,7 @@ impl UpdateOutcome {
     }
 
     /// Consume the outcome and produce a State ready for writeback.
-    pub fn into_state_for_writeback(self) -> State {
+    pub fn into_state_for_writeback(self) -> SnapshotState {
         match self.kind {
             UpdateOutcomeKind::Success { state } => state.into_state_for_writeback(),
             UpdateOutcomeKind::PartialSuccess { state, diagnostic } => {
@@ -4902,7 +4995,7 @@ impl PartialReadDiagnostic {
         }
     }
 
-    pub fn into_state_for_writeback(self, mut state: State) -> State {
+    pub fn into_state_for_writeback(self, mut state: SnapshotState) -> SnapshotState {
         state.partial_read = PartialReadMarker::new(
             PendingReRead::incomplete(self.reason),
             self.missing_attributes.into_iter().collect(),
@@ -5105,14 +5198,14 @@ pub fn ready_noop<'a>() -> BoxFuture<'a, ProviderResult<()>> {
 /// }
 /// ```
 #[derive(Debug, PartialEq)]
-pub struct StateTransformMap(HashMap<ResourceId, State>);
+pub struct StateTransformMap(HashMap<ResourceId, SnapshotState>);
 
 impl StateTransformMap {
-    pub(crate) fn from_states(states: HashMap<ResourceId, State>) -> Self {
+    pub(crate) fn from_states(states: HashMap<ResourceId, SnapshotState>) -> Self {
         Self(states)
     }
 
-    pub(crate) fn into_states(self) -> HashMap<ResourceId, State> {
+    pub(crate) fn into_states(self) -> HashMap<ResourceId, SnapshotState> {
         self.0
     }
 
@@ -5124,33 +5217,33 @@ impl StateTransformMap {
         self.0.len()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&ResourceId, &State)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&ResourceId, &SnapshotState)> {
         self.0.iter()
     }
 
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&ResourceId, &mut State)> {
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&ResourceId, &mut SnapshotState)> {
         self.0.iter_mut()
     }
 
-    pub fn values(&self) -> impl Iterator<Item = &State> {
+    pub fn values(&self) -> impl Iterator<Item = &SnapshotState> {
         self.0.values()
     }
 
-    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut State> {
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut SnapshotState> {
         self.0.values_mut()
     }
 
-    pub fn get(&self, id: &ResourceId) -> Option<&State> {
+    pub fn get(&self, id: &ResourceId) -> Option<&SnapshotState> {
         self.0.get(id)
     }
 
-    pub fn get_mut(&mut self, id: &ResourceId) -> Option<&mut State> {
+    pub fn get_mut(&mut self, id: &ResourceId) -> Option<&mut SnapshotState> {
         self.0.get_mut(id)
     }
 }
 
 impl std::ops::Deref for StateTransformMap {
-    type Target = HashMap<ResourceId, State>;
+    type Target = HashMap<ResourceId, SnapshotState>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -5158,8 +5251,8 @@ impl std::ops::Deref for StateTransformMap {
 }
 
 impl<'a> IntoIterator for &'a StateTransformMap {
-    type Item = (&'a ResourceId, &'a State);
-    type IntoIter = std::collections::hash_map::Iter<'a, ResourceId, State>;
+    type Item = (&'a ResourceId, &'a SnapshotState);
+    type IntoIter = std::collections::hash_map::Iter<'a, ResourceId, SnapshotState>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.iter()
@@ -5167,8 +5260,8 @@ impl<'a> IntoIterator for &'a StateTransformMap {
 }
 
 impl<'a> IntoIterator for &'a mut StateTransformMap {
-    type Item = (&'a ResourceId, &'a mut State);
-    type IntoIter = std::collections::hash_map::IterMut<'a, ResourceId, State>;
+    type Item = (&'a ResourceId, &'a mut SnapshotState);
+    type IntoIter = std::collections::hash_map::IterMut<'a, ResourceId, SnapshotState>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.iter_mut()
@@ -5237,7 +5330,7 @@ pub trait ProviderNormalizer: Send + Sync {
 /// caller's map is unchanged.
 pub async fn normalize_provider_states<N>(
     normalizer: &N,
-    states: &mut HashMap<ResourceId, State>,
+    states: &mut HashMap<ResourceId, SnapshotState>,
 ) -> ProviderResult<()>
 where
     N: ProviderNormalizer + ?Sized,
@@ -5254,7 +5347,7 @@ where
 /// transformation and leaves the input unchanged after an error.
 pub async fn hydrate_provider_states<N>(
     normalizer: &N,
-    states: &mut HashMap<ResourceId, State>,
+    states: &mut HashMap<ResourceId, SnapshotState>,
     saved_attrs: &SavedAttrs,
 ) -> ProviderResult<()>
 where
@@ -5385,7 +5478,6 @@ fn assert_default_tag_value_encodable(value: &Value) -> Result<(), Serialization
         | Value::Concrete(ConcreteValue::Duration(_))
         | Value::Concrete(ConcreteValue::StringList(_))
         | Value::Deferred(DeferredValue::ModuleIf(_))
-        
         | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::Coalesce { .. })
@@ -5471,7 +5563,6 @@ pub fn merge_default_tags<S, D>(
             Err(
                 source @ (SerializationError::NonFiniteFloat { .. }
                 | SerializationError::UnresolvedEnumIdentifier { .. }
-                | SerializationError::RedactedSecretNotAllowed { .. }
                 | SerializationError::UnexpandedModuleIf { .. }
                 | SerializationError::UnavailableSecret(_)),
             ) => {
@@ -6411,6 +6502,8 @@ impl CanonicalCustomTypeValue {
 /// validator's canonical text representation.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum CustomTypeCanonicalizationError {
+    #[error("provider custom types are not loaded")]
+    ProvidersNotLoaded,
     #[error(
         "custom-type canonicalization requires an identified scalar declaration, got {type_name}"
     )]
@@ -6443,6 +6536,9 @@ pub enum CustomTypeCanonicalizationError {
 impl CustomTypeCanonicalizationError {
     pub(crate) fn into_type_error(self) -> crate::schema::TypeError {
         match self {
+            Self::ProvidersNotLoaded => {
+                crate::parser::CustomTypeValidationError::ProvidersNotLoaded.into()
+            }
             Self::EnumResolution { error, .. } => *error,
             Self::ConcreteKindMismatch {
                 identity,
@@ -6465,6 +6561,7 @@ impl CustomTypeCanonicalizationError {
 /// Return the identity carried by an identified scalar or enum declaration.
 pub fn identified_custom_type_identity(attribute_type: &AttributeType) -> Option<&TypeIdentity> {
     match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(unloaded) => Some(unloaded.identity()),
         RawShape::Reference { .. } => None,
         RawShape::String { identity, .. }
         | RawShape::Int { identity, .. }
@@ -6485,8 +6582,9 @@ pub fn identified_custom_type_identity(attribute_type: &AttributeType) -> Option
 /// strings by convention.
 pub fn identified_custom_type_scalar_kind(
     attribute_type: &AttributeType,
-) -> Option<RefinedScalarKind> {
-    match attribute_type.raw_shape() {
+) -> Result<Option<RefinedScalarKind>, crate::parser::UnloadedSchemaType> {
+    Ok(match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(unloaded) => return Err(unloaded.clone()),
         RawShape::Reference {
             identity: _identity,
             pattern: _pattern,
@@ -6512,11 +6610,12 @@ pub fn identified_custom_type_scalar_kind(
         | RawShape::Struct { .. }
         | RawShape::Union(_)
         | RawShape::Ref(_) => None,
-    }
+    })
 }
 
 fn scalar_kind_from_base(attribute_type: &AttributeType) -> Option<RefinedScalarKind> {
     match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => None,
         RawShape::Reference {
             identity: _identity,
             pattern: _pattern,
@@ -6546,18 +6645,38 @@ pub fn canonicalize_custom_type_value(
     declared_type: &AttributeType,
     value: &Value,
 ) -> Result<Option<CanonicalCustomTypeValue>, CustomTypeCanonicalizationError> {
+    match declared_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => {
+            return Err(CustomTypeCanonicalizationError::ProvidersNotLoaded);
+        }
+        RawShape::Reference { .. }
+        | RawShape::String { .. }
+        | RawShape::Int { .. }
+        | RawShape::Float { .. }
+        | RawShape::Bool
+        | RawShape::Duration
+        | RawShape::Enum { .. }
+        | RawShape::List { .. }
+        | RawShape::Map { .. }
+        | RawShape::Struct { .. }
+        | RawShape::Union(_)
+        | RawShape::Ref(_) => {}
+    }
     let identity = identified_custom_type_identity(declared_type).ok_or_else(|| {
         CustomTypeCanonicalizationError::UnidentifiedDeclaration {
             type_name: declared_type.type_name(),
         }
     })?;
-    let scalar_kind = identified_custom_type_scalar_kind(declared_type).ok_or_else(|| {
-        CustomTypeCanonicalizationError::MissingScalarKind {
+    let scalar_kind = identified_custom_type_scalar_kind(declared_type)
+        .map_err(|_| CustomTypeCanonicalizationError::ProvidersNotLoaded)?
+        .ok_or_else(|| CustomTypeCanonicalizationError::MissingScalarKind {
             identity: identity.clone(),
             type_name: declared_type.type_name(),
-        }
-    })?;
+        })?;
     match (declared_type.raw_shape(), value) {
+        (RawShape::UnloadedSchemaType(_), _) => {
+            Err(CustomTypeCanonicalizationError::ProvidersNotLoaded)
+        }
         (
             RawShape::String {
                 identity: _,
@@ -7047,6 +7166,7 @@ fn collect_type_names_from_type(
     use crate::schema::RawShape;
 
     match attr_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => {}
         RawShape::Reference {
             identity,
             pattern: _pattern,
@@ -7107,6 +7227,7 @@ fn local_custom_validator(
     attribute_type: &AttributeType,
 ) -> Option<&crate::schema::CustomValidator> {
     match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => None,
         RawShape::Reference {
             identity: _identity,
             pattern: _pattern,
@@ -7292,6 +7413,7 @@ impl CustomTypeDispatchTable {
         let mut bindings = HashMap::<TypeIdentity, CustomTypeDispatchBinding>::new();
         for (identity, declaration) in witness.identified_declarations() {
             let kind = identified_custom_type_scalar_kind(&declaration)
+                .expect("validated declarations have loaded scalar kinds")
                 .expect("validated provider schema guarantees a scalar bridge kind");
             let callback = local_custom_validator(&declaration).cloned();
             match bindings.entry(identity) {
@@ -7329,7 +7451,7 @@ impl CustomTypeDispatchTable {
         for (identity, declaration) in
             crate::schema::identified_declarations_from_witnesses(schemas, config)
         {
-            let Some(kind) = identified_custom_type_scalar_kind(&declaration) else {
+            let Ok(Some(kind)) = identified_custom_type_scalar_kind(&declaration) else {
                 return Err(CustomTypeDispatchTableError::MissingScalarKind { identity });
             };
             let callback = local_custom_validator(&declaration).cloned();
@@ -7489,25 +7611,27 @@ where
     }
 
     fn known_custom_types(&self) -> BTreeSet<crate::parser::OwnedTypeIdentity> {
-        let mut owners_by_identity =
-            BTreeMap::<TypeIdentity, crate::parser::NonEmptySchemaTypeOwners>::new();
+        // Keep incompatible kinds separate so annotation resolution can reject
+        // a cross-provider conflict before constructing a SchemaType.
+        let mut declarations_by_identity =
+            BTreeMap::<(TypeIdentity, RefinedScalarKind), crate::parser::OwnedTypeIdentity>::new();
         for (owner, indexed) in &self.index {
-            let owner_set = crate::parser::NonEmptySchemaTypeOwners::singleton(
-                crate::parser::SchemaTypeOwner::Provider(owner.clone()),
-            );
-            for identity in indexed.declarations.keys() {
-                owners_by_identity
-                    .entry(identity.clone())
-                    .and_modify(|owners| *owners = owners.union(&owner_set))
-                    .or_insert_with(|| owner_set.clone());
+            for (identity, declarations) in &indexed.declarations {
+                let owned = crate::parser::OwnedTypeIdentity::from_schema_declaration(
+                    owner,
+                    &declarations[0],
+                )
+                .expect("validated identified declarations have a scalar kind");
+                declarations_by_identity
+                    .entry((identity.clone(), owned.scalar_kind()))
+                    .and_modify(|existing| {
+                        *existing =
+                            existing.with_merged_owners(existing.owners().union(owned.owners()));
+                    })
+                    .or_insert(owned);
             }
         }
-        owners_by_identity
-            .into_iter()
-            .map(|(identity, owners)| {
-                crate::parser::OwnedTypeIdentity::with_owners(identity, owners)
-            })
-            .collect()
+        declarations_by_identity.into_values().collect()
     }
 }
 
@@ -7748,7 +7872,7 @@ fn validate_custom_type_annotation(
             if local_custom_validator(declaration).is_none()
                 && let Some(canonical) = canonical
             {
-                let Some(kind) = identified_custom_type_scalar_kind(declaration) else {
+                let Ok(Some(kind)) = identified_custom_type_scalar_kind(declaration) else {
                     return Err(CustomTypeValidationError::Rejected {
                         owner: owner.clone(),
                         identity: identity.clone(),
@@ -7899,9 +8023,9 @@ mod tests {
                         identity.clone(),
                         None,
                         legacy_validator(|value| match value {
-                            Value::Concrete(ConcreteValue::Int(5)) => {
-                                Err("schema-derived callback rejected five".to_string())
-                            }
+                            crate::resource::Value::Concrete(
+                                crate::resource::ConcreteValue::Int(5),
+                            ) => Err("schema-derived callback rejected five".to_string()),
                             _ => Err("Expected integer".to_string()),
                         }),
                     ),
@@ -8267,6 +8391,66 @@ mod tests {
     }
 
     #[test]
+    fn provider_custom_type_index_retains_scalar_kinds_for_resolution() {
+        use crate::parser::{
+            OwnedTypeIdentity, ProviderContext, ProviderCustomTypes, ResourceTypePath, TypeExpr,
+        };
+        use crate::static_type::StaticTypeResolutionError;
+
+        let identity = TypeIdentity::from_dotted("shared.counter.Count");
+        let snapshots = [
+            ("one", RefinedScalarKind::Int),
+            ("two", RefinedScalarKind::Int),
+            ("three", RefinedScalarKind::Float),
+        ]
+        .map(|(owner, kind)| ProviderFactorySchemaSnapshot {
+            name: owner.into(),
+            witness: ValidatedProviderSchemaWitness::new(
+                Vec::new(),
+                ValidatedConfigSchema::validate(BTreeMap::from([(
+                    "count".into(),
+                    kind.identified_type(identity.clone()),
+                )]))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap(),
+        });
+        let factories: &[Box<dyn ProviderFactory>] = &[];
+        let resolver = FactoryCustomTypeResolver::with_index(
+            factories,
+            build_owner_custom_type_index(&snapshots),
+        );
+        let known = resolver.known_custom_types();
+        assert_eq!(known.len(), 2, "only owners with the same kind are grouped");
+        let int_type = known
+            .iter()
+            .find(|owned| owned.scalar_kind() == RefinedScalarKind::Int)
+            .unwrap();
+        assert!(int_type.provider_names().eq(["one", "two"]));
+        assert!(known.contains(&OwnedTypeIdentity::provider(
+            "three",
+            identity,
+            RefinedScalarKind::Float
+        )));
+
+        let context = ProviderContext {
+            custom_types: ProviderCustomTypes::loaded(
+                known.into_iter().collect(),
+                Box::new(|_, _| Ok(())),
+            ),
+            ..ProviderContext::default()
+        };
+        assert!(matches!(
+            crate::validation::resolve_type_expr(
+                &TypeExpr::DottedUnresolved(ResourceTypePath::new("shared", "counter.Count")),
+                &context
+            ),
+            Err(StaticTypeResolutionError::ConflictingScalarKinds { .. })
+        ));
+    }
+
+    #[test]
     fn loaded_custom_types_derive_known_config_identities_and_resolver_from_factories() {
         let identity = TypeIdentity::new(Some("test"), ["config"], "Endpoint");
         let factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>> =
@@ -8278,13 +8462,18 @@ mod tests {
                 .known()
                 .contains(&crate::parser::OwnedTypeIdentity::provider(
                     "config-owner",
-                    identity.clone()
+                    identity.clone(),
+                    crate::schema::RefinedScalarKind::String
                 ))
         );
         crate::parser::CustomTypeResolver::validate(
             &custom_types,
             crate::parser::CustomTypeValidationTarget::Annotation(
-                &crate::parser::OwnedTypeIdentity::provider("config-owner", identity),
+                &crate::parser::OwnedTypeIdentity::provider(
+                    "config-owner",
+                    identity,
+                    crate::schema::RefinedScalarKind::String,
+                ),
             ),
             &Value::Concrete(ConcreteValue::String("https://example.test".into())),
         )
@@ -8376,6 +8565,7 @@ mod tests {
             &crate::parser::OwnedTypeIdentity::provider(
                 "snapshot",
                 TypeIdentity::new(Some("test"), ["item"], "Identifier"),
+                crate::schema::RefinedScalarKind::String
             )
         ));
     }
@@ -8630,7 +8820,7 @@ mod tests {
         );
         assert_eq!(
             state.attributes.get("arn"),
-            Some(&Value::Concrete(ConcreteValue::String("known-arn".into())))
+            Some(&(Value::Concrete(ConcreteValue::String("known-arn".into()))).to_snapshot())
         );
     }
 
@@ -8843,13 +9033,13 @@ mod tests {
         )
         .expect("marker-shaped strings are ordinary persisted values");
         let plain = Value::Concrete(ConcreteValue::String(marker.clone().into()));
-        assert_eq!(persisted.get("token"), Some(plain.clone()));
+        assert_eq!(persisted.get("token"), Some((plain.clone()).to_snapshot()));
 
         let persisted = PersistedAttributes::from_encoded(
             serde_json::from_value(encoded).expect("attribute object"),
         )
         .expect("state row decode");
-        assert_eq!(persisted.get("token"), Some(plain));
+        assert_eq!(persisted.get("token"), Some((plain).to_snapshot()));
     }
 
     #[test]
@@ -8871,20 +9061,28 @@ mod tests {
 
     #[test]
     fn persisted_wire_guest_round_trip_preserves_user_keys_enums_and_secrets() {
-        fn host_value_to_guest_wire(value: Value) -> Value {
+        fn host_value_to_guest_wire(
+            value: crate::resource::SnapshotValue,
+        ) -> crate::resource::SnapshotValue {
             match value {
-                Value::Concrete(ConcreteValue::CanonicalEnum(value)) => {
-                    Value::Concrete(ConcreteValue::String(value.api_value().to_string().into()))
-                }
-                Value::Concrete(ConcreteValue::Map(values)) => Value::Concrete(ConcreteValue::Map(
-                    values
-                        .into_iter()
-                        .map(|(key, value)| (key, host_value_to_guest_wire(value)))
-                        .collect(),
+                crate::resource::Value::Concrete(
+                    crate::resource::ConcreteValue::CanonicalEnum(value),
+                ) => crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                    value.api_value().to_string().into(),
                 )),
-                Value::Concrete(ConcreteValue::List(values)) => Value::Concrete(
-                    ConcreteValue::List(values.into_iter().map(host_value_to_guest_wire).collect()),
-                ),
+                crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(values)) => {
+                    crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(
+                        values
+                            .into_iter()
+                            .map(|(key, value)| (key, host_value_to_guest_wire(value)))
+                            .collect(),
+                    ))
+                }
+                crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(values)) => {
+                    crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(
+                        values.into_iter().map(host_value_to_guest_wire).collect(),
+                    ))
+                }
                 value => value,
             }
         }
@@ -8953,7 +9151,7 @@ mod tests {
         let mut expected = persisted.to_values();
         expected.insert(
             "mode".to_string(),
-            Value::Concrete(ConcreteValue::String("ACTIVE".into())),
+            Value::Concrete(ConcreteValue::String("ACTIVE".into())).to_snapshot(),
         );
 
         let wire_values: HashMap<_, _> = persisted
@@ -8972,7 +9170,9 @@ mod tests {
         let digest = format!("argon2-legacy:73616c74:{}", "ab".repeat(32));
         let hash =
             RedactedSecretHash::from_encoded_digest(&digest).expect("valid explicit legacy digest");
-        let typed = Value::Deferred(DeferredValue::RedactedSecret { hash });
+        let typed = crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+            crate::resource::SnapshotLeaf::RedactedSecret { hash },
+        ));
         let guest = PersistedAttributes::from_typed_persisted_wire_values(HashMap::from([(
             "token".to_string(),
             typed.clone(),
@@ -9003,8 +9203,9 @@ mod tests {
             .expect("migrate row-bound legacy digest");
         let persisted =
             PersistedValue::from_serialized_json(encoded).expect("migrated structural secret");
-        let Value::Deferred(DeferredValue::RedactedSecret { hash }) =
-            persisted.decode().expect("typed migrated secret")
+        let crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+            crate::resource::SnapshotLeaf::RedactedSecret { hash },
+        )) = persisted.decode().expect("typed migrated secret")
         else {
             panic!("migration must produce a typed redacted secret")
         };
@@ -9051,20 +9252,25 @@ mod tests {
         let attributes = HashMap::from([
             (
                 "tags".to_string(),
-                Value::Concrete(ConcreteValue::Map(IndexMap::from([
-                    ("S".to_string(), placeholder.clone()),
-                    (
-                        "Vpc".to_string(),
-                        Value::root_resource_ref("vpc", "identifier", Vec::new()),
-                    ),
-                ]))),
+                crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::Map(
+                    IndexMap::from([
+                        ("S".to_string(), placeholder.clone()),
+                        (
+                            "Vpc".to_string(),
+                            (Value::root_resource_ref("vpc", "identifier", Vec::new()))
+                                .to_snapshot(),
+                        ),
+                    ]),
+                )),
             ),
             (
                 "items".to_string(),
-                Value::Concrete(ConcreteValue::List(vec![
-                    Value::root_resource_ref("vpc", "identifier", Vec::new()),
-                    placeholder,
-                ])),
+                crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::List(
+                    vec![
+                        Value::root_resource_ref("vpc", "identifier", Vec::new()).to_snapshot(),
+                        placeholder,
+                    ],
+                )),
             ),
         ]);
 
@@ -9304,7 +9510,7 @@ mod tests {
     #[test]
     fn lift_covers_orphan_entries_absent_from_any_resource_slice() {
         let orphan = ResourceId::with_provider_identity("aws", "service.Widget", "orphan", None);
-        let raw = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+        let raw = crate::test_support::raw_saved_attrs(HashMap::from([(
             orphan.clone(),
             HashMap::from([(
                 "status".to_string(),
@@ -9316,7 +9522,7 @@ mod tests {
 
         assert!(matches!(
             &lifted.get(&orphan).unwrap()["status"],
-            Value::Concrete(ConcreteValue::CanonicalEnum(value))
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::CanonicalEnum(value))
                 if value.api_value() == "Enabled"
         ));
     }
@@ -9325,7 +9531,7 @@ mod tests {
     fn raw_saved_attrs_lift_is_map_driven_and_remappable() {
         let from = ResourceId::with_provider_identity("aws", "service.Widget", "old", None);
         let to = ResourceId::with_provider_identity("aws", "service.Widget", "new", None);
-        let raw = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+        let raw = crate::test_support::raw_saved_attrs(HashMap::from([(
             from.clone(),
             HashMap::from([(
                 "status".to_string(),
@@ -9337,7 +9543,7 @@ mod tests {
         let mut lifted = raw.lift(&registry);
         assert!(matches!(
             &lifted.get(&from).unwrap()["status"],
-            Value::Concrete(ConcreteValue::CanonicalEnum(value))
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::CanonicalEnum(value))
                 if value.api_value() == "Enabled"
         ));
 
@@ -9371,7 +9577,7 @@ mod tests {
         );
 
         let id = ResourceId::with_provider_identity("aws", "iam.policy", "p1", None);
-        let raw = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+        let raw = crate::test_support::raw_saved_attrs(HashMap::from([(
             id.clone(),
             HashMap::from([(
                 "statement".to_string(),
@@ -9383,13 +9589,14 @@ mod tests {
         )]));
 
         let lifted = raw.lift(&registry);
-        let Value::Concrete(ConcreteValue::Map(statement)) = &lifted.get(&id).unwrap()["statement"]
+        let crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(statement)) =
+            &lifted.get(&id).unwrap()["statement"]
         else {
             panic!("statement must remain a map");
         };
         assert_eq!(
             statement["action"],
-            Value::Concrete(ConcreteValue::StringList(vec!["s3:GetObject".into()])),
+            Value::Concrete(ConcreteValue::StringList(vec!["s3:GetObject".into()])).to_snapshot(),
             "carina#3740: RawSavedAttrs::lift must apply the shared structural canonicalizer"
         );
     }
@@ -9398,7 +9605,7 @@ mod tests {
     fn raw_saved_attrs_lift_preserves_attribute_absent_from_schema() {
         let id = ResourceId::with_provider_identity("aws", "service.Widget", "widget", None);
         let original = Value::Concrete(ConcreteValue::String("opaque".into()));
-        let raw = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+        let raw = crate::test_support::raw_saved_attrs(HashMap::from([(
             id.clone(),
             HashMap::from([("provider_extension".to_string(), original.clone())]),
         )]));
@@ -9407,7 +9614,7 @@ mod tests {
 
         assert_eq!(
             lifted.get(&id).unwrap()["provider_extension"],
-            original,
+            (original).to_snapshot(),
             "carina#3740: a saved attribute absent from a known resource schema must pass through"
         );
     }
@@ -9416,7 +9623,7 @@ mod tests {
     fn raw_saved_attrs_lift_skips_resource_type_absent_from_registry() {
         let id = ResourceId::with_provider_identity("aws", "service.Unknown", "unknown", None);
         let original = Value::Concrete(ConcreteValue::String("Enabled".into()));
-        let raw = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+        let raw = crate::test_support::raw_saved_attrs(HashMap::from([(
             id.clone(),
             HashMap::from([("status".to_string(), original.clone())]),
         )]));
@@ -9425,7 +9632,7 @@ mod tests {
 
         assert_eq!(
             lifted.get(&id).unwrap()["status"],
-            original,
+            (original).to_snapshot(),
             "carina#3740: a saved entry whose resource type is absent from the registry must be skipped"
         );
     }
@@ -9463,7 +9670,7 @@ mod tests {
             .expect("schema fixture must be valid"),
         );
         let id = ResourceId::with_provider_identity("aws", "service.Widget", "widget", None);
-        let raw = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+        let raw = crate::test_support::raw_saved_attrs(HashMap::from([(
             id.clone(),
             HashMap::from([
                 (
@@ -9478,9 +9685,8 @@ mod tests {
         )]));
 
         let once = raw.lift(&registry);
-        let twice =
-            RawSavedAttrs::from_decoded_values_for_test(once.attributes.0.clone()).lift(&registry);
-        let sorted_pairs = |attrs: &HashMap<String, Value>| {
+        let twice = crate::test_support::raw_saved_attrs(once.attributes.0.clone()).lift(&registry);
+        let sorted_pairs = |attrs: &HashMap<String, crate::resource::SnapshotValue>| {
             let mut pairs: Vec<_> = attrs
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
@@ -9521,22 +9727,25 @@ mod tests {
         );
 
         let id = ResourceId::with_provider_identity("test", "service.Widget", "widget", None);
-        let secret_hash = Value::Deferred(DeferredValue::RedactedSecret {
-            hash: RedactedSecretHash::generate(b"saved-attrs-test"),
-        });
-        let raw = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+        let secret_hash: crate::resource::SnapshotValue =
+            crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                crate::resource::SnapshotLeaf::RedactedSecret {
+                    hash: RedactedSecretHash::generate(b"saved-attrs-test"),
+                },
+            ));
+        let raw = crate::test_support::raw_saved_attrs(HashMap::from([(
             id.clone(),
             HashMap::from([(
                 "config".to_string(),
-                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-                    "password".to_string(),
-                    secret_hash.clone(),
-                )]))),
+                crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::Map(
+                    IndexMap::from([("password".to_string(), secret_hash.clone())]),
+                )),
             )]),
         )]));
 
         let lifted = raw.lift(&registry);
-        let Value::Concrete(ConcreteValue::Map(config)) = &lifted.get(&id).unwrap()["config"]
+        let crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(config)) =
+            &lifted.get(&id).unwrap()["config"]
         else {
             panic!("config must remain a map");
         };
@@ -9586,7 +9795,7 @@ mod tests {
         );
 
         let id = ResourceId::with_provider_identity("awscc", "example.Widget", "widget", None);
-        let raw = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+        let raw = crate::test_support::raw_saved_attrs(HashMap::from([(
             id.clone(),
             HashMap::from([(
                 "settings".to_string(),
@@ -9598,11 +9807,14 @@ mod tests {
         )]));
 
         let lifted = raw.lift(&registry);
-        let Value::Concrete(ConcreteValue::Map(settings)) = &lifted.get(&id).unwrap()["settings"]
+        let crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(settings)) =
+            &lifted.get(&id).unwrap()["settings"]
         else {
             panic!("settings must remain a map");
         };
-        let Value::Concrete(ConcreteValue::CanonicalEnum(value)) = &settings["mode"] else {
+        let crate::resource::Value::Concrete(crate::resource::ConcreteValue::CanonicalEnum(value)) =
+            &settings["mode"]
+        else {
             panic!("enum state text must be lifted to CanonicalEnum");
         };
         assert_eq!(
@@ -9617,34 +9829,46 @@ mod tests {
         let bindings = crate::binding_index::ResolvedBindings::default();
         let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = crate::schema::SchemaRegistry::new();
-        let context = crate::executor::ProviderPreparationContext::new(
-            &bindings,
-            &gate,
-            &[],
-            &NoopNormalizer,
-            &[],
-            &schemas,
-        );
-        futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
-            resource, &context,
-        ))
-        .expect("test resource should pass provider preparation")
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let context = crate::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
+                    resource, &context,
+                ))
+                .expect("test resource should pass provider preparation")
+            },
+        )
     }
 
     fn ready_data_source_for_test(resource: DataSource) -> ProviderReadyDataSource {
         let bindings = crate::binding_index::ResolvedBindings::default();
         let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = crate::schema::SchemaRegistry::new();
-        let context = crate::executor::ProviderPreparationContext::new(
-            &bindings,
-            &gate,
-            &[],
-            &NoopNormalizer,
-            &[],
-            &schemas,
-        );
-        crate::executor::prepare_provider_ready_data_source(resource, &context)
-            .expect("test data source should pass provider preparation")
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let context = crate::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                crate::executor::prepare_provider_ready_data_source(resource, &context)
+                    .expect("test data source should pass provider preparation")
+            },
+        )
     }
 
     // Mock Provider for testing
@@ -9698,7 +9922,7 @@ mod tests {
             request: UpdateRequest,
         ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             let id = id.clone();
-            let identifier = identifier.to_string();
+            let identifier = identifier.clone();
             // Apply the patch on top of `from` so the test sees changes and
             // write-only reassertions round-tripped into State.
             let mut attrs = request.from().attributes.clone();
@@ -9707,7 +9931,7 @@ mod tests {
                     PatchOp::Add { key, value }
                     | PatchOp::Replace { key, value }
                     | PatchOp::Reassert { key, value } => {
-                        attrs.insert(key.clone(), value.clone());
+                        attrs.insert(key.clone(), (value.clone()).to_snapshot());
                     }
                     PatchOp::Remove { key } => {
                         attrs.remove(key);
@@ -9715,10 +9939,9 @@ mod tests {
                 }
             }
             Box::pin(async move {
-                Ok(UpdateOutcome::success(
-                    AppliedState::new(id, identifier, attrs)
-                        .expect("provider input identifier is non-empty"),
-                ))
+                Ok(UpdateOutcome::success(AppliedState::from_snapshot_parts(
+                    id, identifier, attrs,
+                )))
             })
         }
 
@@ -9793,7 +10016,10 @@ mod tests {
     fn partial_create_and_update_share_the_canonical_pending_reread_value() {
         use crate::resource::{ApplyTimeUnknown, PendingReRead, ReReadReason};
 
-        fn assert_materialized(mut state: State, expected: &PendingReRead) {
+        fn assert_materialized(
+            mut state: crate::resource::SnapshotState,
+            expected: &PendingReRead,
+        ) {
             let marker = state
                 .partial_read
                 .as_ref()
@@ -9809,8 +10035,9 @@ mod tests {
                 .attributes
                 .get("computed")
                 .expect("missing attribute is materialized");
-            let Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(pending))) =
-                unknown
+            let crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(
+                ApplyTimeUnknown::PendingReRead(pending),
+            )) = unknown
             else {
                 panic!(
                     "expected the marker to materialize a pending re-read unknown, got {unknown:?}"
@@ -10925,18 +11152,24 @@ mod tests {
         registry.insert("", schema.clone());
         let bindings = crate::binding_index::ResolvedBindings::default();
         let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
-        let context = crate::executor::ProviderPreparationContext::new(
-            &bindings,
-            &gate,
-            &[],
-            &NoopNormalizer,
-            &[],
-            &registry,
-        );
-        futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
-            resource, &context,
-        ))
-        .expect("ignore_changes path must resolve during provider preparation")
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let context = crate::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &NoopNormalizer,
+                    &[],
+                    &registry,
+                    type_checks,
+                );
+                futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
+                    resource, &context,
+                ))
+                .expect("ignore_changes path must resolve during provider preparation")
+            },
+        )
     }
 
     #[test]
@@ -11109,6 +11342,9 @@ mod tests {
         let error = build_update_patch(&["config".to_string()], &to, &from, schema.as_schema())
             .expect_err("the current ignored write-only value is unknowable");
 
+        let UpdatePatchError::IgnoredWriteOnly(error) = error else {
+            panic!("expected ignored write-only error")
+        };
         assert_eq!(error.resource_id(), &to.id);
         assert_eq!(error.attribute(), "config");
         assert_eq!(error.path().to_string(), "config.secret");
@@ -11642,7 +11878,7 @@ mod tests {
             .into_state();
         assert_eq!(
             state.attributes.get("tag"),
-            Some(&Value::Concrete(ConcreteValue::String("default".into()))),
+            Some(&(Value::Concrete(ConcreteValue::String("default".into()))).to_snapshot()),
             "resources without provider_instance must route to the kind's default instance"
         );
 
@@ -11654,7 +11890,7 @@ mod tests {
             .into_state();
         assert_eq!(
             state.attributes.get("tag"),
-            Some(&Value::Concrete(ConcreteValue::String("us".into()))),
+            Some(&(Value::Concrete(ConcreteValue::String("us".into()))).to_snapshot()),
             "resources tagged with binding=Some('us') must route to that named instance"
         );
     }
@@ -12087,7 +12323,10 @@ mod tests {
                     // Prefix all string attribute values with "normalized:"
                     for resource in resources.iter_mut() {
                         for value in resource.attributes.values_mut() {
-                            if let Value::Concrete(ConcreteValue::String(s)) = value {
+                            if let crate::resource::Value::Concrete(
+                                crate::resource::ConcreteValue::String(s),
+                            ) = value
+                            {
                                 *s = format!("normalized:{}", s.expose_plaintext()).into();
                             }
                         }
@@ -12148,7 +12387,7 @@ mod tests {
             id.clone(),
             State::existing(id.clone(), HashMap::new()),
         )]));
-        let saved = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+        let saved = crate::test_support::raw_saved_attrs(HashMap::from([(
             id.clone(),
             HashMap::from([(
                 "restored".to_string(),
@@ -12161,7 +12400,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             states.get(&id).unwrap().attributes.get("restored"),
-            Some(&Value::Concrete(ConcreteValue::String("data".into())))
+            Some(&(Value::Concrete(ConcreteValue::String("data".into()))).to_snapshot())
         );
     }
 
@@ -12256,14 +12495,21 @@ mod tests {
                         if resource.id.provider == "normalizing" {
                             assert!(matches!(
                                 resource.get_attr("peer"),
-                                Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
+                                Some(crate::resource::Value::Deferred(
+                                    crate::resource::DeferredValue::ResourceRef { .. }
+                                ))
                             ));
                             assert!(matches!(
                                 resource.get_attr("pending"),
-                                Some(Value::Deferred(DeferredValue::Unknown(_)))
+                                Some(crate::resource::Value::Deferred(
+                                    crate::resource::DeferredValue::Unknown(_)
+                                ))
                             ));
                             for value in resource.attributes.values_mut() {
-                                if let Value::Concrete(ConcreteValue::String(s)) = value {
+                                if let crate::resource::Value::Concrete(
+                                    crate::resource::ConcreteValue::String(s),
+                                ) = value
+                                {
                                     *s = format!("norm:{}", s.expose_plaintext()).into();
                                 }
                             }
@@ -12312,9 +12558,11 @@ mod tests {
         assert_eq!(resources[0].get_attr("peer"), Some(&peer_ref));
         assert!(matches!(
             resources[0].get_attr("pending"),
-            Some(Value::Deferred(DeferredValue::Unknown(
-                crate::resource::ApplyTimeUnknown::UpstreamAllExports { .. }
-            )))
+            Some(crate::resource::Value::Deferred(
+                crate::resource::DeferredValue::Unknown(
+                    crate::resource::ApplyTimeUnknown::UpstreamAllExports { .. }
+                )
+            ))
         ));
     }
 }

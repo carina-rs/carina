@@ -7,7 +7,8 @@ use std::num::NonZeroUsize;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::resource::{
-    AbsoluteBindingAddress, BindingAddress, ConcreteValue, DeferredValue, PlaceholderKind, ValueKind, Value,
+    AbsoluteBindingAddress, BindingAddress, ConcreteValue, DeferredValue, PlaceholderKind, Value,
+    ValueKind,
 };
 
 /// The closed set of binary integer operators in the Carina DSL.
@@ -280,8 +281,9 @@ impl<P: ValueKind, B: BindingAddress> ValidatedIntegerExpr<P, B> {
         lhs: Value<P, B>,
         rhs: Value<P, B>,
     ) -> Result<Value<P, B>, IntegerExpressionError>
-where P: PlaceholderKind,
-{
+    where
+        P: PlaceholderKind,
+    {
         evaluate_integer_values_inner(lhs, self.op, rhs, self.operator_span, |value, side| {
             validate_post_validation_operand_shape(value, side)
         })
@@ -318,7 +320,8 @@ pub fn evaluate_integer_values<P: ValueKind, B: BindingAddress>(
     rhs: Value<P, B>,
     operator_span: IntegerOperatorSpan,
 ) -> Result<Value<P, B>, IntegerExpressionError>
-where P: PlaceholderKind,
+where
+    P: PlaceholderKind,
 {
     evaluate_integer_values_inner(lhs, op, rhs, operator_span, validate_operand_shape)
 }
@@ -330,7 +333,8 @@ fn evaluate_integer_values_inner<P: ValueKind, B: BindingAddress>(
     operator_span: IntegerOperatorSpan,
     validate: impl Fn(&Value<P, B>, IntegerOperandSide) -> Result<(), IntegerOperandError>,
 ) -> Result<Value<P, B>, IntegerExpressionError>
-where P: PlaceholderKind,
+where
+    P: PlaceholderKind,
 {
     let (lhs, lhs_secret_depth) = crate::resource::peel_secrets(lhs);
     let (rhs, rhs_secret_depth) = crate::resource::peel_secrets(rhs);
@@ -427,6 +431,12 @@ fn validate_operand_shape_at_stage<P: ValueKind, B: BindingAddress>(
             | DeferredValue::Access(_)
             | DeferredValue::IntegerArithmetic(_),
         ) => Ok(()),
+        Value::Deferred(DeferredValue::Placeholder(leaf))
+            if matches!(admission, IntegerOperandAdmission::SavedPlan)
+                && leaf.redacted_secret_hash().is_some() =>
+        {
+            Ok(())
+        }
         Value::Deferred(DeferredValue::Placeholder(_))
             if matches!(
                 admission,
@@ -482,9 +492,6 @@ fn validate_operand_shape_at_stage<P: ValueKind, B: BindingAddress>(
             side,
             actual: "Map",
         }),
-
-
-
     }
 }
 
@@ -731,9 +738,6 @@ mod tests {
             Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(
                 crate::resource::PendingReRead::incomplete("test pending reread"),
             ))),
-            Value::Deferred(DeferredValue::RedactedSecret {
-                hash: crate::resource::RedactedSecretHash::generate(b"arithmetic operand"),
-            }),
         ] {
             let stamped_value = expression
                 .evaluate_with_operands(runtime_operand, Value::Concrete(ConcreteValue::Int(1)))

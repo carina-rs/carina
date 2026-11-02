@@ -62,7 +62,10 @@ enum LintFile {
 }
 
 impl LintFile {
-    fn resolve_type_exprs_best_effort(&mut self, context: &carina_core::parser::ProviderContext) {
+    fn resolve_type_exprs_best_effort(
+        &mut self,
+        context: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
+    ) {
         match self {
             Self::Blocked(parsed) => {
                 parsed.resolve_type_exprs_report(context);
@@ -157,19 +160,140 @@ fn collect_list_struct_attrs_for_population<E, D, B: carina_core::resource::Bind
     }
 }
 
+struct LintResult {
+    checks: carina_core::validation::deferred_types::ProviderTypeCheckResult<
+        Result<Vec<LintWarning>, AppError>,
+    >,
+}
+
+struct LintTypeCheckSink<'a> {
+    path: &'a Path,
+    warnings: Vec<carina_core::parser::ParseWarning>,
+    errors: Vec<carina_core::parser::ParseWarning>,
+}
+impl carina_core::validation::deferred_types::ProviderTypeCheckSink for LintTypeCheckSink<'_> {
+    fn record(
+        &mut self,
+        diagnostic: carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic,
+    ) {
+        let (mut warning, is_error) = match diagnostic {
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning) => (warning, false),
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => (error, true),
+        };
+        if warning.file.is_none() {
+            warning.file = Some(self.path.display().to_string());
+        }
+        if is_error {
+            self.errors.push(warning);
+        } else {
+            self.warnings.push(warning);
+        }
+    }
+}
+
+impl LintResult {
+    fn settle(
+        checks: carina_core::validation::deferred_types::ProviderTypeCheckResult<
+            Result<Vec<LintWarning>, AppError>,
+        >,
+    ) -> Self {
+        Self { checks }
+    }
+
+    fn publish(
+        self,
+        path: &Path,
+        color_mode: crate::output_style::ColorMode,
+    ) -> Result<(), AppError> {
+        let mut sink = LintTypeCheckSink {
+            path,
+            warnings: Vec::new(),
+            errors: Vec::new(),
+        };
+        let result = self.checks.publish(&mut sink);
+        let provider_warning_count = sink.warnings.len();
+        for warning in &sink.warnings {
+            crate::commands::validate::print_provider_type_warning(warning);
+        }
+        for error in &sink.errors {
+            eprintln!(
+                "{} {}:{}:{}: {}",
+                "error:".red(color_mode).bold(color_mode),
+                error.file.as_deref().unwrap_or("<config>"),
+                error.line,
+                error.span.as_ref().map_or(1, |span| span.start_column),
+                error.message
+            );
+        }
+        if !sink.errors.is_empty() {
+            let mut errors = sink
+                .errors
+                .into_iter()
+                .map(|error| error.message)
+                .collect::<Vec<_>>();
+            if let Err(error) = result {
+                errors.insert(0, error.to_string());
+            }
+            return Err(AppError::Validation(errors.join("\n")));
+        }
+        let (warnings, result) = match result {
+            Ok(findings) => (findings, Ok(())),
+            Err(error) => (Vec::new(), Err(error)),
+        };
+        let warning_count = provider_warning_count + warnings.len();
+        if warning_count == 0 {
+            result?;
+            println!(
+                "{}",
+                "No lint warnings found.".green(color_mode).bold(color_mode)
+            );
+            return Ok(());
+        }
+        for warning in &warnings {
+            eprintln!(
+                "{} {}:{}  {}",
+                "warning:".yellow(color_mode).bold(color_mode),
+                warning.file.display(),
+                warning.line,
+                warning.message
+            );
+        }
+        result?;
+        Err(AppError::Validation(format!(
+            "Found {} lint warning(s).",
+            warning_count
+        )))
+    }
+}
+
 pub fn run_lint(
     runtime: &crate::runtime::CommandRuntime,
     path: &Path,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let color_mode = runtime.color_mode();
+    lint_result(runtime, path, provider_context)?.publish(path, runtime.color_mode())
+}
+
+fn lint_result(
+    runtime: &crate::runtime::CommandRuntime,
+    path: &Path,
+    provider_context: &ProviderContext,
+) -> Result<LintResult, AppError> {
     let loaded = load_configuration_with_config(
         path,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
-    )?;
+    );
+    let loaded = match loaded {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            return Ok(LintResult::settle(
+                crate::wiring::failed_configuration_report(path, error.into()),
+            ));
+        }
+    };
     let duplicate_declarations = loaded.duplicate_declarations;
-    let parsed = loaded.parsed;
+    let mut parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
     let module_walk = ModuleWalk::load(&parsed, base_dir);
@@ -181,142 +305,167 @@ pub fn run_lint(
 
     let (providers, provider_factory_error) =
         ProviderLoad::load_reporting(runtime, &parsed.providers, base_dir)?;
-    let loaded_provider_context = if provider_factory_error.is_none() {
-        providers.loaded_provider_context()
-    } else {
-        None
-    };
     let provider_factory_error = provider_factory_error.map(|error| error.to_string());
     let schemas = providers.schemas();
+    let load_findings = providers.load_findings(&parsed.providers, false);
+    let authority = providers.validation_catalog(&parsed.providers);
+    let checks = carina_core::validation::deferred_types::TypeCheckSession::run(
+        &authority,
+        |catalog| {
+            let mut type_findings = parsed
+                .resolve_type_exprs_report(catalog)
+                .into_diagnostics()
+                .into_iter()
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>();
+            if type_findings.is_empty()
+                && let Err(error) = carina_core::validation::validate_attribute_params_with_context(
+                    &parsed.attribute_params,
+                    catalog,
+                )
+            {
+                type_findings.push(error);
+            }
+            if type_findings.is_empty()
+                && let Err(error) = parsed.resolve_resource_refs_in_session(catalog)
+            {
+                type_findings.push(error.to_string());
+            }
+            for module in module_walk.iter() {
+                type_findings.extend(
+                    carina_core::validation::resolve_file_type_exprs(
+                        &mut module.loaded().parsed.clone(),
+                        catalog,
+                    )
+                    .into_iter()
+                    .map(|error| error.to_string()),
+                );
+            }
 
-    // Report invalid root-owned module blocks through lint's collected,
-    // path-prefixed output. The resolver enforces the same invariants as
-    // expansion backstops, so do not expand after this gate fails or lint
-    // would abort before rendering the findings below. This deliberately
-    // degrades schema-dependent checks: `iter_top_level_resources` then sees
-    // only root-declared resources, so List<Struct> block-syntax suggestions
-    // can disappear even from root files. The configuration is already
-    // blocked; retaining these findings and the schema-independent text scans
-    // is more useful than aborting lint entirely. Full schema-backed
-    // suggestions return once the blocking finding is fixed.
-    let mut parsed = if module_boundary_findings.is_empty() {
-        let resolution = if let Some(loaded_provider_context) = loaded_provider_context {
-            module_resolver::resolve_module_template_with_config(
-                parsed,
-                base_dir,
-                loaded_provider_context,
+            // Report invalid root-owned module blocks through lint's collected,
+            // path-prefixed output. The resolver enforces the same invariants as
+            // expansion backstops, so do not expand after this gate fails or lint
+            // would abort before rendering the findings below. This deliberately
+            // degrades schema-dependent checks: `iter_top_level_resources` then sees
+            // only root-declared resources, so List<Struct> block-syntax suggestions
+            // can disappear even from root files. The configuration is already
+            // blocked; retaining these findings and the schema-independent text scans
+            // is more useful than aborting lint entirely. Full schema-backed
+            // suggestions return once the blocking finding is fixed.
+            let mut parsed = if module_boundary_findings.is_empty() && type_findings.is_empty() {
+                let resolution = module_resolver::resolve_module_template_with_config(
+                    parsed, base_dir, catalog, schemas,
+                );
+                LintFile::Resolved(resolution.map_err(|e| {
+                    format!(
+                        "Module resolution error: {}",
+                        e.display_relative_to(base_dir)
+                    )
+                })?)
+            } else {
+                LintFile::Blocked(parsed)
+            };
+
+            parsed.resolve_type_exprs_best_effort(catalog);
+            let export_handle_errors = parsed.export_handle_errors();
+
+            // Collect source texts for each .crn file
+            let source_texts: Vec<(PathBuf, String)> = {
+                let files = find_crn_files_in_dir(path)?;
+                let mut texts = Vec::new();
+                for file in files {
+                    let content = fs::read_to_string(&file)
+                        .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
+                    texts.push((file, content));
+                }
+                texts
+            };
+
+            // Collect all List<Struct> attribute names from schemas of parsed resources
+            // and build a map of attr_name -> block_name for lint suggestions
+            let mut all_list_struct_attrs: HashSet<String> = HashSet::new();
+            let mut block_name_suggestions: HashMap<String, String> = HashMap::new();
+            // carina#3181: walk every top-level resource — managed and data
+            // source schemas can both carry List<Struct> attributes. compositions
+            // have no schema, so `get_for` returns `None` for them.
+            parsed.collect_list_struct_attrs(
                 schemas,
-            )
-        } else {
-            module_resolver::resolve_module_template_with_providerless_config(
-                parsed,
-                base_dir,
-                provider_context,
-                schemas,
-            )
-        };
-        LintFile::Resolved(resolution.map_err(|e| {
-            format!(
-                "Module resolution error: {}",
-                e.display_relative_to(base_dir)
-            )
-        })?)
-    } else {
-        LintFile::Blocked(parsed)
-    };
+                &mut all_list_struct_attrs,
+                &mut block_name_suggestions,
+            );
 
-    if let Some(loaded_provider_context) = loaded_provider_context {
-        parsed.resolve_type_exprs_best_effort(loaded_provider_context);
-    }
-    let export_handle_errors = parsed.export_handle_errors();
-
-    // Collect source texts for each .crn file
-    let source_texts: Vec<(PathBuf, String)> = {
-        let files = find_crn_files_in_dir(path)?;
-        let mut texts = Vec::new();
-        for file in files {
-            let content = fs::read_to_string(&file)
-                .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
-            texts.push((file, content));
-        }
-        texts
-    };
-
-    // Collect all List<Struct> attribute names from schemas of parsed resources
-    // and build a map of attr_name -> block_name for lint suggestions
-    let mut all_list_struct_attrs: HashSet<String> = HashSet::new();
-    let mut block_name_suggestions: HashMap<String, String> = HashMap::new();
-    // carina#3181: walk every top-level resource — managed and data
-    // source schemas can both carry List<Struct> attributes. compositions
-    // have no schema, so `get_for` returns `None` for them.
-    parsed.collect_list_struct_attrs(
-        schemas,
-        &mut all_list_struct_attrs,
-        &mut block_name_suggestions,
-    );
-
-    // Scan each source file for list literal usage of List<Struct> attributes
-    let mut warnings: Vec<LintWarning> = module_boundary_findings
-        .into_iter()
-        .map(|finding| LintWarning {
-            // The merged module parse does not retain an offending declaration
-            // span. Keep lint's file:line convention at the caller boundary;
-            // the finding itself retains the recursive module-path prefix.
-            file: path.to_path_buf(),
-            line: 1,
-            message: finding.to_string(),
-        })
-        .collect();
-    if let Some(boundary_errors) = export_handle_errors {
-        warnings.extend(boundary_errors.into_iter().map(|error| LintWarning {
-            file: error.source_file().to_path_buf(),
-            line: error.source_span().start_line(),
-            message: error.to_string(),
-        }));
-    }
-    if let Some(message) = provider_factory_error {
-        warnings.push(LintWarning {
-            file: path.to_path_buf(),
-            line: 1,
-            message,
-        });
-    }
-    for duplicate in &duplicate_declarations {
-        let file = duplicate
-            .first_file()
-            .map(|relative| path.join(relative))
-            .unwrap_or_else(|| path.to_path_buf());
-        warnings.push(LintWarning {
-            file,
-            // Declaration AST nodes do not carry spans. Keep the finding in
-            // lint's normal file:line shape and anchor it at the file start;
-            // the message retains exact per-file provenance.
-            line: 1,
-            message: duplicate.to_string(),
-        });
-    }
-    for module in module_walk.iter() {
-        for duplicate in &module.loaded().duplicate_declarations {
-            let file = duplicate
-                .first_file()
-                .map(|relative| module.module_path().join(relative))
-                .unwrap_or_else(|| module.module_path().to_path_buf());
-            warnings.push(LintWarning {
-                file,
-                line: 1,
-                message: format!("{}: {duplicate}", module.diagnostic_path().display()),
-            });
-        }
-    }
-    for (file_path, source) in &source_texts {
-        // Check for list literal syntax on List<Struct> attributes
-        let hits = find_list_literal_attrs(source, &all_list_struct_attrs);
-        for (attr_name, line) in hits {
-            let suggested_name = block_name_suggestions
-                .get(&attr_name)
-                .map(|s| s.as_str())
-                .unwrap_or(&attr_name);
-            warnings.push(LintWarning {
+            // Scan each source file for list literal usage of List<Struct> attributes
+            let mut warnings: Vec<LintWarning> = module_boundary_findings
+                .into_iter()
+                .map(|finding| LintWarning {
+                    // The merged module parse does not retain an offending declaration
+                    // span. Keep lint's file:line convention at the caller boundary;
+                    // the finding itself retains the recursive module-path prefix.
+                    file: path.to_path_buf(),
+                    line: 1,
+                    message: finding.to_string(),
+                })
+                .collect();
+            if let Some(boundary_errors) = export_handle_errors {
+                warnings.extend(boundary_errors.into_iter().map(|error| LintWarning {
+                    file: error.source_file().to_path_buf(),
+                    line: error.source_span().start_line(),
+                    message: error.to_string(),
+                }));
+            }
+            if let Some(message) = provider_factory_error {
+                warnings.push(LintWarning {
+                    file: path.to_path_buf(),
+                    line: 1,
+                    message,
+                });
+            }
+            for message in type_findings
+                .into_iter()
+                .chain(load_findings.into_iter().map(|error| error.to_string()))
+            {
+                warnings.push(LintWarning {
+                    file: path.to_path_buf(),
+                    line: 1,
+                    message,
+                });
+            }
+            for duplicate in &duplicate_declarations {
+                let file = duplicate
+                    .first_file()
+                    .map(|relative| path.join(relative))
+                    .unwrap_or_else(|| path.to_path_buf());
+                warnings.push(LintWarning {
+                    file,
+                    // Declaration AST nodes do not carry spans. Keep the finding in
+                    // lint's normal file:line shape and anchor it at the file start;
+                    // the message retains exact per-file provenance.
+                    line: 1,
+                    message: duplicate.to_string(),
+                });
+            }
+            for module in module_walk.iter() {
+                for duplicate in &module.loaded().duplicate_declarations {
+                    let file = duplicate
+                        .first_file()
+                        .map(|relative| module.module_path().join(relative))
+                        .unwrap_or_else(|| module.module_path().to_path_buf());
+                    warnings.push(LintWarning {
+                        file,
+                        line: 1,
+                        message: format!("{}: {duplicate}", module.diagnostic_path().display()),
+                    });
+                }
+            }
+            for (file_path, source) in &source_texts {
+                // Check for list literal syntax on List<Struct> attributes
+                let hits = find_list_literal_attrs(source, &all_list_struct_attrs);
+                for (attr_name, line) in hits {
+                    let suggested_name = block_name_suggestions
+                        .get(&attr_name)
+                        .map(|s| s.as_str())
+                        .unwrap_or(&attr_name);
+                    warnings.push(LintWarning {
                 file: file_path.clone(),
                 line,
                 message: format!(
@@ -324,12 +473,12 @@ pub fn run_lint(
                     attr_name, suggested_name, attr_name
                 ),
             });
-        }
+                }
 
-        // Check for duplicate attribute keys within the same block
-        let duplicates = find_duplicate_attrs(source);
-        for dup in duplicates {
-            warnings.push(LintWarning {
+                // Check for duplicate attribute keys within the same block
+                let duplicates = find_duplicate_attrs(source);
+                for dup in duplicates {
+                    warnings.push(LintWarning {
                 file: file_path.clone(),
                 line: dup.line,
                 message: format!(
@@ -337,25 +486,25 @@ pub fn run_lint(
                     dup.name, dup.first_line
                 ),
             });
-        }
+                }
 
-        // Check for direct calls to pipe-preferred functions
-        let pipe_warnings = find_pipe_preferred_direct_calls(source);
-        for pw in pipe_warnings {
-            warnings.push(LintWarning {
-                file: file_path.clone(),
-                line: pw.line,
-                message: format!(
-                    "Consider using pipe form for '{}': data |> {}(...)",
-                    pw.name, pw.name
-                ),
-            });
-        }
+                // Check for direct calls to pipe-preferred functions
+                let pipe_warnings = find_pipe_preferred_direct_calls(source);
+                for pw in pipe_warnings {
+                    warnings.push(LintWarning {
+                        file: file_path.clone(),
+                        line: pw.line,
+                        message: format!(
+                            "Consider using pipe form for '{}': data |> {}(...)",
+                            pw.name, pw.name
+                        ),
+                    });
+                }
 
-        // Check for non-snake_case binding names
-        let naming_warnings = find_non_snake_case_bindings(source);
-        for nw in naming_warnings {
-            warnings.push(LintWarning {
+                // Check for non-snake_case binding names
+                let naming_warnings = find_non_snake_case_bindings(source);
+                for nw in naming_warnings {
+                    warnings.push(LintWarning {
                 file: file_path.clone(),
                 line: nw.line,
                 message: format!(
@@ -363,32 +512,15 @@ pub fn run_lint(
                     nw.name
                 ),
             });
-        }
-    }
+                }
+            }
 
-    warnings.extend(parsed.mixed_tag_key_style_warnings(&source_texts, base_dir));
+            warnings.extend(parsed.mixed_tag_key_style_warnings(&source_texts, base_dir));
 
-    if warnings.is_empty() {
-        println!(
-            "{}",
-            "No lint warnings found.".green(color_mode).bold(color_mode)
-        );
-        Ok(())
-    } else {
-        for w in &warnings {
-            eprintln!(
-                "{} {}:{}  {}",
-                "warning:".yellow(color_mode).bold(color_mode),
-                w.file.display(),
-                w.line,
-                w.message
-            );
-        }
-        Err(AppError::Validation(format!(
-            "Found {} lint warning(s).",
-            warnings.len()
-        )))
-    }
+            Ok(warnings)
+        },
+    );
+    Ok(LintResult::settle(checks))
 }
 
 #[cfg(test)]
@@ -396,6 +528,92 @@ mod tests {
     use super::*;
     use carina_core::lint::collect_tag_keys_for_file;
     use carina_core::parser::ParsedFile;
+
+    #[test]
+    fn lint_hard_provider_load_failure_still_reports_missing_sources() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("main.crn"), "provider broken { source = 'file:///definitely-missing/broken.wasm' }\nprovider broken { source = 'file:///definitely-missing/broken.wasm' }\nprovider missing {}\n").unwrap();
+        let runtime = crate::test_support::TestCommandRuntime::new();
+        let result = lint_result(&runtime, fixture.path(), &ProviderContext::default()).unwrap();
+        let mut sink = LintTypeCheckSink {
+            path: fixture.path(),
+            warnings: Vec::new(),
+            errors: Vec::new(),
+        };
+        let findings = result.checks.publish(&mut sink).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("declared more than once")),
+            "{:?}",
+            findings
+                .iter()
+                .map(|finding| &finding.message)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            findings.iter().any(|finding| finding.message
+                == crate::commands::missing_provider_source_message("missing")),
+            "{:?}",
+            findings
+                .iter()
+                .map(|finding| &finding.message)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn lint_loaded_pending_check_preserves_the_producer_error() {
+        use carina_core::validation::deferred_types::{ProviderTypeCheckSite, TypeCheckSession};
+        let catalog = carina_core::parser::LoadedProviderContext::empty_for_test();
+        let checks = TypeCheckSession::run(&catalog, |session| {
+            session.record(
+                &carina_core::parser::TypeExpr::String,
+                ProviderTypeCheckSite::at_line(Path::new("main.crn"), 3, 4, "lint check"),
+            );
+            Err(AppError::Validation("producer failed".into()))
+        });
+        let error = LintResult::settle(checks)
+            .publish(Path::new("main.crn"), crate::output_style::ColorMode::Plain)
+            .unwrap_err();
+        assert!(error.to_string().contains("producer failed"), "{error}");
+        assert!(error.to_string().contains("fully loaded"), "{error}");
+    }
+
+    #[test]
+    fn lint_loaded_pending_check_is_an_error_finding() {
+        use carina_core::validation::deferred_types::{ProviderTypeCheckSite, TypeCheckSession};
+        let catalog = carina_core::parser::LoadedProviderContext::empty_for_test();
+        let checks = TypeCheckSession::run(&catalog, |session| {
+            session.record(
+                &carina_core::parser::TypeExpr::String,
+                ProviderTypeCheckSite::at_line(Path::new("main.crn"), 3, 4, "lint check"),
+            );
+            Ok(Vec::new())
+        });
+        let result = LintResult::settle(checks);
+        let mut sink = LintTypeCheckSink {
+            path: Path::new("main.crn"),
+            warnings: Vec::new(),
+            errors: Vec::new(),
+        };
+        result.checks.publish(&mut sink).unwrap();
+        assert!(sink.warnings.is_empty());
+        assert_eq!(sink.errors.len(), 1);
+        assert!(sink.errors[0].message.contains("fully loaded"));
+    }
+
+    #[test]
+    fn lint_providerless_fallback_reports_deferred_type_warnings() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("main.crn"), "provider broken { source = 'file:///definitely-missing/broken.wasm' }\nfn f(x: Arn) { x }\nlet a = f('arn:aws:s3:::bucket')\nattributes { x: AwsAccountId = '123' }\n").unwrap();
+        let runtime = crate::test_support::TestCommandRuntime::new();
+        let error = run_lint(&runtime, fixture.path(), &ProviderContext::default()).unwrap_err();
+        assert!(
+            matches!(&error, AppError::Validation(message) if message == "Found 4 lint warning(s)."),
+            "{error}"
+        );
+    }
 
     #[test]
     fn lint_preserves_imported_module_pest_syntax_diagnostic() {

@@ -287,8 +287,7 @@ fn collect_unsynchronized_refs<B: BindingAddress>(
         Value::Deferred(
             DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_)
-            | DeferredValue::BindingRef { .. }
-            ,
+            | DeferredValue::BindingRef { .. },
         ) => {
             // BindingRef lacks the attribute path check_ref needs for deferred_populate.
             // Unknown is parser-deferred and likewise carries no resource attribute path.
@@ -368,6 +367,7 @@ fn path_traverses_deferred(top_attr: EffectiveAttribute<'_>, segments: &[PathSeg
             }
             PathSegment::Field { name } => {
                 match current_type.shape() {
+                    Shape::UnloadedSchemaType(_) => return false,
                     Shape::Struct { .. } | Shape::Union => {}
                     Shape::Reference { .. }
                     | Shape::String { .. }

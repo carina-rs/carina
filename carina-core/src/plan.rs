@@ -10,8 +10,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::effect::{
-    ChangedCreateOnly, Effect, EffectGeneration, EffectWithSource, MoveAuthority, SavedEffect,
-    TemporaryName, UnresolvedSavedEffect,
+    ChangedCreateOnly, Effect, EffectGeneration, EffectWithSource, MoveAuthority, TemporaryName,
+    UnresolvedSavedEffect,
 };
 use crate::hint::ProjectCommand;
 use crate::module_resolver::ModuleConstraintDiagnostic;
@@ -19,8 +19,8 @@ use crate::name_override::NameOverride;
 use crate::provider::{AppliedIdentifier, Timestamp};
 pub use crate::resource::PreventDestroySource;
 use crate::resource::{
-    AbsoluteBindingAddress, DeposedKey, Directives, ResolvedResource, ResolvedResourceId,
-    ResourceId, Value, PlanValueKind, NoPlaceholder, SnapshotLeaf, SnapshotValue,
+    AbsoluteBindingAddress, DeposedKey, Directives, NoPlaceholder, PlanValueKind, ResolvedResource,
+    ResolvedResourceId, ResourceId, SnapshotLeaf, SnapshotValue,
 };
 pub use crate::resource::{ModuleSource, SavedModuleSource};
 
@@ -162,6 +162,7 @@ pub enum PlanErrorKind {
     },
     /// A module argument constraint failed after its inputs became known.
     ModuleConstraint(ModuleConstraintDiagnostic),
+    UnavailableSecret(crate::resource::UnavailableSecretError),
 }
 
 /// The sole resolution seam for a resource that is confirmed absent after an
@@ -257,6 +258,17 @@ impl From<crate::provider::IgnoredWriteOnlyValueError> for PlanErrorKind {
         Self::IgnoredWriteOnlyValueUnavailable {
             attribute: error.attribute().to_string(),
             path: error.path().to_string(),
+        }
+    }
+}
+
+impl From<crate::provider::UpdatePatchError> for PlanErrorKind {
+    fn from(error: crate::provider::UpdatePatchError) -> Self {
+        match error {
+            crate::provider::UpdatePatchError::IgnoredWriteOnly(error) => error.into(),
+            crate::provider::UpdatePatchError::UnavailableSecret(error) => {
+                Self::UnavailableSecret(error)
+            }
         }
     }
 }
@@ -414,6 +426,7 @@ impl PlanErrorKind {
                 }
             }
             Self::ModuleConstraint(diagnostic) => std::fmt::Display::fmt(diagnostic, f),
+            Self::UnavailableSecret(error) => std::fmt::Display::fmt(error, f),
             Self::IgnoredWriteOnlyValueUnavailable { attribute, path } => write!(
                 f,
                 "cannot send attribute `{attribute}` because ignored write-only path `{path}` must be preserved, but its current value cannot be known"
@@ -447,6 +460,7 @@ impl PlanError {
             | PlanErrorKind::WaitTargetMissing { .. }
             | PlanErrorKind::WaitTargetIsDataSource { .. }
             | PlanErrorKind::WaitPredicateInvalid { .. }
+            | PlanErrorKind::UnavailableSecret(_)
             | PlanErrorKind::IgnoredWriteOnlyValueUnavailable { .. }
             | PlanErrorKind::ResolvedValueConstraint { .. }) => {
                 write!(f, "{}: ", self.resource_id)?;
@@ -901,11 +915,28 @@ impl Plan {
 }
 
 impl<S, V: PlanValueKind> Plan<S, V> {
-    pub(crate) fn with_value_stage<Q: PlanValueKind>(self, effects: Vec<Effect<S, Q>>) -> Plan<S, Q> {
-        let Plan { effects: _, ignored_change_summaries, replace_display, permanent_name_overrides,
-            errors, abandoned_deposed, destroy_ordering_notices } = self;
-        Plan { effects, ignored_change_summaries, replace_display, permanent_name_overrides,
-            errors, abandoned_deposed, destroy_ordering_notices }
+    pub(crate) fn with_value_stage<Q: PlanValueKind>(
+        self,
+        effects: Vec<Effect<S, Q>>,
+    ) -> Plan<S, Q> {
+        let Plan {
+            effects: _,
+            ignored_change_summaries,
+            replace_display,
+            permanent_name_overrides,
+            errors,
+            abandoned_deposed,
+            destroy_ordering_notices,
+        } = self;
+        Plan {
+            effects,
+            ignored_change_summaries,
+            replace_display,
+            permanent_name_overrides,
+            errors,
+            abandoned_deposed,
+            destroy_ordering_notices,
+        }
     }
 
     pub fn add(&mut self, effect: Effect<S, V>) {
@@ -1415,6 +1446,7 @@ mod tests {
 
     use crate::resource::{
         DataSource, RelativeBindingName, ResolvedDataSource, ResolvedResource, Resource, RootScope,
+        Value,
     };
 
     fn render_plan_error_kind(kind: PlanErrorKind) -> String {
@@ -2058,7 +2090,10 @@ mod tests {
         let json = serde_json::to_string(&plan).unwrap();
         let deserialized = deserialize_plan(&json);
 
-        assert_eq!(deserialized, SavedPlan::from(plan));
+        assert_eq!(
+            deserialized,
+            SavedPlan::from(crate::test_support::snapshot_plan(&plan))
+        );
     }
 
     #[test]
@@ -2136,7 +2171,7 @@ mod tests {
         let json = serde_json::to_string(&plan).unwrap();
         let deserialized = deserialize_plan(&json);
         assert_eq!(plan.effects().len(), deserialized.effects().len());
-        let saved = SavedPlan::from(plan);
+        let saved = SavedPlan::from(crate::test_support::snapshot_plan(&plan));
         assert_eq!(saved.effects(), deserialized.effects());
     }
 }

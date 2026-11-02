@@ -102,16 +102,19 @@ fn retained_deferred_warnings_match_source_location_for_both_file_owners() {
     let source = project.path().join("main.crn");
     std::fs::write(&source, "let orgs = upstream_state { source = '../orgs' }\nlet rows = for item in orgs.ids { mock.test.resource { name = item } }\n").unwrap();
     let loaded = carina_core::config_loader::load_configuration(project.path()).unwrap();
-    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-        loaded.parsed,
-        project.path(),
+    let parsed = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
-        &SchemaRegistry::new(),
-    )
-    .unwrap();
-    let mut parsed = parsed
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
-        .unwrap();
+        |session| {
+            carina_core::module_resolver::resolve_modules_with_providerless_config(
+                loaded.parsed,
+                project.path(),
+                session,
+                &SchemaRegistry::new(),
+            )
+            .unwrap()
+        },
+    );
+    let mut parsed = parsed.into_expanded(&SchemaRegistry::new()).unwrap();
     parsed.warnings = vec![
         carina_core::parser::ParseWarning {
             file: Some(source.display().to_string()),
@@ -137,11 +140,22 @@ fn retained_deferred_warnings_match_source_location_for_both_file_owners() {
     ];
     let bindings = carina_core::binding_index::IterableBindings::from_upstream_only(HashMap::new());
     let mut pair = CanonicalResourcePair::for_test(parsed.clone(), Vec::new());
-    parsed
-        .expand_partitioned(&bindings, |_| DeferredForExpansionChoice::Retain)
-        .unwrap();
-    pair.expand_deferred_for_expressions(&bindings, |_| DeferredForExpansionChoice::Retain)
-        .unwrap();
+    carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::ProviderContext::default(),
+        |session| {
+            parsed.expand_partitioned(&bindings, session, |_| DeferredForExpansionChoice::Retain)
+        },
+    )
+    .unwrap();
+    carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::ProviderContext::default(),
+        |session| {
+            pair.expand_deferred_for_expressions(&bindings, session, |_| {
+                DeferredForExpansionChoice::Retain
+            })
+        },
+    )
+    .unwrap();
     for warnings in [&parsed.warnings, &pair.parsed().warnings] {
         assert_eq!(
             warnings
@@ -858,13 +872,18 @@ fn anonymous_to_named_fixed_point_uses_state_origin_after_undeclared_hash_projec
         &SchemaRegistry::new(),
     )
     .expect("load multi-file fixture");
-    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-        loaded.parsed,
-        project.path(),
+    let parsed = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
-        &SchemaRegistry::new(),
-    )
-    .expect("test fixture crosses module resolution");
+        |session| {
+            carina_core::module_resolver::resolve_modules_with_providerless_config(
+                loaded.parsed,
+                project.path(),
+                session,
+                &SchemaRegistry::new(),
+            )
+            .expect("test fixture crosses module resolution")
+        },
+    );
     assert_eq!(parsed.state_blocks.len(), 1, "fixture must parse one move");
     let provider_configs = resolved_provider_configs_from_resolved(&parsed, &HashMap::new());
     let parsed = parsed
@@ -1193,13 +1212,16 @@ query {}
     let config = carina_core::parser::ProviderContext::default();
     let parsed = carina_core::parser::parse_file(&root_body, &root_file, &config)
         .expect("root fixture must parse");
-    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        &root_dir,
-        &config,
-        &SchemaRegistry::new(),
-    )
-    .expect("anonymous calls must expand");
+    let parsed =
+        carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
+            carina_core::module_resolver::resolve_modules_with_providerless_config(
+                carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                &root_dir,
+                session,
+                &SchemaRegistry::new(),
+            )
+            .expect("anonymous calls must expand")
+        });
     let parsed = parsed
         .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("anonymous module-call fixture has no parser placeholders");
@@ -1285,13 +1307,16 @@ outer {{}}
     let config = carina_core::parser::ProviderContext::default();
     let parsed = carina_core::parser::parse_file(&root_body, &root_file, &config)
         .expect("root fixture must parse");
-    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        &root_dir,
-        &config,
-        &SchemaRegistry::new(),
-    )
-    .expect("nested calls must expand");
+    let parsed =
+        carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
+            carina_core::module_resolver::resolve_modules_with_providerless_config(
+                carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                &root_dir,
+                session,
+                &SchemaRegistry::new(),
+            )
+            .expect("nested calls must expand")
+        });
     let parsed = parsed
         .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("nested module-call fixture has no parser placeholders");
@@ -1386,6 +1411,89 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
     let expected = "arguments blocks are only valid inside module definitions, not in root configurations.\nalpha failed\nzeta failed";
     assert_eq!(evaluated_error.to_string(), expected);
     assert_eq!(pair_error.to_string(), expected);
+}
+
+#[test]
+fn skipped_resource_validation_keeps_partial_catalog_through_binding_readiness() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("main.crn"),
+        "provider unavailable {}\nfn echo(value: Missing): Missing { value }\nlet result = echo('ok')\n",
+    )
+    .unwrap();
+    let loaded = carina_core::config_loader::load_configuration_with_config(
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .unwrap();
+    let providers = || {
+        ProviderLoad::for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
+            Vec::new(),
+            &loaded.parsed.providers,
+        )
+    };
+    let reporting_providers = providers();
+    let report = reporting_providers.validation_report(&loaded.parsed, project.path(), true, &[]);
+    assert!(!report.provider_type_warnings().is_empty());
+    report
+        .into_result()
+        .expect("partial annotations must defer");
+
+    providers()
+        .validate_evaluated_config(loaded.parsed.clone(), project.path(), true, &[])
+        .expect("binding readiness must retain the partial catalog");
+    providers()
+        .validate_config_pair(
+            loaded.parsed.clone(),
+            loaded.unresolved_parsed,
+            project.path(),
+            true,
+            &[],
+        )
+        .expect("paired binding readiness must retain the partial catalog");
+}
+
+#[test]
+fn settlement_includes_checks_from_binding_readiness() {
+    use carina_core::validation::deferred_types::ProviderTypeCheckSite;
+    let context = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        Vec::new(),
+        &[],
+    );
+    let parsed = carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(
+        carina_core::parser::InferredFile::default(),
+    );
+    let expected = carina_core::parser::parse_type_expr_str(
+        "Missing",
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .unwrap();
+    let report = validation_report_with(
+        &context,
+        &HashMap::new(),
+        &parsed,
+        Path::new("."),
+        true,
+        &[],
+        |_parsed, catalog| {
+            catalog.record(
+                &expected,
+                ProviderTypeCheckSite::at_line(Path::new("main.crn"), 1, 1, "binding readiness"),
+            );
+            Ok(())
+        },
+    );
+    let errors = report.into_errors();
+    assert_eq!(errors.len(), 1);
+    let message = errors[0].to_string();
+    assert!(message.contains("binding readiness"), "{message}");
+    assert!(
+        message.contains("remained deferred in a fully loaded provider catalog"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -1996,13 +2104,18 @@ fn resolve_file_for_test<E>(
 where
     E: carina_core::parser::ResolveExportBindingPhase<carina_core::resource::ParserPlaceholder>,
 {
-    carina_core::module_resolver::resolve_modules_with_providerless_config(
-        carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
+    carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
-        &carina_core::schema::SchemaRegistry::new(),
+        |session| {
+            carina_core::module_resolver::resolve_modules_with_providerless_config(
+                carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
+                std::path::Path::new("."),
+                session,
+                &carina_core::schema::SchemaRegistry::new(),
+            )
+            .expect("test fixture crosses module resolution")
+        },
     )
-    .expect("test fixture crosses module resolution")
 }
 
 fn canonical_unresolved(
@@ -2100,12 +2213,18 @@ fn build_override_aware_pair_for_test(
     inputs: LivePreApplyInputs<'_>,
 ) -> Result<(OverrideAwareResources, OverrideAwareResources), String> {
     let state = ProjectedStateRead::for_test_unmoved(state_file);
-    OverrideAwareResources::build_pair_with_stability(
-        &unresolved,
-        &state,
-        inputs,
-        &HashMap::new(),
-        OverrideAwareBuildMode::Apply,
+    carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            OverrideAwareResources::build_pair_with_stability(
+                &unresolved,
+                &state,
+                inputs,
+                &HashMap::new(),
+                OverrideAwareBuildMode::Apply,
+                session,
+            )
+        },
     )
 }
 
@@ -2140,10 +2259,11 @@ fn resolved_provider_configs_from_resolved<
         })
         .collect::<Result<HashMap<_, _>, _>>()
         .expect("test remote bindings contain no parser placeholders");
-    carina_core::parser::resolve_provider_attributes_with_remote(
-        &parsed,
-        &remote,
+    carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
+        |session| {
+            carina_core::parser::resolve_provider_attributes_with_remote(&parsed, &remote, session)
+        },
     )
     .expect("test provider configs must resolve")
 }
@@ -2659,10 +2779,11 @@ where
         .clone()
         .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("test provider config must contain no parser placeholders");
-    carina_core::parser::resolve_provider_attributes_with_remote(
-        &parsed,
-        remote,
+    carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
+        |session| {
+            carina_core::parser::resolve_provider_attributes_with_remote(&parsed, remote, session)
+        },
     )
     .expect("test provider configs must resolve")
 }
@@ -2672,10 +2793,15 @@ fn validated_provider_configs(
 ) -> carina_core::parser::ResolvedProviderConfigs {
     let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers = configs;
-    carina_core::parser::resolve_provider_attributes_with_remote(
-        &parsed,
-        &HashMap::new(),
+    carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
+        |session| {
+            carina_core::parser::resolve_provider_attributes_with_remote(
+                &parsed,
+                &HashMap::new(),
+                session,
+            )
+        },
     )
     .expect("test provider configs must resolve")
 }
@@ -5283,14 +5409,22 @@ fn removed_block_suppresses_delete_when_state_resource_is_routed_to_named_instan
 
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let no_upstreams: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    add_state_block_effects::<carina_core::resource::UnexpandedDependencyFields>(
-        &mut plan,
-        &state_blocks,
-        &Some(state_file),
-        &[],
-        &[],
-        &bindings,
-        &no_upstreams,
+    carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            add_state_block_effects::<carina_core::resource::UnexpandedDependencyFields>(
+                &mut plan,
+                &state_blocks,
+                &Some(state_file),
+                &[],
+                &[],
+                crate::wiring::StateBlockEvaluationContext {
+                    bindings: &bindings,
+                    unresolved_upstream_bindings: &no_upstreams,
+                    session,
+                },
+            )
+        },
     );
 
     let effects = plan.effects();
@@ -5362,14 +5496,22 @@ fn removed_block_does_not_suppress_deposed_generation_delete() {
     }];
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let no_upstreams: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    add_state_block_effects::<carina_core::resource::UnexpandedDependencyFields>(
-        &mut plan,
-        &state_blocks,
-        &Some(state_file),
-        &[],
-        &[],
-        &bindings,
-        &no_upstreams,
+    carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            add_state_block_effects::<carina_core::resource::UnexpandedDependencyFields>(
+                &mut plan,
+                &state_blocks,
+                &Some(state_file),
+                &[],
+                &[],
+                crate::wiring::StateBlockEvaluationContext {
+                    bindings: &bindings,
+                    unresolved_upstream_bindings: &no_upstreams,
+                    session,
+                },
+            )
+        },
     );
 
     assert!(
@@ -5471,16 +5613,24 @@ fn removed_suppresses_in_flight_orphan_error_and_keeps_deposed() {
     ));
     add_deposed_delete_effects(&mut plan, &Some(state_file.clone()), &[]);
 
-    add_state_block_effects::<carina_core::resource::UnexpandedDependencyFields>(
-        &mut plan,
-        &[StateBlock::Removed {
-            from: StateBlockAddress::new("mock", "example.Widget", "pending"),
-        }],
-        &Some(state_file),
-        &[],
-        &[] as &[Resource],
-        &carina_core::binding_index::ResolvedBindings::default(),
-        &HashSet::new(),
+    carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            add_state_block_effects::<carina_core::resource::UnexpandedDependencyFields>(
+                &mut plan,
+                &[StateBlock::Removed {
+                    from: StateBlockAddress::new("mock", "example.Widget", "pending"),
+                }],
+                &Some(state_file),
+                &[],
+                &[],
+                crate::wiring::StateBlockEvaluationContext {
+                    bindings: &carina_core::binding_index::ResolvedBindings::default(),
+                    unresolved_upstream_bindings: &HashSet::new(),
+                    session,
+                },
+            )
+        },
     );
 
     assert!(plan.errors().is_empty());
@@ -5741,14 +5891,22 @@ fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
 
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let no_upstreams: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    add_state_block_effects::<carina_core::resource::UnexpandedDependencyFields>(
-        &mut plan,
-        &state_blocks,
-        &None,
-        &[],
-        &[resource],
-        &bindings,
-        &no_upstreams,
+    carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            add_state_block_effects::<carina_core::resource::UnexpandedDependencyFields>(
+                &mut plan,
+                &state_blocks,
+                &None,
+                &[],
+                &[resource],
+                crate::wiring::StateBlockEvaluationContext {
+                    bindings: &bindings,
+                    unresolved_upstream_bindings: &no_upstreams,
+                    session,
+                },
+            )
+        },
     );
 
     let effects = plan.effects();
@@ -5829,14 +5987,22 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
     let mut plan = Plan::new();
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let no_upstreams: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    add_state_block_effects::<carina_core::resource::UnexpandedDependencyFields>(
-        &mut plan,
-        &state_blocks,
-        &state_file,
-        &[],
-        std::slice::from_ref(&resource),
-        &bindings,
-        &no_upstreams,
+    carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            add_state_block_effects::<carina_core::resource::UnexpandedDependencyFields>(
+                &mut plan,
+                &state_blocks,
+                &state_file,
+                &[],
+                std::slice::from_ref(&resource),
+                crate::wiring::StateBlockEvaluationContext {
+                    bindings: &bindings,
+                    unresolved_upstream_bindings: &no_upstreams,
+                    session,
+                },
+            )
+        },
     );
 
     assert!(matches!(plan.effects(), [Effect::Import { .. }]));
@@ -5845,14 +6011,22 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
     let removed_blocks = vec![StateBlock::Removed { from: address }];
     let mut removed_plan = Plan::new();
     removed_plan.add_error(PlanError::create_outcome_unknown(resource.id.clone()));
-    add_state_block_effects(
-        &mut removed_plan,
-        &removed_blocks,
-        &state_file,
-        &[],
-        std::slice::from_ref(&resource),
-        &bindings,
-        &no_upstreams,
+    carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            add_state_block_effects(
+                &mut removed_plan,
+                &removed_blocks,
+                &state_file,
+                &[],
+                std::slice::from_ref(&resource),
+                crate::wiring::StateBlockEvaluationContext {
+                    bindings: &bindings,
+                    unresolved_upstream_bindings: &no_upstreams,
+                    session,
+                },
+            )
+        },
     );
     assert!(matches!(removed_plan.effects(), [Effect::Remove { .. }]));
     assert!(matches!(
@@ -5924,14 +6098,22 @@ fn import_does_not_suppress_unknown_outcome_from_another_provider_instance() {
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(imported.clone())));
     plan.add_error(PlanError::create_outcome_unknown(unknown_id.clone()));
-    add_state_block_effects::<carina_core::resource::UnexpandedDependencyFields>(
-        &mut plan,
-        &state_blocks,
-        &state_file,
-        &[],
-        std::slice::from_ref(&imported),
-        &carina_core::binding_index::ResolvedBindings::default(),
-        &std::collections::HashSet::new(),
+    carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            add_state_block_effects::<carina_core::resource::UnexpandedDependencyFields>(
+                &mut plan,
+                &state_blocks,
+                &state_file,
+                &[],
+                std::slice::from_ref(&imported),
+                crate::wiring::StateBlockEvaluationContext {
+                    bindings: &carina_core::binding_index::ResolvedBindings::default(),
+                    unresolved_upstream_bindings: &std::collections::HashSet::new(),
+                    session,
+                },
+            )
+        },
     );
 
     assert!(matches!(plan.effects(), [Effect::Import { id, .. }] if id.as_inner() == &imported.id));
@@ -7247,13 +7429,18 @@ async fn prelude_multifile_plan_migrates_legacy_and_renames_named_orphan() {
         &SchemaRegistry::new(),
     )
     .expect("load multi-file fixture");
-    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-        loaded.parsed,
-        project.path(),
+    let parsed = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
-        &SchemaRegistry::new(),
-    )
-    .expect("test fixture crosses module resolution");
+        |session| {
+            carina_core::module_resolver::resolve_modules_with_providerless_config(
+                loaded.parsed,
+                project.path(),
+                session,
+                &SchemaRegistry::new(),
+            )
+            .expect("test fixture crosses module resolution")
+        },
+    );
     let provider_configs = resolved_provider_configs_from_resolved(&parsed, &HashMap::new());
     let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
         &crate::test_support::TestCommandRuntime::new(),
@@ -7431,13 +7618,18 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
         &SchemaRegistry::new(),
     )
     .expect("load multi-file fixture");
-    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-        loaded.parsed,
-        project.path(),
+    let parsed = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
-        &SchemaRegistry::new(),
-    )
-    .expect("test fixture crosses module resolution");
+        |session| {
+            carina_core::module_resolver::resolve_modules_with_providerless_config(
+                loaded.parsed,
+                project.path(),
+                session,
+                &SchemaRegistry::new(),
+            )
+            .expect("test fixture crosses module resolution")
+        },
+    );
     assert_eq!(
         parsed.deferred_for_expressions().len(),
         2,
@@ -7484,12 +7676,18 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
         .iter()
         .find(|deferred| matches!(deferred.target(), DeferredForTarget::Unbound { .. }))
         .expect("fixture has one unbound deferred loop");
-    let mut loop_children = carina_core::parser::expand_deferred_children(
-        anonymous_loop,
-        &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::String("route".into()),
-        )])),
-        carina_core::resource::AccessMissPolicy::Error,
+    let mut loop_children = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::ProviderContext::default(),
+        |session| {
+            carina_core::parser::expand_deferred_children(
+                anonymous_loop,
+                &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::String("route".into()),
+                )])),
+                carina_core::resource::AccessMissPolicy::Error,
+                session,
+            )
+        },
     )
     .expect("deferred route loop expands");
     let canonical =
@@ -8874,6 +9072,9 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         .map(|source| source.into_value_snapshot())
         .collect::<Vec<_>>();
     let input = LiveExecutionInput {
+        provider_context: carina_core::parser::ProviderContext::clone(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan_ctx.plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
@@ -9061,14 +9262,24 @@ fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
     current_states.insert(sso.id.clone(), sso_state);
 
     let empty_registry = carina_core::schema::SchemaRegistry::new();
-    let resolved = resolve_data_source_refs_for_refresh(
-        &[sso],
-        &[],
-        &[mizzy],
-        &crate::managed_current_from_states(current_states.clone()),
-        &HashMap::new(),
-        &empty_registry,
-        &[],
+    let resolved = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            resolve_data_source_refs_for_refresh(
+                &[sso],
+                &[mizzy],
+                DataSourceRefreshContext {
+                    compositions: &[],
+                    managed_current: ManagedCurrentView::base(&crate::managed_current_from_states(
+                        current_states.clone(),
+                    )),
+                    remote_bindings: &HashMap::new(),
+                    schemas: &empty_registry,
+                    wait_aliases: &[],
+                    session,
+                },
+            )
+        },
     )
     .expect("resolution should succeed");
 
@@ -9111,14 +9322,22 @@ fn resolve_data_source_refs_for_refresh_defers_unresolved_apply_time_input() {
     );
 
     let empty_registry = carina_core::schema::SchemaRegistry::new();
-    let resolved = resolve_data_source_refs_for_refresh(
-        &[target],
-        &[],
-        &[lookup],
-        &HashMap::new(),
-        &HashMap::new(),
-        &empty_registry,
-        &[],
+    let resolved = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            resolve_data_source_refs_for_refresh(
+                &[target],
+                &[lookup],
+                DataSourceRefreshContext {
+                    compositions: &[],
+                    managed_current: ManagedCurrentView::base(&HashMap::new()),
+                    remote_bindings: &HashMap::new(),
+                    schemas: &empty_registry,
+                    wait_aliases: &[],
+                    session,
+                },
+            )
+        },
     )
     .expect("resolution should classify deferred refs");
 
@@ -9152,14 +9371,22 @@ fn resolve_data_source_refs_for_refresh_defers_bare_binding_ref_to_new_resource(
     );
 
     let empty_registry = carina_core::schema::SchemaRegistry::new();
-    let resolved = resolve_data_source_refs_for_refresh(
-        &[target],
-        &[],
-        &[lookup],
-        &HashMap::new(),
-        &HashMap::new(),
-        &empty_registry,
-        &[],
+    let resolved = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            resolve_data_source_refs_for_refresh(
+                &[target],
+                &[lookup],
+                DataSourceRefreshContext {
+                    compositions: &[],
+                    managed_current: ManagedCurrentView::base(&HashMap::new()),
+                    remote_bindings: &HashMap::new(),
+                    schemas: &empty_registry,
+                    wait_aliases: &[],
+                    session,
+                },
+            )
+        },
     )
     .expect("resolution should classify bare binding refs");
 
@@ -9185,14 +9412,22 @@ fn resolve_data_source_refs_for_refresh_defers_unknown_input_instead_of_calling_
     );
 
     let empty_registry = carina_core::schema::SchemaRegistry::new();
-    let resolved = resolve_data_source_refs_for_refresh(
-        &[],
-        &[],
-        &[lookup],
-        &HashMap::new(),
-        &HashMap::new(),
-        &empty_registry,
-        &[],
+    let resolved = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            resolve_data_source_refs_for_refresh(
+                &[],
+                &[lookup],
+                DataSourceRefreshContext {
+                    compositions: &[],
+                    managed_current: ManagedCurrentView::base(&HashMap::new()),
+                    remote_bindings: &HashMap::new(),
+                    schemas: &empty_registry,
+                    wait_aliases: &[],
+                    session,
+                },
+            )
+        },
     )
     .expect("resolution should classify unknown inputs");
 
@@ -9225,14 +9460,22 @@ fn resolve_data_source_refs_for_refresh_defers_resolvable_interpolation_when_tar
     );
 
     let empty_registry = carina_core::schema::SchemaRegistry::new();
-    let resolved = resolve_data_source_refs_for_refresh(
-        &[target],
-        &[],
-        &[lookup],
-        &HashMap::new(),
-        &HashMap::new(),
-        &empty_registry,
-        &[],
+    let resolved = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            resolve_data_source_refs_for_refresh(
+                &[target],
+                &[lookup],
+                DataSourceRefreshContext {
+                    compositions: &[],
+                    managed_current: ManagedCurrentView::base(&HashMap::new()),
+                    remote_bindings: &HashMap::new(),
+                    schemas: &empty_registry,
+                    wait_aliases: &[],
+                    session,
+                },
+            )
+        },
     )
     .expect("resolution should classify new-target input as deferred");
 
@@ -9265,14 +9508,22 @@ fn resolve_data_source_refs_for_refresh_defers_folded_input_with_missing_depende
         .value_bindings
         .insert(absolute_binding("registry_publish.target"));
 
-    let resolved = resolve_data_source_refs_for_refresh(
-        &[target],
-        &[],
-        &[lookup],
-        &HashMap::new(),
-        &HashMap::new(),
-        &carina_core::schema::SchemaRegistry::new(),
-        &[],
+    let resolved = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            resolve_data_source_refs_for_refresh(
+                &[target],
+                &[lookup],
+                DataSourceRefreshContext {
+                    compositions: &[],
+                    managed_current: ManagedCurrentView::base(&HashMap::new()),
+                    remote_bindings: &HashMap::new(),
+                    schemas: &carina_core::schema::SchemaRegistry::new(),
+                    wait_aliases: &[],
+                    session,
+                },
+            )
+        },
     )
     .expect("resolution should classify the preserved dependency");
 
@@ -9321,14 +9572,24 @@ fn resolve_data_source_refs_for_refresh_does_not_treat_missing_create_only_readb
         .expect("schema fixture must be valid"),
     );
 
-    let resolved = resolve_data_source_refs_for_refresh(
-        &[target],
-        &[],
-        &[lookup],
-        &crate::managed_current_from_states(current_states.clone()),
-        &HashMap::new(),
-        &registry,
-        &[],
+    let resolved = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            resolve_data_source_refs_for_refresh(
+                &[target],
+                &[lookup],
+                DataSourceRefreshContext {
+                    compositions: &[],
+                    managed_current: ManagedCurrentView::base(&crate::managed_current_from_states(
+                        current_states.clone(),
+                    )),
+                    remote_bindings: &HashMap::new(),
+                    schemas: &registry,
+                    wait_aliases: &[],
+                    session,
+                },
+            )
+        },
     )
     .expect("resolution should not infer replacement from a missing read-back value");
 
@@ -9374,14 +9635,24 @@ fn resolve_data_source_refs_for_refresh_defers_when_any_input_references_new_res
     );
 
     let empty_registry = carina_core::schema::SchemaRegistry::new();
-    let resolved = resolve_data_source_refs_for_refresh(
-        &[existing, target],
-        &[],
-        &[lookup],
-        &crate::managed_current_from_states(current_states.clone()),
-        &HashMap::new(),
-        &empty_registry,
-        &[],
+    let resolved = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            resolve_data_source_refs_for_refresh(
+                &[existing, target],
+                &[lookup],
+                DataSourceRefreshContext {
+                    compositions: &[],
+                    managed_current: ManagedCurrentView::base(&crate::managed_current_from_states(
+                        current_states.clone(),
+                    )),
+                    remote_bindings: &HashMap::new(),
+                    schemas: &empty_registry,
+                    wait_aliases: &[],
+                    session,
+                },
+            )
+        },
     )
     .expect("resolution should classify mixed existing/new refs");
 
@@ -9420,14 +9691,22 @@ fn resolve_data_source_refs_for_refresh_defers_read_chain_from_new_resource() {
     );
 
     let empty_registry = carina_core::schema::SchemaRegistry::new();
-    let resolved = resolve_data_source_refs_for_refresh(
-        &[target],
-        &[],
-        &[first, second],
-        &HashMap::new(),
-        &HashMap::new(),
-        &empty_registry,
-        &[],
+    let resolved = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            resolve_data_source_refs_for_refresh(
+                &[target],
+                &[first, second],
+                DataSourceRefreshContext {
+                    compositions: &[],
+                    managed_current: ManagedCurrentView::base(&HashMap::new()),
+                    remote_bindings: &HashMap::new(),
+                    schemas: &empty_registry,
+                    wait_aliases: &[],
+                    session,
+                },
+            )
+        },
     )
     .expect("resolution should propagate deferred read chains");
 
@@ -9494,14 +9773,24 @@ fn resolve_data_source_refs_for_refresh_reads_existing_resource_even_when_replac
         .expect("schema fixture must be valid"),
     );
 
-    let resolved = resolve_data_source_refs_for_refresh(
-        &[target],
-        &[],
-        &[lookup],
-        &crate::managed_current_from_states(current_states.clone()),
-        &HashMap::new(),
-        &registry,
-        &[],
+    let resolved = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            resolve_data_source_refs_for_refresh(
+                &[target],
+                &[lookup],
+                DataSourceRefreshContext {
+                    compositions: &[],
+                    managed_current: ManagedCurrentView::base(&crate::managed_current_from_states(
+                        current_states.clone(),
+                    )),
+                    remote_bindings: &HashMap::new(),
+                    schemas: &registry,
+                    wait_aliases: &[],
+                    session,
+                },
+            )
+        },
     )
     .expect("resolution should classify refs to existing resources");
 
@@ -9519,58 +9808,75 @@ fn resolve_data_source_refs_for_refresh_reads_existing_resource_even_when_replac
 
 #[tokio::test]
 async fn literal_input_data_source_refresh_reads_provider_once() {
-    use carina_core::resource::DataSource;
+    carina_core::validation::deferred_types::with_session_for_test_async(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        async |session| {
+            use carina_core::resource::DataSource;
 
-    let mut lookup: DataSource = DataSource::with_provider("test", "Lookup", "roles", None);
-    lookup.attributes.insert(
-        "filter".to_string(),
-        Value::Concrete(ConcreteValue::String("literal".into())),
-    );
+            let mut lookup: DataSource = DataSource::with_provider("test", "Lookup", "roles", None);
+            lookup.attributes.insert(
+                "filter".to_string(),
+                Value::Concrete(ConcreteValue::String("literal".into())),
+            );
 
-    let empty_registry = carina_core::schema::SchemaRegistry::new();
-    let resolved = resolve_data_source_refs_for_refresh(
-        &[],
-        &[],
-        &[lookup],
-        &HashMap::new(),
-        &HashMap::new(),
-        &empty_registry,
-        &[],
+            let empty_registry = carina_core::schema::SchemaRegistry::new();
+            let resolved = carina_core::validation::deferred_types::with_session_for_test(
+                &carina_core::parser::LoadedProviderContext::empty_for_test(),
+                |session| {
+                    resolve_data_source_refs_for_refresh(
+                        &[],
+                        &[lookup],
+                        DataSourceRefreshContext {
+                            compositions: &[],
+                            managed_current: ManagedCurrentView::base(&HashMap::new()),
+                            remote_bindings: &HashMap::new(),
+                            schemas: &empty_registry,
+                            wait_aliases: &[],
+                            session,
+                        },
+                    )
+                },
+            )
+            .expect("literal inputs should be refreshable");
+
+            let provider = ReadWithRetryProvider::new(ReadBehavior::NotFound);
+            let bindings = ResolvedBindings::default();
+            let module_gate =
+                carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+            for resolution in resolved {
+                match resolution {
+                    DataSourceRefreshResolution::Resolved(resource) => {
+                        read_data_source_with_retry(
+                            &provider,
+                            &resource,
+                            &bindings,
+                            &module_gate,
+                            &[],
+                            &empty_registry,
+                            session,
+                        )
+                        .await
+                        .expect("literal input read should succeed");
+                    }
+                    DataSourceRefreshResolution::DeferredToApply { .. } => {
+                        panic!("literal input read must not be deferred");
+                    }
+                }
+            }
+
+            assert_eq!(
+                provider.data_source_read_calls(),
+                1,
+                "literal-input data source should be read exactly once during refresh",
+            );
+        },
     )
-    .expect("literal inputs should be refreshable");
-
-    let provider = ReadWithRetryProvider::new(ReadBehavior::NotFound);
-    let bindings = ResolvedBindings::default();
-    let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-    for resolution in resolved {
-        match resolution {
-            DataSourceRefreshResolution::Resolved(resource) => {
-                read_data_source_with_retry(
-                    &provider,
-                    &resource,
-                    &bindings,
-                    &module_gate,
-                    &[],
-                    &empty_registry,
-                )
-                .await
-                .expect("literal input read should succeed");
-            }
-            DataSourceRefreshResolution::DeferredToApply { .. } => {
-                panic!("literal input read must not be deferred");
-            }
-        }
-    }
-
-    assert_eq!(
-        provider.data_source_read_calls(),
-        1,
-        "literal-input data source should be read exactly once during refresh",
-    );
+    .await
 }
 
 #[tokio::test]
 async fn invalid_data_source_preparation_keeps_complete_typed_diagnostic() {
+    carina_core::validation::deferred_types::with_session_for_test_async(&carina_core::parser::LoadedProviderContext::empty_for_test(), async |session| {
     use carina_core::resource::DataSource;
 
     let lookup = <DataSource>::with_provider("test", "Lookup", "roles", None).with_attribute(
@@ -9607,6 +9913,7 @@ async fn invalid_data_source_preparation_keeps_complete_typed_diagnostic() {
         &module_gate,
         &[],
         &schemas,
+        session,
     )
     .await
     .expect_err("invalid data-source input must fail preparation");
@@ -9633,6 +9940,7 @@ async fn invalid_data_source_preparation_keeps_complete_typed_diagnostic() {
     );
     assert!(std::error::Error::source(&error).is_none());
     assert_eq!(provider.data_source_read_calls(), 0);
+}).await
 }
 
 // Two resources with unknown types must surface as two distinct
@@ -10734,13 +11042,19 @@ fn late_anonymous_identity_reconciliation_moves_deferred_legacy_row() {
     .expect("deferred map loop parses")
     .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("deferred map-loop fixture has no parser placeholders");
-    let children = carina_core::parser::expand_deferred_children(
-        &parsed.deferred_for_expressions()[0],
-        &Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-            "alpha".to_string(),
-            Value::Concrete(ConcreteValue::String("subnet-a".into())),
-        )]))),
-        carina_core::resource::AccessMissPolicy::Error,
+    let children = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::ProviderContext::default(),
+        |session| {
+            carina_core::parser::expand_deferred_children(
+                &parsed.deferred_for_expressions()[0],
+                &Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "alpha".to_string(),
+                    Value::Concrete(ConcreteValue::String("subnet-a".into())),
+                )]))),
+                carina_core::resource::AccessMissPolicy::Error,
+                session,
+            )
+        },
     )
     .expect("planning-time upstream map expands");
     assert_eq!(children[0].id.identity_str(), None);
@@ -10974,20 +11288,24 @@ fn module_checker_and_provider_wrappers_accept_empty_input() {
         &authored,
         ctx.schemas(),
         &module_signatures,
+        &carina_core::parser::ProviderContext::default(),
     );
-    let findings = carina_core::validation::check_module_calls(
-        carina_core::validation::ModuleCallCheckInput {
-            authored: &authored,
-            semantic: Some(&authored),
-            base_dir: Some(std::path::Path::new(".")),
-            imported_signatures: &module_signatures,
-            provider_context: provider_ctx,
-            schemas: ctx.schemas(),
-            binding_use_report: &binding_use_report,
-            bindings: &bindings,
-            reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
-        },
-    );
+    let findings =
+        carina_core::validation::deferred_types::with_session_for_test(provider_ctx, |session| {
+            carina_core::validation::check_module_calls(
+                carina_core::validation::ModuleCallCheckInput {
+                    authored: &authored,
+                    semantic: Some(&authored),
+                    base_dir: Some(std::path::Path::new(".")),
+                    imported_signatures: &module_signatures,
+                    provider_context: session,
+                    schemas: ctx.schemas(),
+                    binding_use_report: &binding_use_report,
+                    bindings: &bindings,
+                    reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
+                },
+            )
+        });
     assert!(findings.is_empty(), "module_calls: got {findings:?}");
 
     let errors = validate_composition_ref_types_with_ctx(&ctx, &parsed);
@@ -11353,10 +11671,17 @@ mod expand_same_config_deferred_for_tests {
         config: &ProviderContext,
     ) -> Result<carina_core::parser::ModuleResolvedParsedFile, Box<dyn std::error::Error>> {
         let parsed = parse(input, config)?;
-        Ok(carina_core::module_resolver::resolve_modules_providerless(
-            carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
-        )?)
+        carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                carina_core::module_resolver::resolve_modules_providerless(
+                    carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    std::path::Path::new("."),
+                    session,
+                )
+                .map_err(Box::<dyn std::error::Error>::from)
+            },
+        )
     }
 
     /// `let cert` (same-config) + a `for` over its provider-read
@@ -12576,10 +12901,15 @@ mod kind_default_source_tests {
     fn resolved(configs: Vec<ExpandedProviderConfig>) -> ResolvedProviderConfigs {
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers = configs;
-        carina_core::parser::resolve_provider_attributes_with_remote(
-            &parsed,
-            &std::collections::HashMap::new(),
+        carina_core::validation::deferred_types::with_session_for_test(
             &carina_core::parser::ProviderContext::default(),
+            |session| {
+                carina_core::parser::resolve_provider_attributes_with_remote(
+                    &parsed,
+                    &std::collections::HashMap::new(),
+                    session,
+                )
+            },
         )
         .unwrap()
     }
@@ -13972,10 +14302,15 @@ exports { team_prefix: String = "x" }"#,
             &[],
         );
         let ctx = wiring.context();
-        let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
-            &parsed,
-            &remote_bindings,
+        let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
             &carina_core::parser::ProviderContext::default(),
+            |session| {
+                carina_core::parser::resolve_provider_attributes_with_remote(
+                    &parsed,
+                    &remote_bindings,
+                    session,
+                )
+            },
         )
         .expect("test provider configs must resolve");
         let canonical_resources =
@@ -14052,10 +14387,15 @@ exports { team_prefix: String = "x" }"#,
             &[],
         );
         let ctx = wiring.context();
-        let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
-            &parsed,
-            &HashMap::new(),
+        let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
             &carina_core::parser::ProviderContext::default(),
+            |session| {
+                carina_core::parser::resolve_provider_attributes_with_remote(
+                    &parsed,
+                    &HashMap::new(),
+                    session,
+                )
+            },
         )
         .expect("test provider configs must resolve");
         let canonical_resources = canonical_expanded_pair(&parsed, Vec::new(), ctx.schemas());
@@ -14208,6 +14548,100 @@ exports { team_prefix: String = "x" }"#,
     }
 }
 
+#[test]
+fn settlement_loaded_validation_report_cannot_hide_pending_evidence() {
+    use carina_core::validation::deferred_types::{ProviderTypeCheckSite, TypeCheckSession};
+    let catalog = carina_core::parser::LoadedProviderContext::empty_for_test();
+    let checks = TypeCheckSession::run(&catalog, |checks| {
+        let expected = carina_core::parser::parse_type_expr_str(
+            "Typo",
+            &carina_core::parser::ProviderContext::default(),
+        )
+        .unwrap();
+        checks.record(
+            &expected,
+            ProviderTypeCheckSite::at_line(Path::new("/project/main.crn"), 2, 3, "attribute 'x'"),
+        );
+        Ok(Default::default())
+    });
+    let schemas = SchemaRegistry::new();
+    let report: ValidationReport = ValidationReport::settle(checks, &schemas);
+    let errors = report.into_errors();
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .to_string()
+            .contains("remained deferred in a fully loaded provider catalog")
+    );
+}
+
+#[test]
+fn reporting_load_findings_match_validation_source_policy() {
+    let parsed = carina_core::parser::parse_file(
+        "provider missing {}\n",
+        Path::new("main.crn"),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .unwrap();
+    let load = ProviderLoad::for_test_with_load_errors(
+        &crate::test_support::TestCommandRuntime::new(),
+        Vec::new(),
+        &parsed.providers,
+        HashMap::from([("broken".into(), "broken provider failed".into())]),
+    );
+    let load = ReportingProviderLoad {
+        context: load.context,
+        load_errors: load.load_errors,
+    };
+    let reporting = load
+        .load_findings(&parsed.providers, false)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let validation =
+        provider_load_findings(&load.context, &load.load_errors, &parsed.providers, false)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+    assert_eq!(reporting, validation);
+    let skipped = load.load_findings(&parsed.providers, true);
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0].to_string(), "broken provider failed");
+}
+
+#[test]
+fn partial_catalog_runs_loaded_resource_validation_and_honours_skip() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("main.crn"), "provider mock {}\nprovider broken {}\nmock.test.resource { name = 'bucket' bukcet = 'typo' }\n").unwrap();
+    let loaded = carina_core::config_loader::load_configuration(directory.path()).unwrap();
+    let providers = ProviderLoad::for_test_with_load_errors(
+        &crate::test_support::TestCommandRuntime::new(),
+        Vec::new(),
+        &loaded.parsed.providers,
+        HashMap::from([("broken".into(), "broken provider failed".into())]),
+    );
+    let errors = providers
+        .validation_report(&loaded.parsed, directory.path(), false, &[])
+        .into_errors();
+    let messages = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(messages.len(), 2, "{messages:#?}");
+    assert!(
+        messages.iter().any(|message| message.contains("bukcet")),
+        "{messages:#?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message == "broken provider failed"),
+        "{messages:#?}"
+    );
+    let skipped = providers
+        .validation_report(&loaded.parsed, directory.path(), true, &[])
+        .into_errors();
+    assert_eq!(skipped.len(), 1, "{skipped:#?}");
+    assert_eq!(skipped[0].to_string(), "broken provider failed");
+}
+
 fn resolved_move_pairs_for_test(
     pairs: impl IntoIterator<Item = (ResolvedResourceId, ResolvedResourceId)>,
 ) -> carina_core::effect::ResolvedMovePairs {
@@ -14258,191 +14692,212 @@ fn validate_rejects_empty_interpolation_in_attribute_param_default() {
 
 #[tokio::test]
 async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped() {
-    use carina_core::resource::Directives;
+    carina_core::validation::deferred_types::with_session_for_test_async(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        async |session| {
+            use carina_core::resource::Directives;
 
-    for explicit in [false, true] {
-        let directory = tempfile::tempdir().unwrap();
-        let state_path = directory.path().join("mock.json");
-        let maximum = directory.path().join("max");
-        let runtime = crate::test_support::TestCommandRuntime::with_mock(
-            carina_provider_mock::MockBehavior {
-                observations: carina_provider_mock::MockObservations {
-                    max_active: Some(maximum.clone()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            carina_provider_mock::MockScope::file(state_path.clone()).unwrap(),
-        );
-        let providers = if explicit {
-            parse(
-                "provider mock {}\n",
-                &carina_core::parser::ProviderContext::default(),
-            )
-            .unwrap()
-            .into_expanded(&carina_core::schema::SchemaRegistry::new())
-            .unwrap()
-            .providers
-        } else {
-            Vec::new()
-        };
-        let resolved = validated_provider_configs(providers);
-        let loaded = ProviderLoad::load(&runtime, resolved.as_provider_configs(), directory.path())
-            .unwrap()
-            .into_complete()
-            .unwrap();
-        let ctx = &loaded.context;
-        std::fs::write(&maximum, "existing observation").unwrap();
-        let _normalizers = create_normalizers_from_configs_with_ctx(ctx, &resolved)
-            .await
-            .unwrap();
-        assert!(!state_path.exists());
-        assert_eq!(
-            std::fs::read_to_string(&maximum).unwrap(),
-            "existing observation"
-        );
-        assert!(matches!(
-            ctx.provider_artifacts.get("mock"),
-            Some(LoadedProviderArtifact::BuiltIn)
-        ));
-        let provider = get_provider_with_ctx(ctx, &resolved, ProgressSink::Human)
-            .await
-            .unwrap();
-        let resource = Resource::with_provider("mock", "test.resource", "same", None)
-            .with_attribute(
-                "name",
-                Value::Concrete(ConcreteValue::String("same".into())),
-            );
-        let id = resource.id.clone();
-        let bindings = ResolvedBindings::default();
-        let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-        let preparation = carina_core::executor::ProviderPreparationContext::new(
-            &bindings,
-            &gate,
-            &[],
-            &carina_core::provider::NoopNormalizer,
-            &[],
-            ctx.schemas(),
-        );
-        let request = carina_core::executor::prepare_create_request(resource, &preparation)
-            .await
-            .unwrap();
-        let (create, cancellation) =
-            carina_core::executor::dispatch_create(&provider, &id, request);
-        create.await.unwrap();
-        drop(cancellation);
-        let identifier = carina_core::provider::AppliedIdentifier::new("mock-id").unwrap();
-        let read_id = if explicit {
-            id.clone()
-        } else {
-            let mut legacy = id.clone();
-            legacy.provider.clear();
-            legacy
-        };
-        assert!(
-            provider
-                .read(&read_id, &identifier, carina_core::provider::ReadRequest)
-                .await
-                .unwrap()
-                .into_state()
-                .exists
-        );
-        provider
-            .delete(
-                &read_id,
-                &identifier,
-                carina_core::provider::DeleteRequest::resolve(
-                    &Directives::default(),
-                    carina_core::provider::ProviderDirectiveSchema::Unavailable,
-                ),
-            )
-            .await
-            .unwrap();
-        assert!(
-            !provider
-                .read(&id, &identifier, carina_core::provider::ReadRequest)
-                .await
-                .unwrap()
-                .into_state()
-                .exists
-        );
-        assert_eq!(runtime.provider_load_count(), 1);
-    }
+            for explicit in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let state_path = directory.path().join("mock.json");
+                let maximum = directory.path().join("max");
+                let runtime = crate::test_support::TestCommandRuntime::with_mock(
+                    carina_provider_mock::MockBehavior {
+                        observations: carina_provider_mock::MockObservations {
+                            max_active: Some(maximum.clone()),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    carina_provider_mock::MockScope::file(state_path.clone()).unwrap(),
+                );
+                let providers = if explicit {
+                    parse(
+                        "provider mock {}\n",
+                        &carina_core::parser::ProviderContext::default(),
+                    )
+                    .unwrap()
+                    .into_expanded(&carina_core::schema::SchemaRegistry::new())
+                    .unwrap()
+                    .providers
+                } else {
+                    Vec::new()
+                };
+                let resolved = validated_provider_configs(providers);
+                let loaded =
+                    ProviderLoad::load(&runtime, resolved.as_provider_configs(), directory.path())
+                        .unwrap()
+                        .into_complete()
+                        .unwrap();
+                let ctx = &loaded.context;
+                std::fs::write(&maximum, "existing observation").unwrap();
+                let _normalizers = create_normalizers_from_configs_with_ctx(ctx, &resolved)
+                    .await
+                    .unwrap();
+                assert!(!state_path.exists());
+                assert_eq!(
+                    std::fs::read_to_string(&maximum).unwrap(),
+                    "existing observation"
+                );
+                assert!(matches!(
+                    ctx.provider_artifacts.get("mock"),
+                    Some(LoadedProviderArtifact::BuiltIn)
+                ));
+                let provider = get_provider_with_ctx(ctx, &resolved, ProgressSink::Human)
+                    .await
+                    .unwrap();
+                let resource = Resource::with_provider("mock", "test.resource", "same", None)
+                    .with_attribute(
+                        "name",
+                        Value::Concrete(ConcreteValue::String("same".into())),
+                    );
+                let id = resource.id.clone();
+                let bindings = ResolvedBindings::default();
+                let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &carina_core::provider::NoopNormalizer,
+                    &[],
+                    ctx.schemas(),
+                    session,
+                );
+                let request = carina_core::executor::prepare_create_request(resource, &preparation)
+                    .await
+                    .unwrap();
+                let (create, cancellation) =
+                    carina_core::executor::dispatch_create(&provider, &id, request);
+                create.await.unwrap();
+                drop(cancellation);
+                let identifier = carina_core::provider::AppliedIdentifier::new("mock-id").unwrap();
+                let read_id = if explicit {
+                    id.clone()
+                } else {
+                    let mut legacy = id.clone();
+                    legacy.provider.clear();
+                    legacy
+                };
+                assert!(
+                    provider
+                        .read(&read_id, &identifier, carina_core::provider::ReadRequest)
+                        .await
+                        .unwrap()
+                        .into_state()
+                        .exists
+                );
+                provider
+                    .delete(
+                        &read_id,
+                        &identifier,
+                        carina_core::provider::DeleteRequest::resolve(
+                            &Directives::default(),
+                            carina_core::provider::ProviderDirectiveSchema::Unavailable,
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    !provider
+                        .read(&id, &identifier, carina_core::provider::ReadRequest)
+                        .await
+                        .unwrap()
+                        .into_state()
+                        .exists
+                );
+                assert_eq!(runtime.provider_load_count(), 1);
+            }
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn round2_binding_stability_reuses_normalized_inputs() {
-    struct AlreadyNormalized;
-    impl ProviderNormalizer for AlreadyNormalized {
-        fn normalize_desired<'a>(
-            &'a self,
-            _: &'a mut [carina_core::resource::ProviderResource],
-        ) -> BoxFuture<'a, ProviderResult<()>> {
-            Box::pin(async {
-                Err(ProviderError::internal(
-                    "desired values must not be normalized again",
-                ))
-            })
-        }
-        fn normalize_state<'a>(
-            &'a self,
-            _: &'a mut carina_core::provider::StateTransformMap,
-        ) -> BoxFuture<'a, ProviderResult<()>> {
-            Box::pin(async {
-                Err(ProviderError::internal(
-                    "read values must not be normalized again",
-                ))
-            })
-        }
-        fn hydrate_read_state<'a>(
-            &'a self,
-            _: &'a mut carina_core::provider::StateTransformMap,
-            _: &'a carina_core::provider::SavedAttrs,
-        ) -> BoxFuture<'a, ProviderResult<()>> {
-            carina_core::provider::ready_noop()
-        }
-    }
-    let parsed = parse("", &carina_core::parser::ProviderContext::default())
-        .unwrap()
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
-        .unwrap();
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "test",
-        PatternResourceSchema::new("test.Widget")
-            .attribute(
-                PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+    carina_core::validation::deferred_types::with_session_for_test_async(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        async |session| {
+            struct AlreadyNormalized;
+            impl ProviderNormalizer for AlreadyNormalized {
+                fn normalize_desired<'a>(
+                    &'a self,
+                    _: &'a mut [carina_core::resource::ProviderResource],
+                ) -> BoxFuture<'a, ProviderResult<()>> {
+                    Box::pin(async {
+                        Err(ProviderError::internal(
+                            "desired values must not be normalized again",
+                        ))
+                    })
+                }
+                fn normalize_state<'a>(
+                    &'a self,
+                    _: &'a mut carina_core::provider::StateTransformMap,
+                ) -> BoxFuture<'a, ProviderResult<()>> {
+                    Box::pin(async {
+                        Err(ProviderError::internal(
+                            "read values must not be normalized again",
+                        ))
+                    })
+                }
+                fn hydrate_read_state<'a>(
+                    &'a self,
+                    _: &'a mut carina_core::provider::StateTransformMap,
+                    _: &'a carina_core::provider::SavedAttrs,
+                ) -> BoxFuture<'a, ProviderResult<()>> {
+                    carina_core::provider::ready_noop()
+                }
+            }
+            let parsed = parse("", &carina_core::parser::ProviderContext::default())
+                .unwrap()
+                .into_expanded(&carina_core::schema::SchemaRegistry::new())
+                .unwrap();
+            let mut schemas = SchemaRegistry::new();
+            schemas.insert(
+                "test",
+                PatternResourceSchema::new("test.Widget")
+                    .attribute(
+                        PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                            .build(),
+                    )
+                    .validate()
+                    .unwrap(),
+            );
+            let resource = Resource::with_provider("test", "test.Widget", "example", None)
+                .with_attribute(
+                    "name",
+                    Value::Concrete(ConcreteValue::String("normalized".into())),
+                );
+            let state = State::existing(resource.id.clone(), resource.resolved_attributes())
+                .with_identifier("id");
+            let current = HashMap::from([(resource.id.clone(), Current::from_state(state))]);
+            let mut provider =
+                comparison_provider_for_resources(&schemas, std::slice::from_ref(&resource));
+            provider.add_normalizer("test", Box::new(AlreadyNormalized));
+            let saved = carina_core::provider::RawSavedAttrs::default().lift(&schemas);
+            let stability = derive_managed_binding_stability(
+                &parsed,
+                std::slice::from_ref(&resource),
+                ManagedBindingStabilityContext {
+                    managed_current: &current,
+                    data_source_values: &DataSourceValues::empty(),
+                    schemas: &schemas,
+                    saved_attrs: &saved,
+                    prev_explicit: &HashMap::new(),
+                    remote_bindings: &HashMap::new(),
+                    wait_aliases: &[],
+                    provider: &provider,
+                    reference_preparation:
+                        &mut carina_core::references::ReferencePreparation::default(),
+                    session,
+                },
             )
-            .validate()
-            .unwrap(),
-    );
-    let resource = Resource::with_provider("test", "test.Widget", "example", None).with_attribute(
-        "name",
-        Value::Concrete(ConcreteValue::String("normalized".into())),
-    );
-    let state =
-        State::existing(resource.id.clone(), resource.resolved_attributes()).with_identifier("id");
-    let current = HashMap::from([(resource.id.clone(), Current::from_state(state))]);
-    let mut provider = comparison_provider_for_resources(&schemas, std::slice::from_ref(&resource));
-    provider.add_normalizer("test", Box::new(AlreadyNormalized));
-    let saved = carina_core::provider::RawSavedAttrs::default().lift(&schemas);
-    let stability = derive_managed_binding_stability(
-        &parsed,
-        std::slice::from_ref(&resource),
-        &current,
-        &DataSourceValues::empty(),
-        &schemas,
-        &saved,
-        &HashMap::new(),
-        &HashMap::new(),
-        &[],
-        &provider,
-        &mut carina_core::references::ReferencePreparation::default(),
+            .await
+            .unwrap();
+            assert_eq!(
+                stability[&resource.id],
+                carina_core::binding_index::ManagedBindingStability::NoPlannedEffect
+            );
+        },
     )
-    .await
-    .unwrap();
-    assert_eq!(
-        stability[&resource.id],
-        carina_core::binding_index::ManagedBindingStability::NoPlannedEffect
-    );
+    .await;
 }

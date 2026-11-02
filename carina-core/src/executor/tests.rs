@@ -121,21 +121,21 @@ fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
     ResolvedDataSource::new(resource.with_dependency_phase(()))
 }
 
-fn test_data_source_values(
+fn test_data_source_values<P: crate::resource::StateValueLeaf>(
     data_sources: &[DataSource],
-    states: &HashMap<ResourceId, State>,
+    states: &HashMap<ResourceId, crate::resource::State<P>>,
 ) -> DataSourceValues {
     DataSourceValues::from_data_sources(data_sources, |data_source| {
         states.get(&data_source.id).map_or_else(
             || DataSourceValue::deferred_to_apply(Vec::new()),
-            |state| DataSourceValue::read(state.clone()),
+            |state| DataSourceValue::read(state.to_snapshot()),
         )
     })
 }
 
-fn executable_data_source_values(
+fn executable_data_source_values<P: crate::resource::StateValueLeaf>(
     data_sources: &[DataSource],
-    states: &HashMap<ResourceId, State>,
+    states: &HashMap<ResourceId, crate::resource::State<P>>,
 ) -> ExecutableDataSourceValues {
     test_data_source_values(data_sources, states)
         .into_executable()
@@ -248,69 +248,83 @@ fn anonymous_deferred_collision_fixture() -> (
     SchemaRegistry,
     Resource,
 ) {
-    let parsed = crate::parser::parse_file(
-        "let upstream = upstream_state { source = '../upstream' }\n\
-         for value in upstream.values {\n\
-           mock.test.Child { identity_input = value }\n\
-         }\n",
-        std::path::Path::new("main.crn"),
-        &crate::parser::ProviderContext::default(),
-    )
-    .expect("unbound deferred loop parses");
-    let parsed = crate::module_resolver::resolve_modules_providerless(
-        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
-    )
-    .expect("deferred fixture crosses the module-resolution seam")
-    .into_expanded(&crate::schema::SchemaRegistry::new())
-    .expect("deferred-loop fixture contains no parser placeholders");
-    let raw_template = parsed.deferred_for_expressions()[0].clone();
-    let graph = crate::resolved_graph::resolve_expanded_graph(parsed.into())
-        .expect("fixture upstream graph");
-    let (template, dependencies) = graph
-        .compile_deferred_for(raw_template.clone())
-        .expect("fixture loop dependency projection");
-    let mut bindings = ResolvedBindings::default();
-    bindings.set_with_completeness(
-        "upstream",
-        HashMap::from([(
-            "values".to_string(),
-            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("stable".into()),
-            )])),
-        )]),
-        crate::binding_index::BindingValueSource::Upstream,
-        crate::binding_index::BindingCompleteness::Complete,
-    );
-    let schema = PatternResourceSchema::new("test.Child").attribute(
-        PatternAttributeSchema::optional("identity_input", PatternAttributeType::string())
-            .create_only()
-            .build(),
-    );
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "mock",
-        schema.validate().expect("schema fixture must be valid"),
-    );
-    let children = deferred_dispatch::materialize_deferred_create(
-        &template,
-        &dependencies,
-        &bindings,
-        &deferred_dispatch::DeferredIdentityInputs {
-            provider_configs: &[],
-            factories: &[],
-            schemas: &schemas,
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            let parsed = crate::parser::parse_file(
+                "let upstream = upstream_state { source = '../upstream' }\n\
+                 for value in upstream.values {\n\
+                   mock.test.Child { identity_input = value }\n\
+                 }\n",
+                std::path::Path::new("main.crn"),
+                &crate::parser::ProviderContext::default(),
+            )
+            .expect("unbound deferred loop parses");
+            let parsed = crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::ProviderContext::default(),
+                |session| {
+                    crate::module_resolver::resolve_modules_providerless(
+                        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                        std::path::Path::new("."),
+                        session,
+                    )
+                    .map_err(Box::new)
+                },
+            )
+            .map_err(|error| *error)
+            .expect("deferred fixture crosses the module-resolution seam")
+            .into_expanded(&crate::schema::SchemaRegistry::new())
+            .expect("deferred-loop fixture contains no parser placeholders");
+            let raw_template = parsed.deferred_for_expressions()[0].clone();
+            let graph = crate::resolved_graph::resolve_expanded_graph(parsed.into())
+                .expect("fixture upstream graph");
+            let (template, dependencies) = graph
+                .compile_deferred_for(raw_template.clone())
+                .expect("fixture loop dependency projection");
+            let mut bindings = ResolvedBindings::default();
+            bindings.set_with_completeness(
+                "upstream",
+                HashMap::from([(
+                    "values".to_string(),
+                    Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                        ConcreteValue::String("stable".into()),
+                    )])),
+                )]),
+                crate::binding_index::BindingValueSource::Upstream,
+                crate::binding_index::BindingCompleteness::Complete,
+            );
+            let schema = PatternResourceSchema::new("test.Child").attribute(
+                PatternAttributeSchema::optional("identity_input", PatternAttributeType::string())
+                    .create_only()
+                    .build(),
+            );
+            let mut schemas = SchemaRegistry::new();
+            schemas.insert(
+                "mock",
+                schema.validate().expect("schema fixture must be valid"),
+            );
+            let children = deferred_dispatch::materialize_deferred_create(
+                &template,
+                &dependencies,
+                &bindings,
+                &deferred_dispatch::DeferredIdentityInputs {
+                    type_checks: session,
+                    provider_configs: &[],
+                    factories: &[],
+                    schemas: &schemas,
+                },
+            )
+            .expect("fixture child materializes");
+            let [Effect::Create(child)] = children.as_slice() else {
+                panic!("fixture must produce one create");
+            };
+            let mut unresolved_child = Resource::from_id(child.id.clone());
+            unresolved_child.attributes = child.attributes.clone();
+            unresolved_child.binding = child.binding.clone();
+
+            (raw_template, bindings, schemas, unresolved_child)
         },
     )
-    .expect("fixture child materializes");
-    let [Effect::Create(child)] = children.as_slice() else {
-        panic!("fixture must produce one create");
-    };
-    let mut unresolved_child = Resource::from_id(child.id.clone());
-    unresolved_child.attributes = child.attributes.clone();
-    unresolved_child.binding = child.binding.clone();
-
-    (raw_template, bindings, schemas, unresolved_child)
 }
 
 #[test]
@@ -599,8 +613,11 @@ fn applied_state_for_test(state: State) -> AppliedState {
     let identifier = state
         .identifier
         .expect("mutation fixtures must carry a provider identifier");
-    AppliedState::new(state.id, identifier, state.attributes)
-        .expect("mutation fixture identifier must be non-empty")
+    AppliedState::from_snapshot_parts(
+        state.id,
+        AppliedIdentifier::new(identifier).expect("mutation fixture identifier must be non-empty"),
+        state.attributes,
+    )
 }
 
 impl Provider for MockProvider {
@@ -629,7 +646,7 @@ impl Provider for MockProvider {
     fn read_data_source(
         &self,
         resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
         self.data_source_reads
             .lock()
             .unwrap()
@@ -639,7 +656,7 @@ impl Provider for MockProvider {
             .unwrap()
             .push(("read".to_string(), resource.id.to_string()));
         let result = self.read_results.lock().unwrap().remove(0);
-        Box::pin(async move { result })
+        Box::pin(async move { result.map(crate::test_support::available_state) })
     }
 
     fn create(
@@ -768,7 +785,9 @@ impl Provider for MockProvider {
                     Ok(resumed.partial(
                         HashMap::from([(
                             "id".to_string(),
-                            Value::Concrete(ConcreteValue::String(identifier.into())),
+                            crate::resource::Value::Concrete(
+                                crate::resource::ConcreteValue::String(identifier.into()),
+                            ),
                         )]),
                         crate::provider::PartialReadDiagnostic::new(
                             "resumed read-back is incomplete".into(),
@@ -1080,9 +1099,11 @@ struct CanonicalizingNormalizer;
 fn canonicalize_value(v: &Value) -> Option<Value> {
     match v {
         Value::Concrete(ConcreteValue::String(s)) if s == "raw_dsl" => {
-            Some(Value::Concrete(ConcreteValue::String("CANONICAL".into())))
+            Some(crate::resource::Value::Concrete(
+                crate::resource::ConcreteValue::String("CANONICAL".into()),
+            ))
         }
-        Value::Concrete(ConcreteValue::Map(m)) => {
+        crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(m)) => {
             let mut out = m.clone();
             let mut changed = false;
             for (k, val) in m {
@@ -1093,7 +1114,7 @@ fn canonicalize_value(v: &Value) -> Option<Value> {
             }
             changed.then_some(Value::Concrete(ConcreteValue::Map(out)))
         }
-        Value::Concrete(ConcreteValue::List(items)) => {
+        crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(items)) => {
             let mut out = items.clone();
             let mut changed = false;
             for (i, item) in items.iter().enumerate() {
@@ -1153,9 +1174,12 @@ impl crate::provider::ProviderNormalizer for SecretListToScalarNormalizer {
     ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         Box::pin(async move {
             for resource in resources {
-                if let Some(Value::Concrete(ConcreteValue::List(items))) =
-                    resource.get_attr("master_password")
-                    && let Some(Value::Concrete(ConcreteValue::String(first))) = items.first()
+                if let Some(crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(
+                    items,
+                ))) = resource.get_attr("master_password")
+                    && let Some(crate::resource::Value::Concrete(
+                        crate::resource::ConcreteValue::String(first),
+                    )) = items.first()
                 {
                     resource.set_attr(
                         "master_password",
@@ -1430,7 +1454,8 @@ fn ok_state(id: &ResourceId) -> State {
         "id".to_string(),
         Value::Concrete(ConcreteValue::String("id-123".into())),
     );
-    State::existing(id.clone(), attrs).with_identifier("id-123")
+    State::existing(id.clone(), crate::test_support::snapshot_attributes(attrs))
+        .with_identifier("id-123")
 }
 
 fn empty_execution_result() -> ExecutionResult {
@@ -1531,7 +1556,7 @@ impl Provider for DelayedCountingProvider {
     fn read_data_source(
         &self,
         _resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
         Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
     }
 
@@ -1661,7 +1686,8 @@ impl Provider for PendingWaitProvider {
                 Value::Concrete(ConcreteValue::String("PENDING".into())),
             );
             Ok(fixture_read_outcome(
-                State::existing(id, attrs).with_identifier("pending-id"),
+                State::existing(id, crate::test_support::snapshot_attributes(attrs))
+                    .with_identifier("pending-id"),
             ))
         })
     }
@@ -1669,7 +1695,7 @@ impl Provider for PendingWaitProvider {
     fn read_data_source(
         &self,
         _resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
         Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
     }
 
@@ -1909,7 +1935,7 @@ impl Provider for PendingRefreshProvider {
     fn read_data_source(
         &self,
         _resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
         Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
     }
 
@@ -1991,7 +2017,7 @@ impl Provider for CheckpointBlockingProvider {
     fn read_data_source(
         &self,
         _resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
         Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
     }
 
@@ -2077,7 +2103,7 @@ impl Provider for ControlledReadyCreateProvider {
     fn read_data_source(
         &self,
         _resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
         Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
     }
 
@@ -2160,6 +2186,71 @@ fn execution_outcome_completed_and_cancelled_are_matchable() {
 }
 
 #[tokio::test]
+async fn unsettled_loaded_type_check_blocks_create_dispatch() {
+    let provider = MockProvider::new();
+    let resource = make_resource("one", &[]);
+    let rid = resource.id.clone();
+    let mut plan = Plan::new();
+    plan.add(create_effect(resource));
+    provider.push_create(Ok(ok_state(&rid)));
+    let catalog = crate::parser::LoadedProviderContext::empty_for_test();
+    let observer = MockObserver::new();
+    let (schemas, comparison_provider) = crate::provider::comparison_fixture_for_test(
+        &TEST_SCHEMAS,
+        plan.effects().iter().map(Effect::resource_id),
+    );
+    let checks = crate::validation::deferred_types::TypeCheckSession::run_async(
+        &catalog,
+        async |type_checks| {
+            type_checks.record(
+                &crate::parser::TypeExpr::String,
+                crate::validation::deferred_types::ProviderTypeCheckSite::at_line(
+                    std::path::Path::new("main.crn"),
+                    1,
+                    1,
+                    "pending runtime check",
+                ),
+            );
+            let input = ExecutionInput {
+                provider_context: catalog.as_provider_context().clone(),
+                plan: &plan,
+                provider_check_inputs: ProviderCheckInputs::Authored,
+                compositions: &[],
+                bindings: ResolvedBindings::default(),
+                managed_current: HashMap::new(),
+                data_source_values: ExecutableDataSourceValues::empty(),
+                normalizer: &NoopNormalizer,
+                provider_configs: &[],
+                factories: &[],
+                schemas: &schemas,
+                parallelism: crate::executor::TEST_UNCAPPED,
+                precompleted_success_count: 0,
+                checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
+            };
+            execute_runtime_plan(
+                &provider,
+                &comparison_provider,
+                input.in_session(type_checks),
+                &observer,
+                uncancelled_shutdown(),
+            )
+            .await
+        },
+    )
+    .await;
+    let outcome = publish_execution_checks(checks);
+    let ExecutionOutcome::Completed(result) = outcome else {
+        panic!("uncancelled execution")
+    };
+    assert_eq!(result.failure_count(), 1);
+    assert!(
+        provider.calls().is_empty(),
+        "an unsettled check must block create dispatch"
+    );
+    assert_eq!(result.success_count, 0);
+}
+
+#[tokio::test]
 async fn execute_plan_returns_completed_when_not_cancelled() {
     let provider = MockProvider::new();
     let resource = make_resource("one", &[]);
@@ -2171,6 +2262,9 @@ async fn execute_plan_returns_completed_when_not_cancelled() {
     provider.push_create(Ok(ok_state(&rid)));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -2220,6 +2314,9 @@ async fn checkpoint_sink_receives_each_completed_effect_before_execution_ends() 
             .expect("checkpoint receiver must remain alive");
     });
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -2273,6 +2370,9 @@ async fn precompleted_state_only_result_is_checkpointed_before_provider_completi
     plan.add(create_effect(resource));
     let (checkpoint_tx, mut checkpoint_rx) = tokio::sync::mpsc::unbounded_channel();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -2354,6 +2454,9 @@ async fn execute_lifecycle_fixture_with_observer(
     observer: &MockObserver,
 ) -> ExecutionResult {
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -2795,43 +2898,53 @@ async fn resume_dispatch_validates_resent_sent_against_checked_request() {
     let pending = persisted_unissued_create_for_executor(&id);
     let bindings = ResolvedBindings::default();
     let module_gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
-    let preparation = crate::executor::ProviderPreparationContext::new(
-        &bindings,
-        &module_gate,
-        &[],
-        &NoopNormalizer,
-        &[],
-        &TEST_SCHEMAS,
-    );
-    let request = crate::executor::prepare_create_request(resource, &preparation)
-        .await
-        .expect("fixture request passes provider preparation");
-    let request = crate::provider::ResumeCreateRequest::new(pending, request)
-        .expect("fixture continuation and request share a route");
+    crate::validation::deferred_types::with_session_for_test_async(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        async |type_checks| {
+            let preparation = crate::executor::ProviderPreparationContext::new(
+                &bindings,
+                &module_gate,
+                &[],
+                &NoopNormalizer,
+                &[],
+                &TEST_SCHEMAS,
+                type_checks,
+            );
+            let request = crate::executor::prepare_create_request(resource, &preparation)
+                .await
+                .expect("fixture request passes provider preparation");
+            let request = crate::provider::ResumeCreateRequest::new(pending, request)
+                .expect("fixture continuation and request share a route");
 
-    let failure = crate::executor::dispatch_resume_create(&provider, request)
-        .await
-        .expect_err("resent pending fixture returns a classified failure");
-    let crate::provider::ResumeFailureKind::InFlight { pending, error } = failure.into_kind()
-    else {
-        panic!("resent pending classification was not preserved");
-    };
-    assert_eq!(
-        pending.sent(),
-        crate::provider::SentRecord::Request(crate::provider::Sent::only(Vec::<String>::new()))
-    );
-    assert_eq!(
-        error.detail().context(),
-        "provider returned sent attributes outside the checked create request"
-    );
-    assert_eq!(
-        error
-            .detail()
-            .cause()
-            .expect("boundary validation retains the typed provider cause")
-            .to_string(),
-        "resent create is pending"
-    );
+            let failure = crate::executor::dispatch_resume_create(&provider, request)
+                .await
+                .expect_err("resent pending fixture returns a classified failure");
+            let crate::provider::ResumeFailureKind::InFlight { pending, error } =
+                failure.into_kind()
+            else {
+                panic!("resent pending classification was not preserved");
+            };
+            assert_eq!(
+                pending.sent(),
+                crate::provider::SentRecord::Request(crate::provider::Sent::only(
+                    Vec::<String>::new()
+                ))
+            );
+            assert_eq!(
+                error.detail().context(),
+                "provider returned sent attributes outside the checked create request"
+            );
+            assert_eq!(
+                error
+                    .detail()
+                    .cause()
+                    .expect("boundary validation retains the typed provider cause")
+                    .to_string(),
+                "resent create is pending"
+            );
+        },
+    )
+    .await
 }
 
 #[tokio::test]
@@ -2882,7 +2995,7 @@ async fn create_before_destroy_outcome_unknown_records_replacement_create_state(
     let result = execute_lifecycle_fixture(
         &provider,
         &plan,
-        HashMap::from([(source_id.clone(), Current::from_state(old))]),
+        HashMap::from([(source_id.clone(), Current::from_snapshot(old))]),
     )
     .await;
 
@@ -3335,6 +3448,9 @@ async fn invalid_resolved_create_value_never_reaches_provider() {
     provider.push_create(Ok(ok_state(&id)));
     let schemas = provider_boundary_constraint_schemas();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -3398,6 +3514,9 @@ async fn invalid_secret_create_value_is_masked_and_never_reaches_provider() {
     let schemas = provider_boundary_constraint_schemas();
     let observer = MockObserver::new();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved,
@@ -3468,6 +3587,9 @@ async fn invalid_resolved_value_is_rejected_before_provider_normalization() {
     plan.add(create_effect(resource));
     let schemas = provider_boundary_constraint_schemas();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -3563,6 +3685,9 @@ async fn runtime_integer_arithmetic_failures_abort_before_dependent_provider_cal
         );
         let observer = MockObserver::new();
         let input = ExecutionInput {
+            provider_context: crate::parser::ProviderContext::clone(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+            ),
             plan: &plan,
             provider_check_inputs: ProviderCheckInputs::Authored,
             compositions: &[],
@@ -3609,10 +3734,10 @@ async fn invalid_resolved_update_value_never_reaches_provider() {
     let id = resource.id.clone();
     let from = State::existing(
         id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "target".to_string(),
             Value::Concrete(ConcreteValue::String("good-before".into())),
-        )]),
+        )])),
     )
     .with_identifier("id-123");
     let mut plan = Plan::new();
@@ -3627,6 +3752,9 @@ async fn invalid_resolved_update_value_never_reaches_provider() {
     provider.push_update(Ok(ok_state(&id)));
     let schemas = provider_boundary_constraint_schemas();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -3659,79 +3787,89 @@ async fn invalid_resolved_update_value_never_reaches_provider() {
 
 #[tokio::test]
 async fn execute_plan_missing_update_schema_fails_before_provider_update() {
-    let provider = MockProvider::new();
-    let mut resource = Resource::with_provider("missing", "missing.resource", "no-schema", None);
-    resource.set_attr(
-        "description",
-        Value::Concrete(ConcreteValue::String("after".into())),
-    );
-    let id = resource.id.clone();
-    let from = State::existing(
-        id.clone(),
-        HashMap::from([(
-            "description".to_string(),
-            Value::Concrete(ConcreteValue::String("before".into())),
-        )]),
+    crate::validation::deferred_types::with_session_for_test_async(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        async |session| {
+            let provider = MockProvider::new();
+            let mut resource =
+                Resource::with_provider("missing", "missing.resource", "no-schema", None);
+            resource.set_attr(
+                "description",
+                Value::Concrete(ConcreteValue::String("after".into())),
+            );
+            let id = resource.id.clone();
+            let from = State::existing(
+                id.clone(),
+                crate::test_support::snapshot_attributes(HashMap::from([(
+                    "description".to_string(),
+                    Value::Concrete(ConcreteValue::String("before".into())),
+                )])),
+            )
+            .with_identifier("id-123");
+            let mut plan = Plan::new();
+            plan.add(Effect::Update {
+                identifier: crate::effect::fixture_applied_identifier("id-123"),
+                from: Box::new(from),
+                to: resolved(resource),
+                changed_attributes: vec!["description".to_string()],
+            });
+            provider.push_update(Ok(ok_state(&id)));
+            let schemas = SchemaRegistry::new();
+            let input = ExecutionInput {
+                provider_context: crate::parser::ProviderContext::clone(
+                    &crate::parser::LoadedProviderContext::empty_for_test(),
+                ),
+                plan: &plan,
+                provider_check_inputs: ProviderCheckInputs::Authored,
+                compositions: &[],
+                bindings: ResolvedBindings::default(),
+                managed_current: HashMap::new(),
+                data_source_values: ExecutableDataSourceValues::empty(),
+                normalizer: &NoopNormalizer,
+                provider_configs: &[],
+                factories: &[],
+                schemas: &schemas,
+                parallelism: crate::executor::TEST_UNCAPPED,
+                precompleted_success_count: 0,
+                checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
+            };
+            let observer = MockObserver::new();
+
+            // Deliberately bypass the convenience fixture that supplies empty schemas:
+            // this test verifies the production boundary rejects an absent schema.
+            let comparison_provider = crate::provider::ProviderRouter::new();
+            let result = completed_result(
+                execute_runtime_plan(
+                    &provider,
+                    &comparison_provider,
+                    input.in_session(session),
+                    &observer,
+                    uncancelled_shutdown(),
+                )
+                .await,
+            );
+
+            assert_eq!(result.success_count, 0);
+            assert_eq!(result.failure_count(), 1);
+            let events = observer.events();
+            assert!(
+                events.iter().any(|event| {
+                    event.starts_with(&format!("failed:{id}:"))
+                        && event.contains("no managed schema is registered")
+                }),
+                "missing schema must be reported through EffectFailed: {events:?}"
+            );
+            assert!(
+                provider
+                    .calls()
+                    .iter()
+                    .all(|(operation, _)| operation != "update"),
+                "provider update must not run when the managed schema is missing"
+            );
+            assert!(provider.captured_update_requests().is_empty());
+        },
     )
-    .with_identifier("id-123");
-    let mut plan = Plan::new();
-    plan.add(Effect::Update {
-        identifier: crate::effect::fixture_applied_identifier("id-123"),
-        from: Box::new(from),
-        to: resolved(resource),
-        changed_attributes: vec!["description".to_string()],
-    });
-    provider.push_update(Ok(ok_state(&id)));
-    let schemas = SchemaRegistry::new();
-    let input = ExecutionInput {
-        plan: &plan,
-        provider_check_inputs: ProviderCheckInputs::Authored,
-        compositions: &[],
-        bindings: ResolvedBindings::default(),
-        managed_current: HashMap::new(),
-        data_source_values: ExecutableDataSourceValues::empty(),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &schemas,
-        parallelism: crate::executor::TEST_UNCAPPED,
-        precompleted_success_count: 0,
-        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
-    };
-    let observer = MockObserver::new();
-
-    // Deliberately bypass the convenience fixture that supplies empty schemas:
-    // this test verifies the production boundary rejects an absent schema.
-    let comparison_provider = crate::provider::ProviderRouter::new();
-    let result = completed_result(
-        execute_runtime_plan(
-            &provider,
-            &comparison_provider,
-            input.into(),
-            &observer,
-            uncancelled_shutdown(),
-        )
-        .await,
-    );
-
-    assert_eq!(result.success_count, 0);
-    assert_eq!(result.failure_count(), 1);
-    let events = observer.events();
-    assert!(
-        events.iter().any(|event| {
-            event.starts_with(&format!("failed:{id}:"))
-                && event.contains("no managed schema is registered")
-        }),
-        "missing schema must be reported through EffectFailed: {events:?}"
-    );
-    assert!(
-        provider
-            .calls()
-            .iter()
-            .all(|(operation, _)| operation != "update"),
-        "provider update must not run when the managed schema is missing"
-    );
-    assert!(provider.captured_update_requests().is_empty());
+    .await
 }
 
 #[tokio::test]
@@ -3765,7 +3903,7 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
     let update_id = updated.id.clone();
     let from = State::existing(
         update_id.clone(),
-        HashMap::from([
+        crate::test_support::snapshot_attributes(HashMap::from([
             (
                 "target".to_string(),
                 Value::Concrete(ConcreteValue::String("good-before".into())),
@@ -3785,7 +3923,7 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
                     Value::Concrete(ConcreteValue::String("https://issuer.example.com".into())),
                 )]))),
             ),
-        ]),
+        ])),
     )
     .with_identifier("id-123");
 
@@ -3803,6 +3941,9 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
     provider.push_update(Ok(ok_state(&update_id)));
     let schemas = provider_boundary_constraint_schemas();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -3892,10 +4033,10 @@ async fn absent_entirely_write_only_struct_stays_reassert_during_apply_augmentat
     let id = updated.id.clone();
     let from = State::existing(
         id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "target".to_string(),
             Value::Concrete(ConcreteValue::String("good-before".into())),
-        )]),
+        )])),
     )
     .with_identifier("id-123");
     let mut plan = Plan::new();
@@ -3943,6 +4084,9 @@ async fn absent_entirely_write_only_struct_stays_reassert_during_apply_augmentat
         .expect("schema fixture must be valid"),
     );
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -4001,10 +4145,10 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_create() {
 
     provider.push_create(Ok(State::existing(
         producer_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "value".to_string(),
             Value::Concrete(ConcreteValue::String("bad".into())),
-        )]),
+        )])),
     )
     .with_identifier("producer-id")));
 
@@ -4031,6 +4175,9 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_create() {
     });
     let schemas = provider_boundary_constraint_schemas();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved,
@@ -4091,19 +4238,19 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_update() {
     let consumer_id = planned_consumer.id.clone();
     let from = State::existing(
         consumer_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "target".to_string(),
             Value::Concrete(ConcreteValue::String("good-before".into())),
-        )]),
+        )])),
     )
     .with_identifier("consumer-id");
 
     provider.push_create(Ok(State::existing(
         producer_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "value".to_string(),
             Value::Concrete(ConcreteValue::String("bad".into())),
-        )]),
+        )])),
     )
     .with_identifier("producer-id")));
 
@@ -4139,6 +4286,9 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_update() {
     });
     let schemas = provider_boundary_constraint_schemas();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved,
@@ -4183,7 +4333,7 @@ async fn invalid_apply_time_value_blocks_deferred_dispatch_child() {
     let cert_id = cert.id.clone();
     provider.push_create(Ok(State::existing(
         cert_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "domain_validation_options".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::Map(indexmap::IndexMap::from([(
@@ -4200,7 +4350,7 @@ async fn invalid_apply_time_value_blocks_deferred_dispatch_child() {
                     ]))),
                 )])),
             )])),
-        )]),
+        )])),
     )
     .with_identifier("cert-id")));
 
@@ -4211,6 +4361,9 @@ async fn invalid_apply_time_value_blocks_deferred_dispatch_child() {
     )));
     let schemas = deferred_child_constraint_schemas();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -4261,10 +4414,10 @@ async fn invalid_deferred_data_source_input_never_reaches_provider() {
 
     provider.push_create(Ok(State::existing(
         upstream_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "value".to_string(),
             Value::Concrete(ConcreteValue::String("bad".into())),
-        )]),
+        )])),
     )
     .with_identifier("producer-id")));
     provider.push_read(Ok(State::existing(data_source_id.clone(), HashMap::new())));
@@ -4284,7 +4437,7 @@ async fn invalid_deferred_data_source_input_never_reaches_provider() {
         managed: &[upstream],
         compositions: &[],
         managed_current: &HashMap::new(),
-        data_source_values: &test_data_source_values(
+        data_source_values: &test_data_source_values::<crate::resource::SnapshotLeaf>(
             std::slice::from_ref(&data_source),
             &HashMap::new(),
         ),
@@ -4293,6 +4446,9 @@ async fn invalid_deferred_data_source_input_never_reaches_provider() {
     });
     let schemas = deferred_data_source_constraint_schemas();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -4346,10 +4502,10 @@ async fn plan_normalized_apply_resolved_data_source_schema_violation_blocks_read
 
     provider.push_create(Ok(State::existing(
         upstream_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "value".to_string(),
             Value::Concrete(ConcreteValue::String("bad".into())),
-        )]),
+        )])),
     )
     .with_identifier("producer-id")));
     provider.push_read(Ok(State::existing(data_source_id.clone(), HashMap::new())));
@@ -4369,7 +4525,7 @@ async fn plan_normalized_apply_resolved_data_source_schema_violation_blocks_read
         managed: std::slice::from_ref(&upstream),
         compositions: &[],
         managed_current: &HashMap::new(),
-        data_source_values: &test_data_source_values(
+        data_source_values: &test_data_source_values::<crate::resource::SnapshotLeaf>(
             std::slice::from_ref(&data_source),
             &HashMap::new(),
         ),
@@ -4379,6 +4535,9 @@ async fn plan_normalized_apply_resolved_data_source_schema_violation_blocks_read
     let schemas = deferred_data_source_constraint_schemas();
     let data_source_origin = data_source.clone().into_value_snapshot();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &resource_origins,
@@ -4527,10 +4686,10 @@ async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read
 
     provider.push_create(Ok(State::existing(
         upstream_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "value".to_string(),
             Value::Concrete(ConcreteValue::String("bad".into())),
-        )]),
+        )])),
     )
     .with_identifier("producer-id")));
     provider.push_read(Ok(State::existing(data_source_id.clone(), HashMap::new())));
@@ -4558,7 +4717,7 @@ async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read
         managed: std::slice::from_ref(&upstream),
         compositions: std::slice::from_ref(&composition),
         managed_current: &HashMap::new(),
-        data_source_values: &test_data_source_values(
+        data_source_values: &test_data_source_values::<crate::resource::SnapshotLeaf>(
             std::slice::from_ref(&data_source),
             &HashMap::new(),
         ),
@@ -4568,6 +4727,9 @@ async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read
     let schemas = SchemaRegistry::new();
     let data_source_origin = data_source.clone().into_value_snapshot();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &resource_origins,
@@ -4661,7 +4823,7 @@ async fn pending_module_validation_and_require_block_first_consuming_effect() {
 
     provider.push_create(Ok(State::existing(
         producer_id.clone(),
-        HashMap::from([
+        crate::test_support::snapshot_attributes(HashMap::from([
             (
                 "value".to_string(),
                 Value::Concrete(ConcreteValue::String("bad".into())),
@@ -4670,7 +4832,7 @@ async fn pending_module_validation_and_require_block_first_consuming_effect() {
                 "other".to_string(),
                 Value::Concrete(ConcreteValue::String("different".into())),
             ),
-        ]),
+        ])),
     )
     .with_identifier("producer-id")));
     provider.push_create(Ok(ok_state(&consumer_id)));
@@ -4678,6 +4840,9 @@ async fn pending_module_validation_and_require_block_first_consuming_effect() {
     let plan = create_plan_from_fixture_resources(vec![producer, consumer]);
     let observer = MockObserver::new();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
@@ -4748,6 +4913,9 @@ async fn nested_forwarded_module_constraint_blocks_provider_dispatch() {
     plan.add(create_effect(resource));
     let observer = MockObserver::new();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
@@ -4811,6 +4979,9 @@ async fn outer_module_constraint_blocks_nested_inner_consumer_provider_dispatch(
     let mut plan = Plan::new();
     plan.add(create_effect(inner_resource));
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&outer),
@@ -4883,6 +5054,9 @@ async fn module_export_constraint_blocks_top_level_consumer_provider_dispatch() 
     let mut plan = Plan::new();
     plan.add(create_effect(top_level));
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
@@ -4937,6 +5111,9 @@ async fn repeated_module_violation_blocks_every_dispatch_but_reports_once() {
     plan.add(create_effect(second));
     let observer = MockObserver::new();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
@@ -5002,16 +5179,19 @@ async fn module_constraint_rechecks_after_binding_changes_in_same_apply() {
     provider.push_create(Ok(ok_state(&first_id)));
     provider.push_create(Ok(State::existing(
         updater_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "value".to_string(),
             Value::Concrete(ConcreteValue::String("bad".into())),
-        )]),
+        )])),
     )
     .with_identifier("source-id")));
     provider.push_create(Ok(ok_state(&second_id)));
 
     let plan = create_plan_from_fixture_resources(vec![first, updater, second]);
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
@@ -5067,6 +5247,9 @@ async fn unresolved_instance_constraint_waits_for_terminal_sweep() {
     provider.push_create(Ok(ok_state(&resource_id)));
     let observer = MockObserver::new();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
@@ -5118,10 +5301,10 @@ async fn unapplied_module_argument_reference_stays_pending_at_early_gate() {
     provider.push_create(Ok(ok_state(&early_id)));
     provider.push_create(Ok(State::existing(
         producer_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "value".to_string(),
             Value::Concrete(ConcreteValue::String("good".into())),
-        )]),
+        )])),
     )
     .with_identifier("producer-id")));
 
@@ -5130,6 +5313,9 @@ async fn unapplied_module_argument_reference_stays_pending_at_early_gate() {
     plan.add(create_effect(producer));
     let observer = MockObserver::new();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
@@ -5189,6 +5375,9 @@ async fn terminal_module_constraint_sweep_rejects_unconsumed_violation() {
     let plan = Plan::new();
     let observer = MockObserver::new();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
@@ -5234,6 +5423,9 @@ async fn terminal_module_constraint_sweep_rejects_still_pending_input() {
     let plan = Plan::new();
     let observer = MockObserver::new();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
@@ -5283,6 +5475,9 @@ async fn terminal_pending_constraint_is_silent_after_failed_and_skipped_effects(
     let plan = create_plan_from_fixture_resources(vec![failed, skipped]);
     let observer = MockObserver::new();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
@@ -5335,6 +5530,9 @@ async fn terminal_pending_constraint_is_silent_after_failure_without_skips() {
     plan.add(create_effect(failed));
     let observer = MockObserver::new();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
@@ -5383,10 +5581,10 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
     )]);
     let pending_state = State::existing(
         target_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "status".to_string(),
             Value::Concrete(ConcreteValue::String("PENDING".into())),
-        )]),
+        )])),
     )
     .with_identifier("target-id");
     provider.push_read(Ok(pending_state.clone()));
@@ -5414,6 +5612,9 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
     });
     let observer = MockObserver::new();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &resource_origins,
@@ -5454,23 +5655,29 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
 
 #[test]
 fn terminal_gate_still_reports_decidable_violations_when_pending_is_suppressed() {
-    let composition = pending_module_composition(
-        "root.known",
-        vec![(
-            "value",
-            Value::Concrete(ConcreteValue::String("bad".into())),
-        )],
-        vec![module_not_bad_constraint("value")],
-    );
-    let gate = ModuleConstraintGate::from_live_compositions(std::slice::from_ref(&composition));
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            let composition = pending_module_composition(
+                "root.known",
+                vec![(
+                    "value",
+                    Value::Concrete(ConcreteValue::String("bad".into())),
+                )],
+                vec![module_not_bad_constraint("value")],
+            );
+            let gate =
+                ModuleConstraintGate::from_live_compositions(std::slice::from_ref(&composition));
 
-    let error = gate
-        .finish(&ResolvedBindings::default(), false)
-        .expect_err("a known violation must not be suppressed with pending inputs");
+            let error = gate
+                .finish(&ResolvedBindings::default(), false, session)
+                .expect_err("a known violation must not be suppressed with pending inputs");
 
-    assert_eq!(error.failures().len(), 1);
-    assert!(error.to_string().contains("value must not be bad"));
-    assert!(!error.to_string().contains("still unresolved"));
+            assert_eq!(error.failures().len(), 1);
+            assert!(error.to_string().contains("value must not be bad"));
+            assert!(!error.to_string().contains("still unresolved"));
+        },
+    )
 }
 
 #[tokio::test]
@@ -5482,6 +5689,9 @@ async fn execute_plan_with_pre_cancelled_token_returns_cancelled_at_t4_or_later(
     plan.add(create_effect(resource));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -5520,6 +5730,9 @@ async fn cancelled_skip_batch_publishes_one_cumulative_checkpoint() {
     let published_skip_counts = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&published_skip_counts);
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -5557,6 +5770,9 @@ async fn execute_plan_with_empty_plan_and_pre_cancelled_token_returns_completed(
     let provider = MockProvider::new();
     let plan = Plan::new();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -5593,6 +5809,9 @@ async fn execute_plan_cancelled_after_three_completed_keeps_in_flight_and_drops_
     let cancel = observer.token();
     let plan = create_independent_create_plan(["r1", "r2", "r3", "r4", "r5"]);
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -5652,6 +5871,9 @@ async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
     plan.add(create_effect(dist));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -5719,6 +5941,9 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
     plan.add(create_effect(dist));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -5780,6 +6005,9 @@ async fn execute_plan_cancelled_while_effect_in_flight_records_that_effect() {
     let cancel = observer.token();
     let plan = create_independent_create_plan(["r1", "r2", "r3"]);
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -5818,6 +6046,9 @@ async fn execute_plan_cleanup_priority_abandons_in_flight_and_keeps_completed_ef
     let shutdown = observer.token();
     let plan = create_independent_create_plan(["r1", "r2", "r3"]);
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -5879,6 +6110,9 @@ async fn cleanup_abandonment_checkpoints_unknown_outcome_after_guest_egress() {
     let shutdown = observer.token();
     let plan = create_independent_create_plan(["unknown"]);
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -5916,6 +6150,9 @@ async fn execute_plan_harvests_ready_effect_before_cleanup_priority() {
     plan.add(create_effect(resource));
     let observer = MockObserver::new();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -5961,7 +6198,10 @@ async fn execute_plan_cleanup_priority_abandons_a_pending_failure_refresh() {
     let id = desired.id.clone();
     let current = State::existing(
         id,
-        HashMap::from([("value".to_string(), Value::Concrete(ConcreteValue::Int(1)))]),
+        crate::test_support::snapshot_attributes(HashMap::from([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::Int(1)),
+        )])),
     )
     .with_identifier("target-id");
     let mut plan = Plan::new();
@@ -5974,6 +6214,9 @@ async fn execute_plan_cleanup_priority_abandons_a_pending_failure_refresh() {
     let (trigger, shutdown) = shutdown_channel();
     let observer = PrioritizeCleanupOnRefresh { trigger };
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -6011,6 +6254,9 @@ async fn test_simple_create() {
     provider.push_create(Ok(ok_state(&rid)));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -6061,6 +6307,9 @@ async fn partial_create_records_state_and_diagnostic() {
     )));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -6115,6 +6364,9 @@ async fn test_apply_renormalizes_after_resolution() {
     provider.push_create(Ok(ok_state(&rid)));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -6213,6 +6465,9 @@ async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
         BindingValueSource::Local,
     );
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved,
@@ -6293,6 +6548,9 @@ async fn plan_normalized_resource_without_authored_origin_is_an_invariant_error(
     );
     let resource_origins = HashMap::new();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &resource_origins,
@@ -6355,10 +6613,10 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
 
     provider.push_create(Ok(State::existing(
         producer_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "value".to_string(),
             Value::Concrete(ConcreteValue::String("known-at-apply".into())),
-        )]),
+        )])),
     )
     .with_identifier("producer-id")));
     provider.push_read(Ok(
@@ -6381,7 +6639,7 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
         managed: std::slice::from_ref(&producer),
         compositions: &[],
         managed_current: &HashMap::new(),
-        data_source_values: &test_data_source_values(
+        data_source_values: &test_data_source_values::<crate::resource::SnapshotLeaf>(
             std::slice::from_ref(&authored),
             &HashMap::new(),
         ),
@@ -6417,6 +6675,9 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
         .expect("schema fixture must be valid"),
     );
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &resource_origins,
@@ -6474,6 +6735,9 @@ async fn test_apply_reapplies_host_enum_canonicalization() {
 
     let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(AliasFactory)];
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -6528,7 +6792,11 @@ async fn test_apply_reapplies_host_enum_canonicalization_update_path() {
         "ip_protocol".to_string(),
         Value::Concrete(ConcreteValue::String("tcp".into())),
     );
-    let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
+    let from_state = State::existing(
+        rid.clone(),
+        crate::test_support::snapshot_attributes(from_attrs),
+    )
+    .with_identifier("id-123");
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
@@ -6541,6 +6809,9 @@ async fn test_apply_reapplies_host_enum_canonicalization_update_path() {
 
     let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(AliasFactory)];
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -6572,7 +6843,7 @@ async fn test_apply_reapplies_host_enum_canonicalization_update_path() {
     assert!(
         matches!(
             op.sent_value(),
-            Some(Value::Concrete(ConcreteValue::CanonicalEnum(canonical)))
+            Some(crate::resource::Value::Concrete(crate::resource::ConcreteValue::CanonicalEnum(canonical)))
                 if canonical.identity().to_string() == "test.ec2.SecurityGroup.IpProtocol"
                     && canonical.api_value() == "all"
         ),
@@ -6602,6 +6873,9 @@ async fn test_apply_reapplies_canonicalize_stage() {
     provider.push_create(Ok(ok_state(&rid)));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -6654,7 +6928,11 @@ async fn test_apply_renormalizes_update_path() {
         "marker".to_string(),
         Value::Concrete(ConcreteValue::String("old".into())),
     );
-    let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
+    let from_state = State::existing(
+        rid.clone(),
+        crate::test_support::snapshot_attributes(from_attrs),
+    )
+    .with_identifier("id-123");
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
@@ -6666,6 +6944,9 @@ async fn test_apply_renormalizes_update_path() {
     provider.push_update(Ok(ok_state(&rid)));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -6731,7 +7012,11 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
         "tags".to_string(),
         Value::Concrete(ConcreteValue::Map(current_tags)),
     );
-    let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
+    let from_state = State::existing(
+        rid.clone(),
+        crate::test_support::snapshot_attributes(from_attrs),
+    )
+    .with_identifier("id-123");
 
     let mut default_tags = indexmap::IndexMap::new();
     default_tags.insert(
@@ -6754,6 +7039,9 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
     provider.push_update(Ok(ok_state(&rid)));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -6782,7 +7070,9 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
         .iter()
         .find(|op| op.key() == "tags")
         .expect("patch must contain the changed `tags` attribute");
-    let Some(Value::Concrete(ConcreteValue::Map(tags))) = tags_op.sent_value() else {
+    let Some(crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(tags))) =
+        tags_op.sent_value()
+    else {
         panic!(
             "expected tags Replace value to be a map, got {:?}",
             tags_op.sent_value()
@@ -6800,6 +7090,99 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
         tags.get("Project"),
         Some(&Value::Concrete(ConcreteValue::String("issue-3480".into())))
     );
+}
+
+#[tokio::test]
+async fn wire_boundary_executor_never_dispatches_non_wire_desired_values() {
+    for operation in ["create", "resume_create", "update", "read"] {
+        let provider = MockProvider::new();
+        let resource = Resource::with_provider("test", "test", "wire-boundary", None);
+        let id = resource.id.clone();
+        let invalid = Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+            u64::MAX,
+        )));
+        let configs = [provider_config_with_default_tags(indexmap::IndexMap::from(
+            [("unrelated".into(), invalid.clone())],
+        ))];
+        let mut plan = Plan::new();
+        let mut managed_current = HashMap::new();
+        let mut data_source_values = ExecutableDataSourceValues::empty();
+        match operation {
+            "create" => {
+                plan.add(create_effect(resource));
+                provider.push_create(Ok(ok_state(&id)));
+            }
+            "resume_create" => {
+                let pending = persisted_unissued_create_for_executor(&id);
+                plan.add(Effect::ResumeCreate {
+                    resource: resolved(resource),
+                    started_at: pending.started_at().clone(),
+                });
+                managed_current.insert(id.clone(), Current::CreateInFlight(pending));
+                provider.push_resume(ResumeFixture::Resumed);
+            }
+            "update" => {
+                plan.add(Effect::Update {
+                    from: Box::new(ok_state(&id)),
+                    identifier: crate::effect::fixture_applied_identifier("id-123"),
+                    to: resolved(resource),
+                    changed_attributes: vec!["name".into()],
+                });
+                provider.push_update(Ok(ok_state(&id)));
+            }
+            "read" => {
+                let mut data = DataSource::with_provider("test", "test", "wire-boundary", None);
+                data.attributes.insert("unread".into(), invalid);
+                data_source_values =
+                    executable_deferred_data_source_values(std::slice::from_ref(&data));
+                plan.add(Effect::Read {
+                    resource: resolved_data_source(data),
+                });
+                provider.push_read(Ok(ok_state(&id)));
+            }
+            _ => unreachable!(),
+        }
+        let input = ExecutionInput {
+            provider_context: crate::parser::ProviderContext::clone(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+            ),
+            plan: &plan,
+            provider_check_inputs: ProviderCheckInputs::Authored,
+            compositions: &[],
+            bindings: ResolvedBindings::default(),
+            managed_current,
+            data_source_values,
+            normalizer: &NoopNormalizer,
+            provider_configs: &configs,
+            factories: &[],
+            schemas: &DEFAULT_TAG_SCHEMAS,
+            parallelism: crate::executor::TEST_UNCAPPED,
+            precompleted_success_count: 0,
+            checkpoint_sink: ExecutionCheckpointSink::noop(),
+        };
+        let result = completed_result(
+            execute_plan(
+                &provider,
+                input,
+                &MockObserver::new(),
+                uncancelled_shutdown(),
+            )
+            .await,
+        );
+        assert!(
+            provider.calls().is_empty(),
+            "{operation}: {:?}",
+            provider.calls()
+        );
+        assert_eq!(result.failure_count(), 1, "{operation}");
+        assert!(
+            result.failures()[0]
+                .to_string()
+                .contains("duration in seconds does not fit"),
+            "{operation}: {:?}",
+            result.failures()
+        );
+    }
 }
 
 #[tokio::test]
@@ -6864,7 +7247,11 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
         "mode".to_string(),
         Value::Concrete(ConcreteValue::String("AES256".into())),
     );
-    let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
+    let from_state = State::existing(
+        rid.clone(),
+        crate::test_support::snapshot_attributes(from_attrs),
+    )
+    .with_identifier("id-123");
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
@@ -6876,6 +7263,9 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
     provider.push_update(Ok(ok_state(&rid)));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -6925,7 +7315,11 @@ async fn test_apply_effective_changed_includes_resource_ref_changed_during_resol
         "description".to_string(),
         Value::Concrete(ConcreteValue::String("old".into())),
     );
-    let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
+    let from_state = State::existing(
+        rid.clone(),
+        crate::test_support::snapshot_attributes(from_attrs),
+    )
+    .with_identifier("id-123");
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
@@ -6946,6 +7340,9 @@ async fn test_apply_effective_changed_includes_resource_ref_changed_during_resol
         BindingValueSource::Local,
     );
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -7009,7 +7406,11 @@ async fn test_apply_effective_changed_includes_updatable_and_skips_create_only_w
         "description".to_string(),
         Value::Concrete(ConcreteValue::String("old".into())),
     );
-    let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
+    let from_state = State::existing(
+        rid.clone(),
+        crate::test_support::snapshot_attributes(from_attrs),
+    )
+    .with_identifier("id-123");
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
@@ -7021,6 +7422,9 @@ async fn test_apply_effective_changed_includes_updatable_and_skips_create_only_w
     provider.push_update(Ok(ok_state(&rid)));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -7087,6 +7491,9 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
     provider.push_update(Ok(ok_state(&rid)));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -7150,6 +7557,9 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
     provider.push_update(Ok(ok_state(&rid)));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -7208,6 +7618,9 @@ async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
     provider.push_create(Ok(ok_state(&rb_id)));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -7269,11 +7682,17 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
     .expect("reference alias source parses");
     crate::parser::resolve_resource_refs(&mut parsed)
         .expect("pre-apply reference resolution succeeds");
-    let parsed = crate::module_resolver::resolve_modules_providerless(
-        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
+    let parsed = crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            crate::module_resolver::resolve_modules_providerless(
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                std::path::Path::new("."),
+                session,
+            )
+            .expect("reference alias fixture crosses the module-resolution seam")
+        },
     )
-    .expect("reference alias fixture crosses the module-resolution seam")
     .into_expanded(&crate::schema::SchemaRegistry::new())
     .expect("reference alias fixture contains no parser placeholders");
 
@@ -7318,13 +7737,18 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
         "identifier".to_string(),
         Value::Concrete(ConcreteValue::String("role-0-id".into())),
     );
-    provider.push_create(Ok(
-        State::existing(role.id.clone(), role_attrs).with_identifier("role-0-id")
-    ));
+    provider.push_create(Ok(State::existing(
+        role.id.clone(),
+        crate::test_support::snapshot_attributes(role_attrs),
+    )
+    .with_identifier("role-0-id")));
     provider.push_create(Ok(ok_state(&consumer.id)));
 
     let plan = create_plan_from_fixture_resources(vec![role, consumer.clone()]);
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -7448,6 +7872,9 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
         store: AsyncMutex::new(0),
     };
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -7520,6 +7947,9 @@ async fn test_simple_delete() {
     provider.push_delete(Ok(()));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -7560,6 +7990,9 @@ async fn test_failed_effect_propagates_to_dependent() {
     provider.push_create(Err(ProviderError::api_error("create failed")));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -7602,6 +8035,9 @@ async fn test_observer_events_emitted_correctly() {
     provider.push_create(Ok(ok_state(&rid)));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -7638,6 +8074,9 @@ async fn test_read_effect_is_no_op() {
     });
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -7705,6 +8144,9 @@ async fn release_list_keys_never_reaches_provider_executor() {
     });
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -7755,6 +8197,9 @@ async fn test_independent_effects_run_in_parallel() {
     provider.push_create(Ok(ok_state(&subnet_b_id)));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -7808,6 +8253,9 @@ async fn test_parallel_failure_skips_dependents() {
     provider.push_create(Ok(ok_state(&subnet_b_id)));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -7859,6 +8307,9 @@ async fn test_dependency_levels_sequential_chain() {
     provider.push_create(Ok(ok_state(&c_id)));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -8007,7 +8458,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
         fn read_data_source(
             &self,
             _resource: &ProviderReadyDataSource,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
             Box::pin(async { Err(ProviderError::internal("not implemented")) })
         }
 
@@ -8088,6 +8539,9 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
     let plan = create_plan_from_fixture_resources(vec![a, b, c]);
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -8170,7 +8624,7 @@ impl Provider for YieldingUpdateProvider {
     fn read_data_source(
         &self,
         _resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
         Box::pin(async { Err(ProviderError::internal("not implemented")) })
     }
 
@@ -8192,7 +8646,7 @@ impl Provider for YieldingUpdateProvider {
         request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         let id = id.clone();
-        let identifier = identifier.to_string();
+        let identifier = identifier.clone();
         let change_unrelated_id = self.change_unrelated_id;
         let active = self.active.clone();
         let max_active = self.max_active.clone();
@@ -8205,17 +8659,17 @@ impl Provider for YieldingUpdateProvider {
             let mut attrs = request.from().attributes.clone();
             attrs.insert(
                 "tags".to_string(),
-                Value::Concrete(ConcreteValue::String("new".into())),
+                (Value::Concrete(ConcreteValue::String("new".into()))).to_snapshot(),
             );
             if change_unrelated_id && id.identity_str().expect("resolved identity") == "vpc" {
                 attrs.insert(
                     "id".to_string(),
-                    Value::Concrete(ConcreteValue::String("provider-violated-id".into())),
+                    (Value::Concrete(ConcreteValue::String("provider-violated-id".into())))
+                        .to_snapshot(),
                 );
             }
             Ok(crate::provider::UpdateOutcome::success(
-                AppliedState::new(id, identifier, attrs)
-                    .expect("provider input identifier is non-empty"),
+                AppliedState::from_snapshot_parts(id, identifier, attrs),
             ))
         })
     }
@@ -8258,7 +8712,7 @@ fn tag_update_resource(binding: &str, parent_ref: Option<&str>) -> Resource {
 fn tag_update_state(id: &ResourceId, binding: &str) -> State {
     State::existing(
         id.clone(),
-        HashMap::from([
+        crate::test_support::snapshot_attributes(HashMap::from([
             (
                 "id".to_string(),
                 Value::Concrete(ConcreteValue::String(format!("{binding}-id").into())),
@@ -8267,7 +8721,7 @@ fn tag_update_state(id: &ResourceId, binding: &str) -> State {
                 "tags".to_string(),
                 Value::Concrete(ConcreteValue::String("old".into())),
             ),
-        ]),
+        ])),
     )
     .with_identifier(format!("{binding}-id"))
 }
@@ -8321,6 +8775,9 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> usize {
 
     let provider = YieldingUpdateProvider::new();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
@@ -8404,6 +8861,9 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
 
     let provider = YieldingUpdateProvider::violates_unrelated_id();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
@@ -8477,6 +8937,9 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
     let plan = create_plan_from_fixture_resources(vec![a, c]);
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -8508,12 +8971,16 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
         );
         m
     };
-    provider.push_create(Ok(
-        State::existing(a_id, id_attr("id-a")).with_identifier("id-a")
-    ));
-    provider.push_create(Ok(
-        State::existing(c_id, id_attr("id-c")).with_identifier("id-c")
-    ));
+    provider.push_create(Ok(State::existing(
+        a_id,
+        crate::test_support::snapshot_attributes(id_attr("id-a")),
+    )
+    .with_identifier("id-a")));
+    provider.push_create(Ok(State::existing(
+        c_id,
+        crate::test_support::snapshot_attributes(id_attr("id-c")),
+    )
+    .with_identifier("id-c")));
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
@@ -8605,10 +9072,10 @@ fn orphan_delete_waits_for_update_that_previously_depended_on_it() {
         .with_attribute("version", Value::Concrete(ConcreteValue::Int(2)));
     let consumer_state = State::existing(
         consumer_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "version".to_string(),
             Value::Concrete(ConcreteValue::Int(1)),
-        )]),
+        )])),
     )
     .with_identifier("consumer-id")
     .with_dependency_bindings(crate::test_support::persisted([ResolvedResourceId::new(
@@ -8749,6 +9216,9 @@ async fn test_update_effect_binding_map_propagation() {
     provider.push_update(Ok(updated_state));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -8795,18 +9265,21 @@ async fn update_protocol_violation_preserves_identifier_for_recovery_refresh() {
     )));
     provider.push_read(Ok(State::existing(
         id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "recovered".to_string(),
             Value::Concrete(ConcreteValue::Bool(true)),
-        )]),
+        )])),
     )));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
-        managed_current: HashMap::from([(id.clone(), Current::from_state(from))]),
+        managed_current: HashMap::from([(id.clone(), Current::from_snapshot(from))]),
         data_source_values: ExecutableDataSourceValues::empty(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
@@ -8847,7 +9320,7 @@ async fn update_protocol_violation_preserves_identifier_for_recovery_refresh() {
     assert_eq!(recovered.identifier().as_str(), "stable-update-id");
     assert_eq!(
         recovered.state().attributes.get("recovered"),
-        Some(&Value::Concrete(ConcreteValue::Bool(true)))
+        Some(&(Value::Concrete(ConcreteValue::Bool(true))).to_snapshot())
     );
 }
 
@@ -8937,6 +9410,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
             Value::Concrete(ConcreteValue::String("vpc-12345".into())),
         )]
         .into_iter()
+        .map(|(key, value)| (key, value.to_snapshot()))
         .collect(),
     )
     .with_identifier("vpc-12345");
@@ -8950,12 +9424,16 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
             Value::Concrete(ConcreteValue::String("subnet-67890".into())),
         )]
         .into_iter()
+        .map(|(key, value)| (key, value.to_snapshot()))
         .collect(),
     )
     .with_identifier("subnet-67890");
     provider.push_create(Ok(subnet_state));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -9044,7 +9522,7 @@ impl Provider for RecordingMockProvider {
     fn read_data_source(
         &self,
         _resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
         Box::pin(async { Err(ProviderError::internal("not implemented")) })
     }
 
@@ -9129,7 +9607,7 @@ impl Provider for CascadeReplaceProvider {
     fn read_data_source(
         &self,
         _resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
         Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
     }
 
@@ -9237,6 +9715,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
             attrs
                 .iter()
                 .map(|(key, value)| ((*key).to_string(), value.clone()))
+                .map(|(key, value)| (key, value.to_snapshot()))
                 .collect(),
         )
         .with_identifier(identifier)
@@ -9423,6 +9902,9 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
     });
     let provider = CascadeReplaceProvider::new();
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
@@ -9511,9 +9993,11 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
         "status".to_string(),
         Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".into())),
     );
-    provider.push_create(Ok(
-        State::existing(cert_id.clone(), create_attrs).with_identifier("acm-cert-id")
-    ));
+    provider.push_create(Ok(State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(create_attrs),
+    )
+    .with_identifier("acm-cert-id")));
     // wait reads: PENDING → PENDING → ISSUED
     let mut pending = HashMap::new();
     pending.insert(
@@ -9529,13 +10013,25 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
         "arn".to_string(),
         Value::Concrete(ConcreteValue::String("arn:aws:acm:...".into())),
     );
-    provider.push_read(Ok(State::existing(cert_id.clone(), pending.clone())));
-    provider.push_read(Ok(State::existing(cert_id.clone(), pending)));
-    provider.push_read(Ok(State::existing(cert_id.clone(), issued)));
+    provider.push_read(Ok(State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(pending.clone()),
+    )));
+    provider.push_read(Ok(State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(pending),
+    )));
+    provider.push_read(Ok(State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(issued),
+    )));
     // create dist → succeeds
     provider.push_create(Ok(ok_state(&dist_id)));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -9673,9 +10169,11 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
         "status".to_string(),
         Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".into())),
     );
-    provider.push_create(Ok(
-        State::existing(cert_id.clone(), create_attrs).with_identifier("acm-cert-id")
-    ));
+    provider.push_create(Ok(State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(create_attrs),
+    )
+    .with_identifier("acm-cert-id")));
     let mut pending = HashMap::new();
     pending.insert(
         "status".to_string(),
@@ -9694,11 +10192,20 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
                 .into(),
         )),
     );
-    provider.push_read(Ok(State::existing(cert_id.clone(), pending)));
-    provider.push_read(Ok(State::existing(cert_id.clone(), issued)));
+    provider.push_read(Ok(State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(pending),
+    )));
+    provider.push_read(Ok(State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(issued),
+    )));
     provider.push_create(Ok(ok_state(&dist_id)));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -9778,12 +10285,20 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
         "status".to_string(),
         Value::Concrete(ConcreteValue::String("ISSUED".into())),
     );
-    provider.push_create(Ok(
-        State::existing(cert_id.clone(), issued.clone()).with_identifier("acm-cert-id")
-    ));
-    provider.push_read(Ok(State::existing(cert_id.clone(), issued)));
+    provider.push_create(Ok(State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(issued.clone()),
+    )
+    .with_identifier("acm-cert-id")));
+    provider.push_read(Ok(State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(issued),
+    )));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -9905,6 +10420,9 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
     ));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -10018,6 +10536,9 @@ async fn test_apply_rejects_wrong_shape_access_without_wait_guidance() {
     );
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -10172,6 +10693,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
             )])),
         )]
         .into_iter()
+        .map(|(key, value)| (key, value.to_snapshot()))
         .collect(),
     )
     .with_identifier("acm-cert-id");
@@ -10182,6 +10704,9 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
     provider.push_create(Ok(record_state));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -10314,7 +10839,7 @@ impl Provider for IdentifierAwareProvider {
     fn read_data_source(
         &self,
         _resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
         Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
     }
 
@@ -10388,8 +10913,11 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
         "status".to_string(),
         Value::Concrete(ConcreteValue::String("issued".into())),
     );
-    let created_state =
-        State::existing(cert_id.clone(), created_attrs).with_identifier("cert-arn-real");
+    let created_state = State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(created_attrs),
+    )
+    .with_identifier("cert-arn-real");
 
     let provider = IdentifierAwareProvider::new("cert-arn-real", created_state);
 
@@ -10410,6 +10938,9 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
     });
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -10462,6 +10993,9 @@ async fn deferred_materialization_failure_retains_reason_in_result_and_event() {
         UnresolvedResource::from_pre_resolve(cert),
     )]);
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &origins,
@@ -10534,6 +11068,9 @@ async fn apply_time_unbound_child_collision_with_another_desired_id_is_typed_err
         Box::new(template),
     )));
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -10577,10 +11114,13 @@ async fn apply_time_unbound_child_collision_with_unabsorbed_state_row_is_typed_e
     plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
         Box::new(template),
     )));
-    let current = Current::from_state(
+    let current = Current::from_snapshot(
         State::existing(collision_id.clone(), HashMap::new()).with_identifier("existing"),
     );
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -10644,10 +11184,13 @@ async fn unbound_deferred_replace_creates_children_before_deleting_legacy_rows()
 
     let mut plan = Plan::new();
     plan.add(legacy_unbound_deferred_replace(template, &legacy_id));
-    let current = Current::from_state(
+    let current = Current::from_snapshot(
         State::existing(legacy_id.clone(), HashMap::new()).with_identifier("existing"),
     );
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -10683,10 +11226,13 @@ async fn unbound_deferred_replace_keeps_legacy_rows_when_gate_fails() {
     let provider = MockProvider::new();
     let mut plan = Plan::new();
     plan.add(legacy_unbound_deferred_replace(template, &legacy_id));
-    let current = Current::from_state(
+    let current = Current::from_snapshot(
         State::existing(legacy_id.clone(), HashMap::new()).with_identifier("existing"),
     );
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -10746,10 +11292,13 @@ async fn completed_plain_anonymous_delete_releases_id_for_unbound_deferred_child
     plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
         Box::new(template),
     )));
-    let current = Current::from_state(
+    let current = Current::from_snapshot(
         State::existing(child_id.clone(), HashMap::new()).with_identifier("existing"),
     );
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -10800,6 +11349,9 @@ async fn deferred_create_returns_error_when_iterable_attr_missing() {
     ));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -10832,10 +11384,10 @@ async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
     let cert_id = cert.id.clone();
     let cert_state = State::existing(
         cert_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "domain_validation_options".to_string(),
             Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::new())),
-        )]),
+        )])),
     )
     .with_identifier("cert-id");
 
@@ -10852,6 +11404,9 @@ async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
     ));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -10883,7 +11438,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
     let cert_id = ResourceId::with_identity("test", "cert");
     let cert_state = State::existing(
         cert_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "domain_validation_options".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::Map(indexmap::IndexMap::from([(
@@ -10900,7 +11455,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
                     ]))),
                 )])),
             )])),
-        )]),
+        )])),
     )
     .with_identifier("cert-id");
     let validation_id = ResourceId::with_identity("test", "validation_records[0]");
@@ -10950,6 +11505,9 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
     )));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -10996,7 +11554,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
     let cert_id = ResourceId::with_identity("test", "cert");
     let cert_state = State::existing(
         cert_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "domain_validation_options".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::Map(indexmap::IndexMap::from([(
@@ -11013,7 +11571,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
                     ]))),
                 )])),
             )])),
-        )]),
+        )])),
     )
     .with_identifier("cert-id");
     let provider = MockProvider::new();
@@ -11044,6 +11602,9 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
     )));
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -11219,7 +11780,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
         fn read_data_source(
             &self,
             _resource: &ProviderReadyDataSource,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
             Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
         }
 
@@ -11313,6 +11874,9 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
         ),
     ]);
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved,
@@ -11373,7 +11937,7 @@ fn resource_with_binding(name: &'static str, binding: &str) -> Resource {
 fn cert_state_for_deferred_replace_deadlock(id: &ResourceId) -> State {
     State::existing(
         id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "domain_validation_options".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::Map(indexmap::IndexMap::from([(
@@ -11390,7 +11954,7 @@ fn cert_state_for_deferred_replace_deadlock(id: &ResourceId) -> State {
                     ]))),
                 )])),
             )])),
-        )]),
+        )])),
     )
     .with_identifier("cert-id")
 }
@@ -11454,6 +12018,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
                 )])),
             )]
             .into_iter()
+            .map(|(key, value)| (key, value.to_snapshot()))
             .collect(),
         ),
     );
@@ -11506,6 +12071,9 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
     });
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -11611,7 +12179,7 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
         )]),
     )
     .with_identifier("target-id");
-    provider.push_create(Ok(upstream_state));
+    provider.push_create(Ok((upstream_state).to_snapshot()));
 
     let read_state = State::existing(
         ds_id.clone(),
@@ -11623,7 +12191,7 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
         )]),
     )
     .with_identifier("roles-id");
-    provider.push_read(Ok(read_state));
+    provider.push_read(Ok((read_state).to_snapshot()));
 
     let consumer_state =
         State::existing(consumer_id.clone(), HashMap::new()).with_identifier("consumer-id");
@@ -11656,6 +12224,9 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
     });
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -11760,14 +12331,15 @@ async fn test_apply_time_data_source_read_failure_skips_downstream_resource() {
         }),
     );
 
-    provider.push_create(Ok(State::existing(
+    provider.push_create(Ok((State::existing(
         upstream_id.clone(),
         HashMap::from([(
             "generated".to_string(),
             Value::Concrete(ConcreteValue::String("target-generated".into())),
         )]),
     )
-    .with_identifier("target-id")));
+    .with_identifier("target-id"))
+    .to_snapshot()));
     provider.push_read(Err(ProviderError::api_error("lookup failed")));
 
     let (mut resolved_managed, mut resolved_data_sources) = resolved_fixture_graph(
@@ -11797,6 +12369,9 @@ async fn test_apply_time_data_source_read_failure_skips_downstream_resource() {
     });
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -11875,7 +12450,7 @@ async fn test_apply_time_data_source_read_retries_throttling_errors() {
         managed: &[] as &[Resource],
         compositions: &[],
         managed_current: &HashMap::new(),
-        data_source_values: &test_data_source_values(
+        data_source_values: &test_data_source_values::<crate::resource::SnapshotLeaf>(
             std::slice::from_ref(&data_source),
             &HashMap::new(),
         ),
@@ -11884,6 +12459,9 @@ async fn test_apply_time_data_source_read_retries_throttling_errors() {
     });
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -11981,6 +12559,9 @@ async fn test_pre_apply_data_source_read_remains_noop_in_executor() {
     });
 
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
@@ -12032,6 +12613,9 @@ async fn deferred_create_reports_iterable_reference_when_binding_missing() {
         UnresolvedResource::from_pre_resolve(producer),
     )]);
     let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &origins,

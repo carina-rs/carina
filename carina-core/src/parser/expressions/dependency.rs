@@ -67,7 +67,7 @@ pub(in crate::parser) fn parse_dependency_operand(
                 declared_type: Some(declared_type),
                 ..
             } => match declared_type.as_ref() {
-                TypeExpr::DottedUnresolved(_) => {
+                TypeExpr::DottedUnresolved(_) | TypeExpr::UnloadedSchemaType(_) => {
                     Ok(UnexpandedDependencyOperand::BareBinding(name.into()))
                 }
                 TypeExpr::String

@@ -30,7 +30,11 @@ use crate::value::CanonicalState;
 /// `type_aware_equal`'s secret arm and compare unequal, which only ever
 /// *over*-reports a diff (safe-by-default) — it never hides a real
 /// change.
-pub(crate) fn schema_aware_equal<R: ReferenceEquality, P: crate::resource::StateValueLeaf, Q: crate::resource::StateValueLeaf>(
+pub(crate) fn schema_aware_equal<
+    R: ReferenceEquality,
+    P: crate::resource::StateValueLeaf,
+    Q: crate::resource::StateValueLeaf,
+>(
     old: &Value<P>,
     new: &Value<Q>,
     attr_type: Option<&AttributeType>,
@@ -39,7 +43,8 @@ pub(crate) fn schema_aware_equal<R: ReferenceEquality, P: crate::resource::State
 ) -> bool {
     match attr_type {
         Some(t) => crate::differ::type_aware_equal(old, new, Some(t), defs, context),
-        None => crate::resource::state_value_snapshot(old).semantically_equal(&crate::resource::state_value_snapshot(new)),
+        None => crate::resource::state_value_snapshot(old)
+            .semantically_equal(&crate::resource::state_value_snapshot(new)),
     }
 }
 
@@ -339,12 +344,18 @@ impl MapDiff {
 ///
 /// All result vectors are sorted by key for deterministic output, so the
 /// caller's input order does not affect the result.
-pub fn compute_map_diff<P: crate::resource::StateValueLeaf,Q: crate::resource::StateValueLeaf>(
-    old_map: &IndexMap<String,Value<P>>,
-    new_map: &IndexMap<String,Value<Q>>,
+pub fn compute_map_diff<P: crate::resource::StateValueLeaf, Q: crate::resource::StateValueLeaf>(
+    old_map: &IndexMap<String, Value<P>>,
+    new_map: &IndexMap<String, Value<Q>>,
 ) -> MapDiff {
-    let old_map: IndexMap<_,_> = old_map.iter().map(|(key,value)|(key.clone(),crate::resource::state_value_snapshot(value))).collect();
-    let new_map: IndexMap<_,_> = new_map.iter().map(|(key,value)|(key.clone(),crate::resource::state_value_snapshot(value))).collect();
+    let old_map: IndexMap<_, _> = old_map
+        .iter()
+        .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
+        .collect();
+    let new_map: IndexMap<_, _> = new_map
+        .iter()
+        .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
+        .collect();
 
     let mut all_keys: Vec<&String> = old_map.keys().chain(new_map.keys()).collect();
     all_keys.sort();

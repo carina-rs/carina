@@ -42,7 +42,7 @@ fn canonical_create_only_value_string_for_test(value: &Value) -> Option<String> 
     )
 }
 
-fn anonymous_state_entry<I, K>(
+fn anonymous_state_entry<I, K, P: crate::resource::StateValueLeaf>(
     registry: &SchemaRegistry,
     provider: &str,
     resource_type: &str,
@@ -52,7 +52,7 @@ fn anonymous_state_entry<I, K>(
     attributes: I,
 ) -> AnonymousIdStateInfo
 where
-    I: IntoIterator<Item = (K, Value)>,
+    I: IntoIterator<Item = (K, crate::resource::Value<P>)>,
     K: Into<String>,
 {
     let attributes = attributes
@@ -135,11 +135,17 @@ fn parse_loop_fixture(source: &str, file: &str) -> Vec<Resource> {
         &crate::parser::ProviderContext::default(),
     )
     .expect("valid loop fixture");
-    crate::module_resolver::resolve_modules_providerless(
-        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        Path::new("."),
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            crate::module_resolver::resolve_modules_providerless(
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                Path::new("."),
+                session,
+            )
+            .expect("loop fixture crosses the module-resolution seam")
+        },
     )
-    .expect("loop fixture crosses the module-resolution seam")
     .into_expanded(&crate::schema::SchemaRegistry::new())
     .expect("loop fixture contains no parser placeholders")
     .resources
@@ -240,7 +246,10 @@ fn redacted_secret_identifier_material_bytes_are_legacy_compatible() {
     let digest = format!("argon2-legacy:73616c74:{}", "ab".repeat(32));
     let hash = crate::resource::RedactedSecretHash::from_encoded_digest(&digest)
         .expect("valid explicit legacy digest");
-    let value = Value::Deferred(DeferredValue::RedactedSecret { hash });
+    let value: crate::resource::SnapshotValue =
+        crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+            crate::resource::SnapshotLeaf::RedactedSecret { hash },
+        ));
 
     assert_eq!(
         deterministic_value_string(&value).as_bytes(),
@@ -1669,11 +1678,17 @@ fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
         &crate::parser::ProviderContext::default(),
     )
     .expect("the parser must preserve the authored use for typed validation");
-    let parsed = crate::module_resolver::resolve_modules_providerless(
-        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
-    )
-    .expect("the fixture crosses module resolution before readiness validation");
+    let parsed = crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            crate::module_resolver::resolve_modules_providerless(
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                std::path::Path::new("."),
+                session,
+            )
+            .expect("the fixture crosses module resolution before readiness validation")
+        },
+    );
     let error = crate::validation::resolve_bare_binding_uses(
         parsed,
         &SchemaRegistry::new(),
@@ -2312,9 +2327,11 @@ fn test_anonymous_id_stable_for_nested_canonical_enum_create_only_values() {
         );
         resource.set_attr(
             "domain_by_name".to_string(),
-            Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
-                "primary".to_string() => enum_value,
-            })),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(
+                indexmap::indexmap! {
+                    "primary".to_string() => enum_value,
+                },
+            )),
         );
         resource
     };
@@ -3979,11 +3996,13 @@ fn reconcile_when_present_absence_matches_only_a_state_row_with_the_attribute_ab
     );
 }
 
-fn redacted_identity_value() -> Value {
+fn redacted_identity_value() -> crate::resource::SnapshotValue {
     let digest = format!("argon2-legacy:73616c74:{}", "ab".repeat(32));
     let hash = crate::resource::RedactedSecretHash::from_encoded_digest(&digest)
         .expect("valid persisted secret digest");
-    Value::Deferred(DeferredValue::RedactedSecret { hash })
+    crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+        crate::resource::SnapshotLeaf::RedactedSecret { hash },
+    ))
 }
 
 #[test]
@@ -4102,10 +4121,10 @@ fn nested_when_present_absence_does_not_match_redacted_state() {
             Value::Concrete(ConcreteValue::Map(IndexMap::new())),
         );
     let desired_values = DesiredIdentityValues::from_resource(&desired, &schema, &|_| Vec::new());
-    let redacted_leaf = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-        "name".to_string(),
-        redacted_identity_value(),
-    )])));
+    let redacted_leaf =
+        crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::Map(
+            IndexMap::from([("name".to_string(), redacted_identity_value())]),
+        ));
 
     for settings in [redacted_leaf, redacted_identity_value()] {
         let state = StateRowIdentityValues::from_state_row(
@@ -4149,8 +4168,11 @@ fn declared_identity_resolved_and_prefix_values_are_undecidable_against_redacted
             desired_values.compare_row(&state, schema, &context),
             DeclaredIdentityRowOutcome::Undecidable(_),
         ));
-        let absent =
-            StateRowIdentityValues::from_state_row(schema, &HashMap::new(), &HashMap::new());
+        let absent = StateRowIdentityValues::from_state_row(
+            schema,
+            &HashMap::<String, crate::resource::ExpandedValue>::new(),
+            &HashMap::new(),
+        );
         assert_eq!(
             desired_values.compare_row(&absent, schema, &context),
             DeclaredIdentityRowOutcome::Mismatch,
@@ -5614,7 +5636,9 @@ fn test_canonical_create_only_string_matches_state_round_trip() {
             .expect("persisted state value should decode");
         assert_eq!(
             canonical_create_only_value_string_for_test(&value),
-            canonical_create_only_value_string_for_test(&persisted),
+            canonical_create_only_value_string_for_test(&crate::test_support::available_value(
+                &persisted
+            )),
             "round-trip canonical mismatch for {value:?}",
         );
     }
@@ -7520,26 +7544,34 @@ fn test_detect_rename_matches_mixed_canonical_and_identifier_enums_in_list_and_m
     );
     resource.set_attr(
         "domain_by_name".to_string(),
-        Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
-            "canonical".to_string() => canonical,
-            "identifier".to_string() => identifier,
-        })),
+        crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(
+            indexmap::indexmap! {
+                "canonical".to_string() => canonical,
+                "identifier".to_string() => identifier,
+            },
+        )),
     );
 
     let persisted_attributes = HashMap::from([
         (
             "domains".to_string(),
-            Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("vpc".into())),
-                Value::Concrete(ConcreteValue::String("standard".into())),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(vec![
+                crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                    "vpc".into(),
+                )),
+                crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                    "standard".into(),
+                )),
             ])),
         ),
         (
             "domain_by_name".to_string(),
-            Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
-                "canonical".to_string() => Value::Concrete(ConcreteValue::String("vpc".into())),
-                "identifier".to_string() => Value::Concrete(ConcreteValue::String("standard".into())),
-            })),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(
+                indexmap::indexmap! {
+                    "canonical".to_string() => Value::Concrete(ConcreteValue::String("vpc".into())),
+                    "identifier".to_string() => Value::Concrete(ConcreteValue::String("standard".into())),
+                },
+            )),
         ),
     ]);
     let state_entries = vec![anonymous_state_entry(
@@ -9152,10 +9184,15 @@ fn loop_conflict_suggestion_reserves_sibling_file_value_bindings() {
         &crate::parser::ProviderContext::default(),
     )
     .expect("directory parses");
-    let mut parsed = crate::module_resolver::resolve_modules_providerless(parsed, fixture.path())
-        .expect("directory fixture crosses the module-resolution seam")
-        .into_expanded(&crate::schema::SchemaRegistry::new())
-        .expect("directory fixture contains no parser placeholders");
+    let mut parsed = crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            crate::module_resolver::resolve_modules_providerless(parsed, fixture.path(), session)
+                .expect("directory fixture crosses the module-resolution seam")
+        },
+    )
+    .into_expanded(&crate::schema::SchemaRegistry::new())
+    .expect("directory fixture contains no parser placeholders");
     let registry = loop_identity_registry(false);
 
     let error =

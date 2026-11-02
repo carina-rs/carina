@@ -60,10 +60,10 @@ impl AttrPath {
     /// Walk this path into `attrs`, descending through nested
     /// `ConcreteValue::Map` values as needed. Returns the leaf `Value`
     /// or `None` if any segment is missing or not a map at a non-leaf.
-    pub(crate) fn resolve<'a, B: BindingAddress>(
+    pub(crate) fn resolve<'a, P: crate::resource::ValueKind, B: BindingAddress>(
         &self,
-        attrs: &'a HashMap<String, Value<NoPlaceholder, B>>,
-    ) -> Option<&'a Value<NoPlaceholder, B>> {
+        attrs: &'a HashMap<String, Value<P, B>>,
+    ) -> Option<&'a Value<P, B>> {
         let (first, rest) = self.segments().split_first()?;
         let mut current = attrs.get(first)?;
         for segment in rest {
@@ -378,7 +378,6 @@ fn unresolved_enum_identifier<B: BindingAddress>(value: &Value<NoPlaceholder, B>
         | Value::Deferred(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
-            
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => None,

@@ -4,7 +4,7 @@ use std::fmt::{self, Display, Formatter};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    BindingAddress, CanonicalComparisonAttributes, ConcreteValue, ValueKind, Resource, Value,
+    BindingAddress, CanonicalComparisonAttributes, ConcreteValue, Resource, Value, ValueKind,
 };
 use crate::schema::{
     CompiledResourceSchema as ResourceSchema, EffectiveType, LeafPath, LeafPathSegment, Shape,
@@ -230,7 +230,10 @@ impl ResolvedIgnoreChanges {
             .any(ResolvedIgnorePath::is_write_only)
     }
 
-    pub(crate) fn with_observed_readable_leaves<P: super::StateValueLeaf,Q: super::StateValueLeaf>(
+    pub(crate) fn with_observed_readable_leaves<
+        P: super::StateValueLeaf,
+        Q: super::StateValueLeaf,
+    >(
         &self,
         attribute: &str,
         desired: &Value<P>,
@@ -242,7 +245,9 @@ impl ResolvedIgnoreChanges {
             .for_attribute(attribute)
             .filter(|path| !path.write_only && !path.leaf.segments().is_empty())
         {
-            let observed_leaf = observed.as_ref().and_then(|value| value_at_leaf(value, &path.leaf));
+            let observed_leaf = observed
+                .as_ref()
+                .and_then(|value| value_at_leaf(value, &path.leaf));
             set_leaf(&mut value, path.leaf.segments(), observed_leaf.cloned());
         }
         value
@@ -256,8 +261,8 @@ impl ResolvedIgnoreChanges {
     /// their current values.
     pub fn mask_observed_readable_leaves(
         &self,
-        baseline: &mut HashMap<String,super::SnapshotValue>,
-        observed: &HashMap<String,super::SnapshotValue>,
+        baseline: &mut HashMap<String, super::SnapshotValue>,
+        observed: &HashMap<String, super::SnapshotValue>,
     ) {
         let attributes = self
             .iter()
@@ -289,11 +294,17 @@ impl ResolvedIgnoreChanges {
     }
 }
 
-pub(crate) fn value_at_leaf<'a,P: super::ValueKind>(value: &'a Value<P>, leaf: &LeafPath) -> Option<&'a Value<P>> {
+pub(crate) fn value_at_leaf<'a, P: super::ValueKind>(
+    value: &'a Value<P>,
+    leaf: &LeafPath,
+) -> Option<&'a Value<P>> {
     value_at_segments(value, leaf.segments())
 }
 
-fn value_at_segments<'a,P: super::ValueKind>(mut value: &'a Value<P>, segments: &[LeafPathSegment]) -> Option<&'a Value<P>> {
+fn value_at_segments<'a, P: super::ValueKind>(
+    mut value: &'a Value<P>,
+    segments: &[LeafPathSegment],
+) -> Option<&'a Value<P>> {
     for segment in segments {
         value = match (segment, value) {
             (
@@ -309,7 +320,11 @@ fn value_at_segments<'a,P: super::ValueKind>(mut value: &'a Value<P>, segments: 
     Some(value)
 }
 
-fn set_leaf<P: super::ValueKind>(value: &mut Value<P>, segments: &[LeafPathSegment], replacement: Option<Value<P>>) {
+fn set_leaf<P: super::ValueKind>(
+    value: &mut Value<P>,
+    segments: &[LeafPathSegment],
+    replacement: Option<Value<P>>,
+) {
     let Some((segment, rest)) = segments.split_first() else {
         if let Some(replacement) = replacement {
             *value = replacement;

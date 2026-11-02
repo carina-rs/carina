@@ -634,6 +634,19 @@ pub(crate) fn parse_primary_eval_with_mode(
             // Ref-typed arguments retain canonical handle bases even when a
             // different argument keeps the call deferred.
             if let Some(user_fn) = ctx.resolved_user_function(&func_name) {
+                if !ctx.config.custom_types_loaded() {
+                    let arguments = crate::parser::functions::lower_function_arguments(
+                        eval_args.clone(),
+                        line,
+                    )?;
+                    crate::parser::functions::record_deferred_function_type_check(
+                        &user_fn,
+                        &arguments,
+                        ctx,
+                        line,
+                        Some(column),
+                    );
+                }
                 if !ctx.seeded_user_functions.contains(&func_name)
                     && eval_args.iter().all(is_static_eval)
                 {
@@ -642,7 +655,11 @@ pub(crate) fn parse_primary_eval_with_mode(
                 }
                 let args = crate::parser::functions::lower_function_arguments(eval_args, line)?;
                 crate::parser::functions::record_deferred_function_type_check(
-                    &user_fn, &args, ctx, line,
+                    &user_fn,
+                    &args,
+                    ctx,
+                    line,
+                    Some(column),
                 );
                 return Ok(EvalValue::from_value(Value::Deferred(
                     DeferredValue::ResolvedFunctionCall {

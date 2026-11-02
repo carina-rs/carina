@@ -328,13 +328,13 @@ impl Orphan {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_state(
-        state: State,
+    pub(crate) fn from_state<P: crate::resource::StateValueLeaf>(
+        state: crate::resource::State<P>,
         binding: Option<AbsoluteBindingAddress>,
         directives: PersistedDirectives,
     ) -> Self {
         Self {
-            current: Current::from_state(state),
+            current: Current::from_snapshot(state.to_snapshot()),
             binding,
             directives,
         }
@@ -423,7 +423,9 @@ impl Orphan {
     /// shape used by binding resolution. Provider state remains authoritative
     /// for its values; the projection exists only so a data-source input can
     /// resolve a binding that is no longer present in the configuration.
-    pub fn binding_resource(&self) -> Resource<crate::resource::ModuleSource,crate::resource::SnapshotLeaf> {
+    pub fn binding_resource(
+        &self,
+    ) -> Resource<crate::resource::ModuleSource, crate::resource::SnapshotLeaf> {
         let attributes = match &self.current {
             Current::Absent(state) => &state.state().attributes,
             Current::Present(present) => &present.state().attributes,
@@ -431,7 +433,9 @@ impl Orphan {
                 return Resource {
                     id: self.current.id().clone(),
                     attributes: Default::default(),
-                    directives: crate::resource::snapshot_directives(self.directives.clone().into()),
+                    directives: crate::resource::snapshot_directives(
+                        self.directives.clone().into(),
+                    ),
                     resolved_ignore_changes: Default::default(),
                     prefixes: Default::default(),
                     binding: self.binding.clone(),
@@ -499,7 +503,7 @@ impl Orphan {
         };
         fresh.id = prior.id.clone();
         fresh.dependency_bindings = prior.dependency_bindings.clone();
-        self.current = Current::from_state(fresh);
+        self.current = Current::from_snapshot(fresh);
         self
     }
 }
@@ -1215,7 +1219,10 @@ fn concrete_list<P: crate::resource::ValueKind>(value: &Value<P>) -> Option<&[Va
     Some(items)
 }
 
-fn keyed_element_key<'a,P: crate::resource::ValueKind>(element: &'a Value<P>, key_field: &str) -> Option<&'a str> {
+fn keyed_element_key<'a, P: crate::resource::ValueKind>(
+    element: &'a Value<P>,
+    key_field: &str,
+) -> Option<&'a str> {
     let Value::Concrete(crate::resource::ConcreteValue::Map(fields)) = element else {
         return None;
     };
@@ -1226,7 +1233,10 @@ fn keyed_element_key<'a,P: crate::resource::ValueKind>(element: &'a Value<P>, ke
     Some(key.expose_plaintext())
 }
 
-fn retained_key_value<P: crate::resource::ValueKind>(element: &Value<P>, key_field: &str) -> Value<P> {
+fn retained_key_value<P: crate::resource::ValueKind>(
+    element: &Value<P>,
+    key_field: &str,
+) -> Value<P> {
     let Value::Concrete(crate::resource::ConcreteValue::Map(fields)) = element else {
         return element.clone();
     };
@@ -1239,7 +1249,7 @@ fn retained_key_value<P: crate::resource::ValueKind>(element: &Value<P>, key_fie
     }
 }
 
-fn unique_elements_by_key<'a,P: crate::resource::ValueKind>(
+fn unique_elements_by_key<'a, P: crate::resource::ValueKind>(
     value: &'a Value<P>,
     key_field: &str,
 ) -> Option<std::collections::BTreeMap<&'a str, &'a Value<P>>> {
@@ -1368,7 +1378,11 @@ fn find_keyed_partial_update_releases(
         .collect()
 }
 
-fn remove_keys_from_list<P: crate::resource::ValueKind>(value: &mut Value<P>, key_field: &str, released: &HashSet<&str>) {
+fn remove_keys_from_list<P: crate::resource::ValueKind>(
+    value: &mut Value<P>,
+    key_field: &str,
+    released: &HashSet<&str>,
+) {
     let Value::Concrete(crate::resource::ConcreteValue::List(elements)) = value else {
         return;
     };
@@ -1649,15 +1663,16 @@ pub fn diff(
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-pub fn diff_for_test(
+pub fn diff_for_test<P: crate::resource::StateValueLeaf>(
     desired: &ResolvedResource,
-    current: &State,
+    current: &crate::resource::State<P>,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
     context_schema: &ComparisonSchema<'_>,
     references: &crate::references::ResolvedReferences,
 ) -> PlanComparisonResult<Diff> {
+    let current = &current.to_snapshot();
     context_schema.with_references(references, &desired.id, |context| {
         diff_with_comparison_schema(
             desired,
@@ -1764,14 +1779,15 @@ fn diff_with_saved_parts(
 }
 
 #[cfg(test)]
-pub(crate) fn diff_test(
+pub(crate) fn diff_test<P: crate::resource::StateValueLeaf>(
     desired: &Resource,
-    current: &State,
-    saved: Option<&HashMap<String, Value>>,
+    current: &crate::resource::State<P>,
+    saved: Option<&HashMap<String, crate::resource::SnapshotValue>>,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
     context_schema: &ComparisonSchema<'_>,
 ) -> Diff {
+    let current = &current.to_snapshot();
     let current_attributes = match schema {
         Some(schema) => {
             CanonicalComparisonAttributes::canonicalize(current.attributes.clone(), schema)

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::resource::{
     AbsoluteBindingAddress, BindingAddress, DataSource, ModuleSource, ParserPlaceholder,
-    ValueKind, RelativeBindingName, Resource, Value,
+    RelativeBindingName, Resource, Value, ValueKind,
 };
 
 use super::ModuleCall;
@@ -212,10 +212,7 @@ impl<P: ValueKind, B: BindingAddress> DeferredStructuralIf<P, B> {
 }
 
 #[derive(Debug, Clone)]
-pub enum DeferredIfBody<
-    P: ValueKind = ParserPlaceholder,
-    B: BindingAddress = RelativeBindingName,
-> {
+pub enum DeferredIfBody<P: ValueKind = ParserPlaceholder, B: BindingAddress = RelativeBindingName> {
     Resource(Box<Resource<ModuleSource, P, B>>),
     DataSource(Box<DataSource<ModuleSource, P, B>>),
     ModuleCall(ModuleCall<P, B>),

@@ -327,11 +327,17 @@ mod tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("unbound deferred loop parses");
-        let parsed = crate::module_resolver::resolve_modules_providerless(
-            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
+        let parsed = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                crate::module_resolver::resolve_modules_providerless(
+                    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    std::path::Path::new("."),
+                    session,
+                )
+                .expect("deferred fixture crosses the module-resolution seam")
+            },
         )
-        .expect("deferred fixture crosses the module-resolution seam")
         .into_expanded(&crate::schema::SchemaRegistry::new())
         .expect("deferred-loop fixture contains no parser placeholders");
         let template = parsed.deferred_for_expressions()[0].clone();
@@ -397,10 +403,18 @@ mod tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("unbound deferred loop parses");
-        let parsed = crate::module_resolver::resolve_modules_providerless(
-            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
+        let parsed = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                crate::module_resolver::resolve_modules_providerless(
+                    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    std::path::Path::new("."),
+                    session,
+                )
+                .map_err(Box::new)
+            },
         )
+        .map_err(|error| *error)
         .expect("module resolution")
         .into_expanded(&crate::schema::SchemaRegistry::new())
         .expect("expanded loop");

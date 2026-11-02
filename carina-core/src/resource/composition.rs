@@ -27,8 +27,8 @@ use crate::static_type::ConsumerStaticType;
 use super::{
     AbsoluteBindingAddress, AccessPath, BindingAddress, DeferredValue, LeftoverPlaceholder,
     LeftoverPlaceholderContext, LeftoverPlaceholderPolicy, ModuleInstanceScope, NoPlaceholder,
-    ParserPlaceholder, ValueKind, PlanValueKind, SnapshotLeaf, RelativeBindingName, ResolvedResourceId, ResourceIdentity,
-    RootScope, StructuralOperand, Value,
+    ParserPlaceholder, PlanValueKind, RelativeBindingName, ResolvedResourceId, ResourceIdentity,
+    RootScope, SnapshotLeaf, StructuralOperand, Value, ValueKind,
 };
 
 /// How a composition attribute is produced from the rest of the
@@ -1371,10 +1371,8 @@ impl SavedCompositionOriginId {
 /// }
 /// ```
 #[derive(Debug, Clone)]
-pub struct LiveComposition<
-    P: ValueKind = NoPlaceholder,
-    B: BindingAddress = AbsoluteBindingAddress,
-> {
+pub struct LiveComposition<P: ValueKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress>
+{
     pub id: ResolvedResourceId,
     pub signature: LiveCompositionSignature<P, B>,
     /// Binding name from `let` bindings in DSL.
@@ -2140,7 +2138,7 @@ mod tests {
         let json = serde_json::to_value(&saved).expect("serialize saved attribute");
         let decoded: SavedCompositionAttribute =
             serde_json::from_value(json).expect("deserialize saved attribute");
-        assert_eq!(decoded.to_value(), value);
+        assert_eq!(decoded.to_value(), (value).to_snapshot());
     }
 
     #[test]
@@ -2149,6 +2147,7 @@ mod tests {
             owned: crate::parser::OwnedTypeIdentity::provider(
                 "aws",
                 crate::schema::TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id"),
+                crate::schema::RefinedScalarKind::String,
             ),
         };
         let argument: LiveCompositionArgument = LiveCompositionArgument::from_value(
@@ -2177,7 +2176,7 @@ mod tests {
 
         let decoded: SavedCompositionArgument =
             serde_json::from_value(saved_json).expect("deserialize composition argument");
-        assert_eq!(decoded.value(), &value);
+        assert_eq!(decoded.value(), &value.to_snapshot());
     }
 
     #[test]
@@ -2221,7 +2220,9 @@ mod tests {
 
         let mut source_identities = CompositionSourceIdentityResolver::new(source_root.path())
             .expect("create composition source identity resolver");
-        let saved = composition
+        let snapshot = crate::value::redact_secrets_in_live_composition(&composition)
+            .expect("composition redaction must succeed");
+        let saved = snapshot
             .into_saved_with_resolver(&mut source_identities)
             .expect("save composition identity");
         let redacted = crate::value::redact_secrets_in_saved_composition(&saved)
@@ -2234,7 +2235,10 @@ mod tests {
         assert!(!json.contains("call_path"), "{json}");
         let decoded: SavedComposition =
             serde_json::from_str(&json).expect("round-trip composition");
-        assert_eq!(decoded.signature.pending_constraints, vec![constraint]);
+        assert_eq!(
+            serde_json::to_value(&decoded.signature.pending_constraints).unwrap(),
+            serde_json::to_value(vec![constraint]).unwrap(),
+        );
 
         let mut missing_origin = serde_json::to_value(&redacted).expect("serialize composition");
         missing_origin
@@ -2420,7 +2424,9 @@ mod tests {
 
         let mut resolver = CompositionSourceIdentityResolver::new(source_root.path())
             .expect("composition source identity resolver");
-        let saved = composition
+        let snapshot = crate::value::redact_secrets_in_live_composition(&composition)
+            .expect("composition redaction must succeed");
+        let saved = snapshot
             .into_saved_with_resolver(&mut resolver)
             .expect("lower live composition");
         let json = serde_json::to_string(&saved).expect("serialize saved composition");
@@ -2432,15 +2438,55 @@ mod tests {
     }
 }
 
-impl<P: ValueKind, B: BindingAddress> LiveComposition<P,B> {
-    pub(crate) fn with_signature<Q: ValueKind>(self, signature: LiveCompositionSignature<Q,B>) -> LiveComposition<Q,B> {
-        let Self { id, signature: _, binding, dependency_bindings, module_name, instance, call_path, quoted_string_attrs } = self;
-        LiveComposition { id, signature, binding, dependency_bindings, module_name, instance, call_path, quoted_string_attrs }
+impl<P: ValueKind, B: BindingAddress> LiveComposition<P, B> {
+    pub(crate) fn with_signature<Q: ValueKind>(
+        self,
+        signature: LiveCompositionSignature<Q, B>,
+    ) -> LiveComposition<Q, B> {
+        let Self {
+            id,
+            signature: _,
+            binding,
+            dependency_bindings,
+            module_name,
+            instance,
+            call_path,
+            quoted_string_attrs,
+        } = self;
+        LiveComposition {
+            id,
+            signature,
+            binding,
+            dependency_bindings,
+            module_name,
+            instance,
+            call_path,
+            quoted_string_attrs,
+        }
     }
 }
 impl<P: PlanValueKind> SavedComposition<P> {
-    pub(crate) fn with_signature<Q: PlanValueKind>(self, signature: SavedCompositionSignature<Q>) -> SavedComposition<Q> {
-        let Self { id, signature: _, binding, dependency_bindings, module_name, instance, origin_id } = self;
-        SavedComposition { id, signature, binding, dependency_bindings, module_name, instance, origin_id }
+    pub(crate) fn with_signature<Q: PlanValueKind>(
+        self,
+        signature: SavedCompositionSignature<Q>,
+    ) -> SavedComposition<Q> {
+        let Self {
+            id,
+            signature: _,
+            binding,
+            dependency_bindings,
+            module_name,
+            instance,
+            origin_id,
+        } = self;
+        SavedComposition {
+            id,
+            signature,
+            binding,
+            dependency_bindings,
+            module_name,
+            instance,
+            origin_id,
+        }
     }
 }

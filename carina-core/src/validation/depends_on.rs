@@ -329,10 +329,9 @@ mod tests {
         parsed: &File<E, crate::resource::ParserPlaceholder, crate::resource::ParserPlaceholder, D>,
     ) -> Vec<DependsOnDiagnostic> {
         let mut parsed = parsed.clone();
-        let report = super::super::resolve_file_type_exprs_report(
-            &mut parsed,
+        let report = crate::validation::deferred_types::with_session_for_test(
             &ProviderContext::default(),
-            None,
+            |session| super::super::resolve_file_type_exprs_report(&mut parsed, session, None),
         );
         assert!(
             report.diagnostics().is_empty(),

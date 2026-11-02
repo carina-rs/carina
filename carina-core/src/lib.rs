@@ -42,6 +42,7 @@ pub mod plan_tree;
 pub mod protocol_convert;
 pub mod provider;
 pub mod provider_source;
+pub mod provider_wire;
 pub mod references;
 pub mod resolved_graph;
 pub mod resolver;
@@ -66,6 +67,74 @@ pub(crate) mod test_support {
         resolved_graph::resolve_expanded_graph,
         resource::{RelativeBindingName, Resource, RootScope},
     };
+    use std::collections::HashMap;
+
+    pub fn snapshot_attributes<P: crate::resource::StateValueLeaf>(
+        values: impl IntoIterator<Item = (String, crate::resource::Value<P>)>,
+    ) -> HashMap<String, crate::resource::SnapshotValue> {
+        values
+            .into_iter()
+            .map(|(key, value)| (key, crate::resource::state_value_snapshot(&value)))
+            .collect()
+    }
+
+    pub fn available_value(
+        value: &crate::resource::SnapshotValue,
+    ) -> crate::resource::ExpandedValue {
+        value
+            .to_value_at("test fixture")
+            .expect("fixture must contain available values")
+    }
+
+    pub fn available_state(state: crate::resource::SnapshotState) -> crate::resource::State {
+        crate::resource::State {
+            id: state.id,
+            identifier: state.identifier,
+            attributes: available_attributes(state.attributes),
+            exists: state.exists,
+            dependency_bindings: state.dependency_bindings,
+            partial_read: state.partial_read,
+        }
+    }
+
+    pub fn available_attributes(
+        values: impl IntoIterator<Item = (String, crate::resource::SnapshotValue)>,
+    ) -> HashMap<String, crate::resource::ExpandedValue> {
+        values
+            .into_iter()
+            .map(|(key, value)| (key, available_value(&value)))
+            .collect()
+    }
+
+    pub fn lift_state_enum_leaves(
+        values: &mut HashMap<String, crate::resource::ExpandedValue>,
+        schema: &crate::schema::CompiledResourceSchema,
+    ) {
+        let mut snapshot = snapshot_attributes(std::mem::take(values));
+        crate::utils::lift_state_enum_leaves(&mut snapshot, schema);
+        *values = available_attributes(snapshot);
+    }
+
+    pub fn raw_saved_attrs<P: crate::resource::StateValueLeaf>(
+        values: HashMap<crate::resource::ResourceId, HashMap<String, crate::resource::Value<P>>>,
+    ) -> crate::provider::RawSavedAttrs {
+        crate::provider::RawSavedAttrs::from_decoded_values_for_test(
+            values
+                .into_iter()
+                .map(|(id, values)| (id, snapshot_attributes(values)))
+                .collect(),
+        )
+    }
+
+    pub fn snapshot_plan(plan: &crate::plan::Plan) -> crate::plan::SnapshotPlan {
+        crate::value::redact_secrets_in_plan(plan).expect("fixture plan must redact")
+    }
+
+    pub fn snapshot_effect<S: Clone>(
+        effect: &crate::effect::Effect<S>,
+    ) -> crate::effect::Effect<S, crate::resource::SnapshotLeaf> {
+        crate::value::redact_secrets_in_effect(effect).expect("fixture effect must redact")
+    }
     /// Explicit rows shared by scheduler/display deferred-loop fixtures.
     pub fn compiled_loop(template: Box<ExpandedDeferredForExpression>) -> DeferredCreatePayload {
         let root = RootScope::new();

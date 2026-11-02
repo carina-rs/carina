@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn decrypt_with_mock_decryptor() {
-        let config = mock_config(Box::new(|ciphertext, _key| {
+        let config = mock_config(std::sync::Arc::new(|ciphertext, _key| {
             Ok(format!("decrypted:{ciphertext}"))
         }));
 
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn decrypt_with_key_argument() {
-        let config = mock_config(Box::new(|ciphertext, key| {
+        let config = mock_config(std::sync::Arc::new(|ciphertext, key| {
             let key_str = key.unwrap_or("none");
             Ok(format!("decrypted:{ciphertext}:key={key_str}"))
         }));
@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     fn secret_decrypt_composition() {
-        let config = mock_config(Box::new(|_ciphertext, _key| {
+        let config = mock_config(std::sync::Arc::new(|_ciphertext, _key| {
             Ok("my-secret-password".to_string())
         }));
 

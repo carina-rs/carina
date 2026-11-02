@@ -59,12 +59,16 @@ pub(crate) fn apply_pipe_step(
     }
 
     if let Some(user_fn) = ctx.resolved_user_function(&func_name) {
+        if !ctx.config.custom_types_loaded() {
+            let arguments = lower_function_arguments(eval_args.clone(), line)?;
+            record_deferred_function_type_check(&user_fn, &arguments, ctx, line, Some(column));
+        }
         if !ctx.seeded_user_functions.contains(&func_name) && eval_args.iter().all(is_static_eval) {
             return evaluate_user_function_eval(&user_fn, eval_args, ctx, line)
                 .map(EvalValue::from_value);
         }
         let args = lower_function_arguments(eval_args, line)?;
-        record_deferred_function_type_check(&user_fn, &args, ctx, line);
+        record_deferred_function_type_check(&user_fn, &args, ctx, line, Some(column));
         return Ok(EvalValue::from_value(Value::Deferred(
             DeferredValue::ResolvedFunctionCall {
                 function: user_fn,

@@ -65,7 +65,7 @@ struct ProviderState {
 impl ProviderState {
     fn new(
         factories: Vec<Box<dyn ProviderFactory>>,
-        provider_errors: HashMap<String, String>,
+        mut provider_errors: HashMap<String, String>,
         configs: Vec<(PathBuf, workspace::DiscoveredProviderConfig)>,
         prober: Option<ProviderInstallProber>,
         install_fingerprint: Vec<(String, ProviderInstallFingerprint)>,
@@ -97,24 +97,16 @@ impl ProviderState {
             .flat_map(|f| f.config_completions().remove("region").unwrap_or_default())
             .collect();
         let factories = Arc::new(factories);
-        let (schemas, diagnostic_engine) = if provider_names.is_empty() {
-            (
-                Arc::new(SchemaRegistry::new()),
-                DiagnosticEngine::without_loaded_provider_schemas(),
-            )
-        } else {
-            let loaded_providers = Arc::new(provider_mod::loaded_provider_snapshot_from_factories(
-                Arc::clone(&factories),
-                supplemental_schemas,
-            ));
-            let schemas = loaded_providers.schemas().schemas_arc();
-            let engine = DiagnosticEngine::new_with_known_providers(
-                loaded_providers,
-                provider_names.clone(),
-                known_provider_names,
-            );
-            (schemas, engine)
-        };
+        let loaded_providers = Arc::new(provider_mod::loaded_provider_snapshot_from_factories(
+            Arc::clone(&factories),
+            supplemental_schemas,
+        ));
+        let schemas = loaded_providers.schemas().schemas_arc();
+        let diagnostic_engine = DiagnosticEngine::new_with_known_providers(
+            loaded_providers,
+            provider_names.clone(),
+            known_provider_names,
+        );
         // Extract custom type names from provider schemas for completion.
         // The structured identities render to their dotted display form
         // (`aws.iam.Role.Arn`, `Ipv4Cidr`), which is also the spelling a
@@ -123,6 +115,14 @@ impl ProviderState {
             .iter()
             .map(|id| id.to_string())
             .collect();
+        for (_, config) in &configs {
+            let provider = &config.factory_config().name;
+            if config.factory_config().is_default() && !provider_names.contains(provider) {
+                provider_errors
+                    .entry(provider.clone())
+                    .or_insert_with(|| format!("Provider '{provider}' schemas are unavailable"));
+            }
+        }
         let diagnostic_engine = diagnostic_engine.with_provider_errors(provider_errors);
         Self {
             schemas: Arc::clone(&schemas),
@@ -560,10 +560,14 @@ impl LanguageServer for Backend {
                 .as_ref()
                 .map(|p| providers.state_for_path(p))
                 .unwrap_or(&providers.empty);
-            let completions =
-                state
-                    .completion_provider
-                    .complete(&doc, position, base_path.as_deref());
+            let completions = state.completion_provider.complete(
+                &doc,
+                position,
+                base_path.as_deref(),
+                &state
+                    .diagnostic_engine
+                    .catalog_for_document(&doc, uri.to_file_path().ok().as_deref()),
+            );
             return Ok(Some(CompletionResponse::Array(completions)));
         }
         Ok(None)

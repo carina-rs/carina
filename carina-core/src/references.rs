@@ -1182,7 +1182,12 @@ impl ReferenceValidation<'_> {
         segments: &[crate::schema::LeafPathSegment],
         path: &str,
         depth: usize,
-        visit: &mut impl FnMut(&Value<P>, &TypeIdentity, &str, bool) -> Result<(), Box<ReferencePlanError>>,
+        visit: &mut impl FnMut(
+            &Value<P>,
+            &TypeIdentity,
+            &str,
+            bool,
+        ) -> Result<(), Box<ReferencePlanError>>,
     ) -> Result<(), Box<ReferencePlanError>> {
         use crate::schema::LeafPathSegment;
         let Some((segment, rest)) = segments.split_first().filter(|_| depth < 64) else {
@@ -1274,7 +1279,12 @@ impl ReferenceValidation<'_> {
         path: &str,
         secret: bool,
         depth: usize,
-        visit: &mut impl FnMut(&Value<P>, &TypeIdentity, &str, bool) -> Result<(), Box<ReferencePlanError>>,
+        visit: &mut impl FnMut(
+            &Value<P>,
+            &TypeIdentity,
+            &str,
+            bool,
+        ) -> Result<(), Box<ReferencePlanError>>,
     ) -> Result<(), Box<ReferencePlanError>> {
         if depth >= 64 {
             return Err(Box::new(ReferencePlanError {
@@ -1367,10 +1377,19 @@ pub fn prepare_empty_for_tests() -> ResolvedReferences {
 #[cfg(test)]
 mod tests;
 
-fn comparison_reference_list_items<P: crate::resource::ValueKind>(value: &Value<P>) -> Option<std::borrow::Cow<'_,[Value<P>]>> {
+fn comparison_reference_list_items<P: crate::resource::ValueKind>(
+    value: &Value<P>,
+) -> Option<std::borrow::Cow<'_, [Value<P>]>> {
     match value {
         Value::Concrete(ConcreteValue::List(items)) => Some(std::borrow::Cow::Borrowed(items)),
-        Value::Concrete(ConcreteValue::StringList(items)) => Some(std::borrow::Cow::Owned(items.iter().cloned().map(ConcreteValue::String).map(Value::Concrete).collect())),
+        Value::Concrete(ConcreteValue::StringList(items)) => Some(std::borrow::Cow::Owned(
+            items
+                .iter()
+                .cloned()
+                .map(ConcreteValue::String)
+                .map(Value::Concrete)
+                .collect(),
+        )),
         _ => None,
     }
 }

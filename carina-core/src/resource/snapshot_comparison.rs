@@ -1,5 +1,5 @@
-use super::*;
 use super::SnapshotValue as Value;
+use super::*;
 
 #[derive(Clone, Copy)]
 pub(crate) struct SavedValueViews<'a> {
@@ -41,7 +41,11 @@ pub(crate) fn match_equal_concrete_items<A: Borrow<Value>, B: Borrow<Value>>(
     }
     for (i, item) in a.iter().enumerate() {
         let item = item.borrow();
-        if !matches!(item, Value::Concrete(_)) || !item.to_value_at("comparison").is_ok_and(|value| value.is_fully_resolved()) {
+        if !matches!(item, Value::Concrete(_))
+            || !item
+                .to_value_at("comparison")
+                .is_ok_and(|value| value.is_fully_resolved())
+        {
             continue;
         }
         if let Some(j) = buckets.get(&item.canonical_hash()).and_then(|bucket| {
@@ -833,7 +837,9 @@ fn pairing_hashes<R: ReferenceEquality>(
     context: &ComparisonContext<'_, R>,
 ) -> Vec<u64> {
     let mut hashes = vec![value.canonical_hash()];
-    if value.secret_hash().is_some() { hashes.push(secret_state_pairing_hash()); }
+    if value.secret_hash().is_some() {
+        hashes.push(secret_state_pairing_hash());
+    }
     match value {
         Value::Deferred(DeferredValue::Secret(inner)) => {
             // `type_aware_equal` checks Secret before schema dispatch. A
@@ -877,6 +883,7 @@ fn append_schema_pairing_hashes<R: ReferenceEquality>(
         return;
     }
     match attr_type.shape_with_defs(defs) {
+        Shape::UnloadedSchemaType(_) => {}
         Shape::Reference { .. } => {
             // Resolved equality must also be considered by multiset pairing.
             hashes.push(pairing_component_hash(0x09, &0_u8));
@@ -1119,31 +1126,89 @@ fn similarity_score<R: ReferenceEquality>(
     }
 }
 
-
 pub(crate) trait ComparisonItem {
     fn comparison_snapshot(&self) -> super::SnapshotValue;
 }
 impl<P: StateValueLeaf> ComparisonItem for super::Value<P> {
-    fn comparison_snapshot(&self) -> super::SnapshotValue { state_value_snapshot(self) }
+    fn comparison_snapshot(&self) -> super::SnapshotValue {
+        state_value_snapshot(self)
+    }
 }
 impl<T: ComparisonItem + ?Sized> ComparisonItem for &T {
-    fn comparison_snapshot(&self) -> super::SnapshotValue { (*self).comparison_snapshot() }
+    fn comparison_snapshot(&self) -> super::SnapshotValue {
+        (*self).comparison_snapshot()
+    }
 }
 
 pub(crate) fn pair_list_elements<D: ComparisonItem, S: ComparisonItem, R: ReferenceEquality>(
-    desired: &[D], saved: &[S], attr_type: Option<&AttributeType>,
-    defs: &BTreeMap<String, AttributeType>, context: &ComparisonContext<'_,R>,
+    desired: &[D],
+    saved: &[S],
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_, R>,
 ) -> Vec<Option<usize>> {
-    let desired = desired.iter().map(ComparisonItem::comparison_snapshot).collect::<Vec<_>>();
-    let saved = saved.iter().map(ComparisonItem::comparison_snapshot).collect::<Vec<_>>();
+    let desired = desired
+        .iter()
+        .map(ComparisonItem::comparison_snapshot)
+        .collect::<Vec<_>>();
+    let saved = saved
+        .iter()
+        .map(ComparisonItem::comparison_snapshot)
+        .collect::<Vec<_>>();
     pair_list_elements_snapshot(&desired, &saved, attr_type, defs, context)
 }
 
-pub(crate) fn pair_list_elements_with_uniqueness<D: ComparisonItem, S: ComparisonItem, R: ReferenceEquality>(
-    desired: &[D], saved: &[S], attr_type: Option<&AttributeType>,
-    defs: &BTreeMap<String, AttributeType>, context: &ComparisonContext<'_,R>,
+pub(crate) fn pair_list_elements_with_uniqueness<
+    D: ComparisonItem,
+    S: ComparisonItem,
+    R: ReferenceEquality,
+>(
+    desired: &[D],
+    saved: &[S],
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_, R>,
 ) -> Vec<ListElementPairing> {
-    let desired = desired.iter().map(ComparisonItem::comparison_snapshot).collect::<Vec<_>>();
-    let saved = saved.iter().map(ComparisonItem::comparison_snapshot).collect::<Vec<_>>();
+    let desired = desired
+        .iter()
+        .map(ComparisonItem::comparison_snapshot)
+        .collect::<Vec<_>>();
+    let saved = saved
+        .iter()
+        .map(ComparisonItem::comparison_snapshot)
+        .collect::<Vec<_>>();
     pair_list_elements_with_uniqueness_snapshot(&desired, &saved, attr_type, defs, context)
+}
+
+#[cfg(test)]
+pub(super) mod testing {
+    use super::*;
+    pub(in crate::resource) fn similarity_score<R: ReferenceEquality>(
+        a: &Value,
+        b: &Value,
+        attr_type: Option<&AttributeType>,
+        defs: &BTreeMap<String, AttributeType>,
+        context: &ComparisonContext<'_, R>,
+    ) -> usize {
+        super::similarity_score(a, b, attr_type, defs, context)
+    }
+    pub(in crate::resource) fn pairing_hashes<R: ReferenceEquality>(
+        value: &Value,
+        attr_type: Option<&AttributeType>,
+        defs: &BTreeMap<String, AttributeType>,
+        context: &ComparisonContext<'_, R>,
+    ) -> Vec<u64> {
+        super::pairing_hashes(value, attr_type, defs, context)
+    }
+    pub(in crate::resource) fn merge_lists<R: ReferenceEquality>(
+        desired: &[Value],
+        projected: &[Value],
+        raw: &[Value],
+        explicit: &ExplicitFields,
+        attr_type: Option<&AttributeType>,
+        defs: &BTreeMap<String, AttributeType>,
+        context: &ComparisonContext<'_, R>,
+    ) -> Vec<Value> {
+        super::merge_lists(desired, projected, raw, explicit, attr_type, defs, context)
+    }
 }

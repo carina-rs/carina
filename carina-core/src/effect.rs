@@ -29,10 +29,10 @@ use crate::provider::AppliedIdentifier;
 #[cfg(test)]
 use crate::resource::DataSource;
 use crate::resource::{
-    AbsoluteBindingAddress, DeposedKey, Directives, LoopElementOrigin, ModuleSource,
-    PersistedDestroyDependencies, ResolvedDataSource, ResolvedDependencies, ResolvedResource,
-    ResolvedResourceId, ResourceId, ResourceIdentity, SavedModuleSource, SchemaUnresolvedResource,
-    State, Value, PlanValueKind, NoPlaceholder, SnapshotLeaf, SnapshotValue,
+    AbsoluteBindingAddress, DeposedKey, Directives, LoopElementOrigin, ModuleSource, NoPlaceholder,
+    PersistedDestroyDependencies, PlanValueKind, ResolvedDataSource, ResolvedDependencies,
+    ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity, SavedModuleSource,
+    SchemaUnresolvedResource, SnapshotLeaf, SnapshotValue, State, Value,
 };
 use crate::schema::FieldName;
 use crate::wait::ManagedWaitTarget;
@@ -368,7 +368,9 @@ impl<S: Serialize + Clone, V: PlanValueKind> Serialize for DeferredCreatePayload
     }
 }
 
-impl<'de, S: serde::de::DeserializeOwned, V: PlanValueKind> Deserialize<'de> for DeferredCreatePayload<S, V> {
+impl<'de, S: serde::de::DeserializeOwned, V: PlanValueKind> Deserialize<'de>
+    for DeferredCreatePayload<S, V>
+{
     fn deserialize<De>(deserializer: De) -> Result<Self, De::Error>
     where
         De: serde::Deserializer<'de>,
@@ -424,7 +426,9 @@ impl<S: Serialize + Clone, V: PlanValueKind> Serialize for DeferredReplacePayloa
     }
 }
 
-impl<'de, S: serde::de::DeserializeOwned, V: PlanValueKind> Deserialize<'de> for DeferredReplacePayload<S, V> {
+impl<'de, S: serde::de::DeserializeOwned, V: PlanValueKind> Deserialize<'de>
+    for DeferredReplacePayload<S, V>
+{
     fn deserialize<De>(deserializer: De) -> Result<Self, De::Error>
     where
         De: serde::Deserializer<'de>,
@@ -918,10 +922,16 @@ impl ResolvedMovePairs {
     /// let project = tempfile::tempdir().unwrap();
     /// std::fs::write(project.path().join("main.crn"), "").unwrap();
     /// let parsed = parse_directory(project.path(), &ProviderContext::default()).unwrap();
-    /// let configuration = resolve_modules_providerless(parsed, project.path())
-    ///     .unwrap()
-    ///     .into_expanded(&SchemaRegistry::new())
-    ///     .unwrap();
+    /// let checks = carina_core::validation::deferred_types::TypeCheckSession::run(
+    ///     &ProviderContext::default(),
+    ///     |session| resolve_modules_providerless(parsed, project.path(), session)
+    ///         .unwrap()
+    ///         .into_expanded(&SchemaRegistry::new())
+    ///         .unwrap(),
+    /// );
+    /// let mut diagnostics = Vec::new();
+    /// let configuration = checks.publish(&mut diagnostics);
+    /// assert!(diagnostics.is_empty());
     /// let addressed = AddressedMoves::preserve_addresses(&configuration.state_blocks);
     /// let pairs = ResolvedMovePairs::from_addressed_moves(addressed);
     /// assert!(pairs.is_empty());
@@ -1222,9 +1232,13 @@ pub type SavedEffect = EffectWithSource<SavedModuleSource, SnapshotLeaf>;
 
 /// Borrowed view of a graph-resolved resource carried by an effect.
 pub type EffectResourceRef<'a, S = ModuleSource, V = NoPlaceholder> = crate::parser::ResourceRef<
-    'a, S, V, <V as PlanValueKind>::Template,
+    'a,
+    S,
+    V,
+    <V as PlanValueKind>::Template,
     crate::parser::ResolvedDeferredForPhase<V, <V as PlanValueKind>::Template>,
-    AbsoluteBindingAddress, (),
+    AbsoluteBindingAddress,
+    (),
 >;
 
 /// Saved-plan effect payload before authored resource directives have been
@@ -1909,7 +1923,7 @@ impl EffectWithSource<ModuleSource> {
             (
                 Effect::Import {
                     id: crate::resource::ResolvedResourceId::new(id.clone()),
-                    identifier: Value<V>::Concrete(ConcreteValue::String("x-1".into())),
+                    identifier: Value::Concrete(ConcreteValue::String("x-1".into())),
                 },
                 Effect::Import { .. }
             ),
@@ -1936,7 +1950,9 @@ impl EffectWithSource<ModuleSource> {
                     key_field: FieldName::declared("key"),
                     keys: ReleasedListKeys::try_new(vec![ReleasedListKey::new(
                         "enabled",
-                        Value::Concrete(ConcreteValue::String("true".into())),
+                        crate::resource::ExpandedValue::Concrete(ConcreteValue::String(
+                            "true".into()
+                        )),
                     )])
                     .expect("test release has one key"),
                 },
@@ -2560,7 +2576,9 @@ impl<S, V: PlanValueKind> EffectWithSource<S, V> {
 ///    [`crate::value::format_value_with_key`].
 ///
 /// Carina#3329.
-pub fn format_import_identifier(identifier: &crate::resource::Value) -> String {
+pub fn format_import_identifier<P: crate::resource::ValueKind>(
+    identifier: &crate::resource::Value<P>,
+) -> String {
     use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
     match identifier {
         Value::Concrete(ConcreteValue::String(s)) => s.expose_plaintext().to_owned(),
@@ -2908,7 +2926,9 @@ mod tests {
                     key_field: FieldName::declared("key"),
                     keys: ReleasedListKeys::try_new(vec![ReleasedListKey::new(
                         "enabled",
-                        Value::Concrete(ConcreteValue::String("true".into())),
+                        crate::resource::ExpandedValue::Concrete(ConcreteValue::String(
+                            "true".into(),
+                        )),
                     )])
                     .expect("fixture has one release key"),
                 },
@@ -2962,14 +2982,15 @@ mod tests {
         use crate::resource::{
             ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart, Value,
         };
-        let inner = Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
-                ApplyTimeUnknown::UpstreamAllExports {
-                    binding: absolute_binding("u"),
-                },
-            ))),
-            InterpolationPart::Literal("-suffix".into()),
-        ]));
+        let inner: crate::resource::ExpandedValue =
+            Value::Deferred(DeferredValue::Interpolation(vec![
+                InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
+                    ApplyTimeUnknown::UpstreamAllExports {
+                        binding: absolute_binding("u"),
+                    },
+                ))),
+                InterpolationPart::Literal("-suffix".into()),
+            ]));
         let outer = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("prefix-".into()),
             InterpolationPart::Expr(inner),
@@ -2982,7 +3003,9 @@ mod tests {
         );
         // Sanity: a bare concrete still renders bare.
         assert_eq!(
-            format_import_identifier(&Value::Concrete(ConcreteValue::String("plain".into()))),
+            format_import_identifier(&crate::resource::ExpandedValue::Concrete(
+                ConcreteValue::String("plain".into())
+            )),
             "plain"
         );
     }
@@ -3145,7 +3168,10 @@ mod tests {
         let original = deferred_replace_effect();
         let json = serde_json::to_string(&original).expect("serialize");
         let decoded = deserialize_effect(&json);
-        assert_eq!(decoded, SavedEffect::from(original));
+        assert_eq!(
+            decoded,
+            SavedEffect::from(crate::test_support::snapshot_effect(&original))
+        );
     }
 
     #[test]
@@ -3269,10 +3295,15 @@ mod tests {
             .into_iter()
             .find_map(|(label, effect)| (label == "ReleaseListKeys").then_some(effect))
             .expect("release fixture");
-        let json = serde_json::to_string(&SavedEffect::from(effect.clone()))
-            .expect("serialize release effect");
+        let json = serde_json::to_string(&SavedEffect::from(crate::test_support::snapshot_effect(
+            &effect,
+        )))
+        .expect("serialize release effect");
         let decoded = deserialize_effect(&json);
-        assert_eq!(decoded, SavedEffect::from(effect));
+        assert_eq!(
+            decoded,
+            SavedEffect::from(crate::test_support::snapshot_effect(&effect))
+        );
         let Effect::ReleaseListKeys {
             attribute,
             key_field,
@@ -3404,7 +3435,7 @@ mod tests {
             let json = serde_json::to_string(&effect).unwrap();
             let deserialized = deserialize_effect(&json);
             assert_eq!(
-                SavedEffect::from(effect.clone()),
+                SavedEffect::from(crate::test_support::snapshot_effect(&effect)),
                 deserialized,
                 "Round-trip failed for {:?}",
                 effect

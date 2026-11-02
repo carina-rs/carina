@@ -16,9 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     AbsoluteBindingAddress, BindingAddress, Directives, ModuleSource, NoPlaceholder,
-    ParserPlaceholder, ValueKind, ProviderModuleSource, RelativeBindingName,
-    ResolvedDependencies, ResolvedDependencyReads, ResolvedResourceId, ResourceId,
-    ResourceIdentity, ResourceIdentityState, SavedModuleSource, UnexpandedDependencyFields, Value,
+    ParserPlaceholder, ProviderModuleSource, RelativeBindingName, ResolvedDependencies,
+    ResolvedDependencyReads, ResolvedResourceId, ResourceId, ResourceIdentity,
+    ResourceIdentityState, SavedModuleSource, UnexpandedDependencyFields, Value, ValueKind,
 };
 
 /// A read-only resource (data source).
@@ -416,7 +416,10 @@ pub struct ResolvedDataSource<S = ModuleSource, P: ValueKind = NoPlaceholder> {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(bound(serialize = "S: Serialize, P: ValueKind + Serialize, Directives<AbsoluteBindingAddress, P>: Serialize", deserialize = "S: Deserialize<'de>, P: ValueKind + Deserialize<'de>, Directives<AbsoluteBindingAddress, P>: Deserialize<'de>"))]
+#[serde(bound(
+    serialize = "S: Serialize, P: ValueKind + Serialize, Directives<AbsoluteBindingAddress, P>: Serialize",
+    deserialize = "S: Deserialize<'de>, P: ValueKind + Deserialize<'de>, Directives<AbsoluteBindingAddress, P>: Deserialize<'de>"
+))]
 struct ResolvedDataSourceWire<S, P: ValueKind> {
     #[serde(flatten)]
     resource: DataSource<S, P, AbsoluteBindingAddress, ()>,
@@ -526,9 +529,7 @@ impl<S, P: ValueKind> ResolvedDataSource<S, P> {
     }
 
     /// Try to construct; returns `None` if identity is pending.
-    pub fn try_new(
-        resource: DataSource<S, P, AbsoluteBindingAddress, ()>,
-    ) -> Option<Self> {
+    pub fn try_new(resource: DataSource<S, P, AbsoluteBindingAddress, ()>) -> Option<Self> {
         match resource.id.identity_state() {
             ResourceIdentityState::Pending(_) => None,
             ResourceIdentityState::Resolved(_) => Some(Self::new(resource)),
@@ -618,7 +619,9 @@ impl<S, P: ValueKind> Deref for ResolvedDataSource<S, P> {
     }
 }
 
-impl<S, P: ValueKind> From<ResolvedDataSource<S, P>> for DataSource<S, P, AbsoluteBindingAddress, ()> {
+impl<S, P: ValueKind> From<ResolvedDataSource<S, P>>
+    for DataSource<S, P, AbsoluteBindingAddress, ()>
+{
     fn from(resource: ResolvedDataSource<S, P>) -> Self {
         resource.resource
     }
@@ -666,7 +669,9 @@ impl<S, P: ValueKind> From<ResolvedDataSource<S, P>> for ResolvedDataSourceWire<
     }
 }
 
-impl<S, P: ValueKind> AsRef<DataSource<S, P, AbsoluteBindingAddress, ()>> for ResolvedDataSource<S, P> {
+impl<S, P: ValueKind> AsRef<DataSource<S, P, AbsoluteBindingAddress, ()>>
+    for ResolvedDataSource<S, P>
+{
     fn as_ref(&self) -> &DataSource<S, P, AbsoluteBindingAddress, ()> {
         self.as_inner()
     }
@@ -689,5 +694,4 @@ impl<S> ResolvedDataSource<S> {
             })
             .collect()
     }
-
 }

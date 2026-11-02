@@ -74,10 +74,15 @@ fn mock_saved_provider_configs() -> SavedProviderConfigs {
         unresolved_attributes: IndexMap::new(),
         binding: None,
     }];
-    let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
-        &parsed,
-        &HashMap::new(),
+    let resolved = carina_core::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
+        |session| {
+            carina_core::parser::resolve_provider_attributes_with_remote(
+                &parsed,
+                &HashMap::new(),
+                session,
+            )
+        },
     )
     .expect("test provider config must resolve");
     SavedProviderConfigs::from(&resolved)

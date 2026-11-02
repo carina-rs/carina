@@ -36,7 +36,7 @@
 //! binding-name table is scoped.
 //!
 //! ```ignore
-//! let index = BindingIndex::from_parsed(&parsed, &registry);
+//! let index = BindingIndex::from_parsed(&parsed, &registry, &crate::parser::ProviderContext::default());
 //! if let Some(entry) = index.get("vpc") {
 //!     // entry.target is the statically known validation surface
 //! }
@@ -224,6 +224,13 @@ pub struct RefTypeMismatch {
     declared: Option<String>,
 }
 
+/// Reference assignment distinguishes a proven mismatch from missing schemas.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RefTypeAssignabilityError {
+    Mismatch(RefTypeMismatch),
+    Unchecked(Box<crate::parser::CustomTypeValidationError>),
+}
+
 impl RefTypeMismatch {
     pub fn actual_type_name(&self) -> &str {
         &self.actual
@@ -246,7 +253,10 @@ impl RefTypeMismatch {
 impl ResolvedRefType {
     /// A lexical value declaration is authoritative independently of the
     /// caller expression later substituted for that value.
-    pub(crate) fn from_value_declaration(type_expr: &crate::parser::TypeExpr) -> Option<Self> {
+    pub(crate) fn from_value_declaration<B: BindingAddress>(
+        type_expr: &crate::parser::TypeExpr,
+        bindings: &BindingIndex<'_, B>,
+    ) -> Option<Self> {
         fn is_value_constraint(type_expr: &crate::parser::TypeExpr) -> bool {
             use crate::parser::TypeExpr;
 
@@ -265,6 +275,7 @@ impl ResolvedRefType {
                 | TypeExpr::Float
                 | TypeExpr::Duration
                 | TypeExpr::Simple(_)
+                | TypeExpr::UnloadedSchemaType(_)
                 | TypeExpr::SchemaType { owned: _ }
                 | TypeExpr::StringLiteral(_) => true,
             }
@@ -273,7 +284,8 @@ impl ResolvedRefType {
         if !is_value_constraint(type_expr) {
             return None;
         }
-        crate::validation::lift_type_expr(type_expr)
+        bindings
+            .lift_declared_type(type_expr)
             .map(|attr_type| Self::new(attr_type, BTreeMap::new()))
     }
 
@@ -346,7 +358,8 @@ impl ResolvedRefType {
                 provider.clone(),
                 resource_type.clone(),
             )),
-            AttrTypeKind::String { .. }
+            AttrTypeKind::UnloadedSchemaType(_)
+            | AttrTypeKind::String { .. }
             | AttrTypeKind::Reference {
                 identity: _,
                 pattern: _,
@@ -371,28 +384,35 @@ impl ResolvedRefType {
     /// `sink`. The returned mismatch identifies the first failing constraint;
     /// inferred failures also retain the current boundary's declaration for
     /// diagnostics.
-    pub fn is_assignable_to_sink(
+    pub fn is_assignable_to_sink<B: BindingAddress>(
         &self,
         sink: TypeInSchema<'_, crate::schema::Compiled>,
-    ) -> Result<(), RefTypeMismatch> {
+        bindings: &BindingIndex<'_, B>,
+    ) -> Result<(), RefTypeAssignabilityError> {
         let authoritative = self.authoritative.constraint().type_in_schema();
-        if !authoritative.is_assignable_to(sink) {
-            return Err(RefTypeMismatch {
+        if !bindings
+            .check_type_assignment(authoritative, sink)
+            .map_err(|reason| RefTypeAssignabilityError::Unchecked(Box::new(reason)))?
+        {
+            return Err(RefTypeAssignabilityError::Mismatch(RefTypeMismatch {
                 actual: authoritative.resolved_type_name(),
                 declared: None,
-            });
+            }));
         }
 
         for evidence in &self.evidence {
             let evidence = evidence.type_in_schema();
-            if !evidence.is_assignable_to(sink) {
-                return Err(RefTypeMismatch {
+            if !bindings
+                .check_type_assignment(evidence, sink)
+                .map_err(|reason| RefTypeAssignabilityError::Unchecked(Box::new(reason)))?
+            {
+                return Err(RefTypeAssignabilityError::Mismatch(RefTypeMismatch {
                     actual: evidence.resolved_type_name(),
                     declared: self
                         .authoritative
                         .is_declared_composition_attribute()
                         .then(|| authoritative.resolved_type_name()),
-                });
+                }));
             }
         }
         Ok(())
@@ -526,6 +546,9 @@ fn suggestion_suffix(unknown: &str, known: &[&str]) -> String {
 /// callers can distinguish "unknown binding" from "known but unchecked".
 #[derive(Debug)]
 pub struct BindingIndex<'a, B: BindingAddress = RelativeBindingName> {
+    schemas: &'a SchemaRegistry,
+    provider_context: crate::parser::ProviderContext,
+    session: Option<&'a dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     entries: HashMap<String, BindingEntry<'a, B>>,
     known_names: std::collections::HashSet<String>,
     resource_handles: HashMap<String, AttributeType>,
@@ -551,11 +574,12 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
     pub fn from_parsed<E, D>(
         parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         registry: &'a SchemaRegistry,
+        provider_context: &crate::parser::ProviderContext,
     ) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        Self::build(parsed, registry, None, None)
+        Self::build(parsed, registry, None, None, provider_context)
     }
 
     /// Build the index with the declared output surfaces of imported modules.
@@ -566,11 +590,18 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         registry: &'a SchemaRegistry,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
+        provider_context: &crate::parser::ProviderContext,
     ) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        Self::build(parsed, registry, None, Some(module_signatures))
+        Self::build(
+            parsed,
+            registry,
+            None,
+            Some(module_signatures),
+            provider_context,
+        )
     }
 
     /// Build the index with statically resolved `upstream_state` exports.
@@ -580,11 +611,18 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         registry: &'a SchemaRegistry,
         upstream_exports: &'a crate::upstream_exports::UpstreamExports<B>,
+        provider_context: &crate::parser::ProviderContext,
     ) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        Self::build(parsed, registry, Some(upstream_exports), None)
+        Self::build(
+            parsed,
+            registry,
+            Some(upstream_exports),
+            None,
+            provider_context,
+        )
     }
 
     /// Build the complete pre-expansion validation index used by the LSP.
@@ -593,6 +631,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         registry: &'a SchemaRegistry,
         upstream_exports: &'a crate::upstream_exports::UpstreamExports<B>,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
+        provider_context: &crate::parser::ProviderContext,
     ) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -602,7 +641,29 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
             registry,
             Some(upstream_exports),
             Some(module_signatures),
+            provider_context,
         )
+    }
+
+    pub fn from_parsed_with_upstream_exports_and_module_signatures_in_session<E, D>(
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+        registry: &'a SchemaRegistry,
+        upstream_exports: Option<&'a crate::upstream_exports::UpstreamExports<B>>,
+        module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
+        session: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        let mut index = Self::build(
+            parsed,
+            registry,
+            upstream_exports,
+            Some(module_signatures),
+            session.catalog(),
+        );
+        index.session = Some(session);
+        index
     }
 
     fn build<E, D>(
@@ -610,6 +671,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         registry: &'a SchemaRegistry,
         upstream_exports: Option<&'a crate::upstream_exports::UpstreamExports<B>>,
         module_signatures: Option<&'a crate::module_resolver::ResolvedModuleSignatures>,
+        provider_context: &crate::parser::ProviderContext,
     ) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -806,6 +868,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
                 | crate::parser::TypeExpr::Float
                 | crate::parser::TypeExpr::Duration
                 | crate::parser::TypeExpr::Simple(_)
+                | crate::parser::TypeExpr::UnloadedSchemaType(_)
                 | crate::parser::TypeExpr::List(_)
                 | crate::parser::TypeExpr::Map(_)
                 | crate::parser::TypeExpr::SchemaType { .. }
@@ -847,6 +910,9 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
             }
         }
         Self {
+            schemas: registry,
+            provider_context: provider_context.clone(),
+            session: None,
             entries,
             known_names,
             resource_handles,
@@ -858,6 +924,50 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
 
     pub fn get(&self, name: &str) -> Option<&BindingEntry<'a, B>> {
         self.entries.get(name)
+    }
+
+    pub(crate) fn provider_context(&self) -> &crate::parser::ProviderContext {
+        &self.provider_context
+    }
+
+    /// Consume assignment with this index's provider authority. Loaded paths
+    /// propagate missing evidence; bootstrap paths explicitly allow it.
+    pub fn check_type_assignment(
+        &self,
+        source: TypeInSchema<'_, crate::schema::Compiled>,
+        sink: TypeInSchema<'_, crate::schema::Compiled>,
+    ) -> Result<bool, crate::parser::CustomTypeValidationError> {
+        let assignment = source.assignment_to(sink);
+        if self.provider_context.custom_types_loaded() {
+            assignment.require_loaded()
+        } else {
+            match self.session {
+                Some(session) => Ok(assignment.record_unchecked(session)),
+                None => assignment.require_loaded(),
+            }
+        }
+    }
+
+    fn lift_declared_type(&self, ty: &crate::parser::TypeExpr) -> Option<AttributeType> {
+        match self.resolve_declared_type(ty) {
+            Ok(resolved) => crate::validation::lift_type_expr(&resolved),
+            // Conflicting declarations cannot supply a sound constraint;
+            // authoritative declaration resolution owns their diagnostic.
+            Err(
+                crate::static_type::StaticTypeResolutionError::ConflictingScalarKinds { .. }
+                | crate::static_type::StaticTypeResolutionError::UnknownCustomType { .. }
+                | crate::static_type::StaticTypeResolutionError::UnknownCustomTypeWithSuggestion {
+                    ..
+                },
+            ) => None,
+        }
+    }
+
+    pub(crate) fn resolve_declared_type(
+        &self,
+        ty: &crate::parser::TypeExpr,
+    ) -> Result<crate::parser::TypeExpr, crate::static_type::StaticTypeResolutionError> {
+        crate::parser::resolve_type_expr_from_schemas(ty, self.schemas, &self.provider_context)
     }
 
     pub(crate) fn user_function(&self, name: &str) -> Option<&'a crate::parser::UserFunction<B>> {
@@ -999,8 +1109,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
                     } else {
                         match attribute.declared_type() {
                             Some(crate::static_type::StaticType::Known(resolved)) => {
-                                let Some(declared) =
-                                    crate::validation::lift_type_expr(resolved.type_expr())
+                                let Some(declared) = self.lift_declared_type(resolved.type_expr())
                                 else {
                                     visiting.remove(&key);
                                     return RefType::Unchecked;
@@ -1104,7 +1213,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
                     if let crate::parser::TypeExpr::Ref(resource_type) = type_expr {
                         return self.resource_handle_output_ref_type(path, resource_type, check);
                     }
-                    let Some(declared) = crate::validation::lift_type_expr(type_expr) else {
+                    let Some(declared) = self.lift_declared_type(type_expr) else {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     };
@@ -1142,7 +1251,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     }
-                    let Some(declared) = crate::validation::lift_type_expr(type_expr) else {
+                    let Some(declared) = self.lift_declared_type(type_expr) else {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     };
@@ -1212,7 +1321,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     };
-                    let Some(declared) = crate::validation::lift_type_expr(type_expr) else {
+                    let Some(declared) = self.lift_declared_type(type_expr) else {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     };
@@ -1830,19 +1939,28 @@ impl<P: PlaceholderKind, B: BindingAddress> ResolvedBinding<P, B> {
 /// installed as the source for downstream references.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SecretPreservingAttributes {
-    attributes: HashMap<String,crate::resource::SnapshotValue>,
+    attributes: HashMap<String, crate::resource::SnapshotValue>,
 }
 
 impl SecretPreservingAttributes {
     /// Combine resolved desired values with the provider-facing values made
     /// from them. Desired-only keys are retained (notably write-only inputs),
     /// while provider values win after inheriting every secret marker.
-    pub(crate) fn from_provider_values<P: crate::resource::StateValueLeaf,Q: crate::resource::StateValueLeaf>(
-        resolved_shapes: &HashMap<String,Value<P>>,
-        provider_values: &HashMap<String,Value<Q>>,
+    pub(crate) fn from_provider_values<
+        P: crate::resource::StateValueLeaf,
+        Q: crate::resource::StateValueLeaf,
+    >(
+        resolved_shapes: &HashMap<String, Value<P>>,
+        provider_values: &HashMap<String, Value<Q>>,
     ) -> Self {
-        let resolved_shapes = resolved_shapes.iter().map(|(key,value)|(key.clone(),crate::resource::state_value_snapshot(value))).collect::<HashMap<_,_>>();
-        let provider_values = provider_values.iter().map(|(key,value)|(key.clone(),crate::resource::state_value_snapshot(value))).collect::<HashMap<_,_>>();
+        let resolved_shapes = resolved_shapes
+            .iter()
+            .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
+            .collect::<HashMap<_, _>>();
+        let provider_values = provider_values
+            .iter()
+            .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
+            .collect::<HashMap<_, _>>();
         let mut attributes = resolved_shapes.clone();
         for (key, value) in &provider_values {
             let protected = resolved_shapes.get(key).map_or_else(
@@ -1856,7 +1974,7 @@ impl SecretPreservingAttributes {
 
     /// Read-only access for state writeback. Construction remains confined to
     /// the secret-preserving resolution paths above.
-    pub fn values(&self) -> &HashMap<String,crate::resource::SnapshotValue> {
+    pub fn values(&self) -> &HashMap<String, crate::resource::SnapshotValue> {
         &self.attributes
     }
 }
@@ -1886,7 +2004,10 @@ impl<P: PlaceholderKind, B: BindingAddress> Default for ResolvedBindings<P, B> {
 }
 
 impl<P: PlaceholderKind, B: BindingAddress> ResolvedBindings<P, B> {
-    pub fn get(&self, name: &str) -> Option<&HashMap<String, crate::resource::SnapshotValue<P, B>>> {
+    pub fn get(
+        &self,
+        name: &str,
+    ) -> Option<&HashMap<String, crate::resource::SnapshotValue<P, B>>> {
         self.by_name.get(name).map(|binding| &binding.attributes)
     }
 
@@ -2358,7 +2479,11 @@ impl ResolvedBindings {
             let Some(binding_name) = resource.binding.as_ref() else {
                 continue;
             };
-            let mut merged = resource.resolved_attributes().into_iter().map(|(key,value)|(key,value.to_snapshot())).collect::<HashMap<_,_>>();
+            let mut merged = resource
+                .resolved_attributes()
+                .into_iter()
+                .map(|(key, value)| (key, value.to_snapshot()))
+                .collect::<HashMap<_, _>>();
             let definitive_attributes: HashSet<String> = merged.keys().cloned().collect();
             let (changed_attributes, refreshable_attributes) = match managed_stability
                 .get(&resource.id)
@@ -2426,7 +2551,10 @@ impl ResolvedBindings {
             by_name.insert(
                 remote_binding.clone(),
                 ResolvedBinding {
-                    attributes: remote_attrs.iter().map(|(key,value)| (key.clone(),value.to_snapshot())).collect(),
+                    attributes: remote_attrs
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.to_snapshot()))
+                        .collect(),
                     source: BindingValueSource::Upstream,
                     completeness: BindingCompleteness::Complete,
                     definitive_attributes: HashSet::new(),
@@ -2528,7 +2656,10 @@ impl ResolvedBindings {
         self.layer_composition_views(compositions.iter().map(CompositionRuntimeRef::Live));
     }
 
-    fn layer_saved_compositions(&mut self, compositions: &[SavedComposition<crate::resource::NoPlaceholder>]) {
+    fn layer_saved_compositions(
+        &mut self,
+        compositions: &[SavedComposition<crate::resource::NoPlaceholder>],
+    ) {
         self.layer_composition_views(compositions.iter().map(CompositionRuntimeRef::Saved));
     }
 
@@ -2548,7 +2679,10 @@ impl ResolvedBindings {
             self.by_name.insert(
                 binding_name.to_string(),
                 ResolvedBinding {
-                    attributes: value_attrs.iter().map(|(key,value)| (key.clone(),value.to_snapshot())).collect(),
+                    attributes: value_attrs
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.to_snapshot()))
+                        .collect(),
                     source: BindingValueSource::Local,
                     completeness: BindingCompleteness::Complete,
                     definitive_attributes,
@@ -2618,7 +2752,11 @@ impl ResolvedBindings {
             let Some(binding_name) = d.binding.as_ref() else {
                 continue;
             };
-            let mut merged = d.attributes.iter().map(|(key,value)| (key.clone(),value.to_snapshot())).collect::<HashMap<_,_>>();
+            let mut merged = d
+                .attributes
+                .iter()
+                .map(|(key, value)| (key.clone(), value.to_snapshot()))
+                .collect::<HashMap<_, _>>();
             let definitive_attributes = merged.keys().cloned().collect();
             let mut completeness = BindingCompleteness::Incomplete;
             match value {
@@ -2628,7 +2766,7 @@ impl ResolvedBindings {
                     completeness = BindingCompleteness::Complete;
                     if state.exists {
                         for (k, v) in &state.attributes {
-                            merged.insert(k.clone(),v.clone());
+                            merged.insert(k.clone(), v.clone());
                         }
                     }
                 }
@@ -2654,7 +2792,11 @@ impl ResolvedBindings {
             let Some(binding_name) = data_source.binding.as_ref() else {
                 continue;
             };
-            let attributes = data_source.attributes.iter().map(|(key,value)| (key.clone(),value.to_snapshot())).collect::<HashMap<_,_>>();
+            let attributes = data_source
+                .attributes
+                .iter()
+                .map(|(key, value)| (key.clone(), value.to_snapshot()))
+                .collect::<HashMap<_, _>>();
             let definitive_attributes = attributes.keys().cloned().collect();
             self.by_name.insert(
                 binding_name.to_string(),
@@ -2718,7 +2860,9 @@ impl ResolvedBindings {
                     binding.removed_sensitive_attributes.clear();
                     for attribute in changed_attributes {
                         if let Some(value) = desired.get(attribute) {
-                            binding.attributes.insert(attribute.clone(), value.to_snapshot());
+                            binding
+                                .attributes
+                                .insert(attribute.clone(), value.to_snapshot());
                         } else {
                             if binding
                                 .attributes
@@ -2773,11 +2917,11 @@ impl ResolvedBindings {
     /// we trust the provider.
     ///
     /// Replaces the executor's `update_binding_map` helper (#2300).
-    pub fn record_applied(
+    pub fn record_applied<P: crate::resource::StateValueLeaf>(
         &mut self,
         binding: Option<&str>,
         resource_attrs: &SecretPreservingAttributes,
-        state: &State,
+        state: &State<P>,
         completeness: BindingCompleteness,
     ) {
         let Some(name) = binding else {
@@ -2785,9 +2929,10 @@ impl ResolvedBindings {
         };
         let mut merged = resource_attrs.values().clone();
         for (k, v) in &state.attributes {
+            let v = crate::resource::state_value_snapshot(v);
             let value = resource_attrs.values().get(k).map_or_else(
                 || v.clone(),
-                |shape| crate::value::mask_plaintext_using_secret_shape_fail_closed(v, shape),
+                |shape| crate::value::mask_plaintext_using_secret_shape_fail_closed(&v, shape),
             );
             merged.insert(k.clone(), value);
         }
@@ -2809,10 +2954,10 @@ impl ResolvedBindings {
     /// as the secret-shape authority. The caller resolves the wait alias to
     /// its target before dispatch, then this lookup happens again at completion
     /// so a just-created or just-updated target supplies the current shape.
-    pub(crate) fn secret_preserving_wait_snapshot(
+    pub(crate) fn secret_preserving_wait_snapshot<P: crate::resource::StateValueLeaf>(
         &self,
         target_binding: &str,
-        state: &State,
+        state: &State<P>,
     ) -> Result<SecretPreservingAttributes, String> {
         let target = self.by_name.get(target_binding).ok_or_else(|| {
             format!("wait target binding `{target_binding}` is unavailable after completion")
@@ -2855,7 +3000,10 @@ impl ResolvedBindings {
         self.by_name.insert(
             name.to_string(),
             ResolvedBinding {
-                attributes: attrs.into_iter().map(|(key,value)| (key,value.to_snapshot())).collect(),
+                attributes: attrs
+                    .into_iter()
+                    .map(|(key, value)| (key, value.to_snapshot()))
+                    .collect(),
                 source,
                 completeness,
                 definitive_attributes,
@@ -3000,7 +3148,10 @@ impl<'a> IterableBindings<'a> {
                         (
                             name,
                             ResolvedBinding {
-                                attributes: attributes.into_iter().map(|(key,value)| (key,value.to_snapshot())).collect(),
+                                attributes: attributes
+                                    .into_iter()
+                                    .map(|(key, value)| (key, value.to_snapshot()))
+                                    .collect(),
                                 source: BindingValueSource::Upstream,
                                 completeness: BindingCompleteness::Complete,
                                 definitive_attributes: HashSet::new(),
@@ -3029,8 +3180,11 @@ impl<'a> IterableBindings<'a> {
 
     /// Resolve a complete deferred iterable through the same three-state
     /// evaluator used by ordinary resource attributes.
-    pub fn resolve_value(&self, value: &Value) -> Result<crate::resolver::ValueResolution, String> {
-        crate::resolver::resolve_ref_value_status(value, self.bindings.as_ref())
+    pub fn resolve_value(
+        &self,
+        value: &Value,
+    ) -> Result<crate::resolver::ValueResolution, crate::resolver::ResolutionError> {
+        crate::resolver::project_ref_value_status(value, self.bindings.as_ref())
     }
 
     /// Missing selections may be treated as final only when every binding
@@ -3044,9 +3198,91 @@ impl<'a> IterableBindings<'a> {
 mod tests {
     use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
     #[test]
+    fn value_declaration_resolves_the_catalog_scalar_kind_before_lifting() {
+        let declaration =
+            crate::parser::parse_type_expr_str("Count", &crate::parser::ProviderContext::default())
+                .unwrap();
+        let parsed = crate::parser::ParsedFile::default();
+        let schemas = SchemaRegistry::new();
+        let provider_context = crate::parser::ProviderContext {
+            custom_types: crate::parser::ProviderCustomTypes::loaded(
+                HashSet::from([crate::parser::OwnedTypeIdentity::provider(
+                    "test",
+                    crate::schema::TypeIdentity::bare("Count"),
+                    crate::schema::RefinedScalarKind::Int,
+                )]),
+                Box::new(|_, _| Ok(())),
+            ),
+            ..Default::default()
+        };
+        let index = BindingIndex::from_parsed(&parsed, &schemas, &provider_context);
+        let source = ResolvedRefType::from_value_declaration(&declaration, &index).unwrap();
+        assert!(
+            source
+                .is_assignable_to_sink(TypeInSchema::schemaless(&AttributeType::int()), &index)
+                .is_ok(),
+            "the declaration must resolve to an Int before it becomes authoritative"
+        );
+        assert!(matches!(
+            source
+                .is_assignable_to_sink(TypeInSchema::schemaless(&AttributeType::string()), &index),
+            Err(RefTypeAssignabilityError::Mismatch(_))
+        ));
+    }
+
+    #[test]
+    fn binding_assignment_requires_loaded_evidence_or_explicitly_allows_unchecked() {
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                let declaration = crate::parser::parse_type_expr_str(
+                    "Count",
+                    &crate::parser::ProviderContext::default(),
+                )
+                .unwrap();
+                let source = crate::validation::lift_type_expr(&declaration).unwrap();
+                let sink = AttributeType::int();
+                let parsed = crate::parser::ParsedFile::default();
+                let schemas = SchemaRegistry::new();
+                let loaded = crate::parser::ProviderContext {
+                    custom_types: crate::parser::ProviderCustomTypes::loaded(
+                        HashSet::new(),
+                        Box::new(|_, _| Ok(())),
+                    ),
+                    ..Default::default()
+                };
+                let strict = BindingIndex::from_parsed(&parsed, &schemas, &loaded);
+                let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+                let bootstrap = BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(&parsed, &schemas, None, &signatures, session);
+                assert_eq!(
+                    strict.check_type_assignment(
+                        TypeInSchema::schemaless(&source),
+                        TypeInSchema::schemaless(&sink)
+                    ),
+                    Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded)
+                );
+                assert_eq!(
+                    bootstrap.check_type_assignment(
+                        TypeInSchema::schemaless(&source),
+                        TypeInSchema::schemaless(&sink)
+                    ),
+                    Ok(true)
+                );
+            },
+        )
+    }
+
+    #[test]
     fn value_declaration_source_keeps_legacy_handle_values_inferred() {
         use crate::parser::{ResourceTypePath, TypeExpr};
 
+        let parsed = crate::parser::ParsedFile::default();
+        let schemas = SchemaRegistry::new();
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &schemas,
+            &crate::parser::ProviderContext::default(),
+        );
         let handle = TypeExpr::Ref(ResourceTypePath::new("aws", "ec2.Vpc"));
         for declaration in [
             handle.clone(),
@@ -3058,11 +3294,13 @@ mod tests {
             TypeExpr::Union(vec![TypeExpr::String, handle]),
         ] {
             assert!(
-                super::ResolvedRefType::from_value_declaration(&declaration).is_none(),
+                super::ResolvedRefType::from_value_declaration(&declaration, &index).is_none(),
                 "a legacy handle annotation must not erase substituted value evidence: {declaration:?}",
             );
         }
-        assert!(super::ResolvedRefType::from_value_declaration(&TypeExpr::String).is_some());
+        assert!(
+            super::ResolvedRefType::from_value_declaration(&TypeExpr::String, &index).is_some()
+        );
     }
 
     use super::*;
@@ -3171,7 +3409,11 @@ let vpc = aws.ec2.Vpc {
         let parsed = parse(src, &Default::default()).expect("parse");
         let registry = registry_with_vpc();
 
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            &crate::parser::ProviderContext::default(),
+        );
         let entry = index.get("vpc").expect("vpc binding present");
         let BindingTarget::Schema(schema) = entry.target else {
             panic!("managed binding must carry a schema target");
@@ -3200,7 +3442,11 @@ let existing = read aws.ec2.Vpc {
                 .expect("schema fixture must be valid"),
         );
 
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            &crate::parser::ProviderContext::default(),
+        );
         let entry = index
             .get("existing")
             .expect("data-source binding present in index");
@@ -3217,7 +3463,11 @@ let existing = read aws.ec2.Vpc {
         parsed.compositions.push(composition("instance"));
 
         let registry = SchemaRegistry::new();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            &crate::parser::ProviderContext::default(),
+        );
 
         let entry = index
             .get("instance")
@@ -3252,8 +3502,12 @@ let existing = read aws.ec2.Vpc {
             },
         )]);
         let registry = SchemaRegistry::new();
-        let index =
-            BindingIndex::from_parsed_with_module_signatures(&parsed, &registry, &signatures);
+        let index = BindingIndex::from_parsed_with_module_signatures(
+            &parsed,
+            &registry,
+            &signatures,
+            &crate::parser::ProviderContext::default(),
+        );
 
         let RefType::Typed(count) = index.ref_type(&AccessPath::new("x", "count")) else {
             panic!("module output must be typed before composition expansion");
@@ -3261,12 +3515,12 @@ let existing = read aws.ec2.Vpc {
         assert_eq!(count.display_type_name(), "Int");
         assert!(
             count
-                .is_assignable_to_sink(TypeInSchema::schemaless(&AttributeType::int()))
+                .is_assignable_to_sink(TypeInSchema::schemaless(&AttributeType::int()), &index)
                 .is_ok()
         );
         assert!(
             count
-                .is_assignable_to_sink(TypeInSchema::schemaless(&AttributeType::string()))
+                .is_assignable_to_sink(TypeInSchema::schemaless(&AttributeType::string()), &index)
                 .is_err()
         );
 
@@ -3305,7 +3559,11 @@ let existing = read aws.ec2.Vpc {
         });
 
         let registry = SchemaRegistry::new();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            &crate::parser::ProviderContext::default(),
+        );
 
         let entry = index
             .get("ready")
@@ -3330,7 +3588,11 @@ aws.ec2.Vpc {
         let parsed = parse(src, &Default::default()).expect("parse");
         let registry = registry_with_vpc();
 
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            &crate::parser::ProviderContext::default(),
+        );
         assert!(index.is_empty());
     }
 
@@ -3349,7 +3611,11 @@ let vpc = aws.ec2.Vpc {
         let parsed = parse(src, &Default::default()).expect("parse");
         let registry = SchemaRegistry::new();
 
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            &crate::parser::ProviderContext::default(),
+        );
         assert!(index.get("vpc").is_none());
         assert!(
             index.is_declared("vpc"),
@@ -3371,7 +3637,11 @@ let cert_issued = wait cert {
         let parsed = parse(src, &Default::default()).expect("parse");
         let registry = SchemaRegistry::new();
 
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            &crate::parser::ProviderContext::default(),
+        );
         assert!(index.get("cert").is_none());
         assert!(index.get("cert_issued").is_none());
         assert!(index.is_declared("cert"));
@@ -3403,7 +3673,11 @@ for _, n in some_iterable {
         let parsed = parse(src, &Default::default()).expect("parse");
         let registry = registry_with_vpc();
 
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            &crate::parser::ProviderContext::default(),
+        );
         assert!(index.get("net").is_some(), "named let binding indexed");
         assert!(
             !index.is_declared("n"),
@@ -3426,7 +3700,11 @@ let vpc = aws.ec2.Vpc {
 "#;
         let parsed = parse(src, &Default::default()).expect("parse");
         let registry = registry_with_vpc();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            &crate::parser::ProviderContext::default(),
+        );
 
         let by_name = index.schemas_by_name();
         let schema = by_name.get("vpc").expect("vpc projection present");
@@ -3448,7 +3726,11 @@ let vpc = aws.ec2.Vpc {
 "#;
         let parsed = parse(src, &Default::default()).expect("parse");
         let registry = registry_with_vpc();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            &crate::parser::ProviderContext::default(),
+        );
         assert!(index.get("missing").is_none());
     }
 
@@ -3474,7 +3756,11 @@ let vpc = aws.ec2.Vpc {
         );
         parsed.compositions.push(output);
         let registry = registry_with_vpc();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            &crate::parser::ProviderContext::default(),
+        );
 
         let RefType::Typed(resolved) = index.ref_type(&AccessPath::new("instance", "cidr")) else {
             panic!("forwarded composition attribute must inherit its source type");
@@ -3507,7 +3793,11 @@ let vpc = aws.ec2.Vpc {
         );
         parsed.compositions.push(output);
         let registry = registry_with_vpc();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            &crate::parser::ProviderContext::default(),
+        );
 
         let RefType::Typed(resolved) = index.ref_type(&AccessPath::new("instance", "cidr")) else {
             panic!("plain forwarded alias must inherit its source type");
@@ -3590,6 +3880,7 @@ let vpc = aws.ec2.Vpc {
                     owned: crate::parser::OwnedTypeIdentity::provider(
                         "aws",
                         crate::schema::TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id"),
+                        crate::schema::RefinedScalarKind::String,
                     ),
                 }),
             },
@@ -3604,6 +3895,7 @@ let vpc = aws.ec2.Vpc {
                             "ec2.SecurityGroup",
                             "Id",
                         ),
+                        crate::schema::RefinedScalarKind::String,
                     ),
                 }),
             },
@@ -3671,6 +3963,20 @@ let vpc = aws.ec2.Vpc {
                 parsed.compositions.push(middle);
 
                 let mut registry = SchemaRegistry::new();
+                for named in &universe {
+                    if let Some(TypeExpr::SchemaType { owned }) = &named.declaration {
+                        registry.insert(
+                            owned.provider_names().next().unwrap(),
+                            PatternResourceSchema::new(named.name)
+                                .attribute(
+                                    PatternAttributeSchema::optional("value", named.attr.clone())
+                                        .build(),
+                                )
+                                .validate()
+                                .unwrap(),
+                        );
+                    }
+                }
                 registry.insert(
                     "test",
                     (PatternResourceSchema::new("source.Node").attribute(
@@ -3679,7 +3985,11 @@ let vpc = aws.ec2.Vpc {
                     .validate()
                     .expect("schema fixture must be valid"),
                 );
-                let index = BindingIndex::from_parsed(&parsed, &registry);
+                let index = BindingIndex::from_parsed(
+                    &parsed,
+                    &registry,
+                    &crate::parser::ProviderContext::default(),
+                );
                 let RefType::Typed(chain) = index.ref_type(&AccessPath::new("middle", "value"))
                 else {
                     panic!(
@@ -3690,9 +4000,10 @@ let vpc = aws.ec2.Vpc {
 
                 for sink in &universe {
                     let accepted = chain
-                        .is_assignable_to_sink(TypeInSchema::schemaless(
-                            &compiled.parts()[sink.name],
-                        ))
+                        .is_assignable_to_sink(
+                            TypeInSchema::schemaless(&compiled.parts()[sink.name]),
+                            &index,
+                        )
                         .is_ok();
                     let actual_accepts = TypeInSchema::schemaless(&compiled.parts()[actual.name])
                         .is_assignable_to(TypeInSchema::schemaless(&compiled.parts()[sink.name]));
@@ -3737,7 +4048,11 @@ let vpc = aws.ec2.Vpc {
             },
         ]);
         let registry = SchemaRegistry::new();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            &crate::parser::ProviderContext::default(),
+        );
 
         let name_binding = RelativeBindingName::new("name");
         let RefType::Typed(name) = index.ref_type(&name_binding) else {
@@ -3762,7 +4077,11 @@ let vpc = aws.ec2.Vpc {
             validations: Vec::new(),
         });
         let registry = SchemaRegistry::new();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            &crate::parser::ProviderContext::default(),
+        );
 
         let vpc_binding = RelativeBindingName::new("vpc");
         let RefType::Typed(vpc) = index.ref_type(&vpc_binding) else {
@@ -3784,7 +4103,7 @@ let vpc = aws.ec2.Vpc {
         .expect("literal union must be liftable");
 
         assert!(
-            vpc.is_assignable_to_sink(TypeInSchema::schemaless(&same))
+            vpc.is_assignable_to_sink(TypeInSchema::schemaless(&same), &index)
                 .is_ok(),
             "a matching resource handle must satisfy the boundary"
         );
@@ -3795,7 +4114,7 @@ let vpc = aws.ec2.Vpc {
             literal_union,
         ] {
             assert!(
-                vpc.is_assignable_to_sink(TypeInSchema::schemaless(&rejected))
+                vpc.is_assignable_to_sink(TypeInSchema::schemaless(&rejected), &index)
                     .is_err(),
                 "resource handles must not flow into value or different-handle sinks"
             );
@@ -3804,22 +4123,28 @@ let vpc = aws.ec2.Vpc {
 
     #[test]
     fn ref_type_classifies_bootstrap_dotted_module_argument_as_managed_handle() {
-        let mut parsed = parse("", &Default::default()).expect("parse");
-        let resource_type = ResourceTypePath::new("aws", "ec2.Vpc");
-        parsed.arguments.push(ArgumentParameter {
-            name: "vpc".to_string(),
-            static_type: TypeExpr::DottedUnresolved(resource_type.clone()),
-            default: None,
-            description: None,
-            validations: Vec::new(),
-        });
-        let registry = registry_with_vpc();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                let mut parsed = parse("", &Default::default()).expect("parse");
+                let resource_type = ResourceTypePath::new("aws", "ec2.Vpc");
+                parsed.arguments.push(ArgumentParameter {
+                    name: "vpc".to_string(),
+                    static_type: TypeExpr::DottedUnresolved(resource_type.clone()),
+                    default: None,
+                    description: None,
+                    validations: Vec::new(),
+                });
+                let registry = registry_with_vpc();
+                let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+                let index = BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(&parsed, &registry, None, &signatures, session);
 
-        let RefType::Typed(vpc) = index.ref_type(&RelativeBindingName::new("vpc")) else {
-            panic!("a dotted module argument naming a managed schema must be a handle");
-        };
-        assert_eq!(vpc.resource_handle_type(), Some(resource_type));
+                let RefType::Typed(vpc) = index.ref_type(&RelativeBindingName::new("vpc")) else {
+                    panic!("a dotted module argument naming a managed schema must be a handle");
+                };
+                assert_eq!(vpc.resource_handle_type(), Some(resource_type));
+            },
+        );
     }
 
     #[test]
@@ -3835,7 +4160,11 @@ let vpc = aws.ec2.Vpc {
         )
         .expect("parse");
         let registry = registry_with_vpc();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            &crate::parser::ProviderContext::default(),
+        );
 
         let vpc_binding = RelativeBindingName::new("vpc");
         let RefType::Typed(vpc) = index.ref_type(&vpc_binding) else {
@@ -3864,6 +4193,7 @@ let vpc = aws.ec2.Vpc {
                                     crate::schema::TypeIdentity::from_schema_type(
                                         "aws", "ec2.Vpc", "Id",
                                     ),
+                                    crate::schema::RefinedScalarKind::String,
                                 ),
                             },
                         )),
@@ -3873,7 +4203,12 @@ let vpc = aws.ec2.Vpc {
             )]),
         )]);
         let registry = SchemaRegistry::new();
-        let index = BindingIndex::from_parsed_with_upstream_exports(&parsed, &registry, &exports);
+        let index = BindingIndex::from_parsed_with_upstream_exports(
+            &parsed,
+            &registry,
+            &exports,
+            &crate::parser::ProviderContext::default(),
+        );
 
         let RefType::Typed(vpc) = index.ref_type(&AccessPath::new("up", "vpc")) else {
             panic!("annotated upstream export must resolve to its declared type");
@@ -3912,7 +4247,12 @@ let vpc = aws.ec2.Vpc {
             )]),
         )]);
         let registry = SchemaRegistry::new();
-        let index = BindingIndex::from_parsed_with_upstream_exports(&parsed, &registry, &exports);
+        let index = BindingIndex::from_parsed_with_upstream_exports(
+            &parsed,
+            &registry,
+            &exports,
+            &crate::parser::ProviderContext::default(),
+        );
 
         assert!(matches!(
             index.ref_type(&AccessPath::new("up", "opaque")),
@@ -3929,7 +4269,12 @@ let vpc = aws.ec2.Vpc {
         });
         let exports = HashMap::new();
         let registry = SchemaRegistry::new();
-        let index = BindingIndex::from_parsed_with_upstream_exports(&parsed, &registry, &exports);
+        let index = BindingIndex::from_parsed_with_upstream_exports(
+            &parsed,
+            &registry,
+            &exports,
+            &crate::parser::ProviderContext::default(),
+        );
 
         assert!(matches!(
             index.ref_type(&AccessPath::new("up", "anything")),
@@ -3974,7 +4319,11 @@ let vpc = aws.ec2.Vpc {
         parsed.compositions.push(make_forwarder("a", "b"));
         parsed.compositions.push(make_forwarder("b", "a"));
         let registry = SchemaRegistry::new();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            &crate::parser::ProviderContext::default(),
+        );
 
         assert!(matches!(
             index.ref_type(&AccessPath::new("a", "out")),
@@ -4007,7 +4356,7 @@ mod resolved_bindings_tests {
         DataSourceValues::from_data_sources(data_sources, |data_source| {
             states.get(&data_source.id).map_or_else(
                 || DataSourceValue::deferred_to_apply(Vec::new()),
-                |state| DataSourceValue::read(state.clone()),
+                |state| DataSourceValue::read(state.to_snapshot()),
             )
         })
     }
@@ -4047,9 +4396,7 @@ mod resolved_bindings_tests {
         let attrs = resolved.get("vpc").expect("vpc binding present");
         assert_eq!(
             attrs.get("cidr_block"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "10.0.0.0/16".into()
-            )))
+            Some(&(Value::Concrete(ConcreteValue::String("10.0.0.0/16".into()))).to_snapshot())
         );
         assert_eq!(resolved.source("vpc"), Some(&BindingValueSource::Local));
     }
@@ -4108,14 +4455,12 @@ mod resolved_bindings_tests {
         let attrs = resolved.get("vpc").expect("vpc binding present");
         assert_eq!(
             attrs.get("id"),
-            Some(&Value::Concrete(ConcreteValue::String("vpc-abc".into()))),
+            Some(&(Value::Concrete(ConcreteValue::String("vpc-abc".into()))).to_snapshot()),
             "state-only attribute must be merged in",
         );
         assert_eq!(
             attrs.get("cidr_block"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "10.0.0.0/16".into()
-            ))),
+            Some(&(Value::Concrete(ConcreteValue::String("10.0.0.0/16".into()))).to_snapshot()),
             "DSL value must win when both sides define a key",
         );
     }
@@ -4165,19 +4510,28 @@ mod resolved_bindings_tests {
             .expect("partial-read missing attribute must be materialized");
         assert!(matches!(
             a_dns_name,
-            Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(pending)))
+            crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(pending)))
                 if pending == &PendingReRead::incomplete("read after create did not return dns_name")
         ));
 
-        crate::resolver::resolve_refs_with_state_and_remote(&mut resources, &resolved)
-            .expect("sibling ref should resolve through the binding view");
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                crate::resolver::resolve_refs_with_state_and_remote(
+                    &mut resources,
+                    &resolved,
+                    session,
+                )
+            },
+        )
+        .expect("sibling ref should resolve through the binding view");
         let target = resources[1]
             .attributes
             .get("target")
             .expect("target attribute should remain present");
         assert!(matches!(
             target,
-            Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(pending)))
+            crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(pending)))
                 if pending == &PendingReRead::incomplete("read after create did not return dns_name")
         ));
     }
@@ -4212,7 +4566,7 @@ mod resolved_bindings_tests {
         let attrs = resolved.get("network").expect("upstream binding present");
         assert_eq!(
             attrs.get("vpc_id"),
-            Some(&Value::Concrete(ConcreteValue::String("vpc-123".into())))
+            Some(&(Value::Concrete(ConcreteValue::String("vpc-123".into()))).to_snapshot())
         );
         assert_eq!(
             resolved.source("network"),
@@ -4289,7 +4643,7 @@ mod resolved_bindings_tests {
         let attrs = resolved.get("shared").expect("shared binding present");
         assert_eq!(
             attrs.get("kind"),
-            Some(&Value::Concrete(ConcreteValue::String("upstream".into()))),
+            Some(&(Value::Concrete(ConcreteValue::String("upstream".into()))).to_snapshot()),
             "upstream binding must override local one with the same name",
         );
         assert_eq!(
@@ -4405,20 +4759,16 @@ mod resolved_bindings_tests {
         let attrs = resolved.get("vpc").expect("vpc binding present");
         assert_eq!(
             attrs.get("name"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "vpc-applied".into()
-            ))),
+            Some(&(Value::Concrete(ConcreteValue::String("vpc-applied".into()))).to_snapshot()),
             "state must win over resource_attrs on conflict",
         );
         assert_eq!(
             attrs.get("id"),
-            Some(&Value::Concrete(ConcreteValue::String("vpc-abc".into())))
+            Some(&(Value::Concrete(ConcreteValue::String("vpc-abc".into()))).to_snapshot())
         );
         assert_eq!(
             attrs.get("cidr_block"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "10.0.0.0/16".into()
-            ))),
+            Some(&(Value::Concrete(ConcreteValue::String("10.0.0.0/16".into()))).to_snapshot()),
         );
         assert_eq!(resolved.source("vpc"), Some(&BindingValueSource::Local));
     }
@@ -4453,9 +4803,10 @@ mod resolved_bindings_tests {
             resolved
                 .get("secret")
                 .and_then(|attrs| attrs.get("comment")),
-            Some(&Value::Deferred(crate::resource::DeferredValue::Secret(
-                Box::new(plaintext)
-            )))
+            Some(
+                &(Value::Deferred(crate::resource::DeferredValue::Secret(Box::new(plaintext))))
+                    .to_snapshot()
+            )
         );
     }
 
@@ -4463,7 +4814,7 @@ mod resolved_bindings_tests {
     fn record_applied_with_no_binding_is_a_noop() {
         let mut resolved = ResolvedBindings::default();
         let attrs: HashMap<String, Value> = HashMap::new();
-        let state = State {
+        let state: crate::resource::State = State {
             id: ResourceId::with_identity("test.resource", "anon"),
             identifier: None,
             exists: true,
@@ -4561,7 +4912,7 @@ mod resolved_bindings_tests {
         );
         assert_eq!(
             resolved.get("registry").and_then(|a| a.get("kind")),
-            Some(&Value::Concrete(ConcreteValue::String("first".into())))
+            Some(&(Value::Concrete(ConcreteValue::String("first".into()))).to_snapshot())
         );
 
         let replacement: HashMap<String, Value> = vec![(
@@ -4578,7 +4929,7 @@ mod resolved_bindings_tests {
         );
         assert_eq!(
             resolved.get("registry").and_then(|a| a.get("kind")),
-            Some(&Value::Concrete(ConcreteValue::String("second".into())))
+            Some(&(Value::Concrete(ConcreteValue::String("second".into()))).to_snapshot())
         );
     }
 
@@ -4617,9 +4968,12 @@ mod resolved_bindings_tests {
             resolved
                 .get("cert_issued")
                 .and_then(|a| a.get("certificate_arn")),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "arn:aws:acm:us-east-1:1:certificate/abc".into()
-            ))),
+            Some(
+                &(Value::Concrete(ConcreteValue::String(
+                    "arn:aws:acm:us-east-1:1:certificate/abc".into()
+                )))
+                .to_snapshot()
+            ),
             "cert_issued.certificate_arn must passthrough to cert's value"
         );
         assert_eq!(
@@ -4672,7 +5026,7 @@ mod resolved_bindings_tests {
         });
         assert_eq!(
             resolved.get("waited").and_then(|a| a.get("id")),
-            Some(&Value::Concrete(ConcreteValue::String("up-1".into())))
+            Some(&(Value::Concrete(ConcreteValue::String("up-1".into()))).to_snapshot())
         );
     }
 
@@ -4707,7 +5061,7 @@ mod resolved_bindings_tests {
             resolved
                 .get("cert_issued")
                 .and_then(|a| a.get("certificate_arn")),
-            Some(&Value::Concrete(ConcreteValue::String("arn:old".into()))),
+            Some(&(Value::Concrete(ConcreteValue::String("arn:old".into()))).to_snapshot()),
             "wait alias is a snapshot: a later set('cert', …) must not mutate it"
         );
     }
@@ -4749,7 +5103,7 @@ mod resolved_bindings_tests {
         assert_eq!(a, b);
         assert_eq!(
             a,
-            Some(Value::Concrete(ConcreteValue::String("arn:shared".into())))
+            Some((Value::Concrete(ConcreteValue::String("arn:shared".into()))).to_snapshot())
         );
     }
 
@@ -4840,7 +5194,7 @@ mod resolved_bindings_tests {
             .get("arns")
             .expect("read-state attribute `arns` must be visible on the binding");
         match arns {
-            Value::Concrete(ConcreteValue::List(items)) => {
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(items)) => {
                 assert_eq!(items.len(), 1, "one role arn returned");
             }
             other => panic!("expected concrete List, got {:?}", other),
@@ -4878,7 +5232,14 @@ mod resolved_bindings_tests {
             default: Box::new(fallback.clone()),
         });
         assert_eq!(
-            crate::resolver::resolve_ref_value_status(&expression, &resolved),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| crate::resolver::resolve_ref_value_status(
+                    &expression,
+                    &resolved,
+                    session
+                )
+            ),
             Ok(crate::resolver::ValueResolution::Present(fallback)),
         );
     }
@@ -4918,9 +5279,7 @@ mod resolved_bindings_tests {
             resolved
                 .get("caller")
                 .and_then(|attributes| attributes.get("account_id")),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "111111111111".into()
-            )))
+            Some(&(Value::Concrete(ConcreteValue::String("111111111111".into()))).to_snapshot())
         );
     }
 
@@ -4972,9 +5331,7 @@ mod resolved_bindings_tests {
         let attrs = resolved.get("echo").expect("echo binding present");
         assert_eq!(
             attrs.get("filter"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "provider-result".into()
-            ))),
+            Some(&(Value::Concrete(ConcreteValue::String("provider-result".into()))).to_snapshot()),
             "read-state attribute must override DSL input on collision",
         );
     }
@@ -5023,9 +5380,7 @@ mod resolved_bindings_tests {
         let attrs = resolved.get("caller").expect("caller binding present");
         assert_eq!(
             attrs.get("account_id"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "111111111111".into()
-            ))),
+            Some(&(Value::Concrete(ConcreteValue::String("111111111111".into()))).to_snapshot()),
             "with no DSL inputs, the binding's content is entirely the \
              read state's attributes",
         );

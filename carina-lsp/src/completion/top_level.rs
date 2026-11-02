@@ -438,7 +438,7 @@ impl CompletionProvider {
         arg_name: &str,
         text: &str,
         base_path: Option<&Path>,
-        provider_ctx: &carina_core::parser::ProviderContext,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
         let Some(parsed) = self.load_called_module(module_name, text, base_path) else {
             return Vec::new();
@@ -456,16 +456,18 @@ impl CompletionProvider {
         // that identity through the same owner index used by validation so
         // an enum parameter retains its member declaration instead of being
         // flattened into a generic refined string.
-        let resolved_type = carina_core::validation::resolve_type_expr(arg_type, provider_ctx)
-            .unwrap_or_else(|_| arg_type.clone());
+        let resolved_type =
+            carina_core::validation::resolve_type_expr(arg_type, provider_ctx.catalog())
+                .unwrap_or_else(|_| arg_type.clone());
         if let parser::TypeExpr::SchemaType { owned } = &resolved_type
-            && let Ok(Some(declaration)) = provider_ctx.enum_declaration(owned)
+            && let Ok(Some(declaration)) = provider_ctx.catalog().enum_declaration(owned)
         {
             return self.value_completions_for_attribute_type(
                 &declaration,
                 &std::collections::BTreeMap::new(),
                 text,
                 base_path,
+                provider_ctx,
             );
         }
 
@@ -482,6 +484,7 @@ impl CompletionProvider {
                 &std::collections::BTreeMap::new(),
                 text,
                 base_path,
+                provider_ctx,
             );
         }
         Vec::new()
@@ -494,7 +497,8 @@ impl CompletionProvider {
             parser::TypeExpr::Int => "int".to_string(),
             parser::TypeExpr::Float => "float".to_string(),
             parser::TypeExpr::Duration => "duration".to_string(),
-            parser::TypeExpr::Simple(name) => name.clone(),
+            parser::TypeExpr::Simple(name) => name.as_str().to_owned(),
+            parser::TypeExpr::UnloadedSchemaType(unloaded) => unloaded.identity().to_string(),
             parser::TypeExpr::List(inner) => format!("list({})", self.format_type_expr(inner)),
             parser::TypeExpr::Map(inner) => format!("map({})", self.format_type_expr(inner)),
             parser::TypeExpr::Ref(resource_path) => {
@@ -1004,6 +1008,7 @@ fn literal_completions_from_type_expr(type_expr: &parser::TypeExpr) -> Vec<Compl
                 | parser::TypeExpr::Float
                 | parser::TypeExpr::Duration
                 | parser::TypeExpr::Simple(_)
+                | parser::TypeExpr::UnloadedSchemaType(_)
                 | parser::TypeExpr::List(_)
                 | parser::TypeExpr::Map(_)
                 | parser::TypeExpr::Ref(_)
@@ -1019,6 +1024,7 @@ fn literal_completions_from_type_expr(type_expr: &parser::TypeExpr) -> Vec<Compl
         | parser::TypeExpr::Float
         | parser::TypeExpr::Duration
         | parser::TypeExpr::Simple(_)
+        | parser::TypeExpr::UnloadedSchemaType(_)
         | parser::TypeExpr::List(_)
         | parser::TypeExpr::Map(_)
         | parser::TypeExpr::Ref(_)
