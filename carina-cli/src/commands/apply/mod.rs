@@ -1024,14 +1024,7 @@ pub async fn refresh_pending_states(
     let mut failed_refreshes = HashSet::new();
 
     for (id, identifier) in refreshes {
-        let mut state = State::not_found(id.clone());
-        state.exists = true;
-        state.identifier = Some(identifier.as_str().to_owned());
-        let rows = carina_state::PreparedRows::from_snapshots(
-            [(id.clone(), Current::from_state(state))],
-            &carina_state::ResolvedRemovedClaims::resolve(&[], None),
-        );
-        let target = rows.refreshable.current(id).unwrap().read_target().unwrap();
+        let target = crate::test_support::refresh_target(id, identifier);
         match read_with_retry(provider, &target).await {
             Ok(state) => {
                 println!("  {} Refresh {}", "✓".green(color_mode), id);

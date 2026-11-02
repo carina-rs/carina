@@ -1039,12 +1039,13 @@ async fn run_destroy_locked_owned(
         ).await?;
         if delete_effects.is_empty() {
             println!("Removed {} resource(s) from state.", prepared_rows.removed.ids().count());
-            return Ok(DestroyAfterHeartbeat::Done);
         }
     }
 
-    println!("{}", "Destroying resources...".red(color_mode).bold(color_mode));
-    println!();
+    if !delete_effects.is_empty() {
+        println!("{}", "Destroying resources...".red(color_mode).bold(color_mode));
+        println!();
+    }
 
     let progress = ProgressBackend::new(color_mode, ProgressSink::Human);
 
@@ -2949,6 +2950,36 @@ mod tests {
             "nat_gw must be destroyed before igw; order: {:?}",
             order.iter().map(|idx| &names[*idx]).collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn removal_only_destroy_clears_exports_and_releases_lock() {
+        let fixture = DestroyCancellationFixture::new().with_orphaned_resources(["retired"]);
+        std::fs::write(
+            fixture.config_path().join("removed.crn"),
+            "removed { from = mock.test.resource 'retired' }\n",
+        )
+        .unwrap();
+        assert!(!fixture.read_state().await.exports.is_empty());
+
+        run_destroy(
+            fixture.runtime(),
+            fixture.config_path(),
+            true,
+            true,
+            true,
+            false,
+            NonZeroUsize::new(1).unwrap(),
+            fixture.provider_context(),
+            fixture.cancel_token(),
+        )
+        .await
+        .expect("removal-only destroy must complete");
+
+        let state = fixture.read_state().await;
+        assert!(state.resources().is_empty(), "removed row must leave state");
+        assert!(state.exports.is_empty(), "destroy must clear stale exports");
+        assert!(!fixture.lock_path().exists(), "lock must be released");
     }
 
     #[tokio::test]

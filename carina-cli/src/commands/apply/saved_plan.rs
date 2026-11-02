@@ -1003,6 +1003,7 @@ impl DesiredVerifiedPlanFile {
         }
         {
             let refresh_rows = self.plan_file.refresh_rows().clone();
+            let data_source_refresh_rows = self.plan_file.data_source_refresh_rows().clone();
             let mut verifier = HistoricalStateVerifier {
                 provider,
                 actual_states,
@@ -1035,7 +1036,7 @@ impl DesiredVerifiedPlanFile {
             }
             for saved in self.plan_file.data_source_values_mut() {
                 if let DataSourceValue::Read(state) = &mut saved.value {
-                    let Some(loaded) = refresh_rows.current(&saved.id) else {
+                    let Some(loaded) = data_source_refresh_rows.current(&saved.id) else {
                         continue;
                     };
                     if let Some(verified) = verifier.verify(&saved.id, state, &loaded).await? {
@@ -1507,6 +1508,85 @@ mod tests {
             SchemaCheckedPendingPlanFile { plan_file },
             Some(locked_state),
         )
+    }
+
+    #[test]
+    fn saved_move_refresh_keeps_managed_and_data_source_snapshots_separate() {
+        let data_source: DataSource = DataSource::with_provider("mock", "iam.Roles", "old", None);
+        let from = data_source.id.clone();
+        let to = ResourceId::with_provider_identity("mock", "iam.Roles", "new", None);
+        // Saved move snapshots are at the destination, while the locked state
+        // still owns the source. The data-source snapshot stays at the source.
+        let source_row = ResourceState::try_applied(
+            from.resource_type.clone(),
+            from.identity().cloned().expect("move source is resolved"),
+            from.provider.clone(),
+            "managed-id",
+        )
+        .expect("fixture identifier is non-empty");
+        let mut locked_state = StateFile::new();
+        locked_state
+            .upsert_resource(source_row)
+            .expect("test state setup must be valid");
+
+        let mut contents = empty_plan_contents(Vec::new());
+        contents.state_lineage = Some(locked_state.lineage.clone());
+        contents.state_serial = Some(locked_state.serial);
+        let desired = Resource::from_id(to.clone()).into_value_snapshot();
+        contents.sorted_resources.push(desired.clone());
+        contents.unresolved_resources.push(desired);
+        contents
+            .sorted_value_destroy_dependencies
+            .push(Default::default());
+        contents
+            .sorted_explicit_destroy_dependencies
+            .push(Default::default());
+        contents.plan.add(Effect::Move {
+            from: ResolvedResourceId::new(from.clone()),
+            to: ResolvedResourceId::new(to.clone()),
+            origin: None,
+        });
+        contents.current_states.push(CurrentStateEntry::managed(
+            to.clone(),
+            State::existing(to, HashMap::new()).with_identifier("managed-id"),
+        ));
+        contents.data_source_values.push(SavedDataSourceValue {
+            id: from.clone(),
+            value: DataSourceValue::read(
+                State::existing(from.clone(), HashMap::new()).with_identifier("data-source-id"),
+            ),
+        });
+        contents
+            .data_source_origins
+            .push(data_source.clone().into_value_snapshot());
+        contents
+            .data_sources
+            .push(data_source.into_value_snapshot());
+        let plan_file = contents
+            .record_for_test(&builtin_context(), Vec::new())
+            .expect("test plan provider evidence must be valid")
+            .reload_in_flight_from_locked_state(Some(&locked_state))
+            .expect("reload saved move plan")
+            .resolve_with_schemas(&carina_core::schema::SchemaRegistry::new())
+            .expect("resolve saved move plan");
+
+        let managed_target = plan_file
+            .refresh_rows()
+            .current(&from)
+            .expect("moved managed snapshot must remain refreshable")
+            .read_target()
+            .expect("managed snapshot has an identifier");
+        assert_eq!(managed_target.id(), &from);
+        assert_eq!(managed_target.identifier().as_str(), "managed-id");
+
+        let data_source_target = plan_file
+            .data_source_refresh_rows()
+            .current(&from)
+            .expect("data-source snapshot must remain refreshable at the move source")
+            .read_target()
+            .expect("data-source snapshot has an identifier");
+        assert_eq!(data_source_target.id(), &from);
+        assert_eq!(data_source_target.identifier().as_str(), "data-source-id");
     }
 
     #[test]

@@ -7,7 +7,8 @@ use carina_core::{
     parser::{StateBlock, StateBlockAddress},
     provider::AppliedIdentifier,
     resource::{
-        AbsoluteBindingAddress, Current, PersistedDirectives, ResolvedResourceId, ResourceId,
+        AbsoluteBindingAddress, Current, DeposedKey, PersistedDirectives, ResolvedResourceId,
+        ResourceId,
     },
 };
 
@@ -70,17 +71,10 @@ impl ResolvedRemovedClaims {
         let mut removed = RemovedRows::default();
         for (id, mut row) in rows {
             // Deposed generations retain their independent refresh lifecycle.
-            for generation in std::mem::take(&mut row.deposed) {
-                refreshable.deposed.push(RefreshableDeposed {
-                    id: ResolvedResourceId::with_provider_identity(
-                        id.provider.clone(),
-                        id.resource_type.clone(),
-                        id.identity().expect("persisted identity").clone(),
-                        generation.provider_instance.clone(),
-                    ),
-                    row_id: ResolvedResourceId::new(id.clone()),
-                    generation,
-                });
+            for key in std::mem::take(&mut row.deposed) {
+                refreshable
+                    .deposed
+                    .push((ResolvedResourceId::new(id.clone()), key));
             }
             // The single current-instance refresh eligibility decision.
             if claims.contains(&id) {
@@ -98,7 +92,7 @@ impl ResolvedRemovedClaims {
 
 #[derive(Debug, Clone)]
 struct RefreshRow {
-    deposed: Vec<DeposedInstance>,
+    deposed: Vec<DeposedKey>,
     current: Current,
     binding: Option<AbsoluteBindingAddress>,
     directives: PersistedDirectives,
@@ -125,7 +119,11 @@ impl PreparedRows {
                 (
                     id,
                     RefreshRow {
-                        deposed: row.deposed.clone(),
+                        deposed: row
+                            .deposed
+                            .iter()
+                            .map(|generation| generation.key.clone())
+                            .collect(),
                         current,
                         binding: row.binding.clone(),
                         directives: row.directives.clone(),
@@ -157,7 +155,7 @@ impl PreparedRows {
 #[derive(Debug, Clone, Default)]
 pub struct RefreshRows {
     rows: HashMap<ResourceId, RefreshRow>,
-    deposed: Vec<RefreshableDeposed>,
+    deposed: Vec<(ResolvedResourceId, DeposedKey)>,
 }
 
 impl RefreshRows {
@@ -165,17 +163,17 @@ impl RefreshRows {
         &'a self,
         state: &'a StateFile,
     ) -> impl Iterator<Item = RefreshableDeposed> + 'a {
-        self.deposed.iter().filter_map(move |selected| {
+        self.deposed.iter().filter_map(move |(row_id, key)| {
             // Selection belongs to the partition. Reload the payload after
             // dependency migration so refresh cannot write back stale metadata.
-            let row = state.find_resource_for_id(selected.row_id.as_inner())?;
+            let row = state.find_resource_for_id(row_id.as_inner())?;
             let generation = row
                 .deposed
                 .iter()
-                .find(|generation| generation.key == selected.generation.key)?
+                .find(|generation| &generation.key == key)?
                 .clone();
             Some(RefreshableDeposed {
-                row_id: selected.row_id.clone(),
+                row_id: row_id.clone(),
                 id: ResolvedResourceId::with_provider_identity(
                     row.provider.clone(),
                     row.resource_type.clone(),
@@ -273,9 +271,6 @@ pub struct RefreshableCurrent {
     current: Current,
 }
 impl RefreshableCurrent {
-    pub fn current(&self) -> &Current {
-        &self.current
-    }
     pub fn into_current(self) -> Current {
         self.current
     }
