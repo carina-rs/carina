@@ -312,8 +312,11 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
                     // loader. Handle RHSs and declared Ref types are
                     // inferable without schemas and must never be advertised
                     // as value-shaped upstream exports.
-                    let inferred =
-                        crate::validation::inference::infer_export_params(&parsed, &empty_schemas);
+                    let inferred = crate::validation::inference::infer_export_params(
+                        &parsed,
+                        &empty_schemas,
+                        config.catalog(),
+                    );
                     if let Err(boundary_errors) =
                         crate::validation::validate_export_handle_boundaries(inferred.parameters())
                     {
@@ -331,7 +334,11 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
                 }
                 let entries: UpstreamExportEntries = match schemas {
                     Some(s) => {
-                        let inferred = crate::validation::inference::apply_inference(parsed, s);
+                        let inferred = crate::validation::inference::apply_inference(
+                            parsed,
+                            s,
+                            config.catalog(),
+                        );
                         if let Err(boundary_errors) =
                             crate::validation::validate_export_handle_boundaries(
                                 &inferred.export_params,
@@ -1383,7 +1390,7 @@ mod tests {
     fn consumer_type(type_expr: TypeExpr) -> crate::static_type::ConsumerStaticType {
         crate::validation::resolve_consumer_static_type_for_signature(
             &type_expr,
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
     }
 
@@ -1482,7 +1489,7 @@ mod tests {
                 std::collections::HashSet::new(),
                 Box::new(|_target, _value| Ok(())),
             ),
-            ..crate::parser::ProviderContext::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         });
 
         let schemas = SchemaRegistry::new();
@@ -2270,7 +2277,7 @@ mod tests {
         schemas: &SchemaRegistry,
     ) -> Vec<String> {
         crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
                 let bindings = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(parsed, schemas, Some(exports), &signatures, session);
@@ -4396,7 +4403,7 @@ mod tests {
                 std::collections::HashSet::from([owned.clone()]),
                 Box::new(|_target, _value| Ok(())),
             ),
-            ..ProviderContext::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         });
         let mut schemas = crate::schema::SchemaRegistry::new();
         schemas.insert(
@@ -4502,7 +4509,7 @@ exports { out: String = instance.out }
         );
 
         let (exports, errors) = crate::validation::deferred_types::with_session_for_test(
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 resolve_upstream_exports_providerless_with_schemas(
                     tmp.path(),

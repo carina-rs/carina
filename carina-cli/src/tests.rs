@@ -111,7 +111,7 @@ test.Target { resource_type = VPC }
     let bootstrap_schemas = SchemaRegistry::new();
     let loaded = carina_core::config_loader::load_configuration_with_config(
         fixture.path(),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         &bootstrap_schemas,
     )
     .expect("schema-independent bootstrap parse");
@@ -317,7 +317,7 @@ fn saved_provider_configs(
     let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers = configs;
     let resolved = carina_core::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &parsed,
@@ -2835,7 +2835,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
         &backend,
         StateLockRef::Held(&lock),
         std::path::Path::new("."),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         carina_core::shutdown::ShutdownToken::running(),
     )
     .await;
@@ -2891,7 +2891,7 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
         &backend,
         StateLockRef::Held(&lock),
         std::path::Path::new("."),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         carina_core::shutdown::ShutdownToken::running(),
     )
     .await;
@@ -2963,7 +2963,7 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
         &backend,
         StateLockRef::Held(&lock),
         std::path::Path::new("."),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         carina_core::shutdown::ShutdownToken::running(),
     )
     .await;
@@ -3142,7 +3142,7 @@ fn wiring_context_constructs_factories_and_schemas_once() {
     let parsed = carina_core::parser::parse_file(
         "provider mock {}\n",
         std::path::Path::new("providers.crn"),
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap();
     let ctx = WiringContext::new_for_test_with_provider_phase(
@@ -4101,11 +4101,14 @@ fn bound_deferred_template() -> carina_core::parser::DeferredForExpression {
            mock.test.resource { name = value }\n\
          }\n",
         std::path::Path::new("main.crn"),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("bound deferred loop parses");
     let parsed = parsed
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("bound deferred loop must contain only loop slots");
     let template = parsed.deferred_for_expressions()[0].clone();
     assert!(matches!(
@@ -4383,11 +4386,14 @@ fn plan_file_validation_rejects_resolved_unbound_deferred_template_identity() {
            mock.test.resource { name = value }\n\
          }\n",
         std::path::Path::new("main.crn"),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("unbound deferred loop parses");
     let parsed = parsed
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("unbound deferred loop must contain only loop slots");
     let template = parsed.deferred_for_expressions()[0].clone();
     assert!(matches!(

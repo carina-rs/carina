@@ -885,11 +885,17 @@ impl DiagnosticRun<'_> {
                     carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
                 };
             let directive_errors = if let Some(graph) = expanded_graph {
-                graph.directive_resolution_errors(directive_boundary, &self.schemas)
+                graph.directive_resolution_errors(
+                    directive_boundary,
+                    &self.schemas,
+                    self.provider_context.catalog(),
+                )
             } else {
-                merged
-                    .unwrap_or(parsed)
-                    .directive_resolution_errors(directive_boundary, &self.schemas)
+                merged.unwrap_or(parsed).directive_resolution_errors(
+                    directive_boundary,
+                    &self.schemas,
+                    self.provider_context.catalog(),
+                )
             };
             let mut directive_sites = HashSet::new();
             for error in directive_errors {
@@ -1100,6 +1106,7 @@ impl DiagnosticRun<'_> {
                         binding_use_report: &binding_use_report,
                         compositions,
                     },
+                    self.provider_context.catalog(),
                 ),
                 None => Vec::new(),
             };
@@ -1109,6 +1116,7 @@ impl DiagnosticRun<'_> {
                         compositions: &inputs.graph.compositions,
                         bindings: &inputs.binding_index,
                     },
+                    self.provider_context.catalog(),
                 ),
                 None => Vec::new(),
             };
@@ -2099,7 +2107,7 @@ impl DiagnosticEngine {
     /// Construct diagnostics for the orphaned-file fallback with no loaded
     /// providers. This path deliberately cannot mint provider-schema inference
     /// evidence.
-    pub fn without_loaded_provider_schemas() -> Self {
+    pub fn without_loaded_provider_schemas(environment: carina_core::EnvironmentSnapshot) -> Self {
         let schemas = Arc::new(SchemaRegistry::new());
         Self {
             schemas: Arc::clone(&schemas),
@@ -2109,14 +2117,7 @@ impl DiagnosticEngine {
             factories: Arc::new(Vec::new()),
             provider_errors: HashMap::new(),
             provider_context: DiagnosticProviderContext::Unloaded(Arc::new(
-                carina_core::parser::ProviderContext {
-                    decryptor: None,
-                    custom_types: carina_core::parser::ProviderCustomTypes::default(),
-                    resource_types:
-                        carina_core::parser::ProviderContext::resource_types_from_schema_registry(
-                            &schemas,
-                        ),
-                },
+                carina_core::parser::ProviderContext::new(environment),
             )),
         }
     }
@@ -2198,10 +2199,16 @@ impl DiagnosticEngine {
         doc: &Document,
         current_file_path: Option<&Path>,
     ) -> carina_core::parser::ProviderContext {
-        match current_file_path.and_then(Path::parent) {
-            Some(directory) => self.directory_catalog(doc, directory).unwrap_or_default(),
+        let mut context = match current_file_path.and_then(Path::parent) {
+            Some(directory) => self.directory_catalog(doc, directory).unwrap_or_else(|| {
+                carina_core::parser::ProviderContext::new(
+                    doc.provider_context().environment.clone(),
+                )
+            }),
             None => (*self.provider_context).clone(),
-        }
+        };
+        context.environment = doc.provider_context().environment.clone();
+        context
     }
 
     fn publish_type_diagnostics(
@@ -2235,7 +2242,12 @@ impl DiagnosticEngine {
                 std::fs::read_to_string(&file).ok()?
             };
             providers.extend(
-                carina_core::parser::parse_provider_factory_declarations(&source, &file).ok()?,
+                carina_core::parser::parse_provider_factory_declarations(
+                    &source,
+                    &file,
+                    doc.provider_context(),
+                )
+                .ok()?,
             );
         }
         if !has_buffer {
@@ -2243,6 +2255,7 @@ impl DiagnosticEngine {
                 carina_core::parser::parse_provider_factory_declarations(
                     &doc.text(),
                     doc.source_file(),
+                    doc.provider_context(),
                 )
                 .ok()?,
             );

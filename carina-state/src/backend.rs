@@ -841,7 +841,7 @@ mod tests {
                 encrypt = "yes"
             }"#,
             std::path::Path::new("backend.crn"),
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .unwrap();
         let config_error = BackendConfig::try_from(raw.backend.as_ref().unwrap()).unwrap_err();

@@ -837,17 +837,20 @@ fn binding_identity_collision_fixture() -> BindingIdentityCollisionFixture {
     directory.push("tests/fixtures/dependency_key_collision");
     let parsed = crate::config_loader::parse_directory(
         &directory,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("multi-file collision fixture parses");
     let parsed = crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_providerless(parsed, &directory, session)
                 .expect("multi-file collision fixture crosses root expansion")
         },
     )
-    .into_expanded(&crate::schema::SchemaRegistry::new())
+    .into_expanded(
+        &crate::schema::SchemaRegistry::new(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
     .expect("collision fixture contains no parser placeholders");
     let mut unresolved = parsed.resources;
 
@@ -1413,8 +1416,8 @@ fn assert_deferred_create_cbd_is_acyclic(plan: &Plan, producer: &ResourceId) {
 fn unbound_deferred_for_promotes_replaced_producer_to_cbd() {
     let parsed = crate::parser::parse(
         "let vpc = ec2.Vpc { name = 'vpc' }\nfor subnet in vpc.subnets { ec2.Subnet { name = subnet } }",
-        &crate::parser::ProviderContext::default(),
-    ).unwrap().into_expanded(&crate::schema::SchemaRegistry::new()).unwrap();
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).unwrap().into_expanded(&crate::schema::SchemaRegistry::new(), &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())).unwrap();
     let target = parsed.deferred_for_expressions()[0].target().clone();
     assert!(matches!(
         target,

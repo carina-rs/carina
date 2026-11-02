@@ -272,11 +272,11 @@ fn build_anonymous_deferred_for_plan() -> Plan {
     let parsed = carina_core::parser::parse_file(
         "for opt in cert.domain_validation_options {\n  aws.route53.Record { name = opt }\n}\n",
         std::path::Path::new("main.crn"),
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("parse anonymous deferred-for target");
     let parsed = carina_core::validation::deferred_types::with_session_for_test(
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::module_resolver::resolve_modules_providerless(
                 carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
@@ -423,11 +423,11 @@ fn snapshot_anonymous_loop_origin_effect_labels() {
     let parsed = carina_core::parser::parse_file(
         "for name in ['one'] {\n  mock.test.resource { name = name }\n}\n",
         std::path::Path::new("main.crn"),
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("parse anonymous-loop fixture");
     let parsed = carina_core::validation::deferred_types::with_session_for_test(
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::module_resolver::resolve_modules_providerless(
                 carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
@@ -437,7 +437,10 @@ fn snapshot_anonymous_loop_origin_effect_labels() {
             .expect("resolve anonymous-loop fixture")
         },
     )
-    .into_expanded(&carina_core::schema::SchemaRegistry::new())
+    .into_expanded(
+        &carina_core::schema::SchemaRegistry::new(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
     .expect("anonymous-loop fixture must not retain parser placeholders");
     let mut resource = parsed
         .resources

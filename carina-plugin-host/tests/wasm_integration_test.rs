@@ -394,6 +394,7 @@ async fn create_request_for_test(resource: Resource) -> CreateRequest {
     let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(Vec::new()),
         schemas.clone(),
+        carina_core::EnvironmentSnapshot::empty(),
     );
     carina_core::validation::deferred_types::with_session_for_test_async(
         provider_types.provider_context(),
@@ -465,6 +466,7 @@ async fn update_request_for_test<P: StateValueLeaf>(
     let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(Vec::new()),
         schemas.clone(),
+        carina_core::EnvironmentSnapshot::empty(),
     );
     carina_core::validation::deferred_types::with_session_for_test_async(
         provider_types.provider_context(),
@@ -809,6 +811,7 @@ fn aws_credential_probe_data_source() -> carina_core::provider::ProviderReadyDat
     let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(Vec::new()),
         schemas.clone(),
+        carina_core::EnvironmentSnapshot::empty(),
     );
     carina_core::validation::deferred_types::with_session_for_test(
         provider_types.provider_context(),
@@ -1240,7 +1243,7 @@ fn resolved_provider_config(
         binding: None,
     }];
     carina_core::validation::deferred_types::with_session_for_test(
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &parsed,
@@ -6792,6 +6795,7 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
     let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(Vec::new()),
         schemas.clone(),
+        carina_core::EnvironmentSnapshot::empty(),
     );
     carina_core::validation::deferred_types::with_session_for_test_async(
         provider_types.provider_context(),

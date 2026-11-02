@@ -921,12 +921,13 @@ impl ResolvedMovePairs {
     /// };
     /// let project = tempfile::tempdir().unwrap();
     /// std::fs::write(project.path().join("main.crn"), "").unwrap();
-    /// let parsed = parse_directory(project.path(), &ProviderContext::default()).unwrap();
+    /// let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    /// let parsed = parse_directory(project.path(), &config).unwrap();
     /// let checks = carina_core::validation::deferred_types::TypeCheckSession::run(
-    ///     &ProviderContext::default(),
+    ///     &config,
     ///     |session| resolve_modules_providerless(parsed, project.path(), session)
     ///         .unwrap()
-    ///         .into_expanded(&SchemaRegistry::new())
+    ///         .into_expanded(&SchemaRegistry::new(), session.catalog())
     ///         .unwrap(),
     /// );
     /// let mut diagnostics = Vec::new();

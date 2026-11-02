@@ -113,7 +113,12 @@ impl<E: carina_core::parser::IntoExpandedExportParam<AbsoluteBindingAddress>>
             .collect::<Result<_, _>>()
             .map_err(carina_core::resource::LeftoverPlaceholders::from)?;
         Ok(CanonicalResourcePair {
-            parsed: parsed.into_expanded(&carina_core::schema::SchemaRegistry::new())?,
+            parsed: parsed.into_expanded(
+                &carina_core::schema::SchemaRegistry::new(),
+                &carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                ),
+            )?,
             unresolved,
             prefix_fallbacks,
         })

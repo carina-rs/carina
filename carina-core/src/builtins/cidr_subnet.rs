@@ -146,7 +146,7 @@ fn calculate_cidr_subnet(prefix: &str, newbits: i64, netnum: i64) -> Result<Stri
 
 #[cfg(test)]
 mod tests {
-    use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
+    use crate::builtins::evaluate_builtin_to_value_for_tests as evaluate_builtin;
     use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
 
     fn cidr_subnet(prefix: &str, newbits: i64, netnum: i64) -> Result<Value, String> {

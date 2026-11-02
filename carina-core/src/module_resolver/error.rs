@@ -623,7 +623,7 @@ mod tests {
         let parsed = crate::parser::parse_file(
             "let child = use { source = './child' }\nchild {}\n",
             Path::new("main.crn"),
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("module-call fixture parses");
         let call = parsed.module_calls[0].clone();

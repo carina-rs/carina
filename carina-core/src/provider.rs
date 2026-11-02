@@ -7100,6 +7100,7 @@ impl LoadedProviderSnapshot {
     ) -> Self {
         let provider_context =
             crate::parser::LoadedProviderContext::new(crate::parser::ProviderContext {
+                environment: crate::EnvironmentSnapshot::empty(),
                 decryptor: None,
                 custom_types: provider_custom_types_from_factories(std::sync::Arc::clone(
                     &factories,
@@ -7744,6 +7745,7 @@ pub fn provider_custom_types_from_factories(
 pub fn loaded_provider_snapshot_from_factories(
     factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>>,
     mut schemas: SchemaRegistry,
+    environment: crate::EnvironmentSnapshot,
 ) -> LoadedProviderSnapshot {
     let snapshot = capture_provider_factory_schema_snapshot(&factories);
     for factory in &snapshot {
@@ -7758,6 +7760,7 @@ pub fn loaded_provider_snapshot_from_factories(
         ));
     let provider_context =
         crate::parser::LoadedProviderContext::new(crate::parser::ProviderContext {
+            environment,
             decryptor: None,
             custom_types,
             resource_types: crate::parser::ProviderContext::resource_types_from_schema_registry(
@@ -8428,7 +8431,7 @@ mod tests {
                 known.into_iter().collect(),
                 Box::new(|_, _| Ok(())),
             ),
-            ..ProviderContext::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         };
         assert!(matches!(
             crate::validation::resolve_type_expr(
@@ -8542,7 +8545,11 @@ mod tests {
                 schema_calls: std::sync::Arc::clone(&schema_calls),
             })]);
 
-        let snapshot = loaded_provider_snapshot_from_factories(factories, SchemaRegistry::new());
+        let snapshot = loaded_provider_snapshot_from_factories(
+            factories,
+            SchemaRegistry::new(),
+            crate::EnvironmentSnapshot::empty(),
+        );
 
         assert_eq!(
             schema_calls.load(std::sync::atomic::Ordering::SeqCst),

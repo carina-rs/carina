@@ -76,16 +76,6 @@ with tempfile.TemporaryDirectory(prefix="carina-in-process-env-") as temporary:
             package = "carina-provider-mock" if key[0] == "carina_provider_mock" else "carina-cli"
             binary_env = dict(child_env, CARGO_MANIFEST_DIR=str(workspace / package))
             args = [executable, "--test-threads=8"]
-            if key == ("carina_cli", "lib"):
-                # This test calls std::env::set_var (unsafe in edition 2024):
-                # env() still reads the process environment. set_var races
-                # with threads reading environ outside Rust's env lock, such
-                # as libc getaddrinfo, timezone lookup, and C dependencies, so
-                # it cannot share a process with other threads. It still runs
-                # under nextest's process-per-test isolation. Remove this sole
-                # exclusion when env() takes an explicit EnvironmentSnapshot
-                # after carina#4189. --exact also makes --skip match only this name.
-                args += ["--skip", "display::tests::plan_export_shows_env_plaintext", "--exact"]
             status = run(args, env=binary_env, cwd=workspace / package, fail_fast=False)
             if status:
                 failures.append((key, status))

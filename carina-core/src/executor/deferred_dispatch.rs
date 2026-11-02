@@ -515,10 +515,10 @@ mod tests {
     fn deferred_directive_failures_keep_their_label_and_typed_source() {
         let parsed = crate::parser::parse(
             "let up = upstream_state { source = '../upstream' }\nlet children = for flag in up.flags { mock.test.Child { name = 'child' directives { force_delete = flag } } }\n",
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         ).unwrap();
         let expanded = crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 crate::module_resolver::resolve_modules_providerless(
                     crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
@@ -530,7 +530,10 @@ mod tests {
         )
         .map_err(|error| *error)
         .unwrap()
-        .into_expanded(&SchemaRegistry::new())
+        .into_expanded(
+            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .unwrap();
         let mut bindings = ResolvedBindings::default();
         bindings.set_with_completeness(
@@ -654,11 +657,11 @@ mod tests {
                      for value in upstream.values {\n\
                        mock.test.Child { identity_input = value }\n\
                      }\n",
-                    &crate::parser::ProviderContext::default(),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
                 .expect("deferred unbound loop parses");
                 let parsed = crate::validation::deferred_types::with_session_for_test(
-                    &crate::parser::ProviderContext::default(),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                     |session| {
                         crate::module_resolver::resolve_modules_providerless(
                             crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
@@ -670,7 +673,10 @@ mod tests {
                 )
                 .map_err(|error| *error)
                 .expect("deferred fixture crosses the module-resolution seam")
-                .into_expanded(&crate::schema::SchemaRegistry::new())
+                .into_expanded(
+                    &crate::schema::SchemaRegistry::new(),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                )
                 .expect("deferred-loop fixture contains no parser placeholders");
                 let template = &parsed.deferred_for_expressions()[0];
                 let mut bindings = ResolvedBindings::default();
@@ -734,11 +740,11 @@ mod tests {
                        mock.test.Child { mode = value }\n\
                      }\n",
                     std::path::Path::new("main.crn"),
-                    &crate::parser::ProviderContext::default(),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
                 .expect("deferred unbound enum loop parses");
                 let parsed = crate::validation::deferred_types::with_session_for_test(
-                    &crate::parser::ProviderContext::default(),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                     |session| {
                         crate::module_resolver::resolve_modules_providerless(
                             crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
@@ -750,7 +756,10 @@ mod tests {
                 )
                 .map_err(|error| *error)
                 .expect("deferred fixture crosses the module-resolution seam")
-                .into_expanded(&crate::schema::SchemaRegistry::new())
+                .into_expanded(
+                    &crate::schema::SchemaRegistry::new(),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                )
                 .expect("deferred-loop fixture contains no parser placeholders");
                 let template = &parsed.deferred_for_expressions()[0];
                 let iterable = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
@@ -796,7 +805,7 @@ mod tests {
 
                 let mut plan_time_resources =
                     crate::validation::deferred_types::with_session_for_test(
-                        &crate::parser::ProviderContext::default(),
+                        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                         |session| {
                             crate::parser::expand_deferred_children(
                                 template,
@@ -844,11 +853,11 @@ mod tests {
                      for value in upstream.values {\n\
                        mock.test.Child { identity_input = value }\n\
                      }\n",
-                    &crate::parser::ProviderContext::default(),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
                 .expect("deferred unbound loop parses");
                 let parsed = crate::validation::deferred_types::with_session_for_test(
-                    &crate::parser::ProviderContext::default(),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                     |session| {
                         crate::module_resolver::resolve_modules_providerless(
                             crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
@@ -860,7 +869,10 @@ mod tests {
                 )
                 .map_err(|error| *error)
                 .expect("deferred fixture crosses the module-resolution seam")
-                .into_expanded(&crate::schema::SchemaRegistry::new())
+                .into_expanded(
+                    &crate::schema::SchemaRegistry::new(),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                )
                 .expect("deferred-loop fixture contains no parser placeholders");
                 let template = &parsed.deferred_for_expressions()[0];
                 let mut bindings = ResolvedBindings::default();

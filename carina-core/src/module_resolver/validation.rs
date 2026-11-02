@@ -1521,7 +1521,7 @@ mod tests {
         let parsed = crate::parser::parse_file(
             "let mod = use { source = './mod' }\nmod {}\n",
             std::path::Path::new("constraint-test.crn"),
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("parse module call identity");
         let call_id = parsed.module_calls[0].id();

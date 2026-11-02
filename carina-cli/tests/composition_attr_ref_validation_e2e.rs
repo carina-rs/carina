@@ -651,6 +651,7 @@ fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validatio
     let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(factories),
         carina_core::schema::SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
     );
     let provider_context = loaded_providers.provider_context();
     let schemas = loaded_providers.schemas();
@@ -673,12 +674,14 @@ fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validatio
     // CLI validation, where both stages can otherwise report this one typo.
     let inferred_exports =
         carina_core::validation::inference::infer_export_params_with_loaded_provider_schemas(
-            &parsed, schemas,
+            &parsed,
+            schemas,
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         );
     let bindings = carina_core::binding_index::BindingIndex::from_parsed(
         &parsed,
         schemas.schemas(),
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     );
     let mut diagnostics = carina_core::validation::inference::attached_inference_failures(
         inferred_exports.checked_exports(),

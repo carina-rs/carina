@@ -89,7 +89,7 @@ impl Fixture {
             true,
             false,
             false,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .await
     }
@@ -102,7 +102,7 @@ impl Fixture {
             true,
             NonZeroUsize::new(1).unwrap(),
             false,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             ShutdownToken::running(),
         )
         .await
@@ -117,7 +117,7 @@ impl Fixture {
             refresh,
             false,
             NonZeroUsize::new(1).unwrap(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             ShutdownToken::running(),
         )
         .await
@@ -128,7 +128,7 @@ impl Fixture {
             &self.runtime,
             self.dir.path(),
             true,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             ShutdownToken::running(),
         )
         .await
@@ -277,7 +277,7 @@ async fn removed_no_refresh_saved_plan_apply() {
             true,
             NonZeroUsize::new(1).unwrap(),
             false,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             ShutdownToken::running(),
         )
         .await
@@ -295,7 +295,7 @@ async fn removed_no_refresh_saved_plan_apply() {
         true,
         NonZeroUsize::new(1).unwrap(),
         false,
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         ShutdownToken::running(),
     )
     .await

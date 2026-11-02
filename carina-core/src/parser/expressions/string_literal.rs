@@ -335,8 +335,11 @@ mod tests {
         for value in values {
             let literal = encode_string_literal(value).expect("value should be source-encodable");
             let source = format!("let rendered = {literal}\n");
-            let parsed = parse(&source, &ProviderContext::default())
-                .unwrap_or_else(|error| panic!("failed to parse {literal}: {error}"));
+            let parsed = parse(
+                &source,
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .unwrap_or_else(|error| panic!("failed to parse {literal}: {error}"));
 
             assert_eq!(
                 parsed.variables.get("rendered"),

@@ -1702,11 +1702,15 @@ mod tests {
             }
         "#;
 
-        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let parsed = parse(
+            input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         let signature = ModuleSignature::from_directory_module(
             &parsed,
             "web_tier",
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         let display = signature.display_with_color(false);
 
@@ -1732,13 +1736,13 @@ mod tests {
         let parsed = parse(
             "arguments {\n  input: missing.types.Identifier\n}\n\
              attributes {\n  output: missing.types.Identifier = input\n}\n",
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("module fixture must parse");
         let signature = ModuleSignature::from_directory_module(
             &parsed,
             "unnameable",
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         let display = signature.display_with_color(false);
 
@@ -1780,11 +1784,15 @@ mod tests {
             }
         "#;
 
-        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let parsed = parse(
+            input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         let signature = ModuleSignature::from_directory_module(
             &parsed,
             "web_tier",
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         let display = signature.display_with_color(false);
 
@@ -1924,9 +1932,13 @@ mod tests {
             }
         "#;
 
-        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let parsed = parse(
+            input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
 
-        let mut config = ProviderContext::default();
+        let mut config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         config
             .resource_types
             .insert(("aws".to_string(), "vpc".to_string()));
@@ -1977,9 +1989,16 @@ mod tests {
             }
         "#;
 
-        let parsed = parse(input, &ProviderContext::default()).unwrap();
-        let signature =
-            FileSignature::from_parsed_file(&parsed, "web_tier", &ProviderContext::default());
+        let parsed = parse(
+            input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let signature = FileSignature::from_parsed_file(
+            &parsed,
+            "web_tier",
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
 
         // Should be detected as a Module, not a RootConfig
         assert!(matches!(signature, FileSignature::Module(_)));
@@ -2007,9 +2026,16 @@ mod tests {
             }
         "#;
 
-        let parsed = parse(input, &ProviderContext::default()).unwrap();
-        let signature =
-            FileSignature::from_parsed_file(&parsed, "main", &ProviderContext::default());
+        let parsed = parse(
+            input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let signature = FileSignature::from_parsed_file(
+            &parsed,
+            "main",
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
 
         // Should be detected as a RootConfig
         assert!(matches!(signature, FileSignature::RootConfig(_)));

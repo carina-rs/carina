@@ -109,7 +109,7 @@ where
         .map(Path::to_path_buf)
         .unwrap_or_else(|| Path::new(".").to_path_buf());
     carina_core::validation::deferred_types::with_session_for_test(
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::module_resolver::resolve_modules_with_providerless_config(
                 carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
@@ -135,7 +135,10 @@ where
         carina_core::parser::IntoExpandedExportParam<carina_core::resource::AbsoluteBindingAddress>,
 {
     resolve_module_file_for_test(parsed)
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("test fixture must contain no parser placeholders")
 }
 
@@ -370,7 +373,7 @@ fn mock_http_ready_config(
         binding: None,
     });
     let resolved = carina_core::validation::deferred_types::with_session_for_test(
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &parsed,
@@ -909,10 +912,13 @@ fn resolved_provider_configs(
 ) -> carina_core::parser::ResolvedProviderConfigs {
     let parsed = parsed
         .clone()
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("test provider configuration must contain no parser placeholders");
     carina_core::validation::deferred_types::with_session_for_test(
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &parsed,
@@ -926,7 +932,7 @@ fn resolved_provider_configs(
 
 fn empty_resolved_provider_configs() -> carina_core::parser::ResolvedProviderConfigs {
     carina_core::validation::deferred_types::with_session_for_test(
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &carina_core::parser::ExpandedInferredFile::default(),
@@ -943,7 +949,10 @@ fn expanded_provider_configs(
 ) -> Vec<carina_core::parser::ExpandedProviderConfig> {
     parsed
         .clone()
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("test provider configs must contain no parser placeholders")
         .providers
 }
@@ -1044,7 +1053,7 @@ for account_id in orgs.accounts {
 }
 "#,
         Path::new("main.crn"),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("parse saved-plan loop provenance fixture");
     let parsed = carina_core::validation::deferred_types::with_session_for_test(
@@ -1058,7 +1067,10 @@ for account_id in orgs.accounts {
             .expect("cross the deferred-body resolution seam")
         },
     )
-    .into_expanded(&carina_core::schema::SchemaRegistry::new())
+    .into_expanded(
+        &carina_core::schema::SchemaRegistry::new(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
     .expect("saved-plan loop fixture must contain only loop slots");
 
     let mut deferred = parsed.deferred_for_expressions().to_vec().into_iter();
@@ -1298,7 +1310,7 @@ async fn run_saved_plan_schema_fingerprint_case(
     let result = run_apply_from_plan_locked(
         fixture.runtime(),
         inspected_saved_plan(plan_file),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -1373,7 +1385,7 @@ fn concurrent_cli_invocations_keep_mock_runtime_separate() {
                 }, carina_provider_mock::MockScope::file(provider_state.clone()).unwrap());
                 start.wait();
                 crate::commands::state::run_state_refresh(
-                    fixture.runtime(), fixture.config_path(), true, &ProviderContext::default(), fixture.shutdown_token(),
+                    fixture.runtime(), fixture.config_path(), true, &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), fixture.shutdown_token(),
                 ).await.unwrap();
                 assert_eq!(fixture.runtime().provider_load_count(), 1);
                 assert_eq!(std::fs::read_to_string(provider_state).unwrap(), encoded);
@@ -1626,7 +1638,7 @@ fn saved_provider_configs(
     let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers = configs;
     let resolved = carina_core::validation::deferred_types::with_session_for_test(
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &parsed,
@@ -1655,7 +1667,7 @@ fn saved_composition_argument<
         value,
         carina_core::validation::resolve_consumer_static_type_for_signature(
             &carina_core::parser::TypeExpr::String,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         ),
         carina_core::parser::ArgumentOrigin::Defaulted,
     )
@@ -1805,7 +1817,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         &crate::test_support::TestCommandRuntime::new(),
         &parsed,
         tmp.path(),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         UpstreamMissingStatePolicy::Strict,
         ProviderUpstreamScope::All,
     )
@@ -1971,7 +1983,7 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
             false,
             NonZeroUsize::new(1).unwrap(),
             false,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             carina_core::shutdown::ShutdownToken::running(),
         )
         .await
@@ -2124,7 +2136,7 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
     let result = run_apply_from_plan_locked(
         fixture.runtime(),
         inspected_saved_plan(plan_file),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         true,
         backend,
         StateLock::disabled_for_test(),
@@ -2295,7 +2307,7 @@ async fn saved_plan_classifies_v20_dependency_names_before_early_migration_write
     let result = run_apply_from_plan_locked(
         fixture.runtime(),
         inspected_saved_plan(plan_file),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         true,
         backend,
         StateLock::disabled_for_test(),
@@ -2489,7 +2501,7 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
         true,
         NonZeroUsize::new(1).unwrap(),
         false,
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         ShutdownToken::running(),
     )
     .await
@@ -2575,7 +2587,7 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
     let error = run_apply_from_plan_locked(
         &user_dirs,
         inspected_saved_plan(plan_file),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         true,
         Arc::clone(&backend),
         StateLock::held(lock),
@@ -2662,7 +2674,7 @@ async fn state_bucket_bootstrap_prepares_resolved_upstream_provider_config() {
         &crate::test_support::TestCommandRuntime::new(),
         &expanded,
         &downstream,
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .await
     .expect("bootstrap provider inputs must resolve");
@@ -2694,14 +2706,17 @@ async fn apply_provider_loading_remains_all_strict_for_tag_only_upstreams() {
     let (_temp, base_dir, parsed) =
         crate::provider_upstream_test_support::provider_default_tags_missing_upstream_fixture();
     let parsed = parsed
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("provider default-tags fixture has no parser placeholders");
 
     let error = match load_apply_provider_inputs(
         &crate::test_support::TestCommandRuntime::new(),
         &parsed,
         &base_dir,
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .await
     {
@@ -2743,7 +2758,7 @@ async fn apply_verifies_backend_before_loading_bootstrap_provider_upstreams() {
         false,
         NonZeroUsize::new(1).unwrap(),
         false,
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         ShutdownToken::running(),
         &cli_observer_factory,
     )
@@ -2796,7 +2811,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     write_upstream("arn:aws:iam::111111111111:role/old");
     let loaded = load_configuration_with_config(
         &downstream,
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         &SchemaRegistry::new(),
     )
     .unwrap();
@@ -2806,13 +2821,16 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     let wiring = ValidatedWiring::from_load_for_test(providers);
     let validated_config = validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed);
     let expanded = resolve_module_file_for_test(parsed.clone().into_parsed())
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("provider upstream fixture has no parser placeholders");
     let stale_inputs = load_apply_provider_inputs(
         &user_dirs,
         &expanded,
         &downstream,
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .await
     .unwrap();
@@ -2829,7 +2847,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     let reloaded = reload_apply_configuration_after_bootstrap(
         &downstream,
         &downstream,
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         validated_config,
         unresolved_parsed,
     )
@@ -2856,7 +2874,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
         backend,
         StateLock::disabled_for_test(),
         &downstream,
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         ShutdownToken::running(),
         &cli_observer_factory,
         NonZeroUsize::new(1).unwrap(),
@@ -2900,7 +2918,7 @@ inner { x = a }
     std::fs::write(inner.join("main.crn"), "arguments { x: Int }\n").expect("inner module");
     let loaded = load_configuration_with_config(
         fixture.path(),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         &SchemaRegistry::new(),
     )
     .expect("load unresolved bootstrap snapshot");
@@ -2916,7 +2934,7 @@ inner { x = a }
     let error = reload_apply_configuration_after_bootstrap(
         fixture.path(),
         fixture.path(),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         validated_config,
         unresolved,
     )
@@ -2988,7 +3006,7 @@ fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
         let fixture = write_module_output_mismatch_fixture(nested);
         let loaded = load_configuration_with_config(
             fixture.path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &SchemaRegistry::new(),
         )
         .expect("load unresolved bootstrap snapshot");
@@ -3003,7 +3021,7 @@ fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
         let error = reload_apply_configuration_after_bootstrap(
             fixture.path(),
             fixture.path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             validated_config,
             unresolved,
         )
@@ -4171,10 +4189,13 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
     );
     let expanded = parsed
         .clone()
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("module data-source fixture has no parser placeholders");
     let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &expanded,
@@ -4706,7 +4727,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
     let result = run_apply_from_plan_locked(
         fixture.runtime(),
         inspected_saved_plan(plan_file),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -4852,7 +4873,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
     let result = run_apply_from_plan_locked(
         fixture.runtime(),
         inspected_saved_plan(plan_file),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -4927,7 +4948,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
     let error = run_apply_from_plan_locked(
         fixture.runtime(),
         inspected_saved_plan(plan_file),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -5014,7 +5035,7 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
     let error = run_apply_from_plan_locked(
         fixture.runtime(),
         inspected_saved_plan(plan_file),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -5058,13 +5079,13 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
     .expect("write provider config");
     let parsed = carina_core::config_loader::load_configuration_with_config(
         &downstream,
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         &SchemaRegistry::new(),
     )
     .expect("load plan fixture")
     .parsed;
     let parsed = carina_core::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::module_resolver::resolve_modules_with_providerless_config(
                 parsed,
@@ -5075,13 +5096,16 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
             .expect("test fixture crosses module resolution")
         },
     )
-    .into_expanded(&carina_core::schema::SchemaRegistry::new())
+    .into_expanded(
+        &carina_core::schema::SchemaRegistry::new(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
     .expect("saved-plan provider fixture has no parser placeholders");
     let plan_inputs = load_and_resolve_provider_configs(
         fixture.runtime(),
         &parsed,
         &downstream,
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         UpstreamMissingStatePolicy::Lenient,
         ProviderUpstreamScope::All,
     )
@@ -5134,7 +5158,7 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
     run_apply_from_plan_locked(
         fixture.runtime(),
         inspected_saved_plan(plan_file),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),
@@ -10089,7 +10113,7 @@ mod apply_deferred_for_parity {
         let parsed = parse_file(
             source,
             std::path::Path::new("apply_deferred_for.crn"),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .expect("parse");
         carina_core::validation::deferred_types::with_session_for_test(
@@ -10215,7 +10239,12 @@ mod apply_deferred_for_parity {
         let parsed = parse_resolved(src);
         let states = dvo_state(&parsed);
         let parsed = parsed
-            .into_expanded(&carina_core::schema::SchemaRegistry::new())
+            .into_expanded(
+                &carina_core::schema::SchemaRegistry::new(),
+                &carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                ),
+            )
             .expect("deferred-for fixture must contain only loop slots");
         let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let schemas = comparison_schemas();
@@ -10285,7 +10314,12 @@ mod apply_deferred_for_parity {
         "#;
         let parsed = parse_resolved(src);
         let parsed = parsed
-            .into_expanded(&carina_core::schema::SchemaRegistry::new())
+            .into_expanded(
+                &carina_core::schema::SchemaRegistry::new(),
+                &carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                ),
+            )
             .expect("deferred-for fixture must contain only loop slots");
         let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let empty: HashMap<ResourceId, State> = HashMap::new();
@@ -10345,7 +10379,12 @@ mod apply_deferred_for_parity {
         let parsed = parse_resolved(&src);
         let states = dvo_state(&parsed);
         let parsed = parsed
-            .into_expanded(&carina_core::schema::SchemaRegistry::new())
+            .into_expanded(
+                &carina_core::schema::SchemaRegistry::new(),
+                &carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                ),
+            )
             .expect("deferred-for fixture must contain only loop slots");
         let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let mut schemas = carina_core::schema::SchemaRegistry::new();
@@ -10503,7 +10542,7 @@ mod saved_plan_version_tests {
             false,
             std::num::NonZeroUsize::new(1).unwrap(),
             false,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             carina_core::shutdown::ShutdownToken::running(),
         )
         .await
@@ -10538,7 +10577,7 @@ mod saved_plan_version_tests {
             false,
             std::num::NonZeroUsize::new(1).unwrap(),
             false,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             carina_core::shutdown::ShutdownToken::running(),
         )
         .await
@@ -10587,7 +10626,9 @@ mod saved_plan_version_tests {
                 false,
                 std::num::NonZeroUsize::new(1).unwrap(),
                 false,
-                &carina_core::parser::ProviderContext::default(),
+                &carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                ),
                 carina_core::shutdown::ShutdownToken::running(),
             )
             .await
@@ -10625,7 +10666,7 @@ mod saved_plan_version_tests {
             false,
             std::num::NonZeroUsize::new(1).unwrap(),
             false,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             carina_core::shutdown::ShutdownToken::running(),
         )
         .await
@@ -10680,7 +10721,7 @@ mod saved_plan_version_tests {
             false,
             std::num::NonZeroUsize::new(1).unwrap(),
             false,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             carina_core::shutdown::ShutdownToken::running(),
         )
         .await
@@ -10722,7 +10763,7 @@ mod saved_plan_version_tests {
             false,
             std::num::NonZeroUsize::new(8).unwrap(),
             false,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             carina_core::shutdown::ShutdownToken::running(),
         )
         .await;
@@ -10781,7 +10822,7 @@ mod saved_plan_version_tests {
             false,
             std::num::NonZeroUsize::new(8).unwrap(),
             false,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             carina_core::shutdown::ShutdownToken::running(),
         )
         .await;
@@ -10843,7 +10884,7 @@ mod saved_plan_version_tests {
             false,
             std::num::NonZeroUsize::new(8).unwrap(),
             false,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             carina_core::shutdown::ShutdownToken::running(),
         )
         .await;
@@ -10933,7 +10974,7 @@ mod saved_plan_version_tests {
             false,
             std::num::NonZeroUsize::new(8).unwrap(),
             false,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             carina_core::shutdown::ShutdownToken::running(),
         )
         .await;
@@ -11005,7 +11046,7 @@ mod saved_plan_version_tests {
             false,
             std::num::NonZeroUsize::new(8).unwrap(),
             false,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             carina_core::shutdown::ShutdownToken::running(),
         )
         .await
@@ -11063,7 +11104,7 @@ mod saved_plan_version_tests {
             false,
             std::num::NonZeroUsize::new(8).unwrap(),
             false,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             carina_core::shutdown::ShutdownToken::running(),
         )
         .await
@@ -11120,7 +11161,7 @@ mod saved_plan_version_tests {
             false,
             std::num::NonZeroUsize::new(8).unwrap(),
             false,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             carina_core::shutdown::ShutdownToken::running(),
         )
         .await
@@ -11177,7 +11218,7 @@ mod saved_plan_version_tests {
             false,
             std::num::NonZeroUsize::new(8).unwrap(),
             false,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             carina_core::shutdown::ShutdownToken::running(),
         )
         .await
@@ -11248,7 +11289,7 @@ mod saved_plan_version_tests {
             false,
             std::num::NonZeroUsize::new(8).unwrap(),
             false,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             carina_core::shutdown::ShutdownToken::running(),
         )
         .await;
@@ -11313,7 +11354,7 @@ mod saved_plan_version_tests {
             false,
             std::num::NonZeroUsize::new(8).unwrap(),
             false,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             carina_core::shutdown::ShutdownToken::running(),
         )
         .await;
@@ -11491,7 +11532,7 @@ mod saved_plan_version_tests {
             false,
             std::num::NonZeroUsize::new(8).unwrap(),
             false,
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             carina_core::shutdown::ShutdownToken::running(),
         )
         .await;

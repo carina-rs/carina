@@ -1839,7 +1839,7 @@ fn assert_suggestion_round_trips(hint: &MovedBlockHint, expected_from: &str, exp
     let parsed = carina_core::parser::parse_file(
         &source,
         std::path::Path::new("module-moved-hint-round-trip.crn"),
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap_or_else(|error| panic!("rendered block did not parse:\n{block}\n{error}"));
     assert!(
@@ -2074,7 +2074,11 @@ fn collect_unused_let_bindings_in_fixtures(
             continue;
         }
         let fixture_name = entry.file_name().to_string_lossy().to_string();
-        let loaded = load_configuration(&fixture_dir).unwrap();
+        let loaded = load_configuration(
+            &fixture_dir,
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         let unused = carina_core::validation::check_unused_bindings(&loaded.authored_bindings);
         if unused.is_empty() {
             continue;
@@ -2635,7 +2639,11 @@ fn plan_snapshot_exports_multifile_string_let_attr_access_rejected() {
         "{}/tests/fixtures/plan_display/exports_multifile_string_let_attr_access_rejected",
         env!("CARGO_MANIFEST_DIR")
     ));
-    let loaded = load_configuration(&fixture_path).unwrap();
+    let loaded = load_configuration(
+        &fixture_path,
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let duplicate_declarations = loaded.duplicate_declarations;
     let parsed = loaded.parsed;
     let providers =

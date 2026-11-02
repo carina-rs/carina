@@ -128,7 +128,7 @@ impl FormattingClient {
         let (service, socket) = LspService::new(move |client| {
             Backend::new(
                 client,
-                ProviderContext::default(),
+                ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
                 Some(Arc::clone(&factory_builder)),
             )
         });

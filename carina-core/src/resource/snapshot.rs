@@ -131,7 +131,8 @@ where
 /// ```compile_fail
 /// use carina_core::{resource::SnapshotValue,parser::{ProviderContext,TypeExpr},validation::typecheck::{check_type_expr_value_providerless,TypecheckInference}};
 /// let snapshot: SnapshotValue = unimplemented!();
-/// check_type_expr_value_providerless(&TypeExpr::String,&snapshot,&ProviderContext::default(),TypecheckInference::Unavailable);
+/// let context = ProviderContext::new(carina_core::EnvironmentSnapshot::new([]));
+/// check_type_expr_value_providerless(&TypeExpr::String,&snapshot,&context,TypecheckInference::Unavailable);
 /// ```
 ///
 /// ```compile_fail

@@ -54,11 +54,12 @@ fn engine_with_schemas(schemas: SchemaRegistry) -> DiagnosticEngine {
         .collect();
     let factories = factories_for(&schemas);
     if provider_names.is_empty() {
-        DiagnosticEngine::without_loaded_provider_schemas()
+        DiagnosticEngine::without_loaded_provider_schemas(carina_core::EnvironmentSnapshot::empty())
     } else {
         let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
             Arc::new(factories),
             SchemaRegistry::new(),
+            carina_core::EnvironmentSnapshot::empty(),
         );
         DiagnosticEngine::new(Arc::new(loaded_providers), provider_names)
     }
@@ -110,7 +111,9 @@ fn lsp_diagnostics(
     let doc = Document::new_with_path(
         text,
         path.clone(),
-        Arc::new(carina_core::parser::ProviderContext::default()),
+        Arc::new(carina_core::parser::ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
     );
     engine.analyze(&doc, Some(&path))
 }
@@ -137,7 +140,7 @@ fn cli_validated_file(
 ) -> carina_core::parser::ExpandedInferredFile {
     let loaded = carina_core::config_loader::load_configuration_with_config(
         fixture.path(),
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         &SchemaRegistry::new(),
     )
     .expect("load CLI fixture");
@@ -444,7 +447,9 @@ fn assert_annotation_parity(
     let document = Document::new_with_path(
         source.to_string(),
         path.clone(),
-        Arc::new(carina_core::parser::ProviderContext::default()),
+        Arc::new(carina_core::parser::ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
     );
     // CLI validate receives a directory, so LSP must analyze that same
     // directory. An orphan buffer deliberately has different catalog authority.
@@ -466,6 +471,7 @@ fn undeclared_type_engine() -> DiagnosticEngine {
     let loaded = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(factories),
         SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
     );
     DiagnosticEngine::new(Arc::new(loaded), vec!["mock".to_string()])
 }
@@ -477,7 +483,7 @@ const FAILED_ANNOTATION_PROVIDER: &str =
 fn providerless_directory_has_cli_lsp_strict_attribute_parity() {
     assert_annotation_parity(
         "attributes { x: AwsAccountId = '123' }\n",
-        DiagnosticEngine::without_loaded_provider_schemas(),
+        DiagnosticEngine::without_loaded_provider_schemas(carina_core::EnvironmentSnapshot::empty()),
         false,
         &[("ERROR", None, "unknown custom type 'AwsAccountId'")],
     );
@@ -487,7 +493,7 @@ fn providerless_directory_has_cli_lsp_strict_attribute_parity() {
 fn failed_provider_dotted_annotation_has_cli_lsp_deferral_parity() {
     assert_annotation_parity(
         &format!("{FAILED_ANNOTATION_PROVIDER}exports {{\n  x: broken.AccountId = 42\n}}\n"),
-        DiagnosticEngine::without_loaded_provider_schemas(),
+        DiagnosticEngine::without_loaded_provider_schemas(carina_core::EnvironmentSnapshot::empty()),
         true,
         &[(
             "WARNING",
@@ -512,7 +518,9 @@ fn unloaded_bare_function_annotation_has_cli_lsp_deferral_parity() {
             &format!(
                 "{FAILED_ANNOTATION_PROVIDER}fn echo(value: Arn): String {{ 'value' }}\n{invocation}"
             ),
-            DiagnosticEngine::without_loaded_provider_schemas(),
+            DiagnosticEngine::without_loaded_provider_schemas(
+                carina_core::EnvironmentSnapshot::empty(),
+            ),
             true,
             &expected,
         );
@@ -621,6 +629,7 @@ fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &Schema
     let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(factories_for(schemas)),
         SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
     );
     let context = loaded_providers.provider_context();
     let schemas = loaded_providers.schema_registry();
@@ -1338,6 +1347,7 @@ fn standalone_module_type_resolution_keeps_cli_location_and_lsp_range() {
 
     let schemas = module_call_parity_schemas();
     let strict_context = carina_core::parser::ProviderContext {
+        environment: carina_core::EnvironmentSnapshot::empty(),
         decryptor: None,
         custom_types: carina_core::provider::provider_custom_types_from_factories(Arc::new(
             factories_for(&schemas),
@@ -1978,7 +1988,9 @@ inner {
     let outer_doc = Document::new_with_path(
         outer_text,
         outer_path.clone(),
-        Arc::new(carina_core::parser::ProviderContext::default()),
+        Arc::new(carina_core::parser::ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
     );
     let lsp = engine_with_schemas(SchemaRegistry::new()).analyze(&outer_doc, Some(&outer_path));
     assert!(
@@ -2023,7 +2035,9 @@ fn nested_int_argument_to_literal_union_is_rejected_by_cli_and_lsp() {
     let outer_doc = Document::new_with_path(
         outer_text,
         outer_path.clone(),
-        Arc::new(carina_core::parser::ProviderContext::default()),
+        Arc::new(carina_core::parser::ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
     );
     let lsp = engine_with_schemas(SchemaRegistry::new()).analyze(&outer_doc, Some(&outer_path));
     assert!(
@@ -2087,7 +2101,9 @@ inner { x = a }
         &Document::new_with_path(
             outer_source.to_string(),
             outer_path.clone(),
-            Arc::new(carina_core::parser::ProviderContext::default()),
+            Arc::new(carina_core::parser::ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
         ),
         Some(&outer_path),
     );
@@ -2108,7 +2124,9 @@ inner { x = a }
         &Document::new_with_path(
             outer_source.to_string(),
             outer_path.clone(),
-            Arc::new(carina_core::parser::ProviderContext::default()),
+            Arc::new(carina_core::parser::ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
         ),
         Some(&outer_path),
     );
@@ -2170,7 +2188,9 @@ inner { resource = resource }
         &Document::new_with_path(
             outer_source.to_string(),
             outer_path.clone(),
-            Arc::new(carina_core::parser::ProviderContext::default()),
+            Arc::new(carina_core::parser::ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
         ),
         Some(&outer_path),
     );
@@ -3671,7 +3691,7 @@ awscc.cloudfront.Distribution {
     )]);
     let bootstrap = carina_core::config_loader::load_configuration_with_config(
         matching.path(),
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         &SchemaRegistry::new(),
     )
     .expect("schema-independent bootstrap parse");
@@ -3794,7 +3814,8 @@ awscc.cloudfront.Distribution {
     )
     .expect("write module fixture");
 
-    let config = carina_core::parser::ProviderContext::default();
+    let config =
+        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
     let loaded = carina_core::config_loader::load_configuration_with_config(
         fixture.path(),
         &config,
@@ -4742,6 +4763,7 @@ fn wasm_style_engine() -> DiagnosticEngine {
     let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(factories),
         SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
     );
     DiagnosticEngine::new(Arc::new(loaded_providers), provider_names)
 }
@@ -4902,6 +4924,7 @@ awsccmock.ec2.subnet {
     let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(factories),
         SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
     );
     let engine = DiagnosticEngine::new(Arc::new(loaded_providers), provider_names);
 
@@ -5014,6 +5037,7 @@ fn engine_2358() -> DiagnosticEngine {
     let loaded_providers = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(factories),
         SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
     );
     DiagnosticEngine::new(Arc::new(loaded_providers), vec!["awscc2358".to_string()])
 }
@@ -5599,7 +5623,9 @@ fn integer_arithmetic_directory_diagnostics_map_operator_after_heredoc() {
     let fixture = write_fixture(&[("main.crn", main)]);
     let cli = cli_diagnostics(Vec::new(), &fixture);
     let lsp = lsp_diagnostics(
-        &DiagnosticEngine::without_loaded_provider_schemas(),
+        &DiagnosticEngine::without_loaded_provider_schemas(
+            carina_core::EnvironmentSnapshot::empty(),
+        ),
         &fixture,
         "main.crn",
     );

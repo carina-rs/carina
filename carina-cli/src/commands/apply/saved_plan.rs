@@ -1355,7 +1355,7 @@ mod tests {
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers = configs;
         let resolved = carina_core::validation::deferred_types::with_session_for_test(
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,

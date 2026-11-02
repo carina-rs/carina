@@ -464,7 +464,7 @@ async fn run_state_migration_check(
     // decrypt() remains unavailable on this read-only/offline path.
     let loaded = load_configuration_with_config(
         config_dir,
-        &ProviderContext::default(),
+        &ProviderContext::new(runtime.environment().clone()),
         &carina_core::schema::SchemaRegistry::new(),
     )?;
     let duplicate_declarations = loaded.duplicate_declarations;
@@ -3077,7 +3077,7 @@ mod tests {
             >,
     {
         carina_core::validation::deferred_types::with_session_for_test(
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             |session| {
                 carina_core::module_resolver::resolve_modules_with_providerless_config(
                     carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
@@ -3088,7 +3088,10 @@ mod tests {
                 .expect("test fixture crosses module resolution")
             },
         )
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("test fixture contains no leftover parser placeholders")
     }
 
@@ -3097,7 +3100,9 @@ mod tests {
             value,
             carina_core::validation::resolve_consumer_static_type_for_signature(
                 &carina_core::parser::TypeExpr::String,
-                &carina_core::parser::ProviderContext::default(),
+                &carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                ),
             ),
             carina_core::parser::ArgumentOrigin::Defaulted,
         )
@@ -3319,7 +3324,7 @@ mod tests {
             &backend,
             StateLock::disabled_for_test().as_ref(),
             &downstream,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             ShutdownToken::running(),
         )
         .await
@@ -3364,7 +3369,7 @@ mod tests {
             &backend,
             StateLock::disabled_for_test().as_ref(),
             &downstream,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             ShutdownToken::running(),
         )
         .await
@@ -3398,7 +3403,7 @@ mod tests {
             &backend,
             StateLock::disabled_for_test().as_ref(),
             &downstream,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             ShutdownToken::running(),
         )
         .await
@@ -3453,7 +3458,7 @@ mod tests {
             backend.as_ref(),
             StateLock::disabled_for_test().as_ref(),
             &downstream,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             ShutdownToken::running(),
         )
         .await
@@ -3480,7 +3485,7 @@ mod tests {
             &backend,
             StateLock::disabled_for_test().as_ref(),
             &base_dir,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             ShutdownToken::running(),
         )
         .await
@@ -3507,7 +3512,7 @@ mod tests {
             &backend,
             StateLock::disabled_for_test().as_ref(),
             &base_dir,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             ShutdownToken::running(),
         )
         .await
@@ -3522,7 +3527,7 @@ mod tests {
             &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             &downstream,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .await
         .expect("state bucket delete provider inputs must resolve");
@@ -3582,7 +3587,7 @@ mod tests {
             &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             &downstream,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .await
         {
@@ -3607,7 +3612,7 @@ mod tests {
             &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             &base_dir,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .await
         .expect("bucket delete must not load tag-only upstream state");
@@ -3650,7 +3655,7 @@ mod tests {
                 }
             "#,
             std::path::Path::new("state_bucket_delete.crn"),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .expect("fixture must parse");
         assert!(
@@ -3665,7 +3670,7 @@ mod tests {
             &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             temp.path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .await
         .expect("deferred default tags must not block bucket provider construction");
@@ -4029,7 +4034,7 @@ mod tests {
             &backend,
             StateLock::disabled_for_test().as_ref(),
             temp.path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             cancel,
         )
         .await
@@ -4120,7 +4125,7 @@ mod tests {
             &backend,
             StateLock::disabled_for_test().as_ref(),
             temp.path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             ShutdownToken::running(),
         )
         .await
@@ -4197,7 +4202,7 @@ mod tests {
             &backend,
             StateLock::disabled_for_test().as_ref(),
             temp.path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             ShutdownToken::running(),
         )
         .await
@@ -4382,7 +4387,7 @@ mod tests {
             "unknown",
             true,
             fixture.config_path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             ShutdownToken::running(),
         )
         .await
@@ -4403,7 +4408,7 @@ mod tests {
             "unknown",
             true,
             fixture.config_path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             ShutdownToken::running(),
         )
         .await
@@ -4446,7 +4451,7 @@ mod tests {
             "normal",
             true,
             fixture.config_path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             ShutdownToken::running(),
         )
         .await
@@ -4476,7 +4481,7 @@ mod tests {
             "unknown",
             true,
             fixture.config_path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             ShutdownToken::running(),
         )
         .await
@@ -4713,7 +4718,7 @@ mod tests {
             fixture.runtime(),
             fixture.config_path(),
             false,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             fixture.shutdown_token(),
         )
         .await
@@ -4780,7 +4785,7 @@ mod tests {
         let drain_barrier =
             install_refresh_drain_barrier(fixture.runtime(), fixture.shutdown_token());
 
-        let provider_context = ProviderContext::default();
+        let provider_context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
         let refresh = run_state_refresh(
             fixture.runtime(),
             fixture.config_path(),
@@ -4860,7 +4865,7 @@ mod tests {
         let parsed = parse_file(
             &source,
             std::path::Path::new("state_refresh.crn"),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .expect("test config should parse");
         assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
@@ -7683,7 +7688,7 @@ mod tests {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         // Use the state fixture which has no backend block
         let path = PathBuf::from(format!("{}/tests/fixtures/state", manifest_dir));
-        let provider_context = ProviderContext::default();
+        let provider_context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
 
         // Call force-unlock with a dummy lock ID.
         // The local backend will return LockNotFound because there is no lock file,

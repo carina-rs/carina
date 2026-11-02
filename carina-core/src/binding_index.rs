@@ -36,7 +36,7 @@
 //! binding-name table is scoped.
 //!
 //! ```ignore
-//! let index = BindingIndex::from_parsed(&parsed, &registry, &crate::parser::ProviderContext::default());
+//! let index = BindingIndex::from_parsed(&parsed, &registry, &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()));
 //! if let Some(entry) = index.get("vpc") {
 //!     // entry.target is the statically known validation surface
 //! }
@@ -3200,8 +3200,9 @@ impl<'a> IterableBindings<'a> {
     pub fn resolve_value(
         &self,
         value: &Value,
+        context: &crate::parser::ProviderContext,
     ) -> Result<crate::resolver::ValueResolution, crate::resolver::ResolutionError> {
-        crate::resolver::project_ref_value_status(value, self.bindings.as_ref())
+        crate::resolver::project_ref_value_status(value, self.bindings.as_ref(), context)
     }
 
     /// Missing selections may be treated as final only when every binding
@@ -3216,9 +3217,11 @@ mod tests {
     use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
     #[test]
     fn value_declaration_resolves_the_catalog_scalar_kind_before_lifting() {
-        let declaration =
-            crate::parser::parse_type_expr_str("Count", &crate::parser::ProviderContext::default())
-                .unwrap();
+        let declaration = crate::parser::parse_type_expr_str(
+            "Count",
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         let parsed = crate::parser::ParsedFile::default();
         let schemas = SchemaRegistry::new();
         let provider_context = crate::parser::ProviderContext {
@@ -3230,7 +3233,7 @@ mod tests {
                 )]),
                 Box::new(|_, _| Ok(())),
             ),
-            ..Default::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         };
         let index = BindingIndex::from_parsed(&parsed, &schemas, &provider_context);
         let source = ResolvedRefType::from_value_declaration(&declaration, &index).unwrap();
@@ -3250,11 +3253,11 @@ mod tests {
     #[test]
     fn binding_assignment_requires_loaded_evidence_or_explicitly_allows_unchecked() {
         crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 let declaration = crate::parser::parse_type_expr_str(
                     "Count",
-                    &crate::parser::ProviderContext::default(),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
                 .unwrap();
                 let source = crate::validation::lift_type_expr(&declaration).unwrap();
@@ -3266,7 +3269,7 @@ mod tests {
                         HashSet::new(),
                         Box::new(|_, _| Ok(())),
                     ),
-                    ..Default::default()
+                    ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
                 };
                 let strict = BindingIndex::from_parsed(&parsed, &schemas, &loaded);
                 let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
@@ -3298,7 +3301,7 @@ mod tests {
         let index = BindingIndex::from_parsed(
             &parsed,
             &schemas,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         let handle = TypeExpr::Ref(ResourceTypePath::new("aws", "ec2.Vpc"));
         for declaration in [
@@ -3336,7 +3339,7 @@ mod tests {
     fn consumer_type(type_expr: TypeExpr) -> crate::static_type::ConsumerStaticType {
         crate::validation::resolve_consumer_static_type_for_signature(
             &type_expr,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
     }
 
@@ -3423,13 +3426,17 @@ let vpc = aws.ec2.Vpc {
     cidr_block = "10.0.0.0/16"
 }
 "#;
-        let parsed = parse(src, &Default::default()).expect("parse");
+        let parsed = parse(
+            src,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse");
         let registry = registry_with_vpc();
 
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         let entry = index.get("vpc").expect("vpc binding present");
         let BindingTarget::Schema(schema) = entry.target else {
@@ -3450,7 +3457,11 @@ let existing = read aws.ec2.Vpc {
     name = "v"
 }
 "#;
-        let parsed = parse(src, &Default::default()).expect("parse");
+        let parsed = parse(
+            src,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse");
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "aws",
@@ -3462,7 +3473,7 @@ let existing = read aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         let entry = index
             .get("existing")
@@ -3476,14 +3487,18 @@ let existing = read aws.ec2.Vpc {
 
     #[test]
     fn build_indexes_composition_but_excludes_it_from_schema_projection() {
-        let mut parsed = parse("", &Default::default()).expect("parse");
+        let mut parsed = parse(
+            "",
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse");
         parsed.compositions.push(composition("instance"));
 
         let registry = SchemaRegistry::new();
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
 
         let entry = index
@@ -3504,7 +3519,7 @@ let existing = read aws.ec2.Vpc {
     fn pre_expansion_module_call_binding_exposes_declared_attribute_types() {
         let parsed = parse(
             "let m = use { source = './m' }\nlet x = m {}\n",
-            &Default::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("module-call fixture must parse");
         let signatures = HashMap::from([(
@@ -3523,7 +3538,7 @@ let existing = read aws.ec2.Vpc {
             &parsed,
             &registry,
             &signatures,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
 
         let RefType::Typed(count) = index.ref_type(&AccessPath::new("x", "count")) else {
@@ -3553,7 +3568,11 @@ let existing = read aws.ec2.Vpc {
 
     #[test]
     fn wait_binding_aliases_composition_target() {
-        let mut parsed = parse("", &Default::default()).expect("parse");
+        let mut parsed = parse(
+            "",
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse");
         parsed.compositions.push(composition("instance"));
         parsed.wait_bindings.push(WaitBinding {
             binding: RelativeBindingName::from("ready"),
@@ -3579,7 +3598,7 @@ let existing = read aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
 
         let entry = index
@@ -3602,13 +3621,17 @@ aws.ec2.Vpc {
     cidr_block = "10.0.0.0/16"
 }
 "#;
-        let parsed = parse(src, &Default::default()).expect("parse");
+        let parsed = parse(
+            src,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse");
         let registry = registry_with_vpc();
 
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert!(index.is_empty());
     }
@@ -3625,13 +3648,17 @@ let vpc = aws.ec2.Vpc {
     name = "v"
 }
 "#;
-        let parsed = parse(src, &Default::default()).expect("parse");
+        let parsed = parse(
+            src,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse");
         let registry = SchemaRegistry::new();
 
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert!(index.get("vpc").is_none());
         assert!(
@@ -3651,13 +3678,17 @@ let cert_issued = wait cert {
     until = cert.status == "issued"
 }
 "#;
-        let parsed = parse(src, &Default::default()).expect("parse");
+        let parsed = parse(
+            src,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse");
         let registry = SchemaRegistry::new();
 
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert!(index.get("cert").is_none());
         assert!(index.get("cert_issued").is_none());
@@ -3687,13 +3718,17 @@ for _, n in some_iterable {
     }
 }
 "#;
-        let parsed = parse(src, &Default::default()).expect("parse");
+        let parsed = parse(
+            src,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse");
         let registry = registry_with_vpc();
 
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert!(index.get("net").is_some(), "named let binding indexed");
         assert!(
@@ -3715,12 +3750,16 @@ let vpc = aws.ec2.Vpc {
     cidr_block = "10.0.0.0/16"
 }
 "#;
-        let parsed = parse(src, &Default::default()).expect("parse");
+        let parsed = parse(
+            src,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse");
         let registry = registry_with_vpc();
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
 
         let by_name = index.schemas_by_name();
@@ -3741,12 +3780,16 @@ let vpc = aws.ec2.Vpc {
     cidr_block = "10.0.0.0/16"
 }
 "#;
-        let parsed = parse(src, &Default::default()).expect("parse");
+        let parsed = parse(
+            src,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse");
         let registry = registry_with_vpc();
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert!(index.get("missing").is_none());
     }
@@ -3760,7 +3803,7 @@ let vpc = aws.ec2.Vpc {
     cidr_block = "10.0.0.0/16"
 }
 "#,
-            &Default::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("parse");
         let mut output = composition("instance");
@@ -3776,7 +3819,7 @@ let vpc = aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
 
         let RefType::Typed(resolved) = index.ref_type(&AccessPath::new("instance", "cidr")) else {
@@ -3794,7 +3837,7 @@ let vpc = aws.ec2.Vpc {
     cidr_block = "10.0.0.0/16"
 }
 "#,
-            &Default::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("parse");
         let mut output = composition("instance");
@@ -3804,7 +3847,7 @@ let vpc = aws.ec2.Vpc {
                 Value::resource_ref("vpc".to_string(), "cidr_block", vec![]),
                 Some(crate::validation::resolve_consumer_static_type(
                     &TypeExpr::DottedUnresolved(ResourceTypePath::new("some", "unnameable.Type")),
-                    &crate::parser::ProviderContext::default(),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )),
             ),
         );
@@ -3813,7 +3856,7 @@ let vpc = aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
 
         let RefType::Typed(resolved) = index.ref_type(&AccessPath::new("instance", "cidr")) else {
@@ -3966,8 +4009,11 @@ let vpc = aws.ec2.Vpc {
                 let Some(declaration) = &declared.declaration else {
                     continue;
                 };
-                let mut parsed = parse("let source = test.source.Node { }", &Default::default())
-                    .expect("source fixture must parse");
+                let mut parsed = parse(
+                    "let source = test.source.Node { }",
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                )
+                .expect("source fixture must parse");
                 let mut middle = composition("middle");
                 middle.signature.attributes.clear();
                 middle.signature.attributes.insert(
@@ -4005,7 +4051,7 @@ let vpc = aws.ec2.Vpc {
                 let index = BindingIndex::from_parsed(
                     &parsed,
                     &registry,
-                    &crate::parser::ProviderContext::default(),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 );
                 let RefType::Typed(chain) = index.ref_type(&AccessPath::new("middle", "value"))
                 else {
@@ -4045,7 +4091,11 @@ let vpc = aws.ec2.Vpc {
 
     #[test]
     fn ref_type_resolves_bare_and_struct_field_module_arguments() {
-        let mut parsed = parse("", &Default::default()).expect("parse");
+        let mut parsed = parse(
+            "",
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse");
         parsed.arguments.extend([
             ArgumentParameter {
                 name: "name".to_string(),
@@ -4068,7 +4118,7 @@ let vpc = aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
 
         let name_binding = RelativeBindingName::new("name");
@@ -4085,7 +4135,11 @@ let vpc = aws.ec2.Vpc {
 
     #[test]
     fn ref_type_lifts_resource_handle_argument_and_enforces_boundary_matrix() {
-        let mut parsed = parse("", &Default::default()).expect("parse");
+        let mut parsed = parse(
+            "",
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse");
         parsed.arguments.push(ArgumentParameter {
             name: "vpc".to_string(),
             static_type: TypeExpr::Ref(ResourceTypePath::new("aws", "ec2.Vpc")),
@@ -4097,7 +4151,7 @@ let vpc = aws.ec2.Vpc {
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
 
         let vpc_binding = RelativeBindingName::new("vpc");
@@ -4143,7 +4197,11 @@ let vpc = aws.ec2.Vpc {
         crate::validation::deferred_types::with_session_for_test(
             &crate::parser::LoadedProviderContext::empty_for_test(),
             |session| {
-                let mut parsed = parse("", &Default::default()).expect("parse");
+                let mut parsed = parse(
+                    "",
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                )
+                .expect("parse");
                 let resource_type = ResourceTypePath::new("aws", "ec2.Vpc");
                 parsed.arguments.push(ArgumentParameter {
                     name: "vpc".to_string(),
@@ -4173,14 +4231,14 @@ let vpc = aws.ec2.Vpc {
     cidr_block = "10.0.0.0/16"
 }
 "#,
-            &Default::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("parse");
         let registry = registry_with_vpc();
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
 
         let vpc_binding = RelativeBindingName::new("vpc");
@@ -4192,7 +4250,11 @@ let vpc = aws.ec2.Vpc {
 
     #[test]
     fn ref_type_resolves_upstream_export_and_reports_missing_export() {
-        let mut parsed = parse("", &Default::default()).expect("parse");
+        let mut parsed = parse(
+            "",
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse");
         parsed.upstream_states.push(UpstreamState {
             binding: RelativeBindingName::new("up"),
             source: "../upstream".into(),
@@ -4224,7 +4286,7 @@ let vpc = aws.ec2.Vpc {
             &parsed,
             &registry,
             &exports,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
 
         let RefType::Typed(vpc) = index.ref_type(&AccessPath::new("up", "vpc")) else {
@@ -4244,7 +4306,11 @@ let vpc = aws.ec2.Vpc {
 
     #[test]
     fn ref_type_leaves_inferred_but_unannotated_upstream_export_unchecked() {
-        let mut parsed = parse("", &Default::default()).expect("parse");
+        let mut parsed = parse(
+            "",
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse");
         parsed.upstream_states.push(UpstreamState {
             binding: RelativeBindingName::new("up"),
             source: "../upstream".into(),
@@ -4268,7 +4334,7 @@ let vpc = aws.ec2.Vpc {
             &parsed,
             &registry,
             &exports,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
 
         assert!(matches!(
@@ -4279,7 +4345,11 @@ let vpc = aws.ec2.Vpc {
 
     #[test]
     fn ref_type_leaves_unloadable_upstream_binding_unchecked() {
-        let mut parsed = parse("", &Default::default()).expect("parse");
+        let mut parsed = parse(
+            "",
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse");
         parsed.upstream_states.push(UpstreamState {
             binding: RelativeBindingName::new("up"),
             source: "../missing".into(),
@@ -4290,7 +4360,7 @@ let vpc = aws.ec2.Vpc {
             &parsed,
             &registry,
             &exports,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
 
         assert!(matches!(
@@ -4332,14 +4402,18 @@ let vpc = aws.ec2.Vpc {
             }),
             quoted_string_attrs: Default::default(),
         };
-        let mut parsed = parse("", &Default::default()).expect("parse");
+        let mut parsed = parse(
+            "",
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse");
         parsed.compositions.push(make_forwarder("a", "b"));
         parsed.compositions.push(make_forwarder("b", "a"));
         let registry = SchemaRegistry::new();
         let index = BindingIndex::from_parsed(
             &parsed,
             &registry,
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
 
         assert!(matches!(
@@ -5410,7 +5484,11 @@ mod binding_name_set_tests {
     use crate::parser::{ParsedFile, parse};
 
     fn parsed_with(src: &str) -> ParsedFile {
-        parse(src, &Default::default()).expect("parse")
+        parse(
+            src,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse")
     }
 
     #[test]

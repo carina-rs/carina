@@ -3175,7 +3175,7 @@ fn loop_scheduler_identity_uses_the_persisted_stable_hash_contract() {
     let parsed = crate::parser::parse_file(
         source,
         std::path::Path::new("stable.crn"),
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("loop parses");
     let origin = parsed.resources[0]
@@ -3201,11 +3201,11 @@ fn deserialized_unbound_loop_template_still_rejects_read_without_a_source_span()
     let parsed = crate::parser::parse(
         "let upstream = upstream_state { source = '../upstream' }\n\
          for value in upstream.values { mock.test.Leaf { value = value } }\n",
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("deferred loop parses");
     let parsed = crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_providerless(
                 crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),

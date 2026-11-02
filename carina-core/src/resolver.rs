@@ -553,14 +553,24 @@ pub fn resolve_ref_value<P: PlaceholderKind, B: BindingAddress>(
 pub(crate) fn project_ref_value_status<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &ResolvedBindings<P, B>,
+    context: &crate::parser::ProviderContext,
 ) -> Result<ValueResolution<P, B>, ResolutionError> {
-    resolve_ref_value_status_inner(value, bindings, RuntimeContext::Projection, false)
+    resolve_ref_value_status_inner(value, bindings, RuntimeContext::Projection(context), false)
 }
 
 #[derive(Clone, Copy)]
-enum RuntimeContext<'a> {
+pub(crate) enum RuntimeContext<'a> {
     Session(&'a dyn crate::validation::deferred_types::ProviderTypeCheckContext),
-    Projection,
+    Projection(&'a crate::parser::ProviderContext),
+}
+
+impl<'a> RuntimeContext<'a> {
+    fn catalog(self) -> &'a crate::parser::ProviderContext {
+        match self {
+            Self::Session(session) => session.catalog(),
+            Self::Projection(context) => context,
+        }
+    }
 }
 
 /// Three-state result used by null/missing coalescing. A missing value is not
@@ -1220,7 +1230,7 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
 
             // Evaluate the built-in function; propagate errors since args are resolved.
             // The evaluator boundary is `EvalValue::into_value` — a closure
-            // returned here would mean `evaluate_builtin` saw fewer args
+            // returned here would mean `evaluate_builtin_with_config` saw fewer args
             // than the function's arity, which can only happen if a
             // partial application leaked through parsing. The parser is
             // supposed to surface that as a parse error, so treat any
@@ -1237,14 +1247,8 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                 .iter()
                 .map(crate::parser::function_argument_as_eval)
                 .collect();
-            let evaluated = match config {
-                RuntimeContext::Session(session) => crate::builtins::evaluate_builtin_with_config(
-                    name,
-                    &eval_args,
-                    session.catalog(),
-                ),
-                RuntimeContext::Projection => crate::builtins::evaluate_builtin(name, &eval_args),
-            };
+            let evaluated =
+                crate::builtins::evaluate_builtin_with_config(name, &eval_args, config.catalog());
             match evaluated {
                 Ok(result) => result
                     .into_value()
@@ -1264,8 +1268,9 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
             args,
             source_line,
         }) => {
-            let RuntimeContext::Session(session) = config else {
-                return Ok(value.clone());
+            let session = match config {
+                RuntimeContext::Session(session) => session,
+                RuntimeContext::Projection(_context) => return Ok(value.clone()),
             };
 
             let resolved_args = match resolve_function_arguments(args, bindings, config)? {
@@ -4459,7 +4464,7 @@ mod runtime_provider_type_tests {
             let mut parsed = parse_file(
                 source,
                 std::path::Path::new("/project/functions.crn"),
-                &ProviderContext::default(),
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .unwrap();
             let mut function = parsed.user_functions.remove("f").unwrap();
@@ -4484,7 +4489,7 @@ mod runtime_provider_type_tests {
                         ))
                     }),
                 ),
-                ..Default::default()
+                ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
             };
             let error =
                 crate::validation::deferred_types::with_session_for_test(&loaded, |session| {
@@ -4496,7 +4501,7 @@ mod runtime_provider_type_tests {
                 custom_types: loaded
                     .custom_types
                     .with_failed_providers(std::collections::BTreeSet::from(["broken".into()])),
-                ..Default::default()
+                ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
             };
             let error =
                 crate::validation::deferred_types::with_session_for_test(&partial, |session| {
@@ -4506,7 +4511,7 @@ mod runtime_provider_type_tests {
             assert!(error.to_string().contains("rejected by ready"), "{error}");
 
             let result = crate::validation::deferred_types::TypeCheckSession::run(
-                &ProviderContext::default(),
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 |unloaded| {
                     evaluate_runtime_user_function(&function, &arguments, &bindings, unloaded, 8)
                         .unwrap();

@@ -4064,7 +4064,7 @@ pub(super) fn substitute_arguments(
     arguments: &HashMap<String, Value>,
 ) -> Result<Value, ArgumentSubstitutionError> {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |config| {
             let arguments = arguments
                 .iter()
@@ -5106,7 +5106,8 @@ mod tests {
         crate::validation::deferred_types::with_session_for_test(
             &crate::parser::LoadedProviderContext::empty_for_test(),
             |session| {
-                let config = crate::parser::ProviderContext::default();
+                let config =
+                    crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
                 let module = crate::parser::parse_file(
                     "arguments { flags: list(Bool) = [false] }\nlet inner = use { source = '../inner' }\nlet children = for flag in flags { inner { protect = flag literal = false } }\n",
                     std::path::Path::new("outer/main.crn"),
@@ -5186,7 +5187,7 @@ mod tests {
         let seed = crate::parser::parse_file(
             "for value in ['one'] {\n  mock.test.Leaf { value = value }\n}\n",
             std::path::Path::new("root.crn"),
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("loop fixture parses")
         .resources
@@ -5252,7 +5253,7 @@ mod tests {
         let seed = crate::parser::parse_file(
             "for value in ['one'] {\n  mock.test.Leaf { value = value }\n}\n",
             std::path::Path::new("module/loop.crn"),
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("loop fixture parses")
         .resources

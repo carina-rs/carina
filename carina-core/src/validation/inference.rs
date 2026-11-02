@@ -240,13 +240,9 @@ pub fn infer_type_from_value<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &InferenceBindings<P, B>,
     schemas: &SchemaRegistry,
+    provider_context: &crate::parser::ProviderContext,
 ) -> Result<TypeExpr, InferenceIssue> {
-    infer_type_from_value_with_provider_context(
-        value,
-        bindings,
-        schemas,
-        &crate::parser::ProviderContext::default(),
-    )
+    infer_type_from_value_with_provider_context(value, bindings, schemas, provider_context)
 }
 
 /// Infer with the same provider catalog that owns the binding/type check.
@@ -1190,6 +1186,7 @@ pub fn apply_inference<D, B: BindingAddress>(
         B,
     >,
     schemas: &SchemaRegistry,
+    provider_context: &crate::parser::ProviderContext,
 ) -> crate::parser::File<
     crate::parser::InferredExportParam<crate::resource::ParserPlaceholder, B>,
     crate::resource::ParserPlaceholder,
@@ -1211,7 +1208,8 @@ where
             export.source_span(),
         );
     }
-    let inferred_exports = infer_export_params(&parsed, schemas).into_parameters();
+    let inferred_exports =
+        infer_export_params(&parsed, schemas, provider_context).into_parameters();
     // Single phase-axis surface (carina#3126): only `export_params`
     // changes phase; every other field moves through `map_export_params`
     // so a new `File<E>` field cannot be silently dropped on the
@@ -1254,6 +1252,7 @@ pub fn infer_export_params<D, B: BindingAddress>(
         B,
     >,
     schemas: &SchemaRegistry,
+    provider_context: &crate::parser::ProviderContext,
 ) -> SchemaCheckedExportParams<B>
 where
     D: crate::parser::DeferredForPhaseTraversal<
@@ -1282,7 +1281,7 @@ where
                         InferredUncheckedReason::NotInferable(NotInferableReason::MissingValue),
                     )),
                     Some(crate::parser::BoundaryExpression::Value(value)) => {
-                        match infer_type_from_value(value, &bindings, schemas) {
+                        match infer_type_from_value(value, &bindings, schemas, provider_context) {
                             Ok(type_expr) => {
                                 ExportStaticType::Inferred(StaticType::Known(type_expr))
                             }
@@ -1343,6 +1342,7 @@ pub fn infer_export_params_with_loaded_provider_schemas<D, B: BindingAddress>(
         B,
     >,
     schemas: &ProviderLoadedSchemaRegistry,
+    provider_context: &crate::parser::ProviderContext,
 ) -> ExportParamsInferredWithLoadedProviderSchemas<B>
 where
     D: crate::parser::DeferredForPhaseTraversal<
@@ -1352,7 +1352,7 @@ where
         >,
 {
     ExportParamsInferredWithLoadedProviderSchemas {
-        inferred: infer_export_params(parsed, schemas.schemas()),
+        inferred: infer_export_params(parsed, schemas.schemas(), provider_context),
     }
 }
 
@@ -1401,6 +1401,7 @@ pub fn retry_unchecked_export_inference<'a, D, B: BindingAddress>(
         B,
     >,
     schemas: &ProviderLoadedSchemaRegistry,
+    provider_context: &crate::parser::ProviderContext,
 ) -> ExportsInferredWithLoadedProviderSchemas<'a, B>
 where
     D: crate::parser::DeferredForPhaseTraversal<
@@ -1439,7 +1440,7 @@ where
             continue;
         };
 
-        match infer_type_from_value(value, &bindings, schemas.schemas()) {
+        match infer_type_from_value(value, &bindings, schemas.schemas(), provider_context) {
             Ok(_type_expr) => {}
             Err(InferenceIssue::NotInferable(_reason)) => {}
             Err(InferenceIssue::Failed(error)) => {
@@ -1497,8 +1498,12 @@ mod tests {
                 AccessMissPolicy::Defer,
             )
             .unwrap();
-            let inferred =
-                infer_type_from_value(&value, &InferenceBindings::new(), &SchemaRegistry::new());
+            let inferred = infer_type_from_value(
+                &value,
+                &InferenceBindings::new(),
+                &SchemaRegistry::new(),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            );
             assert!(
                 matches!(
                     inferred,
@@ -1566,9 +1571,11 @@ mod tests {
 
     #[test]
     fn unloaded_inferred_scalar_kind_defers_without_panicking() {
-        let annotation =
-            crate::parser::parse_type_expr_str("Count", &crate::parser::ProviderContext::default())
-                .unwrap();
+        let annotation = crate::parser::parse_type_expr_str(
+            "Count",
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         assert!(
             matches!(inferred_scalar_kind(&annotation), Err(NotInferableReason::CustomTypeSchemaUnavailable { identity }) if identity == crate::schema::TypeIdentity::bare("Count"))
         );
@@ -1594,7 +1601,7 @@ mod tests {
         )
         .expect("parser-stage bare references remain pending until validation");
         assert!(matches!(
-            infer_type_from_value(&bare, &InferenceBindings::new(), &SchemaRegistry::new()),
+            infer_type_from_value(&bare, &InferenceBindings::new(), &SchemaRegistry::new(), &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())),
             Err(InferenceIssue::Failed(
                 InferenceError::InvalidIntegerArithmeticOperand {
                     side: crate::integer_arithmetic::IntegerOperandSide::Left,
@@ -1631,7 +1638,12 @@ mod tests {
         )
         .expect("resource arithmetic is structurally valid");
         assert_eq!(
-            infer_type_from_value(&deferred, &bindings, &schemas),
+            infer_type_from_value(
+                &deferred,
+                &bindings,
+                &schemas,
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
+            ),
             Ok(TypeExpr::Int),
         );
     }
@@ -1689,7 +1701,12 @@ mod tests {
                 IntegerOperatorSpan::synthetic(),
             )
             .expect("a typed module argument is structurally valid before inference");
-            infer_type_from_value(&expression, &bindings, &schemas)
+            infer_type_from_value(
+                &expression,
+                &bindings,
+                &schemas,
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
         };
 
         assert_eq!(
@@ -1751,6 +1768,7 @@ mod tests {
             &Value::Concrete(ConcreteValue::String("hello".into())),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert_eq!(r, Ok(TypeExpr::String));
     }
@@ -1761,6 +1779,7 @@ mod tests {
             &Value::Concrete(ConcreteValue::Int(42)),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert_eq!(r, Ok(TypeExpr::Int));
     }
@@ -1771,6 +1790,7 @@ mod tests {
             &Value::Concrete(ConcreteValue::Bool(true)),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert_eq!(r, Ok(TypeExpr::Bool));
     }
@@ -1785,6 +1805,7 @@ mod tests {
             ])),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert_eq!(r, Ok(TypeExpr::String));
     }
@@ -1797,6 +1818,7 @@ mod tests {
             )))),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert_eq!(r, Ok(TypeExpr::String));
     }
@@ -1810,6 +1832,7 @@ mod tests {
             ])),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert_eq!(r, Ok(TypeExpr::List(Box::new(TypeExpr::String))));
     }
@@ -1820,7 +1843,12 @@ mod tests {
             Value::Concrete(ConcreteValue::String("a".into())),
             Value::Concrete(ConcreteValue::Int(1)),
         ]));
-        let r = infer_type_from_value(&value, &InferenceBindings::new(), &SchemaRegistry::new());
+        let r = infer_type_from_value(
+            &value,
+            &InferenceBindings::new(),
+            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         assert!(matches!(
             r,
             Err(InferenceIssue::Failed(
@@ -1836,8 +1864,12 @@ mod tests {
             Value::Concrete(ConcreteValue::Int(1)),
         ]));
         let without_bindings = infer_type_from_value_without_bindings(&value);
-        let with_bindings =
-            infer_type_from_value(&value, &InferenceBindings::new(), &SchemaRegistry::new());
+        let with_bindings = infer_type_from_value(
+            &value,
+            &InferenceBindings::new(),
+            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
 
         assert_eq!(without_bindings, with_bindings);
         assert_eq!(
@@ -1865,6 +1897,7 @@ mod tests {
             &Value::Concrete(ConcreteValue::Map(entries)),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert_eq!(r, Ok(TypeExpr::Map(Box::new(TypeExpr::String))));
     }
@@ -1881,6 +1914,7 @@ mod tests {
             &Value::Concrete(ConcreteValue::Map(entries)),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert!(matches!(
             r,
@@ -1915,6 +1949,7 @@ mod tests {
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("vpc"),
             &schemas,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert_eq!(r, Ok(TypeExpr::String));
     }
@@ -1937,6 +1972,7 @@ mod tests {
             ])),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert!(matches!(
             r,
@@ -1950,6 +1986,7 @@ mod tests {
             &Value::Concrete(ConcreteValue::List(vec![])),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert!(matches!(
             r,
@@ -1975,7 +2012,12 @@ mod tests {
         });
 
         assert_eq!(
-            infer_type_from_value(&value, &bindings, &SchemaRegistry::new()),
+            infer_type_from_value(
+                &value,
+                &bindings,
+                &SchemaRegistry::new(),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
+            ),
             Ok(TypeExpr::List(Box::new(TypeExpr::String))),
         );
     }
@@ -1997,8 +2039,13 @@ mod tests {
             default: Box::new(Value::Concrete(ConcreteValue::String("not-a-list".into()))),
         });
 
-        let error = infer_type_from_value(&value, &bindings, &SchemaRegistry::new())
-            .expect_err("coalesce default must match the left type");
+        let error = infer_type_from_value(
+            &value,
+            &bindings,
+            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("coalesce default must match the left type");
         assert!(matches!(
             &error,
             InferenceIssue::Failed(InferenceError::IncompatibleCoalesceTypes { .. })
@@ -2015,6 +2062,7 @@ mod tests {
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("vpc"),
             &schemas_with_vpc(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert_eq!(r, Ok(owned_vpc_id_type()));
     }
@@ -2026,6 +2074,7 @@ mod tests {
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("vpc"),
             &schemas_with_vpc(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert_eq!(r, Ok(TypeExpr::String));
     }
@@ -2078,6 +2127,7 @@ mod tests {
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &InferenceBindings::new(),
             &schemas_with_vpc(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert!(matches!(
             r,
@@ -2094,6 +2144,7 @@ mod tests {
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("vpc"),
             &schemas_with_vpc(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert!(matches!(
             r,
@@ -2114,6 +2165,7 @@ mod tests {
             }),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert_eq!(r, Ok(TypeExpr::String));
     }
@@ -2134,8 +2186,12 @@ mod tests {
             AccessMissPolicy::Error,
         )
         .expect("valid concrete list access");
-        let inferred =
-            infer_type_from_value(&value, &InferenceBindings::new(), &SchemaRegistry::new());
+        let inferred = infer_type_from_value(
+            &value,
+            &InferenceBindings::new(),
+            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
 
         assert_eq!(inferred, Ok(TypeExpr::String));
     }
@@ -2162,7 +2218,12 @@ mod tests {
         .expect("deferred split result remains accessible");
 
         assert_eq!(
-            infer_type_from_value(&value, &InferenceBindings::new(), &SchemaRegistry::new()),
+            infer_type_from_value(
+                &value,
+                &InferenceBindings::new(),
+                &SchemaRegistry::new(),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
+            ),
             Ok(TypeExpr::String)
         );
     }
@@ -2182,8 +2243,12 @@ mod tests {
             AccessMissPolicy::Error,
         )
         .expect("valid concrete map access");
-        let inferred =
-            infer_type_from_value(&value, &InferenceBindings::new(), &SchemaRegistry::new());
+        let inferred = infer_type_from_value(
+            &value,
+            &InferenceBindings::new(),
+            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
 
         assert_eq!(inferred, Ok(TypeExpr::Int));
     }
@@ -2211,8 +2276,12 @@ mod tests {
             AccessMissPolicy::Error,
         )
         .expect("unknown bases remain deferred");
-        let inferred =
-            infer_type_from_value(&value, &InferenceBindings::new(), &SchemaRegistry::new());
+        let inferred = infer_type_from_value(
+            &value,
+            &InferenceBindings::new(),
+            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
 
         assert!(matches!(
             inferred,
@@ -2232,6 +2301,7 @@ mod tests {
             }),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert!(matches!(
             r,
@@ -2264,6 +2334,7 @@ mod tests {
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("vpc"),
             &schemas,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert_eq!(r, Ok(TypeExpr::String));
     }
@@ -2277,6 +2348,7 @@ mod tests {
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("main"),
             &schemas_with_vpc(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert!(matches!(
             r,
@@ -2300,6 +2372,7 @@ mod tests {
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &bindings,
             &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert!(matches!(
             r,
@@ -2331,6 +2404,7 @@ mod tests {
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("vpc"),
             &schemas,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert!(matches!(
             r,
@@ -2427,6 +2501,7 @@ mod tests {
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &bindings,
             &schemas,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         // Pin the inferred shape, not just `is_ok`: the outer Struct
         // is preserved with its `statement` field, and the buried
@@ -2483,7 +2558,11 @@ mod tests {
                 )),
             ));
 
-        let inferred = apply_inference(parsed, &schemas_with_vpc());
+        let inferred = apply_inference(
+            parsed,
+            &schemas_with_vpc(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         assert_eq!(inferred.export_params.len(), 1);
         assert_eq!(
             inferred.export_params[0].static_type,
@@ -2508,7 +2587,11 @@ mod tests {
                 })),
             ));
 
-        let inferred = apply_inference(parsed, &SchemaRegistry::new());
+        let inferred = apply_inference(
+            parsed,
+            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
 
         assert!(matches!(
             &inferred.export_params[0].static_type,
@@ -2538,7 +2621,11 @@ mod tests {
                 Some(Value::Concrete(ConcreteValue::String("inferred".into()))),
             ));
 
-        let inferred = apply_inference(parsed, &SchemaRegistry::new());
+        let inferred = apply_inference(
+            parsed,
+            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
 
         assert_eq!(
             inferred.export_params[0].static_type,
@@ -2552,7 +2639,7 @@ mod tests {
 
     #[test]
     fn handle_exports_retain_provenance_until_the_state_boundary_rejects_them() {
-        let mut context = ProviderContext::default();
+        let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         context
             .resource_types
             .insert(("mock".to_string(), "test.Record".to_string()));
@@ -2578,7 +2665,11 @@ exports {
             "handle export fixture resolves its declaration types",
         );
 
-        let inferred = apply_inference(parsed, &SchemaRegistry::new());
+        let inferred = apply_inference(
+            parsed,
+            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         let handle_type =
             TypeExpr::Ref(crate::parser::ResourceTypePath::new("mock", "test.Record"));
         assert_eq!(
@@ -2656,7 +2747,11 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
                 )),
             ));
 
-        let inferred = apply_inference(parsed, &SchemaRegistry::new());
+        let inferred = apply_inference(
+            parsed,
+            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
 
         assert_eq!(
             inferred.export_params[0].static_type,
@@ -2704,7 +2799,11 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
                 )),
             ));
 
-        let mut inferred = apply_inference(parsed, &SchemaRegistry::new());
+        let mut inferred = apply_inference(
+            parsed,
+            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         assert_eq!(
             inferred.export_params[0].static_type,
             ExportStaticType::Inferred(StaticType::Unchecked(
@@ -2715,7 +2814,11 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
         );
 
         let loaded_schemas = ProviderLoadedSchemaRegistry::for_test(schemas_with_vpc());
-        let schema_checked = retry_unchecked_export_inference(&mut inferred, &loaded_schemas);
+        let schema_checked = retry_unchecked_export_inference(
+            &mut inferred,
+            &loaded_schemas,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         let failures = attached_inference_failures(schema_checked)
             .map(|failure| (failure.name.to_string(), failure.error.clone()))
             .collect::<Vec<_>>();
@@ -2749,9 +2852,17 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
                 )),
             ));
 
-        let mut inferred = apply_inference(parsed, &SchemaRegistry::new());
+        let mut inferred = apply_inference(
+            parsed,
+            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         let loaded_schemas = ProviderLoadedSchemaRegistry::for_test(schemas_with_vpc());
-        let schema_checked = retry_unchecked_export_inference(&mut inferred, &loaded_schemas);
+        let schema_checked = retry_unchecked_export_inference(
+            &mut inferred,
+            &loaded_schemas,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         assert_eq!(attached_inference_failures(schema_checked).count(), 0);
 
         assert_eq!(
@@ -2776,7 +2887,11 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
                 Some(Value::Concrete(ConcreteValue::String("vpc-abc".into()))),
             ));
 
-        let inferred = apply_inference(parsed, &SchemaRegistry::new());
+        let inferred = apply_inference(
+            parsed,
+            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         assert_eq!(
             inferred.export_params[0].static_type,
             ExportStaticType::Declared(crate::parser::bare_type_for_test("vpc_id".to_string()))
@@ -2866,7 +2981,11 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
                 )),
             ));
 
-        let inferred = apply_inference(parsed, &schemas_with_vpc());
+        let inferred = apply_inference(
+            parsed,
+            &schemas_with_vpc(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         assert_eq!(inferred.export_params.len(), 1);
         assert_eq!(
             inferred.export_params[0].static_type,
@@ -2904,7 +3023,11 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
                 )),
             ));
 
-        let inferred = apply_inference(parsed, &SchemaRegistry::new());
+        let inferred = apply_inference(
+            parsed,
+            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         assert_eq!(
             inferred.export_params[0].static_type,
             ExportStaticType::Inferred(StaticType::Unchecked(
@@ -2929,7 +3052,11 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
                 None,
             ));
 
-        let inferred = apply_inference(parsed, &SchemaRegistry::new());
+        let inferred = apply_inference(
+            parsed,
+            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         assert_eq!(
             inferred.export_params[0].static_type,
             ExportStaticType::Inferred(StaticType::Unchecked(
@@ -2976,7 +3103,12 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
         );
 
         let entry = Value::resource_ref("a".to_string(), "x".to_string(), vec![]);
-        let r = infer_type_from_value(&entry, &bindings, &SchemaRegistry::new());
+        let r = infer_type_from_value(
+            &entry,
+            &bindings,
+            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         match r {
             Err(InferenceIssue::Failed(InferenceError::CyclicVirtualBinding { cycle })) => {
                 assert_eq!(
@@ -3012,7 +3144,12 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
         );
 
         let entry = Value::resource_ref("a".to_string(), "x".to_string(), vec![]);
-        let r = infer_type_from_value(&entry, &bindings, &SchemaRegistry::new());
+        let r = infer_type_from_value(
+            &entry,
+            &bindings,
+            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         match r {
             Err(InferenceIssue::Failed(InferenceError::CyclicVirtualBinding { cycle })) => {
                 assert_eq!(
@@ -3050,7 +3187,12 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
             Value::resource_ref("a".to_string(), "x".to_string(), vec![]),
             Value::resource_ref("b".to_string(), "y".to_string(), vec![]),
         ]));
-        let r = infer_type_from_value(&entries, &bindings, &SchemaRegistry::new());
+        let r = infer_type_from_value(
+            &entries,
+            &bindings,
+            &SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         assert_eq!(
             r,
             Ok(TypeExpr::List(Box::new(TypeExpr::String))),

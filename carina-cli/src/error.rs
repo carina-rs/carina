@@ -1802,7 +1802,7 @@ mod tests {
             "let source = mock.test.Source { name = \"source\" }\n\
              mock.test.Consumer { name = source }\n",
             std::path::Path::new("test.crn"),
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .expect("parse binding-use fixture");
         let mut schemas = SchemaRegistry::new();
@@ -1816,7 +1816,8 @@ mod tests {
             );
         }
         let module_signatures = carina_core::module_resolver::ResolvedModuleSignatures::new();
-        let provider_context = carina_core::parser::ProviderContext::default();
+        let provider_context =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
         let context = carina_core::validation::ValidationTypeContext::new_providerless(
             &parsed,
             &schemas,

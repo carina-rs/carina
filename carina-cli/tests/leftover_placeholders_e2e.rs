@@ -257,7 +257,7 @@ fn module_definition_reports_argument_reference_at_authored_file_and_span() {
     let parsed = carina_core::parser::parse_file(
         source,
         Path::new("module/locals.crn"),
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("parse module-shaped CLI fixture");
     let leftovers = parsed

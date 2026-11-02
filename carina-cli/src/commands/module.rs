@@ -71,7 +71,7 @@ fn run_module_info(
         )));
     }
 
-    let parsed = module_resolver::load_module_from_directory(path)?;
+    let parsed = module_resolver::load_module_from_directory(path, provider_context)?;
 
     let module_name = module_resolver::derive_module_name(path);
 

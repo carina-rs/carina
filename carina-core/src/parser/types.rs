@@ -64,15 +64,19 @@ impl From<BuiltinTypeName> for String {
 
 #[cfg(test)]
 pub(crate) fn bare_type_for_test(name: String) -> TypeExpr {
-    resolve_known_bare_custom_type(&name, &ProviderContext::default())
-        .expect("bootstrap resolution has no conflicting declarations")
-        .expect("bootstrap resolution preserves authored names")
+    resolve_known_bare_custom_type(
+        &name,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("bootstrap resolution has no conflicting declarations")
+    .expect("bootstrap resolution preserves authored names")
 }
 
 /// Nominal evidence retained while provider schemas are unavailable.
 ///
-/// The private identity can only be constructed by the resolution seam below,
-/// after checking the provider catalog. It carries no scalar-kind claim.
+/// Parsing resolves the identity against the provider catalog. Deserialization
+/// rejects built-in identities and retains no provider candidates. The type
+/// carries no scalar-kind claim.
 /// Assignment to another identified type uses the shared directional identity
 /// relation; identity-free scalar and literal checks require the missing schema.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -94,12 +98,12 @@ impl UnloadedSchemaType {
 impl TryFrom<TypeIdentity> for UnloadedSchemaType {
     type Error = String;
     fn try_from(identity: TypeIdentity) -> Result<Self, Self::Error> {
-        match resolve_custom_type_identity(&identity, &ProviderContext::default()) {
-            Ok(Some(TypeExpr::UnloadedSchemaType(unloaded))) => Ok(unloaded),
-            Ok(_) => Err(format!(
+        if crate::schema::builtin_type_registry().contains_key(&identity) {
+            Err(format!(
                 "built-in type `{identity}` cannot be an unloaded provider type"
-            )),
-            Err(error) => Err(error.to_string()),
+            ))
+        } else {
+            Ok(Self(identity, Vec::new()))
         }
     }
 }
@@ -111,8 +115,8 @@ impl From<UnloadedSchemaType> for TypeIdentity {
 }
 
 /// Resolve an identity using the catalog, retaining only nominal evidence
-/// when that catalog is not loaded. This is the sole constructor of
-/// `UnloadedSchemaType`, including for deserialized annotations.
+/// when that catalog is not loaded. Deserialized annotations retain nominal
+/// identity only, with no loaded provider candidates.
 pub(crate) fn resolve_custom_type_identity(
     identity: &TypeIdentity,
     config: &ProviderContext,
@@ -532,13 +536,13 @@ mod tests {
                     )
                 }),
             ),
-            ..ProviderContext::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         }
     }
 
     #[test]
     fn parse_type_expr_str_accepts_primitive() {
-        let ctx = ProviderContext::default();
+        let ctx = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         assert!(matches!(
             parse_type_expr_str("Bool", &ctx),
             Some(TypeExpr::Bool)
@@ -555,7 +559,7 @@ mod tests {
 
     #[test]
     fn parse_type_expr_str_trims_surrounding_whitespace() {
-        let ctx = ProviderContext::default();
+        let ctx = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         assert!(matches!(
             parse_type_expr_str("  String  ", &ctx),
             Some(TypeExpr::String)
@@ -564,7 +568,7 @@ mod tests {
 
     #[test]
     fn escaped_string_literal_round_trips_through_display() {
-        let ctx = ProviderContext::default();
+        let ctx = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let parsed = parse_type_expr_str(r"'a\\b'", &ctx).expect("type literal should parse");
 
         assert_eq!(parsed, TypeExpr::StringLiteral(r"a\b".to_string()));
@@ -578,7 +582,7 @@ mod tests {
         // buffers where the user has typed past the type need the
         // bypass — `None` here lets the completion filter fall
         // through to "show everything".
-        let ctx = ProviderContext::default();
+        let ctx = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         assert_eq!(parse_type_expr_str("Bool foo", &ctx), None);
     }
 
@@ -595,14 +599,22 @@ mod tests {
 
     #[test]
     fn unloaded_bare_annotation_retains_nominal_identity_at_parse_time() {
-        let parsed = parse_type_expr_str("Count", &ProviderContext::default()).unwrap();
+        let parsed = parse_type_expr_str(
+            "Count",
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         assert!(matches!(parsed, TypeExpr::UnloadedSchemaType(ref unloaded)
             if unloaded.identity() == &TypeIdentity::bare("Count")));
     }
 
     #[test]
     fn loaded_catalog_rejects_bootstrap_typo_with_resource_schemas() {
-        let parsed = parse_type_expr_str("Typo", &ProviderContext::default()).unwrap();
+        let parsed = parse_type_expr_str(
+            "Typo",
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         let context = loaded_context(Default::default());
         assert!(matches!(
             crate::validation::resolve_type_expr(&parsed, &context),
@@ -627,7 +639,7 @@ mod tests {
 
     #[test]
     fn parse_type_expr_str_pascal_provider_name_is_unloaded() {
-        let ctx = ProviderContext::default();
+        let ctx = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         // An unloaded provider annotation retains nominal evidence immediately.
         assert!(matches!(
             parse_type_expr_str("IamOidcProviderArn", &ctx),
@@ -638,7 +650,7 @@ mod tests {
 
     #[test]
     fn parse_type_expr_str_rejects_unparseable() {
-        let ctx = ProviderContext::default();
+        let ctx = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         assert_eq!(parse_type_expr_str("!!!", &ctx), None);
         assert_eq!(parse_type_expr_str("List(", &ctx), None);
         assert_eq!(parse_type_expr_str("", &ctx), None);
@@ -648,7 +660,7 @@ mod tests {
     /// a scalar kind. A loaded catalog must subsequently resolve or reject it.
     #[test]
     fn parse_type_expr_str_accepts_unknown_when_custom_types_are_unloaded() {
-        let ctx = ProviderContext::default();
+        let ctx = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         assert!(matches!(
             parse_type_expr_str("TotallyMadeUpType", &ctx),
             Some(TypeExpr::UnloadedSchemaType(ref unloaded))

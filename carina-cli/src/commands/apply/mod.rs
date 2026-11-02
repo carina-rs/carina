@@ -881,7 +881,7 @@ async fn verify_upstream_snapshot(
             source: s.source.clone(),
         })
         .collect();
-    let provider_context = ProviderContext::default();
+    let provider_context = ProviderContext::new(runtime.environment().clone());
     let mut cycle_guard = super::plan::seed_cycle_guard(project_dir);
     let current = super::plan::load_upstream_states(
         runtime,

@@ -1031,13 +1031,13 @@ mod tests {
         let parsed = parse_file(
             input,
             std::path::Path::new("test_module.crn"),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .unwrap();
         let sig = FileSignature::from_parsed_file_with_name(
             &parsed,
             "test_module",
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         );
         ModuleInfoApp::new(&sig)
     }

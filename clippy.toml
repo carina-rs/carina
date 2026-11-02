@@ -24,4 +24,5 @@ disallowed-methods = [
   { path = "dirs::video_dir", reason = "resolve all user-owned paths through carina_core::UserDirs" },
   { path = "std::env::home_dir", reason = "resolve all user-owned paths through carina_core::UserDirs" },
   { path = "carina_core::user_dirs::UserDirs::from_real_home", reason = "call UserDirs::from_real_home only at the carina and carina-lsp binary entry points" },
+  { path = "carina_core::environment::EnvironmentSnapshot::capture_process", reason = "capture the environment only at the carina and carina-lsp binary entry points; pass the snapshot to library code" },
 ]

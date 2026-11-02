@@ -57,7 +57,7 @@ pub(crate) fn test_composition_call_path_in(
     let parsed = carina_core::parser::parse_file(
         "let fixture_module = use { source = './fixture_module' }\nfixture_module {}\n",
         source_file,
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("parse composition test call");
     let call = parsed
@@ -84,7 +84,7 @@ pub(crate) fn test_authored_composition_call_path()
     let parsed = carina_core::parser::parse_file(
         "let fixture_module = use { source = './fixture_module' }\nfixture_module {}\n",
         &source_file,
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("parse authored composition test call");
     let call = parsed

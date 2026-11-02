@@ -324,11 +324,11 @@ mod tests {
                mock.test.Child { identity_input = value }\n\
              }\n",
             std::path::Path::new("main.crn"),
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("unbound deferred loop parses");
         let parsed = crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 crate::module_resolver::resolve_modules_providerless(
                     crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
@@ -338,7 +338,10 @@ mod tests {
                 .expect("deferred fixture crosses the module-resolution seam")
             },
         )
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("deferred-loop fixture contains no parser placeholders");
         let template = parsed.deferred_for_expressions()[0].clone();
         let scheduler_key = template.target().scheduler_key().to_string();
@@ -400,11 +403,11 @@ mod tests {
                mock.test.Child { identity_input = value }\n\
              }\n",
             std::path::Path::new("main.crn"),
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("unbound deferred loop parses");
         let parsed = crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 crate::module_resolver::resolve_modules_providerless(
                     crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
@@ -416,7 +419,10 @@ mod tests {
         )
         .map_err(|error| *error)
         .expect("module resolution")
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("expanded loop");
         let template = parsed.deferred_for_expressions()[0].clone();
         let graph = crate::resolved_graph::resolve_expanded_graph(parsed.into())

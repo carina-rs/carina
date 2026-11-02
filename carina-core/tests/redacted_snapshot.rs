@@ -304,10 +304,11 @@ fn snapshot_state_typecheck_uses_checked_conversion() {
     };
     let state = historical_siblings();
     let ordinary = resolve_historical_field("name").unwrap();
+    let context = ProviderContext::new(carina_core::EnvironmentSnapshot::new([]));
     check_type_expr_value_providerless(
         &TypeExpr::String,
         &ordinary,
-        &ProviderContext::default(),
+        &context,
         TypecheckInference::Unavailable,
     )
     .require_provider_schemas()
@@ -316,7 +317,7 @@ fn snapshot_state_typecheck_uses_checked_conversion() {
         check_type_expr_value_providerless(
             &TypeExpr::Int,
             &ordinary,
-            &ProviderContext::default(),
+            &context,
             TypecheckInference::Unavailable
         )
         .require_provider_schemas()

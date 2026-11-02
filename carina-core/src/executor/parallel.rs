@@ -1429,11 +1429,11 @@ mod tests {
                mock.test.Child { identity_input = value }\n\
              }\n",
             std::path::Path::new(file),
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("unbound deferred fixture parses");
         let parsed = crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 crate::module_resolver::resolve_modules_providerless(
                     crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
@@ -1445,7 +1445,10 @@ mod tests {
         )
         .map_err(|error| *error)
         .expect("deferred fixture crosses the module-resolution seam")
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("deferred fixture crosses the placeholder boundary");
         parsed
             .into_deferred_for_expressions()

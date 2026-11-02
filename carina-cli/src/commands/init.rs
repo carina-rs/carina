@@ -40,6 +40,7 @@ pub async fn run_init(
     let color_mode = runtime.color_mode();
     run_init_with_provider_resolver(
         color_mode,
+        runtime.environment().clone(),
         path,
         upgrade,
         locked,
@@ -62,6 +63,7 @@ pub async fn run_init(
 #[allow(clippy::too_many_arguments)]
 async fn run_init_with_provider_resolver(
     color_mode: crate::output_style::ColorMode,
+    environment: carina_core::EnvironmentSnapshot,
     path: &Path,
     upgrade: bool,
     locked: bool,
@@ -89,7 +91,7 @@ async fn run_init_with_provider_resolver(
     let base_dir = get_base_dir(path);
     let path_buf = path.to_path_buf();
 
-    let provider_context = ProviderContext::default();
+    let provider_context = ProviderContext::new(environment);
     let loaded = load_configuration_with_config(
         &path_buf,
         &provider_context,
@@ -324,6 +326,7 @@ mod tests {
     ) {
         run_init_with_provider_resolver(
             color_mode,
+            carina_core::EnvironmentSnapshot::empty(),
             project,
             false,
             false,
@@ -353,6 +356,7 @@ mod tests {
     ) {
         run_init_with_provider_resolver(
             color_mode,
+            carina_core::EnvironmentSnapshot::empty(),
             project,
             false,
             false,
@@ -377,7 +381,7 @@ mod tests {
     async fn assert_installed_provider_loads_as_aws(user_dirs: &UserDirs, project: &Path) {
         let loaded = load_configuration_with_config(
             project,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .unwrap();
@@ -614,6 +618,7 @@ mod tests {
 
         run_init_with_provider_resolver(
             color_mode,
+            carina_core::EnvironmentSnapshot::empty(),
             project.path(),
             false,
             false,

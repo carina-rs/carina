@@ -132,10 +132,13 @@ fn unbound_deferred_test_target() -> DeferredForExpression {
          for value in upstream.accounts {\n\
            mock.test.Child { identity_input = value }\n\
          }\n",
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("unbound deferred loop parses")
-    .into_expanded(&crate::schema::SchemaRegistry::new())
+    .into_expanded(
+        &crate::schema::SchemaRegistry::new(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
     .expect("unbound deferred-loop fixture has no parser placeholders");
     parsed.deferred_for_expressions()[0].clone()
 }

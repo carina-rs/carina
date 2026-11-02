@@ -36,7 +36,12 @@ pub(crate) struct ModuleWalk {
 }
 
 impl ModuleWalk {
-    pub(crate) fn load<E>(parsed: &carina_core::parser::File<E>, base_dir: &Path) -> Self {
+    pub(crate) fn load<E>(
+        parsed: &carina_core::parser::File<E>,
+        base_dir: &Path,
+        environment: &carina_core::EnvironmentSnapshot,
+    ) -> Self {
+        let context = carina_core::parser::ProviderContext::new(environment.clone());
         let mut walk = Self::default();
         let mut visited = HashSet::new();
         for import in &parsed.uses {
@@ -45,6 +50,7 @@ impl ModuleWalk {
                 Path::new(&import.path),
                 &mut visited,
                 &mut walk.modules,
+                &context,
             );
         }
         walk
@@ -64,13 +70,14 @@ fn visit_module(
     diagnostic_path: &Path,
     visited: &mut HashSet<PathBuf>,
     modules: &mut Vec<LoadedModuleAtPath>,
+    context: &carina_core::parser::ProviderContext,
 ) {
     let guard_path = canonical_guard_path(module_path);
     if !visited.insert(guard_path.clone()) {
         return;
     }
 
-    let Some(loaded) = module_resolver::load_module_with_diagnostics(&guard_path) else {
+    let Some(loaded) = module_resolver::load_module_with_diagnostics(&guard_path, context) else {
         return;
     };
     let diagnostic_path = carina_core::utils::normalize_source_path(diagnostic_path);
@@ -92,6 +99,12 @@ fn visit_module(
     });
 
     for (child_module_path, child_diagnostic_path) in child_paths {
-        visit_module(&child_module_path, &child_diagnostic_path, visited, modules);
+        visit_module(
+            &child_module_path,
+            &child_diagnostic_path,
+            visited,
+            modules,
+            context,
+        );
     }
 }

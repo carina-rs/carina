@@ -24,7 +24,7 @@ impl DestroyCancellationFixture {
     pub(super) fn new() -> Self {
         Self {
             base: CancellationFixtureBase::new(),
-            provider_context: ProviderContext::default(),
+            provider_context: ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             ready_result_barrier: None,
             refresh_drain_barrier: None,
             provider_ready_path: None,

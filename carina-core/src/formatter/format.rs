@@ -2654,7 +2654,7 @@ aws.s3.Bucket {
 
     #[test]
     fn wait_depends_on_dotted_handle_round_trips_and_is_idempotent() {
-        let context = crate::parser::ProviderContext::default();
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let config = FormatConfig::default();
         for dependencies in [
             "[r,producer.validation_record]",

@@ -166,7 +166,7 @@ fn integer_arithmetic_reports_checked_zero_errors() {
 fn integer_arithmetic_operator_span_uses_original_line_after_heredoc() {
     let error = parse(
         "let p = <<EOT\na\nb\nc\nd\nEOT\n\nlet x = 1 / 0\n",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("division by zero after a heredoc must be rejected");
 
@@ -304,7 +304,7 @@ fn integer_arithmetic_accepts_typed_function_and_module_operands() {
             doubled: Int = count * 2
         }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("a typed Int module argument is a valid deferred arithmetic operand");
     assert!(matches!(
@@ -329,8 +329,11 @@ fn wait_predicates_reject_actual_integer_arithmetic_with_targeted_error() {
         }
         "#
         .replace("__PREDICATE__", predicate);
-        let error = parse(&source, &ProviderContext::default())
-            .expect_err("wait predicates deliberately remain narrow equality predicates");
+        let error = parse(
+            &source,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("wait predicates deliberately remain narrow equality predicates");
         assert!(
             error
                 .to_string()
@@ -349,7 +352,7 @@ fn structural_for_declarations_keep_pipe_and_postfix_behavior() {
             mock.test.Thing { value = x }
         } |> f()
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("the resource binding should replace the pipe's computed value binding");
     assert_eq!(resource_pipe.resources.len(), 1);
@@ -366,7 +369,7 @@ fn structural_for_declarations_keep_pipe_and_postfix_behavior() {
             child { value = x }
         } |> f()
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("a structural module-call for-expression should remain a valid pipe input");
     assert_eq!(module_pipe.module_calls.len(), 1);
@@ -379,7 +382,7 @@ fn structural_for_declarations_keep_pipe_and_postfix_behavior() {
     for body in ["mock.test.Thing { value = x }", "child { value = x }"] {
         let postfix = parse(
             &format!("let n = for x in [1] {{ {body} }}.value"),
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect_err("postfix access on a structural for-expression is invalid");
         assert!(
@@ -391,7 +394,7 @@ fn structural_for_declarations_keep_pipe_and_postfix_behavior() {
 
         let arithmetic = parse(
             &format!("let n = for x in [1] {{ {body} }} + 1"),
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect_err("integer arithmetic on a structural for-expression is invalid");
         assert!(
@@ -413,7 +416,7 @@ fn structural_for_resource_pipe_is_not_exported_as_a_value() {
         } |> f()
         exports { out: Int = n }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("the parser must retain the structural side of the resource pipe");
 
@@ -432,7 +435,7 @@ fn structural_for_resource_pipe_is_not_exported_as_a_value() {
 fn value_producing_for_body_is_a_syntax_error() {
     let error = parse(
         "mock.test.Thing { attr = for x in [1] { x } }",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("for-expression bodies cannot produce ordinary values");
     let is_syntax_error = match &error {
@@ -474,8 +477,11 @@ fn structural_declarations_are_parsed_before_pipe_application() {
             1,
         ),
     ] {
-        let parsed = parse(source, &ProviderContext::default())
-            .unwrap_or_else(|error| panic!("structural pipe should parse: {error}"));
+        let parsed = parse(
+            source,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap_or_else(|error| panic!("structural pipe should parse: {error}"));
         assert!(
             !parsed.variables.contains_key(binding),
             "a structural declaration must not also retain its pipe result as a value",
@@ -489,7 +495,7 @@ fn structural_declarations_are_parsed_before_pipe_application() {
 fn postfix_and_arithmetic_on_declarations_have_targeted_errors() {
     let postfix = parse(
         "let b = aws.s3.Bucket { name = 'b' }.arn",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("postfix access on an inline resource declaration is invalid");
     assert!(
@@ -501,7 +507,7 @@ fn postfix_and_arithmetic_on_declarations_have_targeted_errors() {
 
     let arithmetic = parse(
         "let n = for x in [1] { mock.test.Thing { value = x } } + 1",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("integer arithmetic on a structural declaration is invalid");
     assert!(
@@ -555,8 +561,11 @@ fn declaration_if_expressions_are_rejected_as_integer_operands_everywhere() {
             format!("let c = true\nlet x = {expression}"),
             format!("let c = true\nmock.test.Thing {{ n = {expression} }}"),
         ] {
-            let error = parse(&source, &ProviderContext::default())
-                .expect_err("a declaration-valued if cannot be an integer operand");
+            let error = parse(
+                &source,
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .expect_err("a declaration-valued if cannot be an integer operand");
             assert!(
                 error.to_string().contains(expected),
                 "expression {expression:?} produced an unexpected error: {error}",
@@ -569,7 +578,7 @@ fn declaration_if_expressions_are_rejected_as_integer_operands_everywhere() {
 fn let_rhs_coalesce_errors_keep_the_authored_line() {
     let closure_error = parse(
         "let source = mock.test.Thing {}\nlet a = source.value\nlet x = a ?? join(\",\")",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("a closure cannot be a coalesce default value");
     let ParseError::InvalidExpression { line, .. } = closure_error else {
@@ -579,7 +588,7 @@ fn let_rhs_coalesce_errors_keep_the_authored_line() {
 
     let resource_error = parse(
         "let first = 1\nlet second = 2\nlet b = mock.test.Thing {} ?? 1",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("a resource declaration cannot be coalesced as a value");
     let ParseError::InvalidExpression { line, message } = resource_error else {
@@ -590,7 +599,7 @@ fn let_rhs_coalesce_errors_keep_the_authored_line() {
 
     let upstream_error = parse(
         "let first = 1\nlet u = upstream_state { source = \"../x\" } ?? {}",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("an upstream-state declaration cannot be coalesced as a value");
     let ParseError::InvalidExpression { line, message } = upstream_error else {
@@ -610,7 +619,7 @@ fn integer_arithmetic_in_a_for_body_resolves_after_its_deferred_iterable() {
                 mock.test.Target { count = item + 1 }
             }
             "#,
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("deferred iterable fixture parses"),
     );
@@ -624,7 +633,10 @@ fn integer_arithmetic_in_a_for_body_resolves_after_its_deferred_iterable() {
         GenericValue::Deferred(GenericDeferredValue::IntegerArithmetic(_))
     ));
     let mut parsed = parsed
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("deferred arithmetic fixture crosses the placeholder boundary");
 
     let mut bindings = ResolvedBindings::default();
@@ -639,7 +651,7 @@ fn integer_arithmetic_in_a_for_body_resolves_after_its_deferred_iterable() {
         crate::binding_index::BindingValueSource::Local,
     );
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             parsed.expand_deferred_for_expressions(&bindings.project_iterable_bindings(), session)
         },
@@ -660,12 +672,133 @@ fn integer_arithmetic_in_a_for_body_resolves_after_its_deferred_iterable() {
     );
 }
 
+#[test]
+fn deferred_for_projection_evaluates_nested_env_from_the_caller_snapshot() {
+    for names in [["alpha", "beta"], ["gamma", "delta"]] {
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::new([(
+            "CARINA_DEFERRED_LIST".to_string(),
+            names.join(",").into(),
+        )]));
+        let schemas = crate::schema::SchemaRegistry::new();
+        let parsed = parse(
+            r#"
+            let upstream = upstream_state { source = "../upstream" }
+            let source = mock.test.Source {
+                list = split(",", env(upstream.variable))
+            }
+            let children = for item in source.list {
+                mock.test.Target { name = item }
+            }
+            "#,
+            &context,
+        )
+        .expect("the environment lookup stays deferred until upstream is loaded");
+        crate::validation::deferred_types::with_session_for_test(&context, |session| {
+            let mut expanded = crate::module_resolver::resolve_modules_with_providerless_config(
+                crate::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
+                std::path::Path::new("."),
+                session,
+                &schemas,
+            )
+            .expect("fixture crosses module resolution")
+            .into_expanded(&schemas, &context)
+            .expect("fixture crosses the placeholder boundary");
+            assert_eq!(expanded.deferred_for_expressions().len(), 1);
+            let source = expanded
+                .resources
+                .iter()
+                .find(|resource| {
+                    resource
+                        .binding
+                        .as_ref()
+                        .is_some_and(|name| name.as_str() == "source")
+                })
+                .expect("source resource");
+            let mut bindings = ResolvedBindings::default();
+            bindings.set(
+                "source",
+                HashMap::from([("list".to_string(), source.get_attr("list").unwrap().clone())]),
+                crate::binding_index::BindingValueSource::Local,
+            );
+            bindings.set(
+                "upstream",
+                HashMap::from([(
+                    "variable".to_string(),
+                    ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                        "CARINA_DEFERRED_LIST".into(),
+                    )),
+                )]),
+                crate::binding_index::BindingValueSource::Upstream,
+            );
+            expanded
+                .expand_deferred_for_expressions(&bindings.project_iterable_bindings(), session)
+                .expect("projection evaluates nested builtins with the caller's snapshot");
+            assert!(expanded.deferred_for_expressions().is_empty());
+            for (index, name) in names.iter().enumerate() {
+                let binding = format!("children[{index}]");
+                let child = expanded
+                    .resources
+                    .iter()
+                    .find(|resource| {
+                        resource
+                            .binding
+                            .as_ref()
+                            .is_some_and(|name| name.as_str() == binding)
+                    })
+                    .expect("expanded child");
+                assert_eq!(
+                    child.get_attr("name"),
+                    Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                        (*name).into()
+                    ))),
+                );
+            }
+        });
+    }
+}
+
+#[test]
+fn loop_directive_projection_evaluates_env_from_the_caller_snapshot() {
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::new([(
+        "DIRECTIVE_VARIABLE".to_string(),
+        "captured".into(),
+    )]));
+    let expression = GenericValue::Deferred(GenericDeferredValue::FunctionCall {
+        name: crate::builtins::BuiltinFunction::env,
+        args: vec![
+            GenericValue::Deferred(GenericDeferredValue::Placeholder(LoopSlot::Value)).into(),
+        ],
+        source_line: 1.into(),
+    });
+    let item = ExpandedValue::Concrete(ExpandedConcreteValue::String("DIRECTIVE_VARIABLE".into()));
+    crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        for evaluation in [
+            crate::resolver::RuntimeContext::Projection(&context),
+            crate::resolver::RuntimeContext::Session(session),
+        ] {
+            let resolved = resolve_loop_directive_value(
+                expression.clone(),
+                None,
+                None,
+                &item,
+                crate::resource::AccessMissPolicy::Error,
+                evaluation,
+            )
+            .expect("both preview and expansion use the caller's snapshot");
+            assert_eq!(
+                resolved,
+                ExpandedValue::Concrete(ExpandedConcreteValue::String("captured".into())),
+            );
+        }
+    });
+}
+
 fn cross_deferred_for_resolution_seam<E>(parsed: File<E>) -> ModuleResolvedFile<E::Absolute>
 where
     E: ResolveExportBindingPhase<ParserPlaceholder>,
 {
     crate::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_with_providerless_config(
                 crate::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
@@ -719,10 +852,17 @@ fn file_into_expanded_collects_every_leftover_with_locations() {
             broken: String = "${}"
         }
     "#;
-    let parsed = parse(source, &ProviderContext::default()).expect("fixture must parse");
+    let parsed = parse(
+        source,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("fixture must parse");
 
     let error = parsed
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect_err("every parser placeholder must be rejected at the expansion boundary");
     let messages = error.to_string();
 
@@ -753,7 +893,10 @@ fn file_into_expanded_collects_multiple_leftovers_inside_one_value() {
     );
 
     let rendered = file
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect_err("both nested placeholders must be rejected")
         .to_string();
 
@@ -1040,10 +1183,18 @@ fn iter_all_resources_yields_direct_then_deferred() {
             }
         }
     "#;
-    let parsed =
-        cross_deferred_for_resolution_seam(parse(src, &ProviderContext::default()).unwrap())
-            .into_expanded(&crate::schema::SchemaRegistry::new())
-            .expect("resource iterator fixture contains no parser placeholders");
+    let parsed = cross_deferred_for_resolution_seam(
+        parse(
+            src,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap(),
+    )
+    .into_expanded(
+        &crate::schema::SchemaRegistry::new(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("resource iterator fixture contains no parser placeholders");
 
     let items: Vec<_> = parsed.iter_all_resources().collect();
     assert_eq!(items.len(), 2, "expected one direct + one deferred");
@@ -1105,7 +1256,11 @@ fn iter_all_resources_classifies_managed_and_data_source_arms() {
         }
         let _ = read aws.sts.caller_identity {}
     "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     let items: Vec<_> = parsed.iter_all_resources().collect();
     // Exactly one managed + one data source — the `read` resource must
@@ -1139,7 +1294,11 @@ fn parser_routes_managed_and_data_sources_to_typed_slices() {
         }
         let _ = read aws.sts.caller_identity {}
     "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     // `resources` is managed-only, `data_sources` holds the read.
     assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
@@ -1159,7 +1318,11 @@ fn parse_provider_block() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.providers.len(), 1);
     assert_eq!(result.providers[0].name, "aws");
 }
@@ -1173,7 +1336,11 @@ fn parse_resource_with_namespaced_type() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
 
     let resource = &result.resources[0];
@@ -1210,7 +1377,11 @@ fn parse_resource_attributes_contain_no_host_metadata() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     for resource in &result.resources {
         assert!(
             resource.attributes.keys().all(|key| !key.starts_with('_')),
@@ -1239,8 +1410,11 @@ fn parse_rejects_reserved_top_level_resource_attribute_names() {
     ];
 
     for input in inputs {
-        let error = parse(input, &ProviderContext::default())
-            .expect_err("reserved top-level resource attribute must be rejected");
+        let error = parse(
+            input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("reserved top-level resource attribute must be rejected");
         let expected_start_column = input.find("\"_x\"").unwrap() + 1;
         match &error {
             ParseError::ReservedResourceAttribute {
@@ -1280,7 +1454,11 @@ fn parse_allows_underscore_prefixed_map_entries_inside_resource_attributes() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let Some(Value::Concrete(ConcreteValue::Map(tags))) = result.resources[0].get_attr("tags")
     else {
         panic!("tags must parse as a concrete map");
@@ -1315,7 +1493,11 @@ fn parse_multiple_resources() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 2);
     assert_eq!(
         result.resources[0]
@@ -1344,7 +1526,11 @@ fn parse_variable_and_resource() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("region"),
@@ -1379,7 +1565,11 @@ fn parse_full_example() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.providers.len(), 1);
     assert_eq!(result.resources.len(), 2);
     assert_eq!(
@@ -1400,7 +1590,11 @@ fn function_call_is_parsed() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("name"),
@@ -1421,7 +1615,11 @@ fn parse_gcp_resource() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
     assert_eq!(result.resources[0].id.resource_type, "storage.bucket");
     assert_eq!(result.resources[0].id.provider, "gcp");
@@ -1438,7 +1636,11 @@ fn parse_anonymous_resource() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
 
     let resource = &result.resources[0];
@@ -1460,7 +1662,11 @@ fn parse_mixed_resources() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 2);
     assert_eq!(result.resources[0].id.identity_str(), None); // anonymous identity is computed later
     assert_eq!(
@@ -1480,7 +1686,10 @@ fn parse_anonymous_resource_without_name_succeeds() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_ok());
     let parsed = result.unwrap();
     assert_eq!(parsed.resources[0].id.identity_str(), None); // identity is computed later
@@ -1500,7 +1709,11 @@ fn parse_resource_reference() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 2);
 
     // Before resolution, the attribute should be a ResourceRef
@@ -1607,7 +1820,11 @@ fn parse_bare_identifier_becomes_enum_identifier() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("instance_tenancy"),
         Some(&Value::Concrete(ConcreteValue::enum_identifier(
@@ -1626,7 +1843,11 @@ fn resource_reference_preserves_namespaced_id() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("region"),
         Some(&Value::Concrete(ConcreteValue::enum_identifier(
@@ -1656,7 +1877,7 @@ fn fully_qualified_shape_keeps_bound_value_head_semantics_in_every_value_positio
                 name = cfg.envs.Prod.cidr
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("a PascalCase path segment must not override a bound value head");
 
@@ -1701,7 +1922,7 @@ fn fully_qualified_shape_keeps_bound_structural_head_semantics_in_every_value_po
                     }}
                 "#,
             ),
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("a PascalCase path segment must not override a structural binding head");
 
@@ -1752,7 +1973,11 @@ fn namespaced_id_with_digit_segment() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("type"),
         Some(&Value::Concrete(ConcreteValue::enum_identifier(
@@ -1775,7 +2000,11 @@ fn namespaced_id_with_numeric_tail() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let policy = result.resources[0]
         .get_attr("assume_role_policy_document")
         .expect("policy doc attr");
@@ -1801,7 +2030,11 @@ fn namespaced_id_numeric_tail_preserves_pure_digits() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("kind"),
         Some(&Value::Concrete(ConcreteValue::enum_identifier(
@@ -1842,7 +2075,11 @@ fn parse_nested_blocks_terraform_style() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
 
     let sg = &result.resources[0];
@@ -1893,7 +2130,11 @@ fn parse_list_syntax() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
 
     let rt = &result.resources[0];
@@ -1936,7 +2177,11 @@ fn parse_directory_module() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     // Check arguments
     assert_eq!(result.arguments.len(), 2);
@@ -1979,7 +2224,11 @@ fn parse_use_expression() {
         let web_tier = use { source = "./modules/web_tier" }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.uses.len(), 1);
     assert_eq!(result.uses[0].path, "./modules/web_tier");
     assert_eq!(result.uses[0].alias, "web_tier");
@@ -1991,7 +2240,11 @@ fn parse_use_expression_requires_source() {
         let web_tier = use { }
     "#;
 
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("source"),
@@ -2005,7 +2258,11 @@ fn parse_use_expression_rejects_unknown_attribute() {
         let web_tier = use { source = "./x", bogus = "y" }
     "#;
 
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("bogus"),
@@ -2026,7 +2283,10 @@ fn parse_use_expression_rejected_as_module_call_argument() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_err(),
         "use expression as module-call argument must be rejected, got: {result:?}"
@@ -2039,7 +2299,10 @@ fn parse_use_expression_rejected_in_list() {
         let mods = [use { source = "./modules/a" }]
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_err(),
         "use expression inside a list must be rejected, got: {result:?}"
@@ -2052,7 +2315,10 @@ fn parse_use_expression_rejected_in_if_branch() {
         let net = if true { use { source = "./a" } } else { use { source = "./b" } }
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_err(),
         "use expression inside an if branch must be rejected, got: {result:?}"
@@ -2070,7 +2336,10 @@ fn parse_use_expression_rejected_in_local_let() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_err(),
         "use expression inside a local let binding must be rejected, got: {result:?}"
@@ -2095,7 +2364,11 @@ fn parse_generic_type_expressions() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     assert_eq!(
         result.arguments[0].static_type,
@@ -2134,7 +2407,11 @@ fn parse_ref_type_expression() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     // Check ref type argument
     assert_eq!(result.arguments[0].name, "vpc");
@@ -2170,7 +2447,11 @@ fn parse_ref_type_with_nested_resource_type() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     // Single-level resource type
     assert_eq!(
@@ -2205,7 +2486,11 @@ fn parse_struct_type_expression() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.export_params.len(), 1);
     let ep = &result.export_params[0];
     assert_eq!(ep.name, "accounts");
@@ -2233,7 +2518,11 @@ fn parse_struct_type_nested_in_list_and_map() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.arguments[0].static_type,
         known(TypeExpr::List(Box::new(TypeExpr::Struct {
@@ -2261,7 +2550,11 @@ fn parse_struct_type_rejects_duplicate_field_name() {
             x: struct { a: String, a: Int } = { a = "hi" }
         }
     "#;
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("duplicate field name 'a'"),
@@ -2393,7 +2686,7 @@ fn user_fn_loaded_catalog_strictly_checks_custom_type_arguments_and_returns() {
                 ))
             }),
         ),
-        ..Default::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     };
     for source in [
         "fn f(x: AccountId) { x }\nlet value = f('account')\n",
@@ -2411,7 +2704,7 @@ fn user_fn_loaded_catalog_strictly_checks_custom_type_arguments_and_returns() {
             Default::default(),
             Box::new(|_, _| Ok(())),
         ),
-        ..Default::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     };
     let error = parse(
         "fn f(x: Arn) { x }\nlet value = f('arn:aws:s3:::bucket')\n",
@@ -2446,7 +2739,11 @@ fn parse_attributes_without_type_annotation() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     assert_eq!(result.attribute_params.len(), 1);
     assert_eq!(result.attribute_params[0].name, "security_group");
@@ -2476,7 +2773,11 @@ fn parse_attributes_mixed_typed_and_untyped() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     assert_eq!(result.attribute_params.len(), 3);
 
@@ -2548,7 +2849,11 @@ fn parse_float_literal() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("weight"),
         Some(&Value::Concrete(ConcreteValue::Float(2.5)))
@@ -2564,7 +2869,11 @@ fn parse_negative_float_literal() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("offset"),
         Some(&Value::Concrete(ConcreteValue::Float(-0.5)))
@@ -2608,7 +2917,11 @@ fn parse_backend_block() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     // Check backend
     assert!(result.backend.is_some());
@@ -2649,10 +2962,17 @@ fn parse_backend_block() {
 #[test]
 fn secret_derived_backend_attribute_error_carries_the_attribute_span() {
     let input = "backend local {\n    path = secret(\"carina.state.json\")\n}";
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let mut parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
-    let error = resolve_resource_refs_with_config(&mut parsed, &ProviderContext::default())
-        .expect_err("secret-derived backend attributes must be rejected");
+    let error = resolve_resource_refs_with_config(
+        &mut parsed,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("secret-derived backend attributes must be rejected");
 
     match error {
         ParseError::SecretDerivedBackendAttribute {
@@ -2696,7 +3016,11 @@ fn parse_backend_block_with_resources() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     assert!(result.backend.is_some());
     let backend = result.backend.unwrap();
@@ -2718,7 +3042,11 @@ fn parse_read_resource_expr() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     // carina#3181 PR C: the `read` resource lands in `data_sources`.
     assert!(result.resources.is_empty());
     assert_eq!(result.data_sources.len(), 1);
@@ -2742,7 +3070,11 @@ fn parse_read_resource_does_not_inject_data_source_attribute() {
             region = "us-east-1"
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert!(result.resources.is_empty());
     let data_source = &result.data_sources[0];
     assert!(data_source.attributes.contains_key("name"));
@@ -2758,7 +3090,10 @@ fn parse_read_resource_without_name_uses_binding() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_ok());
     let parsed = result.unwrap();
     // carina#3181 PR C: `read` resources live in the `data_sources` slice.
@@ -2785,7 +3120,11 @@ fn parse_read_with_regular_resources() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     // carina#3181 PR C: the data source and the managed resource land
     // in separate typed slices.
@@ -2819,7 +3158,11 @@ fn parse_directives_force_delete() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
 
     let resource = &result.resources[0];
@@ -2847,7 +3190,11 @@ fn parse_directives_default_when_absent() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
     assert!(
         !result.resources[0]
@@ -2888,7 +3235,12 @@ fn directive_value_spans_trim_trailing_trivia_after_heredoc() {
             let input = format!(
                 "{prefix}let flag = true\nlet r = mock.test.resource {{\n  name = 'r'\n  directives {{\n{value_prefix}flag{trailing}  }}\n}}\n"
             );
-            let parsed = parse_file(&input, source_file, &ProviderContext::default()).unwrap();
+            let parsed = parse_file(
+                &input,
+                source_file,
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .unwrap();
             let mut directives = parsed.resources[0].directives.clone();
             let mut sources = Vec::new();
             directives.map_expressions(|expression| sources.push(expression.source().clone()));
@@ -2919,7 +3271,11 @@ fn parse_prevent_destroy_preserves_literal_true_and_false_as_explicit() {
                 }}
             "#
         );
-        let parsed = parse(&input, &ProviderContext::default()).expect("literal must parse");
+        let parsed = parse(
+            &input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("literal must parse");
         assert_eq!(
             parsed.resources[0]
                 .directives
@@ -2945,7 +3301,11 @@ fn parse_prevent_destroy_folded_false_is_explicit() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).expect("expression must parse");
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("expression must parse");
     assert_eq!(
         parsed.resources[0]
             .directives
@@ -2972,7 +3332,11 @@ fn parse_prevent_destroy_non_literal_true_fails_closed() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).expect("expression must parse");
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("expression must parse");
     assert_eq!(
         parsed.resources[0]
             .directives
@@ -3000,7 +3364,11 @@ fn parse_directives_anonymous_resource() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
     assert!(
         result.resources[0]
@@ -3026,7 +3394,11 @@ fn anonymous_resource_no_spurious_unique_name_attribute() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
 
     let resource = &result.resources[0];
@@ -3049,7 +3421,11 @@ fn let_bound_resource_no_spurious_unique_name_attribute() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
 
     let resource = &result.resources[0];
@@ -3076,7 +3452,11 @@ fn parse_directives_create_before_destroy() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
 
     let resource = &result.resources[0];
@@ -3117,7 +3497,11 @@ fn parse_directives_both_force_delete_and_create_before_destroy() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
 
     let resource = &result.resources[0];
@@ -3161,7 +3545,11 @@ fn parse_block_syntax_inside_map() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
 
     let role = &result.resources[0];
@@ -3215,7 +3603,11 @@ fn parse_multiple_blocks_inside_map() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let role = &result.resources[0];
     let doc = role.get_attr("policy_document").unwrap();
     if let Value::Concrete(ConcreteValue::Map(map)) = doc {
@@ -3248,7 +3640,11 @@ fn parse_list_syntax_inside_map_still_works() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let role = &result.resources[0];
     let doc = role.get_attr("assume_role_policy_document").unwrap();
     if let Value::Concrete(ConcreteValue::Map(map)) = doc {
@@ -3276,7 +3672,11 @@ fn parse_deeply_nested_blocks() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let r = &result.resources[0];
 
     let outer = r.get_attr("outer").unwrap();
@@ -3319,7 +3719,11 @@ fn parse_nested_block_in_map() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let role = &result.resources[0];
 
     let doc = role.get_attr("policy_document").unwrap();
@@ -3353,7 +3757,11 @@ fn test_find_resource_by_attr() {
             bucket = "other-bucket"
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     assert!(
         parsed
@@ -3390,7 +3798,10 @@ name = "test"
 count = 99999999999999999999
 }
 "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -3404,7 +3815,11 @@ fn pipe_operator_desugars_to_function_call() {
     let input = r#"
         let x = "hello" |> upper()
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     // "hello" |> upper() desugars to upper("hello")
     assert_eq!(
         result.variables.get("x"),
@@ -3423,7 +3838,11 @@ fn pipe_operator_in_attribute_desugars() {
             name = "test" |> lower()
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("name"),
@@ -3442,7 +3861,11 @@ fn join_function_call_parsed() {
             name = join("-", ["a", "b", "c"])
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
     // At parse time, function calls remain as FunctionCall values
     assert_eq!(
@@ -3470,7 +3893,11 @@ fn pipe_with_join_parsed() {
             name = ["a", "b", "c"] |> join("-")
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
     // ["a", "b", "c"] |> join("-") desugars to join("-", ["a", "b", "c"])
     assert_eq!(
@@ -3497,7 +3924,11 @@ fn join_with_multiple_pipes() {
     let input = r#"
         let x = ["a", "b"] |> join("-") |> upper()
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     // Pipe chaining: ["a", "b"] |> join("-") |> upper()
     // => upper(join("-", ["a", "b"]))
     assert_eq!(
@@ -3529,8 +3960,11 @@ fn unknown_function_call_is_rejected_during_parsing() {
     let input = r#"
         let x = foo()
     "#;
-    let error = parse(input, &ProviderContext::default())
-        .expect_err("an unknown name cannot become a deferred builtin call");
+    let error = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("an unknown name cannot become a deferred builtin call");
     assert!(
         error.to_string().contains("Unknown function 'foo'"),
         "unexpected error: {error}",
@@ -3544,8 +3978,16 @@ fn join_resolved_during_resource_ref_resolution() {
             name = join("-", ["my", "bucket", "name"])
         }
     "#;
-    let mut result = parse(input, &ProviderContext::default()).unwrap();
-    resolve_resource_refs(&mut result).unwrap();
+    let mut result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    resolve_resource_refs(
+        &mut result,
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -3561,8 +4003,16 @@ fn pipe_join_resolved_during_resource_ref_resolution() {
             name = ["my", "bucket"] |> join("-")
         }
     "#;
-    let mut result = parse(input, &ProviderContext::default()).unwrap();
-    resolve_resource_refs(&mut result).unwrap();
+    let mut result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    resolve_resource_refs(
+        &mut result,
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String("my-bucket".into())))
@@ -3580,8 +4030,11 @@ fn partial_application_let_binding_dropped_from_variables() {
     let input = r#"
         let f = map(".subnet_id")
     "#;
-    let result = parse(input, &ProviderContext::default())
-        .expect("partial application in let binding should parse");
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("partial application in let binding should parse");
     assert!(result.variables.get("f").is_none());
 }
 
@@ -3594,8 +4047,16 @@ fn partial_application_join_with_pipe() {
             name = ["a", "b"] |> join(",")
         }
     "#;
-    let mut result = parse(input, &ProviderContext::default()).unwrap();
-    resolve_resource_refs(&mut result).unwrap();
+    let mut result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    resolve_resource_refs(
+        &mut result,
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String("a,b".into())))
@@ -3609,7 +4070,11 @@ fn partial_application_closure_direct_call() {
         let f = join(",")
         let x = f(["a", "b"])
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.variables.get("x"),
         Some(&Value::Concrete(ConcreteValue::String("a,b".into())))
@@ -3624,8 +4089,16 @@ fn partial_application_chained_pipes() {
             name = ["a", "b"] |> join(",") |> upper()
         }
     "#;
-    let mut result = parse(input, &ProviderContext::default()).unwrap();
-    resolve_resource_refs(&mut result).unwrap();
+    let mut result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    resolve_resource_refs(
+        &mut result,
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String("A,B".into())))
@@ -3639,7 +4112,11 @@ fn partial_application_closure_pipe() {
         let f = join(",")
         let x = ["a", "b"] |> f()
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.variables.get("x"),
         Some(&Value::Concrete(ConcreteValue::String("a,b".into())))
@@ -3653,7 +4130,10 @@ fn partial_application_too_many_args_errors() {
         let f = join(",")
         let x = f(["a", "b"], "extra")
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_err());
 }
 
@@ -3664,7 +4144,11 @@ fn partial_application_replace() {
         let dash_to_underscore = replace("-", "_")
         let x = "hello-world" |> dash_to_underscore()
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.variables.get("x"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -3681,8 +4165,16 @@ fn partial_application_in_resource_attribute() {
             name = ["my", "bucket"] |> join("-")
         }
     "#;
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
-    resolve_resource_refs(&mut parsed).unwrap();
+    let mut parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    resolve_resource_refs(
+        &mut parsed,
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         parsed.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String("my-bucket".into())))
@@ -3698,8 +4190,16 @@ fn partial_application_closure_in_resource_attribute() {
             name = ["my", "bucket"] |> dash_join()
         }
     "#;
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
-    resolve_resource_refs(&mut parsed).unwrap();
+    let mut parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    resolve_resource_refs(
+        &mut parsed,
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         parsed.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String("my-bucket".into())))
@@ -3715,8 +4215,16 @@ fn partial_application_closure_direct_call_in_resource_attribute() {
             name = dash_join(["my", "bucket"])
         }
     "#;
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
-    resolve_resource_refs(&mut parsed).unwrap();
+    let mut parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    resolve_resource_refs(
+        &mut parsed,
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         parsed.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String("my-bucket".into())))
@@ -3738,7 +4246,11 @@ fn forward_reference_parsed_as_resource_ref() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 2);
 
     let subnet = &result.resources[0];
@@ -3792,9 +4304,11 @@ fn forward_reference_unused_binding_detection() {
         }
     "#;
 
-    let authored =
-        crate::config_loader::AuthoredBindingView::parse_source(input, &ProviderContext::default())
-            .unwrap();
+    let authored = crate::config_loader::AuthoredBindingView::parse_source(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let unused = crate::validation::check_unused_bindings(&authored);
     // vpc is referenced by subnet, so should NOT be unused
     assert!(
@@ -3819,7 +4333,11 @@ fn forward_reference_in_nested_value() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = &result.resources[0];
     // Check nested reference in list > map
     if let Some(Value::Concrete(ConcreteValue::List(items))) = subnet.get_attr("tags") {
@@ -3856,7 +4374,11 @@ fn forward_reference_chained_three_parts() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = &result.resources[0];
     assert_eq!(
         subnet.get_attr("vpc_id"),
@@ -3884,7 +4406,11 @@ fn forward_reference_chained_four_parts() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = &result.resources[0];
     assert_eq!(
         subnet.get_attr("vpc_id"),
@@ -3911,7 +4437,10 @@ fn duplicate_let_binding_resource_produces_error() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_err(),
         "Duplicate let binding 'rt' should produce an error, but parsing succeeded: {:?}",
@@ -3943,7 +4472,10 @@ fn duplicate_let_binding_variable_produces_error() {
         let region = aws.Region.us_east_1
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_err(),
         "Duplicate let binding 'region' should produce an error, but parsing succeeded: {:?}",
@@ -3980,7 +4512,10 @@ fn distinct_let_bindings_are_accepted() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_ok(),
         "Distinct let bindings should parse successfully, got: {:?}",
@@ -4012,7 +4547,11 @@ fn parse_slash_slash_comment_standalone() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.providers.len(), 1);
     assert_eq!(result.providers[0].name, "aws");
 }
@@ -4025,7 +4564,11 @@ fn parse_slash_slash_comment_inline() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
@@ -4046,7 +4589,11 @@ fn parse_mixed_comment_styles() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
@@ -4065,7 +4612,11 @@ fn parse_block_comment_single_line() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.providers.len(), 1);
     assert_eq!(result.providers[0].name, "aws");
 }
@@ -4082,7 +4633,11 @@ fn parse_block_comment_multi_line() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.providers.len(), 1);
     assert_eq!(result.providers[0].name, "aws");
 }
@@ -4099,7 +4654,11 @@ fn parse_block_comment_nested() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.providers.len(), 1);
     assert_eq!(result.providers[0].name, "aws");
 }
@@ -4112,7 +4671,11 @@ fn parse_block_comment_inline() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
@@ -4134,7 +4697,11 @@ fn parse_block_comment_with_all_comment_styles() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
 }
 
@@ -4158,7 +4725,11 @@ fn parse_provider_block_defers_non_literal_default_tags() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let pc = &parsed.providers[0];
 
     assert!(
@@ -4187,7 +4758,11 @@ fn provider_block_undefined_let_reference_flagged() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let errs = check_identifier_scope(&parsed);
     assert!(
         errs.iter().any(|e| format!("{e}").contains("nonexistent")),
@@ -4320,7 +4895,11 @@ fn resolve_provider_attributes_with_remote_substitutes_upstream_refs() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     // Pre-check: the ref survives parsing nested inside the assume_role map.
     let pre = parsed.providers[0].attributes.get("assume_role").unwrap();
@@ -4351,10 +4930,13 @@ fn resolve_provider_attributes_with_remote_substitutes_upstream_refs() {
 
     let expanded = parsed
         .clone()
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("provider config must contain no parser placeholders");
     let resolved = crate::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| resolve_provider_attributes_with_remote(&expanded, &remote, session),
     )
     .expect("resolve must succeed");
@@ -4425,14 +5007,22 @@ fn resolve_provider_attributes_with_remote_rejects_unknown_refs() {
         }
     "#;
 
-    let parsed =
-        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap())
-            .into_expanded(&crate::schema::SchemaRegistry::new())
-            .expect("provider config must contain no parser placeholders");
+    let parsed = cross_deferred_for_resolution_seam(
+        parse(
+            input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap(),
+    )
+    .into_expanded(
+        &crate::schema::SchemaRegistry::new(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("provider config must contain no parser placeholders");
     let empty: HashMap<String, HashMap<String, crate::resource::ExpandedValue>> = HashMap::new();
 
     let error = crate::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| resolve_provider_attributes_with_remote(&parsed, &empty, session),
     )
     .expect_err("resolved provider configs must reject a missing binding");
@@ -4463,10 +5053,14 @@ fn resolve_provider_attributes_with_remote_uses_sibling_user_functions() {
     .unwrap();
 
     let parsed = crate::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_with_providerless_config(
-                parse_directory(tmp.path(), &ProviderContext::default()).unwrap(),
+                parse_directory(
+                    tmp.path(),
+                    &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                )
+                .unwrap(),
                 tmp.path(),
                 session,
                 &crate::schema::SchemaRegistry::new(),
@@ -4474,10 +5068,13 @@ fn resolve_provider_attributes_with_remote_uses_sibling_user_functions() {
             .expect("provider config crosses the module-resolution seam")
         },
     )
-    .into_expanded(&crate::schema::SchemaRegistry::new())
+    .into_expanded(
+        &crate::schema::SchemaRegistry::new(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
     .expect("provider config must contain no parser placeholders");
     let resolved = crate::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| resolve_provider_attributes_with_remote(&parsed, &HashMap::new(), session),
     )
     .expect("provider attributes should use the merged user-function scope");
@@ -4510,10 +5107,14 @@ fn resolve_provider_attributes_with_remote_preserves_function_call_line() {
     .unwrap();
 
     let parsed = crate::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_with_providerless_config(
-                parse_directory(tmp.path(), &ProviderContext::default()).unwrap(),
+                parse_directory(
+                    tmp.path(),
+                    &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                )
+                .unwrap(),
                 tmp.path(),
                 session,
                 &crate::schema::SchemaRegistry::new(),
@@ -4521,10 +5122,13 @@ fn resolve_provider_attributes_with_remote_preserves_function_call_line() {
             .expect("provider config crosses the module-resolution seam")
         },
     )
-    .into_expanded(&crate::schema::SchemaRegistry::new())
+    .into_expanded(
+        &crate::schema::SchemaRegistry::new(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
     .expect("provider config must contain no parser placeholders");
     let error = crate::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| resolve_provider_attributes_with_remote(&parsed, &HashMap::new(), session),
     )
     .expect_err("invalid sibling function should fail at the authored provider call");
@@ -4566,10 +5170,13 @@ fn provider_default_tags_remain_deferred_and_saved_plan_validation_accepts_them(
     let remote: HashMap<String, HashMap<String, crate::resource::ExpandedValue>> = HashMap::new();
 
     let parsed = cross_deferred_for_resolution_seam(parsed)
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("provider config must contain no parser placeholders");
     let resolved = crate::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| resolve_provider_attributes_with_remote(&parsed, &remote, session),
     )
     .expect("default_tags do not participate in the provider-ready invariant");
@@ -4601,7 +5208,7 @@ fn saved_plan_provider_configs_require_fully_resolved_attributes() {
                 assume_role = { role_arn = mgmt.role_arn }
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
 
@@ -4628,7 +5235,7 @@ fn saved_plan_provider_configs_accept_fully_resolved_attributes() {
                 region = "ap-northeast-1"
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
 
@@ -4676,7 +5283,11 @@ fn parse_provider_block_with_default_tags() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.providers.len(), 1);
     assert_eq!(result.providers[0].name, "awscc");
     // default_tags should be extracted from attributes
@@ -4704,7 +5315,11 @@ fn parse_provider_block_without_default_tags() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.providers.len(), 1);
     assert!(result.providers[0].default_tags.is_empty());
 }
@@ -4717,7 +5332,11 @@ fn parse_provider_block_with_source_and_version() {
             version = "0.1.0"
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(parsed.providers.len(), 1);
 
     let provider = &parsed.providers[0];
@@ -4734,9 +5353,12 @@ fn parse_provider_block_with_source_and_version() {
 
 fn parse_typed_provider_source(source: &str) -> crate::provider_source::ProviderSource {
     let input = format!("provider test {{\n    source = '{source}'\n    version = '0.1.0'\n}}");
-    parse(&input, &ProviderContext::default())
-        .unwrap()
-        .providers[0]
+    parse(
+        &input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap()
+    .providers[0]
         .source
         .clone()
         .expect("provider source should be extracted")
@@ -4763,8 +5385,11 @@ fn parse_provider_block_classifies_supported_source_shapes() {
 fn parse_provider_block_rejects_invalid_source_shapes() {
     for source in ["a/b/c/d", "/x"] {
         let input = format!("provider test {{ source = '{source}' }}");
-        let error = parse(&input, &ProviderContext::default())
-            .expect_err("invalid provider source must fail at the parser boundary");
+        let error = parse(
+            &input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("invalid provider source must fail at the parser boundary");
         assert!(
             error.to_string().contains("Invalid source format"),
             "unexpected error for {source}: {error}"
@@ -4776,8 +5401,11 @@ fn parse_provider_block_rejects_invalid_source_shapes() {
 fn invalid_provider_source_reports_attribute_line_and_provider() {
     let input = "provider awscc {\n  region = 'ap-northeast-1'\n\n  source = 'a/b/c/d'\n}";
 
-    let error = parse(input, &ProviderContext::default())
-        .expect_err("invalid provider source must report its authored line");
+    let error = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("invalid provider source must report its authored line");
 
     match error {
         ParseError::InvalidExpression { line, message } => {
@@ -4808,8 +5436,11 @@ fn provider_loading_attributes_reject_values_that_would_be_silently_dropped() {
 
     for (attribute, value) in cases {
         let input = format!("provider test {{\n  {attribute} = {value}\n}}");
-        let error = parse(&input, &ProviderContext::default())
-            .expect_err("provider loading attribute must be a plain string literal");
+        let error = parse(
+            &input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("provider loading attribute must be a plain string literal");
 
         match error {
             ParseError::InvalidExpression { line, message } => {
@@ -4858,7 +5489,11 @@ fn parse_provider_block_without_source() {
             region = awscc.Region.ap_northeast_1
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let provider = &parsed.providers[0];
     assert!(provider.source.is_none());
     assert!(provider.version.is_none());
@@ -4872,7 +5507,11 @@ fn parse_provider_block_with_version_constraint() {
             version = "~0.5.0"
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let provider = &parsed.providers[0];
     let vc = provider.version.as_ref().unwrap();
     assert_eq!(vc.raw, "~0.5.0");
@@ -4888,7 +5527,10 @@ fn parse_provider_block_with_invalid_version_constraint() {
             version = "not-valid"
         }
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_err());
 }
 
@@ -4900,7 +5542,11 @@ fn parse_provider_block_with_revision() {
             revision = "feature-branch"
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(parsed.providers.len(), 1);
 
     let provider = &parsed.providers[0];
@@ -4922,7 +5568,11 @@ fn parse_provider_block_with_revision_sha() {
             revision = "abc123def456"
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let provider = &parsed.providers[0];
     assert_eq!(provider.revision.as_deref(), Some("abc123def456"));
 }
@@ -4936,7 +5586,10 @@ fn parse_provider_block_version_and_revision_mutually_exclusive() {
             revision = "main"
         }
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -4988,7 +5641,11 @@ fn parse_let_binding_module_call() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.module_calls.len(), 1);
 
     let call = &result.module_calls[0];
@@ -5005,8 +5662,18 @@ fn module_call_ids_are_equal_across_independent_reparses() {
     let input = "let module = use { source = './module' }\nlet call = module {}\n";
     let path = std::path::Path::new("/tmp/project/main.crn");
 
-    let first = parse_file(input, path, &ProviderContext::default()).expect("first parse");
-    let second = parse_file(input, path, &ProviderContext::default()).expect("second parse");
+    let first = parse_file(
+        input,
+        path,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("first parse");
+    let second = parse_file(
+        input,
+        path,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("second parse");
 
     assert_eq!(first.module_calls[0].id(), second.module_calls[0].id());
 }
@@ -5017,13 +5684,13 @@ fn module_call_ids_distinguish_files_and_authored_spans() {
     let first_file = parse_file(
         input,
         std::path::Path::new("/tmp/project/first.crn"),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("first file");
     let second_file = parse_file(
         input,
         std::path::Path::new("/tmp/project/second.crn"),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("second file");
 
@@ -5054,7 +5721,11 @@ fn parse_module_call_binding_enables_resource_ref() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let sg = &result.resources[0];
     assert_eq!(
         sg.get_attr("group_name"),
@@ -5075,7 +5746,11 @@ fn parse_string_interpolation_simple() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
@@ -5093,7 +5768,11 @@ fn parse_string_interpolation_multiple_exprs() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
@@ -5114,7 +5793,11 @@ fn parse_string_interpolation_with_resource_ref() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = &result.resources[1];
     assert_eq!(
         subnet.get_attr("name"),
@@ -5138,7 +5821,11 @@ fn parse_string_no_interpolation() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
@@ -5155,7 +5842,11 @@ fn parse_string_dollar_without_brace() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
@@ -5172,7 +5863,11 @@ fn parse_string_escaped_interpolation() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
@@ -5195,8 +5890,11 @@ fn parse_empty_interpolation_accepted_as_unknown() {
         }
     "#;
 
-    let result =
-        parse(input, &ProviderContext::default()).expect("empty `${}` must parse, not abort");
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("empty `${}` must parse, not abort");
     let bucket = &result.resources[0];
     let attr = bucket.get_attr("name").expect("name attr");
     let parts = match attr {
@@ -5232,8 +5930,11 @@ fn parse_whitespace_only_interpolation_accepted_as_unknown() {
         }
     ";
 
-    let result = parse(input, &ProviderContext::default())
-        .expect("`${  }` (whitespace-only) must parse, not abort");
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("`${  }` (whitespace-only) must parse, not abort");
     let bucket = &result.resources[0];
     let attr = bucket.get_attr("name").expect("name attr");
     let parts = match attr {
@@ -5262,8 +5963,12 @@ fn parse_whitespace_only_interpolation_accepted_as_unknown() {
 fn empty_interpolation_retains_authored_file_and_original_range() {
     let input = "let a = \"x${}\"\nlet b = <<EOT\nprefix ${}\nEOT\n";
     let source_file = std::path::Path::new("locations.crn");
-    let parsed = parse_file(input, source_file, &ProviderContext::default())
-        .expect("empty interpolations must retain parser provenance");
+    let parsed = parse_file(
+        input,
+        source_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("empty interpolations must retain parser provenance");
 
     let location = |name: &str| {
         let mut locations = Vec::new();
@@ -5301,17 +6006,17 @@ fn empty_interpolation_retains_authored_file_and_original_range() {
 fn parse_interpolation_expression_uses_ordinary_whitespace_rules() {
     let spaced = parse(
         r#"let value = "x-${join('-', ['a'])}""#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("whitespace between interpolation function arguments must parse");
     let compact = parse(
         r#"let value = "x-${join('-',['a'])}""#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("compact interpolation must parse");
     let commented = parse(
         r#"let value = "x-${join('-', /* elements */ ['a'])}""#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("comments between interpolation expression tokens must parse");
 
@@ -5331,12 +6036,12 @@ fn parse_interpolation_expression_uses_ordinary_whitespace_rules() {
 fn parse_interpolation_expression_allows_spaced_operators_and_arguments() {
     let spaced = parse(
         r#"let value = "x-${ ['a', 'b'] |> join('-') }""#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("ordinary expression spacing inside interpolation must parse");
     let compact = parse(
         r#"let value = "x-${['a','b']|>join('-')}""#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("compact operator expression inside interpolation must parse");
 
@@ -5350,7 +6055,7 @@ fn parse_interpolation_expression_allows_spaced_operators_and_arguments() {
 fn parse_interpolation_allows_normal_trivia_at_non_empty_edges() {
     let compact = parse(
         "let x = 'a'\nlet value = \"x-${x}\"",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("compact interpolation must parse");
 
@@ -5368,8 +6073,11 @@ fn parse_interpolation_allows_normal_trivia_at_non_empty_edges() {
             "a line comment after an interpolation expression",
         ),
     ] {
-        let parsed = parse(input, &ProviderContext::default())
-            .unwrap_or_else(|error| panic!("{description} must parse: {error}"));
+        let parsed = parse(
+            input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap_or_else(|error| panic!("{description} must parse: {error}"));
         assert_eq!(
             parsed.variables.get("value"),
             compact.variables.get("value"),
@@ -5382,12 +6090,12 @@ fn parse_interpolation_allows_normal_trivia_at_non_empty_edges() {
 fn parse_interpolation_allows_newlines_inside_expression() {
     let multiline = parse(
         "let value = \"x-${join('-',\n    ['a'])}\"",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("a newline between interpolation function arguments must parse");
     let compact = parse(
         r#"let value = "x-${join('-',['a'])}""#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("compact interpolation must parse");
 
@@ -5398,12 +6106,12 @@ fn parse_interpolation_allows_newlines_inside_expression() {
 
     let multiline_nested_brace = parse(
         "let value = \"x-${{value = 'a'\n}.value}\"",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("a newline before a nested expression brace must not look like edge trivia");
     let compact_nested_brace = parse(
         r#"let value = "x-${{value = 'a'}.value}""#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("compact nested-brace interpolation must parse");
     assert_eq!(
@@ -5416,7 +6124,11 @@ fn parse_interpolation_allows_newlines_inside_expression() {
 fn parse_interpolation_rejects_multiline_empty_body() {
     for input in ["let value = \"x-${\n}\"", "let value = \"x-${ \n }\""] {
         assert!(
-            parse(input, &ProviderContext::default()).is_err(),
+            parse(
+                input,
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty())
+            )
+            .is_err(),
             "an empty interpolation that spans a newline must be rejected: {input:?}"
         );
     }
@@ -5425,7 +6137,11 @@ fn parse_interpolation_rejects_multiline_empty_body() {
 #[test]
 fn parse_interpolation_rejects_comment_only_body() {
     assert!(
-        parse("let value = \"${ /* c */ }\"", &ProviderContext::default()).is_err(),
+        parse(
+            "let value = \"${ /* c */ }\"",
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty())
+        )
+        .is_err(),
         "a comment without an expression must not satisfy interpolation_expr"
     );
 }
@@ -5434,12 +6150,12 @@ fn parse_interpolation_rejects_comment_only_body() {
 fn parse_interpolation_line_comment_consumes_closing_syntax_to_newline() {
     let commented = parse(
         "let x = 'a'\nlet value = \"${x # c }\"\n}\"",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("the interpolation must close on the line after a line comment");
     let compact = parse(
         "let x = 'a'\nlet value = \"${x}\"",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("compact interpolation must parse");
 
@@ -5453,12 +6169,12 @@ fn parse_interpolation_line_comment_consumes_closing_syntax_to_newline() {
 fn parse_heredoc_inside_multiline_interpolation() {
     let heredoc = parse(
         "let value = \"x-${join('-',\n  [<<EOT\nhello\nEOT\n  ])}\"",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("a heredoc expression inside a multiline interpolation must parse");
     let compact = parse(
         "let value = \"x-${join('-', ['hello'])}\"",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("compact equivalent must parse");
 
@@ -5473,7 +6189,11 @@ fn parse_heredoc_interpolation_is_confined_to_one_physical_body_line() {
     for body in ["${\n  name\n}", "${join(\"-\", [name])}", "${ name # c }"] {
         let input = format!("let name = 'value'\nlet value = <<EOT\n{body}\nEOT\n");
         assert!(
-            parse(&input, &ProviderContext::default()).is_err(),
+            parse(
+                &input,
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty())
+            )
+            .is_err(),
             "heredoc interpolation body must follow preprocessed string rules: {body:?}"
         );
     }
@@ -5483,7 +6203,7 @@ fn parse_heredoc_interpolation_is_confined_to_one_physical_body_line() {
 fn parse_heredoc_backslash_does_not_escape_interpolation() {
     let parsed = parse(
         "let name = 'value'\nlet value = <<EOT\n\\${name}\nEOT\n",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("a backslash before `${name}` must not suppress heredoc interpolation");
 
@@ -5508,7 +6228,11 @@ fn parse_empty_interpolation_does_not_break_sibling_bindings() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).expect("must parse");
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("must parse");
     let resource_names: Vec<&str> = result
         .resources
         .iter()
@@ -5534,7 +6258,11 @@ fn parse_string_interpolation_with_bool() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
@@ -5552,7 +6280,11 @@ fn parse_string_interpolation_with_number() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
@@ -5570,7 +6302,11 @@ fn parse_string_interpolation_only_expr() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("tag"),
@@ -5588,7 +6324,11 @@ fn parse_local_let_binding_in_resource_block() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = &result.resources[0];
 
     // Local let binding should NOT appear in attributes
@@ -5618,7 +6358,11 @@ fn parse_local_let_binding_with_interpolation() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = &result.resources[0];
 
     // Local binding should resolve outer scope variable in interpolation.
@@ -5639,7 +6383,11 @@ fn parse_local_let_binding_chain() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = &result.resources[0];
 
     // Chained local bindings should resolve correctly.
@@ -5663,7 +6411,11 @@ fn parse_local_let_binding_with_function_call() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = &result.resources[0];
 
     // Local binding used inside function call
@@ -5687,7 +6439,11 @@ fn parse_local_let_binding_in_anonymous_resource() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = &result.resources[0];
 
     // Local let binding should work in anonymous resources too
@@ -5710,7 +6466,11 @@ fn parse_local_let_binding_in_nested_block() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = &result.resources[0];
 
     // Local binding should be visible in nested blocks
@@ -5738,7 +6498,11 @@ fn parse_for_expression_over_list() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     // for expression expands to individual resources at parse time
     assert_eq!(result.resources.len(), 2);
 
@@ -5784,7 +6548,11 @@ fn parse_for_expression_with_index() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 2);
 
     assert_eq!(
@@ -5841,7 +6609,11 @@ fn parse_for_expression_over_map() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 2);
 
     // Map iteration produces map-keyed addresses in canonical dot
@@ -5863,7 +6635,7 @@ fn eager_for_expansion_assigns_distinct_list_and_map_addresses() {
                 mock.test.resource { name = name }
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
     let list_ids: Vec<_> = list
@@ -5884,7 +6656,7 @@ fn eager_for_expansion_assigns_distinct_list_and_map_addresses() {
                 mock.test.resource { name = name }
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
     let map_ids: Vec<_> = map
@@ -5909,7 +6681,11 @@ fn parse_for_expression_with_local_binding() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 2);
 
     // Local binding should be resolved within each iteration
@@ -5941,7 +6717,11 @@ fn parse_for_expression_with_module_call() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     // for expression with module call should produce module calls, not resources
     assert_eq!(result.module_calls.len(), 2);
@@ -6002,7 +6782,11 @@ fn parse_for_expression_with_module_call_over_list() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     // for expression with module call over list
     assert_eq!(result.module_calls.len(), 2);
@@ -6060,7 +6844,11 @@ fn test_chained_field_access_two_levels() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = &result.resources[1];
     let vpc_id = subnet.get_attr("vpc_id").expect("vpc_id attribute");
     match vpc_id {
@@ -6090,7 +6878,11 @@ fn test_chained_field_access_three_levels() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = &result.resources[1];
     let vpc_id = subnet.get_attr("vpc_id").expect("vpc_id attribute");
     match vpc_id {
@@ -6122,7 +6914,11 @@ fn parse_index_access_with_integer() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let rt = result.resources.last().expect("route_table resource");
     let subnet_id = rt.get_attr("subnet_id").expect("subnet_id attribute");
     match subnet_id {
@@ -6162,7 +6958,11 @@ fn parse_index_access_with_string_key() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = result.resources.last().expect("subnet resource");
     let vpc_id = subnet.get_attr("vpc_id").expect("vpc_id attribute");
     match vpc_id {
@@ -6199,7 +6999,11 @@ fn parse_index_access_with_chained_fields() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = result.resources.last().expect("subnet resource");
     let sg_id = subnet.get_attr("sg_id").expect("sg_id attribute");
     match sg_id {
@@ -6227,7 +7031,11 @@ fn parse_subscript_after_field_access_with_integer() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = result.resources.last().expect("subnet");
     let value = subnet.get_attr("cidr_block").expect("cidr_block");
     match value {
@@ -6257,7 +7065,11 @@ fn parse_subscript_after_field_access_with_string_key() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = result.resources.last().expect("subnet");
     let value = subnet.get_attr("cidr_block").expect("cidr_block");
     match value {
@@ -6290,7 +7102,11 @@ fn parse_chained_subscripts_after_field_access() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = result.resources.last().expect("subnet");
     let value = subnet.get_attr("cidr_block").expect("cidr_block");
     match value {
@@ -6323,7 +7139,11 @@ fn parse_negative_subscript_is_rejected() {
             cidr_block = orgs.accounts[-1]
         }
     "#;
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{:?}", err);
     assert!(
         msg.contains("non-negative"),
@@ -6345,7 +7165,11 @@ fn parse_field_after_subscript_after_field_is_accepted() {
             cidr_block = orgs.accounts[0].id
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = result.resources.last().expect("subnet");
     let value = subnet.get_attr("cidr_block").expect("cidr_block");
     match value {
@@ -6382,7 +7206,11 @@ fn parse_subscript_after_nested_field_access() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = result.resources.last().expect("subnet");
     let value = subnet.get_attr("cidr_block").expect("cidr_block");
     match value {
@@ -6408,7 +7236,11 @@ fn parse_import_block() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.state_blocks.len(), 1);
     match &result.state_blocks[0] {
         StateBlock::Import { to, to_span: _, id } => {
@@ -6446,7 +7278,11 @@ fn parse_import_block_preserves_interpolation_segments() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.state_blocks.len(), 1);
     match &result.state_blocks[0] {
         StateBlock::Import { id, .. } => match id {
@@ -6491,7 +7327,11 @@ fn parse_removed_block() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.state_blocks.len(), 1);
     match &result.state_blocks[0] {
         StateBlock::Removed { from } => {
@@ -6511,7 +7351,11 @@ fn double_quoted_state_block_address_decodes_escapes() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let StateBlock::Removed { from } = &result.state_blocks[0] else {
         panic!("expected removed block");
     };
@@ -6526,8 +7370,11 @@ fn state_block_address_rejects_interpolation() {
         }
     "#;
 
-    let error = parse(input, &ProviderContext::default())
-        .expect_err("interpolation has no meaning in a state block address");
+    let error = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("interpolation has no meaning in a state block address");
     assert!(
         error.to_string().contains("interpolation is not allowed"),
         "unexpected error: {error}"
@@ -6540,8 +7387,11 @@ fn empty_removed_identity_reports_its_source_line_and_reason_once() {
 removed { from = mock.test.resource "" }
 "#;
 
-    let error = parse(input, &ProviderContext::default())
-        .expect_err("an empty removed-block identity must be rejected");
+    let error = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("an empty removed-block identity must be rejected");
 
     assert_eq!(
         error.to_string(),
@@ -6566,7 +7416,11 @@ fn parse_moved_block() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.state_blocks.len(), 1);
     match &result.state_blocks[0] {
         StateBlock::Moved { addresses } => {
@@ -6592,7 +7446,11 @@ fn parse_moved_block_rejects_different_resource_types() {
         }
     "#;
 
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     assert_eq!(
         err.to_string(),
         "Invalid expression at line 0: moved block requires 'from' and 'to' to use the same provider and resource type (got 'aws.svc.Source' and 'aws.svc.Dest'); a provider or resource type change is not a move. Remove the moved block and let the plan delete and create the resource, or use 'removed' and 'import' to preserve the existing cloud resource"
@@ -6608,7 +7466,11 @@ fn parse_moved_block_rejects_different_providers() {
         }
     "#;
 
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     assert_eq!(
         err.to_string(),
         "Invalid expression at line 0: moved block requires 'from' and 'to' to use the same provider and resource type (got 'aws.svc.X' and 'awscc.svc.X'); a provider or resource type change is not a move. Remove the moved block and let the plan delete and create the resource, or use 'removed' and 'import' to preserve the existing cloud resource"
@@ -6651,8 +7513,11 @@ fn moved_block_accepts_three_map_key_address_forms() {
             "#,
             to_clause
         );
-        let result = parse(&input, &ProviderContext::default())
-            .unwrap_or_else(|e| panic!("parse failed for {label}: {e:?}"));
+        let result = parse(
+            &input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap_or_else(|e| panic!("parse failed for {label}: {e:?}"));
         assert_eq!(result.state_blocks.len(), 1);
         match &result.state_blocks[0] {
             StateBlock::Moved { addresses } => {
@@ -6680,7 +7545,11 @@ fn moved_block_keeps_non_identifier_safe_key_in_quoted_form() {
             to   = awscc.sso.Assignment '_envs["prod-east"]'
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     match &result.state_blocks[0] {
         StateBlock::Moved { addresses } => {
             let to = addresses.to();
@@ -6708,7 +7577,11 @@ fn for_expression_over_map_uses_canonical_dot_form() {
             }
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let names: Vec<&str> = result
         .resources
         .iter()
@@ -6732,7 +7605,11 @@ fn parse_for_expression_with_keys_function_call() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     // keys({Name = "web", Env = "prod"}) should evaluate to ["Env", "Name"] (sorted)
     assert_eq!(result.resources.len(), 2);
     assert_eq!(
@@ -6774,7 +7651,11 @@ fn parse_for_expression_with_values_function_call() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     // values() returns values sorted by key: prod, staging
     assert_eq!(result.resources.len(), 2);
     assert_eq!(
@@ -6801,7 +7682,11 @@ fn parse_for_expression_with_concat_function_call() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 2);
     // concat(items, base_list) => base_list ++ items
     // So concat(["10.0.0.0/16"], ["10.1.0.0/16"]) => ["10.1.0.0/16", "10.0.0.0/16"]
@@ -6834,7 +7719,10 @@ fn parse_for_expression_with_runtime_function_call_errors() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -6849,8 +7737,11 @@ fn invalid_for_iterable_truncates_unicode_by_chars_and_renders_as_a_literal() {
     let value = format!("{}あいう", "a".repeat(49));
     let input = format!("for item in (\"{value}\") {{ awscc.ec2.Vpc {{ name = item }} }}");
 
-    let error = parse(&input, &ProviderContext::default())
-        .expect_err("a string cannot be used as a for iterable");
+    let error = parse(
+        &input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("a string cannot be used as a for iterable");
     let expected = format!("iterable is string '{}あ'… (expected list)", "a".repeat(49));
 
     assert!(
@@ -6871,7 +7762,11 @@ fn parse_if_true_condition_includes_resource() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0]
@@ -6896,7 +7791,11 @@ fn parse_if_false_condition_no_resource() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 0);
 }
 
@@ -6914,7 +7813,11 @@ fn parse_if_else_true_uses_if_branch() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
@@ -6938,7 +7841,11 @@ fn parse_if_else_false_uses_else_branch() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
@@ -6958,7 +7865,11 @@ fn parse_if_else_value_expression() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 0);
     // The binding should be set to the value from the true branch
     // We verify by using the variable in a resource
@@ -6974,7 +7885,11 @@ fn parse_if_else_value_expression() {
         }
     "#;
 
-    let result2 = parse(input2, &ProviderContext::default()).unwrap();
+    let result2 = parse(
+        input2,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result2.resources[0].get_attr("instance_type"),
         Some(&Value::Concrete(ConcreteValue::String("m5.xlarge".into())))
@@ -6995,7 +7910,11 @@ fn parse_if_else_value_expression_false_branch() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("instance_type"),
         Some(&Value::Concrete(ConcreteValue::String("t3.micro".into())))
@@ -7014,7 +7933,11 @@ fn parse_if_with_variable_condition() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
 }
 
@@ -7028,7 +7951,10 @@ fn parse_if_non_bool_condition_errors() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -7042,9 +7968,10 @@ fn parse_if_non_bool_condition_errors() {
 fn parse_if_env_condition_reports_only_the_string_type() {
     let variable = "CARINA_3849_IF_CONDITION";
     let plaintext = "hunter2SECRET";
-    unsafe {
-        std::env::set_var(variable, plaintext);
-    }
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::new([(
+        variable.to_string(),
+        plaintext.into(),
+    )]));
     let input = format!(
         r#"
         let alarm = if env('{variable}') {{
@@ -7055,10 +7982,7 @@ fn parse_if_env_condition_reports_only_the_string_type() {
     "#
     );
 
-    let error = parse(&input, &ProviderContext::default()).expect_err("non-bool condition");
-    unsafe {
-        std::env::remove_var(variable);
-    }
+    let error = parse(&input, &config).expect_err("non-bool condition");
     let message = error.to_string();
 
     assert!(!message.contains(plaintext), "message leaked: {message}");
@@ -7080,7 +8004,10 @@ fn parse_if_resource_ref_condition_errors() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -7097,7 +8024,7 @@ fn parse_if_module_argument_defers_value_selection() {
             arguments { flag: Bool }
             let choice = if flag { "yes" } else { "no" }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("a Bool module argument may select a value branch during expansion");
     assert!(matches!(
@@ -7117,7 +8044,7 @@ fn parse_if_module_argument_defers_structural_selection() {
                 mock.test.Thing { name = "no" }
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("a Bool module argument may select a resource branch during expansion");
     assert_eq!(parsed.deferred_module_ifs.len(), 1);
@@ -7144,7 +8071,7 @@ fn parse_if_module_argument_defers_nested_value_carriers() {
                 ]
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("deferred value conditionals may appear in every recursive value carrier");
 
@@ -7179,7 +8106,7 @@ fn parse_if_module_argument_through_pure_user_function_is_deferred() {
             fn identity(value: Bool): Bool { value }
             let choice = if identity(flag) { "yes" } else { "no" }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("a pure user function of a module argument remains module-dependent");
     assert!(matches!(
@@ -7196,7 +8123,7 @@ fn parse_if_static_pure_function_with_handle_argument_keeps_head_behavior() {
             fn always_true(value: mock.test.Thing): Bool { true }
             let choice = if always_true(source) { "yes" } else { "no" }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("is_static_value-accepted handle arguments must remain valid in root conditions");
 
@@ -7222,8 +8149,11 @@ fn parse_if_runtime_conditions_keep_static_parse_error() {
                 let choice = {condition}
             "#,
         );
-        let error = parse(&input, &ProviderContext::default())
-            .expect_err("resource-dependent conditions must remain parse errors");
+        let error = parse(
+            &input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("resource-dependent conditions must remain parse errors");
         assert!(
             error.to_string().contains(
                 "if condition depends on a runtime value; condition must be statically known at parse time"
@@ -7245,8 +8175,11 @@ fn parse_if_user_function_body_with_runtime_reference_keeps_static_parse_error()
         let choice = if selected(flag) { "yes" } else { "no" }
     "#;
 
-    let error = parse(input, &ProviderContext::default())
-        .expect_err("a runtime reference inside a function body must dominate its module argument");
+    let error = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("a runtime reference inside a function body must dominate its module argument");
     assert!(
         error.to_string().contains(
             "if condition depends on a runtime value; condition must be statically known at parse time"
@@ -7265,7 +8198,7 @@ let choice = if runtime.ready { "yes" } else { "no" }
     let error = super::parse_file(
         source,
         std::path::Path::new("module/main.crn"),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("runtime conditions in module templates must still fail while parsing");
 
@@ -7286,7 +8219,7 @@ fn parse_if_module_argument_value_without_else_is_rejected() {
             arguments { flag: Bool }
             let choice = if flag { "yes" }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("value conditionals require an else branch");
 
@@ -7309,7 +8242,7 @@ fn parse_if_module_argument_resource_without_else_is_deferred() {
                 mock.test.Thing { name = "yes" }
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("a false structural branch may contribute no resource");
     assert_eq!(parsed.deferred_module_ifs.len(), 1);
@@ -7344,8 +8277,11 @@ fn parse_if_module_argument_rejects_mixed_value_and_structural_branches() {
     ];
 
     for (input, expected) in cases {
-        let error = parse(input, &ProviderContext::default())
-            .expect_err("a binding category cannot depend on a caller argument");
+        let error = parse(
+            input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("a binding category cannot depend on a caller argument");
         assert!(
             matches!(
                 error,
@@ -7362,8 +8298,11 @@ fn parse_if_static_value_without_else_is_rejected_in_statement_position() {
     let expected = "an `if` that produces a value must have an `else` branch, because there is no value to use when the condition is false; add `else { <value> }`";
     for condition in ["true", "false"] {
         let input = format!("let choice = if {condition} {{ 'yes' }}\n");
-        let error = parse(&input, &ProviderContext::default())
-            .expect_err("statement-position value conditionals require an else branch");
+        let error = parse(
+            &input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("statement-position value conditionals require an else branch");
         assert!(
             matches!(
                 error,
@@ -7400,8 +8339,11 @@ fn parse_if_static_rejects_mixed_value_and_structural_branches() {
                     }}
                 "#,
             );
-            let error = parse(&input, &ProviderContext::default())
-                .expect_err("a root binding category cannot depend on branch selection");
+            let error = parse(
+                &input,
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .expect_err("a root binding category cannot depend on branch selection");
             assert!(
                 matches!(
                     error,
@@ -7439,7 +8381,7 @@ let nested = if flag {
         let error = super::parse_file(
             source,
             std::path::Path::new("module/main.crn"),
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap_err();
         assert!(
@@ -7468,8 +8410,11 @@ fn parse_if_rejects_resource_producing_for_branches_for_static_conditions() {
 }}
 "#,
         );
-        let error = parse(&source, &ProviderContext::default())
-            .expect_err("a resource-producing for cannot be an if branch");
+        let error = parse(
+            &source,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("a resource-producing for cannot be an if branch");
         assert!(
             matches!(
                 error,
@@ -7517,8 +8462,11 @@ let selected = if flag {
     ];
 
     for (label, source) in cases {
-        let error = parse(source, &ProviderContext::default())
-            .expect_err("a resource-producing for cannot be an if branch");
+        let error = parse(
+            source,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("a resource-producing for cannot be an if branch");
         assert!(
             matches!(
                 error,
@@ -7541,7 +8489,11 @@ fn parse_if_with_module_call() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.module_calls.len(), 1);
     assert_eq!(result.module_calls[0].module_name, "web");
 }
@@ -7556,7 +8508,11 @@ fn parse_if_false_with_module_call() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.module_calls.len(), 0);
 }
 
@@ -7571,7 +8527,11 @@ fn parse_if_with_local_binding() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("alarm_name"),
@@ -7589,7 +8549,11 @@ fn parse_if_else_value_expr_in_attribute_true() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
@@ -7609,7 +8573,11 @@ fn parse_if_else_value_expr_in_attribute_false() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
@@ -7629,9 +8597,12 @@ fn parse_if_value_expr_no_else_true_errors() {
         }
     "#;
 
-    let error = parse(input, &ProviderContext::default())
-        .expect_err("value if without else must be rejected")
-        .to_string();
+    let error = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("value if without else must be rejected")
+    .to_string();
     assert!(
         error.contains("an `if` that produces a value must have an `else` branch, because there is no value to use when the condition is false; add `else { <value> }`"),
         "unexpected missing-else error: {error}"
@@ -7647,7 +8618,10 @@ fn parse_if_value_expr_no_else_false_errors() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -7668,7 +8642,7 @@ fn if_value_expr_rejects_structural_handle_as_a_module_argument() {
                 vpc = if true { primary } else { fallback }
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("an if value branch must cross the ordinary Value boundary");
 
@@ -7686,7 +8660,7 @@ fn postfix_if_value_expr_rejects_structural_handle_before_field_access() {
             let fallback = mock.test.Network { name = "fallback" }
             let selected = (if true { primary } else { fallback }).id
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("postfix access must not make a structural if branch into a value");
 
@@ -7705,7 +8679,7 @@ fn if_value_expr_preserves_pending_bare_use_in_a_typed_resource_sink() {
                 name = if true { network } else { "fallback" }
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("typed structural branches stay pending for the binding-use authority");
 
@@ -7734,7 +8708,7 @@ fn unbound_for_elements_are_pending_and_unbound() {
             }
         }
     "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
 
@@ -7776,7 +8750,7 @@ fn unbound_for_legacy_addresses_match_old_spelling() {
             }
         }
     "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
 
@@ -7806,7 +8780,7 @@ fn unbound_if_is_pending_and_unbound() {
             }
         }
     "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
 
@@ -7834,7 +8808,7 @@ fn unbound_loop_module_call_is_anonymous() {
             web { vpc_cidr = cidr }
         }
     "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
 
@@ -7861,7 +8835,7 @@ fn unbound_for_read_requires_let() {
             read mock.test.Resource { name = name }
         }
     "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("an unbound for cannot create an addressable read");
 
@@ -7888,7 +8862,7 @@ fn unbound_if_read_requires_let() {
             read mock.test.Resource { name = "example" }
         }
     "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("an unbound if cannot create an addressable read");
 
@@ -7919,7 +8893,7 @@ fn deferred_unbound_target_round_trips() {
             }
         }
     "#,
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap(),
     );
@@ -7942,7 +8916,11 @@ fn parse_top_level_for_expression() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 2);
 
     // Each resource should have the loop variable substituted
@@ -7971,7 +8949,11 @@ fn parse_top_level_if_expression() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("alarm_name"),
@@ -7994,7 +8976,11 @@ fn parse_top_level_multiple_for_no_collision() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 4);
 
     // Live identities are anonymous and pending. The migration-only legacy
@@ -8034,7 +9020,11 @@ fn parse_top_level_for_uses_iterable_name_as_binding() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 2);
 
     assert!(
@@ -8072,8 +9062,13 @@ fn parse_top_level_for_uses_last_segment_of_dotted_iterable() {
         }
     "#;
 
-    let result =
-        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
+    let result = cross_deferred_for_resolution_seam(
+        parse(
+            input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap(),
+    );
     // Deferred (upstream_state not resolved), so no concrete resources
     // but the deferred target should retain _accounts only as migration provenance.
     let DeferredForTarget::Unbound { template } = result.deferred_for_expressions()[0].target()
@@ -8093,7 +9088,11 @@ fn parse_top_level_for_literal_list_uses_counter_fallback() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert!(
         result
             .resources
@@ -8127,7 +9126,11 @@ fn parse_top_level_if_false_no_resources() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 0);
 }
 
@@ -8141,7 +9144,11 @@ fn parse_arguments_block_form_description_only() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.arguments.len(), 1);
     assert_eq!(result.arguments[0].name, "vpc");
     assert_eq!(
@@ -8168,7 +9175,11 @@ fn parse_arguments_block_form_description_and_default() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.arguments.len(), 1);
     assert_eq!(result.arguments[0].name, "port");
     assert_eq!(result.arguments[0].static_type, known(TypeExpr::Int));
@@ -8199,7 +9210,11 @@ fn parse_arguments_mixed_simple_and_block_form() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.arguments.len(), 3);
 
     // Simple form (unchanged)
@@ -8247,7 +9262,11 @@ fn parse_arguments_simple_form_has_no_description() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.arguments.len(), 2);
     assert!(result.arguments[0].description.is_none());
     assert!(result.arguments[1].description.is_none());
@@ -8263,7 +9282,11 @@ fn parse_accepts_pascal_case_primitives() {
             d: Float
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.arguments[0].static_type, known(TypeExpr::String));
     assert_eq!(result.arguments[1].static_type, known(TypeExpr::Int));
     assert_eq!(result.arguments[2].static_type, known(TypeExpr::Bool));
@@ -8280,7 +9303,11 @@ fn parse_still_accepts_lowercase_primitives_during_transition() {
             d: Float
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.arguments[0].static_type, known(TypeExpr::String));
     assert_eq!(result.arguments[1].static_type, known(TypeExpr::Int));
     assert_eq!(result.arguments[2].static_type, known(TypeExpr::Bool));
@@ -8296,7 +9323,11 @@ fn parse_accepts_pascal_case_custom_types() {
             bucket_arn: Arn
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.arguments[0].static_type,
         known(crate::parser::bare_type_for_test(
@@ -8321,7 +9352,11 @@ fn parse_three_segment_resource_path_is_ref() {
             bucket: aws.s3.Bucket
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     match expect_known(&result.arguments[0].static_type) {
         TypeExpr::DottedUnresolved(path) => {
             assert_eq!(path.provider, "aws");
@@ -8345,7 +9380,11 @@ fn parse_four_segment_path_with_pascal_tail_is_dotted_unresolved() {
             vpc_id: awscc.ec2.VpcId
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert!(matches!(
         result.arguments[0].static_type,
         TypeExpr::DottedUnresolved(_)
@@ -8358,7 +9397,11 @@ fn type_expr_ref_display_roundtrips_three_segment_path() {
     assert_eq!(ty.to_string(), "aws.ec2.Vpc");
 
     let input = format!(r#"arguments {{ v: {} }}"#, ty);
-    let parsed = parse(&input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        &input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         parsed.arguments[0].static_type,
         known(TypeExpr::DottedUnresolved(ResourceTypePath::new(
@@ -8373,7 +9416,11 @@ fn parser_rejects_lowercase_primitive_after_phase_c() {
     // rejection, so the type annotation below must NOT be mechanically
     // rewritten to PascalCase.
     let input = "arguments { a: string }";
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("unknown type 'string'") && msg.contains("'String'"),
@@ -8384,7 +9431,11 @@ fn parser_rejects_lowercase_primitive_after_phase_c() {
 #[test]
 fn parser_rejects_snake_case_custom_type_after_phase_c() {
     let input = "arguments { a: aws_account_id }";
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("unknown type 'aws_account_id'") && !msg.contains("'AwsAccountId'"),
@@ -8400,7 +9451,11 @@ fn parser_does_not_warn_on_new_spelling() {
             b: AwsAccountId
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert!(
         !result
             .warnings
@@ -8421,7 +9476,11 @@ fn parse_arguments_block_form_default_only() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.arguments.len(), 1);
     assert_eq!(result.arguments[0].name, "port");
     assert_eq!(
@@ -8439,7 +9498,11 @@ fn parse_arguments_block_form_empty_block() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.arguments.len(), 1);
     assert_eq!(result.arguments[0].name, "port");
     assert!(result.arguments[0].default.is_none());
@@ -8457,7 +9520,11 @@ fn parse_arguments_block_form_string_default_not_confused_with_description() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.arguments.len(), 1);
     assert_eq!(result.arguments[0].name, "name");
     assert_eq!(result.arguments[0].static_type, known(TypeExpr::String));
@@ -8486,7 +9553,11 @@ fn parse_arguments_block_form_validation_block() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.arguments.len(), 1);
     let arg = &result.arguments[0];
     assert_eq!(arg.name, "port");
@@ -8538,7 +9609,11 @@ fn parse_require_and_argument_validation_integer_arithmetic() {
         }
         require count / 2 >= 1, "count must be at least two"
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     let ValidateExpr::Compare { lhs, op, rhs } = &result.arguments[0].validations[0].condition
     else {
@@ -8579,7 +9654,11 @@ fn validation_integer_operator_spans_use_original_lines_after_heredoc() {
                  }\n\
                  }\n\
                  require count / 2 >= 1, \"x\"\n";
-    let result = parse(input, &ProviderContext::default()).expect("fixture must parse");
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("fixture must parse");
 
     let ValidateExpr::Compare { lhs, .. } = &result.arguments[0].validations[0].condition else {
         panic!("validation must retain its comparison");
@@ -8616,7 +9695,11 @@ fn parse_arguments_block_form_validate_no_description() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.arguments.len(), 1);
     let arg = &result.arguments[0];
     assert_eq!(arg.validations.len(), 1);
@@ -8637,7 +9720,11 @@ fn parse_arguments_block_form_validate_with_not() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.arguments[0].validations.len(), 1);
 }
 
@@ -8654,7 +9741,11 @@ fn parse_arguments_block_form_validate_with_or() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     match &result.arguments[0].validations[0].condition {
         ValidateExpr::Or(_, _) => {}
         other => panic!("Expected Or, got {:?}", other),
@@ -8674,7 +9765,11 @@ fn parse_arguments_block_form_validate_with_len() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.arguments[0].validations.len(), 1);
     assert_eq!(
         result.arguments[0].validations[0].error_message.as_deref(),
@@ -8699,7 +9794,11 @@ fn parse_arguments_block_form_multiple_validation_blocks() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.arguments[0].validations.len(), 2);
     assert_eq!(
         result.arguments[0].validations[0].error_message.as_deref(),
@@ -8772,7 +9871,11 @@ fn user_fn_simple_call() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("name"),
@@ -8798,7 +9901,11 @@ fn user_fn_with_default_param() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -8824,7 +9931,11 @@ fn user_fn_with_local_let() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -8845,7 +9956,11 @@ fn user_fn_calling_builtin() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String("HELLO".into()))),
@@ -8868,7 +9983,11 @@ fn user_fn_calling_another_fn() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -8889,7 +10008,10 @@ fn user_fn_recursive_call_errors() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -8910,7 +10032,10 @@ fn user_fn_missing_required_arg_errors() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -8931,7 +10056,10 @@ fn user_fn_too_many_args_errors() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -8948,7 +10076,10 @@ fn user_fn_shadows_builtin_errors() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -8969,7 +10100,10 @@ fn user_fn_duplicate_definition_errors() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -8986,7 +10120,11 @@ fn user_fn_stored_in_parsed_file() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert!(result.user_functions.contains_key("greet"));
     let func = &result.user_functions["greet"];
     assert_eq!(func.name, "greet");
@@ -9006,7 +10144,11 @@ fn user_fn_no_params() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String("hello".into()))),
@@ -9029,7 +10171,10 @@ fn user_fn_indirect_recursion_errors() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -9046,7 +10191,10 @@ fn user_fn_required_param_after_optional_errors() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -9067,7 +10215,11 @@ fn user_fn_with_pipe_operator() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -9090,7 +10242,11 @@ fn user_fn_with_string_interpolation() {
 
     // The greet() call evaluates to "hello world", which folds into
     // the surrounding "-suffix" literal.
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let name = result.resources[0].get_attr("name").unwrap();
     assert_eq!(
         name,
@@ -9110,7 +10266,11 @@ fn user_fn_interpolation_substitutes_param_inside_string() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -9132,7 +10292,11 @@ fn user_fn_interpolation_substitutes_local_inside_string() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -9153,7 +10317,11 @@ fn user_fn_typed_param_string() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("name"),
@@ -9175,7 +10343,11 @@ fn user_fn_typed_param_type_mismatch() {
         }
     "#;
 
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert_eq!(
         msg,
@@ -9195,7 +10367,11 @@ fn user_fn_typed_param_int() {
         }
     "#;
 
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert_eq!(
         msg,
@@ -9215,7 +10391,10 @@ fn user_fn_float_param_accepts_int_widening() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default());
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         parsed.is_ok(),
         "an Int function argument must widen to Float: {:?}",
@@ -9235,9 +10414,12 @@ let result = mock.test.resource {{
 "#
         );
 
-        let error = parse(&input, &ProviderContext::default())
-            .expect_err("a concrete String builtin result must not satisfy Int")
-            .to_string();
+        let error = parse(
+            &input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("a concrete String builtin result must not satisfy Int")
+        .to_string();
         assert!(
             error.contains("function 'f': parameter 'x': expected Int, got string"),
             "{label}: {error}"
@@ -9252,7 +10434,7 @@ fn user_fn_evaluated_decrypt_result_is_redacted_at_parameter_boundary() {
         decryptor: Some(std::sync::Arc::new(|_, _| {
             Ok("hunter2plaintext".to_string())
         })),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     };
     let input = r#"
 fn f(x: Int): String { 'ok' }
@@ -9278,7 +10460,7 @@ fn user_fn_evaluated_decrypt_result_is_redacted_at_return_boundary() {
         decryptor: Some(std::sync::Arc::new(|_, _| {
             Ok("hunter2plaintext".to_string())
         })),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     };
     let input = r#"
 fn f(): Int { decrypt('ciphertext') }
@@ -9305,9 +10487,12 @@ let result = mock.test.resource {
 }
 "#;
 
-    let error = parse(input, &ProviderContext::default())
-        .expect_err("a secret String must not satisfy an Int parameter")
-        .to_string();
+    let error = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("a secret String must not satisfy an Int parameter")
+    .to_string();
     assert!(
         error.contains("function 'g': parameter 'x': expected Int, got secret"),
         "{error}"
@@ -9327,8 +10512,11 @@ let result = mock.test.resource {
 }
 "#;
 
-    parse(input, &ProviderContext::default())
-        .expect("length(list) returns an Int accepted by an Int parameter");
+    parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("length(list) returns an Int accepted by an Int parameter");
 }
 
 #[test]
@@ -9343,9 +10531,12 @@ fn user_fn_list_param_checks_element_types() {
         }
     "#;
 
-    let error = parse(input, &ProviderContext::default())
-        .expect_err("a String element must not satisfy list(Int)")
-        .to_string();
+    let error = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("a String element must not satisfy list(Int)")
+    .to_string();
     assert!(error.contains("list element 0"), "{error}");
 }
 
@@ -9361,7 +10552,11 @@ fn user_fn_typed_param_with_default() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -9382,7 +10577,11 @@ fn user_fn_mixed_typed_and_untyped() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String("prod-web".into()))),
@@ -9401,7 +10600,11 @@ fn user_fn_typed_param_bool_mismatch() {
         }
     "#;
 
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert_eq!(
         msg,
@@ -9432,7 +10635,10 @@ fn typed_user_fn_accepts_value_unknown_in_deferred_for_body() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_ok(),
         "deferred-for body must accept typed user fn called with Unknown loop var, got: {:?}",
@@ -9461,7 +10667,10 @@ fn typed_return_user_fn_accepts_value_unknown_in_deferred_for_body() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_ok(),
         "typed-return user fn must accept Unknown propagation, got: {:?}",
@@ -9477,7 +10686,11 @@ fn user_fn_param_type_stored_in_parsed_file() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let func = result.user_functions.get("greet").unwrap();
     assert_eq!(func.params[0].param_type, Some(TypeExpr::String));
     assert_eq!(func.params[1].param_type, Some(TypeExpr::Int));
@@ -9491,7 +10704,11 @@ fn user_fn_untyped_param_type_is_none() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let func = result.user_functions.get("greet").unwrap();
     assert_eq!(func.params[0].param_type, None);
 }
@@ -9508,7 +10725,11 @@ fn user_fn_return_type_string() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let func = result.user_functions.get("greet").unwrap();
     assert_eq!(func.return_type, Some(TypeExpr::String));
 }
@@ -9521,7 +10742,11 @@ fn user_fn_return_type_none_when_omitted() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let func = result.user_functions.get("greet").unwrap();
     assert_eq!(func.return_type, None);
 }
@@ -9538,7 +10763,11 @@ fn user_fn_return_type_mismatch_value() {
         }
     "#;
 
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert_eq!(
         msg,
@@ -9558,7 +10787,10 @@ fn user_fn_float_return_accepts_int_widening() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default());
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         parsed.is_ok(),
         "an Int function return must widen to Float: {:?}",
@@ -9578,9 +10810,12 @@ fn user_fn_list_return_checks_element_types() {
         }
     "#;
 
-    let error = parse(input, &ProviderContext::default())
-        .expect_err("a String element must not satisfy list(Int)")
-        .to_string();
+    let error = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("a String element must not satisfy list(Int)")
+    .to_string();
     assert!(error.contains("list element 0"), "{error}");
 }
 
@@ -9595,9 +10830,12 @@ fn user_fn_literal_union_checks_parameters_and_returns() {
             name = environment("stg")
         }
     "#;
-    let error = parse(bad_argument, &ProviderContext::default())
-        .expect_err("an out-of-set function argument must be rejected")
-        .to_string();
+    let error = parse(
+        bad_argument,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("an out-of-set function argument must be rejected")
+    .to_string();
     assert!(error.contains("'dev' | 'prod'"), "{error}");
 
     let bad_return = r#"
@@ -9609,9 +10847,12 @@ fn user_fn_literal_union_checks_parameters_and_returns() {
             name = environment()
         }
     "#;
-    let error = parse(bad_return, &ProviderContext::default())
-        .expect_err("an out-of-set function return must be rejected")
-        .to_string();
+    let error = parse(
+        bad_return,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("an out-of-set function return must be rejected")
+    .to_string();
     assert!(error.contains("'dev' | 'prod'"), "{error}");
 }
 
@@ -9623,7 +10864,11 @@ fn parse_custom_schema_type_in_fn_param() {
             cidr_block
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let func = result.user_functions.get("format_cidr").unwrap();
     assert_eq!(func.params[0].name, "cidr_block");
     assert_eq!(
@@ -9639,7 +10884,11 @@ fn parse_ipv4_address_type_in_fn_param() {
             addr
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let func = result.user_functions.get("f").unwrap();
     assert_eq!(
         func.params[0].param_type,
@@ -9656,7 +10905,11 @@ fn parse_arn_type_in_fn_param() {
             role
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let func = result.user_functions.get("f").unwrap();
     assert_eq!(
         func.params[0].param_type,
@@ -9671,7 +10924,11 @@ fn parse_custom_type_in_list_generic() {
             cidrs
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let func = result.user_functions.get("f").unwrap();
     assert_eq!(
         func.params[0].param_type,
@@ -9694,7 +10951,11 @@ fn parse_custom_type_in_module_arguments() {
             cidr_block = vpc_cidr
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.arguments[0].name, "vpc_cidr");
     assert_eq!(
         result.arguments[0].static_type,
@@ -9721,7 +10982,11 @@ fn parse_custom_type_in_attributes() {
             cidr_block = "10.0.0.0/16"
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.attribute_params[0].static_type,
         known_opt(crate::parser::bare_type_for_test("ipv4_cidr".to_string()))
@@ -9778,7 +11043,10 @@ fn user_fn_domain_name_custom_types_validate_arguments() {
         let input = format!(
             "fn f(domain: {type_name}) {{ domain }}\nlet b = aws.s3_bucket {{ name = f({domain:?}) }}"
         );
-        let result = parse(&input, &ProviderContext::default());
+        let result = parse(
+            &input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         if valid {
             assert!(result.is_ok(), "{type_name}: {domain:?}: {result:?}");
         } else {
@@ -9800,7 +11068,10 @@ fn user_fn_https_url_custom_type_validates_arguments() {
     ] {
         let input =
             format!("fn f(url: HttpsUrl) {{ url }}\nlet b = aws.s3_bucket {{ name = f({url:?}) }}");
-        let result = parse(&input, &ProviderContext::default());
+        let result = parse(
+            &input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         if valid {
             assert!(result.is_ok(), "{url:?}: {result:?}");
         } else {
@@ -9821,7 +11092,10 @@ fn user_fn_https_url_custom_type_validates_return_values() {
     ] {
         let input =
             format!("fn f(): HttpsUrl {{ {url:?} }}\nlet b = aws.s3_bucket {{ name = f() }}");
-        let result = parse(&input, &ProviderContext::default());
+        let result = parse(
+            &input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         if valid {
             assert!(result.is_ok(), "{url:?}: {result:?}");
         } else {
@@ -9843,7 +11117,10 @@ fn user_fn_custom_type_cidr_arg_valid() {
             name = f("10.0.0.0/16")
         }
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
 }
 
@@ -9856,7 +11133,11 @@ fn user_fn_custom_type_cidr_arg_invalid() {
             name = f("invalid")
         }
     "#;
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("parameter 'x': expected Ipv4Cidr"),
@@ -9873,7 +11154,10 @@ fn user_fn_custom_type_ipv4_address_arg_valid() {
             name = f("10.0.0.1")
         }
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
 }
 
@@ -9886,7 +11170,11 @@ fn user_fn_custom_type_ipv4_address_arg_invalid() {
             name = f("invalid")
         }
     "#;
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("parameter 'x': expected Ipv4Address"),
@@ -9903,7 +11191,10 @@ fn user_fn_custom_type_ipv6_cidr_arg_valid() {
             name = f("2001:db8::/32")
         }
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
 }
 
@@ -9916,7 +11207,11 @@ fn user_fn_custom_type_ipv6_cidr_arg_invalid() {
             name = f("invalid")
         }
     "#;
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("parameter 'x': expected Ipv6Cidr"),
@@ -9933,7 +11228,10 @@ fn user_fn_custom_type_ipv6_address_arg_valid() {
             name = f("2001:db8::1")
         }
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
 }
 
@@ -9946,7 +11244,10 @@ fn user_fn_custom_type_http_response_status_code_arg_valid() {
             name = f("200")
         }
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
 }
 
@@ -9959,7 +11260,11 @@ fn user_fn_custom_type_http_response_status_code_arg_invalid() {
             name = f("nonsense")
         }
     "#;
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("parameter 'x': expected HttpResponseStatusCode"),
@@ -9976,7 +11281,10 @@ fn user_fn_custom_type_redirect_protocol_arg_valid_invalid() {
             name = f("#{protocol}")
         }
     "##;
-    let result = parse(valid, &ProviderContext::default());
+    let result = parse(
+        valid,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
 
     let invalid = r##"
@@ -9986,7 +11294,11 @@ fn user_fn_custom_type_redirect_protocol_arg_valid_invalid() {
             name = f("#{path}")
         }
     "##;
-    let err = parse(invalid, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        invalid,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("parameter 'x': expected RedirectProtocol"),
@@ -10003,7 +11315,10 @@ fn user_fn_custom_type_redirect_host_arg_valid_invalid() {
             name = f("www-#{host}")
         }
     "##;
-    let result = parse(valid, &ProviderContext::default());
+    let result = parse(
+        valid,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
 
     let invalid = r##"
@@ -10013,7 +11328,11 @@ fn user_fn_custom_type_redirect_host_arg_valid_invalid() {
             name = f("#{path}")
         }
     "##;
-    let err = parse(invalid, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        invalid,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("parameter 'x': expected RedirectHost"),
@@ -10030,7 +11349,10 @@ fn user_fn_custom_type_redirect_port_arg_valid_invalid() {
             name = f("#{port}")
         }
     "##;
-    let result = parse(valid, &ProviderContext::default());
+    let result = parse(
+        valid,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
 
     let invalid = r##"
@@ -10040,7 +11362,11 @@ fn user_fn_custom_type_redirect_port_arg_valid_invalid() {
             name = f("65536")
         }
     "##;
-    let err = parse(invalid, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        invalid,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("parameter 'x': expected RedirectPort"),
@@ -10057,7 +11383,10 @@ fn user_fn_custom_type_redirect_path_arg_valid_invalid() {
             name = f("/#{host}/#{path}")
         }
     "##;
-    let result = parse(valid, &ProviderContext::default());
+    let result = parse(
+        valid,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
 
     let invalid = r##"
@@ -10067,7 +11396,11 @@ fn user_fn_custom_type_redirect_path_arg_valid_invalid() {
             name = f("#{path}")
         }
     "##;
-    let err = parse(invalid, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        invalid,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("parameter 'x': expected RedirectPath"),
@@ -10084,7 +11417,10 @@ fn user_fn_custom_type_redirect_query_arg_valid_invalid() {
             name = f("next=#{path}&q=#{query}")
         }
     "##;
-    let result = parse(valid, &ProviderContext::default());
+    let result = parse(
+        valid,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
 
     let invalid = r##"
@@ -10094,7 +11430,11 @@ fn user_fn_custom_type_redirect_query_arg_valid_invalid() {
             name = f("#{bogus}")
         }
     "##;
-    let err = parse(invalid, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        invalid,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("parameter 'x': expected RedirectQuery"),
@@ -10111,7 +11451,11 @@ fn user_fn_custom_type_ipv6_address_arg_invalid() {
             name = f("invalid")
         }
     "#;
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("parameter 'x': expected Ipv6Address"),
@@ -10129,8 +11473,12 @@ fn user_fn_arn_argument_defers_without_schemas_and_rejects_unknown_loaded_type()
         }
     "#;
     let source_file = std::path::Path::new("/project/main.crn");
-    let parsed = parse_file(input, source_file, &ProviderContext::default())
-        .expect("bootstrap parsing must retain the unresolved check");
+    let parsed = parse_file(
+        input,
+        source_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("bootstrap parsing must retain the unresolved check");
     assert!(matches!(
         parsed.resources[0].attributes["name"],
         Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
@@ -10151,7 +11499,7 @@ fn user_fn_arn_argument_defers_without_schemas_and_rejects_unknown_loaded_type()
             Default::default(),
             Box::new(|_, _| panic!("an unknown type must never validate")),
         ),
-        ..Default::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     };
     let error = parse(input, &loaded).expect_err("a loaded catalog must reject an undeclared Arn");
     assert!(
@@ -10164,7 +11512,7 @@ fn user_fn_arn_argument_defers_without_schemas_and_rejects_unknown_loaded_type()
 fn user_fn_unloaded_custom_type_return_defers_until_schemas_are_loaded() {
     let parsed = parse(
         "fn f(): AccountId { 'account' }\nlet value = f()\n",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("an unloaded return annotation must preserve the deferred call");
     assert!(matches!(
@@ -10177,7 +11525,7 @@ fn user_fn_unloaded_custom_type_return_defers_until_schemas_are_loaded() {
 fn user_fn_unloaded_custom_type_argument_defers_until_schemas_are_loaded() {
     let parsed = parse(
         "fn f(x: AccountId) { x }\nlet value = f('account')\n",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("an unloaded parameter annotation must preserve the deferred call");
     assert!(matches!(
@@ -10200,7 +11548,10 @@ fn user_fn_custom_type_arg_resource_ref_skipped() {
             name = f(vpc.cidr_block)
         }
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
 }
 
@@ -10215,7 +11566,10 @@ fn user_fn_custom_type_return_cidr_valid() {
             name = f()
         }
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
 }
 
@@ -10228,7 +11582,11 @@ fn user_fn_custom_type_return_cidr_invalid() {
             name = f()
         }
     "#;
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("return value: expected Ipv4Cidr"),
@@ -10245,7 +11603,11 @@ fn user_fn_custom_type_return_ipv4_address_invalid() {
             name = f()
         }
     "#;
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("return value: expected Ipv4Address"),
@@ -10262,7 +11624,10 @@ fn user_fn_custom_type_return_http_response_status_code_valid() {
             name = f()
         }
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
 }
 
@@ -10275,7 +11640,11 @@ fn user_fn_custom_type_return_http_response_status_code_invalid() {
             name = f()
         }
     "#;
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("return value: expected HttpResponseStatusCode"),
@@ -10292,7 +11661,10 @@ fn user_fn_custom_type_return_redirect_protocol_valid_invalid() {
             name = f()
         }
     "##;
-    let result = parse(valid, &ProviderContext::default());
+    let result = parse(
+        valid,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
 
     let invalid = r##"
@@ -10302,7 +11674,11 @@ fn user_fn_custom_type_return_redirect_protocol_valid_invalid() {
             name = f()
         }
     "##;
-    let err = parse(invalid, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        invalid,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("return value: expected RedirectProtocol"),
@@ -10319,7 +11695,10 @@ fn user_fn_custom_type_return_redirect_host_valid_invalid() {
             name = f()
         }
     "##;
-    let result = parse(valid, &ProviderContext::default());
+    let result = parse(
+        valid,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
 
     let invalid = r##"
@@ -10329,7 +11708,11 @@ fn user_fn_custom_type_return_redirect_host_valid_invalid() {
             name = f()
         }
     "##;
-    let err = parse(invalid, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        invalid,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("return value: expected RedirectHost"),
@@ -10346,7 +11729,10 @@ fn user_fn_custom_type_return_redirect_port_valid_invalid() {
             name = f()
         }
     "##;
-    let result = parse(valid, &ProviderContext::default());
+    let result = parse(
+        valid,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
 
     let invalid = r##"
@@ -10356,7 +11742,11 @@ fn user_fn_custom_type_return_redirect_port_valid_invalid() {
             name = f()
         }
     "##;
-    let err = parse(invalid, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        invalid,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("return value: expected RedirectPort"),
@@ -10373,7 +11763,10 @@ fn user_fn_custom_type_return_redirect_path_valid_invalid() {
             name = f()
         }
     "##;
-    let result = parse(valid, &ProviderContext::default());
+    let result = parse(
+        valid,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
 
     let invalid = r##"
@@ -10383,7 +11776,11 @@ fn user_fn_custom_type_return_redirect_path_valid_invalid() {
             name = f()
         }
     "##;
-    let err = parse(invalid, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        invalid,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("return value: expected RedirectPath"),
@@ -10400,7 +11797,10 @@ fn user_fn_custom_type_return_redirect_query_valid_invalid() {
             name = f()
         }
     "##;
-    let result = parse(valid, &ProviderContext::default());
+    let result = parse(
+        valid,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
 
     let invalid = r##"
@@ -10410,7 +11810,11 @@ fn user_fn_custom_type_return_redirect_query_valid_invalid() {
             name = f()
         }
     "##;
-    let err = parse(invalid, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        invalid,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("return value: expected RedirectQuery"),
@@ -10427,7 +11831,11 @@ fn user_fn_custom_type_return_ipv6_cidr_invalid() {
             name = f()
         }
     "#;
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("return value: expected Ipv6Cidr"),
@@ -10444,7 +11852,11 @@ fn user_fn_custom_type_return_ipv6_address_invalid() {
             name = f()
         }
     "#;
-    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("return value: expected Ipv6Address"),
@@ -10458,9 +11870,10 @@ fn user_fn_custom_type_return_ipv6_address_invalid() {
 fn parse_env_resource_keeps_runtime_plan_and_state_plaintext() {
     let variable = "CARINA_3849_RESOURCE_ENV";
     let plaintext = "hunter2SECRET";
-    unsafe {
-        std::env::set_var(variable, plaintext);
-    }
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::new([(
+        variable.to_string(),
+        plaintext.into(),
+    )]));
     let input = format!(
         r#"
         let my_bucket = aws.s3_bucket {{
@@ -10469,11 +11882,8 @@ fn parse_env_resource_keeps_runtime_plan_and_state_plaintext() {
     "#
     );
 
-    let mut parsed = parse(&input, &ProviderContext::default()).unwrap();
-    resolve_resource_refs_with_config(&mut parsed, &ProviderContext::default()).unwrap();
-    unsafe {
-        std::env::remove_var(variable);
-    }
+    let mut parsed = parse(&input, &config).unwrap();
+    resolve_resource_refs_with_config(&mut parsed, &config).unwrap();
 
     let value = parsed.resources[0].get_attr("name").unwrap();
     assert_eq!(crate::ValueDescription::of(value).to_string(), "string");
@@ -10488,9 +11898,10 @@ fn parse_env_resource_keeps_runtime_plan_and_state_plaintext() {
 fn env_derived_provider_version_error_does_not_echo_plaintext() {
     let variable = "CARINA_3849_PROVIDER_VERSION";
     let plaintext = "hunter2SECRET";
-    unsafe {
-        std::env::set_var(variable, plaintext);
-    }
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::new([(
+        variable.to_string(),
+        plaintext.into(),
+    )]));
     let input = format!(
         r#"
         fn version() {{ env('{variable}') }}
@@ -10500,10 +11911,7 @@ fn env_derived_provider_version_error_does_not_echo_plaintext() {
     "#
     );
 
-    let error = parse(&input, &ProviderContext::default()).expect_err("invalid version");
-    unsafe {
-        std::env::remove_var(variable);
-    }
+    let error = parse(&input, &config).expect_err("invalid version");
     let message = error.to_string();
 
     assert!(!message.contains(plaintext), "message leaked: {message}");
@@ -10514,9 +11922,10 @@ fn env_derived_provider_version_error_does_not_echo_plaintext() {
 fn env_derived_subscript_is_redacted_in_unresolved_reference_diagnostic() {
     let variable = "CARINA_3849_SUBSCRIPT_KEY";
     let plaintext = "hunter2SECRET";
-    unsafe {
-        std::env::set_var(variable, plaintext);
-    }
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::new([(
+        variable.to_string(),
+        plaintext.into(),
+    )]));
     let input = format!(
         r#"
         fn key() {{ env('{variable}') }}
@@ -10524,10 +11933,7 @@ fn env_derived_subscript_is_redacted_in_unresolved_reference_diagnostic() {
     "#
     );
 
-    let parsed = parse(&input, &ProviderContext::default()).expect("parse");
-    unsafe {
-        std::env::remove_var(variable);
-    }
+    let parsed = parse(&input, &config).expect("parse");
     let value = parsed
         .variables
         .get("unresolved")
@@ -10544,9 +11950,10 @@ fn env_derived_subscript_is_redacted_in_unresolved_reference_diagnostic() {
 fn env_derived_pre_field_subscript_is_redacted_in_unresolved_reference_diagnostic() {
     let variable = "CARINA_3849_PRE_FIELD_SUBSCRIPT_KEY";
     let plaintext = "hunter2SECRET";
-    unsafe {
-        std::env::set_var(variable, plaintext);
-    }
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::new([(
+        variable.to_string(),
+        plaintext.into(),
+    )]));
     let input = format!(
         r#"
         fn key() {{ env('{variable}') }}
@@ -10554,10 +11961,7 @@ fn env_derived_pre_field_subscript_is_redacted_in_unresolved_reference_diagnosti
     "#
     );
 
-    let parsed = parse(&input, &ProviderContext::default()).expect("parse");
-    unsafe {
-        std::env::remove_var(variable);
-    }
+    let parsed = parse(&input, &config).expect("parse");
     let value = parsed
         .variables
         .get("unresolved")
@@ -10576,7 +11980,7 @@ fn parse_decrypt_uses_config_decryptor() {
         decryptor: Some(std::sync::Arc::new(|ciphertext, _key| {
             Ok(format!("decrypted:{ciphertext}"))
         })),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     };
 
     // decrypt() in resource attributes is resolved during resolve_resource_refs,
@@ -10618,7 +12022,7 @@ fn decrypt_inside_interpolation_resolves_to_a_secret_string() {
         decryptor: Some(std::sync::Arc::new(|ciphertext, _key| {
             Ok(format!("decrypted:{ciphertext}"))
         })),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     };
     let input = r#"
         let my_bucket = aws.s3_bucket {
@@ -10647,7 +12051,7 @@ fn decrypt_inside_interpolation_resolves_to_a_secret_string() {
 
 #[test]
 fn parse_decrypt_without_decryptor_errors() {
-    let config = ProviderContext::default();
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
 
     let input = r#"
         let my_bucket = aws.s3_bucket {
@@ -10670,7 +12074,7 @@ fn builtin_custom_type_validation_uses_declared_scalar_kind() {
     let error = validate_custom_type(
         &TypeIdentity::bare("PositiveInt"),
         &ExpandedValue::Concrete(ExpandedConcreteValue::String("5".into())),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("a string cannot satisfy an Int refinement")
     .to_string();
@@ -10696,7 +12100,7 @@ fn unresolved_simple_custom_type_never_falls_back_to_a_provider_validator() {
                 panic!("an unresolved Simple node must not enter provider routing")
             }),
         ),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     };
 
     let error = validate_custom_type(
@@ -10728,7 +12132,7 @@ fn provider_context_lookup_preserves_typed_custom_validation_errors() {
                 )
             }),
         ),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     };
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert(
@@ -10801,7 +12205,7 @@ fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
             )]),
             Box::new(|_target, _value| panic!("secret plaintext reached provider validation")),
         ),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     });
 
     validate_schema_custom_type(
@@ -10864,7 +12268,7 @@ fn provider_context_validator_receives_canonical_numeric_text() {
                     Ok(())
                 }),
             ),
-            ..ProviderContext::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         });
 
         validate_schema_custom_type(
@@ -10967,7 +12371,7 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
                 }
             }),
         ),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     });
 
     validate_schema_custom_type(
@@ -11055,7 +12459,7 @@ fn parse_custom_validator_rejects_invalid() {
                 }
             }),
         ),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     });
 
     // Test validate_custom_type directly since the grammar may not accept
@@ -11125,7 +12529,11 @@ arguments {
   vpc_id: awscc.ec2.VpcId
 }
 "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(parsed.arguments.len(), 1);
     let arg = &parsed.arguments[0];
     assert_eq!(arg.name, "vpc_id");
@@ -11140,7 +12548,7 @@ arguments {
 
 #[test]
 fn parse_schema_type_display() {
-    let ctx = ProviderContext::default();
+    let ctx = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let t = TypeExpr::SchemaType {
         owned: crate::parser::OwnedTypeIdentity::provider(
             "awscc",
@@ -11173,7 +12581,11 @@ arguments {
   subnet_ids: list(awscc.ec2.SubnetId)
 }
 "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(parsed.arguments.len(), 1);
     let arg = &parsed.arguments[0];
     match expect_known(&arg.static_type) {
@@ -11198,7 +12610,11 @@ fn parse_let_discard_read_resource() {
         let _ = read aws.sts.caller_identity {}
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     // carina#3181 PR C: `resources` is managed-only — the `read`
     // resource lives in the typed `data_sources` slice.
     assert!(result.resources.is_empty());
@@ -11226,7 +12642,11 @@ fn parse_partitions_managed_and_data_source_slices() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     // `resources` is managed-only — just the bucket.
     assert_eq!(result.resources.len(), 1);
@@ -11259,7 +12679,11 @@ fn parse_upstream_state_registers_binding() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.upstream_states.len(), 1);
     assert_eq!(result.resources.len(), 1);
     let vpc_id_attr = result.resources[0].get_attr("vpc_id").unwrap();
@@ -11282,7 +12706,11 @@ fn test_parse_require_statement() {
         }
         require !enable_https || has_cert, "cert is required when HTTPS is enabled"
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.requires.len(), 1);
     assert_eq!(
         result.requires[0].error_message,
@@ -11303,7 +12731,11 @@ fn test_parse_require_with_len_function() {
         }
         require len(subnet_ids) >= 2, "ALB requires at least two subnets"
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.requires.len(), 1);
     assert_eq!(
         result.requires[0].error_message,
@@ -11329,7 +12761,11 @@ fn test_parse_require_with_null() {
         }
         require cert_arn != null, "cert_arn must not be null"
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.requires.len(), 1);
     match &result.requires[0].condition {
         ValidateExpr::Compare { lhs, op, rhs } => {
@@ -11352,7 +12788,11 @@ fn test_parse_multiple_require_statements() {
         require min_size <= max_size, "min_size must be <= max_size"
         require len(subnet_ids) >= 2, "need at least two subnets"
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.requires.len(), 2);
     assert_eq!(
         result.requires[0].error_message,
@@ -11372,7 +12812,11 @@ fn test_parse_require_with_and_operator() {
         }
         require port >= 1 && port <= 65535, "port must be between 1 and 65535"
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.requires.len(), 1);
     match &result.requires[0].condition {
         ValidateExpr::And(_, _) => {}
@@ -11390,7 +12834,11 @@ fn test_parse_require_null_prefixed_variable() {
         }
         require nullable, "must be true"
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(result.requires.len(), 1);
     match &result.requires[0].condition {
         ValidateExpr::Var(name) => {
@@ -11411,7 +12859,11 @@ fn test_compose_operator_followed_by_pipe_consumes_closure() {
         let f = map(".id") >> join(",")
         let result = [{ id = "a" }, { id = "b" }] |> f()
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     assert_eq!(
         result.variables.get("result").unwrap(),
@@ -11429,7 +12881,11 @@ fn test_compose_operator_with_pipe() {
         let transform = map(".name") >> join(", ")
         let names = [{ name = "alice" }, { name = "bob" }] |> transform()
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.variables.get("names").unwrap(),
         &Value::Concrete(ConcreteValue::String("alice, bob".into()))
@@ -11443,7 +12899,11 @@ fn test_compose_operator_two_step_chain() {
         let transform = split(",") >> join("-")
         let result = "a,b,c" |> transform()
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.variables.get("result").unwrap(),
         &Value::Concrete(ConcreteValue::String("a-b-c".into()))
@@ -11456,7 +12916,10 @@ fn test_compose_operator_error_on_non_closure_lhs() {
     let input = r#"
         let f = "hello" >> join(",")
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -11472,7 +12935,10 @@ fn test_compose_operator_error_on_non_closure_rhs() {
     let input = r#"
         let f = join(",") >> "hello"
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -11490,7 +12956,11 @@ fn test_compose_operator_precedence_with_pipe() {
         let data = [{ x = "1" }, { x = "2" }]
         let result = data |> pipeline()
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.variables.get("result").unwrap(),
         &Value::Concrete(ConcreteValue::String("1-2".into()))
@@ -11508,8 +12978,11 @@ fn test_compose_three_functions() {
     let input = r#"
         let transform = split(",") >> join("-") >> split("-")
     "#;
-    let result =
-        parse(input, &ProviderContext::default()).expect("three-way composition should parse");
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("three-way composition should parse");
     assert!(result.variables.get("transform").is_none());
 }
 
@@ -11521,7 +12994,11 @@ fn parse_single_quoted_string_literal() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
@@ -11539,7 +13016,11 @@ fn parse_single_quoted_string_no_interpolation() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let vpc = &result.resources[0];
     // Should be a plain string, not interpolated
     assert_eq!(
@@ -11552,7 +13033,11 @@ fn parse_single_quoted_string_no_interpolation() {
 fn parse_single_quoted_interpolation_like_sequence_warns_for_each_occurrence() {
     let input = "let policy = '${a} and ${b}'";
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let warnings: Vec<_> = result
         .warnings
         .iter()
@@ -11577,7 +13062,11 @@ let env = "prod"
 let policy = 'arn:${env}:root'
 "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let warning = result
         .warnings
         .iter()
@@ -11602,7 +13091,11 @@ EOT
 let inst = m { nn = 1 }
 "#;
 
-    let parsed = parse(input, &ProviderContext::default()).expect("fixture must parse");
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("fixture must parse");
     let call = parsed.module_calls.first().expect("module call");
 
     assert_eq!(call.source_span().start_line(), 8);
@@ -11626,7 +13119,11 @@ EOT
 }
 "#;
 
-    let parsed = parse(input, &ProviderContext::default()).expect("fixture must parse");
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("fixture must parse");
     let call = parsed.module_calls.first().expect("module call");
 
     assert_eq!(call.source_span().start_line(), 1);
@@ -11643,7 +13140,11 @@ EOT
 fn module_call_heredoc_value_span_uses_original_coordinates_and_bytes() {
     let input = "let inst = m {\n  doc = <<EOT\nalpha\nbeta\nEOT\n}\n";
 
-    let parsed = parse(input, &ProviderContext::default()).expect("fixture must parse");
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("fixture must parse");
     let call = parsed.module_calls.first().expect("module call");
     let span = call
         .authored_argument("doc")
@@ -11667,7 +13168,11 @@ fn assert_module_argument_span(
     argument: &str,
     expected: (usize, usize, usize, usize, usize, usize),
 ) {
-    let parsed = parse(input, &ProviderContext::default()).expect("fixture must parse");
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("fixture must parse");
     let span = parsed
         .module_calls
         .first()
@@ -11754,7 +13259,11 @@ fn module_argument_after_heredoc_uses_exact_original_position() {
 #[test]
 fn authored_spans_share_trailing_whitespace_semantics_across_sites() {
     let input = "attributes {\n  output = {\n    enabled = true\n  }   \n}\nlet inst = m {\n  options = {\n    enabled = true\n  }   \n}\n";
-    let parsed = parse(input, &ProviderContext::default()).expect("fixture must parse");
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("fixture must parse");
 
     let declaration = parsed
         .attribute_params
@@ -11781,7 +13290,11 @@ fn authored_value_spans_exclude_trailing_comments() {
              attributes {{\n  attr = value {comment}\n}}\n\
              exports {{\n  out = value {comment}\n}}\n"
         );
-        let parsed = parse(&input, &ProviderContext::default()).expect("fixture must parse");
+        let parsed = parse(
+            &input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("fixture must parse");
         let value_ends = input
             .match_indices("value")
             .map(|(start, value)| start + value.len())
@@ -11827,7 +13340,11 @@ fn nested_string_comment_markers_do_not_truncate_authored_spans() {
              let x = \"x\"\n\
              {call_source}"
         );
-        let parsed = parse(&input, &ProviderContext::default()).expect("fixture must parse");
+        let parsed = parse(
+            &input,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("fixture must parse");
         let call = parsed.module_calls.first().expect("module call");
         let value_span = call
             .authored_argument("url")
@@ -11860,7 +13377,11 @@ fn parse_single_quoted_string_escape_sequences() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
@@ -11878,7 +13399,11 @@ fn test_compose_three_functions_execution() {
         let transform = split(",") >> join("-") >> split("-")
         let result = "a,b,c" |> transform()
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.variables.get("result").unwrap(),
         &Value::Concrete(ConcreteValue::List(vec![
@@ -11901,7 +13426,11 @@ fn parse_heredoc_basic() {
 EOT
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let resource = &result.resources[0];
     assert_eq!(
         resource.get_attr("policy"),
@@ -11915,7 +13444,11 @@ EOT
 fn parse_heredoc_indented() {
     // <<- strips common leading whitespace
     let input = "aws.iam.Role {\n    name = \"my-role\"\n    policy = <<-EOT\n        line1\n        line2\n        line3\n    EOT\n}\n";
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let resource = &result.resources[0];
     assert_eq!(
         resource.get_attr("policy"),
@@ -11928,7 +13461,11 @@ fn parse_heredoc_indented() {
 #[test]
 fn parse_heredoc_empty() {
     let input = "aws.iam.Role {\n    name = \"my-role\"\n    policy = <<EOT\nEOT\n}\n";
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let resource = &result.resources[0];
     assert_eq!(
         resource.get_attr("policy"),
@@ -11943,7 +13480,11 @@ fn parse_heredoc_in_let_binding() {
 hello world
 EOF
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(
         result.variables.get("doc"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -11960,7 +13501,11 @@ fn quoted_string_as_map_key() {
             "aws:SourceIp" = '10.0.0.0/8'
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     if let Some(Value::Concrete(ConcreteValue::Map(map))) = result.variables.get("m") {
         assert_eq!(
             map.get("token.actions.githubusercontent.com:aud"),
@@ -11996,7 +13541,11 @@ fn quoted_string_as_attribute_key_in_block() {
             }
         }
     "#;
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let resource = &result.resources[0];
     // Navigate: assume_role_policy_document -> statement[0] -> condition -> string_equals
     let doc = resource.get_attr("assume_role_policy_document").unwrap();
@@ -12033,7 +13582,11 @@ exports {
   vpc_id = vpc.vpc_id
 }
 "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(parsed.export_params.len(), 1);
     assert_eq!(parsed.export_params[0].name, "vpc_id");
     assert!(parsed.export_params[0].static_type.is_none());
@@ -12056,7 +13609,11 @@ exports {
   cidr: String = vpc.cidr_block
 }
 "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(parsed.export_params.len(), 2);
     assert_eq!(parsed.export_params[0].name, "vpc_id");
     assert!(parsed.export_params[0].static_type.is_some());
@@ -12085,10 +13642,18 @@ vpc.vpc_id,
 }
 "#;
 
-    let original = parse(input, &ProviderContext::default()).unwrap();
+    let original = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let formatted =
         crate::formatter::format(input, &crate::formatter::FormatConfig::default()).unwrap();
-    let reparsed = parse(&formatted, &ProviderContext::default()).unwrap();
+    let reparsed = parse(
+        &formatted,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     assert_eq!(
         formatted,
@@ -12125,7 +13690,11 @@ awscc.ec2.Subnet {
   cidr_block = vpc.missing_attr ?? '10.0.1.0/24'
 }
 "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = parsed
         .resources
         .iter()
@@ -12157,7 +13726,11 @@ mock.test.resource {
   name = producer.comment ?? producer.parent ?? "default"
 }
 "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let value = parsed.resources[1].get_attr("name").expect("consumer name");
     let Value::Deferred(DeferredValue::Coalesce {
         value: first,
@@ -12205,7 +13778,11 @@ fn coalesced_resource_ref_for_iterable_is_deferred_as_a_complete_expression() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let [deferred] = parsed.parsed_deferred_for_expressions() else {
         panic!(
             "coalesced unresolved iterable must produce one deferred for-expression: {:?}",
@@ -12235,7 +13812,7 @@ let resources = for x in src.list { mock.test.resource { name = x } }
 let reads = for x in src.list { read mock.iam.Roles { name_regex = x } }
 let calls = for x in src.list { child { item = x } }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("the parser must classify deferred bodies without rejecting them");
 
@@ -12258,7 +13835,7 @@ let resources = for x in src.list {
   }
 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("a deferred resource body with directives must parse");
 
@@ -12296,7 +13873,7 @@ for name in ["one", "two", "three"] {
   }
 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("a static resource loop with directives must parse");
 
@@ -12325,7 +13902,7 @@ let resources = for x in src.list { mock.test.resource { name = x } }
 let reads = for x in src.list { read mock.iam.Roles { name_regex = x } }
 let calls = for x in src.list { child { item = x } }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("the parser must retain all deferred body kinds");
 
@@ -12367,7 +13944,7 @@ let resources = for x in (
   ?? []
 ) { mock.test.resource { name = x } }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("the multiline deferred iterable must parse");
 
@@ -12390,7 +13967,7 @@ let resources = for name in names {
   mock.test.resource { name = name }
 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("a module-if iterable must remain a deferred for expression");
 
@@ -12407,7 +13984,7 @@ fn deferred_for_module_call_body_with_bare_unbound_iterable_records_finalization
         r#"let child = use { source = "./child" }
 let mod_items = for x in items { child { item = x } }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("body classification must retain the undefined iterable");
 
@@ -12436,7 +14013,7 @@ fn deferred_for_read_body_with_bare_unbound_iterable_records_finalization_error(
   read mock.iam.Roles { name_regex = x }
 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("body classification must retain the undefined iterable");
 
@@ -12470,7 +14047,7 @@ let items = for x in src.list {
   }
 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("a genuine parser error in a deferred resource body must be preserved");
 
@@ -12514,7 +14091,11 @@ let vpc = awscc.ec2.Vpc {
     let fixture = tempfile::tempdir().unwrap();
     std::fs::write(fixture.path().join("main.crn"), main_input).unwrap();
     std::fs::write(fixture.path().join("exports.crn"), exports_input).unwrap();
-    let loaded = crate::config_loader::load_configuration(fixture.path()).unwrap();
+    let loaded = crate::config_loader::load_configuration(
+        fixture.path(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     let unused = crate::validation::check_unused_bindings(&loaded.authored_bindings);
     assert!(
@@ -12535,7 +14116,11 @@ awscc.ec2.Vpc {
   cidr_block = '10.1.0.0/16' ?? '10.0.0.0/16'
 }
 "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let cidr = parsed.resources[0].get_attr("cidr_block");
     assert_eq!(
         cidr,
@@ -12573,7 +14158,11 @@ fn upstream_state_refs_emit_no_parser_warnings() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let upstream_warnings: Vec<&ParseWarning> = parsed
         .warnings
         .iter()
@@ -12613,11 +14202,18 @@ fn expand_deferred_for_with_remote_bindings() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
     assert_eq!(parsed.resources.len(), 0, "no resources before expansion"); // allow: direct — fixture test inspection
     let mut parsed = parsed
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("deferred template must contain no parser placeholders");
 
     // Simulate loading upstream_state with actual values
@@ -12634,7 +14230,7 @@ fn expand_deferred_for_with_remote_bindings() {
 
     // Expand deferred for-expressions
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             parsed.expand_deferred_for_expressions(
                 &IterableBindings::from_upstream_only(resolve_remote_bindings(remote_bindings)),
@@ -12699,16 +14295,23 @@ fn expand_deferred_for_no_remote_data_stays_deferred() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
     let mut parsed = parsed
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("deferred template must contain no parser placeholders");
 
     // Empty remote_bindings — upstream hasn't been applied yet
     let remote_bindings: HashMap<String, HashMap<String, ExpandedValue>> = HashMap::new();
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             parsed.expand_deferred_for_expressions(
                 &IterableBindings::from_upstream_only(remote_bindings),
@@ -12744,10 +14347,17 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
     let mut parsed = parsed
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("deferred template must contain no parser placeholders");
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -12768,7 +14378,7 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             parsed.expand_deferred_for_expressions(
                 &IterableBindings::from_upstream_only(resolve_remote_bindings(remote_bindings)),
@@ -12824,10 +14434,17 @@ fn expand_deferred_for_indexed_binding_substitutes_index_and_value() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
     let mut parsed = parsed
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("deferred template must contain no parser placeholders");
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -12842,7 +14459,7 @@ fn expand_deferred_for_indexed_binding_substitutes_index_and_value() {
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             parsed.expand_deferred_for_expressions(
                 &IterableBindings::from_upstream_only(resolve_remote_bindings(remote_bindings)),
@@ -12904,10 +14521,17 @@ fn expand_deferred_for_children_depend_on_iterable_binding_for_all_binding_shape
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(parsed.parsed_deferred_for_expressions().len(), 3);
     let mut parsed = parsed
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("deferred templates must contain no parser placeholders");
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -12930,7 +14554,7 @@ fn expand_deferred_for_children_depend_on_iterable_binding_for_all_binding_shape
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             parsed.expand_deferred_for_expressions(
                 &IterableBindings::from_upstream_only(resolve_remote_bindings(remote_bindings)),
@@ -12974,10 +14598,17 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
     let mut parsed = parsed
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("deferred template must contain no parser placeholders");
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -12998,7 +14629,7 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
     let remote_bindings = resolve_remote_bindings(remote_bindings);
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             parsed.expand_deferred_for_expressions(
                 &IterableBindings::from_upstream_only(remote_bindings.clone()),
@@ -13055,10 +14686,17 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
     let mut parsed = parsed
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("deferred template must contain no parser placeholders");
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -13072,7 +14710,7 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             parsed.expand_deferred_for_expressions(
                 &IterableBindings::from_upstream_only(resolve_remote_bindings(remote_bindings)),
@@ -13127,9 +14765,16 @@ fn expand_deferred_for_simple_binding_with_map_iterable_warns() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let mut parsed = parsed
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("deferred template must contain no parser placeholders");
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -13146,7 +14791,7 @@ fn expand_deferred_for_simple_binding_with_map_iterable_warns() {
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             parsed.expand_deferred_for_expressions(
                 &IterableBindings::from_upstream_only(resolve_remote_bindings(remote_bindings)),
@@ -13188,9 +14833,16 @@ fn expand_deferred_for_map_binding_with_list_iterable_warns() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let mut parsed = parsed
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("deferred template must contain no parser placeholders");
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -13205,7 +14857,7 @@ fn expand_deferred_for_map_binding_with_list_iterable_warns() {
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             parsed.expand_deferred_for_expressions(
                 &IterableBindings::from_upstream_only(resolve_remote_bindings(remote_bindings)),
@@ -13254,7 +14906,11 @@ fn parses_upstream_state_expr_with_source() {
             source = "../organizations"
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).expect("parse should succeed");
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("parse should succeed");
     assert_eq!(parsed.upstream_states.len(), 1);
     let us = &parsed.upstream_states[0];
     assert_eq!(us.binding, "orgs");
@@ -13264,7 +14920,11 @@ fn parses_upstream_state_expr_with_source() {
 #[test]
 fn upstream_state_source_decodes_double_quoted_escapes() {
     let input = r#"let orgs = upstream_state { source = "../x\"y" }"#;
-    let parsed = parse(input, &ProviderContext::default()).expect("parse should succeed");
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("parse should succeed");
 
     assert_eq!(
         parsed.upstream_states[0].source,
@@ -13275,8 +14935,11 @@ fn upstream_state_source_decodes_double_quoted_escapes() {
 #[test]
 fn upstream_state_source_rejects_interpolation() {
     let input = r#"let orgs = upstream_state { source = "./a${x}" }"#;
-    let error = parse(input, &ProviderContext::default())
-        .expect_err("interpolated source must be a parse error");
+    let error = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("interpolated source must be a parse error");
     let message = error.to_string();
 
     assert!(
@@ -13296,7 +14959,10 @@ fn old_top_level_upstream_state_syntax_is_rejected() {
             source = "../organizations"
         }
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_err(),
         "old top-level upstream_state syntax must be rejected, got: {:?}",
@@ -13309,8 +14975,11 @@ fn remote_state_keyword_is_no_longer_recognized() {
     let input = r#"
         let orgs = remote_state { path = "./foo.json" }
     "#;
-    let err = parse(input, &ProviderContext::default())
-        .expect_err("remote_state must be a parse error now");
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("remote_state must be a parse error now");
     let msg = err.to_string();
     assert!(
         msg.contains("remote_state") && msg.contains("upstream_state"),
@@ -13321,8 +14990,11 @@ fn remote_state_keyword_is_no_longer_recognized() {
 #[test]
 fn upstream_state_missing_source_is_error() {
     let input = r#"let orgs = upstream_state { }"#;
-    let err = parse(input, &ProviderContext::default())
-        .expect_err("missing source must be a parse error");
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("missing source must be a parse error");
     let msg = err.to_string();
     assert!(
         msg.contains("upstream_state") && msg.contains("source") && msg.contains("orgs"),
@@ -13333,8 +15005,11 @@ fn upstream_state_missing_source_is_error() {
 #[test]
 fn upstream_state_source_must_be_string() {
     let input = r#"let orgs = upstream_state { source = 42 }"#;
-    let err = parse(input, &ProviderContext::default())
-        .expect_err("non-string source must be a parse error");
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("non-string source must be a parse error");
     let msg = err.to_string();
     assert!(
         msg.contains("upstream_state 'orgs': 'source' must be a string literal, got: 42")
@@ -13351,8 +15026,11 @@ fn upstream_state_unknown_attribute_is_error() {
             backend = "s3"
         }
     "#;
-    let err = parse(input, &ProviderContext::default())
-        .expect_err("unknown attribute must be a parse error");
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("unknown attribute must be a parse error");
     let msg = err.to_string();
     assert!(
         msg.contains("backend") && msg.contains("orgs"),
@@ -13366,8 +15044,11 @@ fn upstream_state_duplicate_binding_is_error() {
         let orgs = upstream_state { source = "../a" }
         let orgs = upstream_state { source = "../b" }
     "#;
-    let err = parse(input, &ProviderContext::default())
-        .expect_err("duplicate upstream_state binding must be a parse error");
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("duplicate upstream_state binding must be a parse error");
     match &err {
         ParseError::DuplicateBinding { name, .. } => {
             assert_eq!(name, "orgs");
@@ -13394,8 +15075,11 @@ fn undefined_identifier_in_for_iterable_is_error() {
     // on the merged directory-level `ParsedFile`, so that cross-file
     // `upstream_state` bindings in sibling files aren't rejected during
     // per-file parsing.
-    let parsed = parse(input, &ProviderContext::default())
-        .expect("single-file parse must not reject cross-file iterables");
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("single-file parse must not reject cross-file iterables");
     let errs = check_identifier_scope(&parsed);
     assert_eq!(errs.len(), 1, "expected one error, got {errs:?}");
     match &errs[0] {
@@ -13419,8 +15103,11 @@ fn undefined_identifier_error_suggests_close_match() {
             }
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default())
-        .expect("single-file parse must not reject cross-file iterables");
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("single-file parse must not reject cross-file iterables");
     let errs = check_identifier_scope(&parsed);
     assert_eq!(errs.len(), 1, "expected one error, got {errs:?}");
     let msg = errs[0].to_string();
@@ -13448,8 +15135,11 @@ fn undefined_identifier_error_lists_in_scope_names_without_close_match() {
             }
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default())
-        .expect("single-file parse must not reject cross-file iterables");
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("single-file parse must not reject cross-file iterables");
     let errs = check_identifier_scope(&parsed);
     assert_eq!(errs.len(), 1, "expected one error, got {errs:?}");
     let msg = errs[0].to_string();
@@ -13486,7 +15176,7 @@ fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
             }
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default())
+    let parsed = parse(input, &ProviderContext::new(crate::EnvironmentSnapshot::empty()))
         .expect("single-file parse must not reject bare-iterable identifiers; the cross-file check runs later");
     let errs = check_identifier_scope(&parsed);
     assert!(matches!(
@@ -13494,7 +15184,7 @@ fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
         [ParseError::UndefinedDeferredIterable { name, .. }] if name == "org"
     ));
     let err = crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_providerless(
                 crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
@@ -13536,7 +15226,7 @@ fn for_iterable_string_selected_from_value_is_not_reinterpreted_as_identifier() 
                 mock.test.Thing { name = key }
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("a string value is not an iterable binding name");
 
@@ -13555,7 +15245,7 @@ fn for_iterable_string_selected_from_function_result_is_a_type_error() {
                 mock.test.Thing { name = part }
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("a selected string result cannot be iterated");
 
@@ -13578,7 +15268,10 @@ fn forward_reference_to_later_let_is_allowed() {
             name = "foo-bucket"
         }
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_ok(),
         "Forward reference to later `let` must still parse: {:?}",
@@ -13599,7 +15292,10 @@ fn backward_reference_to_resource_attr_is_allowed() {
             bucket_name = bucket.id
         }
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_ok(),
         "Reference to declared binding's attribute must parse: {:?}",
@@ -13617,7 +15313,10 @@ fn for_discard_pattern_simple_parses() {
             }
         }
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_ok(),
         "discard in simple for-binding must parse: {:?}",
@@ -13636,7 +15335,10 @@ fn for_discard_pattern_map_key_parses() {
             }
         }
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_ok(),
         "discard in map-form key position must parse: {:?}",
@@ -13654,7 +15356,10 @@ fn for_discard_pattern_map_value_parses() {
             }
         }
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_ok(),
         "discard in map-form value position must parse: {:?}",
@@ -13671,7 +15376,10 @@ fn for_discard_pattern_indexed_parses() {
             }
         }
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_ok(),
         "discard in indexed-form must parse: {:?}",
@@ -13691,7 +15399,10 @@ fn for_discard_pattern_cannot_be_referenced() {
             }
         }
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_err(),
         "referencing a discard binding should error, got: {:?}",
@@ -13709,7 +15420,11 @@ fn for_unused_binding_warns_simple() {
             }
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let unused: Vec<_> = parsed
         .warnings
         .iter()
@@ -13734,7 +15449,11 @@ fn for_used_binding_no_warning() {
             }
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert!(
         !parsed
             .warnings
@@ -13756,7 +15475,11 @@ fn for_unused_map_key_warns_only_key() {
             }
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let unused: Vec<_> = parsed
         .warnings
         .iter()
@@ -13791,7 +15514,11 @@ fn for_discard_binding_no_unused_warning() {
             }
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert!(
         !parsed.warnings.iter().any(|w| w.message.contains("unused")),
         "discard binding should suppress unused warning, got: {:?}",
@@ -13813,7 +15540,10 @@ fn reference_to_upstream_state_binding_is_allowed() {
             }
         }
     "#;
-    let result = parse(input, &ProviderContext::default());
+    let result = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_ok(),
         "Reference to upstream_state binding must parse: {:?}",
@@ -13835,7 +15565,11 @@ fn quoted_literal_marker_survives_anonymous_resource_rename() {
             target_type = "AWS_ACCOUNT"
         }
     "#;
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let mut parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
 
     // Simulate the identity assignment that compute_anonymous_identifiers would
@@ -13881,7 +15615,11 @@ fn quoted_string_attrs_distinguish_quoted_from_bare_and_namespaced() {
             target_type = awscc.sso.Assignment.TargetType.AWS_ACCOUNT
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     let quoted_of = |binding: &str| -> bool {
         parsed
@@ -13919,7 +15657,11 @@ fn quoted_string_attrs_are_top_level_only() {
             }
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let sg = parsed
         .resources
         .iter()
@@ -13941,7 +15683,11 @@ fn quoted_string_attrs_skipped_for_interpolated_strings() {
             name = "bucket-${x}"
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let r = parsed
         .resources
         .iter()
@@ -13968,7 +15714,11 @@ fn value_map_preserves_insertion_order() {
             b_fourth = "4"
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let Some(Value::Concrete(ConcreteValue::Map(map))) = parsed.variables.get("m") else {
         panic!("expected variables['m'] to be a Value::Concrete(ConcreteValue::Map)");
     };
@@ -13998,7 +15748,11 @@ fn provider_config_default_tags_preserve_insertion_order() {
             }
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let pc = parsed
         .providers
         .first()
@@ -14026,7 +15780,11 @@ fn provider_config_attributes_preserve_insertion_order() {
             region = "ap-northeast-1"
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let pc = parsed
         .providers
         .first()
@@ -14053,7 +15811,11 @@ fn parsed_file_variables_preserve_insertion_order() {
         let m_third = "3"
         let b_fourth = "4"
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let keys: Vec<&str> = parsed.variables.keys().map(String::as_str).collect();
     assert_eq!(
         keys,
@@ -14081,7 +15843,11 @@ fn nested_block_value_map_preserves_insertion_order() {
             }
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let resource = parsed
         .resources
         .first()
@@ -14141,8 +15907,11 @@ fn inferred_file_holds_inferred_export_param() {
 
 #[test]
 fn parse_rejects_self_referential_let_binding() {
-    let err = parse("let X = X", &ProviderContext::default())
-        .expect_err("single-file self-referential let must fail");
+    let err = parse(
+        "let X = X",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("single-file self-referential let must fail");
     let message = err.to_string();
 
     match err {
@@ -14165,8 +15934,11 @@ fn parse_directory_files_rejects_self_referential_let_binding() {
         "let X = X".to_string(),
     )];
 
-    let err = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
-        .expect_err("directory self-referential let must fail");
+    let err = crate::config_loader::parse_directory_files(
+        &files,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("directory self-referential let must fail");
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
@@ -14209,8 +15981,11 @@ fn parse_directory_files_folds_coalesce_after_later_let_resolves() {
         ),
     ];
 
-    let parsed = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
-        .expect("later sibling let should resolve through coalesce");
+    let parsed = crate::config_loader::parse_directory_files(
+        &files,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("later sibling let should resolve through coalesce");
     let consumer = parsed
         .iter()
         .find(|(path, _)| path == &std::path::PathBuf::from("consumer.crn"))
@@ -14239,8 +16014,11 @@ fn parse_directory_files_resolves_sibling_let_in_coalesce_default() {
         ),
     ];
 
-    let parsed = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
-        .expect("sibling let in a coalesce default should resolve at the directory fixed point");
+    let parsed = crate::config_loader::parse_directory_files(
+        &files,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("sibling let in a coalesce default should resolve at the directory fixed point");
     let consumer = parsed
         .iter()
         .find(|(path, _)| path == &std::path::PathBuf::from("consumer.crn"))
@@ -14263,8 +16041,11 @@ fn assert_directory_let_chain_resolves(hops: usize) {
     let files = sibling_let_chain_files(hops);
     let final_name = chain_binding_name(hops);
 
-    let parsed = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
-        .expect("sibling let chain must parse");
+    let parsed = crate::config_loader::parse_directory_files(
+        &files,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("sibling let chain must parse");
     let final_file = parsed
         .iter()
         .find(|(path, _)| path == &std::path::PathBuf::from(format!("{final_name}.crn")))
@@ -14304,8 +16085,11 @@ fn parse_directory_files_rejects_cyclic_sibling_let_chain() {
         (std::path::PathBuf::from("b.crn"), "let B = A".to_string()),
     ];
 
-    let err = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
-        .expect_err("cyclic sibling lets must fail");
+    let err = crate::config_loader::parse_directory_files(
+        &files,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("cyclic sibling lets must fail");
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
@@ -14328,8 +16112,11 @@ fn parse_directory_files_rejects_resource_ref_let_cycle() {
         ),
     ];
 
-    let err = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
-        .expect_err("ResourceRef let cycle must fail");
+    let err = crate::config_loader::parse_directory_files(
+        &files,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("ResourceRef let cycle must fail");
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
@@ -14352,8 +16139,11 @@ fn parse_directory_files_rejects_function_call_let_cycle() {
         ),
     ];
 
-    let err = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
-        .expect_err("FunctionCall let cycle must fail");
+    let err = crate::config_loader::parse_directory_files(
+        &files,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("FunctionCall let cycle must fail");
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
@@ -14376,8 +16166,11 @@ fn parse_directory_files_rejects_interpolation_let_cycle() {
         ),
     ];
 
-    let err = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
-        .expect_err("Interpolation let cycle must fail");
+    let err = crate::config_loader::parse_directory_files(
+        &files,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("Interpolation let cycle must fail");
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
@@ -14394,8 +16187,11 @@ fn parse_directory_files_rejects_list_let_cycle() {
         (std::path::PathBuf::from("b.crn"), "let B = [A]".to_string()),
     ];
 
-    let err = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
-        .expect_err("List let cycle must fail");
+    let err = crate::config_loader::parse_directory_files(
+        &files,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("List let cycle must fail");
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
@@ -14418,8 +16214,11 @@ fn parse_directory_files_rejects_map_let_cycle() {
         ),
     ];
 
-    let err = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
-        .expect_err("Map let cycle must fail");
+    let err = crate::config_loader::parse_directory_files(
+        &files,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("Map let cycle must fail");
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
@@ -14471,8 +16270,11 @@ fn parse_directory_files_does_not_treat_dotted_string_literal_as_let_reference()
         ),
     ];
 
-    let parsed = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
-        .expect("quoted dotted strings must stay literal, not dependency edges");
+    let parsed = crate::config_loader::parse_directory_files(
+        &files,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("quoted dotted strings must stay literal, not dependency edges");
     let a_file = parsed
         .iter()
         .find(|(path, _)| path == &std::path::PathBuf::from("a.crn"))
@@ -14504,8 +16306,11 @@ fn parse_directory_files_preserves_sibling_resource_ref_rhs() {
         ),
     ];
 
-    let parsed = crate::config_loader::parse_directory_files(&files, &ProviderContext::default())
-        .expect("resource-ref let must parse");
+    let parsed = crate::config_loader::parse_directory_files(
+        &files,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("resource-ref let must parse");
     let bridge_file = parsed
         .iter()
         .find(|(path, _)| path == &std::path::PathBuf::from("bridge.crn"))
@@ -14559,15 +16364,21 @@ fn parse_directory_preserves_module_arg_dotted_string_literal() {
     )
     .unwrap();
 
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("directory fixture must parse");
+    let parsed = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("directory fixture must parse");
     let parsed = crate::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             resolve_modules(parsed, tmp.path(), session).expect("module expansion must succeed")
         },
     )
-    .into_expanded(&crate::schema::SchemaRegistry::new())
+    .into_expanded(
+        &crate::schema::SchemaRegistry::new(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
     .expect("module fixture contains no parser placeholders");
     let record = parsed
         .resources
@@ -14607,8 +16418,11 @@ fn parse_directory_preserves_direct_attr_dotted_string_literal() {
     )
     .unwrap();
 
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("directory fixture must parse");
+    let parsed = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("directory fixture must parse");
     let target = parsed
         .resources
         .iter()
@@ -14652,8 +16466,11 @@ fn parse_directory_preserves_export_param_dotted_string_literal() {
     )
     .unwrap();
 
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("directory fixture must parse");
+    let parsed = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("directory fixture must parse");
     let export = parsed
         .export_params
         .iter()
@@ -14685,7 +16502,11 @@ fn parse_preserves_data_source_attr_dotted_string_literal() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).expect("fixture must parse");
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("fixture must parse");
     let data_source = parsed
         .data_sources
         .iter()
@@ -14717,7 +16538,11 @@ fn parse_preserves_attribute_param_default_dotted_string_literal() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).expect("fixture must parse");
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("fixture must parse");
     let attr = parsed
         .attribute_params
         .iter()
@@ -14771,8 +16596,11 @@ fn parse_subscript_on_upstream_state_in_sibling_file() {
         "#,
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("cross-file upstream subscript must parse");
+    let parsed = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("cross-file upstream subscript must parse");
     let res = parsed
         .resources
         .iter()
@@ -14827,8 +16655,11 @@ fn parse_subscript_on_upstream_state_inside_string_interpolation_sibling_file() 
         "#,
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("cross-file upstream subscript inside ${...} must parse");
+    let parsed = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("cross-file upstream subscript inside ${...} must parse");
     let res = parsed
         .resources
         .iter()
@@ -14900,8 +16731,11 @@ fn parse_dot_notation_on_upstream_state_in_sibling_file() {
         "#,
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("cross-file upstream dot-notation must parse");
+    let parsed = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("cross-file upstream dot-notation must parse");
     let res = parsed
         .resources
         .iter()
@@ -14951,8 +16785,11 @@ fn parse_dot_notation_on_upstream_state_inside_string_interpolation_sibling_file
         "#,
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("cross-file upstream dot-notation inside ${...} must parse");
+    let parsed = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("cross-file upstream dot-notation inside ${...} must parse");
     let res = parsed
         .resources
         .iter()
@@ -15024,8 +16861,11 @@ fn parse_directory_resolves_sibling_user_fn_with_static_args() {
     use crate::config_loader::parse_directory;
     let tmp = sibling_user_fn_fixture("timestamp()");
 
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("sibling-file user-fn with static args must parse");
+    let parsed = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("sibling-file user-fn with static args must parse");
     let res = parsed
         .resources
         .iter()
@@ -15046,8 +16886,11 @@ fn parse_directory_folds_coalesce_after_sibling_function_resolves() {
     use crate::config_loader::parse_directory;
     let tmp = sibling_user_fn_fixture("timestamp() ?? 'fallback'");
 
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("sibling-file function in coalesce must parse");
+    let parsed = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("sibling-file function in coalesce must parse");
     let value = parsed
         .resources
         .iter()
@@ -15083,8 +16926,11 @@ fn parse_directory_resolves_sibling_function_in_coalesce_default() {
     )
     .unwrap();
 
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("sibling function in a coalesce default should resolve");
+    let parsed = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("sibling function in a coalesce default should resolve");
     let selected = parsed.variables.get("selected");
     let Some(Value::Deferred(DeferredValue::Coalesce { default, .. })) = selected else {
         panic!("unresolved left should retain coalesce, got {selected:?}")
@@ -15100,7 +16946,10 @@ fn parse_directory_truly_undefined_fn_with_static_args_still_errors() {
     use crate::config_loader::parse_directory;
     let tmp = sibling_user_fn_fixture("no_such_fn()");
 
-    let result = parse_directory(tmp.path(), &ProviderContext::default());
+    let result = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_err(),
         "directory parse must error when calling a fn that exists nowhere in the directory"
@@ -15134,8 +16983,11 @@ fn parse_directory_resolves_sibling_user_fn_in_top_level_let() {
         "#,
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("top-level `let` calling a sibling user-fn must parse");
+    let parsed = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("top-level `let` calling a sibling user-fn must parse");
     let v = parsed
         .variables
         .get("v")
@@ -15166,7 +17018,10 @@ fn parse_directory_truly_undefined_fn_in_top_level_let_still_errors() {
         "#,
     )
     .unwrap();
-    let result = parse_directory(tmp.path(), &ProviderContext::default());
+    let result = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_err(),
         "top-level `let v = no_such_fn()` must error when no `fn no_such_fn` exists in the directory"
@@ -15188,8 +17043,11 @@ fn parse_directory_resolves_sibling_user_fn_in_let_list() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("helpers.crn"), "fn ts() { \"2026\" }\n").unwrap();
     std::fs::write(tmp.path().join("main.crn"), "let xs = [ts(), \"static\"]\n").unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("List containing sibling user-fn must parse");
+    let parsed = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("List containing sibling user-fn must parse");
     let v = parsed.variables.get("xs").expect("xs present");
     match v {
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -15214,8 +17072,11 @@ fn parse_directory_resolves_sibling_user_fn_in_let_map() {
         "let m = { created_at = ts() }\n",
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("Map containing sibling user-fn must parse");
+    let parsed = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("Map containing sibling user-fn must parse");
     let v = parsed.variables.get("m").expect("m present");
     match v {
         Value::Concrete(ConcreteValue::Map(map)) => {
@@ -15239,8 +17100,11 @@ fn parse_directory_resolves_sibling_user_fn_in_let_interpolation() {
         "let s = \"prefix-${ts()}-suffix\"\n",
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("Interpolation containing sibling user-fn must parse");
+    let parsed = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("Interpolation containing sibling user-fn must parse");
     let v = parsed.variables.get("s").expect("s present");
     assert!(
         matches!(v, Value::Concrete(ConcreteValue::String(s)) if s == "prefix-2026-suffix"),
@@ -15258,7 +17122,10 @@ fn parse_directory_truly_undefined_fn_in_let_list_still_errors() {
         "let xs = [no_such_fn(), \"static\"]\n",
     )
     .unwrap();
-    let result = parse_directory(tmp.path(), &ProviderContext::default());
+    let result = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_err(),
         "List containing a truly-undefined fn must error"
@@ -15284,7 +17151,11 @@ arguments {
   env: 'dev' = 'dev'
 }
 "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(parsed.arguments.len(), 1);
     let arg = &parsed.arguments[0];
     assert_eq!(arg.name, "env");
@@ -15301,7 +17172,11 @@ arguments {
   env: 'dev' | 'prod' = 'dev'
 }
 "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(parsed.arguments.len(), 1);
     let arg = &parsed.arguments[0];
     assert_eq!(
@@ -15321,8 +17196,11 @@ arguments {
 }
 "#;
 
-    let error = parse(src, &ProviderContext::default())
-        .expect_err("interpolation has no meaning in a string literal type");
+    let error = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("interpolation has no meaning in a string literal type");
     assert!(
         matches!(
             error,
@@ -15343,7 +17221,11 @@ arguments {
   region: 'tokyo' | 'osaka' | 'oregon' = 'tokyo'
 }
 "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let arg = &parsed.arguments[0];
     assert_eq!(
         expect_known(&arg.static_type).to_string(),
@@ -15358,7 +17240,11 @@ arguments {
   env: 'dev' | 'prod' = 'prod'
 }
 "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let arg = &parsed.arguments[0];
     assert_eq!(
         arg.default.as_ref().unwrap(),
@@ -15373,7 +17259,11 @@ arguments {
   envs: list('dev' | 'prod') = ['dev', 'prod']
 }
 "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let arg = &parsed.arguments[0];
     let inner = match expect_known(&arg.static_type) {
         TypeExpr::List(inner) => inner.as_ref(),
@@ -15405,7 +17295,11 @@ fn extract_directives_reads_depends_on_list() {
             }
         }
     "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let bucket = parsed
         .resources
         .iter()
@@ -15428,7 +17322,11 @@ fn extract_directives_reads_ignore_changes_attribute_paths() {
             }
         }
     "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let function = parsed
         .resources
         .iter()
@@ -15452,9 +17350,12 @@ fn extract_directives_rejects_string_literal_ignore_changes_paths() {
             directives { ignore_changes = ["code.image_uri"] }
         }
     "#;
-    let error = parse(src, &ProviderContext::default())
-        .expect_err("ignore_changes paths must not be string literals")
-        .to_string();
+    let error = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("ignore_changes paths must not be string literals")
+    .to_string();
 
     assert!(
         error.contains("bare attribute path") && error.contains("code.image_uri"),
@@ -15496,7 +17397,10 @@ fn extract_directives_rejects_string_literal_in_depends_on() {
             directives { depends_on = ["role"] }
         }
     "#;
-    let result = parse(src, &ProviderContext::default());
+    let result = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_err(),
         "expected parse error for string-literal element in depends_on"
@@ -15660,8 +17564,11 @@ fn parse_duration_in_directory_scoped_fixture() {
         "#,
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("multi-file fixture with a Duration must parse");
+    let parsed = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("multi-file fixture with a Duration must parse");
     let cert = parsed
         .resources
         .iter()
@@ -15704,7 +17611,11 @@ fn extract_directives_accepts_empty_depends_on_list() {
             directives { depends_on = [] }
         }
     "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let bucket = parsed
         .resources
         .iter()
@@ -15740,7 +17651,11 @@ fn extract_directives_depends_on_in_for_loop_resource() {
             }
         }
     "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let deferred = parsed
         .parsed_deferred_for_expressions()
         .first()
@@ -15766,7 +17681,10 @@ fn extract_directives_rejects_string_literal_in_anonymous_resource_depends_on() 
             directives { depends_on = ["role"] }
         }
     "#;
-    let result = parse(src, &ProviderContext::default());
+    let result = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_err(),
         "expected parse error for string-literal element in anonymous resource"
@@ -15791,7 +17709,11 @@ fn parse_provider_expr_named_instance_in_let_binding() {
             region = "us-east-1"
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     // Two entries: the default kind+instance from the top-level block,
     // plus the `let us = ...` named instance.
@@ -15846,8 +17768,11 @@ fn parse_provider_expr_rejects_source_on_named_instance() {
             region = "us-east-1"
         }
     "#;
-    let err = parse(input, &ProviderContext::default())
-        .expect_err("source on named instance must be rejected");
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("source on named instance must be rejected");
     let msg = format!("{err}");
     assert!(
         msg.contains("source"),
@@ -15867,8 +17792,11 @@ fn parse_provider_expr_rejects_version_on_named_instance() {
             version = "0.2.0"
         }
     "#;
-    let err = parse(input, &ProviderContext::default())
-        .expect_err("version on named instance must be rejected");
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("version on named instance must be rejected");
     let msg = format!("{err}");
     assert!(
         msg.contains("version"),
@@ -15888,8 +17816,11 @@ fn parse_provider_expr_rejects_revision_on_named_instance() {
             revision = "main"
         }
     "#;
-    let err = parse(input, &ProviderContext::default())
-        .expect_err("revision on named instance must be rejected");
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("revision on named instance must be rejected");
     let msg = format!("{err}");
     assert!(
         msg.contains("revision"),
@@ -15907,7 +17838,11 @@ fn parse_top_level_provider_block_is_default_without_a_binding() {
             version = "0.1.0"
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(parsed.providers.len(), 1);
     let p = &parsed.providers[0];
     assert_eq!(p.name, "mock");
@@ -15934,7 +17869,11 @@ fn parse_provider_expr_multiple_named_instances() {
             region = "us-east-1"
         }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(parsed.providers.len(), 3);
     let mut bindings: Vec<Option<&str>> = parsed
         .providers
@@ -15973,8 +17912,11 @@ fn parse_provider_expr_named_instance_visible_across_files() {
         "#,
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("multi-file directory parse must succeed");
+    let parsed = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("multi-file directory parse must succeed");
 
     assert_eq!(
         parsed.providers.len(),
@@ -16002,7 +17944,11 @@ fn parse_provider_expr_empty_body() {
         }
         let us = provider aws {}
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let named = parsed
         .providers
         .iter()
@@ -16024,8 +17970,11 @@ fn parse_provider_expr_rejects_duplicate_binding() {
         let us = provider aws { region = "us-east-1" }
         let us = provider aws { region = "eu-west-1" }
     "#;
-    let err = parse(input, &ProviderContext::default())
-        .expect_err("duplicate let binding for a provider instance must be rejected");
+    let err = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("duplicate let binding for a provider instance must be rejected");
     let msg = format!("{err}");
     assert!(
         msg.to_lowercase().contains("duplicate"),
@@ -16047,7 +17996,11 @@ fn parse_provider_expr_with_discard_pattern() {
         }
         let _ = provider aws { region = "us-east-1" }
     "#;
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        input,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     assert_eq!(parsed.providers.len(), 2);
 }
 
@@ -16158,7 +18111,11 @@ fn extract_directives_reads_provider_binding() {
             }
         }
     "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let bucket = parsed
         .resources
         .iter()
@@ -16186,7 +18143,11 @@ fn extract_directives_provider_default_is_none() {
             bucket_name = "x"
         }
     "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let bucket = parsed
         .resources
         .iter()
@@ -16207,7 +18168,10 @@ fn extract_directives_rejects_string_literal_in_provider() {
             directives { provider = "us" }
         }
     "#;
-    let result = parse(src, &ProviderContext::default());
+    let result = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     assert!(
         result.is_err(),
         "directives.provider must reject string-literal values"
@@ -16250,8 +18214,11 @@ fn extract_directives_provider_visible_across_files() {
         "#,
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("multi-file directory parse must succeed");
+    let parsed = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("multi-file directory parse must succeed");
     let cert = parsed
         .resources
         .iter()
@@ -16282,7 +18249,11 @@ fn extract_directives_reads_provider_in_anonymous_resource() {
             directives { provider = us }
         }
     "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let bucket = parsed
         .resources
         .iter()
@@ -16309,7 +18280,11 @@ fn check_provider_instance_routing_accepts_named_instance() {
             directives { provider = us }
         }
     "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let errs = crate::parser::check_provider_instance_routing(&parsed);
     assert!(
         errs.is_empty(),
@@ -16329,7 +18304,11 @@ fn check_provider_instance_routing_accepts_default_when_none() {
             bucket_name = "x"
         }
     "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let errs = crate::parser::check_provider_instance_routing(&parsed);
     assert!(
         errs.is_empty(),
@@ -16349,7 +18328,11 @@ fn check_provider_instance_routing_rejects_unknown_binding() {
             directives { provider = nope }
         }
     "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let errs = crate::parser::check_provider_instance_routing(&parsed);
     assert_eq!(
         errs.len(),
@@ -16380,7 +18363,11 @@ fn check_provider_instance_routing_rejects_kind_mismatch() {
             directives { provider = us }
         }
     "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let errs = crate::parser::check_provider_instance_routing(&parsed);
     assert_eq!(
         errs.len(),
@@ -16407,7 +18394,11 @@ fn check_provider_instance_routing_rejects_missing_default_instance() {
             bucket_name = "x"
         }
     "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let errs = crate::parser::check_provider_instance_routing(&parsed);
     assert_eq!(
         errs.len(),
@@ -16447,8 +18438,11 @@ fn check_provider_instance_routing_multi_file_named_instance() {
         "#,
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("multi-file directory parse must succeed");
+    let parsed = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("multi-file directory parse must succeed");
     let errs = crate::parser::check_provider_instance_routing(&parsed);
     assert!(
         errs.is_empty(),
@@ -16475,8 +18469,11 @@ fn parser_rejects_non_provider_handle_in_provider_directive() {
             directives { provider = role }
         }
     "#;
-    let error = parse(src, &ProviderContext::default())
-        .expect_err("a resource handle cannot route a provider directive");
+    let error = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("a resource handle cannot route a provider directive");
     let msg = error.to_string();
     assert!(
         msg.contains("'role' is a resource, not a provider instance") && msg.contains("line 13"),
@@ -16506,8 +18503,11 @@ fn parse_directory_named_instance_region_is_enum_identifier_namespaced() {
         "#,
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("multi-file directory parse must succeed");
+    let parsed = parse_directory(
+        tmp.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("multi-file directory parse must succeed");
 
     let us = parsed
         .providers
@@ -16569,7 +18569,11 @@ fn parser_propagates_directives_provider_instance_to_resource_id() {
             bucket_name = "default-region"
         }
     "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let cert = parsed
         .resources
         .iter()
@@ -16672,8 +18676,11 @@ fn parse_chained_index_then_field_access() {
             name = cert.domain_validation_options[0].resource_record_name
         }
     "#;
-    let parsed = parse(src, &ProviderContext::default())
-        .expect("`<binding>.<field>[<idx>].<field>` must parse — carina#3025");
+    let parsed = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("`<binding>.<field>[<idx>].<field>` must parse — carina#3025");
 
     // The resource exists and its `name` attribute carries the
     // expected ordered segment chain.
@@ -16717,7 +18724,11 @@ fn parse_multi_step_index_then_field_chain() {
             cidr_block = orgs.accounts[0].subnets[1].id
         }
     "#;
-    let result = parse(src, &ProviderContext::default()).unwrap();
+    let result = parse(
+        src,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let subnet = result.resources.last().expect("subnet");
     let value = subnet.get_attr("cidr_block").expect("cidr_block");
     match value {
@@ -16788,7 +18799,7 @@ fn postfix_index_on_deferred_function_call_parses_as_access() {
             }
             let selected = split("/", role.arn)[1]
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("a function result must accept postfix indexing");
 
@@ -16832,7 +18843,7 @@ fn postfix_index_on_static_function_result_evaluates_during_parse_resolution() {
 fn postfix_index_on_known_list_reports_out_of_range_during_parse() {
     let error = parse(
         r#"let selected = ["a", "b"][5]"#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("known out-of-range list access must fail during parsing");
 
@@ -16854,7 +18865,7 @@ fn postfix_index_parses_on_parenthesized_pipe_results() {
             let x = queue.arn
             let from_pipe = (x |> split(":"))[1]
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("postfix access must parse after parenthesized pipes");
     assert!(matches!(
@@ -16876,7 +18887,7 @@ fn postfix_index_on_let_bound_deferred_value_does_not_become_binding_name() {
             let parts = split(":", queue.arn)
             let selected = parts[5]
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("let-bound computed values must accept postfix indexing");
 
@@ -16900,7 +18911,7 @@ fn postfix_index_on_let_bound_known_list_evaluates_immediately() {
             let values = ["a", "b"]
             let selected = values[1]
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("known let-bound lists must be indexed eagerly");
 
@@ -16935,8 +18946,11 @@ fn postfix_index_on_sibling_let_bound_computed_value_is_directory_scoped() {
     )
     .unwrap();
 
-    let parsed = parse_directory(directory.path(), &ProviderContext::default())
-        .expect("sibling let-bound computed value must be visible to postfix access");
+    let parsed = parse_directory(
+        directory.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("sibling let-bound computed value must be visible to postfix access");
     let value = parsed
         .export_params
         .iter()
@@ -16971,7 +18985,7 @@ fn postfix_grammar_keeps_for_expanded_resource_address_shape() {
                 subnet_id = subnets[0].id
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("for-expanded resource addresses must retain legacy parsing");
     let value = parsed
@@ -17023,7 +19037,7 @@ fn postfix_access_preserves_deferred_for_binding_as_resource_address() {
             }
             mock.test.Consumer { name = roles[0].name }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("a deferred structural for binding must remain a reference path");
 
@@ -17040,7 +19054,7 @@ fn postfix_access_preserves_statically_empty_for_binding_as_resource_address() {
             }
             mock.test.Consumer { name = roles[0].name }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("an empty structural for binding must remain a reference path");
 
@@ -17061,7 +19075,7 @@ fn postfix_access_preserves_deferred_map_for_binding_as_resource_address() {
                 grouped = (roles)["k"].name
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("a deferred map-for binding must remain a reference path");
 
@@ -17082,7 +19096,7 @@ fn postfix_access_preserves_module_call_binding_field_access() {
                 grouped = (child).output
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("module-call output access must remain a reference path");
 
@@ -17102,7 +19116,7 @@ fn postfix_access_preserves_indexed_resource_binding_address() {
                 grouped = (res)[0].name
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("indexed resource addresses must remain reference paths");
 
@@ -17113,8 +19127,11 @@ fn postfix_access_preserves_indexed_resource_binding_address() {
 }
 
 fn assert_bare_handle_error(source: &str, binding: &str, kind: &str) {
-    let error = parse(source, &ProviderContext::default())
-        .expect_err("a bare structural handle must not lower into Value");
+    let error = parse(
+        source,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("a bare structural handle must not lower into Value");
     let message = error.to_string();
     assert!(
         message.contains(&format!("'{binding}' is {kind}, not a value")),
@@ -17135,7 +19152,7 @@ fn resolved_bare_value_stays_clean_and_records_parser_side_provenance() {
     let parsed = parse(
         r#"let authored_name = "runtime-value"
 mock.test.Consumer { name = authored_name }"#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("a normal let binding resolves exactly as main evaluation does");
     let consumer = parsed
@@ -17172,7 +19189,7 @@ mock.test.Consumer {
   first = payload
   second = payload
 }"#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("record repeated value binding uses");
     let sources = parsed
@@ -17218,8 +19235,11 @@ fn lexical_child_scope_ids_are_unique_across_sibling_files() {
     )
     .unwrap();
 
-    let parsed = parse_directory(directory.path(), &ProviderContext::default())
-        .expect("parse sibling lexical scopes");
+    let parsed = parse_directory(
+        directory.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("parse sibling lexical scopes");
     let uses = parsed
         .bare_binding_uses()
         .uses()
@@ -17234,8 +19254,11 @@ fn lexical_child_scope_ids_are_unique_across_sibling_files() {
 }
 
 fn assert_bare_handle_is_pending_for_typed_resource_value(source: &str, binding: &str) {
-    let parsed = parse(source, &ProviderContext::default())
-        .expect("typed resource values retain parser-side handle provenance");
+    let parsed = parse(
+        source,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("typed resource values retain parser-side handle provenance");
     let consumer = parsed
         .resources
         .iter()
@@ -17294,7 +19317,7 @@ fn boundary_blocks_preserve_bare_resource_handles_for_typed_validation() {
         r#"let vpc = mock.test.Thing { name = "source" }
 attributes { output = vpc }
 exports { exported = vpc }"#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("boundary blocks retain structural handles until validation");
 
@@ -17331,7 +19354,7 @@ fn bare_resource_handle_in_module_collection_becomes_a_pending_argument_slot() {
         r#"let vpc = mock.test.Thing { name = "source" }
 let child_module = use { source = "./child" }
 let child = child_module { values = [vpc] }"#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("module argument parsing defers structural diagnostics");
     let call = parsed.module_calls.first().expect("module call");
@@ -17384,7 +19407,7 @@ fn pending_nested_blocks_keep_authored_list_indices() {
                 }
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("pending blocks must not disturb later authored paths");
 
@@ -17421,7 +19444,7 @@ fn grouped_direct_module_resource_argument_keeps_the_handle_boundary() {
 let child_module = use { source = "./child" }
 let child = child_module { parent = (vpc) }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("a grouped direct handle remains a direct module argument");
     let call = parsed.module_calls.first().expect("module call");
@@ -17447,7 +19470,7 @@ for item in ["one", "two"] {
   child_module { param = shared }
 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("expand module calls in a for expression");
     assert_eq!(parsed.module_calls.len(), 2);
@@ -17479,7 +19502,7 @@ for item in ["one", "two"] {
 fn top_level_value_lowering_reports_the_authored_bare_handle_line() {
     let error = parse(
         "let vpc = mock.test.Thing { name = \"source\" }\n\n\nlet values = [vpc]\n",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("a bare handle nested in a top-level value must be rejected");
 
@@ -17500,8 +19523,11 @@ fn directory_function_resolution_reports_the_authored_call_line() {
     )
     .unwrap();
 
-    let error = parse_directory(directory.path(), &ProviderContext::default())
-        .expect_err("an unknown deferred function must fail after directory resolution");
+    let error = parse_directory(
+        directory.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("an unknown deferred function must fail after directory resolution");
     assert!(
         error.contains("at line 3"),
         "expected the authored function-call line, got {error}",
@@ -17519,8 +19545,11 @@ fn deferred_call_in_user_function_body_reports_the_body_line() {
     )
     .unwrap();
 
-    let error = parse_directory(directory.path(), &ProviderContext::default())
-        .expect_err("a deferred call in a function body must fail after directory resolution");
+    let error = parse_directory(
+        directory.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("a deferred call in a function body must fail after directory resolution");
     assert!(
         error.contains("at line 2"),
         "expected the function-body expression line, got {error}",
@@ -17583,7 +19612,7 @@ mock.test.Consumer { name = secondary }"#,
 
 #[test]
 fn ref_typed_user_function_argument_accepts_a_structural_handle() {
-    let mut context = ProviderContext::default();
+    let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     context
         .resource_types
         .insert(("mock".to_string(), "test.Thing".to_string()));
@@ -17628,7 +19657,7 @@ let name = resource_name(vpc)
     )
     .unwrap();
 
-    let mut context = ProviderContext::default();
+    let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     context
         .resource_types
         .insert(("mock".to_string(), "test.Thing".to_string()));
@@ -17644,7 +19673,7 @@ let name = resource_name(vpc)
 
 #[test]
 fn ref_typed_user_function_pipe_accepts_a_structural_handle() {
-    let mut context = ProviderContext::default();
+    let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     context
         .resource_types
         .insert(("mock".to_string(), "test.Thing".to_string()));
@@ -17669,7 +19698,7 @@ fn ref_typed_user_function_pipe_accepts_a_structural_handle() {
 
 #[test]
 fn deferred_user_function_call_carries_a_ref_typed_handle() {
-    let mut context = ProviderContext::default();
+    let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     context
         .resource_types
         .insert(("mock".to_string(), "test.Thing".to_string()));
@@ -17696,7 +19725,7 @@ fn deferred_user_function_call_carries_a_ref_typed_handle() {
 
 #[test]
 fn deferred_user_function_pipe_carries_a_ref_typed_handle() {
-    let mut context = ProviderContext::default();
+    let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     context
         .resource_types
         .insert(("mock".to_string(), "test.Thing".to_string()));
@@ -17746,8 +19775,11 @@ fn forward_structural_handle_is_pending_after_directory_kind_resolution() {
     )
     .unwrap();
 
-    let parsed = parse_directory(directory.path(), &ProviderContext::default())
-        .expect("a forward structural handle reaches typed validation");
+    let parsed = parse_directory(
+        directory.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("a forward structural handle reaches typed validation");
     let consumer = parsed
         .resources
         .iter()
@@ -17777,8 +19809,11 @@ fn sibling_structural_handle_is_pending_after_directory_kind_resolution() {
     )
     .unwrap();
 
-    let parsed = parse_directory(directory.path(), &ProviderContext::default())
-        .expect("a sibling structural handle reaches typed validation");
+    let parsed = parse_directory(
+        directory.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("a sibling structural handle reaches typed validation");
     let consumer = parsed
         .resources
         .iter()
@@ -17810,8 +19845,11 @@ fn integer_arithmetic_rejects_a_structural_handle_from_a_sibling_file_in_both_po
         )
         .unwrap();
 
-        let error = parse_directory(directory.path(), &ProviderContext::default())
-            .expect_err("a resource handle cannot be an arithmetic operand");
+        let error = parse_directory(
+            directory.path(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("a resource handle cannot be an arithmetic operand");
         assert!(
             error.contains("'b' is a resource, not a value"),
             "expression {expression:?} produced an unexpected diagnostic: {error}"
@@ -17823,7 +19861,7 @@ fn integer_arithmetic_rejects_a_structural_handle_from_a_sibling_file_in_both_po
 fn integer_arithmetic_retains_provisional_metadata_for_both_operands() {
     let parsed = parse_with_seeded_bindings(
         "let n = a + b\n",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         &[BindingSeed::provisional("a"), BindingSeed::provisional("b")],
     )
     .expect("provisional operands remain pending until directory kind resolution");
@@ -17851,8 +19889,11 @@ fn forward_value_binding_remains_a_value() {
     )
     .unwrap();
 
-    let parsed = parse_directory(directory.path(), &ProviderContext::default())
-        .expect("a forward value binding remains valid");
+    let parsed = parse_directory(
+        directory.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("a forward value binding remains valid");
     assert_eq!(
         resource_attribute(&parsed, "test.Consumer", "name"),
         Value::Concrete(ConcreteValue::String("value".into())),
@@ -17884,8 +19925,11 @@ let us = provider mock {}
     )
     .unwrap();
 
-    let parsed = parse_directory(directory.path(), &ProviderContext::default())
-        .expect("directives accept typed sibling handles");
+    let parsed = parse_directory(
+        directory.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("directives accept typed sibling handles");
     let consumer = parsed
         .resources
         .iter()
@@ -17910,7 +19954,7 @@ let consumer = mock.test.Consumer {
   directives { depends_on = [us] }
 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("a provider instance is not a dependency target");
 
@@ -17951,8 +19995,11 @@ let ready = wait target {
 "#,
         ),
     ] {
-        let error = parse(source, &ProviderContext::default())
-            .expect_err("a value-typed module argument is not a dependency handle");
+        let error = parse(
+            source,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("a value-typed module argument is not a dependency handle");
         assert!(
             error.to_string().contains(&format!(
                 "{boundary}: expected a managed resource handle; got String"
@@ -17970,7 +20017,7 @@ fn accessing_a_handle_nested_in_a_computed_list_rejects_the_bare_element() {
             let r = mock.test.Thing { name = "r" }
             let consumer = mock.test.Consumer { name = [q, r][1].identifier }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("a computed container cannot contain a bare structural handle");
 
@@ -18010,7 +20057,7 @@ fn postfix_access_reference_roots_are_canonical_reference_paths() {
                 wait_grouped     = (w).ready
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("parenthesized and aliased reference roots must parse canonically");
 
@@ -18083,8 +20130,11 @@ fn postfix_access_preserves_sibling_deferred_for_binding_as_resource_address() {
     )
     .unwrap();
 
-    let parsed = parse_directory(directory.path(), &ProviderContext::default())
-        .expect("sibling structural bindings must be typed as references");
+    let parsed = parse_directory(
+        directory.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("sibling structural bindings must be typed as references");
     let value = |name: &str| {
         parsed
             .export_params
@@ -18121,7 +20171,7 @@ fn postfix_access_on_partial_application_is_a_parse_error() {
             let values = { k = { x = "value" } }
             let selected = lookup(values, "k")["x"]
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("a partial application is not indexable data");
 
@@ -18139,7 +20189,7 @@ fn structural_binding_alias_field_access_uses_the_canonical_resource() {
             let y = x
             let consumer = mock.test.Consumer { name = y.identifier }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("postfix access through a structural alias remains valid");
 
@@ -18164,8 +20214,11 @@ fn sibling_structural_alias_field_access_uses_the_canonical_resource() {
     )
     .unwrap();
 
-    let parsed = parse_directory(directory.path(), &ProviderContext::default())
-        .expect("a sibling structural alias remains typed through the fixed point");
+    let parsed = parse_directory(
+        directory.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("a sibling structural alias remains typed through the fixed point");
     let value = resource_attribute(&parsed, "test.Consumer", "name");
     assert_eq!(
         value,
@@ -18186,7 +20239,7 @@ fn for_iterable_computed_structural_handles_rejects_the_bare_element() {
                 mock.test.Consumer { name = o.identifier }
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("computed collections cannot contain bare resource handles");
 
@@ -18224,8 +20277,11 @@ fn sibling_computed_handles_keep_the_bare_handle_diagnostic() {
     )
     .unwrap();
 
-    let error = parse_directory(directory.path(), &ProviderContext::default())
-        .expect_err("the sibling value cannot contain a bare resource handle");
+    let error = parse_directory(
+        directory.path(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("the sibling value cannot contain a bare resource handle");
     let message = error.to_string();
     assert!(
         message.contains("'q' is a resource, not a value"),
@@ -18244,7 +20300,7 @@ fn invalid_secret_subscript_diagnostic_never_exposes_plaintext() {
             let parts = ["a", "b"]
             let selected = parts[secret("hunter2")]
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("a secret value is not a valid list subscript");
 
@@ -18267,7 +20323,11 @@ mod loop_var_field_access_matrix {
     use super::*;
 
     fn first_name(src: &str) -> Value {
-        let p = parse(src, &ProviderContext::default()).expect("parse");
+        let p = parse(
+            src,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse");
         // Raw parser output cannot expose finalized deferred loops; the
         // concrete resource below proves this inline list expanded eagerly.
         p.resources
@@ -18313,7 +20373,7 @@ mod loop_var_field_access_matrix {
         // is meaningless and must keep erroring.
         let err = parse(
             r#"for s in ["x"] { aws.ec2.Subnet { name = s.foo } }"#,
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert!(
             err.is_err(),
@@ -18342,14 +20402,21 @@ mod loop_var_field_access_matrix {
                 aws.ec2.Subnet { name = o.k }
             }
         "#;
-        let p = parse(src, &ProviderContext::default()).expect("parse");
+        let p = parse(
+            src,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse");
         assert_eq!(
             p.parsed_deferred_for_expressions().len(),
             1,
             "loop deferred"
         );
         let mut p = cross_deferred_for_resolution_seam(p)
-            .into_expanded(&crate::schema::SchemaRegistry::new())
+            .into_expanded(
+                &crate::schema::SchemaRegistry::new(),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
             .expect("deferred template must contain no parser placeholders");
         // The template body must carry the deferred postfix operation, not a
         // resource ResourceRef (which would never resolve for a loop var) and
@@ -18387,7 +20454,7 @@ mod loop_var_field_access_matrix {
         let mut remote = HashMap::new();
         remote.insert("up".to_string(), up_attrs);
         crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 p.expand_deferred_for_expressions(
                     &IterableBindings::from_upstream_only(resolve_remote_bindings(remote)),
@@ -18434,7 +20501,11 @@ mod loop_var_field_access_matrix {
                 mock.test.Thing { name = item["k"].nested.value }
             }
         "#;
-        let parsed = parse(source, &ProviderContext::default()).expect("parse deferred loops");
+        let parsed = parse(
+            source,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse deferred loops");
         assert_eq!(parsed.parsed_deferred_for_expressions().len(), 2);
 
         for deferred in parsed.parsed_deferred_for_expressions() {
@@ -18481,7 +20552,10 @@ mod loop_var_field_access_matrix {
         remote.insert("up".to_string(), up);
 
         let mut expanded = cross_deferred_for_resolution_seam(parsed)
-            .into_expanded(&crate::schema::SchemaRegistry::new())
+            .into_expanded(
+                &crate::schema::SchemaRegistry::new(),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
             .expect("cross expansion boundary");
         for deferred in expanded.deferred_for_expressions() {
             let root = loop_access_root(
@@ -18497,7 +20571,7 @@ mod loop_var_field_access_matrix {
             ));
         }
         crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 expanded.expand_deferred_for_expressions(
                     &IterableBindings::from_upstream_only(resolve_remote_bindings(remote)),
@@ -18539,9 +20613,16 @@ mod loop_var_field_access_matrix {
                 mock.test.Thing { name = item["missing"] }
             }
         "#;
-        let parsed = parse(src, &ProviderContext::default()).expect("parse deferred loop");
+        let parsed = parse(
+            src,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("parse deferred loop");
         let mut parsed = cross_deferred_for_resolution_seam(parsed)
-            .into_expanded(&crate::schema::SchemaRegistry::new())
+            .into_expanded(
+                &crate::schema::SchemaRegistry::new(),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
             .expect("deferred template must contain no parser placeholders");
         let item = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "present".to_string(),
@@ -18556,7 +20637,7 @@ mod loop_var_field_access_matrix {
         remote.insert("up".to_string(), attrs);
 
         let error = crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 parsed.expand_deferred_for_expressions(
                     &IterableBindings::from_upstream_only(resolve_remote_bindings(remote)),
@@ -18580,10 +20661,17 @@ mod loop_var_field_access_matrix {
             }
         "#;
         let parsed = cross_deferred_for_resolution_seam(
-            parse(src, &ProviderContext::default()).expect("parse deferred loop"),
+            parse(
+                src,
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .expect("parse deferred loop"),
         );
         let mut parsed = parsed
-            .into_expanded(&crate::schema::SchemaRegistry::new())
+            .into_expanded(
+                &crate::schema::SchemaRegistry::new(),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
             .expect("deferred template must contain no parser placeholders");
         let item = ExpandedValue::Concrete(ExpandedConcreteValue::Map(IndexMap::from([(
             "present".to_string(),
@@ -18598,7 +20686,7 @@ mod loop_var_field_access_matrix {
         resolved.set("q", attrs, crate::binding_index::BindingValueSource::Local);
 
         crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 parsed
                     .expand_deferred_for_expressions(&resolved.project_iterable_bindings(), session)
@@ -18644,7 +20732,7 @@ fn for_iterable_structural_binding_has_a_user_facing_description() {
                 mock.test.Thing { name = sub }
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("a for-result handle is not itself an iterable value");
 
@@ -18667,7 +20755,7 @@ fn validation_subscripts_share_expression_string_decoding_and_index_checks() {
             require tags["line\nkey"] == "value", "missing tag"
             require tags[("KEY")] == "value", "missing parenthesized tag"
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("escaped validation subscript should parse");
 
@@ -18708,7 +20796,7 @@ fn validation_subscripts_share_expression_string_decoding_and_index_checks() {
             arguments { tags: list(String) }
             require tags[-1] == "value", "missing tag"
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("negative validation indexes must use the shared rejection");
     assert!(
@@ -18730,7 +20818,7 @@ fn deferred_user_calls_share_the_root_lexical_scope() {
                 second: String = suffix(input)
             }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("deferred calls should parse");
 
@@ -18766,7 +20854,7 @@ fn deferred_user_calls_share_the_root_lexical_scope() {
 }
 #[test]
 fn wait_depends_on_accepts_bare_and_dotted_dependency_operands() {
-    let parsed = parse("let ready = wait cert { until = cert.status == \"issued\" depends_on = [r, producer.validation_record] }\n", &ProviderContext::default()).unwrap();
+    let parsed = parse("let ready = wait cert { until = cert.status == \"issued\" depends_on = [r, producer.validation_record] }\n", &ProviderContext::new(crate::EnvironmentSnapshot::empty())).unwrap();
     let operands = parsed.wait_bindings[0]
         .depends_on
         .iter()
@@ -18781,7 +20869,7 @@ fn directive_functions_preserve_the_authored_error_file() {
     let mut parsed = super::parse_file(
         "let r = mock.test.resource { name = 'r' directives { force_delete = true } }",
         path,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
     parsed.resources[0]
@@ -18796,14 +20884,18 @@ fn directive_functions_preserve_the_authored_error_file() {
         )],
         source_line: 1.into(),
     });
-    let error = super::resolve_resource_refs(&mut parsed).expect_err("length(Bool) must fail");
+    let error = super::resolve_resource_refs(
+        &mut parsed,
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect_err("length(Bool) must fail");
     assert_eq!(error.source_file(), Some(path), "{error}");
 }
 
 #[test]
 fn directive_functions_resolve_in_deferred_if_resource_and_read_bodies() {
     for read in ["", "read "] {
-        let mut parsed = parse(&format!("arguments {{ flag: Bool }}\nlet choice = if flag {{ {read}mock.test.resource {{ name = 'r' directives {{ force_delete = true }} }} }} else {{ {read}mock.test.resource {{ name = 'other' directives {{ force_delete = true }} }} }}\n"), &ProviderContext::default()).unwrap();
+        let mut parsed = parse(&format!("arguments {{ flag: Bool }}\nlet choice = if flag {{ {read}mock.test.resource {{ name = 'r' directives {{ force_delete = true }} }} }} else {{ {read}mock.test.resource {{ name = 'other' directives {{ force_delete = true }} }} }}\n"), &ProviderContext::new(crate::EnvironmentSnapshot::empty())).unwrap();
         assert_eq!(parsed.deferred_module_ifs.len(), 1);
         for branch in parsed.deferred_module_ifs[0].branches_mut() {
             let directives = match branch {
@@ -18828,18 +20920,24 @@ fn directive_functions_resolve_in_deferred_if_resource_and_read_bodies() {
                     source_line: 2.into(),
                 });
         }
-        super::resolve_resource_refs(&mut parsed).unwrap();
+        super::resolve_resource_refs(
+            &mut parsed,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         assert!(
             parsed
                 .directive_resolution_errors(
                     super::ParserPlaceholderBoundary::ModuleDefinition,
-                    &crate::schema::SchemaRegistry::new()
+                    &crate::schema::SchemaRegistry::new(),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
                 )
                 .is_empty(),
             "{:?}",
             parsed.directive_resolution_errors(
                 super::ParserPlaceholderBoundary::ModuleDefinition,
-                &crate::schema::SchemaRegistry::new()
+                &crate::schema::SchemaRegistry::new(),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
             )
         );
     }
@@ -18847,25 +20945,28 @@ fn directive_functions_resolve_in_deferred_if_resource_and_read_bodies() {
 
 #[test]
 fn module_iterable_loop_directives_wait_for_argument_substitution() {
-    let parsed = parse("arguments { flags: list(Bool) }\nlet values = flags\nfor flag in values { mock.test.resource { name = 'r' directives { prevent_destroy = flag force_delete = flag create_before_destroy = flag } } }", &ProviderContext::default()).unwrap();
+    let parsed = parse("arguments { flags: list(Bool) }\nlet values = flags\nfor flag in values { mock.test.resource { name = 'r' directives { prevent_destroy = flag force_delete = flag create_before_destroy = flag } } }", &ProviderContext::new(crate::EnvironmentSnapshot::empty())).unwrap();
     assert!(
         parsed
             .directive_resolution_errors(
                 super::ParserPlaceholderBoundary::ModuleDefinition,
-                &crate::schema::SchemaRegistry::new()
+                &crate::schema::SchemaRegistry::new(),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
             )
             .is_empty(),
         "{:?}",
         parsed.directive_resolution_errors(
             super::ParserPlaceholderBoundary::ModuleDefinition,
-            &crate::schema::SchemaRegistry::new()
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         )
     );
     assert!(
         parsed
             .directive_resolution_errors(
                 super::ParserPlaceholderBoundary::ExpandedFile,
-                &crate::schema::SchemaRegistry::new()
+                &crate::schema::SchemaRegistry::new(),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
             )
             .is_empty()
     );
