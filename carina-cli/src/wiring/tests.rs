@@ -324,6 +324,7 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
             expanded_resources,
             sorted_resources: Vec::new(),
             addressed: AddressedState {
+                refresh_rows: RefreshRows::default(),
                 managed_current: HashMap::new(),
                 orphans: Orphans::new(),
                 saved_attrs: crate::empty_lifted_saved_attrs(),
@@ -345,7 +346,7 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
     let provider = carina_core::provider::ProviderRouter::new();
     let state_file = None;
     let state_block_claims = StateBlockClaims::default();
-    let resolved_state_block_targets = ResolvedStateBlockTargets::default();
+    let resolved_state_block_targets = crate::test_support::empty_state_block_targets();
     let expected = missing_identifier_plan_error("diagnostic");
     let preparation_errors =
         NonEmptyPlanErrors::try_from(vec![expected.clone()]).expect("one error is non-empty");
@@ -611,7 +612,7 @@ let item = test.thing {
             ProgressSink::Human,
             &HashMap::new(),
             &StateBlockClaims::default(),
-            &ResolvedStateBlockTargets::default(),
+            &crate::test_support::empty_state_block_targets(),
             crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
         )
         .await
@@ -719,7 +720,7 @@ async fn anonymous_to_named_enum_and_int_match_through_multifile_state_wiring() 
         ProgressSink::Human,
         &HashMap::new(),
         &StateBlockClaims::default(),
-        &ResolvedStateBlockTargets::default(),
+        &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
@@ -815,7 +816,7 @@ async fn anonymous_to_named_unordered_enum_list_matches_reordered_persisted_stat
         ProgressSink::Human,
         &HashMap::new(),
         &StateBlockClaims::default(),
-        &ResolvedStateBlockTargets::default(),
+        &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
@@ -1034,7 +1035,7 @@ let first = test.thing {
             ProgressSink::Human,
             &HashMap::new(),
             &StateBlockClaims::default(),
-            &ResolvedStateBlockTargets::default(),
+            &crate::test_support::empty_state_block_targets(),
             crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
         )
         .await
@@ -1161,7 +1162,7 @@ let direct = awscc.ec2.Route {
             ProgressSink::Human,
             &HashMap::new(),
             &StateBlockClaims::default(),
-            &ResolvedStateBlockTargets::default(),
+            &crate::test_support::empty_state_block_targets(),
             crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
         )
         .await
@@ -3910,7 +3911,7 @@ async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creat
         ProgressSink::Human,
         &HashMap::new(),
         &StateBlockClaims::default(),
-        &ResolvedStateBlockTargets::default(),
+        &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await;
@@ -4435,7 +4436,7 @@ let shared = read test.shared.Type {}
         ProgressSink::Human,
         &HashMap::new(),
         &StateBlockClaims::default(),
-        &ResolvedStateBlockTargets::default(),
+        &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
@@ -4484,9 +4485,12 @@ async fn read_with_retry_translates_not_found_to_state_not_found() {
     let id = ResourceId::with_identity("test.Resource", "gone");
 
     let identifier = crate::fixture_applied_identifier("some-identifier");
-    let state = read_with_retry(&provider, &id, &identifier)
-        .await
-        .expect("not found should translate into a not_found state");
+    let state = read_with_retry(
+        &provider,
+        &crate::test_support::refresh_target(&id, &identifier),
+    )
+    .await
+    .expect("not found should translate into a not_found state");
 
     assert!(!state.exists);
     assert_eq!(state.id, id);
@@ -4499,7 +4503,11 @@ async fn read_with_retry_propagates_other_errors() {
     let id = ResourceId::with_identity("test.Resource", "broken");
 
     let identifier = crate::fixture_applied_identifier("some-identifier");
-    let result = read_with_retry(&provider, &id, &identifier).await;
+    let result = read_with_retry(
+        &provider,
+        &crate::test_support::refresh_target(&id, &identifier),
+    )
+    .await;
 
     assert!(matches!(result, Err(ProviderError::ApiError(_))));
 }
@@ -4510,9 +4518,12 @@ async fn read_with_retry_does_not_retry_not_found() {
     let id = ResourceId::with_identity("test.Resource", "gone");
 
     let identifier = crate::fixture_applied_identifier("some-identifier");
-    let state = read_with_retry(&provider, &id, &identifier)
-        .await
-        .expect("not found should translate into a not_found state");
+    let state = read_with_retry(
+        &provider,
+        &crate::test_support::refresh_target(&id, &identifier),
+    )
+    .await
+    .expect("not found should translate into a not_found state");
 
     assert!(!state.exists);
     assert_eq!(state.id, id);
@@ -4536,7 +4547,7 @@ async fn outcome_unknown_refresh_preserves_managed_and_orphan_rows_without_provi
 
     let refreshed = refresh_loaded_resource_with_retry(
         &provider,
-        Current::create_outcome_unknown(unknown.clone()),
+        crate::test_support::refresh_current(Current::create_outcome_unknown(unknown.clone())),
         None,
         &SchemaRegistry::new(),
     )
@@ -4552,6 +4563,16 @@ async fn outcome_unknown_refresh_preserves_managed_and_orphan_rows_without_provi
         Some(absolute_binding("unknown")),
         carina_core::resource::PersistedDirectives::default(),
     );
+    let orphan = PreparedRows::from_snapshots(
+        [(id, orphan.into_current())],
+        &ResolvedRemovedClaims::resolve(&[], None),
+    )
+    .refreshable
+    .build_orphans(&HashSet::new())
+    .into_iter()
+    .next()
+    .unwrap()
+    .1;
     let refreshed_orphan =
         refresh_loaded_orphan_with_retry(&provider, orphan, None, &SchemaRegistry::new())
             .await
@@ -5087,7 +5108,7 @@ fn moved_block_resolves_routed_instance_on_from_and_to() {
         &mut prev_explicit,
         &mut saved_attrs,
         &state_blocks,
-        &Some(state_file),
+        &Some(state_file.clone()),
     )
     .expect("fixture move routes must agree with current state");
 
@@ -5151,7 +5172,7 @@ fn same_type_moved_block_parses_and_materializes_state() {
         &mut HashMap::new(),
         &mut crate::empty_lifted_saved_attrs(),
         &parsed.state_blocks,
-        &Some(state_file),
+        &Some(state_file.clone()),
     )
     .expect("fixture move routes must agree with current state");
 
@@ -5238,7 +5259,7 @@ fn moved_in_flight_rebinds_resume_to_destination() {
         &mut HashMap::new(),
         &mut crate::empty_lifted_saved_attrs(),
         &parsed.state_blocks,
-        &Some(state_file),
+        &Some(state_file.clone()),
     )
     .expect("fixture move routes must agree with current state");
 
@@ -5415,10 +5436,11 @@ fn removed_block_suppresses_delete_when_state_resource_is_routed_to_named_instan
             add_state_block_effects::<carina_core::resource::UnexpandedDependencyFields>(
                 &mut plan,
                 &state_blocks,
-                &Some(state_file),
+                &Some(state_file.clone()),
                 &[],
                 &[],
                 crate::wiring::StateBlockEvaluationContext {
+                    removed: &ResolvedRemovedClaims::resolve(&state_blocks, Some(&state_file)),
                     bindings: &bindings,
                     unresolved_upstream_bindings: &no_upstreams,
                     session,
@@ -5502,10 +5524,11 @@ fn removed_block_does_not_suppress_deposed_generation_delete() {
             add_state_block_effects::<carina_core::resource::UnexpandedDependencyFields>(
                 &mut plan,
                 &state_blocks,
-                &Some(state_file),
+                &Some(state_file.clone()),
                 &[],
                 &[],
                 crate::wiring::StateBlockEvaluationContext {
+                    removed: &ResolvedRemovedClaims::resolve(&state_blocks, Some(&state_file)),
                     bindings: &bindings,
                     unresolved_upstream_bindings: &no_upstreams,
                     session,
@@ -5621,10 +5644,16 @@ fn removed_suppresses_in_flight_orphan_error_and_keeps_deposed() {
                 &[StateBlock::Removed {
                     from: StateBlockAddress::new("mock", "example.Widget", "pending"),
                 }],
-                &Some(state_file),
+                &Some(state_file.clone()),
                 &[],
                 &[],
                 crate::wiring::StateBlockEvaluationContext {
+                    removed: &ResolvedRemovedClaims::resolve(
+                        &[StateBlock::Removed {
+                            from: StateBlockAddress::new("mock", "example.Widget", "pending"),
+                        }],
+                        Some(&state_file),
+                    ),
                     bindings: &carina_core::binding_index::ResolvedBindings::default(),
                     unresolved_upstream_bindings: &HashSet::new(),
                     session,
@@ -5669,7 +5698,7 @@ fn deposed_delete_without_provider_identifier_becomes_plan_error() {
         .expect("test state setup must be valid");
     let mut plan = Plan::new();
 
-    add_deposed_delete_effects(&mut plan, &Some(state_file), &[]);
+    add_deposed_delete_effects(&mut plan, &Some(state_file.clone()), &[]);
 
     assert!(plan.effects().is_empty());
     assert_eq!(plan.errors().len(), 1);
@@ -5708,7 +5737,7 @@ fn malformed_deposed_generation_with_healthy_current_instance_recommends_reimpor
         .expect("test state setup must be valid");
     let mut plan = Plan::new();
 
-    add_deposed_delete_effects(&mut plan, &Some(state_file), &[]);
+    add_deposed_delete_effects(&mut plan, &Some(state_file.clone()), &[]);
 
     let message = render_plan_error(&plan.errors()[0]);
     assert!(message.contains("`removed` block"), "{message}");
@@ -5901,6 +5930,7 @@ fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
                 &[],
                 &[resource],
                 crate::wiring::StateBlockEvaluationContext {
+                    removed: &ResolvedRemovedClaims::resolve(&[], None),
                     bindings: &bindings,
                     unresolved_upstream_bindings: &no_upstreams,
                     session,
@@ -5997,6 +6027,7 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
                 &[],
                 std::slice::from_ref(&resource),
                 crate::wiring::StateBlockEvaluationContext {
+                    removed: &ResolvedRemovedClaims::resolve(&state_blocks, state_file.as_ref()),
                     bindings: &bindings,
                     unresolved_upstream_bindings: &no_upstreams,
                     session,
@@ -6021,6 +6052,7 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
                 &[],
                 std::slice::from_ref(&resource),
                 crate::wiring::StateBlockEvaluationContext {
+                    removed: &ResolvedRemovedClaims::resolve(&removed_blocks, state_file.as_ref()),
                     bindings: &bindings,
                     unresolved_upstream_bindings: &no_upstreams,
                     session,
@@ -6108,6 +6140,7 @@ fn import_does_not_suppress_unknown_outcome_from_another_provider_instance() {
                 &[],
                 std::slice::from_ref(&imported),
                 crate::wiring::StateBlockEvaluationContext {
+                    removed: &ResolvedRemovedClaims::resolve(&state_blocks, state_file.as_ref()),
                     bindings: &carina_core::binding_index::ResolvedBindings::default(),
                     unresolved_upstream_bindings: &std::collections::HashSet::new(),
                     session,
@@ -6164,7 +6197,7 @@ fn test_materialize_moved_states_warns_on_missing_from() {
         &mut HashMap::new(),
         &mut crate::empty_lifted_saved_attrs(),
         &state_blocks,
-        &Some(state_file),
+        &Some(state_file.clone()),
         &mut |warning| warnings.push(warning),
     )
     .expect("fixture move routes must agree with current state");
@@ -6398,6 +6431,7 @@ fn test_detected_bucket_move(origin: &str, projected_from: &str, to: &str) -> Re
 #[test]
 fn resource_move_invariants_missing_detected_source_is_an_error() {
     let mut addressed = AddressedState {
+        refresh_rows: RefreshRows::default(),
         managed_current: HashMap::new(),
         orphans: Orphans::new(),
         saved_attrs: crate::empty_lifted_saved_attrs(),
@@ -6476,7 +6510,7 @@ fn explicit_move_accepts_deposed_only_source_that_is_present_in_state() {
         &mut HashMap::new(),
         &mut crate::empty_lifted_saved_attrs(),
         &parsed.state_blocks,
-        &Some(state_file),
+        &Some(state_file.clone()),
     )
     .expect("a persisted deposed-only source is a valid move source");
 
@@ -6509,6 +6543,7 @@ fn detected_move_accepts_deposed_only_source_that_is_present_in_state() {
         .upsert_resource(deposed_only)
         .expect("test state setup must be valid");
     let mut addressed = AddressedState {
+        refresh_rows: RefreshRows::default(),
         managed_current: HashMap::new(),
         orphans: Orphans::new(),
         saved_attrs: crate::empty_lifted_saved_attrs(),
@@ -6537,6 +6572,7 @@ fn resource_move_invariants_chained_moves_are_composed() {
     let intermediate = bucket_id("intermediate");
     let target = bucket_id("target");
     let mut addressed = AddressedState {
+        refresh_rows: RefreshRows::default(),
         managed_current: HashMap::from([(
             source.as_inner().clone(),
             Current::absent(source.as_inner().clone()),
@@ -6579,6 +6615,7 @@ fn resource_move_invariants_detected_target_cannot_be_an_explicit_source() {
     let explicit_target = bucket_id("explicit_target");
     let detected_source = bucket_id("detected_source");
     let mut addressed = AddressedState {
+        refresh_rows: RefreshRows::default(),
         managed_current: HashMap::from([(
             detected_source.as_inner().clone(),
             Current::absent(detected_source.as_inner().clone()),
@@ -6637,6 +6674,7 @@ fn resource_move_invariants_detected_source_cannot_be_an_explicit_target() {
     let explicit_target = bucket_id("explicit_target");
     let detected_target = bucket_id("detected_target");
     let mut addressed = AddressedState {
+        refresh_rows: RefreshRows::default(),
         managed_current: HashMap::from([(
             explicit_target.as_inner().clone(),
             Current::absent(explicit_target.as_inner().clone()),
@@ -6695,6 +6733,7 @@ fn resource_move_invariants_late_move_can_extend_an_early_chain() {
     let intermediate = bucket_id("intermediate");
     let target = bucket_id("target");
     let mut addressed = AddressedState {
+        refresh_rows: RefreshRows::default(),
         managed_current: HashMap::from([(
             intermediate.as_inner().clone(),
             Current::absent(intermediate.as_inner().clone()),
@@ -6742,7 +6781,7 @@ fn test_plan_fails_on_two_moves_to_same_target() {
         validate_plan_time_state_block_collisions(
             &resolved_desired_ids(&desired),
             &moved_pairs,
-            &ResolvedStateBlockTargets::default(),
+            &crate::test_support::empty_state_block_targets(),
             &state_file,
         ),
         "two moved/rename pairs resolve to the same target awscc.s3.Bucket target",
@@ -6762,7 +6801,7 @@ fn test_plan_fails_on_two_moves_from_same_source() {
         validate_plan_time_state_block_collisions(
             &resolved_desired_ids(&desired),
             &moved_pairs,
-            &ResolvedStateBlockTargets::default(),
+            &crate::test_support::empty_state_block_targets(),
             &state_file,
         ),
         "two moved/rename pairs share the same source awscc.s3.Bucket old",
@@ -6846,7 +6885,7 @@ fn test_plan_fails_on_move_onto_occupied_state_entry() {
         validate_plan_time_state_block_collisions(
             &resolved_desired_ids(&desired),
             &moved_pairs,
-            &ResolvedStateBlockTargets::default(),
+            &crate::test_support::empty_state_block_targets(),
             &state_file,
         ),
         "moved/rename pair awscc.s3.Bucket old -> awscc.s3.Bucket occupied would overwrite an existing state entry",
@@ -6884,7 +6923,7 @@ fn test_plan_allows_from_absent_to_present_idempotent_noop() {
     validate_plan_time_state_block_collisions(
         &resolved_desired_ids(&desired),
         &moved_pairs,
-        &ResolvedStateBlockTargets::default(),
+        &crate::test_support::empty_state_block_targets(),
         &state_file,
     )
     .expect("from-absent/to-present no-op must not error");
@@ -6902,7 +6941,7 @@ fn test_plan_fails_on_synthesized_rename_colliding_with_moved_to() {
         validate_plan_time_state_block_collisions(
             &resolved_desired_ids(&desired),
             &moved_pairs,
-            &ResolvedStateBlockTargets::default(),
+            &crate::test_support::empty_state_block_targets(),
             &state_file,
         ),
         "two moved/rename pairs resolve to the same target awscc.s3.Bucket named",
@@ -6919,7 +6958,7 @@ fn test_plan_fails_on_orphan_self_move() {
         validate_plan_time_state_block_collisions(
             &resolved_desired_ids(&desired),
             &moved_pairs,
-            &ResolvedStateBlockTargets::default(),
+            &crate::test_support::empty_state_block_targets(),
             &state_file,
         ),
         "moved block from and to name the same address awscc.s3.Bucket orphan: a self-move cannot transfer state",
@@ -6939,7 +6978,7 @@ fn test_plan_fails_on_rotation_shape() {
         validate_plan_time_state_block_collisions(
             &resolved_desired_ids(&desired),
             &moved_pairs,
-            &ResolvedStateBlockTargets::default(),
+            &crate::test_support::empty_state_block_targets(),
             &state_file,
         ),
         "moved/rename pair from awscc.s3.Bucket b collides with a desired resource",
@@ -7527,7 +7566,7 @@ async fn prelude_multifile_plan_migrates_legacy_and_renames_named_orphan() {
         ProgressSink::Human,
         &HashMap::new(),
         &StateBlockClaims::default(),
-        &ResolvedStateBlockTargets::default(),
+        &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
@@ -7763,7 +7802,7 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
         ProgressSink::Human,
         &expanded_remote_bindings,
         &StateBlockClaims::default(),
-        &ResolvedStateBlockTargets::default(),
+        &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
@@ -8836,7 +8875,7 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
         &mut HashMap::new(),
         &mut crate::empty_lifted_saved_attrs(),
         &state_blocks,
-        &Some(state_file),
+        &Some(state_file.clone()),
     )
     .expect("fixture move routes must agree with current state");
     assert_eq!(moved_pairs.len(), 5);
@@ -8994,12 +9033,12 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
     let plan_ctx = create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &Some(state_file),
+        &Some(state_file.clone()),
         false,
         ProgressSink::Human,
         &HashMap::new(),
         &StateBlockClaims::empty(),
-        &ResolvedStateBlockTargets::default(),
+        &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
@@ -9187,7 +9226,7 @@ moved {{
         &parsed,
         &provider_configs,
         &parsed.resources,
-        &Some(state_file),
+        &Some(state_file.clone()),
         false,
         &HashMap::new(),
         &state_block_claims,
@@ -10675,6 +10714,7 @@ fn late_anonymous_identity_resolution_reports_all_typed_identity_errors() {
     .expect("identity fixture has no unresolved references");
     let claims = StateBlockClaims::empty();
     let mut addressed = AddressedState {
+        refresh_rows: RefreshRows::default(),
         managed_current: HashMap::new(),
         orphans: Orphans::new(),
         saved_attrs: crate::empty_lifted_saved_attrs(),
@@ -10730,6 +10770,7 @@ fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas()
     .expect("schema-less test resource has no references to resolve");
     let claims = StateBlockClaims::empty();
     let mut addressed = AddressedState {
+        refresh_rows: RefreshRows::default(),
         managed_current: HashMap::new(),
         orphans: Orphans::new(),
         saved_attrs: crate::empty_lifted_saved_attrs(),
@@ -10841,6 +10882,7 @@ fn late_anonymous_reconciliation_sees_early_move_target_and_leaves_other_orphan(
     );
     let desired_ids = HashSet::from([desired_id.as_inner().clone()]);
     let mut addressed = AddressedState {
+        refresh_rows: RefreshRows::default(),
         managed_current: HashMap::new(),
         orphans: state_file.build_orphans(&desired_ids).into_plan_orphans(),
         saved_attrs: crate::empty_lifted_saved_attrs(),
@@ -10960,6 +11002,7 @@ fn late_anonymous_reconciliation_composes_from_projected_source_to_new_hash() {
     let early_id = ResolvedResourceId::new(resources.resources()[0].id.clone());
     let desired_ids = HashSet::from([early_id.as_inner().clone()]);
     let mut addressed = AddressedState {
+        refresh_rows: RefreshRows::default(),
         managed_current: HashMap::new(),
         orphans: state_file.build_orphans(&desired_ids).into_plan_orphans(),
         saved_attrs: crate::empty_lifted_saved_attrs(),
@@ -11085,6 +11128,7 @@ fn late_anonymous_identity_reconciliation_moves_deferred_legacy_row() {
         .upsert_resource(legacy)
         .expect("legacy deferred row");
     let mut addressed = AddressedState {
+        refresh_rows: RefreshRows::default(),
         managed_current: HashMap::new(),
         orphans: state_file
             .build_orphans(&HashSet::new())
@@ -11202,6 +11246,7 @@ fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums
         .expect("test state setup must be valid");
     let desired_ids = HashSet::from([named.id.clone()]);
     let mut addressed = AddressedState {
+        refresh_rows: RefreshRows::default(),
         managed_current: HashMap::new(),
         orphans: state_file.build_orphans(&desired_ids).into_plan_orphans(),
         prev_explicit: HashMap::new(),
@@ -11433,7 +11478,12 @@ mod read_with_retry_identifier_tests {
         let id = ResourceId::with_provider_identity("awscc", "iam.Role", "existing", None);
         let identifier = crate::fixture_applied_identifier("AROABC123");
 
-        let _state = read_with_retry(&provider, &id, &identifier).await.unwrap();
+        let _state = read_with_retry(
+            &provider,
+            &crate::test_support::refresh_target(&id, &identifier),
+        )
+        .await
+        .unwrap();
 
         let calls = provider.calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "provider.read must be called exactly once");
@@ -14324,7 +14374,7 @@ exports { team_prefix: String = "x" }"#,
             ProgressSink::Human,
             &remote_bindings,
             &StateBlockClaims::default(),
-            &ResolvedStateBlockTargets::default(),
+            &crate::test_support::empty_state_block_targets(),
             crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
         )
         .await
@@ -14408,7 +14458,7 @@ exports { team_prefix: String = "x" }"#,
             ProgressSink::Human,
             &HashMap::new(),
             &StateBlockClaims::default(),
-            &ResolvedStateBlockTargets::default(),
+            &crate::test_support::empty_state_block_targets(),
             crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
         )
         .await

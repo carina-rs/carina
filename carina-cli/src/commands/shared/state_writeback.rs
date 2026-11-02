@@ -7429,6 +7429,10 @@ mod apply_state_save_tests {
                     )],
                     &raw_sorted_resources,
                     crate::wiring::StateBlockEvaluationContext {
+                        removed: &carina_state::ResolvedRemovedClaims::resolve(
+                            &state_blocks,
+                            state_file_for_wiring.as_ref(),
+                        ),
                         bindings: &bindings,
                         unresolved_upstream_bindings: &unresolved_upstreams,
                         session,

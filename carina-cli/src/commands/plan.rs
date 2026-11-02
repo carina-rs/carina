@@ -3873,6 +3873,7 @@ pub(crate) struct UnresolvedReloadedPlanFile {
 
 #[derive(Debug)]
 pub(crate) struct ReloadedPlanFile {
+    refresh_rows: carina_state::RefreshRows,
     contents: PlanFileContents<SavedModuleSource>,
     evidence: ProviderEvidence,
     current_states: Vec<ReloadedCurrentStateEntry>,
@@ -3986,7 +3987,26 @@ impl UnresolvedReloadedPlanFile {
             upstream_sources,
             wait_bindings,
         };
+        let origins = MovedOrigins::from_plan(&contents.plan);
+        let snapshots = current_states
+            .iter()
+            .map(|entry| {
+                let ReloadedCurrentStateEntry::Managed { id, current } = entry;
+                (origins.origin_for(id).clone(), *current.clone())
+            })
+            .chain(contents.data_source_values.iter().filter_map(|saved| {
+                let DataSourceValue::Read(state) = &saved.value else {
+                    return None;
+                };
+                Some((saved.id.clone(), Current::from_state(*state.clone())))
+            }));
+        let refresh_rows = carina_state::PreparedRows::from_snapshots(
+            snapshots,
+            &carina_state::ResolvedRemovedClaims::from_effects(contents.plan.effects()),
+        )
+        .refreshable;
         Ok(ReloadedPlanFile {
+            refresh_rows,
             contents,
             evidence,
             current_states,
@@ -3996,6 +4016,10 @@ impl UnresolvedReloadedPlanFile {
 }
 
 impl ReloadedPlanFile {
+    pub(crate) fn refresh_rows(&self) -> &carina_state::RefreshRows {
+        &self.refresh_rows
+    }
+
     pub(crate) fn persisted_directive_changes(&self) -> &[PersistedDirectiveChange] {
         &self.persisted_directive_changes
     }

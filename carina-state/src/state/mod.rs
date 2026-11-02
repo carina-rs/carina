@@ -670,7 +670,7 @@ impl OutcomeUnknownRow<'_> {
     }
 }
 
-/// Persisted orphans classified per row for safe provider refresh.
+/// Cached or refreshed orphan values ready for planner conversion.
 ///
 /// Converting to planner input preserves malformed rows as existing states
 /// without identifiers, so the differ emits
@@ -1970,8 +1970,8 @@ impl StateFile {
         }
     }
 
-    /// Build each persisted orphan as one typed value containing its
-    /// provider-facing state and host-owned binding/directive metadata.
+    /// Build cached planner orphans with host-owned binding/directive metadata.
+    /// Provider refresh inputs are minted by `PreparedRows` before this split.
     pub fn build_orphans(
         &self,
         desired_ids: &std::collections::HashSet<ResourceId>,

@@ -387,7 +387,8 @@ async fn run_destroy_locked_owned(
         lock,
         cancel,
         async |cancel, mid_run_writer| {
-    let state_block_claims = validated_config.reconcile_for_destroy(&state_file);
+    let state_blocks = validated_config.reconcile_for_destroy(&state_file);
+    let state_block_claims = &state_blocks.claims;
     let (ctx, parsed) = validated_config.context_and_resources();
 
     let provider_inputs = load_and_resolve_provider_configs(&runtime,
@@ -412,6 +413,7 @@ async fn run_destroy_locked_owned(
     // We use the unsorted list for state reads, then sort once at the end.
     let detected_resources = crate::wiring::DeferredForExpansionPrelude::new_for_state_refresh(
         parsed,
+        &state_blocks.targets.removed_from,
         &state_file,
         ctx.schemas(),
     )?
@@ -420,7 +422,7 @@ async fn run_destroy_locked_owned(
         &provider,
         &parsed.data_sources,
         provider_inputs.configs().as_provider_configs(),
-        &state_block_claims,
+        state_block_claims,
     )?;
     let moved_pairs = crate::wiring::resolve_moved_pairs(
         ctx,
@@ -430,6 +432,7 @@ async fn run_destroy_locked_owned(
         &state_file,
     )?;
     let expansion_prelude = detected_resources.into_destroy_prelude(&moved_pairs);
+    let prepared_rows = expansion_prelude.prepared_rows().clone();
     let mut all_resources = expansion_prelude.sorted_resources().to_vec();
 
     if !refresh {
@@ -476,10 +479,11 @@ async fn run_destroy_locked_owned(
                 let Some(resource) = resource_iter.next() else {
                     break;
                 };
+                let Some(loaded) = prepared_rows.refreshable.current(&resource.id) else {
+                    managed_current.insert(resource.id.clone(), Current::absent(resource.id.clone()));
+                    continue;
+                };
                 let progress = refresh_phase.begin(&resource.id);
-                let loaded = persisted_state
-                    .map(|sf| sf.build_state_for_resource(&resource.id))
-                    .unwrap_or_else(|| Current::absent(resource.id.clone()));
                 refresh_in_flight.push(async move {
                     let current = refresh_loaded_resource_with_retry(
                         provider_ref,
@@ -554,7 +558,7 @@ async fn run_destroy_locked_owned(
         if let Some(sf) = persisted_state {
             let desired_ids: HashSet<ResourceId> =
                 all_resources.iter().map(|r| r.id.clone()).collect();
-            let loaded_orphans = sf.build_orphans(&desired_ids);
+            let loaded_orphans = prepared_rows.refreshable.build_orphans(&desired_ids);
             let orphan_entries: Vec<_> = loaded_orphans.into_iter().collect();
             let mut refresh_cancelled = false;
             let mut orphan_iter = orphan_entries.into_iter();
@@ -696,14 +700,14 @@ async fn run_destroy_locked_owned(
             // --refresh=false: build states from state file without AWS calls.
             // carina#3181: `all_resources` is managed-only.
             for resource in &all_resources {
-                let current = sf.build_state_for_resource(&resource.id);
+                let current = prepared_rows.refreshable.current(&resource.id).map(|row| row.into_current()).unwrap_or_else(|| Current::absent(resource.id.clone()));
                 managed_current.insert(resource.id.clone(), current);
             }
 
             // Include orphaned resources (in state but not in .crn)
             let desired_ids: HashSet<ResourceId> = all_resources.iter().map(|r| r.id.clone()).collect();
-            for (id, loaded) in sf.build_orphans(&desired_ids) {
-                let current = loaded.into_current();
+            for (id, loaded) in prepared_rows.refreshable.build_orphans(&desired_ids) {
+                let current = loaded.into_orphan().into_current();
                 if let Some(resolved_id) = ResolvedResourceId::try_new(id.clone()) {
                     let orphan_resource = build_orphan_resource(sf, &resolved_id);
                     all_resources.push(orphan_resource);
@@ -880,6 +884,7 @@ async fn run_destroy_locked_owned(
     .map_err(AppError::Config)?;
 
     if delete_effects.is_empty()
+        && prepared_rows.removed.is_empty()
         && protected_resources.is_empty()
         && prevent_destroy_resources.is_empty()
     {
@@ -889,6 +894,9 @@ async fn run_destroy_locked_owned(
 
     // Build a Plan from the delete effects for tree display
     let mut destroy_plan = Plan::new();
+    for id in prepared_rows.removed.ids() {
+        destroy_plan.add(Effect::Remove { id: id.clone() });
+    }
     for idx in &display_order {
         destroy_plan.add(delete_effects[*idx].clone());
     }
@@ -978,7 +986,7 @@ async fn run_destroy_locked_owned(
         )));
     }
 
-    if should_skip_destroy_execution(delete_effects.len()) {
+    if should_skip_destroy_execution(delete_effects.len() + prepared_rows.removed.ids().count()) {
         println!(
             "{}",
             "All resources are protected. Nothing to destroy.".yellow(color_mode)
@@ -1018,6 +1026,21 @@ async fn run_destroy_locked_owned(
             return Ok(DestroyAfterHeartbeat::Done);
         }
         println!();
+    }
+
+    match cancel.phase() {
+        carina_core::shutdown::ShutdownPhase::Running => {}
+        _ => return Err(AppError::Interrupted),
+    }
+    if !prepared_rows.removed.is_empty() {
+        mid_run_writer.write_removals(
+            state_file.as_mut().expect("removed rows came from persisted state"),
+            &prepared_rows.removed,
+        ).await?;
+        if delete_effects.is_empty() {
+            println!("Removed {} resource(s) from state.", prepared_rows.removed.ids().count());
+            return Ok(DestroyAfterHeartbeat::Done);
+        }
     }
 
     println!("{}", "Destroying resources...".red(color_mode).bold(color_mode));

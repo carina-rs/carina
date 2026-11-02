@@ -8,14 +8,12 @@ use carina_core::parser::{
     SavedProviderConfigs,
 };
 use carina_core::plan::SavedPlan;
-use carina_core::provider::{
-    AppliedIdentifier, PersistedAttributes, Provider, ProviderRouter, ReadRequest,
-};
+use carina_core::provider::{PersistedAttributes, Provider, ProviderRouter, ReadRequest};
 use carina_core::resource::{
     Current, DataSource, ResolvedResourceId, Resource, ResourceId, SavedComposition,
     SavedDataSource, SavedModuleSource, SavedResource, State, Value,
 };
-use carina_state::{ResourceState, StateFile};
+use carina_state::{RefreshRows, RefreshableCurrent, ResourceState, StateFile};
 
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
 use crate::commands::plan::{
@@ -81,7 +79,6 @@ struct HistoricalStateVerifier<'a> {
     provider: &'a dyn Provider,
     actual_states: &'a mut HashMap<ResourceId, State>,
     verified_planned_states: &'a mut HashMap<ResourceId, State>,
-    historical_addresses: &'a HistoricalResourceAddresses,
     apply_target: ApplyTarget<'a>,
 }
 
@@ -90,7 +87,7 @@ impl HistoricalStateVerifier<'_> {
         &mut self,
         id: &ResourceId,
         state: &State,
-        provider_identifier: Option<&AppliedIdentifier>,
+        loaded: &RefreshableCurrent,
     ) -> Result<Option<State>, AppError> {
         if !state
             .attributes
@@ -107,15 +104,14 @@ impl HistoricalStateVerifier<'_> {
         // Orphans do not participate in ordinary drift reads. Read them here
         // because their historical secret still needs verification.
         if !self.actual_states.contains_key(id) {
-            let historical_id = self.historical_addresses.origin_for(id);
-            let identifier = provider_identifier.ok_or_else(|| {
+            let target = loaded.read_target().ok_or_else(|| {
                 AppError::Validation(format!(
                     "saved plan resource {id} has no valid provider identifier; create a new plan before applying"
                 ))
             })?;
             let mut actual = self
                 .provider
-                .read(historical_id, identifier, ReadRequest)
+                .read(target.id(), target.identifier(), ReadRequest)
                 .await
                 .map_err(AppError::Provider)?
                 .into_state();
@@ -805,6 +801,12 @@ pub(super) struct ScopeCheckedDesiredPlan {
 }
 
 impl ScopeCheckedDesiredPlan {
+    pub(super) fn refresh_rows(&self) -> &RefreshRows {
+        match &self.plan.plan {
+            DesiredPlanFile::Verified(plan) => plan.plan_file.refresh_rows(),
+            DesiredPlanFile::NeedsHistoricalVerification(plan) => plan.plan_file.refresh_rows(),
+        }
+    }
     pub(super) fn context(&self) -> &WiringContext {
         self.plan.context()
     }
@@ -1000,28 +1002,29 @@ impl DesiredVerifiedPlanFile {
             }
         }
         {
+            let refresh_rows = self.plan_file.refresh_rows().clone();
             let mut verifier = HistoricalStateVerifier {
                 provider,
                 actual_states,
                 verified_planned_states,
-                historical_addresses,
                 apply_target,
             };
             for entry in self.plan_file.current_states_mut() {
                 let ReloadedCurrentStateEntry::Managed { id, current } = entry;
+                let Some(loaded) = refresh_rows.current(historical_addresses.origin_for(id)) else {
+                    continue;
+                };
                 let verified = match current.as_ref() {
                     carina_core::resource::Current::Absent(state) => {
-                        verifier.verify(id, state.state(), None).await?
+                        verifier.verify(id, state.state(), &loaded).await?
                     }
                     carina_core::resource::Current::Present(present) => {
-                        verifier
-                            .verify(id, present.state(), Some(present.identifier()))
-                            .await?
+                        verifier.verify(id, present.state(), &loaded).await?
                     }
                     carina_core::resource::Current::CreateInFlight(_pending) => None,
                     carina_core::resource::Current::CreateOutcomeUnknown(_unknown) => None,
                     carina_core::resource::Current::MissingIdentifier(state) => {
-                        verifier.verify(id, state.state(), None).await?
+                        verifier.verify(id, state.state(), &loaded).await?
                     }
                 };
                 if let Some(verified) = verified
@@ -1032,14 +1035,10 @@ impl DesiredVerifiedPlanFile {
             }
             for saved in self.plan_file.data_source_values_mut() {
                 if let DataSourceValue::Read(state) = &mut saved.value {
-                    let identifier = state
-                        .identifier
-                        .as_deref()
-                        .and_then(|identifier| AppliedIdentifier::new(identifier).ok());
-                    if let Some(verified) = verifier
-                        .verify(&saved.id, state, identifier.as_ref())
-                        .await?
-                    {
+                    let Some(loaded) = refresh_rows.current(&saved.id) else {
+                        continue;
+                    };
+                    if let Some(verified) = verifier.verify(&saved.id, state, &loaded).await? {
                         **state = verified;
                     }
                 }

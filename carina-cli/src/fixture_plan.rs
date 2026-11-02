@@ -458,6 +458,7 @@ where
     }
     let expansion_prelude = crate::wiring::DeferredForExpansionPrelude::new(
         canonical_resources,
+        &resolved_state_block_targets.removed_from,
         &state_file,
         wiring.schemas(),
     )
