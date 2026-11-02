@@ -256,10 +256,7 @@ impl ProviderBoundPlanFile {
                     providers,
                 })
                 .map_err(|source| {
-                    AppError::from_locked_state_reload(
-                        source,
-                        &std::path::PathBuf::from(project_dir.display().to_string()),
-                    )
+                    AppError::from_locked_state_reload(source, &project_dir.source_label())
                 }),
             Self::NeedsSecretVerification {
                 plan:
@@ -280,10 +277,7 @@ impl ProviderBoundPlanFile {
                     },
                 )
                 .map_err(|source| {
-                    AppError::from_locked_state_reload(
-                        source,
-                        &std::path::PathBuf::from(project_dir.display().to_string()),
-                    )
+                    AppError::from_locked_state_reload(source, &project_dir.source_label())
                 }),
         }
     }

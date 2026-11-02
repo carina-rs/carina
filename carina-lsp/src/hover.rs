@@ -45,11 +45,8 @@ fn find_use_import_path(
                 Err(_) => continue,
             },
         };
-        let Ok(parsed) = carina_core::parser::parse_file(
-            &content,
-            &std::path::PathBuf::from(file.display().to_string()),
-            ctx,
-        ) else {
+        let Ok(parsed) = carina_core::parser::parse_file(&content, &file.source_label(), ctx)
+        else {
             continue;
         };
         if let Some(import) = parsed.uses.iter().find(|imp| imp.alias == alias) {

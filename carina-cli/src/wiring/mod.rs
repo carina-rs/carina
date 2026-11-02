@@ -888,7 +888,7 @@ pub(crate) fn failed_configuration_report<T>(
                 if let Ok(source) = file.read_to_string()
                     && let Ok(mut parsed) = carina_core::parser::parse_file(
                         &source,
-                        &PathBuf::from(file.display().to_string()),
+                        &file.source_label(),
                         session.catalog(),
                     )
                 {
@@ -1289,10 +1289,8 @@ fn require_expanded_config<E>(
 where
     E: carina_core::parser::ExportParamLike<ParserPlaceholder, AbsoluteBindingAddress>,
 {
-    let display = base_dir.display().clone();
-    module_resolver::ensure_expanded_root_graph(file).map_err(|error| {
-        AppError::Config(error.display_relative_to(&std::path::PathBuf::from(display.to_string())))
-    })
+    module_resolver::ensure_expanded_root_graph(file)
+        .map_err(|error| AppError::Config(error.display_relative_to(&base_dir.source_label())))
 }
 
 fn resolve_file_binding_uses<E: IntoExpandedExportParam<AbsoluteBindingAddress>>(

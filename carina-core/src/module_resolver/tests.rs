@@ -1227,6 +1227,52 @@ let disabled = chooser { flag = false }
     );
 }
 
+#[test]
+fn absolute_nested_imports_share_the_registered_module_location() {
+    for suffix in ["leaf/", "./leaf", "/leaf", "./leaf//"] {
+        let temp = tempfile::tempdir().unwrap();
+        let modules = temp.path().join("modules");
+        fs::create_dir_all(modules.join("leaf")).unwrap();
+        fs::create_dir(modules.join("wrapper")).unwrap();
+        fs::write(
+            modules.join("leaf/main.crn"),
+            "arguments { label: String }\nlet item = mock.test.Thing { value = label }\n",
+        )
+        .unwrap();
+        let absolute_source = format!("{}/{suffix}", modules.to_str().unwrap().replace('\\', "/"));
+        fs::write(
+            modules.join("wrapper/main.crn"),
+            format!(
+                "arguments {{ label: String }}\nlet leaf = use {{ source = \"{absolute_source}\" }}\nlet child = leaf {{ label = label }}\n"
+            ),
+        )
+        .unwrap();
+        let source = "let wrapper = use { source = \"./modules/wrapper\" }\nlet instance = wrapper { label = \"nested\" }\n";
+        let parsed = crate::parser::parse_file(
+            source,
+            &temp.path().join("main.crn"),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+
+        let expanded = resolve_modules(parsed, temp.path())
+            .unwrap_or_else(|error| panic!("absolute import {absolute_source:?}: {error}"));
+
+        assert_eq!(expanded.resources.len(), 1);
+        let resource = &expanded.resources[0];
+        assert_eq!(
+            resource.binding.as_ref().map(|binding| binding.as_str()),
+            Some("instance.child.item")
+        );
+        assert_eq!(
+            resource.get_attr("value"),
+            Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                "nested".into()
+            )))
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn cached_module_registers_nested_imports_for_each_symlink_spelling() {

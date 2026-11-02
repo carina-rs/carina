@@ -381,7 +381,7 @@ impl LockedEgress {
             source,
             sha256,
             record,
-            project_dir: PathBuf::from(project_dir.display().to_string()),
+            project_dir: project_dir.source_label(),
         }
     }
 

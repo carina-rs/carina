@@ -617,7 +617,7 @@ pub fn load_configuration_with_config(
     schemas: &SchemaRegistry,
 ) -> Result<LoadedConfig, String> {
     let resolved = path.clone();
-    let path_label = std::path::PathBuf::from(resolved.display().to_string());
+    let path_label = resolved.source_label();
     let path = path_label.as_path();
     if resolved.is_file() {
         Err(format!("expected directory, got file: {}", path.display()))
@@ -640,10 +640,7 @@ pub fn load_configuration_with_config(
             let content = file
                 .read_to_string()
                 .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
-            file_inputs.push((
-                std::path::PathBuf::from(file.display().to_string()),
-                content,
-            ));
+            file_inputs.push((file.source_label(), content));
         }
         let parsed_files = match parse_directory_files_located(&file_inputs, config) {
             Ok(v) => v,
@@ -871,7 +868,7 @@ fn parse_directory_with_overrides_impl(
     preserve_failed_user_calls: bool,
 ) -> Result<DirectoryParseResult, DirectoryParseFailure> {
     let resolved = dir.clone();
-    let dir_label = std::path::PathBuf::from(resolved.display().to_string());
+    let dir_label = resolved.source_label();
     let dir = dir_label.as_path();
     let files = resolved
         .crn_files()
@@ -913,10 +910,7 @@ fn parse_directory_with_overrides_impl(
                 DirectoryParseFailure::Message(format!("Failed to read {}: {}", file.display(), e))
             })?,
         };
-        file_inputs.push((
-            std::path::PathBuf::from(file.display().to_string()),
-            content,
-        ));
+        file_inputs.push((file.source_label(), content));
     }
 
     let parsed_files = match parse_directory_files_located(&file_inputs, config) {
@@ -1584,6 +1578,37 @@ mod tests {
     use crate::parser::ModuleCall;
     use crate::resource::{DeferredValue, Value};
     use std::fs;
+
+    // macOS APFS rejects non-UTF-8 names.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn diagnostic_source_lookup_preserves_non_utf8_project_directory() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"project-\xff".to_vec()));
+        fs::create_dir(&directory).unwrap();
+        let main_path = directory.join("main.crn");
+        fs::write(&main_path, "backend local { path = 'carina.state.json' }\n").unwrap();
+        let root = ResolvedPath::new(&directory).unwrap();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+
+        let parsed =
+            parse_directory_with_overrides_and_diagnostics(&root, &context, &HashMap::new())
+                .unwrap();
+
+        assert!(parsed.semantic_file(&main_path).is_some());
+        assert_eq!(
+            parsed.sole_backend_file.as_deref(),
+            Some(main_path.as_path())
+        );
+        assert_eq!(
+            parsed.source_files[0].0.identity(),
+            root.join("main.crn").unwrap().identity()
+        );
+    }
 
     #[cfg(unix)]
     #[test]

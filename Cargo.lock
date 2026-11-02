@@ -1102,6 +1102,7 @@ dependencies = [
  "futures",
  "hex",
  "indexmap 2.13.0",
+ "libc",
  "log",
  "password-hash 0.5.0",
  "pest",

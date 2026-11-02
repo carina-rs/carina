@@ -6798,7 +6798,7 @@ async fn build_upstream_backend<B: carina_core::resource::BindingAddress>(
     resolve_backend_for_read(
         color_mode,
         source_abs,
-        std::path::Path::new(&source_abs.display().to_string()),
+        &source_abs.source_label(),
         backend_config.as_ref(),
         BackendLockRequirement::AllowMissing,
         ReadBackendWarningPolicy::UpstreamSource {
@@ -6807,9 +6807,7 @@ async fn build_upstream_backend<B: carina_core::resource::BindingAddress>(
         },
     )
     .await
-    .map_err(|error| {
-        error.with_upstream_state_source(std::path::Path::new(&source_abs.display().to_string()))
-    })
+    .map_err(|error| error.with_upstream_state_source(&source_abs.source_label()))
 }
 
 /// Walk an upstream's transitive `upstream_state` chain *without*

@@ -2215,7 +2215,7 @@ impl LegacyLockEntry {
         LegacyLockEntryError {
             source: self.source.clone(),
             reason: self.reason.clone(),
-            project_dir: PathBuf::from(project_dir.display().to_string()),
+            project_dir: project_dir.source_label(),
         }
     }
 }
@@ -3199,7 +3199,7 @@ fn finish_legacy_lock_migration(
         project_dir,
     )?;
     let migration = LockFileMigration {
-        project_dir: PathBuf::from(project_dir.display().to_string()),
+        project_dir: project_dir.source_label(),
         from,
         to: LockFile::CURRENT_VERSION,
         discarded_discovery_pins,
@@ -3727,32 +3727,25 @@ impl LockFile {
     /// remediation commands; callers must not derive it from a canonicalized
     /// lock path.
     pub fn load(project_dir: &ResolvedPath) -> Result<Option<LoadedLockFile>, LockFileError> {
-        let display = project_dir.display().clone();
         let project = project_dir.clone();
         let path = project
             .join(PROVIDER_LOCK_FILE_NAME)
             .map_err(|source| LockFileError::Read {
-                path: PathBuf::from(display.join(PROVIDER_LOCK_FILE_NAME).to_string()),
+                path: project_dir.source_label().join(PROVIDER_LOCK_FILE_NAME),
                 source,
             })?;
         let Some(content) = Self::read_from_path(&path)? else {
             return Ok(None);
         };
-        Self::parse_toml_str(
-            &content,
-            &PathBuf::from(path.display().to_string()),
-            project_dir,
-        )
-        .map(Some)
+        Self::parse_toml_str(&content, &path.source_label(), project_dir).map(Some)
     }
 
     fn read_from_path(path: &ResolvedPath) -> Result<Option<String>, LockFileError> {
-        let display = path.display().clone();
         match path.read_to_string() {
             Ok(content) => Ok(Some(content)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(source) => Err(LockFileError::Read {
-                path: PathBuf::from(display.to_string()),
+                path: path.source_label(),
                 source,
             }),
         }
@@ -3815,7 +3808,7 @@ impl LockFile {
                     Ok(LoadedLockFile::Migrated {
                         lock_file,
                         migration: LockFileMigration {
-                            project_dir: PathBuf::from(project_dir.display().to_string()),
+                            project_dir: project_dir.source_label(),
                             from: version,
                             to: Self::CURRENT_VERSION,
                             discarded_discovery_pins: BTreeMap::new(),
@@ -3856,7 +3849,7 @@ impl LockFile {
                 Ok(LoadedLockFile::Migrated {
                     lock_file,
                     migration: LockFileMigration {
-                        project_dir: PathBuf::from(project_dir.display().to_string()),
+                        project_dir: project_dir.source_label(),
                         from: version,
                         to: Self::CURRENT_VERSION,
                         discarded_discovery_pins: BTreeMap::new(),
@@ -4026,7 +4019,7 @@ impl LockFile {
             };
             if !registry_host.contains_key(registry.resolved_hostname()) {
                 return Err(LockFileError::MissingRegistryHostRecord {
-                    project_dir: PathBuf::from(project_dir.display().to_string()),
+                    project_dir: project_dir.source_label(),
                     provider: canonical_lock_source(&entry.source),
                     hostname: registry.resolved_hostname().to_owned(),
                 });
@@ -4981,7 +4974,7 @@ impl InstalledProvider {
     pub fn provenance(&self) -> ProviderArtifactProvenance {
         match &self.artifact {
             InstalledArtifact::LockFile(artifact) => ProviderArtifactProvenance::LockFile {
-                project_dir: PathBuf::from(artifact.project_dir().display().to_string()),
+                project_dir: artifact.project_dir().source_label(),
                 pin: artifact.pin().clone(),
             },
             InstalledArtifact::File(artifact) => ProviderArtifactProvenance::File {
@@ -5202,16 +5195,16 @@ fn remote_provider_trust(
         Ok(Some(identity)) => ProviderTrust::from_verified_remote(&identity).ok_or_else(|| {
             ProviderLoadIdentityError::non_carina_official_signer(
                 artifact.source(),
-                &PathBuf::from(artifact.project_dir().display().to_string()),
+                &artifact.project_dir().source_label(),
             )
         }),
         Ok(None) => Err(ProviderLoadIdentityError::missing_official_record(
             artifact.source(),
-            &PathBuf::from(artifact.project_dir().display().to_string()),
+            &artifact.project_dir().source_label(),
         )),
         Err(error) => Err(ProviderLoadIdentityError::invalid_official_record(
             artifact.source(),
-            &PathBuf::from(artifact.project_dir().display().to_string()),
+            &artifact.project_dir().source_label(),
             error,
         )),
     }
@@ -5917,10 +5910,7 @@ impl RegistryRefusal {
     ) -> Self {
         Self::Signer {
             rejection,
-            target: ProviderRefusalTarget::new(
-                source,
-                PathBuf::from(project_dir.display().to_string()),
-            ),
+            target: ProviderRefusalTarget::new(source, project_dir.source_label()),
         }
     }
 
@@ -6692,10 +6682,8 @@ mod registry_listing_validation {
             }
 
             let source_key = source.source_key();
-            let target = ProviderRefusalTarget::new(
-                source_key.as_str(),
-                PathBuf::from((project_dir).display().to_string()),
-            );
+            let target =
+                ProviderRefusalTarget::new(source_key.as_str(), project_dir.source_label());
             let valid_until_present = versions.valid_until.is_some();
 
             let sequence_validation = match (previous_sequence_state, versions.sequence) {
@@ -7183,10 +7171,7 @@ fn resolve_registry<H: RegistryHttp>(
     let existing_discovery = match existing_host {
         Some(host) => Some(host.authorized_discovery().map_err(|_| {
             RegistryRefusal::DiscoveryMigrationAuthorizationRequired {
-                target: HostRefusalTarget::new(
-                    source.hostname(),
-                    PathBuf::from((project_dir).display().to_string()),
-                ),
+                target: HostRefusalTarget::new(source.hostname(), project_dir.source_label()),
             }
             .to_string()
         })?),
@@ -7213,10 +7198,7 @@ fn resolve_registry<H: RegistryHttp>(
         return Err(RegistryRefusal::DiscoveryPinMismatch {
             pinned: existing_pin.api_base_url().to_string(),
             resolved: discovery_pin.api_base_url().to_string(),
-            target: HostRefusalTarget::new(
-                host,
-                PathBuf::from((project_dir).display().to_string()),
-            ),
+            target: HostRefusalTarget::new(host, project_dir.source_label()),
         }
         .to_string());
     }
@@ -7678,11 +7660,7 @@ fn convert_obtainable_legacy_signer_pin<H: RegistryHttp>(
             resolved: download.shasum.clone(),
             target: ProviderRefusalTarget::new(
                 source_key.as_str(),
-                PathBuf::from(
-                    (lock_file.install_lock().project_dir())
-                        .display()
-                        .to_string(),
-                ),
+                lock_file.install_lock().project_dir().source_label(),
             ),
         }
         .to_string());
@@ -7692,11 +7670,7 @@ fn convert_obtainable_legacy_signer_pin<H: RegistryHttp>(
             version: locked_version.clone(),
             target: ProviderRefusalTarget::new(
                 source_key.as_str(),
-                PathBuf::from(
-                    (lock_file.install_lock().project_dir())
-                        .display()
-                        .to_string(),
-                ),
+                lock_file.install_lock().project_dir().source_label(),
             ),
         }
         .to_string()
@@ -7792,7 +7766,9 @@ pub fn cache_path_wasm(
     source: &RemoteSourceKey,
     version: &str,
 ) -> PathBuf {
-    PathBuf::from(base_dir.display().to_string())
+    base_dir
+        .persisted_path()
+        .to_path_buf()
         .join(".carina")
         .join("providers")
         .join(source.as_str())
@@ -8113,10 +8089,7 @@ fn verify_registry_lock_pin(
             version: version.to_string(),
             locked: entry.sha256.clone(),
             resolved: expected_shasum.to_string(),
-            target: ProviderRefusalTarget::new(
-                source_key.as_str(),
-                PathBuf::from((project_dir).display().to_string()),
-            ),
+            target: ProviderRefusalTarget::new(source_key.as_str(), project_dir.source_label()),
         }
         .to_string());
     }
@@ -8127,10 +8100,7 @@ fn verify_registry_lock_pin(
         return Err(RegistryRefusal::HostnamePinMismatch {
             locked: locked_registry.resolved_hostname().to_string(),
             resolved: registry.hostname.clone(),
-            target: ProviderRefusalTarget::new(
-                source_key.as_str(),
-                PathBuf::from((project_dir).display().to_string()),
-            ),
+            target: ProviderRefusalTarget::new(source_key.as_str(), project_dir.source_label()),
         }
         .to_string());
     }
@@ -8139,10 +8109,7 @@ fn verify_registry_lock_pin(
         .map_err(|error| error.to_string())?;
     if ratchets.signature.is_required() && signature.is_none() {
         return Err(RegistryRefusal::SignatureFieldDisappeared {
-            target: ProviderRefusalTarget::new(
-                source_key.as_str(),
-                PathBuf::from((project_dir).display().to_string()),
-            ),
+            target: ProviderRefusalTarget::new(source_key.as_str(), project_dir.source_label()),
         }
         .to_string());
     }
@@ -8155,10 +8122,7 @@ fn verify_registry_lock_pin(
     });
     if ratchets.transparency_log_present && !transparency_log_present {
         return Err(RegistryRefusal::TransparencyLogFieldDisappeared {
-            target: ProviderRefusalTarget::new(
-                source_key.as_str(),
-                PathBuf::from((project_dir).display().to_string()),
-            ),
+            target: ProviderRefusalTarget::new(source_key.as_str(), project_dir.source_label()),
         }
         .to_string());
     }
@@ -9045,9 +9009,10 @@ fn file_provider_cache_path(
     let file_name = src_path
         .as_path()
         .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("provider");
-    let dest = PathBuf::from(base_dir.display().to_string())
+        .unwrap_or_else(|| std::ffi::OsStr::new("provider"));
+    let dest = base_dir
+        .persisted_path()
+        .to_path_buf()
         .join(".carina")
         .join("providers")
         .join("file")
@@ -9056,8 +9021,7 @@ fn file_provider_cache_path(
             src_path
                 .as_path()
                 .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("provider.wasm"),
+                .unwrap_or_else(|| std::ffi::OsStr::new("provider.wasm")),
         );
     WasmArtifactPath::new(dest, provider_name)
 }
@@ -9412,7 +9376,7 @@ pub fn find_installed_provider<P: PlaceholderKind, B: BindingAddress>(
         }
         return Err(FindInstalledProviderError::Other(
             missing_locked_artifact_error(
-                &PathBuf::from(base_dir.display().to_string()),
+                &base_dir.source_label(),
                 &selection.pin,
                 config.revision.as_deref(),
             ),
@@ -10635,7 +10599,6 @@ pub fn validate_lock_constraints<P: PlaceholderKind, B: BindingAddress>(
     base_dir: &ResolvedPath,
     providers: &[ProviderConfig<P, B>],
 ) -> Result<(), LockConstraintError> {
-    let display = base_dir.display().clone();
     let lock_file = match load_lock_file(base_dir)? {
         Some(lf) => lf,
         None => return Ok(()),
@@ -10703,7 +10666,7 @@ pub fn validate_lock_constraints<P: PlaceholderKind, B: BindingAddress>(
                     provider: config.name.clone(),
                     locked_version: version,
                     constraint: constraint.raw.clone(),
-                    project_dir: PathBuf::from(display.to_string()),
+                    project_dir: base_dir.source_label(),
                 });
             }
         }
@@ -14725,7 +14688,7 @@ sha256 = "abc"
 
         let save_error = with_lock_file_rename_hook(
             move |temporary_path, target_path| {
-                if target_path.display().to_string() != expected_target.display().to_string() {
+                if target_path.source_label() != expected_target {
                     return Err(io::Error::other(format!(
                         "rename target {} differs from expected {}",
                         target_path.display(),
@@ -26239,6 +26202,81 @@ future_protection_field = "retain-me"
                 assert_eq!(installed.path(), &artifact);
             }
         }
+    }
+
+    // macOS APFS rejects non-UTF-8 names.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_provider_install_preserves_non_utf8_project_directory() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"project-\xff".to_vec()));
+        fs::create_dir(&project_dir).unwrap();
+        let bytes = wasm_encoder::Component::new().finish();
+        fs::write(temp.path().join("local.wasm"), &bytes).unwrap();
+        let project = ResolvedPath::new(&project_dir).unwrap();
+        let guard = ProviderInstallLock::acquire(&project).unwrap();
+        let mut lock = LockFile::default();
+        let source_path = temp.path().join("local.wasm");
+        let file_path = source_path.to_str().unwrap();
+
+        let installed = resolve_file_provider(
+            &guard,
+            "local",
+            &format!("file://{file_path}"),
+            file_path,
+            &mut lock,
+        )
+        .expect("init must install inside a project with non-UTF-8 path bytes");
+
+        assert_eq!(
+            installed.as_path(),
+            project_dir.join(".carina/providers/file/local/local.wasm")
+        );
+        assert_eq!(
+            guard.project_artifact(&installed).unwrap().read().unwrap(),
+            bytes
+        );
+        assert_eq!(fs::read(installed.as_path()).unwrap(), bytes);
+        assert_eq!(lock.provider.len(), 1);
+        assert_eq!(lock.provider[0].name, "local");
+        assert_eq!(lock.provider[0].sha256, sha256_bytes(&bytes));
+    }
+
+    // macOS APFS rejects non-UTF-8 names.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_provider_cache_preserves_non_utf8_project_directory() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"project-\xff".to_vec()));
+        fs::create_dir(&project_dir).unwrap();
+        let project = ResolvedPath::new(&project_dir).unwrap();
+        let source = source_key("github.com/example/provider-widget");
+
+        let cache = cache_path_wasm(&project, &source, "1.0.0");
+
+        assert_eq!(
+            cache,
+            project_dir.join(
+                ".carina/providers/github.com/example/provider-widget/1.0.0/provider-widget.wasm"
+            )
+        );
+        let revision = crate::revision_resolver::cache_path_revision(
+            &project,
+            &github_source("github.com/example/provider-widget"),
+            &commit_sha("abc123def456789012345678901234567890abcd"),
+        );
+        assert_eq!(
+            revision,
+            project_dir.join(".carina/providers/github.com/example/provider-widget/rev-abc123def456/provider-widget.wasm")
+        );
     }
 
     #[cfg(unix)]

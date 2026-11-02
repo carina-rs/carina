@@ -157,7 +157,7 @@ impl ProviderInstallLock {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
-        let guard_path = carina_dir.join(PROVIDER_INSTALL_LOCK_FILE_NAME)?;
+        let guard_path = carina_dir.file_leaf(PROVIDER_INSTALL_LOCK_FILE_NAME)?;
         let guard_file = guard_path.open_lock()?;
 
         match guard_file.try_lock() {
@@ -366,16 +366,9 @@ fn validate_project_target(
     install_lock: &ProviderInstallLock,
     destination: &Path,
 ) -> io::Result<()> {
-    let cache = install_lock.carina_dir.display().join("providers");
+    let cache = install_lock.carina_dir.persisted_path().join("providers")?;
     let label = DisplayPath::new(destination)?;
-    if label.relative_to(&cache).is_some_and(|relative| {
-        !Path::new(&relative).components().any(|part| {
-            matches!(
-                part,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    }) {
+    if cache.contains(&carina_core::paths::PersistedPath::new(destination)?) {
         Ok(())
     } else {
         Err(io::Error::new(

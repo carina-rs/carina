@@ -1,7 +1,7 @@
 //! `ModuleResolver` driver: import processing, nested-module resolution,
 //! and the top-level `resolve_modules*` entry points.
 
-use crate::paths::{DisplayPath, ResolvedPath};
+use crate::paths::{PersistedPath, ResolvedPath};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
@@ -804,12 +804,28 @@ impl TypeResolutionPolicy for DeferredUpstreamTypeResolution {
     }
 }
 
+/// An import location uses its owner's captured locator. Registration and
+/// expansion share this constructor without re-resolving aliases or comparing
+/// independently rendered diagnostic spellings.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(super) struct ModuleLocationKey {
+    source: PersistedPath,
+}
+
+impl ModuleLocationKey {
+    pub(super) fn new(owner: &ResolvedPath, source: &str) -> std::io::Result<Self> {
+        Ok(Self {
+            source: owner.persisted_path().join(source)?,
+        })
+    }
+}
+
 /// Context for module resolution
 pub(crate) struct ModuleResolver<'cfg, P = StrictTypeResolution> {
     /// Base directory for resolving relative imports
     pub(super) base_dir: PathBuf,
     pub(super) io_base_dir: ResolvedPath,
-    pub(super) module_locations: HashMap<DisplayPath, ResolvedPath>,
+    pub(super) module_locations: HashMap<ModuleLocationKey, ResolvedPath>,
     /// Root of the configuration being expanded. Unlike `base_dir`, this does
     /// not change while recursively resolving nested module imports and is
     /// therefore the stable base for user-facing source labels.
@@ -922,7 +938,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         schemas: &'cfg SchemaRegistry,
     ) -> Self {
         let io_base_dir = base_dir.clone();
-        let base_dir = std::path::PathBuf::from(base_dir.display().to_string());
+        let base_dir = base_dir.source_label();
         Self {
             io_base_dir,
             module_locations: HashMap::new(),
@@ -1037,8 +1053,10 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         }
 
         let canonical = full_path.identity();
-        self.module_locations
-            .insert(full_path.display().clone(), full_path.clone());
+        self.module_locations.insert(
+            ModuleLocationKey::new(&self.io_base_dir, path)?,
+            full_path.clone(),
+        );
 
         // Check for circular import
         if self.resolving.contains(&canonical) {
@@ -1128,10 +1146,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         let mut files: Vec<(std::path::PathBuf, String)> = Vec::with_capacity(paths.len());
         for path in paths {
             let content = path.read_to_string()?;
-            files.push((
-                std::path::PathBuf::from(path.display().to_string()),
-                content,
-            ));
+            files.push((path.source_label(), content));
         }
         let parsed_files = crate::config_loader::parse_directory_files_located_from_root(
             &files,
@@ -1234,10 +1249,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         let base_dir = base_dir.clone();
         // Save both the diagnostic spelling and pinned IO address.
         let original_io_base = std::mem::replace(&mut self.io_base_dir, base_dir.clone());
-        let original_base_dir = std::mem::replace(
-            &mut self.base_dir,
-            std::path::PathBuf::from(base_dir.display().to_string()),
-        );
+        let original_base_dir = std::mem::replace(&mut self.base_dir, base_dir.source_label());
         let original_imported = std::mem::take(&mut self.imported_modules);
         let original_paths = std::mem::take(&mut self.module_paths);
 

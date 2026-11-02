@@ -155,6 +155,12 @@ impl ResolvedPath {
         &self.display
     }
 
+    /// Original OS-string spelling for parser source labels and legacy
+    /// diagnostics. Use this path's IO methods for filesystem access.
+    pub fn source_label(&self) -> PathBuf {
+        self.display.clone().into_source_path()
+    }
+
     /// Absolute locator captured without resolving the user's symlink spelling.
     /// Persist this value when the path will be reused from another directory.
     pub fn persisted_path(&self) -> &PersistedPath {
@@ -202,18 +208,41 @@ impl ResolvedPath {
 
     /// Derive a sibling of the pinned file's identity, including its real name.
     /// Lock and recovery files must use this rather than the locator's parent.
-    /// The diagnostic and persisted spellings still follow the user's locator.
+    /// The diagnostic spelling still follows the user's locator.
+    /// The returned leaf cannot be resolved through a symlink into another file.
+    ///
+    /// ```compile_fail,E0308
+    /// use carina_core::paths::ResolvedPath;
+    /// let state = ResolvedPath::new("state.json").unwrap();
+    /// let lock: ResolvedPath = state.sibling_with_extension("lock").unwrap();
+    /// ```
     pub fn sibling_with_extension(
         &self,
         extension: impl AsRef<std::ffi::OsStr>,
-    ) -> io::Result<Self> {
+    ) -> io::Result<NoFollowLeaf> {
         let extension = extension.as_ref();
-        Self::from_address(
-            &self.resolved.with_extension(extension),
-            self.display.with_extension(extension),
-            self.display_address.with_extension(extension),
-            PersistedPath(DisplayPath(self.persisted.0.0.with_extension(extension))),
-        )
+        Ok(NoFollowLeaf {
+            address: self.resolved.with_extension(extension),
+            display: self.display.with_extension(extension),
+        })
+    }
+
+    /// Anchor a file name to this pinned directory without resolving its leaf.
+    pub fn file_leaf(&self, name: impl AsRef<std::ffi::OsStr>) -> io::Result<NoFollowLeaf> {
+        let name = Path::new(name.as_ref());
+        let mut components = name.components();
+        if !matches!(components.next(), Some(Component::Normal(part)) if part == name.as_os_str())
+            || components.next().is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected one file name",
+            ));
+        }
+        Ok(NoFollowLeaf {
+            address: self.resolved.join(name),
+            display: self.display.join(name),
+        })
     }
 
     pub fn create_dir(&self) -> io::Result<()> {
@@ -222,16 +251,6 @@ impl ResolvedPath {
 
     pub fn create_dir_all(&self) -> io::Result<()> {
         std::fs::create_dir_all(&self.resolved)
-    }
-
-    /// Open the persistent advisory-lock inode without truncating it.
-    pub fn open_lock(&self) -> io::Result<std::fs::File> {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.resolved)
     }
 
     pub fn read(&self) -> io::Result<Vec<u8>> {
@@ -290,49 +309,14 @@ impl ResolvedPath {
         tokio::fs::remove_file(&self.resolved).await
     }
 
-    /// Exclusive creation, including durable contents and cleanup on failure.
-    pub fn create_lock(&self, content: &[u8]) -> io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&self.resolved)?;
-        if let Err(error) = file.write_all(content).and_then(|()| file.sync_all()) {
-            let _ = self.remove();
-            return Err(error);
-        }
-        Ok(())
-    }
-
     /// Stage beside the pinned target, preserving an existing file's mode.
     /// Neither the staging name nor the destination can escape this module.
     pub fn stage(&self) -> io::Result<StagedFile> {
-        let permissions = match self.metadata() {
-            Ok(metadata) => Some(metadata.permissions()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
-        let name = self
-            .resolved
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
-        let temporary = self
-            .resolved
-            .with_file_name(format!(".{name}.tmp.{}", uuid::Uuid::new_v4()));
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        let stage = StagedFile {
-            file,
-            temporary,
-            destination: self.resolved.clone(),
-        };
-        if let Some(permissions) = permissions {
-            stage.file.set_permissions(permissions)?;
+        NoFollowLeaf {
+            address: self.resolved.clone(),
+            display: self.display.clone(),
         }
-        Ok(stage)
+        .stage()
     }
 
     /// Replace atomically, sync contents and parent, and preserve the file mode.
@@ -379,6 +363,224 @@ impl ResolvedPath {
         });
         names.sort();
         names.into_iter().map(|name| self.join(name)).collect()
+    }
+}
+
+/// A file leaf under a pinned parent. Unlike [`ResolvedPath`], this type never
+/// resolves the leaf's symlink target. Reads and advisory opens use no-follow
+/// handles; creation is exclusive, and replacement renames over the leaf.
+#[derive(Clone)]
+pub struct NoFollowLeaf {
+    address: PathBuf,
+    display: DisplayPath,
+}
+
+impl fmt::Debug for NoFollowLeaf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("NoFollowLeaf").field(&self.display).finish()
+    }
+}
+
+/// A symlink where a lock, recovery claim, or temporary file must be a file.
+#[derive(Debug, thiserror::Error)]
+#[error("refusing to follow symlink file leaf at {path}")]
+pub struct SymlinkLeafError {
+    path: DisplayPath,
+}
+
+impl NoFollowLeaf {
+    pub fn display(&self) -> &DisplayPath {
+        &self.display
+    }
+
+    pub fn sibling_with_extension(
+        &self,
+        extension: impl AsRef<std::ffi::OsStr>,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            address: self.address.with_extension(extension.as_ref()),
+            display: self.display.with_extension(extension),
+        })
+    }
+
+    fn symlink_error(&self) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            SymlinkLeafError {
+                path: self.display.clone(),
+            },
+        )
+    }
+
+    pub fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        let metadata = std::fs::symlink_metadata(&self.address)?;
+        if metadata.file_type().is_symlink() {
+            return Err(self.symlink_error());
+        }
+        Ok(metadata)
+    }
+
+    fn reject_symlink(&self) -> io::Result<()> {
+        match self.metadata() {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn open(&self, options: &mut std::fs::OpenOptions) -> io::Result<std::fs::File> {
+        self.open_after_symlink_check(options, || {})
+    }
+
+    fn open_after_symlink_check(
+        &self,
+        options: &mut std::fs::OpenOptions,
+        after_check: impl FnOnce(),
+    ) -> io::Result<std::fs::File> {
+        self.reject_symlink()?;
+        after_check();
+        Self::configure_no_follow(options)?;
+        let file = options.open(&self.address).map_err(|error| {
+            #[cfg(unix)]
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                return self.symlink_error();
+            }
+            match self.reject_symlink() {
+                Err(symlink_error)
+                    if symlink_error
+                        .get_ref()
+                        .is_some_and(|source| source.is::<SymlinkLeafError>()) =>
+                {
+                    symlink_error
+                }
+                _ => error,
+            }
+        })?;
+        if file.metadata()?.file_type().is_symlink() {
+            return Err(self.symlink_error());
+        }
+        Ok(file)
+    }
+
+    fn configure_no_follow(options: &mut std::fs::OpenOptions) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_FLAG_OPEN_REPARSE_POINT: open the entry, never its target.
+            options.custom_flags(0x0020_0000);
+            Ok(())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = options;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "no-follow file opens are unavailable on this platform",
+            ))
+        }
+    }
+
+    /// Open the persistent advisory-lock inode without truncating it.
+    pub fn open_lock(&self) -> io::Result<std::fs::File> {
+        self.open(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false),
+        )
+    }
+
+    pub fn read_to_string(&self) -> io::Result<String> {
+        use std::io::Read;
+        let mut content = String::new();
+        self.open(std::fs::OpenOptions::new().read(true))?
+            .read_to_string(&mut content)?;
+        Ok(content)
+    }
+
+    #[cfg(feature = "async-io")]
+    pub async fn read_to_string_async(&self) -> io::Result<String> {
+        let leaf = self.clone();
+        tokio::task::spawn_blocking(move || leaf.read_to_string())
+            .await
+            .map_err(io::Error::other)?
+    }
+
+    pub fn remove(&self) -> io::Result<()> {
+        self.reject_symlink()?;
+        std::fs::remove_file(&self.address)
+    }
+
+    #[cfg(feature = "async-io")]
+    pub async fn remove_async(&self) -> io::Result<()> {
+        let leaf = self.clone();
+        tokio::task::spawn_blocking(move || leaf.remove())
+            .await
+            .map_err(io::Error::other)?
+    }
+
+    /// Exclusive creation, including durable contents and cleanup on failure.
+    pub fn create_lock(&self, content: &[u8]) -> io::Result<()> {
+        let mut file = self.create_new()?;
+        if let Err(error) = file.write_all(content).and_then(|()| file.sync_all()) {
+            let _ = self.remove();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn create_new(&self) -> io::Result<std::fs::File> {
+        self.open(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true),
+        )
+    }
+
+    fn stage(&self) -> io::Result<StagedFile> {
+        let permissions = match self.metadata() {
+            Ok(metadata) => Some(metadata.permissions()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let mut name = std::ffi::OsString::from(".");
+        name.push(self.address.file_name().unwrap_or_default());
+        name.push(format!(".tmp.{}", uuid::Uuid::new_v4()));
+        let temporary = Self {
+            address: self.address.with_file_name(&name),
+            display: DisplayPath(self.display.0.with_file_name(name)),
+        };
+        let stage = StagedFile {
+            file: temporary.create_new()?,
+            temporary,
+            destination: self.clone(),
+        };
+        if let Some(permissions) = permissions {
+            stage.file.set_permissions(permissions)?;
+        }
+        Ok(stage)
+    }
+
+    pub fn atomic_replace(&self, content: &[u8]) -> io::Result<()> {
+        let mut stage = self.stage()?;
+        stage.write_all(content)?;
+        stage.publish()
+    }
+
+    #[cfg(feature = "async-io")]
+    pub async fn atomic_replace_async(&self, content: Vec<u8>) -> io::Result<()> {
+        let leaf = self.clone();
+        tokio::task::spawn_blocking(move || leaf.atomic_replace(&content))
+            .await
+            .map_err(io::Error::other)?
     }
 }
 
@@ -500,8 +702,8 @@ impl CanonicalPath {
 /// ```
 pub struct StagedFile {
     file: std::fs::File,
-    temporary: PathBuf,
-    destination: PathBuf,
+    temporary: NoFollowLeaf,
+    destination: NoFollowLeaf,
 }
 
 impl StagedFile {
@@ -513,8 +715,10 @@ impl StagedFile {
     }
     pub fn publish(self) -> io::Result<()> {
         self.file.sync_all()?;
-        std::fs::rename(&self.temporary, &self.destination)?;
-        if let Some(parent) = self.destination.parent() {
+        self.temporary.reject_symlink()?;
+        self.destination.reject_symlink()?;
+        std::fs::rename(&self.temporary.address, &self.destination.address)?;
+        if let Some(parent) = self.destination.address.parent() {
             #[cfg(unix)]
             std::fs::File::open(parent)?.sync_all()?;
             // Platforms without portable directory handles retain best-effort synchronization.
@@ -547,7 +751,7 @@ impl io::Seek for StagedFile {
 }
 impl Drop for StagedFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.temporary);
+        let _ = self.temporary.remove();
     }
 }
 
@@ -806,6 +1010,25 @@ impl PersistedPath {
 
     pub fn display(&self) -> &DisplayPath {
         &self.0
+    }
+
+    /// Bridge to locator APIs that still require a `PathBuf`, preserving OS
+    /// bytes. This is the recorded logical locator, never the pinned IO address.
+    pub fn to_path_buf(&self) -> PathBuf {
+        self.0.0.clone()
+    }
+
+    /// Whether a locator is lexically below this directory without traversing
+    /// parents. Path components are compared as OS strings, never display text.
+    pub fn contains(&self, path: &Self) -> bool {
+        path.0.0.strip_prefix(&self.0.0).is_ok_and(|relative| {
+            !relative.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        })
     }
 
     pub fn join(&self, child: impl AsRef<Path>) -> io::Result<Self> {
@@ -1242,7 +1465,7 @@ mod tests {
         assert_eq!(files[0].read_to_string().unwrap(), "original");
         assert_eq!(files[0].display().0.as_path(), alias.join("main.crn"));
         let state = root.join("state.json").unwrap();
-        let lock = root.join("state.lock").unwrap();
+        let lock = root.file_leaf("state.lock").unwrap();
         lock.create_lock(b"owner").unwrap();
         assert_eq!(
             lock.create_lock(b"thief").unwrap_err().kind(),
@@ -1321,6 +1544,11 @@ mod tests {
             )
             .unwrap();
             let lock = state.with_extension("lock").unwrap();
+            let lock = lock
+                .parent()
+                .unwrap()
+                .file_leaf(lock.display().file_name().unwrap())
+                .unwrap();
             lock.create_lock(b"owner").unwrap();
             if existing_state {
                 assert_eq!(state.read().unwrap(), b"original");
@@ -1356,9 +1584,135 @@ mod tests {
             .unwrap();
         let state = ResolvedPath::new(project.join("carina.state.json")).unwrap();
         let lock = state.with_extension("lock").unwrap();
+        let lock = lock
+            .parent()
+            .unwrap()
+            .file_leaf(lock.display().file_name().unwrap())
+            .unwrap();
         lock.create_lock(b"owner").unwrap();
         assert!(project.join("carina.state.lock").exists());
         assert!(!data.join("real.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sibling_leaves_reject_symlinks_before_and_after_derivation() {
+        for extension in ["lock", "lock.recover", "json.tmp.fixed"] {
+            for link_before_derivation in [true, false] {
+                let temp = tempfile::tempdir().unwrap();
+                let state_path = temp.path().join("state.json");
+                std::fs::write(&state_path, b"state must survive").unwrap();
+                let state = ResolvedPath::new(&state_path).unwrap();
+                let leaf_path = state_path.with_extension(extension);
+                if link_before_derivation {
+                    std::os::unix::fs::symlink(&state_path, &leaf_path).unwrap();
+                }
+                let leaf = state.sibling_with_extension(extension).unwrap();
+                if !link_before_derivation {
+                    std::os::unix::fs::symlink(&state_path, &leaf_path).unwrap();
+                }
+
+                let read_error = leaf.read_to_string().unwrap_err();
+                assert_eq!(read_error.kind(), io::ErrorKind::InvalidInput);
+                assert!(read_error.to_string().contains("symlink"), "{read_error}");
+                assert!(read_error.get_ref().unwrap().is::<SymlinkLeafError>());
+                assert_eq!(
+                    leaf.open_lock().unwrap_err().kind(),
+                    io::ErrorKind::InvalidInput
+                );
+                assert_eq!(
+                    leaf.create_lock(b"lock").unwrap_err().kind(),
+                    io::ErrorKind::InvalidInput
+                );
+                assert_eq!(
+                    leaf.atomic_replace(b"replacement").unwrap_err().kind(),
+                    io::ErrorKind::InvalidInput
+                );
+                assert_eq!(
+                    leaf.remove().unwrap_err().kind(),
+                    io::ErrorKind::InvalidInput
+                );
+                assert_eq!(std::fs::read(&state_path).unwrap(), b"state must survive");
+                assert!(
+                    std::fs::symlink_metadata(&leaf_path)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nofollow_open_rejects_a_symlink_created_after_the_leaf_check() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state.json");
+        let lock = temp.path().join("state.lock");
+        std::fs::write(&state, b"state must survive").unwrap();
+        let leaf = ResolvedPath::new(&state)
+            .unwrap()
+            .sibling_with_extension("lock")
+            .unwrap();
+
+        let error = leaf
+            .open_after_symlink_check(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false),
+                || std::os::unix::fs::symlink(&state, &lock).unwrap(),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.get_ref().unwrap().is::<SymlinkLeafError>());
+        assert_eq!(std::fs::read(&state).unwrap(), b"state must survive");
+    }
+
+    #[test]
+    fn file_leaf_rejects_paths_that_could_traverse_a_leaf_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = ResolvedPath::new(temp.path()).unwrap();
+        for name in [
+            "",
+            ".",
+            "..",
+            "file/",
+            "file/.",
+            "./file",
+            "nested/file",
+            "../file",
+        ] {
+            assert_eq!(
+                directory.file_leaf(name).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "{name:?}"
+            );
+        }
+    }
+
+    // macOS APFS rejects non-UTF-8 names.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staging_preserves_non_utf8_destination_name() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let name = std::ffi::OsString::from_vec(b"state-\xff.json".to_vec());
+        let target = ResolvedPath::new(temp.path().join(&name)).unwrap();
+        let stage = target.stage().unwrap();
+
+        assert!(
+            stage
+                .temporary
+                .address
+                .file_name()
+                .unwrap()
+                .as_encoded_bytes()
+                .starts_with(b".state-\xff.json.tmp.")
+        );
     }
 
     #[cfg(unix)]
@@ -1389,12 +1743,13 @@ mod tests {
         assert!(!temp.path().join("replacement.lock").exists());
         let mut stage = state.stage().unwrap();
         assert_eq!(
-            stage.temporary.parent().unwrap(),
+            stage.temporary.address.parent().unwrap(),
             std::fs::canonicalize(&data).unwrap()
         );
         assert!(
             stage
                 .temporary
+                .address
                 .file_name()
                 .unwrap()
                 .to_str()

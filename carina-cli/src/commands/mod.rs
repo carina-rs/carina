@@ -164,10 +164,7 @@ fn emit_read_backend_drift_warning(
                 return;
             }
 
-            upstream_backend_drift_warning(
-                drift,
-                std::path::Path::new(&source_dir.display().to_string()),
-            )
+            upstream_backend_drift_warning(drift, &source_dir.source_label())
         }
     };
 
@@ -463,7 +460,7 @@ fn extend_module_resolution_errors(
     base_dir: &ResolvedPath,
 ) {
     let base_dir = base_dir.clone();
-    let base_label = std::path::PathBuf::from(base_dir.display().to_string());
+    let base_label = base_dir.source_label();
     let base_dir = base_label.as_path();
     for residual in residuals {
         let message = if residual.is_constraint() {

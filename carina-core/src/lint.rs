@@ -423,7 +423,7 @@ pub fn collect_all_tag_keys<E, D, S: AsRef<str>, B: crate::resource::BindingAddr
         if seen_files.insert(file.identity()) {
             entries.extend(collect_tag_keys_for_file(
                 source.as_ref(),
-                &PathBuf::from(file.display().to_string()),
+                &file.source_label(),
             ));
         }
     }
@@ -463,7 +463,7 @@ pub fn collect_all_tag_keys<E, D, S: AsRef<str>, B: crate::resource::BindingAddr
             };
             entries.extend(collect_tag_keys_for_file(
                 &content,
-                &PathBuf::from(module_file.display().to_string()),
+                &module_file.source_label(),
             ));
         }
     }

@@ -26,11 +26,7 @@ pub fn get_parsed_file(
 ) -> Result<ParsedFile, ModuleError> {
     let path = path.clone();
     let content = path.read_to_string()?;
-    let parsed = crate::parser::parse_file(
-        &content,
-        std::path::Path::new(&path.display().to_string()),
-        config,
-    )?;
+    let parsed = crate::parser::parse_file(&content, &path.source_label(), config)?;
     Ok(parsed)
 }
 
@@ -104,17 +100,12 @@ fn load_directory_module_with_diagnostics_and_config(
     let mut files: Vec<(PathBuf, String)> = Vec::with_capacity(paths.len());
     for path in paths {
         if let Ok(content) = path.read_to_string() {
-            files.push((
-                std::path::PathBuf::from(path.display().to_string()),
-                content,
-            ));
+            files.push((path.source_label(), content));
         }
     }
     let parsed_files = crate::config_loader::parse_directory_files(&files, config).ok()?;
-    let duplicate_declarations = crate::config_loader::find_duplicate_declarations(
-        std::path::Path::new(&dir_path.display().to_string()),
-        &parsed_files,
-    );
+    let duplicate_declarations =
+        crate::config_loader::find_duplicate_declarations(&dir_path.source_label(), &parsed_files);
 
     let mut merged = ParsedFile::default();
     for (_, parsed) in parsed_files {
@@ -139,7 +130,7 @@ fn load_directory_module_with_diagnostics_and_config(
 /// - `modules/web_tier.crn` → `web_tier` (file-based)
 /// - `web_tier.crn` → `web_tier`
 pub fn derive_module_name(path: &ResolvedPath) -> String {
-    let label = PathBuf::from(path.display().to_string());
+    let label = path.source_label();
     if path.is_dir() {
         return label
             .file_name()
@@ -185,10 +176,7 @@ pub fn load_module_from_directory(
         let content = path
             .read_to_string()
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        files.push((
-            std::path::PathBuf::from(path.display().to_string()),
-            content,
-        ));
+        files.push((path.source_label(), content));
     }
 
     let parsed_files = crate::config_loader::parse_directory_files(&files, config)

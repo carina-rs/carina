@@ -1582,8 +1582,7 @@ impl DiagnosticRun<'_> {
         let Some(residual_diagnostic) = residual.diagnostic() else {
             return Vec::new();
         };
-        let relative_message = residual
-            .display_relative_to(&std::path::PathBuf::from(base_path.display().to_string()));
+        let relative_message = residual.display_relative_to(&base_path.source_label());
         if matches!(
             call_source,
             carina_core::module_resolver::ModuleErrorCallSource::Unavailable
@@ -1595,7 +1594,7 @@ impl DiagnosticRun<'_> {
             let error_source = if error_source.is_absolute() {
                 error_source.to_path_buf()
             } else {
-                std::path::PathBuf::from(base_path.display().join(error_source).to_string())
+                base_path.source_label().join(error_source)
             };
             if current_source == error_source.as_path() {
                 let mut diagnostic = parse_error_to_diagnostic(error);
@@ -1663,7 +1662,7 @@ impl DiagnosticRun<'_> {
             let error_source = if error_source.is_absolute() {
                 error_source.to_path_buf()
             } else {
-                std::path::PathBuf::from(base_path.display().join(error_source).to_string())
+                base_path.source_label().join(error_source)
             };
             if current_source == error_source.as_path() {
                 let line = (line as u32).saturating_sub(1);
@@ -1703,8 +1702,7 @@ impl DiagnosticRun<'_> {
             base_path,
         );
 
-        let current_path =
-            std::path::PathBuf::from(base_path.display().join(current_file_name).to_string());
+        let current_path = base_path.source_label().join(current_file_name);
         carina_core::lint::find_mixed_tag_key_styles(&tag_keys)
             .into_iter()
             .filter(|warning| warning.file.as_deref() == Some(current_path.as_path()))
@@ -1972,7 +1970,7 @@ impl DiagnosticRun<'_> {
             };
             let Ok(parsed) = carina_core::parser::parse_file(
                 &content,
-                &std::path::PathBuf::from(file.display().to_string()),
+                &file.source_label(),
                 self.provider_context.catalog(),
             ) else {
                 continue;

@@ -108,16 +108,10 @@ fn discover_by_dir_recursive(
             && let Ok(content) = path.read_to_string()
         {
             let ctx = ProviderContext::new(environment.clone());
-            if let Ok(parsed) =
-                parser::parse_file(&content, &PathBuf::from(path.display().to_string()), &ctx)
+            if let Ok(parsed) = parser::parse_file(&content, &path.source_label(), &ctx)
                 && !parsed.providers.is_empty()
             {
-                let source_dir = PathBuf::from(
-                    path.parent()
-                        .unwrap_or_else(|| dir.clone())
-                        .display()
-                        .to_string(),
-                );
+                let source_dir = path.parent().unwrap_or_else(|| dir.clone()).source_label();
                 let dir_providers = result.entry(source_dir).or_default();
                 let mut seen: HashSet<ProviderInstanceKey> = dir_providers
                     .iter()
@@ -179,9 +173,7 @@ fn discover_imports_recursive(
             && let Ok(content) = path.read_to_string()
         {
             let ctx = ProviderContext::new(environment.clone());
-            if let Ok(parsed) =
-                parser::parse_file(&content, &PathBuf::from(path.display().to_string()), &ctx)
-            {
+            if let Ok(parsed) = parser::parse_file(&content, &path.source_label(), &ctx) {
                 let caller_dir = path.parent().unwrap_or_else(|| dir.clone());
                 for import in &parsed.uses {
                     let Ok(module_path) = caller_dir.join(&import.path) else {
@@ -219,6 +211,26 @@ fn discover_imports_recursive(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    // macOS APFS rejects non-UTF-8 names.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_directory_keys_preserve_non_utf8_project_directory() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = TempDir::new().unwrap();
+        let directory = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"project-\xff".to_vec()));
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("main.crn"), "provider mock {}\n").unwrap();
+
+        let providers =
+            discover_providers_by_dir(&directory, &carina_core::EnvironmentSnapshot::empty());
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[&directory][0].name, "mock");
+    }
 
     #[cfg(unix)]
     #[test]

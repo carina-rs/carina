@@ -364,7 +364,7 @@ fn lint_result(
                 LintFile::Resolved(resolution.map_err(|e| {
                     format!(
                         "Module resolution error: {}",
-                        e.display_relative_to(&PathBuf::from(base_dir.display().to_string()))
+                        e.display_relative_to(&base_dir.source_label())
                     )
                 })?)
             } else {
@@ -407,7 +407,7 @@ fn lint_result(
                     // The merged module parse does not retain an offending declaration
                     // span. Keep lint's file:line convention at the caller boundary;
                     // the finding itself retains the recursive module-path prefix.
-                    file: PathBuf::from(base_dir.display().to_string()),
+                    file: base_dir.source_label(),
                     line: 1,
                     message: finding.to_string(),
                 })
@@ -421,7 +421,7 @@ fn lint_result(
             }
             if let Some(message) = provider_factory_error {
                 warnings.push(LintWarning {
-                    file: PathBuf::from(base_dir.display().to_string()),
+                    file: base_dir.source_label(),
                     line: 1,
                     message,
                 });
@@ -431,7 +431,7 @@ fn lint_result(
                 .chain(load_findings.into_iter().map(|error| error.to_string()))
             {
                 warnings.push(LintWarning {
-                    file: PathBuf::from(base_dir.display().to_string()),
+                    file: base_dir.source_label(),
                     line: 1,
                     message,
                 });
@@ -439,8 +439,8 @@ fn lint_result(
             for duplicate in &duplicate_declarations {
                 let file = duplicate
                     .first_file()
-                    .map(|relative| PathBuf::from(base_dir.display().join(relative).to_string()))
-                    .unwrap_or_else(|| PathBuf::from(base_dir.display().to_string()));
+                    .map(|relative| base_dir.source_label().join(relative))
+                    .unwrap_or_else(|| base_dir.source_label());
                 warnings.push(LintWarning {
                     file,
                     // Declaration AST nodes do not carry spans. Keep the finding in
@@ -454,12 +454,8 @@ fn lint_result(
                 for duplicate in &module.loaded().duplicate_declarations {
                     let file = duplicate
                         .first_file()
-                        .map(|relative| {
-                            PathBuf::from(module.module_path().display().join(relative).to_string())
-                        })
-                        .unwrap_or_else(|| {
-                            PathBuf::from(module.module_path().display().to_string())
-                        });
+                        .map(|relative| module.module_path().source_label().join(relative))
+                        .unwrap_or_else(|| module.module_path().source_label());
                     warnings.push(LintWarning {
                         file,
                         line: 1,
@@ -468,7 +464,7 @@ fn lint_result(
                 }
             }
             for (file, source) in &source_texts {
-                let file_path = PathBuf::from(file.display().to_string());
+                let file_path = file.source_label();
                 // Check for list literal syntax on List<Struct> attributes
                 let hits = find_list_literal_attrs(source, &all_list_struct_attrs);
                 for (attr_name, line) in hits {

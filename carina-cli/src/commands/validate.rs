@@ -368,7 +368,7 @@ pub fn run_validate(
             let content = file
                 .read_to_string()
                 .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
-            texts.push((PathBuf::from(file.display().to_string()), content));
+            texts.push((file.source_label(), content));
         }
         texts
     };

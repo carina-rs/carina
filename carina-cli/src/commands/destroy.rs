@@ -901,7 +901,7 @@ async fn run_destroy_locked_owned(
         for error in identifier_errors {
             error_plan.add_error(error);
         }
-        render_plan_errors_and_abort(color_mode,&error_plan, &std::path::PathBuf::from( base_dir.display().to_string()))?;
+        render_plan_errors_and_abort(color_mode, &error_plan, &base_dir.source_label())?;
     }
 
     let wait_aliases = build_destroy_wait_aliases(&resolved_wait_bindings, &delete_effects);

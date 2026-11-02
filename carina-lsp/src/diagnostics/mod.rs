@@ -608,17 +608,13 @@ impl DiagnosticRun<'_> {
                         checks::MergedModuleResolution::ConstraintFailed { .. }
                         | checks::MergedModuleResolution::Unowned { .. } => None,
                     });
-            diagnostics.extend(
-                self.loop_anonymous_identity_diagnostics(
-                    doc,
-                    &current_file,
-                    &directory,
-                    expanded_identity_graph,
-                    base_path
-                        .map(|base| std::path::PathBuf::from(base.display().to_string()))
-                        .as_deref(),
-                ),
-            );
+            diagnostics.extend(self.loop_anonymous_identity_diagnostics(
+                doc,
+                &current_file,
+                &directory,
+                expanded_identity_graph,
+                base_path.map(|base| base.source_label()).as_deref(),
+            ));
         }
         let upstream_resolution = match (base_path, merged) {
             (Some(base), Some(merged)) => {
@@ -2254,7 +2250,7 @@ impl DiagnosticEngine {
             providers.extend(
                 carina_core::parser::parse_provider_factory_declarations(
                     &source,
-                    &std::path::PathBuf::from(file.display().to_string()),
+                    &file.source_label(),
                     doc.provider_context(),
                 )
                 .ok()?,

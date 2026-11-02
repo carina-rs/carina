@@ -194,12 +194,8 @@ async fn run_init_with_provider_resolver(
             if !migrate_state {
                 eprintln!(
                     "{}",
-                    drift_warning(
-                        drift.existing(),
-                        drift.configured(),
-                        &std::path::PathBuf::from(path.display().to_string())
-                    )
-                    .yellow(color_mode)
+                    drift_warning(drift.existing(), drift.configured(), &path.source_label())
+                        .yellow(color_mode)
                 );
                 migration_pending = true;
             } else {

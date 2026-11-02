@@ -2154,7 +2154,7 @@ async fn run_apply_locked_owned(
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
 ) -> LockCommandOutcome<Result<Option<Duration>, AppError>> {
-    let project_label = std::path::PathBuf::from(project_dir.display().to_string());
+    let project_label = project_dir.source_label();
     let project_display = project_label.as_path();
     let runtime = validated_config.context().runtime().clone();
     let color_mode = validated_config.context().runtime().color_mode();

@@ -1153,18 +1153,13 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             .iter()
             .find(|import| import.alias == call.module_name)
             .ok_or_else(|| ModuleError::UnknownModule(call.module_name.clone()))?;
-        let source = std::path::Path::new(&import.path);
-        let display_directory = if source.is_absolute() {
-            crate::paths::DisplayPath::new(source)?
-        } else {
-            owner_directory
-                .map(|directory| directory.display())
-                .unwrap_or(self.io_base_dir.display())
-                .join(source)
-        };
+        let location = super::resolver::ModuleLocationKey::new(
+            owner_directory.unwrap_or(&self.io_base_dir),
+            &import.path,
+        )?;
         let directory = self
             .module_locations
-            .get(&display_directory)
+            .get(&location)
             .ok_or_else(|| ModuleError::UnknownModule(call.module_name.clone()))?;
         let module = self
             .module_cache

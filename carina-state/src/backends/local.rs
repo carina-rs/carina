@@ -4,7 +4,7 @@
 //! It uses a .lock file for simple locking mechanism.
 
 use async_trait::async_trait;
-use carina_core::paths::{DisplayPath, ResolvedPath};
+use carina_core::paths::{DisplayPath, NoFollowLeaf, ResolvedPath};
 #[cfg(any(test, feature = "test-utils"))]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -31,8 +31,8 @@ pub struct LocalBackend {
     /// Path to the state file
     state_path: ResolvedPath,
     /// Path to the lock file
-    lock_path: ResolvedPath,
-    recovery_path: ResolvedPath,
+    lock_path: NoFollowLeaf,
+    recovery_path: NoFollowLeaf,
     /// Tracks the first in-memory state-schema migration observed by
     /// `read_state` on this backend instance, so the warning is emitted
     /// exactly once per backend (carina#3283). `carina plan` reads state
@@ -68,7 +68,7 @@ const RECOVERY_CLAIM_TIMEOUT_SECS: i64 = 30;
 const LOCK_WRITE_GRACE_PERIOD: Duration = Duration::from_millis(100);
 
 struct RecoveryClaimGuard {
-    path: ResolvedPath,
+    path: NoFollowLeaf,
 }
 
 impl Drop for RecoveryClaimGuard {
@@ -137,16 +137,16 @@ impl LocalBackend {
         self.state_path.display()
     }
 
-    fn recovery_path(&self) -> ResolvedPath {
+    fn recovery_path(&self) -> NoFollowLeaf {
         // A sibling of the already-pinned lock, never the project alias.
         self.recovery_path.clone()
     }
 
-    fn create_lock_file(path: &ResolvedPath, content: &str) -> std::io::Result<()> {
+    fn create_lock_file(path: &NoFollowLeaf, content: &str) -> std::io::Result<()> {
         path.create_lock(content.as_bytes())
     }
 
-    fn file_written_recently(path: &ResolvedPath) -> bool {
+    fn file_written_recently(path: &NoFollowLeaf) -> bool {
         path.metadata()
             .and_then(|metadata| metadata.modified())
             .ok()
@@ -708,6 +708,55 @@ mod tests {
                     .is_some_and(|name| name.to_string_lossy().starts_with(prefix.as_ref()))
             })
             .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lock_and_recovery_symlink_leaves_fail_without_changing_state() {
+        for extension in ["lock", "lock.recover"] {
+            for link_before_construction in [true, false] {
+                let dir = tempdir().unwrap();
+                let state_path = dir.path().join("carina.state.json");
+                let state = StateFile::new();
+                let original = serde_json::to_vec(&state).unwrap();
+                std::fs::write(&state_path, &original).unwrap();
+                let leaf = state_path.with_extension(extension);
+                if link_before_construction {
+                    std::os::unix::fs::symlink(&state_path, &leaf).unwrap();
+                }
+                let backend = LocalBackend::with_path(state_path.clone());
+                if !link_before_construction {
+                    std::os::unix::fs::symlink(&state_path, &leaf).unwrap();
+                }
+
+                // wall-clock-ok: real filesystem lock retries need a hang guard for symlink leaves.
+                let result =
+                    tokio::time::timeout(Duration::from_secs(2), backend.acquire_lock("apply"))
+                        .await
+                        .expect("a symlink leaf must fail promptly");
+
+                assert_eq!(std::fs::read(&state_path).unwrap(), original);
+                let error = result.expect_err("a symlink leaf must reject lock acquisition");
+                assert!(matches!(&error, BackendError::Io(_)), "{error:?}");
+                assert!(error.to_string().contains("symlink"), "{error}");
+                assert!(
+                    std::fs::symlink_metadata(&leaf)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
+                assert_eq!(
+                    backend
+                        .read_state()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .into_state()
+                        .lineage,
+                    state.lineage
+                );
+            }
+        }
     }
 
     #[cfg(unix)]

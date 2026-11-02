@@ -1116,7 +1116,9 @@ pub fn cache_path_revision(
     sha: &CommitSha,
 ) -> PathBuf {
     let sha_prefix = sha.short();
-    PathBuf::from(base_dir.display().to_string())
+    base_dir
+        .persisted_path()
+        .to_path_buf()
         .join(".carina")
         .join("providers")
         .join(source.to_string())
@@ -1832,7 +1834,7 @@ where
             recovery,
             selected.artifact_id(),
             mode,
-            &PathBuf::from(base_dir.display().to_string()),
+            &base_dir.source_label(),
         )
     {
         eprintln!("{notice}");
