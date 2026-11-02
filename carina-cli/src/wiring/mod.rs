@@ -3537,7 +3537,10 @@ fn reconcile_anonymous_identifiers_with_ctx(
     Ok(identifier::reconcile_anonymous_identifiers(
         resources,
         data_sources,
-        ctx.schemas(),
+        identifier::IdentityEvaluationContext {
+            schemas: ctx.schemas(),
+            provider_context: ctx.provider_context().as_provider_context(),
+        },
         comparison_provider,
         &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
         &|binding| state_view.entries_by_binding(claims, binding),
@@ -3556,7 +3559,10 @@ fn detect_legacy_loop_moves_with_ctx(
 ) -> Result<Vec<ResolvedMove>, AppError> {
     Ok(identifier::detect_legacy_loop_address_moves(
         resources,
-        ctx.schemas(),
+        identifier::IdentityEvaluationContext {
+            schemas: ctx.schemas(),
+            provider_context: ctx.provider_context().as_provider_context(),
+        },
         comparison_provider,
         &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
         &|binding| state_view.entries_by_binding(claims, binding),
@@ -3582,7 +3588,10 @@ fn detect_anonymous_to_named_moves_with_ctx(
     )?;
     Ok(identifier::detect_anonymous_to_named_renames(
         candidates,
-        ctx.schemas(),
+        identifier::IdentityEvaluationContext {
+            schemas: ctx.schemas(),
+            provider_context: ctx.provider_context().as_provider_context(),
+        },
         comparison_provider,
         identifier::AnonymousToNamedStateLookup::new(
             &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
@@ -7560,7 +7569,8 @@ async fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTa
 
                 let (residual_deferred_for, deferred_create_targets) = target
                     .expand_partitioned(&iterable_bindings, session, |deferred| {
-                        match iterable_bindings.resolve_value(&deferred.iterable) {
+                        match iterable_bindings.resolve_value(&deferred.iterable, session.catalog())
+                        {
                             Ok(carina_core::resolver::ValueResolution::Present(value))
                                 if is_value_fully_concrete_for_expansion(&value) =>
                             {

@@ -6969,7 +6969,7 @@ fn validate_export_params_rejects_every_secret_value_shape_uniformly() {
             "topsecretXYZ".into(),
         )))
     };
-    let builtin = crate::builtins::evaluate_builtin_to_value("upper", &[secret_string()])
+    let builtin = crate::builtins::evaluate_builtin_to_value_for_tests("upper", &[secret_string()])
         .expect("upper(secret(...)) must evaluate");
     let config = loaded_context_for_test(ProviderContext {
         decryptor: Some(std::sync::Arc::new(|_, _| {

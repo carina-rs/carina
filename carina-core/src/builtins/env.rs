@@ -41,14 +41,6 @@ pub(crate) fn builtin_env<B: BindingAddress>(
     })
 }
 
-/// Config-less dispatch validates arguments, then reports the missing input.
-pub(crate) fn builtin_env_without_config<B: BindingAddress>(
-    args: &[Value<NoPlaceholder, B>],
-) -> Result<Value<NoPlaceholder, B>, String> {
-    parse_env_args(args)?;
-    Err("env() requires an environment snapshot in ProviderContext".to_string())
-}
-
 fn parse_env_args<B: BindingAddress>(
     args: &[Value<NoPlaceholder, B>],
 ) -> Result<(&ValueString, bool), String> {
@@ -85,17 +77,19 @@ mod tests {
     use crate::{EnvironmentSnapshot, parser::ProviderContext};
 
     #[test]
-    fn env_without_config_requires_a_snapshot() {
-        let args = [Value::Concrete(ConcreteValue::String("PATH".into()))];
-        let error = crate::builtins::evaluate_builtin_to_value("env", &args).unwrap_err();
+    fn env_dispatch_uses_the_supplied_snapshot() {
+        let config = ProviderContext::new(EnvironmentSnapshot::new([(
+            "VARIABLE".to_string(),
+            "captured".into(),
+        )]));
+        let args = [Value::Concrete(ConcreteValue::String("VARIABLE".into()))];
         assert_eq!(
-            error,
-            "env() requires an environment snapshot in ProviderContext"
+            crate::builtins::evaluate_builtin_to_value("env", &args, &config).unwrap(),
+            Value::Concrete(ConcreteValue::String("captured".into())),
         );
-
         let invalid = crate::builtins::evaluate_builtin_to_value::<
             crate::resource::RelativeBindingName,
-        >("env", &[])
+        >("env", &[], &config)
         .unwrap_err();
         assert!(invalid.contains("expects 1 argument"));
     }

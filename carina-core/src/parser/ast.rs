@@ -7284,6 +7284,7 @@ where
                             loop_template && !allow_arguments,
                             element_type.as_ref(),
                             iterable,
+                            context,
                         )
                     })
                     .filter_map(|mut error| {
@@ -8201,18 +8202,17 @@ impl<E> ExpandedFile<E> {
         let mut new_warnings: Vec<ParseWarning> = Vec::new();
 
         for (idx, deferred) in self.deferred_for_phase.expressions.iter().enumerate() {
-            let iterable_value =
-                match bindings
-                    .resolve_value(&deferred.iterable)
-                    .map_err(|message| DeferredForExpansionError::Resolution {
-                        line: deferred.line(),
-                        expression: crate::value::format_value(&deferred.iterable),
-                        message,
-                    })? {
-                    crate::resolver::ValueResolution::Present(value) => value,
-                    crate::resolver::ValueResolution::Absent
-                    | crate::resolver::ValueResolution::Unknown(_) => continue,
-                };
+            let iterable_value = match bindings
+                .resolve_value(&deferred.iterable, type_checks.catalog())
+                .map_err(|message| DeferredForExpansionError::Resolution {
+                    line: deferred.line(),
+                    expression: crate::value::format_value(&deferred.iterable),
+                    message,
+                })? {
+                crate::resolver::ValueResolution::Present(value) => value,
+                crate::resolver::ValueResolution::Absent
+                | crate::resolver::ValueResolution::Unknown(_) => continue,
+            };
             let miss_policy = bindings.access_miss_policy(&deferred.iterable);
 
             match (&deferred.binding, &iterable_value) {
@@ -8537,7 +8537,7 @@ fn substitute_attrs<S, D>(
                     key,
                     value,
                     miss_policy,
-                    Some(type_checks),
+                    crate::resolver::RuntimeContext::Session(type_checks),
                 )
             },
         )
@@ -8570,25 +8570,27 @@ pub(crate) fn resolve_loop_directive_value<B: BindingAddress>(
     key: Option<&str>,
     value: &Value<NoPlaceholder, B>,
     miss_policy: crate::resource::AccessMissPolicy,
-    type_checks: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+    context: crate::resolver::RuntimeContext<'_>,
 ) -> Result<Value<NoPlaceholder, B>, PlaceholderAccessError> {
     let expression =
         substitute_placeholder_with_policy(expression, index, key, value, miss_policy)?
             .canonicalize();
     let bindings = crate::binding_index::ResolvedBindings::default();
-    match type_checks {
-        Some(type_checks) => {
+    match context {
+        crate::resolver::RuntimeContext::Session(type_checks) => {
             crate::resolver::resolve_ref_value(&expression, &bindings, type_checks)
         }
         // A syntax preview cannot evaluate annotated calls. The real expansion
         // borrows its run session and checks them before returning children.
-        None => crate::resolver::project_ref_value_status(&expression, &bindings).map(|value| {
-            match value {
-                crate::resolver::ValueResolution::Present(value)
-                | crate::resolver::ValueResolution::Unknown(value) => value,
-                crate::resolver::ValueResolution::Absent => expression,
-            }
-        }),
+        crate::resolver::RuntimeContext::Projection(context) => {
+            crate::resolver::project_ref_value_status(&expression, &bindings, context).map(
+                |value| match value {
+                    crate::resolver::ValueResolution::Present(value)
+                    | crate::resolver::ValueResolution::Unknown(value) => value,
+                    crate::resolver::ValueResolution::Absent => expression,
+                },
+            )
+        }
     }
     .map_err(|message| PlaceholderAccessError {
         line: 0,

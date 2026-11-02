@@ -672,6 +672,127 @@ fn integer_arithmetic_in_a_for_body_resolves_after_its_deferred_iterable() {
     );
 }
 
+#[test]
+fn deferred_for_projection_evaluates_nested_env_from_the_caller_snapshot() {
+    for names in [["alpha", "beta"], ["gamma", "delta"]] {
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::new([(
+            "CARINA_DEFERRED_LIST".to_string(),
+            names.join(",").into(),
+        )]));
+        let schemas = crate::schema::SchemaRegistry::new();
+        let parsed = parse(
+            r#"
+            let upstream = upstream_state { source = "../upstream" }
+            let source = mock.test.Source {
+                list = split(",", env(upstream.variable))
+            }
+            let children = for item in source.list {
+                mock.test.Target { name = item }
+            }
+            "#,
+            &context,
+        )
+        .expect("the environment lookup stays deferred until upstream is loaded");
+        crate::validation::deferred_types::with_session_for_test(&context, |session| {
+            let mut expanded = crate::module_resolver::resolve_modules_with_providerless_config(
+                crate::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
+                std::path::Path::new("."),
+                session,
+                &schemas,
+            )
+            .expect("fixture crosses module resolution")
+            .into_expanded(&schemas, &context)
+            .expect("fixture crosses the placeholder boundary");
+            assert_eq!(expanded.deferred_for_expressions().len(), 1);
+            let source = expanded
+                .resources
+                .iter()
+                .find(|resource| {
+                    resource
+                        .binding
+                        .as_ref()
+                        .is_some_and(|name| name.as_str() == "source")
+                })
+                .expect("source resource");
+            let mut bindings = ResolvedBindings::default();
+            bindings.set(
+                "source",
+                HashMap::from([("list".to_string(), source.get_attr("list").unwrap().clone())]),
+                crate::binding_index::BindingValueSource::Local,
+            );
+            bindings.set(
+                "upstream",
+                HashMap::from([(
+                    "variable".to_string(),
+                    ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                        "CARINA_DEFERRED_LIST".into(),
+                    )),
+                )]),
+                crate::binding_index::BindingValueSource::Upstream,
+            );
+            expanded
+                .expand_deferred_for_expressions(&bindings.project_iterable_bindings(), session)
+                .expect("projection evaluates nested builtins with the caller's snapshot");
+            assert!(expanded.deferred_for_expressions().is_empty());
+            for (index, name) in names.iter().enumerate() {
+                let binding = format!("children[{index}]");
+                let child = expanded
+                    .resources
+                    .iter()
+                    .find(|resource| {
+                        resource
+                            .binding
+                            .as_ref()
+                            .is_some_and(|name| name.as_str() == binding)
+                    })
+                    .expect("expanded child");
+                assert_eq!(
+                    child.get_attr("name"),
+                    Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                        (*name).into()
+                    ))),
+                );
+            }
+        });
+    }
+}
+
+#[test]
+fn loop_directive_projection_evaluates_env_from_the_caller_snapshot() {
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::new([(
+        "DIRECTIVE_VARIABLE".to_string(),
+        "captured".into(),
+    )]));
+    let expression = GenericValue::Deferred(GenericDeferredValue::FunctionCall {
+        name: crate::builtins::BuiltinFunction::env,
+        args: vec![
+            GenericValue::Deferred(GenericDeferredValue::Placeholder(LoopSlot::Value)).into(),
+        ],
+        source_line: 1.into(),
+    });
+    let item = ExpandedValue::Concrete(ExpandedConcreteValue::String("DIRECTIVE_VARIABLE".into()));
+    crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        for evaluation in [
+            crate::resolver::RuntimeContext::Projection(&context),
+            crate::resolver::RuntimeContext::Session(session),
+        ] {
+            let resolved = resolve_loop_directive_value(
+                expression.clone(),
+                None,
+                None,
+                &item,
+                crate::resource::AccessMissPolicy::Error,
+                evaluation,
+            )
+            .expect("both preview and expansion use the caller's snapshot");
+            assert_eq!(
+                resolved,
+                ExpandedValue::Concrete(ExpandedConcreteValue::String("captured".into())),
+            );
+        }
+    });
+}
+
 fn cross_deferred_for_resolution_seam<E>(parsed: File<E>) -> ModuleResolvedFile<E::Absolute>
 where
     E: ResolveExportBindingPhase<ParserPlaceholder>,

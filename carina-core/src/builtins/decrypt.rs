@@ -11,24 +11,6 @@ use crate::resource::{
 
 use super::value_type_name;
 
-/// `decrypt(ciphertext)` or `decrypt(ciphertext, key)` - Decrypt an encrypted value.
-///
-/// This is the fallback entry point used by `evaluate_builtin` (no config).
-/// It always returns an error since the decryptor is only available via `ProviderContext`.
-/// Use `builtin_decrypt_with_config` for the config-aware version.
-pub(crate) fn builtin_decrypt<B: BindingAddress>(
-    args: &[Value<NoPlaceholder, B>],
-) -> Result<Value<NoPlaceholder, B>, String> {
-    // Validate arguments for better error messages
-    let (_ciphertext, _key) = parse_decrypt_args(args)?;
-
-    Err(
-        "decrypt() requires a configured provider with encryption support. \
-         Ensure a provider (e.g., awscc) is configured and credentials are available."
-            .to_string(),
-    )
-}
-
 /// `decrypt()` implementation that uses the decryptor from [`ProviderContext`].
 pub(crate) fn builtin_decrypt_with_config<B: BindingAddress>(
     args: &[Value<NoPlaceholder, B>],
@@ -108,8 +90,6 @@ mod tests {
         ExpandedValue as Value,
     };
 
-    use super::builtin_decrypt;
-
     fn mock_config(decrypt_fn: crate::parser::DecryptorFn) -> ProviderContext {
         ProviderContext {
             decryptor: Some(decrypt_fn),
@@ -169,9 +149,13 @@ mod tests {
     }
 
     #[test]
-    fn decrypt_fallback_without_config_returns_error() {
+    fn decrypt_dispatch_without_decryptor_returns_error() {
         let args = vec![Value::Concrete(ConcreteValue::String("AQICAHh".into()))];
-        let result = builtin_decrypt(&args);
+        let result = crate::builtins::evaluate_builtin_to_value(
+            "decrypt",
+            &args,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         assert!(result.is_err());
         assert!(
             result

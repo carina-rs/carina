@@ -234,7 +234,12 @@ fn detect_legacy_loop_moves_for_test(
     };
     super::detect_legacy_loop_address_moves(
         resources,
-        registry,
+        IdentityEvaluationContext {
+            schemas: registry,
+            provider_context: &crate::parser::ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            ),
+        },
         &comparison_provider,
         &find_state_by_type,
         &|_binding| Vec::new(),
@@ -354,7 +359,12 @@ fn try_reconcile_anonymous_identifiers(
     super::reconcile_anonymous_identifiers(
         resources,
         &[],
-        registry,
+        IdentityEvaluationContext {
+            schemas: registry,
+            provider_context: &crate::parser::ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            ),
+        },
         &comparison_provider,
         &find_screened_state_by_type,
         find_state_by_binding,
@@ -1476,14 +1486,72 @@ fn longer_reference_chain_resolves_from_state_for_legacy_identity_migration() {
         )]),
     };
 
-    let resolved = resolve_deferred_create_only_value(&reference, &|binding| {
-        (binding == "source")
-            .then(|| source.clone())
-            .into_iter()
-            .collect()
-    });
+    let resolved = resolve_deferred_create_only_value(
+        &reference,
+        &|binding| {
+            (binding == "source")
+                .then(|| source.clone())
+                .into_iter()
+                .collect()
+        },
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
 
     assert_eq!(resolved, Some(concrete_string("resolved-name")));
+}
+
+#[test]
+fn identity_projection_evaluates_env_from_the_caller_snapshot() {
+    let schema = PatternResourceSchema::new("test.resource")
+        .attribute(
+            PatternAttributeSchema::required("name", PatternAttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .validate()
+        .expect("identity schema");
+    let mut desired = Resource::with_provider("mock", "test.resource", "desired", None);
+    desired.set_attr(
+        "name",
+        Value::Deferred(DeferredValue::FunctionCall {
+            name: crate::builtins::BuiltinFunction::env,
+            args: vec![Value::root_resource_ref("source", "variable", Vec::new()).into()],
+            source_line: 1.into(),
+        }),
+    );
+    let find_state = |binding: &str| {
+        assert_eq!(binding, "source");
+        vec![AnonymousIdBindingStateInfo {
+            name: binding.to_string(),
+            attribute_values: HashMap::from([(
+                "variable".to_string(),
+                concrete_string("IDENTITY_VARIABLE"),
+            )]),
+        }]
+    };
+    for expected in ["first", "second"] {
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::new([(
+            "IDENTITY_VARIABLE".to_string(),
+            expected.into(),
+        )]));
+        let create_only = DesiredCreateOnlyValues::from_resource(
+            &desired,
+            schema.as_schema(),
+            &find_state,
+            &context,
+        );
+        let Some(DesiredCreateOnlyValue::Resolved(actual)) = create_only.values.get("name") else {
+            panic!("the state-backed env call must resolve for create-only comparison");
+        };
+        assert_eq!(actual.value, concrete_string(expected));
+        let identity =
+            DesiredIdentityValues::from_resource(&desired, &schema, &find_state, &context);
+        let Some(DesiredIdentityValue::Resolved(actual)) = identity.values.values().next() else {
+            panic!("the state-backed env call must resolve for declared-identity comparison");
+        };
+        assert_eq!(actual.value, concrete_string(expected));
+    }
 }
 
 #[test]
@@ -3121,7 +3189,12 @@ fn state_row_identity_values_use_the_original_permanent_name_override() {
         .expect("schema fixture must be valid");
     let mut desired = Resource::pending_with_provider("mock", "test.unique_identity", None);
     desired.set_attr("name", concrete_string("role"));
-    let desired_values = DesiredIdentityValues::from_resource(&desired, &schema, &|_| Vec::new());
+    let desired_values = DesiredIdentityValues::from_resource(
+        &desired,
+        &schema,
+        &|_| Vec::new(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     let attributes = HashMap::from([("name".to_string(), concrete_string("role-a1b2c3d4"))]);
     let without_override =
         StateRowIdentityValues::from_state_row(&schema, &attributes, &HashMap::new());
@@ -4022,7 +4095,12 @@ fn reconcile_when_present_absence_does_not_match_a_redacted_secret() {
     );
     let schema = registry.get_for(&desired[0]).unwrap();
     let schema = schema.schema();
-    let desired_values = DesiredIdentityValues::from_resource(&desired[0], schema, &|_| Vec::new());
+    let desired_values = DesiredIdentityValues::from_resource(
+        &desired[0],
+        schema,
+        &|_| Vec::new(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
 
     assert_eq!(
         desired_values.compare_row(
@@ -4116,7 +4194,12 @@ fn nested_when_present_absence_does_not_match_redacted_state() {
             "settings",
             Value::Concrete(ConcreteValue::Map(IndexMap::new())),
         );
-    let desired_values = DesiredIdentityValues::from_resource(&desired, &schema, &|_| Vec::new());
+    let desired_values = DesiredIdentityValues::from_resource(
+        &desired,
+        &schema,
+        &|_| Vec::new(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     let redacted_leaf = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
         "name".to_string(),
         redacted_identity_value(),
@@ -4151,8 +4234,12 @@ fn declared_identity_resolved_and_prefix_values_are_undecidable_against_redacted
     for desired in [resolved, prefix] {
         let schema = registry.get_for(&desired).unwrap();
         let schema = schema.schema();
-        let desired_values =
-            DesiredIdentityValues::from_resource(&desired, schema, &|_| Vec::new());
+        let desired_values = DesiredIdentityValues::from_resource(
+            &desired,
+            schema,
+            &|_| Vec::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         let state = StateRowIdentityValues::from_state_row(
             schema,
             &HashMap::from([("name".to_string(), redacted_identity_value())]),
@@ -4345,7 +4432,12 @@ fn reconcile_complete_declared_identity_rejects_multiple_legacy_state_matches() 
     let error = super::reconcile_anonymous_identifiers(
         &desired,
         &[],
-        &registry,
+        IdentityEvaluationContext {
+            schemas: &registry,
+            provider_context: &crate::parser::ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            ),
+        },
         &comparison_provider,
         &find_state_by_type,
         &|_binding| Vec::new(),
@@ -4719,8 +4811,12 @@ fn empty_struct_create_only_values_are_absent_inline_deferred_and_in_state() {
     );
 
     for desired in [&inline, &deferred] {
-        let desired =
-            DesiredCreateOnlyValues::from_resource(desired, schema.as_schema(), &find_state);
+        let desired = DesiredCreateOnlyValues::from_resource(
+            desired,
+            schema.as_schema(),
+            &find_state,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         assert!(
             !desired.has_configured_values(),
             "an empty struct must be identical to an unconfigured identity input"
@@ -5012,7 +5108,12 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
     let simhash_renames = super::reconcile_anonymous_identifiers(
         &simhash_resources,
         &[],
-        &simhash_schemas,
+        IdentityEvaluationContext {
+            schemas: &simhash_schemas,
+            provider_context: &crate::parser::ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            ),
+        },
         &simhash_comparison_provider,
         &|provider, resource_type| {
             claims.screen_entries(
@@ -5070,7 +5171,12 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
     let create_only_renames = super::reconcile_anonymous_identifiers(
         &create_only_resources,
         &[],
-        &create_only_schemas,
+        IdentityEvaluationContext {
+            schemas: &create_only_schemas,
+            provider_context: &crate::parser::ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            ),
+        },
         &create_only_comparison_provider,
         &|provider, resource_type| {
             claims.screen_entries(
@@ -5136,7 +5242,12 @@ fn test_reconcile_skips_desired_name_claimed_by_moved_to() {
     super::reconcile_anonymous_identifiers(
         &resources,
         &[],
-        &schemas,
+        IdentityEvaluationContext {
+            schemas: &schemas,
+            provider_context: &crate::parser::ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            ),
+        },
         &comparison_provider,
         &|provider, resource_type| {
             claims.screen_entries(
@@ -7236,7 +7347,12 @@ fn detect_reference_form_rename(
     );
     let detection = super::detect_anonymous_to_named_renames(
         AnonymousToNamedCandidates::new(&resources, &candidates, &claimed_origins),
-        registry,
+        IdentityEvaluationContext {
+            schemas: registry,
+            provider_context: &crate::parser::ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            ),
+        },
         &comparison_provider,
         AnonymousToNamedStateLookup::new(
             &|provider, resource_type| {
@@ -7886,13 +8002,13 @@ fn test_detect_rename_invalid_enum_is_typed_unresolved_and_does_not_rename() {
         .get_for(&resource)
         .expect("resource schema exists")
         .schema();
-    let resolution = canonical_or_resolved_create_only_value(
+    let resolution = canonical_create_only_value(
         resource
             .get_attr("domain")
-            .expect("domain is configured on the test resource"),
+            .expect("domain is configured on the test resource")
+            .clone(),
         schema.as_schema(),
         "domain",
-        &|_binding| Vec::new(),
     );
     let Err(UnresolvedReason::Type(error)) = resolution else {
         panic!("invalid enum must return its typed canonicalization error")
@@ -8064,7 +8180,12 @@ fn test_reconcile_skips_state_entry_claimed_by_removed_from() {
     super::reconcile_anonymous_identifiers(
         &resources,
         &[],
-        &schemas,
+        IdentityEvaluationContext {
+            schemas: &schemas,
+            provider_context: &crate::parser::ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            ),
+        },
         &comparison_provider,
         &|provider, resource_type| {
             claims.screen_entries(
@@ -8140,7 +8261,12 @@ fn test_reconcile_existing_removed_from_identity_does_not_repoint_to_orphan() {
     let renames = super::reconcile_anonymous_identifiers(
         &resources,
         &[],
-        &schemas,
+        IdentityEvaluationContext {
+            schemas: &schemas,
+            provider_context: &crate::parser::ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            ),
+        },
         &comparison_provider,
         &|provider, resource_type| {
             claims.screen_entries(provider, resource_type, state_entries.clone(), |entry| {

@@ -35,7 +35,7 @@ use crate::eval_value::{
 use crate::parser::{
     ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value,
 };
-use crate::resource::{LegacyLoopAddress, LoopKind, RelativeBindingName};
+use crate::resource::{LegacyLoopAddress, LoopKind};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1109,15 +1109,7 @@ fn parse_with_seeded_bindings_inner(
                                 };
                                 let fn_name = user_fn.name.clone();
                                 // Check for shadowing builtins
-                                if crate::builtins::evaluate_builtin::<RelativeBindingName>(
-                                    &fn_name,
-                                    &[],
-                                )
-                                .is_ok()
-                                    || crate::builtins::builtin_functions()
-                                        .iter()
-                                        .any(|f| f.name == fn_name)
-                                {
+                                if crate::builtins::is_known_builtin(&fn_name) {
                                     return Err(ParseError::UserFunctionError(format!(
                                         "function '{fn_name}' shadows a built-in function"
                                     )));

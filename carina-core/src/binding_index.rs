@@ -3136,8 +3136,12 @@ impl<'a> IterableBindings<'a> {
 
     /// Resolve a complete deferred iterable through the same three-state
     /// evaluator used by ordinary resource attributes.
-    pub fn resolve_value(&self, value: &Value) -> Result<crate::resolver::ValueResolution, String> {
-        crate::resolver::project_ref_value_status(value, self.bindings.as_ref())
+    pub fn resolve_value(
+        &self,
+        value: &Value,
+        context: &crate::parser::ProviderContext,
+    ) -> Result<crate::resolver::ValueResolution, String> {
+        crate::resolver::project_ref_value_status(value, self.bindings.as_ref(), context)
     }
 
     /// Missing selections may be treated as final only when every binding

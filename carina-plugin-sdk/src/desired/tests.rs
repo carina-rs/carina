@@ -1030,8 +1030,14 @@ async fn provider_ready_inputs_preserve_env_string_diagnostic_sensitivity() {
         use carina_core::executor::{
             ModuleConstraintGate, ProviderPreparationContext, prepare_create_request,
         };
-        let sensitive =
-            carina_core::builtins::evaluate_builtin_to_value("env", &[string("PATH")]).unwrap();
+        let environment =
+            carina_core::EnvironmentSnapshot::new([("PATH".to_string(), "/captured/path".into())]);
+        let sensitive = carina_core::builtins::evaluate_builtin_to_value(
+            "env",
+            &[string("PATH")],
+            &carina_core::parser::ProviderContext::new(environment),
+        )
+        .unwrap();
         let Value::Concrete(ConcreteValue::String(text)) = &sensitive else {
             panic!("env returns a string")
         };

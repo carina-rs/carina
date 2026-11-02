@@ -30,6 +30,7 @@ impl EnvironmentSnapshot {
         }
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn empty() -> Self {
         Self::new([])
     }

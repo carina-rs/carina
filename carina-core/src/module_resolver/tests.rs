@@ -1996,7 +1996,12 @@ fn nested_unbound_module_loop_migrates_composed_legacy_address() {
     );
     let moves = crate::identifier::detect_legacy_loop_address_moves(
         &parsed.resources,
-        &registry,
+        crate::identifier::IdentityEvaluationContext {
+            schemas: &registry,
+            provider_context: &crate::parser::ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            ),
+        },
         &comparison_provider,
         &|provider, resource_type| {
             claims.screen_entries(
