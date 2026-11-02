@@ -1263,8 +1263,7 @@ impl fmt::Display for EgressDenied {
                 | Some(ProviderKind::Aws)
                 | Some(ProviderKind::GitHub)
                 | Some(ProviderKind::Untrusted),
-                ProviderLoadSource::LocalFile { path: _, .. }
-                | ProviderLoadSource::Remote { source: _ },
+                ProviderLoadSource::LocalFile { .. } | ProviderLoadSource::Remote { source: _ },
                 DestinationDenied::HostNotAllowed
                 | DestinationDenied::MetadataWithheld(_)
                 | DestinationDenied::LoopbackAddressDenied(_)
