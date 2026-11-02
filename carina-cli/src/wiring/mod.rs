@@ -9289,8 +9289,7 @@ pub(crate) fn resolve_import_target<D>(
 
 /// Check whether a `ProviderError` is an AWS throttling error that should be retried.
 fn is_throttling_error(err: &ProviderError) -> bool {
-    let msg = err.to_string();
-    msg.contains("ThrottlingException") || msg.contains("Rate exceeded")
+    err.is_throttled()
 }
 
 /// Read a resource via the provider with retry and exponential backoff for throttling errors.

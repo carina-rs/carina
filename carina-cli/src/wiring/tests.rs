@@ -26,6 +26,18 @@ fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress
 }
 
 #[test]
+fn throttling_error_uses_wire_message_before_display_truncation() {
+    for marker in ["ThrottlingException", "Rate exceeded"] {
+        let mut wire = ProviderError::api_error("request failed").to_wire();
+        wire.message = format!("{} {marker}", "x".repeat(9 * 1024));
+        let error = ProviderError::from_wire(wire);
+
+        assert!(!error.to_string().contains(marker));
+        assert!(is_throttling_error(&error), "missing raw marker {marker}");
+    }
+}
+
+#[test]
 fn environment_snapshot_survives_provider_loading_and_validation_catalogs() {
     let runtime = crate::test_support::TestCommandRuntime::new().with_environment(
         carina_core::EnvironmentSnapshot::new([("NAME".to_string(), "snapshot-resource".into())]),

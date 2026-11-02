@@ -838,8 +838,7 @@ pub fn unresolved_data_source_inputs<S, D>(
 }
 
 fn is_throttling_error(err: &ProviderError) -> bool {
-    let msg = err.to_string();
-    msg.contains("ThrottlingException") || msg.contains("Rate exceeded")
+    err.is_throttled()
 }
 
 /// Read a data source through the provider with the same throttling retry

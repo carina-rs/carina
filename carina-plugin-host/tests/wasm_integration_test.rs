@@ -2694,10 +2694,7 @@ async fn test_wasm_identifierless_read_back_resume_ends_invalid_continuation() {
         error.to_string().contains("requires an identifier"),
         "{error}"
     );
-    assert_eq!(
-        error.detail().code.as_deref(),
-        Some("READ_BACK_WITHOUT_IDENTIFIER")
-    );
+    assert_eq!(error.detail().code(), Some("READ_BACK_WITHOUT_IDENTIFIER"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

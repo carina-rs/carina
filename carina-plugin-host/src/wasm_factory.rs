@@ -12567,7 +12567,7 @@ mod tests {
         assert_eq!(detail.provider_name.as_deref(), Some("awscc"));
         assert_eq!(detail.operation.as_deref(), Some("sts.GetCallerIdentity"));
         assert_eq!(detail.status, Some(403));
-        assert_eq!(detail.code.as_deref(), Some("AccessDenied"));
+        assert_eq!(detail.code(), Some("AccessDenied"));
         assert_eq!(detail.request_id.as_deref(), Some("request-123"));
         assert_eq!(
             mapped.to_string(),

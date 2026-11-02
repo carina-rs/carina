@@ -91,6 +91,8 @@ pub(crate) fn fixture_applied_identifier(identifier: impl Into<String>) -> Appli
 pub struct ErrorDetail {
     /// Human-readable message.
     message: ProviderText,
+    /// Retry policy captured before diagnostic text is escaped or truncated.
+    throttling: ThrottlingClassification,
     /// Resource the error pertains to, if known.
     pub resource_id: Option<Box<ProviderErrorResourceId>>,
     /// Underlying terminal cause. Flattened to a string when the error crosses
@@ -120,12 +122,36 @@ pub struct ErrorDetail {
     /// share a status (HTTP 403 covers `AccessDenied`,
     /// `InvalidAccessKeyId`, `SignatureDoesNotMatch`, etc.), so both
     /// belong in the rendered output.
-    pub code: Option<ProviderText>,
+    code: Option<ProviderText>,
     /// Correlation id from the cloud-API response (AWS
     /// `x-amzn-RequestId`, GCP `X-Goog-Request-Id`, Azure
     /// `x-ms-request-id`, …). Operators paste this into support
     /// tickets so the provider can look up server-side logs.
     pub request_id: Option<ProviderText>,
+}
+
+#[derive(Debug, Default)]
+struct ThrottlingClassification {
+    message_or_cause: bool,
+    code: bool,
+}
+
+impl ThrottlingClassification {
+    fn from_raw(message: &str, code: Option<&str>, cause: Option<&str>) -> Self {
+        Self {
+            message_or_cause: has_throttling_marker(message)
+                || cause.is_some_and(has_throttling_marker),
+            code: code.is_some_and(has_throttling_marker),
+        }
+    }
+
+    fn is_throttled(&self) -> bool {
+        self.message_or_cause || self.code
+    }
+}
+
+fn has_throttling_marker(text: &str) -> bool {
+    text.contains("ThrottlingException") || text.contains("Rate exceeded")
 }
 
 /// Original resource identity with a sanitized diagnostic header.
@@ -378,6 +404,12 @@ impl ProviderError {
         }
     }
 
+    /// Whether the original message, code or cause identifies throttling.
+    /// Diagnostic escaping, truncation and redaction do not affect retry policy.
+    pub fn is_throttled(&self) -> bool {
+        self.detail().throttling.is_throttled()
+    }
+
     /// User-supplied input is invalid.
     pub fn invalid_input(message: impl Into<String>) -> Self {
         ProviderError::InvalidInput(Box::new(ErrorDetail::new(message)))
@@ -454,6 +486,7 @@ impl ProviderError {
     pub fn to_wire(&self) -> WireProviderError {
         let ErrorDetail {
             message,
+            throttling: _throttling,
             resource_id,
             cause,
             host_cause: _host_cause,
@@ -505,8 +538,11 @@ impl ProviderError {
         } = error;
         let resource_id = resource_id
             .map(|id| Box::new(crate::protocol_convert::protocol_to_resource_id(&id).into()));
+        let throttling =
+            ThrottlingClassification::from_raw(&message, code.as_deref(), cause.as_deref());
         let detail = Box::new(ErrorDetail {
             message: message.into(),
+            throttling,
             resource_id,
             cause: cause.map(|cause| ProviderDiagnostic::new(FlattenedWireCause(cause.into()))),
             // Host lifecycle markers are intentionally not part of the wire
@@ -561,7 +597,10 @@ impl ProviderError {
     /// Attach the application-level error code from the cloud API
     /// (e.g. `"AccessDenied"`, `"NoSuchBucket"`).
     pub fn with_code(mut self, code: impl Into<String>) -> Self {
-        self.detail_mut().code = Some(ProviderText::new(code));
+        let code = code.into();
+        let detail = self.detail_mut();
+        detail.throttling.code = has_throttling_marker(&code);
+        detail.code = Some(ProviderText::new(code));
         self
     }
 
@@ -588,7 +627,9 @@ impl ProviderError {
 
 impl ErrorDetail {
     pub fn new(message: impl Into<String>) -> Self {
+        let message = message.into();
         Self {
+            throttling: ThrottlingClassification::from_raw(&message, None, None),
             message: ProviderText::new(message),
             ..Self::default()
         }
@@ -598,8 +639,22 @@ impl ErrorDetail {
         context: &'static str,
         cause: impl std::error::Error + Send + Sync + 'static,
     ) -> Self {
+        let mut throttling = ThrottlingClassification::from_raw(context, None, None);
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&cause);
+        while let Some(error) = source {
+            if let Some(diagnostic) = error.downcast_ref::<ProviderDiagnostic>() {
+                source = Some(diagnostic.error());
+                continue;
+            }
+            throttling.message_or_cause |= match error.downcast_ref::<ProviderError>() {
+                Some(error) => error.is_throttled(),
+                None => has_throttling_marker(&error.to_string()),
+            };
+            source = error.source();
+        }
         Self {
             message: context.into(),
+            throttling,
             cause: Some(ProviderDiagnostic::new(cause)),
             ..Self::default()
         }
@@ -609,6 +664,12 @@ impl ErrorDetail {
     /// message-only error.
     pub fn context(&self) -> &str {
         &self.message
+    }
+
+    /// Sanitized application-level code for diagnostics. Set it with
+    /// [`ProviderError::with_code`] so raw-text retry classification stays valid.
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
     }
 
     /// Typed source error, when this detail was built by a cause-bearing path.
@@ -10481,6 +10542,150 @@ mod tests {
         let err = ProviderError::internal("simple error");
         let display = format!("{}", err);
         assert_eq!(display, "simple error");
+    }
+
+    #[test]
+    fn provider_error_throttling_classifies_raw_wire_message_code_and_cause() {
+        for marker in ["ThrottlingException", "Rate exceeded"] {
+            for prefix in ["x".repeat(9 * 1024), "\x1b".repeat(1500)] {
+                let raw = format!("{prefix} {marker}");
+                for (message, code, cause) in [
+                    (raw.clone(), None, None),
+                    ("request failed".into(), Some(raw.clone()), None),
+                    ("request failed".into(), None, Some(raw.clone())),
+                ] {
+                    let error = ProviderError::from_wire(WireProviderError {
+                        kind: WireProviderErrorKind::ApiError,
+                        message,
+                        resource_id: None,
+                        cause,
+                        provider_name: None,
+                        operation: None,
+                        status: None,
+                        code,
+                        request_id: None,
+                    });
+                    assert!(!error.to_string().contains(marker));
+                    assert!(error.is_throttled(), "missing raw marker {marker}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn provider_error_throttling_classifies_every_native_constructor() {
+        let message_constructors: [fn(String) -> ProviderError; 5] = [
+            ProviderError::invalid_input,
+            ProviderError::api_error,
+            ProviderError::not_found,
+            ProviderError::timeout,
+            ProviderError::internal,
+        ];
+        let cause_constructors: [fn(&'static str, std::io::Error) -> ProviderError; 5] = [
+            ProviderError::invalid_input_caused_by,
+            ProviderError::api_error_caused_by,
+            ProviderError::not_found_caused_by,
+            ProviderError::timeout_caused_by,
+            ProviderError::internal_caused_by,
+        ];
+        for marker in ["ThrottlingException", "Rate exceeded"] {
+            let raw = format!("{} {marker}", "x".repeat(9 * 1024));
+            for construct in message_constructors {
+                let error = construct(raw.clone());
+                assert!(!error.to_string().contains(marker));
+                assert!(error.is_throttled());
+            }
+            for construct in cause_constructors {
+                let error = construct("request failed", std::io::Error::other(raw.clone()));
+                assert!(!error.to_string().contains(marker));
+                assert!(error.is_throttled());
+            }
+        }
+    }
+
+    #[test]
+    fn provider_error_throttling_uses_raw_code_and_preserves_classification_on_redaction() {
+        let raw = format!("{} ThrottlingException", "x".repeat(9 * 1024));
+        let error = ProviderError::api_error("request failed").with_code(raw.clone());
+        assert!(!error.to_string().contains("ThrottlingException"));
+        assert!(error.is_throttled());
+        assert!(!error.with_code("AccessDenied").is_throttled());
+
+        let error = ProviderError::api_error(raw)
+            .with_redacted_message("redacted")
+            .with_code("AccessDenied");
+        assert_eq!(error.detail().context(), "redacted");
+        assert!(error.is_throttled());
+    }
+
+    #[test]
+    fn provider_error_throttling_keeps_existing_case_sensitive_marker_semantics() {
+        for message in [
+            "prefix ThrottlingException suffix",
+            "prefix Rate exceeded suffix",
+        ] {
+            assert!(ProviderError::api_error(message).is_throttled());
+        }
+        for message in [
+            "throttlingexception",
+            "rate exceeded",
+            "Throttling",
+            "TooManyRequests",
+            "RequestLimitExceeded",
+            "SlowDown",
+        ] {
+            assert!(!ProviderError::api_error(message).is_throttled());
+            assert!(
+                !ProviderError::api_error("request failed")
+                    .with_code(message)
+                    .is_throttled()
+            );
+        }
+        assert!(
+            !ProviderError::api_error("request failed")
+                .with_status(429)
+                .is_throttled()
+        );
+    }
+
+    #[test]
+    fn provider_error_throttling_classifies_nested_typed_causes() {
+        #[derive(Debug)]
+        struct ServiceError(std::io::Error);
+
+        impl std::fmt::Display for ServiceError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("service error")
+            }
+        }
+
+        impl std::error::Error for ServiceError {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let raw = format!("{} Rate exceeded", "x".repeat(9 * 1024));
+        let error = ProviderError::api_error_caused_by(
+            "request failed",
+            ServiceError(std::io::Error::other(raw.clone())),
+        );
+        assert!(!error.to_string().contains("Rate exceeded"));
+        assert!(error.is_throttled());
+
+        let nested =
+            ProviderError::internal_caused_by("operation failed", ProviderError::api_error(raw));
+        assert!(!nested.to_string().contains("Rate exceeded"));
+        assert!(nested.is_throttled());
+    }
+
+    #[test]
+    fn provider_error_throttling_inspects_original_diagnostic_cause() {
+        let raw = format!("{} ThrottlingException", "x".repeat(9 * 1024));
+        let diagnostic = ProviderDiagnostic::new(std::io::Error::other(raw));
+        assert!(!diagnostic.to_string().contains("ThrottlingException"));
+        let error = ProviderError::api_error_caused_by("request failed", diagnostic);
+        assert!(error.is_throttled());
     }
 
     #[test]
