@@ -4744,6 +4744,58 @@ fn binding_state_entries_for(
 }
 
 #[test]
+fn create_only_snapshot_container_verifies_secret_leaves() {
+    let schema = PatternResourceSchema::new("test.SecretIdentity")
+        .attribute(
+            PatternAttributeSchema::optional(
+                "settings",
+                PatternAttributeType::map(PatternAttributeType::string()),
+            )
+            .create_only()
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let settings = |token: &str, name: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "token".into(),
+                Value::Deferred(DeferredValue::Secret(Box::new(concrete_string(token)))),
+            ),
+            ("name".into(), concrete_string(name)),
+        ])))
+    };
+    let snapshot = crate::value::redact_secrets_in_value(&settings("original", "legacy")).unwrap();
+    let state = StateCreateOnlyValues::from_state_attributes(
+        &schema,
+        &HashMap::from([("settings".into(), snapshot)]),
+    );
+    let context = crate::differ::exact_comparison_context_for_tests();
+    for (token, name, matches) in [
+        ("original", "legacy", true),
+        ("changed", "legacy", false),
+        ("original", "changed", false),
+    ] {
+        let desired = Resource::new("test.SecretIdentity", "desired")
+            .with_attribute("settings", settings(token, name));
+        let values =
+            DesiredCreateOnlyValues::without_binding_resolution(&desired, schema.as_schema());
+        assert_eq!(
+            values.all_match(&state, schema.as_schema(), &context),
+            matches
+        );
+        assert_eq!(
+            values.resolved_subset_match(&state, schema.as_schema(), &context),
+            (1, matches)
+        );
+        assert_eq!(
+            values.match_counts(&state, schema.as_schema(), &context),
+            if matches { (1, 0) } else { (0, 1) }
+        );
+    }
+}
+
+#[test]
 fn empty_struct_create_only_values_are_absent_inline_deferred_and_in_state() {
     let schema = PatternResourceSchema::new("test.Widget")
         .attribute(

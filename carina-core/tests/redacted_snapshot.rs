@@ -251,6 +251,40 @@ fn snapshot_binding_hash_does_not_become_plan_unknown() {
 }
 
 #[test]
+fn snapshot_bulk_resolvers_keep_unavailable_secret_typed() {
+    use carina_core::resolver::{
+        ResolutionError, resolve_refs_for_plan, resolve_refs_with_state_and_remote,
+    };
+    use carina_core::resource::Resource;
+
+    for plan in [false, true] {
+        let expression = root_resource_ref(
+            "state",
+            "config",
+            vec![carina_core::resource::PathSegment::Field {
+                name: "password".into(),
+            }],
+        );
+        let mut resources =
+            [Resource::new("mock.Consumer", "consumer").with_attribute("password", expression)];
+        let bindings = historical_bindings();
+        let error = carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                if plan {
+                    resolve_refs_for_plan(&mut resources, &bindings, &Default::default(), session)
+                } else {
+                    resolve_refs_with_state_and_remote(&mut resources, &bindings, session)
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, ResolutionError::UnavailableSecret(error)
+            if error.path() == "state.config.password"));
+    }
+}
+
+#[test]
 fn snapshot_preserves_real_loop_slots() {
     use carina_core::resource::LoopSlot;
     let expression: Value<LoopSlot> = Value::Deferred(DeferredValue::Placeholder(LoopSlot::Value));

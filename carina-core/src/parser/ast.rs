@@ -10343,6 +10343,13 @@ impl<P: ValueKind, B: BindingAddress> ValidateExpr<P, B> {
         &self,
         map: &mut impl FnMut(&Value<P, B>) -> Result<Value<Q, B>, E>,
     ) -> Result<ValidateExpr<Q, B>, E> {
+        self.try_map_bound_arguments(&mut |_, _, value| map(value))
+    }
+
+    pub(crate) fn try_map_bound_arguments<Q: ValueKind, E>(
+        &self,
+        map: &mut impl FnMut(&str, &str, &Value<P, B>) -> Result<Value<Q, B>, E>,
+    ) -> Result<ValidateExpr<Q, B>, E> {
         Ok(match self {
             Self::Bool(v) => ValidateExpr::Bool(*v),
             Self::Int(v) => ValidateExpr::Int(*v),
@@ -10361,7 +10368,7 @@ impl<P: ValueKind, B: BindingAddress> ValidateExpr<P, B> {
             } => ValidateExpr::BoundArgument {
                 argument: argument.clone(),
                 operand: operand.clone(),
-                value: map(value)?,
+                value: map(argument, operand, value)?,
             },
             Self::IntegerArithmetic {
                 lhs,
@@ -10369,33 +10376,68 @@ impl<P: ValueKind, B: BindingAddress> ValidateExpr<P, B> {
                 rhs,
                 operator_span,
             } => ValidateExpr::IntegerArithmetic {
-                lhs: Box::new(lhs.try_map_stage(map)?),
+                lhs: Box::new(lhs.try_map_bound_arguments(map)?),
                 op: *op,
-                rhs: Box::new(rhs.try_map_stage(map)?),
+                rhs: Box::new(rhs.try_map_bound_arguments(map)?),
                 operator_span: *operator_span,
             },
             Self::Compare { lhs, op, rhs } => ValidateExpr::Compare {
-                lhs: Box::new(lhs.try_map_stage(map)?),
+                lhs: Box::new(lhs.try_map_bound_arguments(map)?),
                 op: op.clone(),
-                rhs: Box::new(rhs.try_map_stage(map)?),
+                rhs: Box::new(rhs.try_map_bound_arguments(map)?),
             },
             Self::And(lhs, rhs) => ValidateExpr::And(
-                Box::new(lhs.try_map_stage(map)?),
-                Box::new(rhs.try_map_stage(map)?),
+                Box::new(lhs.try_map_bound_arguments(map)?),
+                Box::new(rhs.try_map_bound_arguments(map)?),
             ),
             Self::Or(lhs, rhs) => ValidateExpr::Or(
-                Box::new(lhs.try_map_stage(map)?),
-                Box::new(rhs.try_map_stage(map)?),
+                Box::new(lhs.try_map_bound_arguments(map)?),
+                Box::new(rhs.try_map_bound_arguments(map)?),
             ),
-            Self::Not(v) => ValidateExpr::Not(Box::new(v.try_map_stage(map)?)),
+            Self::Not(v) => ValidateExpr::Not(Box::new(v.try_map_bound_arguments(map)?)),
             Self::FunctionCall { name, args } => ValidateExpr::FunctionCall {
                 name: name.clone(),
                 args: args
                     .iter()
-                    .map(|arg| arg.try_map_stage(map))
+                    .map(|arg| arg.try_map_bound_arguments(map))
                     .collect::<Result<_, _>>()?,
             },
             Self::Null => ValidateExpr::Null,
+        })
+    }
+
+    pub(crate) fn bound_arguments(&self) -> impl Iterator<Item = (&str, &str, &Value<P, B>)> {
+        let mut pending = vec![self];
+        std::iter::from_fn(move || {
+            while let Some(expression) = pending.pop() {
+                match expression {
+                    Self::BoundArgument {
+                        argument,
+                        operand,
+                        value,
+                    } => {
+                        return Some((argument.as_str(), operand.as_str(), value));
+                    }
+                    Self::IntegerArithmetic { lhs, rhs, .. }
+                    | Self::Compare { lhs, rhs, .. }
+                    | Self::And(lhs, rhs)
+                    | Self::Or(lhs, rhs) => {
+                        pending.push(rhs.as_ref());
+                        pending.push(lhs.as_ref());
+                    }
+                    Self::Not(inner) => pending.push(inner.as_ref()),
+                    Self::FunctionCall { args, .. } => pending.extend(args.iter().rev()),
+                    Self::Bool(_)
+                    | Self::Int(_)
+                    | Self::Float(_)
+                    | Self::Duration(_)
+                    | Self::String(_)
+                    | Self::Var(_)
+                    | Self::Access { .. }
+                    | Self::Null => {}
+                }
+            }
+            None
         })
     }
 }

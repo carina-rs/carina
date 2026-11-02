@@ -1742,7 +1742,7 @@ fn deterministic_value_string<P: crate::resource::ValueKind, B: BindingAddress>(
 /// Stable concrete-value spelling used to decide whether a create-only value
 /// can participate in reconciliation. Provider-independent schema
 /// canonicalization is layered on top by [`schema_canonical_value_string`].
-fn comparable_create_only_value_string<P: PlaceholderKind, B: BindingAddress>(
+fn comparable_create_only_value_string<P: crate::resource::ValueKind, B: BindingAddress>(
     value: &Value<P, B>,
 ) -> Option<String> {
     match value {
@@ -1789,7 +1789,7 @@ fn comparable_create_only_value_string<P: PlaceholderKind, B: BindingAddress>(
     }
 }
 
-fn comparable_create_only_feature_string<P: PlaceholderKind, B: BindingAddress>(
+fn comparable_create_only_feature_string<P: crate::resource::ValueKind, B: BindingAddress>(
     value: &Value<P, B>,
 ) -> String {
     comparable_create_only_value_string(value).unwrap_or_else(|| deterministic_value_string(value))
@@ -1798,7 +1798,7 @@ fn comparable_create_only_feature_string<P: PlaceholderKind, B: BindingAddress>(
 /// Provider-independent canonical spelling for identity and create-only keys.
 /// Enum identifiers, provider/state strings, and already-canonical enum values
 /// all reduce to the schema's API value.
-fn schema_canonical_value_string<P: PlaceholderKind, B: BindingAddress>(
+fn schema_canonical_value_string<P: crate::resource::ValueKind, B: BindingAddress>(
     value: &Value<P, B>,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
@@ -1833,8 +1833,8 @@ fn schema_canonical_value_string<P: PlaceholderKind, B: BindingAddress>(
 /// so a bare reference and its long form cannot compare equal while producing
 /// different prefix-match keys. Resolved candidates do not use this key; they
 /// compare only through `type_aware_equal`.
-fn canonical_create_only_value_string(
-    value: &Value,
+fn canonical_create_only_value_string<P: crate::resource::ValueKind>(
+    value: &Value<P>,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
     context: &ObservationComparison<'_>,
@@ -3498,19 +3498,20 @@ fn canonical_or_resolved_create_only_value(
 }
 
 #[derive(Clone)]
-struct ResolvedCreateOnlyValue {
-    value: Value,
+struct ResolvedCreateOnlyValue<P: crate::resource::StateValueLeaf = crate::resource::NoPlaceholder>
+{
+    value: Value<P>,
 }
 
-impl ResolvedCreateOnlyValue {
-    fn from_value(value: Value) -> Option<Self> {
+impl<P: crate::resource::StateValueLeaf> ResolvedCreateOnlyValue<P> {
+    fn from_value(value: Value<P>) -> Option<Self> {
         comparable_create_only_value_string(&value)?;
         Some(Self { value })
     }
 
-    fn semantically_equal(
+    fn semantically_equal<Q: crate::resource::StateValueLeaf>(
         &self,
-        other: &Self,
+        other: &ResolvedCreateOnlyValue<Q>,
         schema: &ResourceSchema,
         attr_type: &AttributeType,
         context: &ObservationComparison<'_>,
@@ -3534,7 +3535,9 @@ impl ResolvedCreateOnlyValue {
         let state_key =
             canonical_create_only_value_string(&self.value, Some(attr_type), &schema.defs, context);
         let prefix_key = canonical_create_only_value_string(
-            &Value::Concrete(ConcreteValue::String(prefix.into())),
+            &Value::<crate::resource::NoPlaceholder>::Concrete(ConcreteValue::String(
+                prefix.into(),
+            )),
             Some(attr_type),
             &schema.defs,
             context,
@@ -3555,7 +3558,7 @@ enum DesiredCreateOnlyValue {
 impl DesiredCreateOnlyValue {
     fn matches_state(
         &self,
-        state: &ResolvedCreateOnlyValue,
+        state: &ResolvedCreateOnlyValue<crate::resource::SnapshotLeaf>,
         schema: &ResourceSchema,
         attribute: &str,
         context: &ObservationComparison<'_>,
@@ -3653,7 +3656,7 @@ fn desired_comparable_values<'attribute, S, D>(
 
 fn resolved_subset_match(
     desired_values: &HashMap<String, DesiredCreateOnlyValue>,
-    state_values: &HashMap<String, ResolvedCreateOnlyValue>,
+    state_values: &HashMap<String, ResolvedCreateOnlyValue<crate::resource::SnapshotLeaf>>,
     schema: &ResourceSchema,
     context: &ObservationComparison<'_>,
 ) -> (usize, bool) {
@@ -3798,10 +3801,11 @@ impl DesiredCreateOnlyValues {
 /// [`crate::resource::Current`] attributes. Construction applies each schema attribute's
 /// `canonicalize_state` conversion before comparison. Unlike
 /// [`DesiredCreateOnlyValues`], this type cannot represent an unresolved
-/// configured value.
+/// configured value. Historical hash leaves stay in the snapshot and are
+/// verified by the shared type-aware comparison.
 #[derive(Clone, Default)]
 pub struct StateCreateOnlyValues {
-    values: HashMap<String, ResolvedCreateOnlyValue>,
+    values: HashMap<String, ResolvedCreateOnlyValue<crate::resource::SnapshotLeaf>>,
 }
 
 impl StateCreateOnlyValues {
@@ -3826,7 +3830,7 @@ impl StateCreateOnlyValues {
             .filter_map(|attribute| {
                 canonical
                     .get(attribute)
-                    .and_then(|value| value.to_value_at(format!("state.{attribute}")).ok())
+                    .cloned()
                     .and_then(ResolvedCreateOnlyValue::from_value)
                     .map(|value| (attribute.to_string(), value))
             })

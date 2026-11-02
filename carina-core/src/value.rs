@@ -57,6 +57,9 @@ impl std::fmt::Display for SerializationContext {
 /// message string.
 #[derive(Debug, Error)]
 pub enum SerializationError {
+    #[error("cannot hash null provider secret")]
+    NullProviderSecret,
+
     #[error(transparent)]
     UnavailableSecret(#[from] UnavailableSecretError),
 
@@ -368,8 +371,8 @@ impl PersistedValue {
         value: &Value<P>,
         previous: Option<&Self>,
     ) -> Result<Self, SerializationError> {
-        snapshot_to_json_inner(
-            &crate::resource::state_value_snapshot(value),
+        value_to_json_inner(
+            value,
             previous.map(Self::view),
             true,
             JsonEncoding::Persisted,
@@ -690,8 +693,8 @@ pub fn value_to_json(value: &Value) -> Result<serde_json::Value, SerializationEr
     value_to_json_inner(value, None, true, JsonEncoding::Ordinary)
 }
 
-fn value_to_json_inner(
-    value: &Value,
+fn value_to_json_inner<P: crate::resource::StateValueLeaf>(
+    value: &Value<P>,
     previous: Option<PersistedView<'_>>,
     persist_secrets: bool,
     encoding: JsonEncoding,
@@ -816,10 +819,11 @@ fn value_to_json_inner(
         }),
         Value::Deferred(DeferredValue::Secret(inner)) => {
             if persist_secrets {
-                let material = canonical_secret_hash_material(inner)?;
+                let plaintext =
+                    crate::resource::state_value_snapshot(inner).to_value_at("secret")?;
                 let previous = previous.and_then(PersistedView::redacted_secret_hash);
                 Ok(persisted_secret_json(
-                    &RedactedSecretHash::reuse_or_generate(&material, previous.as_ref()),
+                    &RedactedSecretHash::reuse_or_generate(&plaintext, previous.as_ref())?,
                 ))
             } else {
                 value_to_json_inner(inner, None, false, encoding)
@@ -831,157 +835,10 @@ fn value_to_json_inner(
                 context: ctx,
             })
         }
-        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
-    }
-}
-
-fn snapshot_to_json_inner(
-    value: &SnapshotValue,
-    previous: Option<PersistedView<'_>>,
-    persist_secrets: bool,
-    encoding: JsonEncoding,
-) -> Result<serde_json::Value, SerializationError> {
-    let ctx = encoding.context();
-    match value {
-        Value::Deferred(DeferredValue::ModuleIf(_)) => {
-            Err(SerializationError::UnexpandedModuleIf { context: ctx })
-        }
-        Value::Concrete(ConcreteValue::String(s)) => {
-            // Both serialize as a flat JSON string. The schema-aware
-            // state loader re-classifies `EnumIdentifier` from the
-            // attribute's declared type, so the on-disk JSON stays
-            // unchanged. See carina#2986 design doc §5.
-            Ok(serde_json::Value::String(s.expose_plaintext().to_owned()))
-        }
-        Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
-            Ok(serde_json::Value::String(s.to_string()))
-        }
-        Value::Concrete(ConcreteValue::CanonicalEnum(c)) => match encoding {
-            JsonEncoding::Ordinary => Ok(serde_json::Value::String(c.api_value().to_string())),
-            JsonEncoding::Persisted => Ok(canonical_enum_to_json(c, PERSISTED_ENUM_KEY)),
-            JsonEncoding::LegacySecretMaterial => Ok(canonical_enum_to_json(c, LEGACY_ENUM_KEY)),
+        Value::Deferred(DeferredValue::Placeholder(leaf)) => match leaf.clone().snapshot_leaf() {
+            SnapshotLeaf::RedactedSecret { hash } => Ok(persisted_secret_json(&hash)),
+            SnapshotLeaf::Expression(never) => match never {},
         },
-        Value::Concrete(ConcreteValue::Int(n)) => Ok(serde_json::Value::Number((*n).into())),
-        Value::Concrete(ConcreteValue::Duration(d)) => {
-            Ok(serde_json::Value::Number((d.as_secs() as i64).into()))
-        }
-        Value::Concrete(ConcreteValue::Float(f)) => {
-            let num =
-                serde_json::Number::from_f64(*f).ok_or(SerializationError::NonFiniteFloat {
-                    value: *f,
-                    context: ctx,
-                })?;
-            Ok(serde_json::Value::Number(num))
-        }
-        Value::Concrete(ConcreteValue::Bool(b)) => Ok(serde_json::Value::Bool(*b)),
-        Value::Concrete(ConcreteValue::List(items)) => {
-            let previous = previous.and_then(PersistedView::as_list);
-            let arr: Result<Vec<_>, _> = items
-                .iter()
-                .enumerate()
-                .map(|(index, item)| {
-                    snapshot_to_json_inner(
-                        item,
-                        previous.and_then(|previous| previous.get(index)),
-                        persist_secrets,
-                        encoding,
-                    )
-                })
-                .collect();
-            Ok(serde_json::Value::Array(arr?))
-        }
-        Value::Concrete(ConcreteValue::StringList(items)) => Ok(serde_json::Value::Array(
-            items
-                .iter()
-                .map(|s| serde_json::Value::String(s.expose_plaintext().to_owned()))
-                .collect(),
-        )),
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            let previous = previous.and_then(PersistedView::as_map);
-            let obj: Result<serde_json::Map<_, _>, _> = map
-                .iter()
-                .map(|(key, value)| {
-                    let encoded_key = if matches!(encoding, JsonEncoding::Persisted) {
-                        escape_persisted_map_key(key).into_owned()
-                    } else {
-                        key.clone()
-                    };
-                    snapshot_to_json_inner(
-                        value,
-                        previous.and_then(|previous| previous.get(key)),
-                        persist_secrets,
-                        encoding,
-                    )
-                    .map(|json| (encoded_key, json))
-                })
-                .collect();
-            Ok(serde_json::Value::Object(obj?))
-        }
-        Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            Err(SerializationError::UnresolvedResourceRef {
-                path: path.to_dot_string(),
-                context: ctx,
-            })
-        }
-        Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            Err(SerializationError::UnresolvedResourceRef {
-                // A bare-binding reference is by construction never a
-                // resolved value — it must be substituted by the resolver
-                // pass before reaching any serialization boundary. Report
-                // through the same channel as `ResourceRef` so the same
-                // diagnostic path covers both producer kinds.
-                path: binding.to_string(),
-                context: ctx,
-            })
-        }
-        Value::Deferred(DeferredValue::Coalesce { .. }) => {
-            Err(SerializationError::UnresolvedCoalesce { context: ctx })
-        }
-        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
-            Err(SerializationError::UnresolvedIntegerArithmetic { context: ctx })
-        }
-        Value::Deferred(DeferredValue::Interpolation(_)) => {
-            Err(SerializationError::UnresolvedInterpolation { context: ctx })
-        }
-        Value::Deferred(
-            DeferredValue::FunctionCall { name, .. } | DeferredValue::Unavailable { name, .. },
-        ) => Err(SerializationError::UnresolvedFunctionCall {
-            name: name.to_string(),
-            context: ctx,
-        }),
-        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
-            Err(SerializationError::UnresolvedFunctionCall {
-                name: function.name.clone(),
-                context: ctx,
-            })
-        }
-        Value::Deferred(DeferredValue::Access(_)) => Err(SerializationError::UnresolvedAccess {
-            expression: format_value(value),
-            context: ctx,
-        }),
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            if persist_secrets {
-                let material = canonical_secret_hash_material(&inner.to_value_at("secret")?)?;
-                let previous = previous.and_then(PersistedView::redacted_secret_hash);
-                Ok(persisted_secret_json(
-                    &RedactedSecretHash::reuse_or_generate(&material, previous.as_ref()),
-                ))
-            } else {
-                snapshot_to_json_inner(inner, None, false, encoding)
-            }
-        }
-        Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { hash })) => {
-            Ok(persisted_secret_json(hash))
-        }
-        Value::Deferred(DeferredValue::Unknown(reason)) => {
-            Err(SerializationError::UnknownNotAllowed {
-                reason: Box::new(reason.clone()),
-                context: ctx,
-            })
-        }
-        Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::Expression(never))) => {
-            match *never {}
-        }
     }
 }
 
@@ -993,10 +850,9 @@ pub(crate) fn persist_secret_json(
     plaintext: &Value,
     previous: Option<PersistedView<'_>>,
 ) -> Result<serde_json::Value, SerializationError> {
-    let material = canonical_secret_hash_material(plaintext)?;
     let previous = previous.and_then(PersistedView::redacted_secret_hash);
     Ok(persisted_secret_json(
-        &RedactedSecretHash::reuse_or_generate(&material, previous.as_ref()),
+        &RedactedSecretHash::reuse_or_generate(plaintext, previous.as_ref())?,
     ))
 }
 
@@ -2646,9 +2502,8 @@ fn redact_secrets_only<P: PlaceholderKind>(
 fn redact_secret_leaf<P: PlaceholderKind>(
     inner: &Value<P>,
 ) -> Result<SnapshotValue<P>, SerializationError> {
-    let material = canonical_secret_hash_material(inner)?;
     Ok(SnapshotValue::redacted(
-        RedactedSecretHash::reuse_or_generate(&material, None),
+        RedactedSecretHash::reuse_or_generate(inner, None)?,
     ))
 }
 
@@ -3145,9 +3000,8 @@ fn redact_with_guide(
 ) -> Result<SnapshotValue, SerializationError> {
     if let Some(secret_value) = guide.secret_value(source) {
         let previous = guide.previous_hash();
-        let material = canonical_secret_hash_material(secret_value)?;
         return Ok(SnapshotValue::redacted(
-            RedactedSecretHash::reuse_or_generate(&material, previous.as_ref()),
+            RedactedSecretHash::reuse_or_generate(secret_value, previous.as_ref())?,
         ));
     }
 
@@ -3876,26 +3730,13 @@ pub fn redact_secrets_in_value(value: &Value) -> Result<SnapshotValue, Serializa
     }
 }
 
-fn redact_snapshot_attrs_with_guide<'a, Attributes, Redact>(
-    attrs: impl Iterator<Item = (&'a String, &'a SnapshotValue)>,
+fn redact_attrs_with_guide<'a, P: ValueKind + 'a, Attributes, Redact>(
+    attrs: impl Iterator<Item = (&'a String, &'a Value<P>)>,
     mut redact: Redact,
 ) -> Result<Attributes, SerializationError>
 where
     Attributes: FromIterator<(String, SnapshotValue)>,
-    Redact: FnMut(&str, &SnapshotValue) -> Result<SnapshotValue, SerializationError>,
-{
-    attrs
-        .map(|(key, value)| redact(key, value).map(|value| (key.clone(), value)))
-        .collect()
-}
-
-fn redact_attrs_with_guide<'a, Attributes, Redact>(
-    attrs: impl Iterator<Item = (&'a String, &'a Value)>,
-    mut redact: Redact,
-) -> Result<Attributes, SerializationError>
-where
-    Attributes: FromIterator<(String, SnapshotValue)>,
-    Redact: FnMut(&str, &Value) -> Result<SnapshotValue, SerializationError>,
+    Redact: FnMut(&str, &Value<P>) -> Result<SnapshotValue, SerializationError>,
 {
     attrs
         .map(|(key, value)| redact(key, value).map(|value| (key.clone(), value)))
@@ -3926,7 +3767,7 @@ pub fn redact_secrets_in_resource<S: Clone, D: Clone>(
     })?;
     Ok(resource.to_snapshot().with_value_stage(
         attributes,
-        crate::resource::snapshot_directives(resource.directives.clone()),
+        crate::resource::convert_directives(resource.directives.clone()),
     ))
 }
 
@@ -3955,7 +3796,7 @@ pub fn redact_secrets_in_resource_reusing_persisted_hashes<S: Clone, D: Clone>(
     })?;
     Ok(resource.to_snapshot().with_value_stage(
         attributes,
-        crate::resource::snapshot_directives(resource.directives.clone()),
+        crate::resource::convert_directives(resource.directives.clone()),
     ))
 }
 
@@ -3985,7 +3826,7 @@ fn redact_resource_using_redacted_shape<S: Clone, D: Clone, T, E>(
     })?;
     Ok(resource.to_snapshot().with_value_stage(
         attributes,
-        crate::resource::snapshot_directives(resource.directives.clone()),
+        crate::resource::convert_directives(resource.directives.clone()),
     ))
 }
 
@@ -4018,7 +3859,7 @@ pub fn redact_secrets_in_resource_using_evaluated<S: Clone, D: Clone, T, E>(
         })?;
     Ok(source.to_snapshot().with_value_stage(
         attributes,
-        crate::resource::snapshot_directives(source.directives.clone()),
+        crate::resource::convert_directives(source.directives.clone()),
     ))
 }
 
@@ -4059,7 +3900,7 @@ pub fn rehydrate_resource_secrets<S: Clone, D: Clone, T, E>(
         .collect::<Result<IndexMap<_, _>, SecretRehydrationSiteError>>()?;
     Ok(saved.clone().with_value_stage(
         attributes,
-        crate::resource::expression_directives(saved.directives.clone()),
+        crate::resource::convert_directives(saved.directives.clone()),
     ))
 }
 
@@ -4079,7 +3920,7 @@ pub fn redact_secrets_in_data_source<S: Clone, D: Clone>(
     })?;
     Ok(resource.to_snapshot().with_value_stage(
         attributes,
-        crate::resource::snapshot_directives(resource.directives.clone()),
+        crate::resource::convert_directives(resource.directives.clone()),
     ))
 }
 
@@ -4109,7 +3950,7 @@ pub fn redact_secrets_in_data_source_using_evaluated<S: Clone, D: Clone, T, E>(
         })?;
     Ok(source.to_snapshot().with_value_stage(
         attributes,
-        crate::resource::snapshot_directives(source.directives.clone()),
+        crate::resource::convert_directives(source.directives.clone()),
     ))
 }
 
@@ -4154,7 +3995,7 @@ pub fn rehydrate_data_source_secrets<S: Clone, D: Clone, T, E>(
         .collect::<Result<IndexMap<_, _>, SecretRehydrationSiteError>>()?;
     Ok(saved.clone().with_value_stage(
         attributes,
-        crate::resource::expression_directives(saved.directives.clone()),
+        crate::resource::convert_directives(saved.directives.clone()),
     ))
 }
 
@@ -4298,15 +4139,43 @@ pub fn rehydrate_saved_composition_with_candidate(
         .pending_constraints
         .iter()
         .map(|constraint| {
+            let mut candidates: HashMap<&str, std::collections::VecDeque<&Value>> = HashMap::new();
+            if let Some(candidate) = evaluated.and_then(|composition| {
+                composition
+                    .signature
+                    .pending_constraints
+                    .iter()
+                    .find(|candidate| candidate.id == constraint.id)
+            }) {
+                // Operand spelling is diagnostic metadata. Match each
+                // argument's occurrences in authored traversal order.
+                for (argument, _, value) in candidate.expression.bound_arguments() {
+                    candidates.entry(argument).or_default().push_back(value);
+                }
+            }
+            let expression = constraint.expression.try_map_bound_arguments(
+                &mut |argument, operand, value| {
+                    let candidate = candidates
+                        .get_mut(argument)
+                        .and_then(std::collections::VecDeque::pop_front);
+                    restore(
+                        value,
+                        candidate,
+                        format!(
+                            "{}.constraints.{}.{operand}",
+                            saved.id,
+                            constraint.id.as_str(),
+                        ),
+                    )
+                },
+            )?;
             Ok(crate::resource::PendingModuleConstraint {
                 id: constraint.id.clone(),
                 message: constraint.message.clone(),
-                expression: constraint.expression.try_map_stage(&mut |value| {
-                    value.to_value_at(format!("{}.constraint", saved.id))
-                })?,
+                expression,
             })
         })
-        .collect::<Result<_, UnavailableSecretError>>()?;
+        .collect::<Result<_, SecretRehydrationSiteError>>()?;
     Ok(saved
         .clone()
         .with_signature(crate::resource::SavedCompositionSignature {
@@ -4320,7 +4189,7 @@ pub fn rehydrate_saved_composition_with_candidate(
 pub fn redact_secrets_in_state<P: crate::resource::StateValueLeaf>(
     state: &crate::resource::State<P>,
 ) -> Result<crate::resource::SnapshotState, SerializationError> {
-    let state = state_snapshot(state);
+    let state = state.to_snapshot();
     let attributes = state
         .attributes
         .iter()
@@ -4332,23 +4201,6 @@ pub fn redact_secrets_in_state<P: crate::resource::StateValueLeaf>(
     })
 }
 
-fn state_snapshot<P: crate::resource::StateValueLeaf>(
-    state: &crate::resource::State<P>,
-) -> crate::resource::SnapshotState {
-    crate::resource::State {
-        id: state.id.clone(),
-        identifier: state.identifier.clone(),
-        attributes: state
-            .attributes
-            .iter()
-            .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
-            .collect(),
-        exists: state.exists,
-        dependency_bindings: state.dependency_bindings.clone(),
-        partial_read: state.partial_read.clone(),
-    }
-}
-
 pub fn redact_secrets_in_state_using_resource<D, P: crate::resource::StateValueLeaf>(
     state: &crate::resource::State<P>,
     desired: &crate::resource::Resource<
@@ -4358,7 +4210,7 @@ pub fn redact_secrets_in_state_using_resource<D, P: crate::resource::StateValueL
         D,
     >,
 ) -> Result<crate::resource::SnapshotState, SerializationError> {
-    let state = state_snapshot(state);
+    let state = state.to_snapshot();
     let attributes = state
         .attributes
         .iter()
@@ -4380,7 +4232,7 @@ pub fn redact_secrets_in_state_using_persisted<P: crate::resource::StateValueLea
     state: &crate::resource::State<P>,
     persisted: &crate::provider::PersistedAttributes,
 ) -> Result<crate::resource::SnapshotState, SerializationError> {
-    let state = state_snapshot(state);
+    let state = state.to_snapshot();
     let attributes = state
         .attributes
         .iter()
@@ -4624,7 +4476,7 @@ pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
                     }
                 } else if let Some(guide) = planned_resources.get(&from.id) {
                     **from = if reusable_resource(&from.id).is_some() {
-                        let attributes = redact_snapshot_attrs_with_guide(
+                        let attributes = redact_attrs_with_guide(
                             from.attributes.iter(),
                             |key, value| match guide.attributes.get(key) {
                                 Some(shape) => redact_using_redacted_shape(value, shape),
@@ -10964,11 +10816,9 @@ mod tests {
     #[test]
     fn separate_saved_plan_placeholders_get_distinct_random_salts() {
         let inner = Value::Concrete(ConcreteValue::String("SAME_IMPORT_SECRET".into()));
-        let material = canonical_secret_hash_material(&inner).expect("canonical hash material");
-
         assert_ne!(
-            RedactedSecretHash::reuse_or_generate(&material, None),
-            RedactedSecretHash::reuse_or_generate(&material, None),
+            RedactedSecretHash::reuse_or_generate(&inner, None).unwrap(),
+            RedactedSecretHash::reuse_or_generate(&inner, None).unwrap(),
             "independent placeholders must not reveal equal plaintexts",
         );
     }

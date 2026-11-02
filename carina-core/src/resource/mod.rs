@@ -4592,13 +4592,18 @@ impl RedactedSecretHash {
 
     /// Reuse a matching self-contained digest or generate a fresh PHC digest.
     /// Legacy hashes are verification-only and are always upgraded on write.
-    pub(crate) fn reuse_or_generate(plaintext: &[u8], previous: Option<&Self>) -> Self {
+    pub(crate) fn reuse_or_generate<P: PlaceholderKind>(
+        plaintext: &Value<P>,
+        previous: Option<&Self>,
+    ) -> Result<Self, crate::value::SerializationError> {
         if let Some(previous @ Self(RedactedSecretHashKind::Argon2idPhc { .. })) = previous
-            && previous.verify(plaintext)
+            && SnapshotValue::<P>::redacted(previous.clone()).verify_secret(plaintext)?
         {
-            return previous.clone();
+            return Ok(previous.clone());
         }
-        Self::generate(plaintext)
+        Ok(Self::generate(
+            &crate::value::canonical_secret_hash_material(plaintext)?,
+        ))
     }
 
     /// Verify a candidate against this typed digest.
@@ -8437,7 +8442,9 @@ impl From<PersistedDirectives> for Directives {
 
 impl From<&PersistedDirectives> for Directives<AbsoluteBindingAddress, SnapshotLeaf> {
     fn from(directives: &PersistedDirectives) -> Self {
-        snapshot_directives(Directives::from(directives))
+        convert_directives(Directives::<AbsoluteBindingAddress, NoPlaceholder>::from(
+            directives,
+        ))
     }
 }
 
@@ -11144,6 +11151,4 @@ pub(crate) use snapshot::state_value_snapshot;
 
 pub type SnapshotState = State<SnapshotLeaf>;
 
-pub(crate) use snapshot::{plan_directives, template_directives};
-
-pub(crate) use snapshot::{expression_directives, snapshot_directives};
+pub(crate) use snapshot::convert_directives;

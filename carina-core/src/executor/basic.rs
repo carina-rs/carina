@@ -2030,10 +2030,16 @@ mod assert_fully_resolved_tests {
             &crate::parser::LoadedProviderContext::empty_for_test(),
             |session| resolve_ref_value(&value, &bindings, session),
         )
-        .map_err(ReportedError::message)
+        .map_err(ReportedError::new)
         .and_then(|resolved| assert_fully_resolved(&resolved, "name", &bindings))
         .expect_err("the apply path must reject the final computed list access");
 
+        assert!(matches!(
+            error
+                .as_error()
+                .downcast_ref::<crate::resolver::ResolutionError>(),
+            Some(crate::resolver::ResolutionError::Message(_))
+        ));
         assert!(
             error
                 .to_string()

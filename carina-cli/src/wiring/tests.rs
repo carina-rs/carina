@@ -2275,7 +2275,8 @@ fn build_override_aware_pair_for_test(
     unresolved: CanonicalResourcePair<carina_core::parser::ExpandedParsedExportParam>,
     state_file: Option<&StateFile>,
     inputs: LivePreApplyInputs<'_>,
-) -> Result<(OverrideAwareResources, OverrideAwareResources), String> {
+) -> Result<(OverrideAwareResources, OverrideAwareResources), carina_core::resolver::ResolutionError>
+{
     let state = ProjectedStateRead::for_test_unmoved(state_file);
     carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::LoadedProviderContext::empty_for_test(),

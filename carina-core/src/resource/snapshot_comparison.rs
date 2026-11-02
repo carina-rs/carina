@@ -61,15 +61,19 @@ pub(crate) fn match_equal_concrete_items<A: Borrow<Value>, B: Borrow<Value>>(
     (matched_a, matched_b)
 }
 
-pub(crate) fn comparison_list_items(value: &Value) -> Option<std::borrow::Cow<'_, [Value]>> {
+pub(crate) fn comparison_list_items<P: ValueKind>(
+    value: &super::Value<P>,
+) -> Option<std::borrow::Cow<'_, [super::Value<P>]>> {
     match value {
-        Value::Concrete(ConcreteValue::List(items)) => Some(std::borrow::Cow::Borrowed(items)),
-        Value::Concrete(ConcreteValue::StringList(items)) => Some(std::borrow::Cow::Owned(
+        super::Value::Concrete(ConcreteValue::List(items)) => {
+            Some(std::borrow::Cow::Borrowed(items))
+        }
+        super::Value::Concrete(ConcreteValue::StringList(items)) => Some(std::borrow::Cow::Owned(
             items
                 .iter()
                 .cloned()
                 .map(ConcreteValue::String)
-                .map(Value::Concrete)
+                .map(super::Value::Concrete)
                 .collect(),
         )),
         _ => None,
@@ -830,7 +834,7 @@ where
     }
 }
 
-fn pairing_hashes<R: ReferenceEquality>(
+pub(super) fn pairing_hashes<R: ReferenceEquality>(
     value: &Value,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
@@ -996,7 +1000,7 @@ fn pairing_component_hash<T: Hash>(tag: u8, value: &T) -> u64 {
 
 /// Merge two lists using projected saved values for value pairing and raw saved values to
 /// corroborate stored-index authoring attribution.
-fn merge_lists<R: ReferenceEquality>(
+pub(super) fn merge_lists<R: ReferenceEquality>(
     desired: &[Value],
     projected_saved: &[Value],
     raw_saved: &[Value],
@@ -1097,7 +1101,7 @@ fn merge_lists<R: ReferenceEquality>(
 /// For Maps: count matching key-value pairs.
 /// For equal scalars: return 1.
 /// Otherwise: return 0.
-fn similarity_score<R: ReferenceEquality>(
+pub(super) fn similarity_score<R: ReferenceEquality>(
     a: &Value,
     b: &Value,
     attr_type: Option<&AttributeType>,
@@ -1178,37 +1182,4 @@ pub(crate) fn pair_list_elements_with_uniqueness<
         .map(ComparisonItem::comparison_snapshot)
         .collect::<Vec<_>>();
     pair_list_elements_with_uniqueness_snapshot(&desired, &saved, attr_type, defs, context)
-}
-
-#[cfg(test)]
-pub(super) mod testing {
-    use super::*;
-    pub(in crate::resource) fn similarity_score<R: ReferenceEquality>(
-        a: &Value,
-        b: &Value,
-        attr_type: Option<&AttributeType>,
-        defs: &BTreeMap<String, AttributeType>,
-        context: &ComparisonContext<'_, R>,
-    ) -> usize {
-        super::similarity_score(a, b, attr_type, defs, context)
-    }
-    pub(in crate::resource) fn pairing_hashes<R: ReferenceEquality>(
-        value: &Value,
-        attr_type: Option<&AttributeType>,
-        defs: &BTreeMap<String, AttributeType>,
-        context: &ComparisonContext<'_, R>,
-    ) -> Vec<u64> {
-        super::pairing_hashes(value, attr_type, defs, context)
-    }
-    pub(in crate::resource) fn merge_lists<R: ReferenceEquality>(
-        desired: &[Value],
-        projected: &[Value],
-        raw: &[Value],
-        explicit: &ExplicitFields,
-        attr_type: Option<&AttributeType>,
-        defs: &BTreeMap<String, AttributeType>,
-        context: &ComparisonContext<'_, R>,
-    ) -> Vec<Value> {
-        super::merge_lists(desired, projected, raw, explicit, attr_type, defs, context)
-    }
 }

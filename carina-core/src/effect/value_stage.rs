@@ -1,6 +1,6 @@
 //! Structural mapping between snapshot and evaluation plan carriers.
 use super::*;
-use crate::resource::{plan_directives, template_directives};
+use crate::resource::convert_directives;
 
 pub(crate) fn map_template<S: Clone, P: PlanValueKind, Q: PlanValueKind, E>(
     template: &DeferredForExpression<S, P, P::Template>,
@@ -15,7 +15,7 @@ pub(crate) fn map_template<S: Clone, P: PlanValueKind, Q: PlanValueKind, E>(
         .collect::<Result<_, _>>()?;
     let resource = resource.clone().with_value_stage(
         attributes,
-        template_directives::<P, Q>(resource.directives.clone()),
+        convert_directives::<_, P::Template, Q::Template>(resource.directives.clone()),
     );
     Ok(template
         .clone()
@@ -42,7 +42,7 @@ impl<S: Clone, P: PlanValueKind> EffectWithSource<S, P> {
             Ok(
                 resource.replace_inner(resource.as_inner().clone().with_value_stage(
                     attributes,
-                    plan_directives::<P, Q>(resource.directives.clone()),
+                    convert_directives::<_, P, Q>(resource.directives.clone()),
                 )),
             )
         };
@@ -77,7 +77,7 @@ impl<S: Clone, P: PlanValueKind> EffectWithSource<S, P> {
                 Effect::Read {
                     resource: resource.replace_inner(resource.as_inner().clone().with_value_stage(
                         attributes,
-                        plan_directives::<P, Q>(resource.directives.clone()),
+                        convert_directives::<_, P, Q>(resource.directives.clone()),
                     )),
                 }
             }

@@ -230,9 +230,9 @@ impl SelectedStateAttributes {
         authority: PreviousSecretHashAuthority<'_>,
         mut is_desired_key: impl FnMut(&str) -> bool,
         protected_secret_keys: &mut HashSet<String>,
-    ) {
+    ) -> Result<(), SerializationError> {
         let Some(previous) = Self::authority_attributes(authority) else {
-            return;
+            return Ok(());
         };
         let keys = previous.keys().cloned().collect::<Vec<_>>();
         for key in keys {
@@ -248,12 +248,14 @@ impl SelectedStateAttributes {
             let Some(masked) = merge_previous_secret_hashes_into_provider_value(
                 previous_value,
                 self.encoded.get(&key),
-            ) else {
+            )?
+            else {
                 continue;
             };
             self.encoded.insert(key.clone(), masked);
             protected_secret_keys.insert(key);
         }
+        Ok(())
     }
 
     fn protect_for_resource<S>(
@@ -293,7 +295,12 @@ impl SelectedStateAttributes {
                     self.encoded.insert(key.clone(), masked);
                     protected_secret_keys.insert(key.clone());
                 }
-                Err(error) if strict_desired => return Err(error),
+                Err(error)
+                    if strict_desired
+                        || matches!(&error, SerializationError::UnavailableSecret(_)) =>
+                {
+                    return Err(error);
+                }
                 Err(_) => {
                     self.encoded.remove(key);
                 }
@@ -303,7 +310,7 @@ impl SelectedStateAttributes {
             previous_hash_authority,
             |key| resource.attributes.contains_key(key),
             &mut protected_secret_keys,
-        );
+        )?;
         Ok(self)
     }
 
@@ -340,18 +347,21 @@ impl SelectedStateAttributes {
             previous_hash_authority,
             |key| resource.attributes.contains_key(key),
             &mut protected_secret_keys,
-        );
+        )?;
         self.encoded.retain(|key, _| present_keys.contains(key));
         Ok(self)
     }
 
-    fn protect_orphan(mut self, previous: &PersistedAttributes) -> Self {
+    fn protect_orphan(
+        mut self,
+        previous: &PersistedAttributes,
+    ) -> Result<Self, SerializationError> {
         self.protect_previous_secret_hashes(
             PreviousSecretHashAuthority::AllPreviouslyHashedKeys(previous),
             |_| false,
             &mut HashSet::new(),
-        );
-        self
+        )?;
+        Ok(self)
     }
 
     fn finish(mut self) -> Result<(PersistedAttributes, Vec<String>), PersistedAttributesError> {
@@ -3766,7 +3776,7 @@ impl RefreshableResourceState<'_> {
             Some(&previous),
         )?;
         selected.carry_write_only(&previous, write_only_keys);
-        let (attributes, write_only_attributes) = selected.protect_orphan(&previous).finish()?;
+        let (attributes, write_only_attributes) = selected.protect_orphan(&previous)?.finish()?;
         refreshed.current = match state
             .identifier
             .as_deref()

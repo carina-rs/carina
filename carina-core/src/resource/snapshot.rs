@@ -28,8 +28,8 @@ impl<P: PlaceholderKind> ValueKind for SnapshotLeaf<P> {
         directives: Directives<B, Self>,
         resolve: &mut impl FnMut(B) -> C,
     ) -> Directives<C, Self> {
-        snapshot_directives(P::rebind_directives(
-            expression_directives(directives),
+        convert_directives(P::rebind_directives(
+            convert_directives(directives),
             resolve,
         ))
     }
@@ -38,18 +38,18 @@ impl<P: PlaceholderKind> ValueKind for SnapshotLeaf<P> {
         directives: &mut Directives<AbsoluteBindingAddress, Self>,
         map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
     ) {
-        let mut expression = expression_directives(std::mem::take(directives));
+        let mut expression = convert_directives(std::mem::take(directives));
         P::map_absolute_directive_values(&mut expression, map);
-        *directives = snapshot_directives(expression);
+        *directives = convert_directives(expression);
     }
 
     fn make_directive_sources_relative(
         directives: &mut Directives<AbsoluteBindingAddress, Self>,
         root: &Path,
     ) {
-        let mut expression = expression_directives(std::mem::take(directives));
+        let mut expression = convert_directives(std::mem::take(directives));
         P::make_directive_sources_relative(&mut expression, root);
-        *directives = snapshot_directives(expression);
+        *directives = convert_directives(expression);
     }
 
     fn redacted_secret_hash(&self) -> Option<&RedactedSecretHash> {
@@ -90,30 +90,16 @@ impl<P: PlaceholderKind> ValueKind for SnapshotLeaf<P> {
     }
 }
 
-pub(crate) fn snapshot_directives<B: BindingAddress, P: PlaceholderKind>(
+/// Change only the leaf marker when both stages have identical directive types.
+pub(crate) fn convert_directives<B: BindingAddress, P: ValueKind, Q>(
     directives: Directives<B, P>,
-) -> Directives<B, SnapshotLeaf<P>> {
-    let Directives {
-        force_delete,
-        create_before_destroy,
-        prevent_destroy,
-        depends_on_diagnostic_sources,
-        ignore_changes,
-        provider_instance,
-    } = directives;
-    Directives {
-        force_delete,
-        create_before_destroy,
-        prevent_destroy,
-        depends_on_diagnostic_sources,
-        ignore_changes,
-        provider_instance,
-    }
-}
-
-pub(crate) fn expression_directives<B: BindingAddress, P: PlaceholderKind>(
-    directives: Directives<B, SnapshotLeaf<P>>,
-) -> Directives<B, P> {
+) -> Directives<B, Q>
+where
+    Q: ValueKind<
+            DirectiveBool<B> = P::DirectiveBool<B>,
+            DirectivePreventDestroy<B> = P::DirectivePreventDestroy<B>,
+        >,
+{
     let Directives {
         force_delete,
         create_before_destroy,
@@ -184,22 +170,20 @@ impl UnavailableSecretError {
 
 impl<P: PlaceholderKind, B: BindingAddress> Value<P, B> {
     pub fn to_snapshot(&self) -> SnapshotValue<P, B> {
-        match self
-            .clone()
-            .try_map_placeholder::<SnapshotLeaf<P>, Infallible>(&mut |leaf| {
-                Ok(Value::Deferred(DeferredValue::Placeholder(
-                    SnapshotLeaf::Expression(leaf),
-                )))
-            }) {
-            Ok(value) => value,
-            Err(never) => match never {},
-        }
+        self.clone().into()
     }
 }
 
 impl<P: PlaceholderKind, B: BindingAddress> From<Value<P, B>> for SnapshotValue<P, B> {
     fn from(value: Value<P, B>) -> Self {
-        value.to_snapshot()
+        match value.try_map_placeholder::<SnapshotLeaf<P>, Infallible>(&mut |leaf| {
+            Ok(Value::Deferred(DeferredValue::Placeholder(
+                SnapshotLeaf::Expression(leaf),
+            )))
+        }) {
+            Ok(value) => value,
+            Err(never) => match never {},
+        }
     }
 }
 
@@ -372,7 +356,7 @@ impl<S: Clone, P: PlaceholderKind, B: BindingAddress, D: Clone> Resource<S, P, B
                 .iter()
                 .map(|(key, value)| (key.clone(), value.to_snapshot()))
                 .collect(),
-            snapshot_directives(self.directives.clone()),
+            convert_directives(self.directives.clone()),
         )
     }
 }
@@ -390,7 +374,7 @@ impl<S: Clone, P: PlaceholderKind, B: BindingAddress, D: Clone> Resource<S, Snap
             .collect::<Result<_, _>>()?;
         Ok(self
             .clone()
-            .with_value_stage(attributes, expression_directives(self.directives.clone())))
+            .with_value_stage(attributes, convert_directives(self.directives.clone())))
     }
 }
 
@@ -428,7 +412,7 @@ impl<S: Clone, P: PlaceholderKind, B: BindingAddress, D: Clone> DataSource<S, P,
                 .iter()
                 .map(|(key, value)| (key.clone(), value.to_snapshot()))
                 .collect(),
-            snapshot_directives(self.directives.clone()),
+            convert_directives(self.directives.clone()),
         )
     }
 }
@@ -448,7 +432,7 @@ impl<S: Clone, P: PlaceholderKind, B: BindingAddress, D: Clone>
             .collect::<Result<_, _>>()?;
         Ok(self
             .clone()
-            .with_value_stage(attributes, expression_directives(self.directives.clone())))
+            .with_value_stage(attributes, convert_directives(self.directives.clone())))
     }
 }
 
@@ -494,48 +478,6 @@ impl<P: ValueKind, B: BindingAddress> AccessExpr<P, B> {
             source_line: self.source_line,
             display_root: self.display_root.clone(),
         }
-    }
-}
-
-pub(crate) fn plan_directives<P: PlanValueKind, Q: PlanValueKind>(
-    directives: Directives<AbsoluteBindingAddress, P>,
-) -> Directives<AbsoluteBindingAddress, Q> {
-    let Directives {
-        force_delete,
-        create_before_destroy,
-        prevent_destroy,
-        depends_on_diagnostic_sources,
-        ignore_changes,
-        provider_instance,
-    } = directives;
-    Directives {
-        force_delete,
-        create_before_destroy,
-        prevent_destroy,
-        depends_on_diagnostic_sources,
-        ignore_changes,
-        provider_instance,
-    }
-}
-
-pub(crate) fn template_directives<P: PlanValueKind, Q: PlanValueKind>(
-    directives: Directives<AbsoluteBindingAddress, P::Template>,
-) -> Directives<AbsoluteBindingAddress, Q::Template> {
-    let Directives {
-        force_delete,
-        create_before_destroy,
-        prevent_destroy,
-        depends_on_diagnostic_sources,
-        ignore_changes,
-        provider_instance,
-    } = directives;
-    Directives {
-        force_delete,
-        create_before_destroy,
-        prevent_destroy,
-        depends_on_diagnostic_sources,
-        ignore_changes,
-        provider_instance,
     }
 }
 

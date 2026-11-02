@@ -6163,7 +6163,7 @@ pub async fn derive_managed_binding_stability<E>(
         &parsed.upstream_binding_names(),
         session,
     )
-    .map_err(AppError::Validation)?;
+    .map_err(AppError::ValueResolution)?;
     // Keep dependency operands unexpanded until the single graph transition.
     let stability = reference_preparation
         .pre_graph_stability(
@@ -10103,7 +10103,7 @@ fn resolve_data_source_refs_for_refresh_from_refs(
             &bindings,
             session,
         )
-        .map_err(AppError::Validation)?;
+        .map_err(AppError::ValueResolution)?;
         carina_core::value::canonicalize_data_sources_with_schemas(
             std::slice::from_mut(&mut resolved),
             schemas,
@@ -10356,14 +10356,14 @@ pub(crate) fn prepare_data_sources_for_plan(
                     upstream_bindings,
                     session,
                 )
-                .map_err(AppError::Validation)?;
+                .map_err(AppError::ValueResolution)?;
             } else {
                 carina_core::resolver::resolve_data_source_refs(
                     std::slice::from_mut(&mut resource),
                     bindings,
                     session,
                 )
-                .map_err(AppError::Validation)?;
+                .map_err(AppError::ValueResolution)?;
             }
         }
         prepared.push(resource);

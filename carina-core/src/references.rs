@@ -1329,7 +1329,7 @@ impl ReferenceValidation<'_> {
                 }
             }
             Shape::List { .. } => {
-                if let Some(items) = comparison_reference_list_items(value)
+                if let Some(items) = crate::resource::comparison_list_items(value)
                     && let Some(element) = ty.list_element()
                 {
                     for (index, value) in items.iter().enumerate() {
@@ -1376,20 +1376,3 @@ pub fn prepare_empty_for_tests() -> ResolvedReferences {
 
 #[cfg(test)]
 mod tests;
-
-fn comparison_reference_list_items<P: crate::resource::ValueKind>(
-    value: &Value<P>,
-) -> Option<std::borrow::Cow<'_, [Value<P>]>> {
-    match value {
-        Value::Concrete(ConcreteValue::List(items)) => Some(std::borrow::Cow::Borrowed(items)),
-        Value::Concrete(ConcreteValue::StringList(items)) => Some(std::borrow::Cow::Owned(
-            items
-                .iter()
-                .cloned()
-                .map(ConcreteValue::String)
-                .map(Value::Concrete)
-                .collect(),
-        )),
-        _ => None,
-    }
-}

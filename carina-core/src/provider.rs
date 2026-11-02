@@ -1747,106 +1747,105 @@ fn contains_secret_hash_view(value: PersistedView<'_>) -> bool {
 
 /// Preserve secret hashes from a previous persisted value while retaining
 /// provider material at every unprotected path. Returns `None` when the
-/// previous value contains no secret hash.
+/// previous value contains no secret hash. Unavailable provider plaintext
+/// returns its typed serialization error rather than retaining stale evidence.
 pub fn merge_previous_secret_hashes_into_provider_value(
     previous_value: &PersistedValue,
     provider_value: Option<&PersistedValue>,
-) -> Option<PersistedValue> {
-    match (secret_hash_shape(previous_value), provider_value) {
+) -> Result<Option<PersistedValue>, SerializationError> {
+    Ok(match (secret_hash_shape(previous_value), provider_value) {
         (SecretHashShape::None, _) => None,
         (SecretHashShape::TopLevel, Some(provider_value))
             if secret_hash_shape(provider_value) == SecretHashShape::TopLevel =>
         {
             Some(provider_value.clone())
         }
-        (SecretHashShape::TopLevel, Some(provider_value)) => Some(
-            hash_provider_json_as_secret(provider_value, Some(previous_value))
-                .unwrap_or_else(|_| previous_value.clone()),
-        ),
-        (SecretHashShape::TopLevel, None) => Some(previous_value.clone()),
+        (SecretHashShape::TopLevel, Some(provider_value)) if !provider_value.view().is_null() => {
+            Some(hash_provider_json_as_secret(
+                provider_value,
+                Some(previous_value),
+            )?)
+        }
+        (SecretHashShape::TopLevel, _) => Some(previous_value.clone()),
         (SecretHashShape::Nested, provider_value) => Some(
-            merge_previous_secret_hashes_into_provider_json(previous_value, provider_value),
+            merge_previous_secret_hashes_into_provider_json(previous_value, provider_value)?,
         ),
-    }
+    })
 }
 
 fn merge_previous_secret_hashes_into_provider_json(
     previous_value: &PersistedValue,
     provider_value: Option<&PersistedValue>,
-) -> PersistedValue {
+) -> Result<PersistedValue, SerializationError> {
     let merged = merge_previous_secret_hashes_into_provider_json_inner(
         previous_value.view(),
         provider_value.map(PersistedValue::view),
-    );
-    PersistedValue::from_serialized_json(merged)
-        .expect("merging validated persisted trees preserves the host namespace")
+    )?;
+    Ok(PersistedValue::from_serialized_json(merged)
+        .expect("merging validated persisted trees preserves the host namespace"))
 }
 
 fn merge_previous_secret_hashes_into_provider_json_inner(
     previous_value: PersistedView<'_>,
     provider_value: Option<PersistedView<'_>>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, SerializationError> {
     if previous_value.is_redacted_secret() {
-        let Some(provider_value) = provider_value else {
-            return previous_value.to_owned_json();
+        let Some(provider_value) = provider_value.filter(|value| !value.is_null()) else {
+            return Ok(previous_value.to_owned_json());
         };
         if secret_hash_shape_view(provider_value) == SecretHashShape::TopLevel {
-            return provider_value.to_owned_json();
+            return Ok(provider_value.to_owned_json());
         }
-        return hash_provider_view_as_secret(provider_value, Some(previous_value))
-            .unwrap_or_else(|_| previous_value.to_owned_json());
+        return hash_provider_view_as_secret(provider_value, Some(previous_value));
     }
 
     if let Some(previous_map) = previous_value.as_map() {
         let Some(provider_map) = provider_value.and_then(PersistedView::as_map) else {
-            return previous_value.to_owned_json();
+            return Ok(previous_value.to_owned_json());
         };
         let replacements = previous_map
             .iter()
             .filter(|(_, previous_child)| contains_secret_hash_view(*previous_child))
             .map(|(key, previous_child)| {
-                (
-                    key.to_string(),
-                    merge_previous_secret_hashes_into_provider_json_inner(
-                        previous_child,
-                        provider_map.get(key),
-                    ),
+                merge_previous_secret_hashes_into_provider_json_inner(
+                    previous_child,
+                    provider_map.get(key),
                 )
-            });
-        return provider_map.replacing_children(replacements);
+                .map(|value| (key.to_string(), value))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(provider_map.replacing_children(replacements));
     }
 
     if let Some(previous_items) = previous_value.as_list() {
         let Some(provider_value) = provider_value else {
-            return previous_value.to_owned_json();
+            return Ok(previous_value.to_owned_json());
         };
         let Some(provider_items) = provider_value.as_list() else {
-            return previous_value.to_owned_json();
+            return Ok(previous_value.to_owned_json());
         };
         if !previous_secret_hash_array_alignment_is_trusted(previous_items, provider_items) {
-            return hash_provider_view_as_secret(provider_value, Some(previous_value))
-                .unwrap_or_else(|_| previous_value.to_owned_json());
+            return hash_provider_view_as_secret(provider_value, Some(previous_value));
         }
         let replacements = previous_items
             .iter()
             .enumerate()
             .filter(|(_, previous_child)| contains_secret_hash_view(*previous_child))
             .map(|(index, previous_child)| {
-                (
-                    index,
-                    merge_previous_secret_hashes_into_provider_json_inner(
-                        previous_child,
-                        provider_items.get(index),
-                    ),
+                merge_previous_secret_hashes_into_provider_json_inner(
+                    previous_child,
+                    provider_items.get(index),
                 )
-            });
-        return provider_items.replacing_children(replacements);
+                .map(|value| (index, value))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(provider_items.replacing_children(replacements));
     }
 
-    provider_value.map_or_else(
+    Ok(provider_value.map_or_else(
         || previous_value.to_owned_json(),
         PersistedView::to_owned_json,
-    )
+    ))
 }
 
 fn previous_secret_hash_array_alignment_is_trusted(
@@ -1880,7 +1879,7 @@ fn previous_secret_hash_array_alignment_is_trusted(
 pub(crate) fn hash_provider_json_as_secret(
     provider_value: &PersistedValue,
     previous: Option<&PersistedValue>,
-) -> Result<PersistedValue, String> {
+) -> Result<PersistedValue, SerializationError> {
     hash_provider_view_as_secret(provider_value.view(), previous.map(PersistedValue::view)).map(
         |encoded| {
             PersistedValue::from_serialized_json(encoded)
@@ -1892,20 +1891,11 @@ pub(crate) fn hash_provider_json_as_secret(
 fn hash_provider_view_as_secret(
     provider_value: PersistedView<'_>,
     previous: Option<PersistedView<'_>>,
-) -> Result<serde_json::Value, String> {
-    if provider_value.is_null() {
-        return Err("cannot hash null provider secret".to_string());
-    }
+) -> Result<serde_json::Value, SerializationError> {
     let plaintext = provider_value
         .decode_value()
-        .ok_or_else(|| "cannot hash null provider secret".to_string())?;
-    crate::value::persist_secret_json(
-        &plaintext
-            .to_value_at("provider secret")
-            .map_err(|error| error.to_string())?,
-        previous,
-    )
-    .map_err(|error| error.to_string())
+        .ok_or(SerializationError::NullProviderSecret)?;
+    crate::value::persist_secret_json(&plaintext.to_value_at("provider secret")?, previous)
 }
 
 /// Saved attributes decoded from persisted state but not yet reconciled
@@ -5560,6 +5550,7 @@ pub fn merge_default_tags<S, D>(
             }
             Err(
                 source @ (SerializationError::NonFiniteFloat { .. }
+                | SerializationError::NullProviderSecret
                 | SerializationError::UnresolvedEnumIdentifier { .. }
                 | SerializationError::UnexpandedModuleIf { .. }
                 | SerializationError::UnavailableSecret(_)),
@@ -9297,6 +9288,47 @@ mod tests {
                 .and_then(RedactedSecretHash::from_encoded_digest)
                 .is_some(),
         );
+    }
+
+    #[test]
+    fn persistence_merges_propagate_typed_unavailable_secret() {
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("previous secret".into()),
+        ))));
+        let previous = PersistedValue::encode_desired_value(&secret, None).unwrap();
+        let opaque = previous.decode().unwrap();
+        let provider = PersistedValue::encode_provider_value(
+            &crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::Map(
+                IndexMap::from([("token".into(), opaque)]),
+            )),
+            None,
+        )
+        .unwrap();
+        let error = hash_provider_json_as_secret(&provider, Some(&previous)).unwrap_err();
+        assert!(
+            matches!(error, SerializationError::UnavailableSecret(ref error)
+            if error.path() == "provider secret.token")
+        );
+        let map = |value: &PersistedValue| {
+            PersistedValue::from_serialized_json(serde_json::json!({"protected": value.as_json()}))
+                .unwrap()
+        };
+        let list = |value: &PersistedValue| {
+            PersistedValue::from_serialized_json(serde_json::json!([value.as_json()])).unwrap()
+        };
+        for (previous, provider) in [
+            (previous.clone(), provider.clone()),
+            (map(&previous), map(&provider)),
+            (list(&previous), list(&provider)),
+        ] {
+            let error =
+                merge_previous_secret_hashes_into_provider_value(&previous, Some(&provider))
+                    .expect_err("an unavailable provider secret must not retain stale evidence");
+            assert!(
+                matches!(error, SerializationError::UnavailableSecret(ref error)
+                if error.path().ends_with(".token"))
+            );
+        }
     }
 
     #[test]

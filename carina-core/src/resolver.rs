@@ -32,9 +32,16 @@ impl From<String> for ResolutionError {
     }
 }
 
-impl From<ResolutionError> for String {
-    fn from(error: ResolutionError) -> Self {
-        error.to_string()
+impl From<crate::parser::ParseError> for ResolutionError {
+    fn from(error: crate::parser::ParseError) -> Self {
+        match error {
+            crate::parser::ParseError::UnavailableSecret(error) => Self::UnavailableSecret(error),
+            crate::parser::ParseError::Located { path, error } => match Self::from(*error) {
+                Self::Message(message) => Self::Message(format!("{}: {message}", path.display())),
+                unavailable @ Self::UnavailableSecret(_) => unavailable,
+            },
+            error => Self::Message(error.to_string()),
+        }
     }
 }
 
@@ -67,7 +74,7 @@ pub fn resolve_refs_with_state(
     resources: &mut [Resource],
     managed_current: &HashMap<ResourceId, PlanInputCurrent>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> Result<(), ResolutionError> {
     let bindings = crate::binding_index::ResolvedBindings::pre_apply_live(
         crate::binding_index::LivePreApplyInputs {
             managed: resources,
@@ -98,7 +105,7 @@ pub fn resolve_refs_with_state_and_remote(
     resources: &mut [Resource],
     bindings: &ResolvedBindings,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> Result<(), ResolutionError> {
     resolve_refs_inner(
         resources,
         bindings,
@@ -118,7 +125,7 @@ pub fn resolve_refs_for_plan(
     bindings: &ResolvedBindings,
     unresolved_upstream_bindings: &std::collections::HashSet<&str>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> Result<(), ResolutionError> {
     resolve_refs_inner(resources, bindings, unresolved_upstream_bindings, config)
 }
 
@@ -127,7 +134,7 @@ fn resolve_refs_inner(
     bindings: &ResolvedBindings,
     unresolved_upstream_bindings: &std::collections::HashSet<&str>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> Result<(), ResolutionError> {
     // Save dependency bindings before resolution destroys ResourceRef values.
     // This metadata is used by plan tree building to recover parent-child
     // relationships (see build_plan_tree in display.rs and app.rs).
@@ -192,7 +199,7 @@ pub fn resolve_managed_refs_with_state_and_remote(
     managed: &mut [Resource],
     bindings: &ResolvedBindings,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> Result<(), ResolutionError> {
     resolve_refs_inner(managed, bindings, &std::collections::HashSet::new(), config)
 }
 
@@ -209,7 +216,7 @@ pub fn resolve_data_source_refs(
     data_sources: &mut [DataSource],
     bindings: &ResolvedBindings,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> Result<(), ResolutionError> {
     resolve_data_source_refs_inner(
         data_sources,
         bindings,
@@ -227,7 +234,7 @@ pub fn resolve_data_source_refs_for_plan(
     bindings: &ResolvedBindings,
     unresolved_upstream_bindings: &std::collections::HashSet<&str>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> Result<(), ResolutionError> {
     resolve_data_source_refs_inner(data_sources, bindings, unresolved_upstream_bindings, config)
 }
 
@@ -236,7 +243,7 @@ fn resolve_data_source_refs_inner(
     bindings: &ResolvedBindings,
     unresolved_upstream_bindings: &std::collections::HashSet<&str>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> Result<(), ResolutionError> {
     for data_source in data_sources.iter_mut() {
         let deps =
             crate::deps::get_resource_value_ref_dependencies(crate::parser::ResourceRef::<
@@ -291,7 +298,7 @@ pub fn resolve_live_composition_refs_post_apply(
     compositions: &mut [LiveComposition],
     bindings: &ResolvedBindings,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> Result<(), ResolutionError> {
     for v in compositions.iter_mut() {
         v.signature.attributes =
             resolve_composition_attributes(&v.signature.attributes, bindings, config)?;
@@ -303,7 +310,7 @@ pub fn resolve_saved_composition_refs_post_apply(
     compositions: &mut [crate::resource::SavedComposition<crate::resource::NoPlaceholder>],
     bindings: &ResolvedBindings,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> Result<(), ResolutionError> {
     for composition in compositions {
         composition.signature.attributes =
             resolve_composition_attributes(&composition.signature.attributes, bindings, config)?;
@@ -342,7 +349,7 @@ fn resolve_composition_attributes<A: RuntimeCompositionAttribute>(
     attributes: &IndexMap<String, A>,
     bindings: &ResolvedBindings,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<IndexMap<String, A>, String> {
+) -> Result<IndexMap<String, A>, ResolutionError> {
     attributes
         .iter()
         .map(|(key, attribute)| {
@@ -862,11 +869,15 @@ fn locate_user_function_error<B: BindingAddress>(
 
 fn user_function_runtime_error(
     line: usize,
-    message: impl Into<String>,
+    error: impl Into<ResolutionError>,
 ) -> crate::parser::ParseError {
-    crate::parser::ParseError::InvalidExpression {
-        line,
-        message: message.into(),
+    match error.into() {
+        ResolutionError::UnavailableSecret(error) => {
+            crate::parser::ParseError::UnavailableSecret(error)
+        }
+        ResolutionError::Message(message) => {
+            crate::parser::ParseError::InvalidExpression { line, message }
+        }
     }
 }
 
@@ -1284,7 +1295,7 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                 session,
                 source_line.get().unwrap_or(function.body.source_line),
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(ResolutionError::from)?;
             let evaluated = evaluated
                 .into_expanded()
                 .map(Value::into_placeholder_type)
@@ -1523,6 +1534,31 @@ mod tests {
         assert_eq!(
             error,
             IntegerExpressionError::SecretEvaluation(IntegerArithmeticError::DivideByZero),
+        );
+    }
+
+    #[test]
+    fn user_function_errors_preserve_unavailable_secret_through_parser_context() {
+        let snapshot = crate::value::redact_secrets_in_value(&Value::Deferred(
+            DeferredValue::Secret(Box::new(Value::Concrete(ConcreteValue::String(
+                "historical secret".into(),
+            )))),
+        ))
+        .unwrap();
+        let unavailable = snapshot.to_value_at("state.credentials.token").unwrap_err();
+        let located =
+            user_function_runtime_error(8, ResolutionError::UnavailableSecret(unavailable.clone()))
+                .in_file("/project/functions.crn");
+        assert_eq!(
+            ResolutionError::from(located),
+            ResolutionError::UnavailableSecret(unavailable),
+        );
+
+        let ordinary = user_function_runtime_error(8, "ordinary failure".to_string())
+            .in_file("/project/functions.crn");
+        assert_eq!(
+            ResolutionError::from(ordinary).to_string(),
+            "/project/functions.crn: Invalid expression at line 8: ordinary failure",
         );
     }
 
@@ -2115,7 +2151,7 @@ mod tests {
         current_states: &HashMap<ResourceId, State>,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         wait_aliases: &[crate::binding_index::WaitAliasSpec],
-    ) -> Result<(), String> {
+    ) -> Result<(), ResolutionError> {
         let plan_input_states = crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
@@ -2142,7 +2178,7 @@ mod tests {
         current_states: &HashMap<ResourceId, State>,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         wait_aliases: &[crate::binding_index::WaitAliasSpec],
-    ) -> Result<(), String> {
+    ) -> Result<(), ResolutionError> {
         let plan_input_states = crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),

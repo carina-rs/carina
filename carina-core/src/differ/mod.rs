@@ -433,9 +433,7 @@ impl Orphan {
                 return Resource {
                     id: self.current.id().clone(),
                     attributes: Default::default(),
-                    directives: crate::resource::snapshot_directives(
-                        self.directives.clone().into(),
-                    ),
+                    directives: self.directives.clone().into(),
                     resolved_ignore_changes: Default::default(),
                     prefixes: Default::default(),
                     binding: self.binding.clone(),
@@ -450,7 +448,7 @@ impl Orphan {
                 return Resource {
                     id: self.current.id().clone(),
                     attributes: Default::default(),
-                    directives: crate::resource::snapshot_directives((&self.directives).into()),
+                    directives: (&self.directives).into(),
                     resolved_ignore_changes: Default::default(),
                     prefixes: Default::default(),
                     binding: self.binding.clone(),
@@ -469,7 +467,7 @@ impl Orphan {
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
-            directives: crate::resource::snapshot_directives((&self.directives).into()),
+            directives: (&self.directives).into(),
             resolved_ignore_changes: Default::default(),
             prefixes: Default::default(),
             binding: self.binding.clone(),

@@ -291,7 +291,7 @@ fn similarity_score(
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> usize {
-    super::snapshot_comparison::testing::similarity_score(
+    super::snapshot_comparison::similarity_score(
         &a.to_snapshot(),
         &b.to_snapshot(),
         attr_type,
@@ -308,7 +308,7 @@ fn merge_lists(
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> Vec<Value> {
-    super::snapshot_comparison::testing::merge_lists(
+    super::snapshot_comparison::merge_lists(
         &desired.iter().map(Value::to_snapshot).collect::<Vec<_>>(),
         &projected_saved
             .iter()
@@ -2565,13 +2565,13 @@ fn enum_pairing_hashes_keep_dotted_strings_literal() {
     let api = Value::Concrete(ConcreteValue::String("json".into()));
     let defs = crate::schema::empty_defs_for_schema_walks();
     let context = crate::differ::exact_comparison_context_for_tests();
-    let dotted_hashes = super::snapshot_comparison::testing::pairing_hashes(
+    let dotted_hashes = super::snapshot_comparison::pairing_hashes(
         &dotted.to_snapshot(),
         Some(&attr_type),
         defs,
         &context,
     );
-    let api_hashes = super::snapshot_comparison::testing::pairing_hashes(
+    let api_hashes = super::snapshot_comparison::pairing_hashes(
         &api.to_snapshot(),
         Some(&attr_type),
         defs,

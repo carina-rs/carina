@@ -639,6 +639,17 @@ impl<P: ValueKind, B: BindingAddress> PendingModuleConstraint<P, B> {
     pub fn message(&self) -> &str {
         &self.message
     }
+
+    pub fn contains_redacted_secret_placeholder(&self) -> bool {
+        let Self {
+            id: _id,
+            expression,
+            message: _message,
+        } = self;
+        expression
+            .bound_arguments()
+            .any(|(_, _, value)| crate::value::contains_redacted_secret(value))
+    }
 }
 
 /// The function-shaped I/O surface of a live composition.
@@ -1816,7 +1827,7 @@ impl<P: PlanValueKind> SavedComposition<P> {
         let SavedCompositionSignature {
             arguments,
             attributes,
-            pending_constraints: _pending_constraints,
+            pending_constraints,
         } = signature;
         arguments
             .values()
@@ -1824,6 +1835,9 @@ impl<P: PlanValueKind> SavedComposition<P> {
             || attributes
                 .values()
                 .any(SavedCompositionAttribute::contains_redacted_secret_placeholder)
+            || pending_constraints
+                .iter()
+                .any(PendingModuleConstraint::contains_redacted_secret_placeholder)
     }
 }
 
@@ -2177,6 +2191,71 @@ mod tests {
         let decoded: SavedCompositionArgument =
             serde_json::from_value(saved_json).expect("deserialize composition argument");
         assert_eq!(decoded.value(), &value.to_snapshot());
+    }
+
+    #[test]
+    fn saved_composition_restores_and_verifies_constraint_only_secrets() {
+        fn live(password: &str) -> LiveComposition {
+            LiveComposition {
+                id: ResolvedResourceId::new(ResourceId::with_identity("_virtual", "secure")),
+                signature: LiveCompositionSignature {
+                    arguments: IndexMap::new(),
+                    attributes: IndexMap::new(),
+                    pending_constraints: vec![PendingModuleConstraint {
+                        id: ModuleConstraintId::require(0),
+                        expression: ValidateExpr::Compare {
+                            lhs: Box::new(ValidateExpr::FunctionCall {
+                                name: "length".into(),
+                                args: vec![ValidateExpr::BoundArgument {
+                                    argument: "password".into(),
+                                    operand: "password".into(),
+                                    value: Value::Deferred(DeferredValue::Secret(Box::new(
+                                        Value::Concrete(ConcreteValue::String(password.into())),
+                                    ))),
+                                }],
+                            }),
+                            op: CompareOp::Gte,
+                            rhs: Box::new(ValidateExpr::Int(12)),
+                        },
+                        message: "password must be long enough".into(),
+                    }],
+                },
+                binding: Some(RootScope::new().resolve("secure".into())),
+                dependency_bindings: BTreeSet::new(),
+                module_name: "secure_module".into(),
+                instance: "secure".into(),
+                call_path: Default::default(),
+                quoted_string_attrs: HashSet::new(),
+            }
+        }
+        let source_root = tempfile::tempdir().unwrap();
+        let mut identities = CompositionSourceIdentityResolver::new(source_root.path()).unwrap();
+        let evaluated = live("original-secret-password");
+        let saved = crate::value::redact_secrets_in_live_composition(&evaluated)
+            .unwrap()
+            .into_saved_with_resolver(&mut identities)
+            .unwrap();
+        let bytes = serde_json::to_vec(&saved).unwrap();
+        let saved: SavedComposition = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            saved.contains_redacted_secret_placeholder(),
+            "constraints alone must trigger saved-plan rehydration"
+        );
+        let restored = crate::value::rehydrate_saved_composition_secrets(&saved, &evaluated)
+            .expect("matching bound secrets must rehydrate before live conversion");
+        assert_eq!(
+            restored.signature.pending_constraints,
+            evaluated.signature.pending_constraints
+        );
+        let error = crate::value::rehydrate_saved_composition_secrets(
+            &saved,
+            &live("changed-secret-password"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.source,
+            crate::value::SecretRehydrationError::HashMismatch
+        ));
     }
 
     #[test]
