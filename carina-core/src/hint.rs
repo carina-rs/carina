@@ -93,8 +93,12 @@ impl fmt::Display for ProjectCommand<'_> {
                 write_path_word(formatter, path)?;
             }
             CommandPath::Display(path) => {
-                formatter.write_str(" ")?;
-                write_shell_word(formatter, &path.to_string())?;
+                let spelling = path.to_string();
+                let path = Path::new(&spelling);
+                if !is_default_project_dir(path) {
+                    formatter.write_str(" ")?;
+                    write_path_word(formatter, path)?;
+                }
             }
             CommandPath::Raw(_) => {}
         }
@@ -147,6 +151,25 @@ fn write_shell_word(formatter: &mut fmt::Formatter<'_>, value: &str) -> fmt::Res
 mod tests {
     use super::ProjectCommand;
     use std::path::Path;
+
+    #[test]
+    fn display_paths_keep_the_same_default_omission_and_shell_spelling() {
+        for (input, expected) in [
+            (".", "carina init"),
+            ("./", "carina init"),
+            ("./.", "carina init"),
+            ("infra/foo", "carina init infra/foo"),
+            ("./infra/foo", "carina init ./infra/foo"),
+            ("-foo", "carina init ./-foo"),
+            ("infra/team's", "carina init 'infra/team'\\''s'"),
+        ] {
+            let path = crate::paths::DisplayPath::new(input).unwrap();
+            assert_eq!(
+                ProjectCommand::for_display_path("init", &path).to_string(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn omits_dot_project_dir() {

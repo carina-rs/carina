@@ -40,7 +40,7 @@ impl BackendDrift {
 pub enum BackendDriftStatus {
     Fresh,
     Unchanged,
-    Drifted(BackendDrift),
+    Drifted(Box<BackendDrift>),
 }
 
 /// Opaque proof that a backend address was chosen through a named selection
@@ -265,7 +265,7 @@ impl BackendSelection {
         let (selected_config, drift) = match inspection.status {
             BackendDriftStatus::Drifted(drift) => {
                 let config = drift.existing.to_state_config()?;
-                (Some(config), Some(drift))
+                (Some(config), Some(*drift))
             }
             BackendDriftStatus::Fresh | BackendDriftStatus::Unchanged => {
                 (inspection.configured, None)
@@ -310,7 +310,7 @@ impl BackendSelection {
                     ),
                 },
             )),
-            BackendDriftStatus::Drifted(drift) => Ok(MutationBackendSelection::Drifted(drift)),
+            BackendDriftStatus::Drifted(drift) => Ok(MutationBackendSelection::Drifted(*drift)),
         }
     }
 
@@ -425,11 +425,11 @@ fn inspect_resolved(
     let status = match existing {
         None => BackendDriftStatus::Fresh,
         Some(existing) if existing == configured_lock => BackendDriftStatus::Unchanged,
-        Some(existing) => BackendDriftStatus::Drifted(BackendDrift {
+        Some(existing) => BackendDriftStatus::Drifted(Box::new(BackendDrift {
             project_dir: project_dir.clone(),
             existing,
             configured: configured_lock,
-        }),
+        })),
     };
     Ok(BackendInspection {
         project_dir,

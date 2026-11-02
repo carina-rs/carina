@@ -94,8 +94,8 @@ fn absolute_binding(spelling: &str) -> carina_core::resource::AbsoluteBindingAdd
 }
 
 #[test]
-fn saved_plan_version_is_39_for_pinned_source_identity_and_resolved_dependencies() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 39);
+fn saved_plan_version_is_40_for_pinned_source_identity_and_resolved_dependencies() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 40);
 }
 
 #[test]
@@ -942,7 +942,7 @@ fn plan_file_serde_round_trip() {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "0.1.0".to_string(),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
-            source_path: carina_core::paths::DisplayPath::new("example.crn").unwrap(),
+            source_path: carina_core::paths::PersistedPath::new("example.crn").unwrap(),
             source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
             state_lineage: Some("test-lineage".to_string()),
             state_serial: Some(1),
@@ -1053,7 +1053,7 @@ fn plan_file_serde_round_trip() {
     assert_eq!(deserialized.carina_version, "0.1.0");
     assert_eq!(
         deserialized.source_path,
-        carina_core::paths::DisplayPath::new("example.crn").unwrap()
+        carina_core::paths::PersistedPath::new("example.crn").unwrap()
     );
     assert_eq!(deserialized.state_lineage, Some("test-lineage".to_string()));
     assert_eq!(deserialized.state_serial, Some(1));
@@ -3957,7 +3957,7 @@ fn plan_file_serialization_redacts_secrets() {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "0.1.0".to_string(),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
-            source_path: carina_core::paths::DisplayPath::new("example.crn").unwrap(),
+            source_path: carina_core::paths::PersistedPath::new("example.crn").unwrap(),
             source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
             state_lineage: None,
             state_serial: None,
@@ -4024,7 +4024,7 @@ fn plan_file_serialization_rejects_pending_resource_identity() {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
-            source_path: carina_core::paths::DisplayPath::new("main.crn").unwrap(),
+            source_path: carina_core::paths::PersistedPath::new("main.crn").unwrap(),
             source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
             state_lineage: None,
             state_serial: None,
@@ -4072,7 +4072,7 @@ fn plan_file_validation_rejects_missing_resource_identity() {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
-            source_path: carina_core::paths::DisplayPath::new("main.crn").unwrap(),
+            source_path: carina_core::paths::PersistedPath::new("main.crn").unwrap(),
             source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
             state_lineage: None,
             state_serial: None,
@@ -4150,7 +4150,7 @@ fn plan_file_with_deferred_effect(effect: Effect) -> PlanFile {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-10-30T00:00:00Z".to_string(),
-            source_path: carina_core::paths::DisplayPath::new("main.crn").unwrap(),
+            source_path: carina_core::paths::PersistedPath::new("main.crn").unwrap(),
             source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
             state_lineage: None,
             state_serial: None,
@@ -4504,7 +4504,7 @@ fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-01-01T00:00:00Z".to_string(),
-        source_path: carina_core::paths::DisplayPath::new("main.crn").unwrap(),
+        source_path: carina_core::paths::PersistedPath::new("main.crn").unwrap(),
         source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
         state_lineage: None,
         state_serial: None,
@@ -4634,7 +4634,7 @@ fn plan_file_validation_rejects_blocked_data_source_without_plan_errors() {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-10-28T00:00:00Z".to_string(),
-            source_path: carina_core::paths::DisplayPath::new("main.crn").unwrap(),
+            source_path: carina_core::paths::PersistedPath::new("main.crn").unwrap(),
             source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
             state_lineage: None,
             state_serial: None,

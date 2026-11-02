@@ -5090,7 +5090,7 @@ impl InstalledProvider {
                     trust,
                     notice,
                     ProviderLoadSource::local_file(
-                        &project_dir.join_display(&path).map_err(|source| {
+                        &project_dir.join_display(path.display()).map_err(|source| {
                             ProviderLoadIdentityError::Absolutize {
                                 path: PathBuf::from(path.to_string()),
                                 source,
@@ -5231,18 +5231,14 @@ fn local_provider_trust(
 ) -> io::Result<(
     ProviderTrust,
     Option<String>,
-    carina_core::paths::DisplayPath,
+    carina_core::paths::PersistedPath,
 )> {
-    let label_path = carina_core::paths::DisplayPath::new(source.path())?;
-    let resolved = match project_dir.join_display(&label_path).and_then(|file| {
-        file.metadata()?;
-        Ok(file)
-    }) {
-        Ok(resolved) => resolved,
-        Err(_canonicalize_error) => {
-            return Ok((ProviderTrust::untrusted(), None, label_path));
-        }
-    };
+    let display_path = carina_core::paths::DisplayPath::new(source.path())?;
+    let resolved = project_dir.join_display(&display_path)?;
+    let label_path = resolved.persisted_path().clone();
+    if resolved.metadata().is_err() {
+        return Ok((ProviderTrust::untrusted(), None, label_path));
+    }
     let Some(grant) = grants.matching(&resolved.identity()) else {
         return Ok((ProviderTrust::untrusted(), None, label_path));
     };
@@ -5255,7 +5251,7 @@ fn local_provider_trust(
     if current_sha256.as_deref() != Some(installed_sha256.as_str()) {
         notice_sink(&format!(
             "carina: local provider {} does not match the installed bytes; re-run `{}` before trusting it",
-            label_path,
+            display_path,
             ProjectCommand::for_display_path("init", project_dir.display()),
         ));
         return Ok((ProviderTrust::untrusted(), None, label_path));
@@ -9382,8 +9378,10 @@ pub fn find_installed_provider<P: PlaceholderKind, B: BindingAddress>(
         ProviderSource::File(file_source) => {
             let src = WasmArtifactPath::new(PathBuf::from(file_source.path()), &config.name)?;
             let dest = file_provider_cache_path(base_dir, &src, &config.name)?;
+            let dest_label = carina_core::paths::DisplayPath::new(dest.as_path())
+                .map_err(|error| FindInstalledProviderError::Other(error.to_string()))?;
             if io_base
-                .join(dest.as_path())
+                .join_display(&dest_label)
                 .map_err(|error| FindInstalledProviderError::Other(error.to_string()))?
                 .exists()
             {
@@ -26197,7 +26195,7 @@ future_protection_field = "retain-me"
         let project = tempfile::tempdir().unwrap();
         let source_path = project.path().join("local-provider.wasm");
         fs::write(&source_path, b"local provider").unwrap();
-        let expected_source_path = carina_core::paths::DisplayPath::new(&source_path).unwrap();
+        let expected_source_path = carina_core::paths::PersistedPath::new(&source_path).unwrap();
         let config = provider_config(&format!("file://{}", source_path.display()), None);
         let installed = find_file_provider_source(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),

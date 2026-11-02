@@ -3472,9 +3472,10 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility before decoding the payload. Format 39
-    // pins the source locator to its planned canonical identity and stores
-    // resolved dependency addresses and legacy migration classifications.
+    // Validate version compatibility before decoding the payload. Format 40
+    // requires an absolute source locator and its planned canonical identity.
+    // Format 39 stores resolved dependency addresses and legacy migration
+    // classifications.
     // Format 38 retains lifecycle values, default origins, and loop call sites;
     // earlier binaries could silently discard safety directives. Format 37
     // requires a relative diagnostic file (or null) and line on each deferred-for
@@ -3588,7 +3589,9 @@ async fn run_apply_from_plan_with_observer_factory(
         .validate_replace_display()
         .map_err(AppError::Config)?;
 
-    let source = ResolvedPath::new(&source_path)
+    let source = plan_file
+        .source_path
+        .resolve()
         .and_then(|source| {
             source.metadata()?;
             Ok(source)
@@ -3596,7 +3599,7 @@ async fn run_apply_from_plan_with_observer_factory(
         .map_err(|source| {
             AppError::SavedPlanSourceResolution(Box::new(
                 crate::error::SavedPlanSourceResolutionError {
-                    source_path: plan_file.source_path.clone(),
+                    source_path: plan_file.source_path.display().clone(),
                     replan_command: saved_plan_replan_command(plan_path, &source_path),
                     source,
                 },
@@ -3604,7 +3607,7 @@ async fn run_apply_from_plan_with_observer_factory(
         })?;
     if source.identity() != plan_file.source_identity {
         return Err(AppError::SavedPlanSourceChanged {
-            source_path: plan_file.source_path.clone(),
+            source_path: plan_file.source_path.display().clone(),
             replan_command: saved_plan_replan_command(plan_path, &source_path),
         });
     }

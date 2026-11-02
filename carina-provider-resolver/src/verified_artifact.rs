@@ -1077,7 +1077,7 @@ impl VerifiedArtifact {
                     locked_identity: locked_identity.to_string(),
                     expected_sha256: lock_entry.sha256.clone(),
                     actual_sha256,
-                    project_dir: PathBuf::from(project_dir.display().to_string()),
+                    project_dir: PathBuf::from(project_dir.persisted_path().to_string()),
                 },
             )));
         }

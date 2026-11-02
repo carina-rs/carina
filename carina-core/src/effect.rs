@@ -917,15 +917,17 @@ impl ResolvedMovePairs {
     ///     effect::{AddressedMoves, ResolvedMovePairs},
     ///     module_resolver::resolve_modules_providerless,
     ///     parser::ProviderContext,
+    ///     paths::ResolvedPath,
     ///     schema::SchemaRegistry,
     /// };
     /// let project = tempfile::tempdir().unwrap();
     /// std::fs::write(project.path().join("main.crn"), "").unwrap();
+    /// let project_dir = ResolvedPath::new(project.path()).unwrap();
     /// let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
-    /// let parsed = parse_directory(project.path(), &config).unwrap();
+    /// let parsed = parse_directory(&project_dir, &config).unwrap();
     /// let checks = carina_core::validation::deferred_types::TypeCheckSession::run(
     ///     &config,
-    ///     |session| resolve_modules_providerless(parsed, project.path(), session)
+    ///     |session| resolve_modules_providerless(parsed, &project_dir, session)
     ///         .unwrap()
     ///         .into_expanded(&SchemaRegistry::new(), session.catalog())
     ///         .unwrap(),

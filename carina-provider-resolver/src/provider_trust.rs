@@ -2,7 +2,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use carina_core::hint::ProjectCommand;
-use carina_core::paths::{DisplayPath, PathIdentity};
+use carina_core::paths::{PathIdentity, PersistedPath};
 use carina_core::provider_source::RemoteSourceKey;
 
 use crate::provider_resolver::RegistrySignatureProtection;
@@ -107,7 +107,8 @@ fn remote_trust_shape(
 #[derive(Debug, Clone, Eq)]
 pub enum ProviderLoadSource {
     LocalFile {
-        path: DisplayPath,
+        /// Absolute locator recorded when the provider load is identified.
+        path: PersistedPath,
         identity: PathIdentity,
         canonical_source: PathBuf,
     },
@@ -119,7 +120,7 @@ pub enum ProviderLoadSource {
 impl ProviderLoadSource {
     pub fn local_file(path: &carina_core::paths::ResolvedPath, canonical_source: PathBuf) -> Self {
         let identity = PathIdentity::from(path.identity());
-        let path = path.display().clone();
+        let path = path.persisted_path().clone();
         Self::LocalFile {
             path,
             identity,

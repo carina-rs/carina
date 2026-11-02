@@ -62,6 +62,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub struct ResolvedPath {
     resolved: PathBuf,
     display: DisplayPath,
+    // Capture the logical address before pinning symlinks, for IO and persistence.
+    display_address: PathBuf,
+    persisted: PersistedPath,
     sibling_parent: Option<PathBuf>,
 }
 
@@ -74,10 +77,17 @@ impl fmt::Debug for ResolvedPath {
 impl ResolvedPath {
     pub fn new(path: impl AsRef<Path>) -> io::Result<Self> {
         let display = DisplayPath::new(path)?;
-        Self::from_address(&display.0, display.clone())
+        let address = absolute_io_address(&display.0)?;
+        let persisted = PersistedPath::new(&address)?;
+        Self::from_address(&address, display, address.clone(), persisted)
     }
 
-    fn from_address(address: &Path, display: DisplayPath) -> io::Result<Self> {
+    fn from_address(
+        address: &Path,
+        display: DisplayPath,
+        display_address: PathBuf,
+        persisted: PersistedPath,
+    ) -> io::Result<Self> {
         let sibling_parent = address
             .parent()
             .map(|parent| pin_io_path(parent, 0))
@@ -86,6 +96,8 @@ impl ResolvedPath {
         Ok(Self {
             resolved,
             display,
+            display_address,
+            persisted,
             sibling_parent,
         })
     }
@@ -96,16 +108,40 @@ impl ResolvedPath {
             sibling_parent: resolved.parent().map(Path::to_path_buf),
             resolved,
             display: DisplayPath(self.display.0.parent()?.to_path_buf()),
+            display_address: self.display_address.parent()?.to_path_buf(),
+            persisted: PersistedPath(self.persisted.0.parent()?),
         })
     }
 
-    /// Join an absolute diagnostic label without exporting it as an IO path.
+    /// Resolve a complete diagnostic locator, whose relative spelling is
+    /// process-CWD-relative. Locators under this path reuse its pinned tree.
     pub fn join_display(&self, child: &DisplayPath) -> io::Result<Self> {
-        self.join(&child.0)
+        let address = if child.0.is_absolute() {
+            child.0.clone()
+        } else if let Some(relative) = strip_display_prefix(&child.0, &self.display.0) {
+            self.display_address.join(relative)
+        } else {
+            absolute_io_address(&child.0)?
+        };
+        let persisted = PersistedPath::new(&address)?;
+        let io_address = match address
+            .strip_prefix(&self.display_address)
+            .or_else(|_| address.strip_prefix(&self.persisted.0.0))
+        {
+            Ok(relative) => self.resolved.join(relative),
+            Err(_) => address.clone(),
+        };
+        Self::from_address(&io_address, child.clone(), address, persisted)
     }
 
     pub fn display(&self) -> &DisplayPath {
         &self.display
+    }
+
+    /// Absolute locator captured without resolving the user's symlink spelling.
+    /// Persist this value when the path will be reused from another directory.
+    pub fn persisted_path(&self) -> &PersistedPath {
+        &self.persisted
     }
 
     /// Identity of the pinned address, without any further resolution.
@@ -118,13 +154,18 @@ impl ResolvedPath {
     pub fn join(&self, child: impl AsRef<Path>) -> io::Result<Self> {
         let child = child.as_ref();
         let relative = if child.is_absolute() {
-            child.strip_prefix(&self.display.0).unwrap_or(child)
+            child
+                .strip_prefix(&self.display_address)
+                .or_else(|_| child.strip_prefix(&self.persisted.0.0))
+                .unwrap_or(child)
         } else {
             child
         };
         Self::from_address(
             &self.resolved.join(relative),
-            DisplayPath(self.display.0.join(child)),
+            self.display.join(child),
+            self.display_address.join(child),
+            self.persisted.join(child)?,
         )
     }
 
@@ -455,10 +496,9 @@ impl<'de> Deserialize<'de> for CanonicalPath {
     }
 }
 
-/// An absolute path retaining symlinks and parent components as supplied.
+/// A diagnostic path retaining the user's spelling, including relative paths,
+/// symlinks, separators and dot components.
 ///
-/// Relative input uses a validated logical `$PWD`, falling back to
-/// [`std::path::absolute`] when it does not identify the current directory.
 /// Equality compares spelling; use [`CanonicalPath`] to compare file identity.
 /// APIs accepting a display path cannot receive a canonical identity. For
 /// example, the signature used by `BackendError::with_state_read_location`:
@@ -481,22 +521,20 @@ impl<'de> Deserialize<'de> for CanonicalPath {
 /// let path = DisplayPath::new("main.crn").unwrap();
 /// let _ = std::fs::read_to_string(path.as_path());
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(transparent)]
 pub struct DisplayPath(PathBuf);
 
 impl DisplayPath {
     pub fn new(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
-        if path.is_relative()
-            && !path.as_os_str().is_empty()
-            && let Some(pwd) = std::env::var_os("PWD").map(PathBuf::from)
-            && let Ok(current) = std::env::current_dir()
-            && logical_pwd_matches_cwd(&pwd, &current)
-        {
-            return std::path::absolute(pwd.join(path)).map(Self);
+        if path.as_os_str().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an empty path has no absolute IO address",
+            ));
         }
-        std::path::absolute(path).map(Self)
+        Ok(Self(path.to_path_buf()))
     }
 
     pub fn file_name(&self) -> Option<&std::ffi::OsStr> {
@@ -508,19 +546,72 @@ impl DisplayPath {
     pub fn parent(&self) -> Option<Self> {
         self.0.parent().map(|path| Self(path.to_path_buf()))
     }
+    /// Preserve the base's spelling, omitting `.` components only from the child.
     pub fn join(&self, child: impl AsRef<Path>) -> Self {
-        Self(self.0.join(child))
+        let child: PathBuf = child
+            .as_ref()
+            .components()
+            .filter(|component| *component != Component::CurDir)
+            .collect();
+        if child.as_os_str().is_empty() {
+            self.clone()
+        } else {
+            Self(self.0.join(child))
+        }
     }
     pub fn with_extension(&self, extension: impl AsRef<std::ffi::OsStr>) -> Self {
         Self(self.0.with_extension(extension))
     }
     /// Lexical relative rendering for source labels and command output only.
     pub fn relative_to(&self, base: &Self) -> Option<String> {
-        self.0
-            .strip_prefix(&base.0)
-            .ok()
-            .map(|path| path.display().to_string())
+        strip_display_prefix(&self.0, &base.0).map(|path| path.display().to_string())
     }
+}
+
+// Joined labels may omit a leading `./` that an authored locator still has.
+// Treat both spellings alike when locating them within a pinned display tree.
+fn strip_display_prefix<'a>(path: &'a Path, base: &Path) -> Option<&'a Path> {
+    let path = path.strip_prefix(".").unwrap_or(path);
+    let base = base.strip_prefix(".").unwrap_or(base);
+    path.strip_prefix(base).ok()
+}
+
+impl PartialEq for DisplayPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_os_str() == other.0.as_os_str()
+    }
+}
+
+impl Eq for DisplayPath {}
+
+impl PartialOrd for DisplayPath {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DisplayPath {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.as_os_str().cmp(other.0.as_os_str())
+    }
+}
+
+impl std::hash::Hash for DisplayPath {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(self.0.as_os_str(), state);
+    }
+}
+
+fn absolute_io_address(path: &Path) -> io::Result<PathBuf> {
+    if path.is_relative()
+        && !path.as_os_str().is_empty()
+        && let Some(pwd) = std::env::var_os("PWD").map(PathBuf::from)
+        && let Ok(current) = std::env::current_dir()
+        && logical_pwd_matches_cwd(&pwd, &current)
+    {
+        return std::path::absolute(pwd.join(path));
+    }
+    std::path::absolute(path)
 }
 
 fn logical_pwd_matches_cwd(pwd: &Path, cwd: &Path) -> bool {
@@ -549,10 +640,53 @@ impl fmt::Display for DisplayPath {
 impl<'de> Deserialize<'de> for DisplayPath {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let path = PathBuf::deserialize(deserializer)?;
+        Self::new(path).map_err(serde::de::Error::custom)
+    }
+}
+
+/// An absolute locator for recorded paths and later filesystem access.
+///
+/// Construction uses [`std::path::absolute`] without resolving symlinks or
+/// parent components. Deserialization requires an already absolute spelling
+/// and never consults the filesystem. Use [`ResolvedPath::persisted_path`] to
+/// retain the base directory captured when a live path was resolved.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct PersistedPath(DisplayPath);
+
+impl PersistedPath {
+    pub fn new(path: impl AsRef<Path>) -> io::Result<Self> {
+        let display = DisplayPath::new(path)?;
+        std::path::absolute(&display.0).map(|path| Self(DisplayPath(path)))
+    }
+
+    pub fn display(&self) -> &DisplayPath {
+        &self.0
+    }
+
+    pub fn join(&self, child: impl AsRef<Path>) -> io::Result<Self> {
+        Self::new(self.0.join(child).0)
+    }
+
+    /// Pin the saved locator against the filesystem at the time it is reused.
+    pub fn resolve(&self) -> io::Result<ResolvedPath> {
+        ResolvedPath::new(&self.0.0)
+    }
+}
+
+impl fmt::Display for PersistedPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl<'de> Deserialize<'de> for PersistedPath {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let path = PathBuf::deserialize(deserializer)?;
         if !path.is_absolute() {
-            return Err(serde::de::Error::custom("display path must be absolute"));
+            return Err(serde::de::Error::custom("persisted path must be absolute"));
         }
-        Ok(Self(path))
+        Ok(Self(DisplayPath(path)))
     }
 }
 
@@ -635,6 +769,160 @@ fn relative_path_from_root(root: &Path, path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_path_construction_and_serde_preserve_authored_spelling() {
+        for input in [
+            ".",
+            "./main.crn",
+            "infra//./foo/../main.crn",
+            "//missing-project/main.crn",
+        ] {
+            let path = DisplayPath::new(input).unwrap();
+            assert_eq!(path.to_string(), input);
+            let encoded = serde_json::to_value(&path).unwrap();
+            assert_eq!(encoded, input);
+            let decoded: DisplayPath = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded.to_string(), input);
+        }
+    }
+
+    #[test]
+    fn display_path_joins_preserve_base_spelling_and_omit_child_curdir_components() {
+        for (base, child, expected) in [
+            (".", "main.crn", "./main.crn"),
+            (".", "../upstream", "./../upstream"),
+            ("./", "./../upstream", "./../upstream"),
+            ("./.", "./main.crn", "././main.crn"),
+            ("infra/env", "./alias/main.crn", "infra/env/alias/main.crn"),
+            ("./infra/env", "./alias", "./infra/env/alias"),
+            (
+                "infra//./env",
+                "./alias/./main.crn",
+                "infra//./env/alias/main.crn",
+            ),
+            ("infra/env", "../upstream", "infra/env/../upstream"),
+            (
+                "infra/env",
+                "alias/../main.crn",
+                "infra/env/alias/../main.crn",
+            ),
+            ("infra/env", ".", "infra/env"),
+            (".", ".", "."),
+            ("infra/env", "", "infra/env"),
+            ("infra/env", "/other/main.crn", "/other/main.crn"),
+        ] {
+            assert_eq!(
+                DisplayPath::new(base).unwrap().join(child).to_string(),
+                expected
+            );
+        }
+
+        let base = PersistedPath::new("infra/env").unwrap();
+        assert_eq!(
+            base.join("./alias/../main.crn").unwrap().to_string(),
+            format!("{base}/alias/../main.crn")
+        );
+        assert_eq!(
+            base.join("../upstream").unwrap().0.0,
+            std::path::absolute(base.0.0.join("../upstream")).unwrap()
+        );
+    }
+
+    #[test]
+    fn display_path_relative_labels_accept_an_optional_leading_dot() {
+        for (base, path, expected) in [
+            (".", "../upstream", "../upstream"),
+            (".", "./main.crn", "main.crn"),
+            ("infra/env", "./infra/env/main.crn", "main.crn"),
+            ("./infra/env", "infra/env/main.crn", "main.crn"),
+            (
+                ".carina/providers",
+                "./.carina/providers/mock.wasm",
+                "mock.wasm",
+            ),
+        ] {
+            assert_eq!(
+                DisplayPath::new(path)
+                    .unwrap()
+                    .relative_to(&DisplayPath::new(base).unwrap()),
+                Some(expected.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn joined_dot_display_locators_reuse_the_pinned_project() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("main.crn"), "pinned project").unwrap();
+        // Model a captured logical CWD without changing the test process CWD.
+        let root = ResolvedPath::from_address(
+            project.path(),
+            DisplayPath::new(".").unwrap(),
+            project.path().to_path_buf(),
+            PersistedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
+        let child = root.join("./main.crn").unwrap();
+        assert_eq!(child.display().to_string(), "./main.crn");
+        let located = root.join_display(child.display()).unwrap();
+        assert_eq!(located.read_to_string().unwrap(), "pinned project");
+        assert_eq!(located.persisted_path(), child.persisted_path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn display_path_ordering_compares_spelling_including_separators() {
+        let single = DisplayPath::new("/project/main.crn").unwrap();
+        let double = DisplayPath::new("//project/main.crn").unwrap();
+        assert_ne!(single, double);
+        assert!(double < single);
+        let spellings = std::collections::HashSet::from([single.clone(), double.clone()]);
+        assert_eq!(spellings.len(), 2);
+        for paths in [[single.clone(), double.clone()], [double.clone(), single]] {
+            assert_eq!(paths.into_iter().min().unwrap(), double);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_path_relative_display_locators_keep_io_pinned_without_repeating_root() {
+        let cwd = std::env::current_dir().unwrap();
+        let temp = tempfile::tempdir_in(&cwd).unwrap();
+        let original = temp.path().join("original");
+        let replacement = temp.path().join("replacement");
+        let alias = temp.path().join("alias");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::write(original.join("main.crn"), "original").unwrap();
+        std::fs::write(replacement.join("main.crn"), "replacement").unwrap();
+        std::fs::write(temp.path().join("outside.crn"), "outside").unwrap();
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        let relative_temp = Path::new(".").join(temp.path().file_name().unwrap());
+        let relative_alias = relative_temp.join("alias");
+        let root = ResolvedPath::new(&relative_alias).unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+
+        for spelling in [relative_alias.join("main.crn"), alias.join("main.crn")] {
+            let label = DisplayPath::new(&spelling).unwrap();
+            let source = root.join_display(&label).unwrap();
+            assert_eq!(source.read_to_string().unwrap(), "original");
+            assert_eq!(source.display().to_string(), spelling.display().to_string());
+        }
+        let outside = DisplayPath::new(relative_temp.join("outside.crn")).unwrap();
+        assert_eq!(
+            root.join_display(&outside)
+                .unwrap()
+                .read_to_string()
+                .unwrap(),
+            "outside"
+        );
+        assert_eq!(
+            root.join("main.crn").unwrap().display().to_string(),
+            relative_alias.join("main.crn").display().to_string()
+        );
+    }
 
     #[cfg(unix)]
     #[test]
@@ -797,21 +1085,30 @@ mod tests {
     }
 
     #[test]
-    fn display_path_makes_relative_input_absolute() {
-        let path = DisplayPath::new("project/main.crn").unwrap();
-        assert!(path.0.as_path().is_absolute());
-        assert!(path.0.as_path().ends_with("project/main.crn"));
+    fn display_path_preserves_relative_input_spelling() {
+        let input = "./project//main.crn";
+        let path = DisplayPath::new(input).unwrap();
+        assert!(path.0.is_relative());
+        assert_eq!(path.to_string(), input);
+    }
+
+    #[test]
+    fn persisted_path_makes_relative_input_absolute() {
+        let input = "project/main.crn";
+        let path = PersistedPath::new(input).unwrap();
+        assert!(path.0.0.is_absolute());
+        assert_eq!(path.0.0, std::path::absolute(input).unwrap());
         assert_eq!(
-            CanonicalPath::new(path.0.as_path().parent().unwrap().parent().unwrap()).unwrap(),
+            CanonicalPath::new(path.0.0.parent().unwrap().parent().unwrap()).unwrap(),
             CanonicalPath::new(std::env::current_dir().unwrap()).unwrap()
         );
     }
 
     #[test]
-    fn display_path_deserialization_rejects_relative_paths() {
+    fn persisted_path_deserialization_rejects_relative_paths() {
         for input in ["project/main.crn", "../project", ""] {
-            let error = serde_json::from_value::<DisplayPath>(serde_json::json!(input))
-                .expect_err("persisted display paths must already be absolute");
+            let error = serde_json::from_value::<PersistedPath>(serde_json::json!(input))
+                .expect_err("persisted paths must already be absolute");
             assert!(error.to_string().contains("absolute"), "{error}");
         }
     }
@@ -822,6 +1119,58 @@ mod tests {
         let input = dir.path().join("nonexistent/../main.crn");
         let path: DisplayPath = serde_json::from_value(serde_json::json!(input)).unwrap();
         assert_eq!(path.0.as_path(), input);
+    }
+
+    #[test]
+    fn persisted_path_deserialization_preserves_absolute_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("nonexistent/../main.crn");
+        let path: PersistedPath = serde_json::from_value(serde_json::json!(input)).unwrap();
+        assert_eq!(path.0.0, input);
+        assert_eq!(
+            serde_json::to_value(path).unwrap(),
+            serde_json::json!(input)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_path_from_resolved_retains_symlink_locator_after_retarget() {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::tempdir_in(&cwd).unwrap();
+        let original = dir.path().join("original");
+        let replacement = dir.path().join("replacement");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::write(original.join("main.crn"), "original").unwrap();
+        std::fs::write(replacement.join("main.crn"), "replacement").unwrap();
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        let input = Path::new(".")
+            .join(dir.path().file_name().unwrap())
+            .join("alias");
+        let resolved = ResolvedPath::new(&input).unwrap();
+        let saved = resolved.persisted_path().clone();
+        assert_eq!(resolved.display().to_string(), input.display().to_string());
+        assert_eq!(saved.0.0, std::path::absolute(&input).unwrap());
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+
+        assert_eq!(resolved.persisted_path(), &saved);
+        assert_eq!(resolved.identity(), CanonicalPath::new(&original).unwrap());
+        assert_eq!(
+            resolved
+                .join_display(&saved.display().join("main.crn"))
+                .unwrap()
+                .read_to_string()
+                .unwrap(),
+            "original"
+        );
+        assert_eq!(
+            saved.resolve().unwrap().identity(),
+            CanonicalPath::new(&replacement).unwrap()
+        );
+        assert!(saved.to_string().ends_with("/alias"));
     }
 
     #[test]

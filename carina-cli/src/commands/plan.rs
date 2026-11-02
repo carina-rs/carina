@@ -20,7 +20,7 @@ use carina_core::parser::{
     SavedProviderConfigs, UpstreamState,
 };
 use carina_core::paths::ResolvedPath;
-use carina_core::paths::{CanonicalPath, DisplayPath};
+use carina_core::paths::{CanonicalPath, PersistedPath};
 use carina_core::plan::{Plan, SnapshotPlan, UnresolvedSavedPlan};
 use carina_core::provider::{ProviderInstanceKey, ProviderRouter, ReferenceScope};
 use carina_core::provider_source::ProviderSource;
@@ -484,7 +484,7 @@ mod provider_scope_evidence_tests {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-10-30T00:00:00Z".to_string(),
-            source_path: carina_core::paths::DisplayPath::new("test.crn").unwrap(),
+            source_path: carina_core::paths::PersistedPath::new("test.crn").unwrap(),
             source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
             state_lineage: None,
             state_serial: None,
@@ -709,8 +709,8 @@ pub struct PlanFileContents<S = ModuleSource, P = SnapshotPlan<S>, V: PlanValueK
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
-    /// Plan format 39 pins the display source locator to its planned canonical
-    /// identity so a retargeted symlink requires replanning.
+    /// Plan format 40 requires an absolute source locator and its planned
+    /// canonical identity so a retargeted symlink requires replanning.
     /// Plan format 39 stores complete dependency addresses and legacy migration
     /// classifications alongside the directive-value representation from 38.
     ///
@@ -762,13 +762,13 @@ pub struct PlanFileContents<S = ModuleSource, P = SnapshotPlan<S>, V: PlanValueK
     /// Its presence is the plan-only discriminator used by `PlanFileHeader`;
     /// keep its serialized name stable across plan formats.
     pub timestamp: String,
-    /// Absolute source locator, retaining the user's symlink spelling.
+    /// Absolute source locator retaining the user's symlink spelling.
     /// Used for apply-time filesystem access and recovery guidance, never as
     /// a file-identity key.
     ///
     /// `PlanFileHeader` decodes this field on a best-effort basis to render
     /// replan guidance when the format has a string value for it.
-    pub source_path: DisplayPath,
+    pub source_path: PersistedPath,
     /// Canonical source identity captured at plan time; apply rejects retargeting.
     pub source_identity: CanonicalPath,
     /// State lineage for drift detection
@@ -1130,13 +1130,14 @@ impl PlanFile {
 /// serialization order. The mandatory directive-change and provider-evidence
 /// fields introduced by format 35 remain mandatory. Format 39's optional
 /// classification field is mandatory in the wire shape and is never
-/// defaulted.
+/// defaulted. Format 40 requires the absolute source locator and canonical
+/// source identity captured at plan time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanFileWire {
     version: u32,
     carina_version: String,
     timestamp: String,
-    source_path: DisplayPath,
+    source_path: PersistedPath,
     source_identity: CanonicalPath,
     state_lineage: Option<String>,
     state_serial: Option<u64>,
@@ -2176,7 +2177,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 39;
+    pub const CURRENT_VERSION: u32 = 40;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
@@ -4577,7 +4578,7 @@ mod managed_current_serde_tests {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-10-23T08:00:00Z".to_string(),
-            source_path: carina_core::paths::DisplayPath::new("test.crn").unwrap(),
+            source_path: carina_core::paths::PersistedPath::new("test.crn").unwrap(),
             source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
             state_lineage: None,
             state_serial: None,
@@ -5103,7 +5104,7 @@ fn build_plan_file_contents<E>(
         "plan resources must stay paired with their authored origins"
     );
     let source = path.clone();
-    let source_path = source.display().clone();
+    let source_path = source.persisted_path().clone();
     let source_identity = source.identity();
     let mut composition_source_identities = CompositionSourceIdentityResolver::new(&source)?;
 
@@ -5245,8 +5246,9 @@ fn build_plan_file_contents<E>(
         .collect();
 
     let contents = PlanFileContents {
-        // carina#4202: bumped 38→39 — retain the display source locator and
+        // carina#4202: bumped 39→40 — require the absolute source locator and
         // canonical identity separately, rejecting retargeted source symlinks.
+        // Format 39 already records typed dependency handles (carina#3803).
         // carina#4174: bumped 36→37 — deferred-for templates require file
         // (relative path or null) and line for apply-time diagnostics.
         // carina#4094: bumped 35→36 — saved plans use typed deferred-for
@@ -6688,7 +6690,7 @@ pub(crate) async fn load_upstream_states<B: carina_core::resource::BindingAddres
 
     for us in upstream_states {
         let source_abs = base_dir
-            .join(&us.source)
+            .join_display(&base_dir.persisted_path().display().join(&us.source))
             .and_then(|source| {
                 source.metadata()?;
                 Ok(source)
@@ -6828,7 +6830,7 @@ async fn walk_upstream_cycles_only<B: carina_core::resource::BindingAddress>(
 ) -> Result<(), AppError> {
     for us in upstream_states {
         let source_abs = base_dir
-            .join(&us.source)
+            .join_display(&base_dir.persisted_path().display().join(&us.source))
             .and_then(|source| {
                 source.metadata()?;
                 Ok(source)

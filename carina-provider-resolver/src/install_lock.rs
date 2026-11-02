@@ -375,7 +375,9 @@ fn project_artifact(
     artifact: &WasmArtifactPath,
 ) -> io::Result<ResolvedPath> {
     validate_project_target(install_lock, artifact.as_path())?;
-    install_lock.project_dir().join(artifact.as_path())
+    install_lock
+        .project_dir()
+        .join_display(&DisplayPath::new(artifact.as_path())?)
 }
 
 fn locate_lock_file_error(location: &DisplayPath, operation: &str, cause: io::Error) -> io::Error {

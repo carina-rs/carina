@@ -1657,14 +1657,14 @@ pub fn prepare_root_export_validation(
 /// directory being expanded:
 ///
 /// ```compile_fail,E0308
-/// use std::path::Path;
 /// use carina_core::module_resolver::resolve_modules_providerless;
 /// use carina_core::parser::{ParsedFile, ProviderContext};
+/// use carina_core::paths::ResolvedPath;
 /// use carina_core::validation::deferred_types::TypeCheckSession;
 ///
 /// let parsed = ParsedFile::default();
 /// let checks = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
-///     resolve_modules_providerless(parsed, Path::new("."), session)
+///     resolve_modules_providerless(parsed, &ResolvedPath::new(".").unwrap(), session)
 /// });
 /// checks.publish(&mut Vec::new());
 /// ```

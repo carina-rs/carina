@@ -117,6 +117,7 @@ fn retarget_during_apply(saved: bool) {
         .unwrap();
     let started = Instant::now();
     while !handshake.path().join("ready").exists() {
+        // wall-clock-ok: hang guard waiting for the real apply child to reach its handshake.
         if started.elapsed() >= Duration::from_secs(30) || child.try_wait().unwrap().is_some() {
             let _ = child.kill();
             let output = child.wait_with_output().unwrap();
@@ -180,6 +181,7 @@ fn retarget_at_handshake(
         .unwrap();
     let started = Instant::now();
     while !handshake.path().join("ready").exists() {
+        // wall-clock-ok: hang guard waiting for the real CLI child to reach its handshake.
         if started.elapsed() >= Duration::from_secs(30) || child.try_wait().unwrap().is_some() {
             let _ = child.kill();
             panic!(

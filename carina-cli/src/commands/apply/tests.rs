@@ -1131,7 +1131,7 @@ for account_id in orgs.accounts {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-30T00:00:00Z".to_string(),
-        source_path: carina_core::paths::DisplayPath::new("infra").unwrap(),
+        source_path: carina_core::paths::PersistedPath::new("infra").unwrap(),
         source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
         state_lineage: None,
         state_serial: None,
@@ -1264,7 +1264,7 @@ async fn run_saved_plan_schema_fingerprint_case(
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-27T00:00:00Z".to_string(),
-        source_path: carina_core::paths::DisplayPath::new(fixture.config_path()).unwrap(),
+        source_path: carina_core::paths::PersistedPath::new(fixture.config_path()).unwrap(),
         source_identity: carina_core::paths::CanonicalPath::new(fixture.config_path()).unwrap(),
         state_lineage: None,
         state_serial: None,
@@ -1536,7 +1536,7 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-28T00:00:00Z".to_string(),
-        source_path: carina_core::paths::DisplayPath::new(fixture.config_path()).unwrap(),
+        source_path: carina_core::paths::PersistedPath::new(fixture.config_path()).unwrap(),
         source_identity: carina_core::paths::CanonicalPath::new(fixture.config_path()).unwrap(),
         state_lineage: None,
         state_serial: None,
@@ -1840,7 +1840,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-16T00:00:00Z".to_string(),
-        source_path: carina_core::paths::DisplayPath::new(tmp.path()).unwrap(),
+        source_path: carina_core::paths::PersistedPath::new(tmp.path()).unwrap(),
         source_identity: carina_core::paths::CanonicalPath::new(tmp.path()).unwrap(),
         state_lineage: None,
         state_serial: None,
@@ -1947,7 +1947,7 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-29T00:00:00Z".to_string(),
-        source_path: carina_core::paths::DisplayPath::new(tmp.path()).unwrap(),
+        source_path: carina_core::paths::PersistedPath::new(tmp.path()).unwrap(),
         source_identity: carina_core::paths::CanonicalPath::new(tmp.path()).unwrap(),
         state_lineage: None,
         state_serial: None,
@@ -2107,7 +2107,7 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-16T00:00:00Z".to_string(),
-        source_path: carina_core::paths::DisplayPath::new(tmp.path()).unwrap(),
+        source_path: carina_core::paths::PersistedPath::new(tmp.path()).unwrap(),
         source_identity: carina_core::paths::CanonicalPath::new(tmp.path()).unwrap(),
         state_lineage: Some(lineage.to_string()),
         state_serial: Some(7),
@@ -2273,7 +2273,7 @@ async fn saved_plan_classifies_v20_dependency_names_before_early_migration_write
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-31T00:00:00Z".to_string(),
-        source_path: carina_core::paths::DisplayPath::new(tmp.path()).unwrap(),
+        source_path: carina_core::paths::PersistedPath::new(tmp.path()).unwrap(),
         source_identity: carina_core::paths::CanonicalPath::new(tmp.path()).unwrap(),
         state_lineage: Some(lineage.to_string()),
         state_serial: Some(9),
@@ -2475,7 +2475,7 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-29T00:00:00Z".to_string(),
-        source_path: carina_core::paths::DisplayPath::new(project.path()).unwrap(),
+        source_path: carina_core::paths::PersistedPath::new(project.path()).unwrap(),
         source_identity: carina_core::paths::CanonicalPath::new(project.path()).unwrap(),
         state_lineage: None,
         state_serial: None,
@@ -2577,7 +2577,7 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-29T00:00:00Z".to_string(),
-        source_path: carina_core::paths::DisplayPath::new(project.path()).unwrap(),
+        source_path: carina_core::paths::PersistedPath::new(project.path()).unwrap(),
         source_identity: carina_core::paths::CanonicalPath::new(project.path()).unwrap(),
         state_lineage: None,
         state_serial: None,
@@ -4694,7 +4694,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-07-02T00:00:00Z".to_string(),
-        source_path: carina_core::paths::DisplayPath::new(fixture.config_path()).unwrap(),
+        source_path: carina_core::paths::PersistedPath::new(fixture.config_path()).unwrap(),
         source_identity: carina_core::paths::CanonicalPath::new(fixture.config_path()).unwrap(),
         state_lineage: None,
         state_serial: None,
@@ -4860,7 +4860,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-09-29T00:00:00Z".to_string(),
-        source_path: carina_core::paths::DisplayPath::new(fixture.config_path()).unwrap(),
+        source_path: carina_core::paths::PersistedPath::new(fixture.config_path()).unwrap(),
         source_identity: carina_core::paths::CanonicalPath::new(fixture.config_path()).unwrap(),
         state_lineage: None,
         state_serial: None,
@@ -4967,7 +4967,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-09-29T00:00:00Z".to_string(),
-        source_path: carina_core::paths::DisplayPath::new(fixture.config_path()).unwrap(),
+        source_path: carina_core::paths::PersistedPath::new(fixture.config_path()).unwrap(),
         source_identity: carina_core::paths::CanonicalPath::new(fixture.config_path()).unwrap(),
         state_lineage: None,
         state_serial: None,
@@ -5032,7 +5032,7 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-14T00:00:00Z".to_string(),
-        source_path: carina_core::paths::DisplayPath::new(fixture.config_path()).unwrap(),
+        source_path: carina_core::paths::PersistedPath::new(fixture.config_path()).unwrap(),
         source_identity: carina_core::paths::CanonicalPath::new(fixture.config_path()).unwrap(),
         state_lineage: None,
         state_serial: None,
@@ -5168,7 +5168,7 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-14T00:00:00Z".to_string(),
-        source_path: carina_core::paths::DisplayPath::new(fixture.config_path()).unwrap(),
+        source_path: carina_core::paths::PersistedPath::new(fixture.config_path()).unwrap(),
         source_identity: carina_core::paths::CanonicalPath::new(fixture.config_path()).unwrap(),
         state_lineage: None,
         state_serial: None,
@@ -5594,7 +5594,7 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-21T00:00:00Z".to_string(),
-        source_path: carina_core::paths::DisplayPath::new(fixture.config_path()).unwrap(),
+        source_path: carina_core::paths::PersistedPath::new(fixture.config_path()).unwrap(),
         source_identity: carina_core::paths::CanonicalPath::new(fixture.config_path()).unwrap(),
         state_lineage: None,
         state_serial: None,
@@ -10543,8 +10543,9 @@ mod apply_deferred_for_parity {
 mod saved_plan_version_tests {
 
     //! Saved plan formats have no backward-compatibility path: re-running
-    //! `carina plan` is the supported migration. Version 39 pins the source
-    //! locator to its canonical identity. Version 38 retains authored
+    //! `carina plan` is the supported migration. Version 40 pins the absolute source
+    //! locator to its canonical identity. Version 39 stores typed dependency
+    //! handles. Version 38 retains authored
     //! directives and default origins. Version 37 requires deferred
     //! diagnostic locations. Version 36 adds typed
     //! deferred-for templates and stage-specific placeholder types. Version 35
@@ -10621,8 +10622,52 @@ mod saved_plan_version_tests {
     }
 
     #[test]
-    fn source_identity_requires_plan_format_39() {
-        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 39);
+    fn source_identity_requires_plan_format_40() {
+        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 40);
+    }
+
+    #[tokio::test]
+    async fn saved_plan_without_source_identity_is_rejected_as_corrupt() {
+        let (_dir, plan_path, mut json) = replacement_plan_json();
+        json.as_object_mut().unwrap().remove("source_identity");
+        let error = serde_json::from_value::<crate::commands::plan::PlanFile>(json.clone())
+            .expect_err("current plans must record source identity");
+        assert!(
+            error
+                .to_string()
+                .contains("missing field `source_identity`"),
+            "{error}"
+        );
+
+        let message = rejected_saved_plan_message(
+            &plan_path,
+            &json,
+            "a current plan without source identity must fail payload decoding",
+        )
+        .await;
+        assert!(
+            message.contains("missing field `source_identity`"),
+            "{message}"
+        );
+        assert!(message.contains("carina plan"), "{message}");
+        assert!(message.contains("corrupted"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn saved_plan_with_relative_source_path_is_rejected_as_corrupt() {
+        let (_dir, plan_path, mut json) = replacement_plan_json();
+        json["source_path"] = serde_json::json!("./missing-source");
+        let message = rejected_saved_plan_message(
+            &plan_path,
+            &json,
+            "current saved source locators must already be absolute",
+        )
+        .await;
+        assert!(
+            message.contains("persisted path must be absolute"),
+            "{message}"
+        );
+        assert!(message.contains("corrupted"), "{message}");
     }
 
     #[tokio::test]
@@ -10634,7 +10679,7 @@ mod saved_plan_version_tests {
             rejected_saved_plan_message(&plan_path, &json, "format 38 must require replanning")
                 .await;
         assert!(
-            message.contains("Unsupported plan file version: 38 (expected 39)"),
+            message.contains("Unsupported plan file version: 38 (expected 40)"),
             "{message}"
         );
         assert!(!message.contains("corrupted"), "{message}");
@@ -10724,7 +10769,7 @@ mod saved_plan_version_tests {
         );
     }
 
-    /// v38 and older lack the canonical source identity; reject their
+    /// Main's v39 and older lack the canonical source identity; reject their
     /// headers before attempting to decode any format-specific payload.
     #[tokio::test]
     async fn previous_emitted_and_older_plan_versions_are_rejected_before_payload_decoding() {
@@ -10732,12 +10777,12 @@ mod saved_plan_version_tests {
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            39,
-            "carina#4202 and carina#3803 require format 39 for pinned source identity and resolved dependencies",
+            40,
+            "carina#4202 requires format 40 for source identity on top of carina#3803 format 39",
         );
-        let previous = 38;
+        let previous = 39;
 
-        for older_version in [previous, 37, 36, 35, 34, 33, 32] {
+        for older_version in [previous, 38, 37, 36, 35, 34, 33, 32] {
             let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
             let old_plan = serde_json::json!({
                 "version": older_version,
@@ -11586,7 +11631,7 @@ mod saved_plan_version_tests {
             version: crate::commands::plan::PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-07-02T00:00:00Z".to_string(),
-            source_path: carina_core::paths::DisplayPath::new(dir.path()).unwrap(),
+            source_path: carina_core::paths::PersistedPath::new(dir.path()).unwrap(),
             source_identity: carina_core::paths::CanonicalPath::new(dir.path()).unwrap(),
             state_lineage: None,
             state_serial: None,
