@@ -1024,7 +1024,8 @@ pub async fn refresh_pending_states(
     let mut failed_refreshes = HashSet::new();
 
     for (id, identifier) in refreshes {
-        match read_with_retry(provider, id, identifier).await {
+        let target = crate::test_support::refresh_target(id, identifier);
+        match read_with_retry(provider, &target).await {
             Ok(state) => {
                 println!("  {} Refresh {}", "✓".green(color_mode), id);
                 managed_current.insert(id.clone(), Current::from_state(state));
@@ -1380,6 +1381,7 @@ pub(crate) async fn detect_drift<S: Clone>(
         (),
     >],
     planned_state_entries: &[crate::commands::plan::ReloadedCurrentStateEntry],
+    refresh_rows: &carina_state::RefreshRows,
     historical_addresses: &HistoricalResourceAddresses,
     operation_provider: &dyn Provider,
     comparison_provider: &ProviderRouter,
@@ -1427,15 +1429,17 @@ pub(crate) async fn detect_drift<S: Clone>(
             .unwrap_or(&resource.id);
 
         let mut actual_state = match planned_current {
-            Some(Current::Present(present)) => read_managed_state_with_retry(
-                operation_provider,
-                historical_id,
-                present.identifier(),
-                state_file,
-                schemas,
-            )
-            .await
-            .map_err(AppError::Provider)?,
+            Some(Current::Present(_)) => match refresh_rows
+                .current(historical_id)
+                .and_then(|row| row.read_target())
+            {
+                Some(target) => {
+                    read_managed_state_with_retry(operation_provider, &target, state_file, schemas)
+                        .await
+                        .map_err(AppError::Provider)?
+                }
+                None => State::not_found(historical_id.clone()),
+            },
             Some(Current::MissingIdentifier(_state)) => {
                 return Err(AppError::Validation(format!(
                     "saved plan resource {} has no valid provider identifier; create a new plan before applying",
@@ -1618,10 +1622,21 @@ pub(crate) async fn detect_drift_for_test<S: Clone>(
         .into_iter()
         .map(ResolvedResource::into_inner)
         .collect::<Vec<_>>();
+    let rows = carina_state::PreparedRows::from_snapshots(
+        planned_state_entries.iter().map(|entry| {
+            let crate::commands::plan::ReloadedCurrentStateEntry::Managed { id, current } = entry;
+            (
+                historical_addresses.origin_for(id).clone(),
+                *current.clone(),
+            )
+        }),
+        &carina_state::ResolvedRemovedClaims::resolve(&[], None),
+    );
     detect_drift(
         color_mode,
         &sorted_resources,
         planned_state_entries,
+        &rows.refreshable,
         historical_addresses,
         operation_provider,
         &comparison_provider,
@@ -2152,6 +2167,7 @@ async fn run_apply_locked_owned(
             // refreshed in a later phase against the populated `managed_current`.
             let expansion_prelude = crate::wiring::DeferredForExpansionPrelude::new(
                 canonical_resources,
+                &resolved_state_block_targets.removed_from,
                 &state_file,
                 ctx.schemas(),
             )?
@@ -3082,6 +3098,7 @@ async fn prepare_saved_plan_secret_candidates(
         create_providers_from_configs_with_ctx(wiring, provider_inputs.configs()).await?;
     let expansion_prelude = crate::wiring::DeferredForExpansionPrelude::new(
         canonical_resources,
+        &state_blocks.targets.removed_from,
         &candidate_state,
         wiring.schemas(),
     )?
@@ -3815,6 +3832,7 @@ async fn run_apply_from_plan_locked_owned(
                 color_mode,
                 validated_plan.sorted_resources(),
                 validated_plan.current_states(),
+                validated_plan.refresh_rows(),
                 &historical_addresses,
                 validated_plan.provider(),
                 validated_plan.provider(),

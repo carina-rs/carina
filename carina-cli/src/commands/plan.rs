@@ -2140,7 +2140,8 @@ impl PlanFile {
 
     /// Reload state-owned create continuations after the saved-plan apply has
     /// acquired its state lock. The plan contains only an address and marker;
-    /// any status change in either direction invalidates it.
+    /// any status change in either direction invalidates it unless the row is
+    /// being removed without resuming its create.
     pub(crate) fn reload_in_flight_from_locked_state(
         self,
         state_file: Option<&StateFile>,
@@ -2151,6 +2152,15 @@ impl PlanFile {
             persisted_directive_changes,
         } = self;
         let moved_origins = MovedOrigins::from_unresolved_plan(&contents.plan);
+        let planned_removals: HashSet<_> = contents
+            .plan
+            .effects()
+            .iter()
+            .filter_map(|effect| match effect {
+                UnresolvedSavedEffect::Remove { id } => Some(id.as_inner().clone()),
+                _ => None,
+            })
+            .collect();
         let planned_in_flight_origins: HashSet<_> = contents
             .current_states
             .iter()
@@ -2176,15 +2186,20 @@ impl PlanFile {
 
         if let Some(state_file) = state_file {
             for row in state_file.resources() {
+                let locked_id = ResourceId::with_provider_identity(
+                    row.provider.clone(),
+                    row.resource_type.clone(),
+                    row.identity.clone(),
+                    row.directives.provider_instance.clone(),
+                );
+                // Removed rows have no saved refresh snapshot or continuation
+                // marker. Their recorded state-only effect needs neither.
+                if planned_removals.contains(&locked_id) {
+                    continue;
+                }
                 let row_in_flight = match row.current() {
                     carina_state::CurrentInstance::CreateInFlight { pending: _pending } => true,
                     carina_state::CurrentInstance::CreateOutcomeUnknown { unknown } => {
-                        let locked_id = ResourceId::with_provider_identity(
-                            row.provider.clone(),
-                            row.resource_type.clone(),
-                            row.identity.clone(),
-                            row.directives.provider_instance.clone(),
-                        );
                         if planned_unknown_origins.get(&locked_id) != Some(unknown.started_at()) {
                             return Err(carina_core::plan::PlanError::create_outcome_unknown(
                                 locked_id,
@@ -2211,12 +2226,6 @@ impl PlanFile {
                 if !row_in_flight {
                     continue;
                 }
-                let locked_id = ResourceId::with_provider_identity(
-                    row.provider.clone(),
-                    row.resource_type.clone(),
-                    row.identity.clone(),
-                    row.directives.provider_instance.clone(),
-                );
                 if !planned_in_flight_origins.contains(&locked_id) {
                     return Err(LockedStateReloadError::Config(format!(
                         "saved plan is stale for {locked_id}: create-in-flight status changed from false to true; create a new plan before applying"
@@ -3873,6 +3882,8 @@ pub(crate) struct UnresolvedReloadedPlanFile {
 
 #[derive(Debug)]
 pub(crate) struct ReloadedPlanFile {
+    refresh_rows: carina_state::RefreshRows,
+    data_source_refresh_rows: carina_state::RefreshRows,
     contents: PlanFileContents<SavedModuleSource>,
     evidence: ProviderEvidence,
     current_states: Vec<ReloadedCurrentStateEntry>,
@@ -3986,7 +3997,31 @@ impl UnresolvedReloadedPlanFile {
             upstream_sources,
             wait_bindings,
         };
+        let origins = MovedOrigins::from_plan(&contents.plan);
+        // A move source can share an address with a data source. Keep their
+        // refresh inputs separate and apply removed claims only to managed rows.
+        let managed_snapshots = current_states.iter().map(|entry| {
+            let ReloadedCurrentStateEntry::Managed { id, current } = entry;
+            (origins.origin_for(id).clone(), *current.clone())
+        });
+        let refresh_rows = carina_state::PreparedRows::from_snapshots(
+            managed_snapshots,
+            &carina_state::ResolvedRemovedClaims::from_effects(contents.plan.effects()),
+        )
+        .refreshable;
+        let data_source_refresh_rows = carina_state::PreparedRows::from_snapshots(
+            contents.data_source_values.iter().filter_map(|saved| {
+                let DataSourceValue::Read(state) = &saved.value else {
+                    return None;
+                };
+                Some((saved.id.clone(), Current::from_state(*state.clone())))
+            }),
+            &carina_state::ResolvedRemovedClaims::resolve(&[], None),
+        )
+        .refreshable;
         Ok(ReloadedPlanFile {
+            refresh_rows,
+            data_source_refresh_rows,
             contents,
             evidence,
             current_states,
@@ -3996,6 +4031,14 @@ impl UnresolvedReloadedPlanFile {
 }
 
 impl ReloadedPlanFile {
+    pub(crate) fn refresh_rows(&self) -> &carina_state::RefreshRows {
+        &self.refresh_rows
+    }
+
+    pub(crate) fn data_source_refresh_rows(&self) -> &carina_state::RefreshRows {
+        &self.data_source_refresh_rows
+    }
+
     pub(crate) fn persisted_directive_changes(&self) -> &[PersistedDirectiveChange] {
         &self.persisted_directive_changes
     }
