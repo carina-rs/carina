@@ -314,19 +314,19 @@ impl<P: ValueKind, B: BindingAddress> ValidatedIntegerExpr<P, B> {
     }
 }
 
-pub fn evaluate_integer_values<P: ValueKind, B: BindingAddress>(
+pub fn evaluate_integer_values<P, B: BindingAddress>(
     lhs: Value<P, B>,
     op: IntegerOp,
     rhs: Value<P, B>,
     operator_span: IntegerOperatorSpan,
 ) -> Result<Value<P, B>, IntegerExpressionError>
 where
-    P: PlaceholderKind,
+    P: ValueKind + PlaceholderKind,
 {
     evaluate_integer_values_inner(lhs, op, rhs, operator_span, validate_operand_shape)
 }
 
-fn evaluate_integer_values_inner<P: ValueKind, B: BindingAddress>(
+fn evaluate_integer_values_inner<P, B: BindingAddress>(
     lhs: Value<P, B>,
     op: IntegerOp,
     rhs: Value<P, B>,
@@ -334,7 +334,7 @@ fn evaluate_integer_values_inner<P: ValueKind, B: BindingAddress>(
     validate: impl Fn(&Value<P, B>, IntegerOperandSide) -> Result<(), IntegerOperandError>,
 ) -> Result<Value<P, B>, IntegerExpressionError>
 where
-    P: PlaceholderKind,
+    P: ValueKind + PlaceholderKind,
 {
     let (lhs, lhs_secret_depth) = crate::resource::peel_secrets(lhs);
     let (rhs, rhs_secret_depth) = crate::resource::peel_secrets(rhs);

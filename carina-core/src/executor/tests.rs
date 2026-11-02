@@ -5684,11 +5684,11 @@ fn module_constraint_resolution_keeps_unavailable_secret_typed() {
                     let ValidateExpr::Compare { lhs, .. } = &mut constraint.expression else {
                         unreachable!("test comparison constraint");
                     };
-                    *lhs = Box::new(ValidateExpr::BoundArgument {
+                    **lhs = ValidateExpr::BoundArgument {
                         argument: "value".into(),
                         operand: "argument.value".into(),
                         value: reference.clone(),
-                    });
+                    };
                 }
                 let composition = pending_module_composition(
                     "root.checked",

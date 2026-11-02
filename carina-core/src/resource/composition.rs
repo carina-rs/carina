@@ -1965,6 +1965,59 @@ impl<'a> Iterator for CompositionRuntimeAttributes<'a> {
     }
 }
 
+impl<P: ValueKind, B: BindingAddress> LiveComposition<P, B> {
+    pub(crate) fn with_signature<Q: ValueKind>(
+        self,
+        signature: LiveCompositionSignature<Q, B>,
+    ) -> LiveComposition<Q, B> {
+        let Self {
+            id,
+            signature: _,
+            binding,
+            dependency_bindings,
+            module_name,
+            instance,
+            call_path,
+            quoted_string_attrs,
+        } = self;
+        LiveComposition {
+            id,
+            signature,
+            binding,
+            dependency_bindings,
+            module_name,
+            instance,
+            call_path,
+            quoted_string_attrs,
+        }
+    }
+}
+impl<P: PlanValueKind> SavedComposition<P> {
+    pub(crate) fn with_signature<Q: PlanValueKind>(
+        self,
+        signature: SavedCompositionSignature<Q>,
+    ) -> SavedComposition<Q> {
+        let Self {
+            id,
+            signature: _,
+            binding,
+            dependency_bindings,
+            module_name,
+            instance,
+            origin_id,
+        } = self;
+        SavedComposition {
+            id,
+            signature,
+            binding,
+            dependency_bindings,
+            module_name,
+            instance,
+            origin_id,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2514,58 +2567,5 @@ mod tests {
         assert!(!json.contains("capability_only"), "{json}");
         assert!(!json.contains("producer.instance"), "{json}");
         assert!(!json.contains("Handle"), "{json}");
-    }
-}
-
-impl<P: ValueKind, B: BindingAddress> LiveComposition<P, B> {
-    pub(crate) fn with_signature<Q: ValueKind>(
-        self,
-        signature: LiveCompositionSignature<Q, B>,
-    ) -> LiveComposition<Q, B> {
-        let Self {
-            id,
-            signature: _,
-            binding,
-            dependency_bindings,
-            module_name,
-            instance,
-            call_path,
-            quoted_string_attrs,
-        } = self;
-        LiveComposition {
-            id,
-            signature,
-            binding,
-            dependency_bindings,
-            module_name,
-            instance,
-            call_path,
-            quoted_string_attrs,
-        }
-    }
-}
-impl<P: PlanValueKind> SavedComposition<P> {
-    pub(crate) fn with_signature<Q: PlanValueKind>(
-        self,
-        signature: SavedCompositionSignature<Q>,
-    ) -> SavedComposition<Q> {
-        let Self {
-            id,
-            signature: _,
-            binding,
-            dependency_bindings,
-            module_name,
-            instance,
-            origin_id,
-        } = self;
-        SavedComposition {
-            id,
-            signature,
-            binding,
-            dependency_bindings,
-            module_name,
-            instance,
-            origin_id,
-        }
     }
 }

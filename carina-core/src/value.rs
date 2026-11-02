@@ -6928,6 +6928,56 @@ pub fn canonicalize_states_with_schemas(
     }
 }
 
+/// Canonicalize historical structure while preserving hash leaves as evidence.
+/// State-only structural inspection never converts a historical hash to an
+/// evaluable value. Hashes remain opaque leaves in the shared state traversal.
+pub(crate) fn canonicalize_snapshot_attribute_map_with_schema<Attributes>(
+    attributes: &mut Attributes,
+    schema: &crate::schema::CompiledResourceSchema,
+) where
+    Attributes: Default
+        + IntoIterator<Item = (String, SnapshotValue)>
+        + FromIterator<(String, SnapshotValue)>,
+{
+    *attributes = std::mem::take(attributes)
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let value = match schema.attributes.get(&key) {
+                Some(attribute) => canonicalize_snapshot_with_type(
+                    value,
+                    &attribute.attr_type,
+                    &schema.defs,
+                    crate::schema::FieldAncestry::from_input_mode(attribute.input_mode()),
+                ),
+                None => Some(value),
+            };
+            value.map(|value| (key, value))
+        })
+        .collect();
+}
+
+pub(crate) fn canonicalize_snapshot_with_type(
+    value: SnapshotValue,
+    ty: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+    ancestry: crate::schema::FieldAncestry,
+) -> Option<SnapshotValue> {
+    unwrap_infallible(canonicalize_state_entry_with_type(
+        value,
+        ty,
+        defs,
+        ancestry,
+        PreserveEnumResolutionErrors,
+    ))
+    .into_present()
+}
+
+pub(crate) fn redact_state_snapshot_value(
+    value: &SnapshotValue,
+) -> Result<SnapshotValue, SerializationError> {
+    redact_snapshot_secrets(value)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::schema::{
@@ -14995,54 +15045,4 @@ mod tests {
             ))
         ));
     }
-}
-
-/// Canonicalize historical structure while preserving hash leaves as evidence.
-/// State-only structural inspection never converts a historical hash to an
-/// evaluable value. Hashes remain opaque leaves in the shared state traversal.
-pub(crate) fn canonicalize_snapshot_attribute_map_with_schema<Attributes>(
-    attributes: &mut Attributes,
-    schema: &crate::schema::CompiledResourceSchema,
-) where
-    Attributes: Default
-        + IntoIterator<Item = (String, SnapshotValue)>
-        + FromIterator<(String, SnapshotValue)>,
-{
-    *attributes = std::mem::take(attributes)
-        .into_iter()
-        .filter_map(|(key, value)| {
-            let value = match schema.attributes.get(&key) {
-                Some(attribute) => canonicalize_snapshot_with_type(
-                    value,
-                    &attribute.attr_type,
-                    &schema.defs,
-                    crate::schema::FieldAncestry::from_input_mode(attribute.input_mode()),
-                ),
-                None => Some(value),
-            };
-            value.map(|value| (key, value))
-        })
-        .collect();
-}
-
-pub(crate) fn canonicalize_snapshot_with_type(
-    value: SnapshotValue,
-    ty: &AttributeType,
-    defs: &std::collections::BTreeMap<String, AttributeType>,
-    ancestry: crate::schema::FieldAncestry,
-) -> Option<SnapshotValue> {
-    unwrap_infallible(canonicalize_state_entry_with_type(
-        value,
-        ty,
-        defs,
-        ancestry,
-        PreserveEnumResolutionErrors,
-    ))
-    .into_present()
-}
-
-pub(crate) fn redact_state_snapshot_value(
-    value: &SnapshotValue,
-) -> Result<SnapshotValue, SerializationError> {
-    redact_snapshot_secrets(value)
 }
