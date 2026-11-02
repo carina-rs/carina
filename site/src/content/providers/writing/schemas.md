@@ -406,7 +406,7 @@ fn color() -> AttributeType {
                 Ok(())
             }
             _ => Err(TypeError::ValidationFailed {
-                message: "color must not be black".to_string(),
+                message: "color must not be black".into(),
             }),
         }),
         None,

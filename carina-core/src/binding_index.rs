@@ -1806,7 +1806,7 @@ impl AppliedOperation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartialReadBack {
     operation: AppliedOperation,
-    reason: String,
+    reason: crate::provider_text::ProviderText,
     missing_attributes: HashSet<String>,
     end: crate::provider::ReadBackEnd,
 }
@@ -1819,8 +1819,12 @@ impl PartialReadBack {
     ) -> Self {
         Self {
             operation,
-            reason: diagnostic.reason().to_string(),
-            missing_attributes: diagnostic.missing_attributes().iter().cloned().collect(),
+            reason: diagnostic.reason(),
+            missing_attributes: diagnostic
+                .missing_attributes()
+                .iter()
+                .map(|name| name.as_str().to_owned())
+                .collect(),
             end,
         }
     }

@@ -2895,7 +2895,9 @@ where
                     && let Err(message) = factory.verify_version(&constraint.raw)
                 {
                     let reason = installed
-                        .with_load_error(carina_plugin_host::WasmProviderLoadError::Other(message))
+                        .with_load_error(carina_plugin_host::WasmProviderLoadError::Other(
+                            message.into(),
+                        ))
                         .to_string();
                     if report_errors {
                         eprintln!("{}", reason.red(color_mode));
@@ -4241,7 +4243,7 @@ fn append_resolved_value_constraint_errors(
             PlanErrorKind::ResolvedValueConstraint {
                 attributes,
                 origins,
-                message: error.to_string(),
+                message: error.to_string().into(),
             },
         ));
     }
@@ -4824,7 +4826,7 @@ fn source_provider_kind_mismatch_from_load_error(
             configured,
             reported,
         } => Some(AppError::SourceProviderKindMismatch {
-            configured: configured.clone(),
+            configured: configured.to_string(),
             loaded: reported.clone(),
             provider_source: source.to_string(),
         }),
@@ -9323,8 +9325,7 @@ pub(crate) fn resolve_import_target<D>(
 
 /// Check whether a `ProviderError` is an AWS throttling error that should be retried.
 fn is_throttling_error(err: &ProviderError) -> bool {
-    let msg = err.to_string();
-    msg.contains("ThrottlingException") || msg.contains("Rate exceeded")
+    err.is_throttled()
 }
 
 /// Read a resource via the provider with retry and exponential backoff for throttling errors.

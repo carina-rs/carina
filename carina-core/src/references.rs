@@ -70,7 +70,7 @@ pub enum ReferenceFailure {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("provider instance {instance:?}, resource {resource}, attribute {path}, reference {raw:?}")] // error-chain: caller-renders-sources
+#[error("{}", crate::provider_text::ProviderText::new(format!("provider instance {instance:?}, resource {resource}, attribute {path}, reference {raw:?}")))] // error-chain: caller-renders-sources
 pub struct ReferencePlanError {
     pub instance: ProviderInstanceKey,
     pub resource: ResourceId,

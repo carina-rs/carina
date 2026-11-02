@@ -198,6 +198,7 @@ pub use compiled_pattern::{
     Compiled, CompiledPattern, Draft, PatternCompileError, PatternCompileErrorSource, PatternForm,
 };
 
+use crate::provider_text::{ProviderString, ProviderText};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -287,7 +288,7 @@ impl FieldGroupKind {
 pub enum FieldGroupError {
     #[error("field groups require at least two fields, got {actual}")]
     TooFewFields { actual: usize },
-    #[error("field group contains duplicate field `{name}`")]
+    #[error("field group contains duplicate field `{}`", ProviderText::new(name))]
     DuplicateField { name: String },
 }
 
@@ -376,7 +377,7 @@ impl fmt::Display for RefEncountered {
         write!(
             f,
             "unresolved AttributeType::Ref(\"{}\") has no defs in scope",
-            self.name
+            ProviderText::new(&self.name)
         )
     }
 }
@@ -446,7 +447,11 @@ pub fn legacy_validator<F>(f: F) -> CustomValidator
 where
     F: Fn(&Value) -> Result<(), String> + Send + Sync + 'static,
 {
-    Arc::new(move |v| f(v).map_err(|message| TypeError::ValidationFailed { message }))
+    Arc::new(move |v| {
+        f(v).map_err(|message| TypeError::ValidationFailed {
+            message: message.into(),
+        })
+    })
 }
 
 /// External validator resolved from the exact declared refined type.
@@ -998,7 +1003,7 @@ pub struct PatternStructField<R: PatternForm = Draft> {
     /// Whether user input for this field is optional, required, or forbidden.
     declared_input_mode: InputMode,
     /// Description of this field
-    pub(crate) description: Option<String>,
+    pub(crate) description: Option<ProviderText>,
     /// Provider-side property name (e.g., "IpProtocol")
     pub(crate) provider_name: Option<String>,
     /// Alternative block name for repeated block syntax (e.g., "transition" for "transitions")
@@ -1210,7 +1215,7 @@ macro_rules! impl_user_input_struct_field_builder {
             }
 
             pub fn with_description(mut self, description: impl Into<String>) -> Self {
-                self.field.description = Some(description.into());
+                self.field.description = Some(ProviderText::new(description));
                 self
             }
 
@@ -1281,7 +1286,7 @@ impl<R: PatternForm> CreateOnlyOptionalStructFieldBuilder<R> {
 
 impl<R: PatternForm> ProviderPopulatedStructFieldBuilder<R> {
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
-        self.field.description = Some(description.into());
+        self.field.description = Some(ProviderText::new(description));
         self
     }
 
@@ -2151,7 +2156,9 @@ impl RefResolutionFailure<'_> {
                 self.name
             ),
         };
-        TypeError::ValidationFailed { message }
+        TypeError::ValidationFailed {
+            message: message.into(),
+        }
     }
 }
 
@@ -4164,7 +4171,7 @@ impl PatternAttributeType<Compiled> {
             }
             (AttrTypeKind::Float { .. }, ConcreteValueRef::Float(f)) => {
                 Err(TypeError::ValidationFailed {
-                    message: format!("non-finite float value: {f}"),
+                    message: format!("non-finite float value: {f}").into(),
                 })
             }
             (AttrTypeKind::Float { binding, range }, ConcreteValueRef::Int(i)) => {
@@ -4244,7 +4251,8 @@ impl PatternAttributeType<Compiled> {
                 expected,
                 extra_message: validation_result
                     .and_then(Result::err)
-                    .map(validation_error_message),
+                    .map(validation_error_message)
+                    .map(ProviderText::new),
             });
         }
 
@@ -4299,7 +4307,8 @@ impl PatternAttributeType<Compiled> {
                             message: format!(
                                 "Invalid {name} {}: {message}",
                                 user_form.render_enum_value(InvalidEnumValueKind::Identifier)
-                            ),
+                            )
+                            .into(),
                         }
                     })?;
                 }
@@ -4891,7 +4900,7 @@ pub fn enum_identity(name: &str, namespace: Option<&str>) -> TypeIdentity {
 
 fn validation_error_message(err: TypeError) -> String {
     match err {
-        TypeError::ValidationFailed { message } => message,
+        TypeError::ValidationFailed { message } => message.to_string(),
         other => other.to_string(),
     }
 }
@@ -4908,7 +4917,7 @@ fn validate_string_refinement(
     {
         return Err(TypeError::PatternMismatch {
             value: s.into(),
-            pattern: pattern.to_string(),
+            pattern: pattern.to_string().into(),
             attribute: None,
             type_name,
         });
@@ -4938,7 +4947,7 @@ fn validate_int_range(
         && (min.is_some_and(|min| value < min) || max.is_some_and(|max| value > max))
     {
         return Err(TypeError::ValidationFailed {
-            message: format!("value {value} is outside allowed range {min:?}..={max:?}"),
+            message: format!("value {value} is outside allowed range {min:?}..={max:?}").into(),
         });
     }
     Ok(())
@@ -4952,7 +4961,7 @@ fn validate_float_range(
         && (min.is_some_and(|min| value < min) || max.is_some_and(|max| value > max))
     {
         return Err(TypeError::ValidationFailed {
-            message: format!("value {value} is outside allowed range {min:?}..={max:?}"),
+            message: format!("value {value} is outside allowed range {min:?}..={max:?}").into(),
         });
     }
     Ok(())
@@ -6559,7 +6568,7 @@ impl DslSpelling {
 
 impl fmt::Display for DslSpelling {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        ProviderText::new(&self.0).fmt(f)
     }
 }
 
@@ -6631,6 +6640,18 @@ pub struct ExpectedEnumVariant {
 }
 
 impl ExpectedEnumVariant {
+    /// Original DSL text for edits and matching. Display is a diagnostic label.
+    pub fn dsl_spelling(&self) -> String {
+        match &self.provider {
+            Some(provider) => std::iter::once(provider.as_str())
+                .chain(self.segments.iter().map(String::as_str))
+                .chain([self.type_name.as_str(), self.value.as_str()])
+                .collect::<Vec<_>>()
+                .join("."),
+            None => self.value.as_str().to_owned(),
+        }
+    }
+
     /// Build the accepted fully-qualified DSL spelling directly from the
     /// structured enum identity. This avoids re-parsing a dotted display name
     /// at the binding/enum disambiguation seam.
@@ -6680,16 +6701,7 @@ impl ExpectedEnumVariant {
 
 impl fmt::Display for ExpectedEnumVariant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.provider {
-            Some(provider) => {
-                write!(f, "{}", provider)?;
-                for seg in &self.segments {
-                    write!(f, ".{}", seg)?;
-                }
-                write!(f, ".{}.{}", self.type_name, self.value)
-            }
-            None => write!(f, "{}", self.value),
-        }
+        ProviderText::new(self.dsl_spelling()).fmt(f)
     }
 }
 
@@ -7002,22 +7014,19 @@ impl DiagnosticValue {
     }
 
     fn render_string_literal(&self) -> String {
-        match self {
-            Self::Plain(value) => display_string_literal(value),
-            Self::Masked => SECRET_VALUE_MASK.to_string(),
-            Self::TypeOnlyString => "string".to_string(),
-        }
+        self.render_enum_value(InvalidEnumValueKind::String)
     }
 
     fn render_enum_value(&self, value_kind: InvalidEnumValueKind) -> String {
-        match self {
+        let text = match self {
             Self::Plain(value) => match value_kind {
                 InvalidEnumValueKind::String => display_string_literal(value),
                 InvalidEnumValueKind::Identifier => value.clone(),
             },
             Self::Masked => SECRET_VALUE_MASK.to_string(),
             Self::TypeOnlyString => "string".to_string(),
-        }
+        };
+        ProviderText::new(text).to_string()
     }
 }
 
@@ -7191,8 +7200,8 @@ fn contains_union_alternatives_mismatch(error: &TypeError) -> bool {
 /// A lexical binding that shadows an enum member with the same bare spelling.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[error(
-        "`{name}` was interpreted as the `{binding_kind}` binding; if you meant the enum `{}` value, write `{qualified}`",
-        r#enum.kind
+        "`{}` was interpreted as the `{binding_kind}` binding; if you meant the enum `{}` value, write `{qualified}`",
+        ProviderText::new(name), ProviderText::new(&r#enum.kind)
     )]
 pub struct BindingShadowsEnumMemberError {
     pub name: String,
@@ -7214,7 +7223,11 @@ fn format_field_group_violation(path: &FieldPath, group: &FieldGroup) -> String 
 /// Type error
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum TypeError {
-    #[error("Type mismatch: expected {expected}, got {got}")]
+    #[error(
+        "Type mismatch: expected {}, got {}",
+        ProviderText::new(expected),
+        ProviderText::new(got)
+    )]
     TypeMismatch { expected: String, got: String },
 
     #[error(transparent)]
@@ -7222,7 +7235,7 @@ pub enum TypeError {
 
     #[error(
         "{}",
-        format_invalid_enum(value, *value_kind, attribute.as_deref(), type_name.as_deref(), expected)
+        ProviderText::new(format_invalid_enum(value, *value_kind, attribute.as_deref(), type_name.as_deref(), expected))
     )]
     InvalidEnumVariant {
         value: DiagnosticValue,
@@ -7246,18 +7259,18 @@ pub enum TypeError {
 
     #[error(
         "{}",
-        format_pattern_mismatch(value, pattern, attribute.as_deref(), type_name.as_deref())
+        ProviderText::new(format_pattern_mismatch(value, pattern.as_str(), attribute.as_deref(), type_name.as_deref()))
     )]
     PatternMismatch {
         value: DiagnosticValue,
-        pattern: String,
+        pattern: ProviderString,
         attribute: Option<String>,
         type_name: Option<String>,
     },
 
     #[error(
         "{}",
-        format_length_out_of_range(value, *length, *min, *max, attribute.as_deref(), type_name.as_deref())
+        ProviderText::new(format_length_out_of_range(value, *length, *min, *max, attribute.as_deref(), type_name.as_deref()))
     )]
     LengthOutOfRange {
         value: DiagnosticValue,
@@ -7271,7 +7284,7 @@ pub enum TypeError {
     #[error(
         "Duplicate list element {} at index {index} (first at index {first_index}){}",
         value.render_enum_value(InvalidEnumValueKind::Identifier),
-        attribute.as_ref().map(|name| format!(" for '{name}'")).unwrap_or_default()
+        attribute.as_ref().map(|name| format!(" for '{}'", ProviderText::new(name))).unwrap_or_default()
     )]
     DuplicateListElement {
         value: DiagnosticValue,
@@ -7289,7 +7302,7 @@ pub enum TypeError {
     /// See #2094.
     #[error(
         "{}",
-        format_string_literal_expected_enum(user_typed, attribute.as_deref(), type_name, expected, extra_message.as_deref())
+        ProviderText::new(format_string_literal_expected_enum(user_typed, attribute.as_deref(), type_name, expected, extra_message.as_deref()))
     )]
     StringLiteralExpectedEnum {
         /// The string the user typed between the quotes, or a secret mask.
@@ -7311,11 +7324,11 @@ pub enum TypeError {
         /// path, where the validator does not enumerate variants. When
         /// `expected` is non-empty, this field is silently ignored by
         /// the renderer; callers should not set both at once.
-        extra_message: Option<String>,
+        extra_message: Option<ProviderText>,
     },
 
     #[error("Validation failed: {message}")]
-    ValidationFailed { message: String },
+    ValidationFailed { message: ProviderText },
 
     #[error("{error}")]
     CustomTypeValidation {
@@ -7325,27 +7338,30 @@ pub enum TypeError {
 
     #[error("Resource validation failed: {message}")]
     ResourceValidationFailed {
-        message: String,
+        message: ProviderText,
         /// Optional attribute name for precise diagnostic positioning.
         attribute: Option<String>,
     },
 
-    #[error("Required attribute '{name}' is missing")]
+    #[error("Required attribute '{}' is missing", ProviderText::new(name))]
     MissingRequired { name: String },
 
-    #[error("{}", format_field_group_violation(path, group))]
+    #[error("{}", ProviderText::new(format_field_group_violation(path, group)))]
     FieldGroupViolation { path: FieldPath, group: FieldGroup },
 
-    #[error("Attribute '{name}' is populated by the provider and cannot be set")]
+    #[error(
+        "Attribute '{}' is populated by the provider and cannot be set",
+        ProviderText::new(name)
+    )]
     ReadOnlyAttribute { name: String },
 
-    #[error("Unknown attribute '{name}'{}", suggestion.as_ref().map(|s| format!(", did you mean '{}'?", s)).unwrap_or_default())]
+    #[error("Unknown attribute '{}'{}", ProviderText::new(name), suggestion.as_ref().map(|s| format!(", did you mean '{}'?", ProviderText::new(s))).unwrap_or_default())]
     UnknownAttribute {
         name: String,
         suggestion: Option<String>,
     },
 
-    #[error("Unknown field '{field}' in {struct_name}{}", suggestion.as_ref().map(|s| format!(", did you mean '{}'?", s)).unwrap_or_default())]
+    #[error("Unknown field '{}' in {}{}", ProviderText::new(field), ProviderText::new(struct_name), suggestion.as_ref().map(|s| format!(", did you mean '{}'?", ProviderText::new(s))).unwrap_or_default())]
     UnknownStructField {
         struct_name: String,
         field: String,
@@ -7354,7 +7370,7 @@ pub enum TypeError {
 
     #[error(
         "{}",
-        format_union_struct_mismatch(reason, supplied_fields, alternatives)
+        ProviderText::new(format_union_struct_mismatch(reason, supplied_fields, alternatives))
     )]
     UnionStructMismatch {
         /// Classification consumed by the concise renderer.
@@ -7374,19 +7390,22 @@ pub enum TypeError {
     #[error("List item at index {index}: {inner}")]
     ListItemError { index: usize, inner: Box<TypeError> },
 
-    #[error("Map key '{key}': {inner}")]
+    #[error("Map key '{}': {inner}", ProviderText::new(key))]
     MapKeyError { key: String, inner: Box<TypeError> },
 
-    #[error("Map value for key '{key}': {inner}")]
+    #[error("Map value for key '{}': {inner}", ProviderText::new(key))]
     MapValueError { key: String, inner: Box<TypeError> },
 
-    #[error("Struct field '{field}': {inner}")]
+    #[error("Struct field '{}': {inner}", ProviderText::new(field))]
     StructFieldError {
         field: String,
         inner: Box<TypeError>,
     },
 
-    #[error("'{attribute}' cannot use block syntax; use map assignment: {attribute} = {{ ... }}")]
+    #[error(
+        "'{0}' cannot use block syntax; use map assignment: {0} = {{ ... }}",
+        ProviderText::new(attribute)
+    )]
     BlockSyntaxNotAllowed { attribute: String },
 }
 
@@ -7567,10 +7586,10 @@ impl TypeError {
                 attribute,
                 type_name,
                 expected,
-                extra_message: extra_message.map(|_| MASKED_MESSAGE.to_string()),
+                extra_message: extra_message.map(|_| MASKED_MESSAGE.into()),
             },
             TypeError::ValidationFailed { .. } => TypeError::ValidationFailed {
-                message: MASKED_MESSAGE.to_string(),
+                message: MASKED_MESSAGE.into(),
             },
             TypeError::CustomTypeValidation { error, attribute } => {
                 TypeError::CustomTypeValidation {
@@ -7580,7 +7599,7 @@ impl TypeError {
             }
             TypeError::ResourceValidationFailed { attribute, .. } => {
                 TypeError::ResourceValidationFailed {
-                    message: MASKED_MESSAGE.to_string(),
+                    message: MASKED_MESSAGE.into(),
                     attribute,
                 }
             }
@@ -7892,7 +7911,7 @@ pub struct CompletionValue {
     /// The value to insert (e.g., "aws.vpc.InstanceTenancy.default")
     pub value: String,
     /// Description shown in completion popup
-    pub description: String,
+    pub description: ProviderText,
 }
 
 /// Canonical name of a field in a struct-valued schema node.
@@ -7951,7 +7970,7 @@ impl CompletionValue {
     pub fn new(value: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
             value: value.into(),
-            description: description.into(),
+            description: ProviderText::new(description),
         }
     }
 }
@@ -8033,7 +8052,7 @@ pub struct PatternAttributeSchema<R: PatternForm = Draft> {
     /// Whether user input for this attribute is optional, required, or forbidden.
     pub(crate) input_mode: InputMode,
     pub(crate) default: Option<Value>,
-    pub(crate) description: Option<String>,
+    pub(crate) description: Option<ProviderText>,
     /// Completion values for this attribute (used by LSP)
     pub(crate) completions: Option<Vec<CompletionValue>>,
     /// Provider-side property name (e.g., "VpcId" for AWS Cloud Control)
@@ -8283,7 +8302,7 @@ macro_rules! impl_user_input_attribute_builder {
             }
 
             pub fn with_description(mut self, description: impl Into<String>) -> Self {
-                self.attribute.description = Some(description.into());
+                self.attribute.description = Some(ProviderText::new(description));
                 self
             }
 
@@ -8389,7 +8408,7 @@ impl<R: PatternForm> CreateOnlyOptionalAttributeSchemaBuilder<R> {
 
 impl<R: PatternForm> ProviderPopulatedAttributeSchemaBuilder<R> {
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
-        self.attribute.description = Some(description.into());
+        self.attribute.description = Some(ProviderText::new(description));
         self
     }
 
@@ -8430,16 +8449,23 @@ pub enum SchemaKind {
 pub enum AttributePathTypeError {
     #[error("attribute path cannot be empty")]
     Empty,
-    #[error("unknown top-level attribute `{attribute}`")]
+    #[error("unknown top-level attribute `{}`", ProviderText::new(attribute))]
     UnknownAttribute { attribute: String },
-    #[error("unknown field `{field}` on struct `{struct_name}` after `{parent_path}`")]
+    #[error(
+        "unknown field `{}` on struct `{}` after `{}`",
+        ProviderText::new(field),
+        ProviderText::new(struct_name),
+        ProviderText::new(parent_path)
+    )]
     UnknownStructField {
         parent_path: String,
         field: String,
         struct_name: String,
     },
     #[error(
-        "cannot traverse `{path}` because it has type {type_name}; only struct fields and map values can be traversed"
+        "cannot traverse `{}` because it has type {}; only struct fields and map values can be traversed",
+        ProviderText::new(path),
+        ProviderText::new(type_name)
     )]
     CannotTraverse { path: String, type_name: String },
 }
@@ -8544,7 +8570,7 @@ pub struct PatternResourceSchema<R: PatternForm = Draft> {
     pub(crate) resource_type: String,
     pub(crate) attributes: BTreeMap<String, PatternAttributeSchema<R>>,
     duplicate_attributes: Vec<String>,
-    pub(crate) description: Option<String>,
+    pub(crate) description: Option<ProviderText>,
     /// Cross-attribute validation, including its fingerprintable source.
     pub(crate) validation: ResourceValidation,
     /// Whether this is a managed resource or a data source.
@@ -8627,18 +8653,28 @@ impl ResourceValidation {
 /// `field_groups[0]` or `defs.Tag.key` as a resource attribute.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SchemaValidationIssueLocation {
-    Attribute(String),
-    Definition(String),
+    Attribute(ProviderString),
+    Definition(ProviderString),
     FieldGroup(usize),
     UniqueName,
     DefaultPreventDestroy,
 }
 
 impl SchemaValidationIssueLocation {
+    fn raw_path(&self) -> String {
+        match self {
+            Self::Attribute(path) => path.as_str().to_owned(),
+            Self::Definition(path) => format!("defs.{}", path.as_str()),
+            Self::FieldGroup(index) => format!("field_groups[{index}]"),
+            Self::UniqueName => "unique_name".into(),
+            Self::DefaultPreventDestroy => "default_prevent_destroy".into(),
+        }
+    }
+
     fn with_suffix(&self, suffix: impl fmt::Display) -> Self {
         match self {
-            Self::Attribute(path) => Self::Attribute(format!("{path}{suffix}")),
-            Self::Definition(path) => Self::Definition(format!("{path}{suffix}")),
+            Self::Attribute(path) => Self::Attribute(format!("{}{suffix}", path.as_str()).into()),
+            Self::Definition(path) => Self::Definition(format!("{}{suffix}", path.as_str()).into()),
             Self::FieldGroup(_) | Self::UniqueName | Self::DefaultPreventDestroy => {
                 unreachable!("schema-level issue locations cannot have type-path descendants")
             }
@@ -8647,7 +8683,7 @@ impl SchemaValidationIssueLocation {
 
     pub fn attribute_path(&self) -> Option<&str> {
         match self {
-            Self::Attribute(path) => Some(path),
+            Self::Attribute(path) => Some(path.as_str()),
             Self::Definition(_)
             | Self::FieldGroup(_)
             | Self::UniqueName
@@ -8659,7 +8695,7 @@ impl SchemaValidationIssueLocation {
 impl fmt::Display for SchemaValidationIssueLocation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Attribute(path) => f.write_str(path),
+            Self::Attribute(path) => write!(f, "{path}"),
             Self::Definition(path) => write!(f, "defs.{path}"),
             Self::FieldGroup(index) => write!(f, "field_groups[{index}]"),
             Self::UniqueName => f.write_str("unique_name"),
@@ -8672,8 +8708,8 @@ impl fmt::Display for SchemaValidationIssueLocation {
 struct SchemaDefinitionIssue {
     pattern_error: Option<PatternCompileError>,
     location: SchemaValidationIssueLocation,
-    path: String,
-    message: String,
+    path: ProviderString,
+    message: ProviderText,
 }
 
 impl fmt::Display for SchemaDefinitionIssue {
@@ -8695,7 +8731,7 @@ fn fmt_schema_issues(issues: &[SchemaDefinitionIssue], f: &mut fmt::Formatter<'_
 /// Error returned when a resource-schema draft fails whole-schema validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceSchemaValidationError {
-    resource_type: String,
+    resource_type: ProviderString,
     issues: Vec<SchemaDefinitionIssue>,
 }
 
@@ -9603,7 +9639,7 @@ fn config_definition_issues(
     let mut visited_definitions = HashSet::new();
     let mut identified_kinds = HashMap::new();
     for (name, attr_type) in attribute_types {
-        let location = SchemaValidationIssueLocation::Attribute(name.clone());
+        let location = SchemaValidationIssueLocation::Attribute(name.clone().into());
         validate_type_definition(
             attr_type,
             &defs,
@@ -9637,7 +9673,7 @@ impl ValidatedConfigSchema {
         let attribute_types = compile_schema::compile_all(attribute_types, |(name, attr_type)| {
             attr_type
                 .compile_patterns(
-                    SchemaValidationIssueLocation::Attribute(name.clone()),
+                    SchemaValidationIssueLocation::Attribute(name.clone().into()),
                     &mut issues,
                 )
                 .map(|attr_type| (name, attr_type))
@@ -9756,12 +9792,14 @@ impl fmt::Display for ProviderSchemaValidationError {
         match self {
             Self::BuiltinTypeCollision { identity } => write!(
                 formatter,
-                "custom type `{identity}` conflicts with the built-in declaration; use the core types constructor (including its scalar kind and validator) or choose a different identity"
+                "custom type `{identity}` conflicts with the built-in declaration; use the core types constructor (including its scalar kind and validator) or choose a different identity",
+                identity = ProviderText::new(identity.to_string())
             ),
             Self::MissingScalarKind { identity } => {
                 write!(
                     formatter,
-                    "custom type `{identity}` has no scalar bridge kind"
+                    "custom type `{identity}` has no scalar bridge kind",
+                    identity = ProviderText::new(identity.to_string())
                 )
             }
             Self::ConflictingScalarKinds {
@@ -9770,18 +9808,21 @@ impl fmt::Display for ProviderSchemaValidationError {
                 second_kind,
             } => write!(
                 formatter,
-                "custom type `{identity}` is bound to both {first_kind} and {second_kind} within one provider"
+                "custom type `{identity}` is bound to both {first_kind} and {second_kind} within one provider",
+                identity = ProviderText::new(identity.to_string())
             ),
             Self::DanglingReferenceForm { identity } => write!(
                 formatter,
-                "reference form identity `{identity}` is not declared by this provider"
+                "reference form identity `{identity}` is not declared by this provider",
+                identity = ProviderText::new(identity.to_string())
             ),
             Self::NonStringReferenceForm {
                 identity,
                 declaration,
             } => write!(
                 formatter,
-                "reference form identity `{identity}` is declared as {declaration}, not refined String"
+                "reference form identity `{identity}` is declared as {declaration}, not refined String",
+                identity = ProviderText::new(identity.to_string())
             ),
         }
     }
@@ -10153,9 +10194,9 @@ fn push_schema_issue(
 ) {
     issues.push(SchemaDefinitionIssue {
         pattern_error: None,
-        path: location.to_string(),
+        path: location.raw_path().into(),
         location: location.clone(),
-        message: message.into(),
+        message: ProviderText::new(message),
     });
 }
 
@@ -10956,7 +10997,7 @@ fn validate_tags_key_value(attributes: &HashMap<String, Value>) -> Result<(), Ve
             }
             if has_key && has_value {
                 return Err(vec![TypeError::ResourceValidationFailed {
-                    message: "tags map contains both 'key' and 'value' as keys, which looks like a Key/Value pair list. Use flat map syntax instead: tags = { Name = '...' }".to_string(),
+                    message: "tags map contains both 'key' and 'value' as keys, which looks like a Key/Value pair list. Use flat map syntax instead: tags = { Name = '...' }".into(),
                     attribute: Some("tags".to_string()),
                 }]);
             }
@@ -11661,7 +11702,7 @@ impl<R: PatternForm> PatternResourceSchema<R> {
     }
 
     pub fn with_description(mut self, desc: impl Into<String>) -> Self {
-        self.description = Some(desc.into());
+        self.description = Some(ProviderText::new(desc));
         self
     }
 
@@ -11919,7 +11960,9 @@ impl fmt::Display for BlockNameConflict {
         write!(
             f,
             "{}: cannot use both '{}' and '{}' (they refer to the same attribute)",
-            self.resource_id, self.alias, self.canonical
+            ProviderText::new(&self.resource_id),
+            ProviderText::new(&self.alias),
+            ProviderText::new(&self.canonical)
         )
     }
 }
@@ -13999,7 +14042,8 @@ impl fmt::Display for SchemaRegistryError {
                 incoming: _incoming,
             } => write!(
                 formatter,
-                "schema owner `{owner}` has conflicting witness-backed reference-form tables"
+                "schema owner `{}` has conflicting witness-backed reference-form tables",
+                ProviderText::new(owner)
             ),
         }
     }
@@ -14264,7 +14308,7 @@ impl PatternResourceSchema<Draft> {
         }
 
         for name in &self.duplicate_attributes {
-            let location = SchemaValidationIssueLocation::Attribute(name.clone());
+            let location = SchemaValidationIssueLocation::Attribute(name.clone().into());
             push_schema_issue(
                 issues,
                 &location,
@@ -14273,7 +14317,7 @@ impl PatternResourceSchema<Draft> {
         }
 
         for (name, attribute) in &self.attributes {
-            let location = SchemaValidationIssueLocation::Attribute(name.clone());
+            let location = SchemaValidationIssueLocation::Attribute(name.clone().into());
             validate_attribute_mode(attribute, &location, issues);
             if attribute.identity_mode.is_identity()
                 && identity_leaf_is_scalar_or_enum(
@@ -14328,7 +14372,7 @@ impl PatternResourceSchema<Draft> {
         for (name, definition) in &self.defs {
             validate_identified_scalar_kind_consistency(
                 definition,
-                SchemaValidationIssueLocation::Definition(name.clone()),
+                SchemaValidationIssueLocation::Definition(name.clone().into()),
                 &mut identified_kinds,
                 issues,
             );
@@ -14338,7 +14382,7 @@ impl PatternResourceSchema<Draft> {
             validate_type_definition(
                 definition,
                 &self.defs,
-                SchemaValidationIssueLocation::Definition(name.clone()),
+                SchemaValidationIssueLocation::Definition(name.clone().into()),
                 None,
                 &mut visited_definitions,
                 issues,
@@ -14372,8 +14416,7 @@ impl PatternResourceSchema<Draft> {
         }
 
         if let Some(conflict) = self.first_write_only_conflict() {
-            let location =
-                SchemaValidationIssueLocation::Attribute(conflict.attribute().to_string());
+            let location = SchemaValidationIssueLocation::Attribute(conflict.attribute().into());
             push_schema_issue(issues, &location, conflict.message());
         }
 
@@ -14381,7 +14424,7 @@ impl PatternResourceSchema<Draft> {
             type_create_only_analysis(&attribute.attr_type, &self.defs, &mut Vec::new())
                 .union_conflict
         }) {
-            let location = SchemaValidationIssueLocation::Attribute(name.clone());
+            let location = SchemaValidationIssueLocation::Attribute(name.clone().into());
             push_schema_issue(
                 issues,
                 &location,
@@ -14420,7 +14463,7 @@ fn finish_resource_schema_validation(
             })
         }
         _ => Err(ResourceSchemaValidationError {
-            resource_type,
+            resource_type: resource_type.into(),
             issues,
         }),
     }

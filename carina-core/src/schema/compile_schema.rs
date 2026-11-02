@@ -34,9 +34,9 @@ impl PatternAttributeType<Draft> {
                         Ok(pattern) => Some(pattern),
                         Err(error) => {
                             issues.push(SchemaDefinitionIssue {
-                                path: location.to_string(),
+                                path: location.raw_path().into(),
                                 location,
-                                message: error.to_string(),
+                                message: error.to_string().into(),
                                 pattern_error: Some(error),
                             });
                             return None;
@@ -58,9 +58,9 @@ impl PatternAttributeType<Draft> {
                         Ok(pattern) => Some(pattern),
                         Err(error) => {
                             issues.push(SchemaDefinitionIssue {
-                                path: location.to_string(),
+                                path: location.raw_path().into(),
                                 location,
-                                message: error.to_string(),
+                                message: error.to_string().into(),
                                 pattern_error: Some(error),
                             });
                             return None;
@@ -201,7 +201,7 @@ impl PatternAttributeSchema<Draft> {
             deferred_populate,
         } = self;
         let attr_type = attr_type.compile_patterns(
-            SchemaValidationIssueLocation::Attribute(name.clone()),
+            SchemaValidationIssueLocation::Attribute(name.clone().into()),
             issues,
         )?;
         Some(PatternAttributeSchema {
@@ -247,7 +247,7 @@ impl PatternResourceSchema<Draft> {
             attr.compile_patterns(issues).map(|attr| (name, attr))
         });
         let defs = compile_all(defs, |(name, ty)| {
-            let location = SchemaValidationIssueLocation::Definition(name.clone());
+            let location = SchemaValidationIssueLocation::Definition(name.clone().into());
             ty.compile_patterns(location, issues).map(|ty| (name, ty))
         });
         Some(PatternResourceSchema {

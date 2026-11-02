@@ -8,6 +8,22 @@ use std::sync::{Arc, Mutex};
 
 type TableResult = Result<wire::ReferenceOutcome, wire::ReferenceError>;
 
+#[test]
+fn provider_text_reference_plan_context_sanitizes_raw_path_and_value() {
+    let raw = format!("path\x1b[2J\u{9b}{}", "x".repeat(20 * 1024));
+    let error = ReferencePlanError {
+        instance: ProviderInstanceKey::new("test", None),
+        resource: crate::resource::ResourceId::with_identity("test.Widget", "example"),
+        path: raw.clone(),
+        raw: raw.clone().into(),
+        source: ReferenceFailure::MissingWitness,
+    };
+    let rendered = error.to_string();
+    assert!(!rendered.contains(['\x1b', '\u{9b}']));
+    assert!(rendered.len() <= crate::provider_text::MAX_PROVIDER_TEXT_BYTES);
+    assert_eq!(error.path, raw);
+}
+
 struct TableProvider {
     table: HashMap<String, TableResult>,
     calls: Arc<Mutex<Vec<Vec<ReferenceRequest>>>>,

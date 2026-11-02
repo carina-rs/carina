@@ -545,6 +545,7 @@ impl std::error::Error for StateBucketCreateError {
 #[derive(Debug)]
 pub struct StateBucketSeedError {
     identifier: String,
+    identifier_label: carina_core::provider_text::ProviderText,
     resource_address: String,
     source: BackendError,
 }
@@ -552,6 +553,7 @@ pub struct StateBucketSeedError {
 impl StateBucketSeedError {
     pub fn new(identifier: String, resource_address: String, source: BackendError) -> Self {
         Self {
+            identifier_label: carina_core::provider_text::ProviderText::new(&identifier),
             identifier,
             resource_address,
             source,
@@ -560,6 +562,13 @@ impl StateBucketSeedError {
 
     pub fn identifier(&self) -> &str {
         &self.identifier
+    }
+
+    pub fn identifier_literal(&self) -> carina_core::value::RenderedValue {
+        let value: carina_core::resource::Value = carina_core::resource::Value::Concrete(
+            carina_core::resource::ConcreteValue::String(self.identifier.as_str().into()),
+        );
+        carina_core::value::render_value(&value)
     }
 
     pub fn resource_address(&self) -> &str {
@@ -572,7 +581,7 @@ impl std::fmt::Display for StateBucketSeedError {
         write!(
             f,
             "State bucket '{}' was created but could not be recorded in state, so it exists outside state. Add the following import block to the configuration and re-run apply to record it:",
-            self.identifier
+            self.identifier_label
         )
     }
 }
@@ -836,7 +845,8 @@ fn parse_account_guard_clause(msg: &str, kind: &str) -> Option<AccountGuardClaus
 #[derive(Debug, thiserror::Error)]
 pub enum SavedPlanSecretVerificationError {
     #[error(
-        "Saved-plan secret is unavailable at {location}: {error}; re-run `{replan}` after restoring its value."
+        "Saved-plan secret is unavailable at {location}: {error}; re-run `{replan}` after restoring its value.",
+        location = carina_core::provider_text::ProviderText::new(location)
     )]
     UnavailableSecret {
         location: String,
@@ -845,12 +855,14 @@ pub enum SavedPlanSecretVerificationError {
     },
 
     #[error(
-        "Saved-plan secret verification failed at {location}: the secret changed since the plan was created; re-run `{replan}`."
+        "Saved-plan secret verification failed at {location}: the secret changed since the plan was created; re-run `{replan}`.",
+        location = carina_core::provider_text::ProviderText::new(location)
     )]
     HashMismatch { location: String, replan: String },
 
     #[error(
-        "Saved-plan secret verification failed at {location}: the configuration changed and the recorded secret position no longer exists; re-run `{replan}`."
+        "Saved-plan secret verification failed at {location}: the configuration changed and the recorded secret position no longer exists; re-run `{replan}`.",
+        location = carina_core::provider_text::ProviderText::new(location)
     )]
     ConfigurationChanged { location: String, replan: String },
 
@@ -863,17 +875,20 @@ pub enum SavedPlanSecretVerificationError {
     },
 
     #[error(
-        "Saved-plan secret verification failed at {location}: the current secret could not be evaluated (for example, an environment variable or decryption key may be unavailable); re-run `{replan}` after restoring the required inputs."
+        "Saved-plan secret verification failed at {location}: the current secret could not be evaluated (for example, an environment variable or decryption key may be unavailable); re-run `{replan}` after restoring the required inputs.",
+        location = carina_core::provider_text::ProviderText::new(location)
     )]
     SecretEvaluationUnavailable { location: String, replan: String },
 
     #[error(
-        "Saved-plan secret verification failed because orphan resource {resource} no longer exists; re-run `{replan}`."
+        "Saved-plan secret verification failed because orphan resource {resource} no longer exists; re-run `{replan}`.",
+        resource = carina_core::provider_text::ProviderText::new(resource)
     )]
     OrphanVanished { resource: String, replan: String },
 
     #[error(
-        "Saved-plan secret verification failed at {location}: the current secret could not be encoded for verification: {error}; re-run `{replan}`."
+        "Saved-plan secret verification failed at {location}: the current secret could not be encoded for verification: {error}; re-run `{replan}`.",
+        location = carina_core::provider_text::ProviderText::new(location)
     )]
     Serialization {
         location: String,
@@ -1150,7 +1165,7 @@ pub enum AppError {
     )]
     SourceProviderKindMismatch {
         configured: String,
-        loaded: String,
+        loaded: carina_core::provider_text::ProviderText,
         provider_source: String,
     },
 
@@ -1529,6 +1544,71 @@ impl From<&str> for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_text_saved_plan_secret_error_locations_are_display_only() {
+        let raw = format!("state.\x1b[2J\x07\u{9b}{}", "x".repeat(20 * 1024));
+        let secret: carina_core::resource::Value =
+            carina_core::resource::Value::Deferred(carina_core::resource::DeferredValue::Secret(
+                Box::new(carina_core::resource::Value::Concrete(
+                    carina_core::resource::ConcreteValue::String("private".into()),
+                )),
+            ));
+        let snapshot = carina_core::value::redact_secrets_in_value(&secret).unwrap();
+        let unavailable = snapshot.to_value_at(&raw).unwrap_err();
+        let replan = "carina plan".to_string();
+        for error in [
+            SavedPlanSecretVerificationError::UnavailableSecret {
+                location: raw.clone(),
+                replan: replan.clone(),
+                error: unavailable.clone(),
+            },
+            SavedPlanSecretVerificationError::HashMismatch {
+                location: raw.clone(),
+                replan: replan.clone(),
+            },
+            SavedPlanSecretVerificationError::ConfigurationChanged {
+                location: raw.clone(),
+                replan: replan.clone(),
+            },
+            SavedPlanSecretVerificationError::SecretEvaluationUnavailable {
+                location: raw.clone(),
+                replan: replan.clone(),
+            },
+            SavedPlanSecretVerificationError::OrphanVanished {
+                resource: raw.clone(),
+                replan: replan.clone(),
+            },
+            SavedPlanSecretVerificationError::Serialization {
+                location: raw.clone(),
+                replan,
+                error: carina_core::value::SerializationError::UnavailableSecret(unavailable),
+            },
+        ] {
+            assert!(!error.to_string().contains(['\x1b', '\x07', '\u{9b}']));
+            assert!(error.to_string().contains("truncated,"));
+        }
+    }
+
+    #[test]
+    fn provider_text_state_bucket_seed_error_preserves_identifier_data_and_source() {
+        let raw = format!("\x1b[2J\x07{}", "x".repeat(20 * 1024));
+        let error = StateBucketSeedError::new(
+            raw.clone(),
+            "test.bucket 'state'".into(),
+            BackendError::Configuration("write failed".into()),
+        );
+        assert_eq!(error.identifier(), raw);
+        assert!(!error.to_string().contains(['\x1b', '\x07']));
+        assert!(
+            error.identifier_label.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES
+        );
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .is::<BackendError>()
+        );
+    }
 
     #[test]
     fn deferred_loop_expansion_preserves_unavailable_secret_error() {

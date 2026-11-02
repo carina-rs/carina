@@ -158,7 +158,7 @@ pub type SnapshotValue<P = NoPlaceholder, B = AbsoluteBindingAddress> = Value<Sn
 
 /// An opaque historical secret was selected where its value is required.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
-#[error("secret value unavailable at {path}")]
+#[error("secret value unavailable at {path}", path = crate::provider_text::ProviderText::new(path))]
 pub struct UnavailableSecretError {
     path: String,
 }

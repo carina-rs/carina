@@ -334,7 +334,7 @@ impl EnumValueResolver<'_, Compiled> {
             && let Err(message) = validate_enum_namespace(text, identity)
         {
             return Err(TypeError::ValidationFailed {
-                message: format!("Invalid {} '{}': {}", identity.kind, text, message),
+                message: format!("Invalid {} '{}': {}", identity.kind, text, message).into(),
             });
         }
 
@@ -927,7 +927,7 @@ mod tests {
             vec![],
             Some(validator(|_| {
                 Err(TypeError::ValidationFailed {
-                    message: "no".to_string(),
+                    message: "no".into(),
                 })
             })),
             None,

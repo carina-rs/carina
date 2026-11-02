@@ -22,6 +22,7 @@
 //! let _ = config_schema_to_protocol(&draft);
 //! ```
 
+use crate::provider_text::{ProviderString, ProviderText};
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
@@ -68,7 +69,7 @@ fn protocol_to_field_group(group: &protocol::FieldGroup) -> Result<FieldGroup, S
         protocol::FieldGroupKind::AtMostOne => FieldGroupKind::AtMostOne,
     };
     FieldGroup::new(kind, group.fields.clone()).map_err(|error| SchemaDecodeError::InvalidSchema {
-        detail: "field group is invalid".to_string(),
+        detail: "field group is invalid".into(),
         resource_type: None,
         attribute_path: Vec::new(),
         schema_issue_location: None,
@@ -79,10 +80,55 @@ fn protocol_to_field_group(group: &protocol::FieldGroup) -> Result<FieldGroup, S
 /// A key or index locating a nested value in a provider input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WirePathSegment {
-    Key(String),
+    Key(WirePathKey),
     Index(usize),
     /// The failing value is inside an opaque secret; its inner path is hidden.
     Secret,
+}
+
+/// A value's map key retained for secret-path traversal, with a separate safe
+/// diagnostic spelling. Sanitizing diagnostic text must not change data lookup.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WirePathKey {
+    key: String,
+    diagnostic: ProviderText,
+}
+
+impl fmt::Debug for WirePathKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.diagnostic.as_str(), f)
+    }
+}
+
+impl WirePathKey {
+    pub fn as_str(&self) -> &str {
+        self.diagnostic.as_str()
+    }
+
+    pub(crate) fn lookup_key(&self) -> &str {
+        &self.key
+    }
+}
+
+impl From<String> for WirePathKey {
+    fn from(key: String) -> Self {
+        Self {
+            diagnostic: ProviderText::new(&key),
+            key,
+        }
+    }
+}
+
+impl From<&str> for WirePathKey {
+    fn from(key: &str) -> Self {
+        key.to_string().into()
+    }
+}
+
+impl fmt::Display for WirePathKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.diagnostic.fmt(f)
+    }
 }
 
 /// A core value or type cannot be represented by the provider protocol.
@@ -127,7 +173,7 @@ pub enum ProtocolConvertError {
         base_kind: &'static str,
     },
     Context {
-        context: String,
+        context: ProviderText,
         source: Box<ProtocolConvertError>,
     },
     ValuePath {
@@ -162,33 +208,40 @@ impl fmt::Display for ProtocolConvertError {
             ),
             Self::OpenEnumWithoutNamespace { identity } => write!(
                 formatter,
-                "open enum `{identity}` has no namespace for the protocol CustomEnum record"
+                "open enum `{identity}` has no namespace for the protocol CustomEnum record",
+                identity = ProviderText::new(identity.to_string())
             ),
             Self::OpenEnumWithAliases { identity } => write!(
                 formatter,
-                "open enum `{identity}` carries DSL aliases that CustomEnum cannot represent"
+                "open enum `{identity}` carries DSL aliases that CustomEnum cannot represent",
+                identity = ProviderText::new(identity.to_string())
             ),
             Self::EmptyCustomEnumNamespace { name } => write!(
                 formatter,
-                "protocol CustomEnum `{name}` must have a non-empty namespace"
+                "protocol CustomEnum `{}` must have a non-empty namespace",
+                ProviderText::new(name)
             ),
             Self::ClosedEnumWithTransform { identity } => write!(
                 formatter,
-                "closed enum `{identity}` carries a DSL transform that StringEnum cannot represent"
+                "closed enum `{identity}` carries a DSL transform that StringEnum cannot represent",
+                identity = ProviderText::new(identity.to_string())
             ),
             Self::ClosedEnumUnsupportedBase {
                 identity,
                 base_kind,
             } => write!(
                 formatter,
-                "closed enum `{identity}` has {base_kind} base metadata that StringEnum cannot represent"
+                "closed enum `{identity}` has {base_kind} base metadata that StringEnum cannot represent",
+                identity = ProviderText::new(identity.to_string()),
+                base_kind = ProviderText::new(base_kind)
             ),
             Self::LegacyCustomUnsupportedBase {
                 identity,
                 base_kind,
             } => write!(
                 formatter,
-                "legacy Custom `{identity}` has {base_kind} base metadata that core cannot preserve with the enclosing identity"
+                "legacy Custom `{identity}` has {base_kind} base metadata that core cannot preserve with the enclosing identity",
+                identity = ProviderText::new(identity.to_string())
             ),
             Self::LegacyCustomUnsupportedMetadata {
                 identity,
@@ -196,7 +249,8 @@ impl fmt::Display for ProtocolConvertError {
                 base_kind,
             } => write!(
                 formatter,
-                "legacy Custom `{identity}` carries `{field}` metadata that a {base_kind} base cannot represent"
+                "legacy Custom `{identity}` carries `{field}` metadata that a {base_kind} base cannot represent",
+                identity = ProviderText::new(identity.to_string())
             ),
             Self::Context {
                 context,
@@ -294,7 +348,7 @@ impl ProtocolConvertError {
 
     fn context(self, context: impl Into<String>) -> Self {
         Self::Context {
-            context: context.into(),
+            context: ProviderText::new(context),
             source: Box::new(self),
         }
     }
@@ -304,9 +358,9 @@ impl ProtocolConvertError {
 #[derive(Debug)]
 pub enum SchemaDecodeError {
     InvalidSchema {
-        detail: String,
-        resource_type: Option<String>,
-        attribute_path: Vec<String>,
+        detail: ProviderText,
+        resource_type: Option<ProviderString>,
+        attribute_path: Vec<ProviderString>,
         schema_issue_location: Option<Box<SchemaValidationIssueLocation>>,
         source: Option<Box<dyn Error + Send + Sync>>,
     },
@@ -319,7 +373,7 @@ pub enum SchemaDecodeError {
 impl SchemaDecodeError {
     fn new(detail: impl Into<String>) -> Self {
         Self::InvalidSchema {
-            detail: detail.into(),
+            detail: ProviderText::new(detail),
             resource_type: None,
             attribute_path: Vec::new(),
             schema_issue_location: None,
@@ -329,7 +383,7 @@ impl SchemaDecodeError {
 
     fn from_default(error: ProtocolConvertError) -> Self {
         Self::InvalidSchema {
-            detail: "schema default value conversion error".to_string(),
+            detail: "schema default value conversion error".into(),
             resource_type: None,
             attribute_path: Vec::new(),
             schema_issue_location: None,
@@ -339,7 +393,7 @@ impl SchemaDecodeError {
 
     fn config_schema_validation(error: ConfigSchemaValidationError) -> Self {
         Self::InvalidSchema {
-            detail: "provider config schema is invalid".to_string(),
+            detail: "provider config schema is invalid".into(),
             resource_type: None,
             attribute_path: Vec::new(),
             schema_issue_location: None,
@@ -356,8 +410,8 @@ impl SchemaDecodeError {
             .next()
             .map(|(location, _message)| location.clone());
         Self::InvalidSchema {
-            detail: "resource schema is invalid".to_string(),
-            resource_type: Some(resource_type.to_string()),
+            detail: "resource schema is invalid".into(),
+            resource_type: Some(resource_type.into()),
             attribute_path: Vec::new(),
             schema_issue_location: schema_issue_location.map(Box::new),
             source: Some(Box::new(error)),
@@ -404,7 +458,7 @@ impl SchemaDecodeError {
 
     fn empty_custom_enum_namespace(name: &str) -> Self {
         Self::InvalidSchema {
-            detail: "custom enum namespace is invalid".to_string(),
+            detail: "custom enum namespace is invalid".into(),
             resource_type: None,
             attribute_path: Vec::new(),
             schema_issue_location: None,
@@ -422,7 +476,7 @@ impl SchemaDecodeError {
 
     fn protocol(error: ProtocolConvertError, detail: &'static str) -> Self {
         Self::InvalidSchema {
-            detail: detail.to_string(),
+            detail: detail.into(),
             resource_type: None,
             attribute_path: Vec::new(),
             schema_issue_location: None,
@@ -455,7 +509,7 @@ impl SchemaDecodeError {
                 schema_issue_location: _schema_issue_location,
                 source: _source,
             } => {
-                attribute_path.insert(0, name.to_string());
+                attribute_path.insert(0, name.into());
             }
             Self::DuplicateReferenceForm { identity: _ } | Self::InvalidProviderSchema(_) => {}
         }
@@ -471,12 +525,14 @@ impl SchemaDecodeError {
                 schema_issue_location,
                 source: _source,
             } => {
-                let path = std::iter::once(name.to_string())
+                let path = std::iter::once(ProviderString::from(name))
                     .chain(attribute_path.drain(..))
+                    .map(ProviderString::into_string)
                     .collect::<Vec<_>>()
                     .join(".");
-                *schema_issue_location =
-                    Some(Box::new(SchemaValidationIssueLocation::Definition(path)));
+                *schema_issue_location = Some(Box::new(SchemaValidationIssueLocation::Definition(
+                    path.into(),
+                )));
             }
             Self::DuplicateReferenceForm { identity: _ } | Self::InvalidProviderSchema(_) => {}
         }
@@ -491,7 +547,7 @@ impl SchemaDecodeError {
                 attribute_path: _attribute_path,
                 schema_issue_location: _schema_issue_location,
                 source: _source,
-            } => *current = Some(resource_type.to_string()),
+            } => *current = Some(resource_type.into()),
             Self::DuplicateReferenceForm { identity: _ } | Self::InvalidProviderSchema(_) => {}
         }
         self
@@ -511,12 +567,26 @@ impl fmt::Display for SchemaDecodeError {
                 if let Some(resource_type) = resource_type {
                     write!(formatter, "resource '{resource_type}'")?;
                     if !attribute_path.is_empty() {
-                        write!(formatter, " attribute '{}'", attribute_path.join("."))?;
+                        write!(
+                            formatter,
+                            " attribute '{}'",
+                            ProviderText::new(
+                                attribute_path
+                                    .iter()
+                                    .map(ProviderString::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join(".")
+                            )
+                        )?;
                     } else if let Some(attribute_path) = schema_issue_location
                         .as_deref()
                         .and_then(SchemaValidationIssueLocation::attribute_path)
                     {
-                        write!(formatter, " attribute '{attribute_path}'")?;
+                        write!(
+                            formatter,
+                            " attribute '{}'",
+                            ProviderText::new(attribute_path)
+                        )?;
                     }
                     formatter.write_str(": ")?;
                     if let Some(location) = schema_issue_location
@@ -531,13 +601,23 @@ impl fmt::Display for SchemaDecodeError {
                     write!(
                         formatter,
                         "attribute '{}': {}",
-                        attribute_path.join("."),
+                        ProviderText::new(
+                            attribute_path
+                                .iter()
+                                .map(ProviderString::as_str)
+                                .collect::<Vec<_>>()
+                                .join(".")
+                        ),
                         detail
                     )?;
                 }
             }
             Self::DuplicateReferenceForm { identity } => {
-                write!(formatter, "duplicate reference form identity `{identity}`")?;
+                write!(
+                    formatter,
+                    "duplicate reference form identity `{}`",
+                    ProviderText::new(identity.to_string())
+                )?;
             }
             Self::InvalidProviderSchema(error) => error.fmt(formatter)?,
         }
@@ -558,7 +638,7 @@ impl Error for SchemaDecodeError {
                 .as_deref()
                 .map(|source| source as &(dyn Error + 'static)),
             Self::DuplicateReferenceForm { identity: _ } => None,
-            Self::InvalidProviderSchema(error) => Some(error),
+            Self::InvalidProviderSchema(_error) => None,
         }
     }
 }
@@ -1898,7 +1978,9 @@ pub fn try_core_to_protocol_value(value: &Value) -> Result<protocol::Value, Prot
                 .map(|(key, value)| {
                     try_core_to_protocol_value(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
+                        .map_err(|error| {
+                            error.at_value_path(WirePathSegment::Key(key.clone().into()))
+                        })
                 })
                 .collect::<Result<_, _>>()?,
         )),
@@ -1977,7 +2059,9 @@ pub fn protocol_to_core_value(value: &protocol::Value) -> Result<Value, Protocol
                 .map(|(key, value)| {
                     protocol_to_core_value(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
+                        .map_err(|error| {
+                            error.at_value_path(WirePathSegment::Key(key.clone().into()))
+                        })
                 })
                 .collect::<Result<IndexMap<_, _>, _>>()?,
         ))),
@@ -2026,7 +2110,9 @@ pub fn protocol_schema_default_to_core(
                 .map(|(key, value)| {
                     protocol_schema_default_to_core(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
+                        .map_err(|error| {
+                            error.at_value_path(WirePathSegment::Key(key.clone().into()))
+                        })
                 })
                 .collect::<Result<IndexMap<_, _>, _>>()?,
         ))),
@@ -2042,7 +2128,7 @@ pub fn try_core_to_protocol_value_map(
         .map(|(key, value)| {
             try_core_to_protocol_value(value)
                 .map(|converted| (key.clone(), converted))
-                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone().into())))
         })
         .collect()
 }
@@ -2056,7 +2142,7 @@ pub fn protocol_to_core_value_map(
         .map(|(key, value)| {
             protocol_to_core_value(value)
                 .map(|converted| (key.clone(), converted))
-                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone().into())))
         })
         .collect()
 }
@@ -2114,7 +2200,9 @@ pub fn try_core_to_protocol_persisted_value(
                 .map(|(key, value)| {
                     try_core_to_protocol_persisted_value(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
+                        .map_err(|error| {
+                            error.at_value_path(WirePathSegment::Key(key.clone().into()))
+                        })
                 })
                 .collect::<Result<_, _>>()?,
         )),
@@ -2170,7 +2258,9 @@ pub fn protocol_to_core_persisted_value(
                 .map(|(key, value)| {
                     protocol_to_core_persisted_value(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
+                        .map_err(|error| {
+                            error.at_value_path(WirePathSegment::Key(key.clone().into()))
+                        })
                 })
                 .collect::<Result<IndexMap<_, _>, _>>()?,
         ))),
@@ -2186,7 +2276,7 @@ pub fn try_core_to_protocol_persisted_value_map(
         .map(|(key, value)| {
             try_core_to_protocol_persisted_value(value)
                 .map(|converted| (key.clone(), converted))
-                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone().into())))
         })
         .collect()
 }
@@ -2200,7 +2290,7 @@ pub fn protocol_to_core_persisted_value_map(
         .map(|(key, value)| {
             protocol_to_core_persisted_value(value)
                 .map(|converted| (key.clone(), converted))
-                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone().into())))
         })
         .collect()
 }
@@ -2529,7 +2619,7 @@ pub fn try_applied_state_to_protocol(
                     .map_err(ProtocolConvertError::UnavailableSecret)?;
                 try_core_to_protocol_value(&value)
                     .map(|value| (key.clone(), value))
-                    .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
+                    .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone().into())))
             })
             .collect::<Result<_, _>>()?,
     })
@@ -2623,8 +2713,11 @@ pub fn try_update_outcome_to_protocol(
             Ok(protocol::UpdateOutcome::PartialSuccess {
                 state: try_applied_update_state_to_protocol(state, state_after_patch)?,
                 diagnostic: protocol::PartialReadDiagnostic {
-                    reason: reason.clone(),
-                    missing_attributes: missing_attributes.clone(),
+                    reason: reason.as_str().to_owned(),
+                    missing_attributes: missing_attributes
+                        .iter()
+                        .map(|name| name.as_str().to_owned())
+                        .collect(),
                 },
             })
         }
@@ -2751,6 +2844,20 @@ mod tests {
     };
 
     #[test]
+    fn provider_text_invalid_provider_schema_child_is_rendered_once() {
+        let child = crate::schema::ProviderSchemaValidationError::DanglingReferenceForm {
+            identity: crate::schema::TypeIdentity::bare("missing\x1b[2J"),
+        };
+        let error = super::SchemaDecodeError::InvalidProviderSchema(child);
+        let rendered = crate::executor::render_error_chain(&error);
+        assert_eq!(
+            rendered.matches("is not declared by this provider").count(),
+            1
+        );
+        assert!(!rendered.contains('\x1b'));
+    }
+
+    #[test]
     fn decode_rejects_uncompilable_string_patterns() {
         use carina_provider_protocol::types as protocol;
         let string = protocol::AttributeType::String {
@@ -2784,7 +2891,7 @@ mod tests {
             let (location, source) = source.pattern_errors().next().unwrap();
             assert_eq!(
                 location,
-                &SchemaValidationIssueLocation::Attribute("value".to_string())
+                &SchemaValidationIssueLocation::Attribute("value".into())
             );
             assert_eq!(source.pattern, "(?=x)");
         }
@@ -2879,7 +2986,7 @@ mod tests {
         assert!(
             matches!(error, SchemaDecodeError::InvalidSchema {
             schema_issue_location: Some(ref location), ref attribute_path, ..
-        } if **location == SchemaValidationIssueLocation::Definition("Bad".to_string()) && attribute_path.is_empty()),
+        } if **location == SchemaValidationIssueLocation::Definition("Bad".into()) && attribute_path.is_empty()),
             "{error}"
         );
         assert!(error.to_string().contains("defs.Bad"), "{error}");

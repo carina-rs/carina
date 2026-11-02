@@ -1836,7 +1836,7 @@ mod assert_fully_resolved_tests {
                     .to_string();
                 assert!(error.contains("add a `wait` block"), "{error}");
                 assert!(!error.contains("read-back"), "{error}");
-                assert!(!error.contains(diagnostic.reason()), "{error}");
+                assert!(!error.contains(diagnostic.reason().as_str()), "{error}");
             }
         }
     }

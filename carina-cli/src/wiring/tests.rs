@@ -26,6 +26,18 @@ fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress
 }
 
 #[test]
+fn throttling_error_uses_wire_message_before_display_truncation() {
+    for marker in ["ThrottlingException", "Rate exceeded"] {
+        let mut wire = ProviderError::api_error("request failed").to_wire();
+        wire.message = format!("{} {marker}", "x".repeat(9 * 1024));
+        let error = ProviderError::from_wire(wire);
+
+        assert!(!error.to_string().contains(marker));
+        assert!(is_throttling_error(&error), "missing raw marker {marker}");
+    }
+}
+
+#[test]
 fn environment_snapshot_survives_provider_loading_and_validation_catalogs() {
     let runtime = crate::test_support::TestCommandRuntime::new().with_environment(
         carina_core::EnvironmentSnapshot::new([("NAME".to_string(), "snapshot-resource".into())]),
@@ -2448,7 +2460,7 @@ fn tied_union_error_with_attributes(first: &'static str, second: &'static str) -
             carina_core::schema::validator(move |_| {
                 Err(TypeError::PatternMismatch {
                     value: "invalid".into(),
-                    pattern: pattern.to_string(),
+                    pattern: pattern.into(),
                     attribute: Some(attribute.to_string()),
                     type_name: None,
                 })
@@ -2476,7 +2488,7 @@ fn tied_union_error_with_one_unattributed_failure() -> TypeError {
         carina_core::schema::validator(|_| {
             Err(TypeError::PatternMismatch {
                 value: "invalid".into(),
-                pattern: "^first$".to_string(),
+                pattern: "^first$".into(),
                 attribute: Some("target".to_string()),
                 type_name: None,
             })
@@ -2489,7 +2501,7 @@ fn tied_union_error_with_one_unattributed_failure() -> TypeError {
         None,
         carina_core::schema::validator(|_| {
             Err(TypeError::ValidationFailed {
-                message: "second failure".to_string(),
+                message: "second failure".into(),
             })
         }),
         None,
