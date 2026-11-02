@@ -2397,6 +2397,7 @@ impl PlanFile {
                 dependencies: _dependencies,
                 module_source: _module_source,
                 quoted_string_attrs: _quoted_string_attrs,
+                declaration: _declaration,
             } = data_source;
             attributes
                 .values()
@@ -8494,6 +8495,7 @@ mod run_plan_out_tests {
             instance: "root.checked".to_string(),
             call_path: crate::test_composition_call_path(),
             quoted_string_attrs: Default::default(),
+            declaration: Default::default(),
         };
         let parsed = carina_core::parser::ExpandedParsedFile::default();
         let ctx = crate::wiring::PlanContext {

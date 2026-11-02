@@ -63,6 +63,9 @@ pub(crate) fn parse_resource_for_target(
         Rule::anonymous_resource => "anonymous resource",
         _ => "resource expression",
     };
+    let declaration = crate::parser::DeclarationProvenance::from_location(
+        crate::parser::DeclarationLocation::from_pair(&pair, preprocessed_file, source_file),
+    );
     let mut iter = pair.into_inner();
     let namespaced_type = next_pair(&mut iter, "resource type", context)?
         .as_str()
@@ -154,6 +157,7 @@ pub(crate) fn parse_resource_for_target(
         default_tag_keys: Default::default(),
         loop_provenance,
         quoted_string_attrs,
+        declaration,
     })
 }
 
@@ -399,6 +403,9 @@ pub(crate) fn parse_read_resource_expr(
     preprocessed_file: &crate::parser::PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<DataSource, ParseError> {
+    let declaration = crate::parser::DeclarationProvenance::from_location(
+        crate::parser::DeclarationLocation::from_pair(&pair, preprocessed_file, source_file),
+    );
     let mut inner = pair.into_inner();
 
     let namespaced_type = next_pair(&mut inner, "resource type", "read resource expression")?
@@ -456,6 +463,7 @@ pub(crate) fn parse_read_resource_expr(
         dependencies: Default::default(),
         module_source: None,
         quoted_string_attrs,
+        declaration,
     })
 }
 

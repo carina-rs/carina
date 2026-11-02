@@ -1410,6 +1410,7 @@ impl SavedCompositionOriginId {
 ///         module_name: composition.module_name,
 ///         instance: composition.instance,
 ///         quoted_string_attrs: composition.quoted_string_attrs,
+///         declaration: composition.declaration,
 ///     }
 /// }
 /// ```
@@ -1432,6 +1433,8 @@ pub struct LiveComposition<P: ValueKind = NoPlaceholder, B: BindingAddress = Abs
     /// string literal. Parse-time only; `#[serde(skip)]` keeps it out
     /// of state — mirrors [`Resource::quoted_string_attrs`](super::Resource).
     pub quoted_string_attrs: HashSet<String>,
+    /// Parser-owned location of the module call that created this composition.
+    pub declaration: crate::parser::DeclarationProvenance,
 }
 
 pub type AuthoredLiveComposition = LiveComposition<ParserPlaceholder, RelativeBindingName>;
@@ -1481,6 +1484,7 @@ impl<B: BindingAddress> LiveComposition<ParserPlaceholder, B> {
             instance,
             call_path,
             quoted_string_attrs,
+            declaration,
         } = self;
         let _non_value_fields = (
             binding,
@@ -1488,6 +1492,7 @@ impl<B: BindingAddress> LiveComposition<ParserPlaceholder, B> {
             module_name,
             call_path,
             quoted_string_attrs,
+            declaration,
         );
         let LiveCompositionSignature {
             arguments,
@@ -1566,6 +1571,7 @@ impl<B: BindingAddress> LiveComposition<ParserPlaceholder, B> {
             instance,
             call_path,
             quoted_string_attrs,
+            declaration,
         } = self;
         let LiveCompositionSignature {
             arguments,
@@ -1632,6 +1638,7 @@ impl<B: BindingAddress> LiveComposition<ParserPlaceholder, B> {
             instance,
             call_path,
             quoted_string_attrs,
+            declaration,
         })
     }
 }
@@ -1657,6 +1664,7 @@ impl<P: ValueKind> LiveComposition<P, RelativeBindingName> {
             instance,
             call_path,
             quoted_string_attrs,
+            declaration,
         } = self;
         let LiveCompositionSignature {
             arguments,
@@ -1689,6 +1697,7 @@ impl<P: ValueKind> LiveComposition<P, RelativeBindingName> {
             instance,
             call_path: call_path.resolve_bindings(resolve),
             quoted_string_attrs,
+            declaration,
         }
     }
 }
@@ -1714,6 +1723,7 @@ impl<P: ValueKind> LiveComposition<P, AbsoluteBindingAddress> {
             instance,
             call_path,
             quoted_string_attrs: _quoted_string_attrs,
+            declaration: _declaration,
         } = self;
         *id = id
             .instantiate_with_identity(ResourceIdentity::new(map(&id.binding_address()).as_str()));
@@ -1758,6 +1768,7 @@ impl<P: PlanValueKind> LiveComposition<P, AbsoluteBindingAddress> {
             instance,
             call_path,
             quoted_string_attrs,
+            declaration,
         } = self;
         let origin_id = resolver.saved_origin_id(&call_path)?;
         let LiveCompositionSignature {
@@ -1801,7 +1812,7 @@ impl<P: PlanValueKind> LiveComposition<P, AbsoluteBindingAddress> {
             saved_attributes.insert(name, SavedCompositionAttribute { value });
         }
         let attributes = saved_attributes;
-        drop(quoted_string_attrs);
+        drop((quoted_string_attrs, declaration));
         Ok(SavedComposition {
             id,
             signature: SavedCompositionSignature {
@@ -2011,6 +2022,7 @@ impl<P: ValueKind, B: BindingAddress> LiveComposition<P, B> {
             instance,
             call_path,
             quoted_string_attrs,
+            declaration,
         } = self;
         LiveComposition {
             id,
@@ -2021,6 +2033,7 @@ impl<P: ValueKind, B: BindingAddress> LiveComposition<P, B> {
             instance,
             call_path,
             quoted_string_attrs,
+            declaration,
         }
     }
 }
@@ -2093,6 +2106,7 @@ mod tests {
             instance: "call".to_string(),
             call_path: call_path("first.crn", "first"),
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         };
         let mut right = left.clone();
         right.call_path = call_path("second.crn", "second");
@@ -2414,6 +2428,7 @@ mod tests {
                 instance: "secure".into(),
                 call_path: Default::default(),
                 quoted_string_attrs: HashSet::new(),
+                declaration: Default::default(),
             }
         }
         let source_root = tempfile::tempdir().unwrap();
@@ -2486,6 +2501,7 @@ mod tests {
             instance: "secure".to_string(),
             call_path: Default::default(),
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         };
 
         let mut source_identities = CompositionSourceIdentityResolver::new(
@@ -2692,6 +2708,7 @@ mod tests {
             instance: "instance".to_string(),
             call_path: Default::default(),
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         };
 
         let mut resolver = CompositionSourceIdentityResolver::new(

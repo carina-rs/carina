@@ -1007,6 +1007,7 @@ impl<S, P: ValueKind> From<ResourceWithDependenciesWire<S, P>> for SchemaUnresol
                 default_tag_keys,
                 loop_provenance,
                 quoted_string_attrs: HashSet::new(),
+                declaration: Default::default(),
             },
             value_dependencies,
             explicit_dependencies,
@@ -8910,6 +8911,9 @@ pub struct Resource<
     /// Parse-time only; `#[serde(skip)]` keeps it out of state.
     #[serde(default, skip)]
     pub quoted_string_attrs: HashSet<String>,
+    /// Parser-owned declaration provenance; absent on programmatic/state nodes.
+    #[serde(skip)]
+    pub declaration: crate::parser::DeclarationProvenance,
 }
 
 /// Persisted resource representation used by saved plans.
@@ -8956,6 +8960,7 @@ impl<S, P: ValueKind> Resource<S, P, RelativeBindingName> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         } = self;
         Resource {
             id,
@@ -8972,6 +8977,7 @@ impl<S, P: ValueKind> Resource<S, P, RelativeBindingName> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         }
     }
 
@@ -9003,6 +9009,7 @@ impl<P: ValueKind> Resource<ModuleSource, P, AbsoluteBindingAddress> {
             default_tag_keys: _default_tag_keys,
             loop_provenance: _loop_provenance,
             quoted_string_attrs: _quoted_string_attrs,
+            declaration: _declaration,
         } = self;
         for value in attributes.values_mut() {
             value.map_absolute_bindings(map);
@@ -9047,6 +9054,7 @@ impl<P: ValueKind, B: BindingAddress, D> From<Resource<ModuleSource, P, B, D>>
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         } = resource;
         Self {
             id,
@@ -9060,6 +9068,7 @@ impl<P: ValueKind, B: BindingAddress, D> From<Resource<ModuleSource, P, B, D>>
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         }
     }
 }
@@ -9081,6 +9090,7 @@ impl<S, B: BindingAddress, D> Resource<S, ParserPlaceholder, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         } = self;
         let directives = directives.resolve(
             &id,
@@ -9099,6 +9109,7 @@ impl<S, B: BindingAddress, D> Resource<S, ParserPlaceholder, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         })
     }
 }
@@ -9121,6 +9132,7 @@ impl<S, B: BindingAddress, D> Resource<S, ParserPlaceholder, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         } = self;
         let directives = directives.into_loop_template(
             &id,
@@ -9148,6 +9160,7 @@ impl<S, B: BindingAddress, D> Resource<S, ParserPlaceholder, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         })
     }
 }
@@ -9166,6 +9179,7 @@ impl<P: ValueKind, B: BindingAddress> Resource<ModuleSource, P, B> {
             default_tag_keys: DefaultTagKeys::default(),
             loop_provenance: LoopProvenance::default(),
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         }
     }
 
@@ -9246,6 +9260,7 @@ impl<S, D> Resource<S, NoPlaceholder, AbsoluteBindingAddress, D> {
             default_tag_keys: _default_tag_keys,
             loop_provenance: _loop_provenance,
             quoted_string_attrs: _quoted_string_attrs,
+            declaration: _declaration,
         } = self;
         attributes
             .values()
@@ -9266,6 +9281,7 @@ impl<S, D> Resource<S, NoPlaceholder, AbsoluteBindingAddress, D> {
             default_tag_keys,
             loop_provenance: _,
             quoted_string_attrs,
+            declaration,
         } = self;
         ProviderResource {
             id,
@@ -9279,6 +9295,7 @@ impl<S, D> Resource<S, NoPlaceholder, AbsoluteBindingAddress, D> {
             default_tag_keys,
             loop_provenance: LoopProvenance::default(),
             quoted_string_attrs,
+            declaration,
         }
     }
 
@@ -9299,6 +9316,7 @@ impl<S, D> Resource<S, NoPlaceholder, AbsoluteBindingAddress, D> {
             default_tag_keys,
             loop_provenance: _,
             quoted_string_attrs,
+            declaration: _declaration,
         } = provider;
         self.id = id;
         self.attributes = attributes;
@@ -9467,6 +9485,7 @@ impl<S, P: ValueKind, B: BindingAddress, D> Resource<S, P, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         } = self;
         Resource {
             id,
@@ -9480,6 +9499,7 @@ impl<S, P: ValueKind, B: BindingAddress, D> Resource<S, P, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         }
     }
 }

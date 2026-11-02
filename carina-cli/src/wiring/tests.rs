@@ -14502,6 +14502,7 @@ mod resolved_value_constraint_gate {
             instance: "root.checked".to_string(),
             call_path: crate::test_composition_call_path(),
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         }
     }
 

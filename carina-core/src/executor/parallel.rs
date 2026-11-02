@@ -1934,6 +1934,7 @@ mod tests {
                         timeout_secs: None,
                         depends_on: Default::default(),
                         line: 1,
+                        declaration: Default::default(),
                     }],
                     ..Default::default()
                 };
@@ -2227,6 +2228,7 @@ mod tests {
             instance: "module".to_string(),
             call_path: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
+            declaration: Default::default(),
         };
 
         let child_id = child.id.clone();
@@ -2351,6 +2353,7 @@ mod tests {
             instance: "bootstrap".to_string(),
             call_path: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
+            declaration: Default::default(),
         };
 
         let mut role_policy: Resource =

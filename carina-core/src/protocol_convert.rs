@@ -2389,6 +2389,7 @@ pub fn try_resource_to_protocol<S, D>(
         default_tag_keys: _default_tag_keys,
         loop_provenance: _loop_provenance,
         quoted_string_attrs: _quoted_string_attrs,
+        declaration: _declaration,
     } = resource;
     let attributes = attributes
         .iter()
@@ -2423,6 +2424,7 @@ pub fn try_data_source_to_protocol<S, D>(
         dependencies: _dependencies,
         module_source: _module_source,
         quoted_string_attrs: _quoted_string_attrs,
+        declaration: _declaration,
     } = data_source;
     let attributes = attributes
         .iter()

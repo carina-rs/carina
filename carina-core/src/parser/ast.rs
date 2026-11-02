@@ -1431,6 +1431,7 @@ mod deferred_template_resource_serde {
                     default_tag_keys,
                     loop_provenance,
                     quoted_string_attrs: HashSet::new(),
+                    declaration: Default::default(),
                 },
                 legacy_null_name,
             })
@@ -3670,7 +3671,7 @@ impl<P: ValueKind> ModuleArgument<P, AbsoluteBindingAddress> {
     }
 }
 
-/// Parser-owned identity of a source file containing a module call.
+/// Parser-owned identity of a source file containing declarations.
 ///
 /// The inner path is intentionally opaque: callers may inspect it for
 /// diagnostics and saved-plan normalization, but only the parser can mint an
@@ -4102,16 +4103,14 @@ pub enum CallExpansion {
 /// [`CallExpansion`] distinguishes concrete iterations sharing that span.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ModuleCallId {
-    source_file: SourceFileId,
-    call_span: SourceSpan,
+    location: super::DeclarationLocation,
     expansion: CallExpansion,
 }
 
 impl ModuleCallId {
-    pub(in crate::parser) fn direct(source_file: PathBuf, call_span: SourceSpan) -> Self {
+    pub(in crate::parser) fn direct(location: super::DeclarationLocation) -> Self {
         Self {
-            source_file: SourceFileId::new(source_file),
-            call_span,
+            location,
             expansion: CallExpansion::Direct,
         }
     }
@@ -4121,15 +4120,19 @@ impl ModuleCallId {
     }
 
     pub fn source_file(&self) -> &Path {
-        self.source_file.path()
+        self.location.file().path()
     }
 
     pub fn source_file_id(&self) -> &SourceFileId {
-        &self.source_file
+        self.location.file()
     }
 
     pub fn call_span(&self) -> SourceSpan {
-        self.call_span
+        self.location.span()
+    }
+
+    pub fn declaration_location(&self) -> &super::DeclarationLocation {
+        &self.location
     }
 
     pub fn expansion(&self) -> &CallExpansion {
@@ -4138,7 +4141,18 @@ impl ModuleCallId {
 
     #[cfg(test)]
     pub(crate) fn test_dummy_in(source_file: impl Into<PathBuf>) -> Self {
-        Self::direct(source_file.into(), SourceSpan::dummy())
+        let file = super::preprocess_file("fixture {}").expect("module-call fixture");
+        let pair = file
+            .parse()
+            .expect("module-call fixture")
+            .flatten()
+            .find(|pair| pair.as_rule() == super::Rule::module_call)
+            .expect("module-call fixture pair");
+        Self::direct(super::DeclarationLocation::from_pair(
+            &pair,
+            &file,
+            &source_file.into(),
+        ))
     }
 }
 
@@ -4156,16 +4170,15 @@ impl<P: ValueKind, B: BindingAddress> ModuleCall<P, B> {
     pub(super) fn from_authored_arguments_in_source(
         module_name: impl Into<String>,
         binding_name: Option<B>,
-        call_span: SourceSpan,
+        location: super::DeclarationLocation,
         arguments: HashMap<String, AuthoredModuleArgument<P, B>>,
-        source_file: PathBuf,
     ) -> Self {
         Self {
             module_name: module_name.into(),
             binding_name,
             arguments,
             source: Box::new(ModuleCallSite {
-                id: ModuleCallId::direct(source_file, call_span),
+                id: ModuleCallId::direct(location),
             }),
             loop_origin: None,
         }
@@ -4331,12 +4344,11 @@ impl<P: ValueKind> ModuleCall<P, RelativeBindingName> {
         Self::from_authored_arguments_in_source(
             module_name,
             binding_name.map(RelativeBindingName::new),
-            span,
+            ModuleCallId::test_dummy_in("test.crn").location,
             arguments
                 .into_iter()
                 .map(|(name, argument)| (name, AuthoredModuleArgument::new(argument, span, span)))
                 .collect(),
-            PathBuf::from("test.crn"),
         )
     }
 
@@ -4596,8 +4608,8 @@ impl SourceSpan {
             .map(|inner| inner.as_span().end())
             .max()
             .unwrap_or_else(|| span.end());
-        // A module call's closing brace is grammar punctuation rather than an
-        // inner pair. The module-call pair itself ends exactly at that brace;
+        // A block's closing brace is grammar punctuation rather than an
+        // inner pair. The declaration pair itself ends exactly at that brace;
         // unlike declaration/value pairs, it cannot absorb trailing trivia
         // outside the block.
         let end = if matches!(
@@ -4605,6 +4617,10 @@ impl SourceSpan {
             crate::parser::Rule::module_call
                 | crate::parser::Rule::for_expr
                 | crate::parser::Rule::if_expr
+                | crate::parser::Rule::resource_expr
+                | crate::parser::Rule::anonymous_resource
+                | crate::parser::Rule::read_resource_expr
+                | crate::parser::Rule::wait_expr
         ) {
             span.end()
         } else {
@@ -5491,6 +5507,7 @@ pub struct WaitBinding<B: BindingAddress = RelativeBindingName> {
     pub depends_on: super::UnexpandedDependencies<B>,
     /// Source line of the `wait` keyword. Used by diagnostics.
     pub line: usize,
+    pub declaration: super::DeclarationProvenance,
 }
 
 impl WaitBinding<AbsoluteBindingAddress> {
@@ -5506,6 +5523,7 @@ impl WaitBinding<AbsoluteBindingAddress> {
             timeout_secs: _timeout_secs,
             depends_on,
             line: _line,
+            declaration: _declaration,
         } = self;
         *binding = map(binding);
         *target = map(target);
@@ -5853,6 +5871,17 @@ pub trait DeferredForPhaseTraversal<
     where
         Self: Sized;
 
+    /// Analysis also inspects parser-side read templates before their iterable
+    /// becomes known. The general resource walk intentionally omits them.
+    fn analysis_resource_refs(
+        &self,
+    ) -> Box<dyn Iterator<Item = ResourceRef<'_, ModuleSource, P, T, Self, B>> + '_>
+    where
+        Self: Sized,
+    {
+        self.resource_refs()
+    }
+
     fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, P, T, B>> + '_>
     where
         Self: Sized;
@@ -5897,6 +5926,22 @@ impl<P: ValueKind, B: BindingAddress> DeferredForPhaseTraversal<P, P, B>
     where
         P: 'a,
         B: 'a;
+
+    fn analysis_resource_refs(
+        &self,
+    ) -> Box<dyn Iterator<Item = ResourceRef<'_, ModuleSource, P, P, Self, B>> + '_> {
+        Box::new(
+            self.expressions
+                .iter()
+                .filter_map(|deferred| match deferred.body() {
+                    DeferredForBody::Resource(resource) => {
+                        Some(ResourceRef::Deferred { resource, deferred })
+                    }
+                    DeferredForBody::Read(source) => Some(ResourceRef::DataSource(source)),
+                    DeferredForBody::ModuleCall(_) => None,
+                }),
+        )
+    }
 
     fn resource_refs(
         &self,
@@ -6734,6 +6779,7 @@ where
                         timeout_secs,
                         depends_on,
                         line,
+                        declaration,
                     } = wait;
                     let UntilPredicateAst {
                         root,
@@ -6752,6 +6798,7 @@ where
                         timeout_secs,
                         depends_on: depends_on.resolve_bindings(resolve),
                         line,
+                        declaration,
                     }
                 })
                 .collect(),
@@ -7797,6 +7844,7 @@ where
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         } = resource;
         let _resource_metadata = (
             directives,
@@ -7808,6 +7856,7 @@ where
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         );
         for (attribute, value) in attributes {
             value.collect_leftover_placeholders(
@@ -7830,6 +7879,7 @@ where
             dependencies,
             module_source,
             quoted_string_attrs,
+            declaration,
         } = data_source;
         let _data_source_metadata = (
             directives,
@@ -7837,6 +7887,7 @@ where
             dependencies,
             module_source,
             quoted_string_attrs,
+            declaration,
         );
         for (attribute, value) in attributes {
             value.collect_leftover_placeholders(
@@ -8547,6 +8598,7 @@ fn substitute_attrs<S, D>(
         default_tag_keys,
         loop_provenance,
         quoted_string_attrs,
+        declaration,
     } = resource;
     // Only the loop element supplies values here. Direct resource references
     // remain deferred and must fail the directive's strict Bool boundary.
@@ -8588,6 +8640,7 @@ fn substitute_attrs<S, D>(
         default_tag_keys,
         loop_provenance,
         quoted_string_attrs,
+        declaration,
     })
 }
 
@@ -9029,6 +9082,7 @@ mod substitute_placeholder_tests {
                 loop_origin: None,
             }),
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         });
 
         parsed.arguments.push(ArgumentParameter {
@@ -9059,6 +9113,7 @@ mod substitute_placeholder_tests {
             timeout_secs: None,
             depends_on: Default::default(),
             line: 1,
+            declaration: Default::default(),
         });
         parsed.uses.push(UseStatement::dummy(
             "./module".to_string(),

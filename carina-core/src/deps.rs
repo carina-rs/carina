@@ -358,6 +358,7 @@ mod tests {
             instance: "v".to_string(),
             call_path: Default::default(),
             quoted_string_attrs: Default::default(),
+            declaration: Default::default(),
         };
 
         let deps = get_composition_dependencies(&virt);

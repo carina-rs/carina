@@ -173,6 +173,7 @@ mod tests {
             instance: "i".to_string(),
             call_path: Default::default(),
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         };
         let id = c.id.clone();
         let node: GraphNode = c.into();

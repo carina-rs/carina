@@ -4163,6 +4163,7 @@ mod tests {
             instance: "root.checked".to_string(),
             call_path: crate::test_composition_call_path(),
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         };
         let data_source = <DataSource>::with_provider("test", "lookup", "unrelated", None)
             .with_attribute(
@@ -4252,6 +4253,7 @@ mod tests {
             instance: "root.checked".to_string(),
             call_path: crate::test_composition_call_path(),
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         };
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(carina_core::parser::ProviderConfig {

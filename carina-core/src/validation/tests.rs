@@ -2431,6 +2431,7 @@ fn make_composition(binding: &str, attributes: &[&str]) -> LiveComposition {
         instance: binding.to_string(),
         call_path: CompositionCallPath::direct(call),
         quoted_string_attrs: Default::default(),
+        declaration: Default::default(),
     }
 }
 
@@ -2964,6 +2965,7 @@ fn unknown_attribute_reference_through_wait_binding_reports_error() {
         timeout_secs: None,
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     });
     parsed.resources.push(listener); // allow: direct — fixture test inspection
 
@@ -3040,6 +3042,7 @@ fn known_attribute_reference_through_wait_binding_is_accepted() {
         timeout_secs: None,
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     });
     parsed.resources.push(listener); // allow: direct — fixture test inspection
 
@@ -3276,6 +3279,7 @@ fn unknown_attribute_reference_through_wait_binding_inside_nested_struct_reports
         timeout_secs: None,
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     });
     parsed.resources.push(listener); // allow: direct — fixture test inspection
 
@@ -6554,6 +6558,7 @@ fn attribute_param_ref_types_flags_unknown_attribute_through_wait_binding() {
         timeout_secs: None,
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     });
 
     let bindings = crate::binding_index::BindingIndex::from_parsed(
@@ -7954,6 +7959,7 @@ fn export_param_ref_types_flags_unknown_attribute_through_wait_binding() {
         timeout_secs: None,
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     });
 
     let bindings = crate::binding_index::BindingIndex::from_parsed(

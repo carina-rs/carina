@@ -1024,6 +1024,9 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 instance: instance_prefix.to_string(),
                 call_path: expanded_call_path.clone(),
                 quoted_string_attrs: HashSet::new(),
+                declaration: crate::parser::DeclarationProvenance::from_location(
+                    call.id().declaration_location().clone(),
+                ),
             };
             compositions.push(composition);
         }
@@ -1498,6 +1501,7 @@ fn resolve_wait_binding(
         timeout_secs,
         depends_on,
         line,
+        declaration,
     } = wb;
     let diagnostic_source = Some((None, *line));
     let Some(target) =
@@ -1525,6 +1529,7 @@ fn resolve_wait_binding(
         timeout_secs: *timeout_secs,
         depends_on: resolve_directive_dependencies(depends_on, &Default::default(), resolver)?,
         line: *line,
+        declaration: declaration.clone(),
     }))
 }
 
@@ -3372,6 +3377,7 @@ fn expand_module_resource_with_identity(
         default_tag_keys,
         loop_provenance,
         quoted_string_attrs,
+        declaration,
     } = new_resource;
     let resolved_depends_on = resolve_directive_dependencies(
         &dependencies.depends_on,
@@ -3409,6 +3415,7 @@ fn expand_module_resource_with_identity(
         default_tag_keys,
         loop_provenance,
         quoted_string_attrs,
+        declaration,
     })
 }
 
@@ -3432,6 +3439,7 @@ fn expand_module_data_source(
         dependencies,
         module_source: _,
         quoted_string_attrs,
+        declaration,
     } = new_data_source;
     let resolved_depends_on = resolve_directive_dependencies(
         &dependencies.depends_on,
@@ -3464,6 +3472,7 @@ fn expand_module_data_source(
             resolver.call_path.clone(),
         )),
         quoted_string_attrs,
+        declaration,
     })
 }
 
@@ -3482,6 +3491,7 @@ fn expand_module_composition(
         instance,
         call_path,
         quoted_string_attrs,
+        declaration,
     } = composition;
     let crate::resource::LiveCompositionSignature {
         arguments,
@@ -3708,6 +3718,7 @@ fn expand_module_composition(
         instance: prefix_resource_identity(resolver.scope.key(), instance),
         call_path,
         quoted_string_attrs: quoted_string_attrs.clone(),
+        declaration: declaration.clone(),
     })
 }
 

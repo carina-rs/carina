@@ -2,6 +2,11 @@
 //!
 //! Convert DSL to AST using pest
 
+mod analysis;
+pub use analysis::{
+    AnalysisItemKind, AnalysisResourceRef, AnalysisTree, AnalysisTreeError, AnalysisWaitRef,
+    DeclarationLocation, DeclarationProvenance, Located,
+};
 mod ast;
 pub(crate) use ast::ParserSeedMetadata;
 mod blocks;

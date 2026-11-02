@@ -17,6 +17,108 @@ use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
 #[test]
+fn declaration_location_and_envelope_keep_parser_span() {
+    let source = "// sibling declaration\nlet bucket = mock.test.Resource { name = '東京' }\n";
+    let file = preprocess_file(source).unwrap();
+    let pair = file
+        .parse()
+        .unwrap()
+        .flatten()
+        .find(|pair| pair.as_rule() == Rule::resource_expr)
+        .unwrap();
+    let location =
+        DeclarationLocation::from_pair(&pair, &file, std::path::Path::new("sibling.crn"));
+    assert_eq!(location.file().path(), std::path::Path::new("sibling.crn"));
+    assert_eq!(location.span().start_line(), 2);
+    assert_eq!(
+        &source[location.span().start_byte()..location.span().end_byte()],
+        "mock.test.Resource { name = '東京' }",
+    );
+
+    let diagnostic = Located::new(location.clone(), "example finding");
+    assert_eq!(diagnostic.location(), &location);
+    assert_eq!(diagnostic.detail(), &"example finding");
+    assert_eq!(diagnostic.into_parts(), (location, "example finding"));
+}
+
+#[test]
+fn analysis_tree_rejects_unlocated_data_wait_and_nested_declarations() {
+    let source = "arguments { flag: Bool names: list(String) }\n\
+        let named = mock.test.Resource { name = 'named' }\n\
+        let lookup = read mock.test.Lookup { name = 'lookup' }\n\
+        let ready = wait named { until = named.status == 'ready' }\n\
+        let items = for n in names { mock.test.Resource { name = n } }\n\
+        let reads = for n in names { read mock.test.Lookup { name = n } }\n\
+        let selected = if flag { mock.test.Resource { name = 'then' } } else { mock.test.Resource { name = 'else' } }\n\
+        let selected_read = if flag { read mock.test.Lookup { name = 'then' } } else { read mock.test.Lookup { name = 'else' } }\n";
+    for case in 0..7 {
+        let mut parsed = parse(
+            source,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        assert!(AnalysisTree::try_from_file(&parsed).is_ok());
+        let expected = match case {
+            0 => {
+                parsed.data_sources[0].declaration = Default::default();
+                AnalysisItemKind::DataSource
+            }
+            1 => {
+                parsed.wait_bindings[0].declaration = Default::default();
+                AnalysisItemKind::Wait
+            }
+            2 => {
+                parsed.parsed_deferred_for_expressions_mut()[0].body =
+                    DeferredForBody::resource(GenericResource::new("test.Resource", "synthetic"));
+                AnalysisItemKind::DeferredResource
+            }
+            3 => {
+                let DeferredForBody::Read(data) =
+                    &mut parsed.parsed_deferred_for_expressions_mut()[1].body
+                else {
+                    panic!("read template")
+                };
+                data.declaration = Default::default();
+                AnalysisItemKind::DataSource
+            }
+            4 | 5 => {
+                let deferred = &mut parsed.deferred_module_ifs[0];
+                let branch = if case == 4 {
+                    &mut deferred.then_branch
+                } else {
+                    deferred.else_branch.as_mut().unwrap()
+                };
+                let DeferredIfBody::Resource(resource) = branch else {
+                    panic!("resource branch")
+                };
+                resource.declaration = Default::default();
+                AnalysisItemKind::Resource
+            }
+            6 => {
+                let DeferredIfBody::DataSource(data) =
+                    &mut parsed.deferred_module_ifs[1].then_branch
+                else {
+                    panic!("read branch")
+                };
+                data.declaration = Default::default();
+                AnalysisItemKind::DataSource
+            }
+            _ => unreachable!(),
+        };
+        let error = match AnalysisTree::try_from_file(&parsed) {
+            Ok(_) => panic!("case {case} admitted unlocated {expected:?}"),
+            Err(error) => error,
+        };
+        match error {
+            AnalysisTreeError::MissingResourceProvenance { kind, .. } => assert_eq!(kind, expected),
+            AnalysisTreeError::MissingWaitProvenance { .. } => {
+                assert_eq!(expected, AnalysisItemKind::Wait)
+            }
+        }
+    }
+}
+
+#[test]
 fn attribute_value_source_span_ignores_names_in_earlier_nested_maps() {
     let source = "mock.test.Resource {\n  nested = { values = [\"a\"] }\n  values = [\"repo\", \"repo\"]\n}\n";
     let path = crate::schema::FieldPath::new().push_index(1);
@@ -991,6 +1093,7 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
         timeout_secs: None,
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     });
     file.requires.push(RequireBlock::dummy(
         ValidateExpr::BoundArgument {

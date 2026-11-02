@@ -618,6 +618,7 @@ mod tests {
             timeout_secs: None,
             depends_on: Default::default(),
             line: 0,
+            declaration: Default::default(),
         });
         let diags = validate_deferred_populate_refs(&parsed, &registry_for_acm());
         assert!(diags.is_empty(), "got: {diags:?}");

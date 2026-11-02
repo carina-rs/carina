@@ -85,6 +85,9 @@ pub struct DataSource<
     /// of state — mirrors [`Resource::quoted_string_attrs`](super::Resource).
     #[serde(default, skip)]
     pub quoted_string_attrs: HashSet<String>,
+    /// Parser-owned declaration provenance; absent on programmatic/state nodes.
+    #[serde(skip)]
+    pub declaration: crate::parser::DeclarationProvenance,
 }
 
 /// Persisted data-source representation used by saved plans.
@@ -111,6 +114,7 @@ impl<P: ValueKind, B: BindingAddress, D> From<DataSource<ModuleSource, P, B, D>>
             dependencies,
             module_source,
             quoted_string_attrs,
+            declaration,
         } = data_source;
         Self {
             id,
@@ -120,6 +124,7 @@ impl<P: ValueKind, B: BindingAddress, D> From<DataSource<ModuleSource, P, B, D>>
             dependencies,
             module_source: module_source.as_ref().map(SavedModuleSource::from),
             quoted_string_attrs,
+            declaration,
         }
     }
 }
@@ -137,6 +142,7 @@ impl<P: ValueKind, B: BindingAddress>
             dependencies: Default::default(),
             module_source: None,
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         }
     }
 
@@ -150,6 +156,7 @@ impl<P: ValueKind, B: BindingAddress>
             dependencies: Default::default(),
             module_source: None,
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         }
     }
 
@@ -182,6 +189,7 @@ impl<P: ValueKind, B: BindingAddress>
             dependencies: Default::default(),
             module_source: None,
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         }
     }
 
@@ -199,6 +207,7 @@ impl<P: ValueKind, B: BindingAddress>
             dependencies: Default::default(),
             module_source: None,
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         }
     }
 }
@@ -230,6 +239,7 @@ impl<S, B: BindingAddress, D> DataSource<S, ParserPlaceholder, B, D> {
             dependencies,
             module_source,
             quoted_string_attrs,
+            declaration,
         } = self;
         let directives = directives.resolve(
             &id,
@@ -248,6 +258,7 @@ impl<S, B: BindingAddress, D> DataSource<S, ParserPlaceholder, B, D> {
             dependencies,
             module_source,
             quoted_string_attrs,
+            declaration,
         })
     }
 }
@@ -263,6 +274,7 @@ impl<S, D> DataSource<S, NoPlaceholder, AbsoluteBindingAddress, D> {
             dependencies: _,
             module_source: _,
             quoted_string_attrs,
+            declaration,
         } = self;
         ProviderDataSource {
             id,
@@ -272,6 +284,7 @@ impl<S, D> DataSource<S, NoPlaceholder, AbsoluteBindingAddress, D> {
             dependencies: (),
             module_source: None,
             quoted_string_attrs,
+            declaration,
         }
     }
 }
@@ -309,6 +322,7 @@ impl<S, P: ValueKind> DataSource<S, P, RelativeBindingName> {
             dependencies,
             module_source,
             quoted_string_attrs,
+            declaration,
         } = self;
         DataSource {
             id,
@@ -321,6 +335,7 @@ impl<S, P: ValueKind> DataSource<S, P, RelativeBindingName> {
             dependencies: dependencies.resolve_bindings(resolve),
             module_source,
             quoted_string_attrs,
+            declaration,
         }
     }
 }
@@ -338,6 +353,7 @@ impl<P: ValueKind> DataSource<ModuleSource, P, AbsoluteBindingAddress> {
             dependencies,
             module_source,
             quoted_string_attrs: _quoted_string_attrs,
+            declaration: _declaration,
         } = self;
         for value in attributes.values_mut() {
             value.map_absolute_bindings(map);
@@ -368,6 +384,7 @@ impl<S, P: ValueKind, B: BindingAddress, D> DataSource<S, P, B, D> {
             dependencies: _,
             module_source,
             quoted_string_attrs,
+            declaration,
         } = self;
         DataSource {
             id,
@@ -377,6 +394,7 @@ impl<S, P: ValueKind, B: BindingAddress, D> DataSource<S, P, B, D> {
             dependencies,
             module_source,
             quoted_string_attrs,
+            declaration,
         }
     }
 }
@@ -501,6 +519,7 @@ impl<S, P: ValueKind> ResolvedDataSource<S, P> {
                 dependencies: (),
                 module_source: None,
                 quoted_string_attrs: HashSet::new(),
+                declaration: Default::default(),
             },
             value_dependencies,
             explicit_dependencies,

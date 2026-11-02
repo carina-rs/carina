@@ -1140,6 +1140,7 @@ let observed_names = roles.names
                     instance: instance.to_string(),
                     call_path: crate::test_authored_composition_call_path(),
                     quoted_string_attrs: Default::default(),
+                    declaration: Default::default(),
                 }
             };
         let mut parsed = ParsedFile::default();

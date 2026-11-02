@@ -3419,6 +3419,7 @@ mod tests {
                 loop_origin: None,
             }),
             quoted_string_attrs: Default::default(),
+            declaration: Default::default(),
         }
     }
 
@@ -3596,6 +3597,7 @@ let existing = read aws.ec2.Vpc {
             timeout_secs: None,
             depends_on: Default::default(),
             line: 1,
+            declaration: Default::default(),
         });
 
         let registry = SchemaRegistry::new();
@@ -4405,6 +4407,7 @@ let vpc = aws.ec2.Vpc {
                 loop_origin: None,
             }),
             quoted_string_attrs: Default::default(),
+            declaration: Default::default(),
         };
         let mut parsed = parse(
             "",

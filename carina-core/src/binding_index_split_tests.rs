@@ -117,6 +117,7 @@ fn make_managed(binding: &'static str, attrs: &[(&str, Value)]) -> Resource {
         default_tag_keys: Default::default(),
         loop_provenance: Default::default(),
         quoted_string_attrs: Default::default(),
+        declaration: Default::default(),
     }
 }
 
@@ -145,6 +146,7 @@ fn make_virtual(binding: &'static str, attrs: &[(&str, Value)]) -> LiveCompositi
         instance: binding.into(),
         call_path: Default::default(),
         quoted_string_attrs: Default::default(),
+        declaration: Default::default(),
     }
 }
 

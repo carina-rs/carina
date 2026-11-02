@@ -189,6 +189,7 @@ fn resolved_fixture_resources_with_wait(
         timeout_secs: None,
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     });
     let (resources, data_sources) = resolved_fixture_graph_with_parsed(parsed, &resources, &[]);
     assert!(data_sources.is_empty());
@@ -4621,6 +4622,7 @@ fn pending_module_composition(
         instance: instance.to_string(),
         call_path: Default::default(),
         quoted_string_attrs: HashSet::new(),
+        declaration: Default::default(),
     }
 }
 

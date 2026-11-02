@@ -7736,6 +7736,7 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
             instance: call_binding.to_string(),
             call_path: CompositionCallPath::direct(call),
             quoted_string_attrs: Default::default(),
+            declaration: Default::default(),
         }
     }
 

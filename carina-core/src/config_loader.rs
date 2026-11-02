@@ -3372,6 +3372,7 @@ awscc.ec2.SecurityGroup {
                 timeout_secs: None,
                 depends_on: Default::default(),
                 line: 1,
+                declaration: Default::default(),
             }],
             ..ParsedFile::default()
         };

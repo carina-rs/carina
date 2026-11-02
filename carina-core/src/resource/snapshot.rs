@@ -333,6 +333,7 @@ impl<S, P: ValueKind, B: BindingAddress, D> Resource<S, P, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         } = self;
         Resource {
             id,
@@ -346,6 +347,7 @@ impl<S, P: ValueKind, B: BindingAddress, D> Resource<S, P, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         }
     }
 }
@@ -393,6 +395,7 @@ impl<S, P: ValueKind, B: BindingAddress, D> DataSource<S, P, B, D> {
             dependencies,
             module_source,
             quoted_string_attrs,
+            declaration,
         } = self;
         DataSource {
             id,
@@ -402,6 +405,7 @@ impl<S, P: ValueKind, B: BindingAddress, D> DataSource<S, P, B, D> {
             dependencies,
             module_source,
             quoted_string_attrs,
+            declaration,
         }
     }
 }

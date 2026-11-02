@@ -550,7 +550,7 @@ fn parse_primary_inner_with_resource_or_module(
         }
         Rule::wait_expr => {
             let line = ctx.original_position(&inner)?.line();
-            let wb = parse_wait_expr(inner, binding_name_str, ctx)?;
+            let wb = parse_wait_expr(inner, binding_name_str, ctx, preprocessed_file, source_file)?;
             if ctx.wait_bindings.contains_key(wb.binding.as_str()) {
                 return Err(ParseError::DuplicateBinding {
                     name: wb.binding.into_string(),

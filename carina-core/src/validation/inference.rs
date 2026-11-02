@@ -2967,6 +2967,7 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
                 },
             ),
             quoted_string_attrs: std::collections::HashSet::new(),
+            declaration: Default::default(),
         };
         parsed.compositions.push(virt); // allow: direct — fixture test inspection
         parsed

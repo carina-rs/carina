@@ -1763,6 +1763,7 @@ fn module_composition<P: PlaceholderKind + PartialEq, B: carina_core::resource::
             )
         },
         quoted_string_attrs: HashSet::new(),
+        declaration: Default::default(),
     }
 }
 
@@ -9568,6 +9569,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
         instance: "github_actions_carina".to_string(),
         call_path: crate::test_composition_call_path(),
         quoted_string_attrs: std::collections::HashSet::new(),
+        declaration: Default::default(),
     };
     let sorted_resources = [role_resource];
     let pre_resolve_compositions = vec![composition];
@@ -9681,6 +9683,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
                 instance: binding.to_string(),
                 call_path: crate::test_composition_call_path(),
                 quoted_string_attrs: std::collections::HashSet::new(),
+                declaration: Default::default(),
             }
         };
     let inner_virtual = make_virtual(
@@ -9874,6 +9877,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         instance: "carina_module".to_string(),
         call_path: crate::test_composition_call_path(),
         quoted_string_attrs: std::collections::HashSet::new(),
+        declaration: Default::default(),
     };
 
     let mut sorted_resources = vec![role_managed];
