@@ -7854,7 +7854,7 @@ fn resumed_persisted_create_records_nested_write_only_sent_values() {
         )]),
     )
     .unwrap();
-    let identified = IdentifiedCreate::from_in_flight_for_test(
+    let created = IdentifiedCreate::from_in_flight_for_test(
         pending,
         identifier,
         CreateObservation::Observed(observed_state),
@@ -7862,7 +7862,7 @@ fn resumed_persisted_create_records_nested_write_only_sent_values() {
 
     let row = resource_state_from_observation_for_test(
         &resolved(&resource),
-        &identified,
+        &created,
         None,
         Some(&schema),
         None,
@@ -7910,7 +7910,7 @@ fn provider_text_partial_create_writeback_preserves_raw_missing_attribute_keys()
         assert!(!label.contains('\x1b'));
         assert!(label.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
         assert_ne!(label, key);
-        let identified = IdentifiedCreate::from_in_flight_for_test(
+        let created = IdentifiedCreate::from_in_flight_for_test(
             pending,
             identifier,
             CreateObservation::Observed(
@@ -7920,7 +7920,7 @@ fn provider_text_partial_create_writeback_preserves_raw_missing_attribute_keys()
         .with_partial_read_for_test(diagnostic);
         let row = resource_state_from_observation_for_test(
             &resolved(&resource),
-            &identified,
+            &created,
             None,
             None,
             None,
@@ -7972,28 +7972,23 @@ fn resumed_partial_create_records_exact_missing_attributes() {
         vec!["computed".to_string()],
     )
     .unwrap();
-    let identified = IdentifiedCreate::from_in_flight_for_test(
+    let created = IdentifiedCreate::from_in_flight_for_test(
         pending,
         identifier.clone(),
         CreateObservation::Observed(observed_state),
     )
     .with_partial_read_for_test(diagnostic);
 
-    let SentRecord::Persisted(envelope) = identified.sent() else {
+    let SentRecord::Persisted(envelope) = created.sent() else {
         panic!("resumed partial create must retain its persisted sent envelope")
     };
     assert_eq!(
         envelope.token().expose_for_provider_call(),
         "persisted-token"
     );
-    let row = resource_state_from_observation_for_test(
-        &resolved(&resource),
-        &identified,
-        None,
-        None,
-        None,
-    )
-    .expect("resumed partial create must be persistable");
+    let row =
+        resource_state_from_observation_for_test(&resolved(&resource), &created, None, None, None)
+            .expect("resumed partial create must be persistable");
 
     assert_eq!(
         row.identifier().map(AppliedIdentifier::as_str),

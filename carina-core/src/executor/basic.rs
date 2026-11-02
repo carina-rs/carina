@@ -747,7 +747,7 @@ pub(super) fn process_basic_result<S: Clone>(
             resolved_attrs,
             binding,
         } => {
-            let (identified, state, diagnostic, read_back_end) = partial.into_parts();
+            let (created, state, diagnostic, read_back_end) = partial.into_parts();
             started.partially_succeeded(&state, &diagnostic, duration);
             let completeness =
                 BindingCompleteness::PartialReadBack(PartialReadBack::from_diagnostic(
@@ -769,7 +769,7 @@ pub(super) fn process_basic_result<S: Clone>(
             });
             exec.accumulator.insert_published(
                 resource_id,
-                Applied::Observed(std::sync::Arc::new(identified)),
+                Applied::Observed(std::sync::Arc::new(created)),
                 &state,
             );
             BasicEffectCompletion::Succeeded
@@ -1500,7 +1500,7 @@ mod process_basic_result_tests {
                 state,
                 request: _request,
             } => state,
-            Applied::Observed(_identified) => panic!("unexpected observed create"),
+            Applied::Observed(_created) => panic!("unexpected observed create"),
             Applied::CreateInFlight(_pending) => panic!("unexpected in-flight create"),
             Applied::CreateOutcomeUnknown(_unknown) => {
                 panic!("unexpected unknown create outcome")

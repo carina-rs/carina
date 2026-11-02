@@ -3006,8 +3006,7 @@ async fn test_wasm_pending_update_polls_until_success() {
             .await
             .expect("setup create should succeed"),
     );
-    let identified_identifier =
-        AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
+    let created_identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
     resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
     resource.set_attr(
         "update_pending_polls",
@@ -3022,7 +3021,7 @@ async fn test_wasm_pending_update_polls_until_success() {
 
     let state = provider
         .provider()
-        .update(&id, &identified_identifier, request)
+        .update(&id, &created_identifier, request)
         .await
         .expect("pending update should settle")
         .into_state_for_writeback();
@@ -3056,8 +3055,7 @@ async fn test_wasm_update_read_back_completes_within_budget() {
             .await
             .expect("setup create should succeed"),
     );
-    let identified_identifier =
-        AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
+    let created_identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
     resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
     resource.set_attr(
         "update_read_back_pending_polls",
@@ -3075,7 +3073,7 @@ async fn test_wasm_update_read_back_completes_within_budget() {
 
     let state = provider
         .provider()
-        .update(&id, &identified_identifier, request)
+        .update(&id, &created_identifier, request)
         .await
         .expect("update read-back should settle within the default budget")
         .into_state_for_writeback();
@@ -3109,8 +3107,7 @@ async fn test_wasm_update_read_back_budget_returns_partial_then_refresh_complete
             .await
             .expect("setup create should succeed"),
     );
-    let identified_identifier =
-        AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
+    let created_identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
     resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
     resource.set_attr(
         "update_read_back_pending_polls",
@@ -3128,7 +3125,7 @@ async fn test_wasm_update_read_back_budget_returns_partial_then_refresh_complete
 
     let outcome = provider
         .provider()
-        .update(&id, &identified_identifier, request)
+        .update(&id, &created_identifier, request)
         .await
         .expect("the final update attempt should return a partial success");
     let diagnostic = outcome
@@ -3179,8 +3176,7 @@ async fn test_wasm_update_read_back_phase_regression_is_protocol_violation_and_r
             .await
             .expect("setup create should succeed"),
     );
-    let identified_identifier =
-        AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
+    let created_identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
     resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
     resource.set_attr(
         "update_read_back_pending_polls",
@@ -3203,14 +3199,14 @@ async fn test_wasm_update_read_back_phase_regression_is_protocol_violation_and_r
 
     let error = provider
         .provider()
-        .update(&id, &identified_identifier, request)
+        .update(&id, &created_identifier, request)
         .await
         .expect_err("read-back must not regress to operation pending");
     assert!(error.to_string().contains("polling protocol"), "{error}");
 
     let recovered = provider
         .provider()
-        .read(&id, &identified_identifier, ReadRequest)
+        .read(&id, &created_identifier, ReadRequest)
         .await
         .expect("the retained update identifier must remain usable for recovery")
         .into_state();

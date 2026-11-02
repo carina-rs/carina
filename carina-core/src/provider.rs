@@ -3938,11 +3938,11 @@ impl PartialResume {
             diagnostic,
             read_back_end,
         } = self;
-        let identified = completed
+        let created = completed
             .into_identified_create()
             .with_partial_read(diagnostic.clone());
-        let state = identified.observed_state();
-        (identified, state, diagnostic, read_back_end)
+        let state = created.observed_state();
+        (created, state, diagnostic, read_back_end)
     }
 }
 
@@ -8929,9 +8929,9 @@ mod tests {
         let ResumeOutcomeKind::PartialSuccess(partial) = outcome.into_kind() else {
             panic!("resumed partial read-back must remain distinct from a resent create")
         };
-        let (identified, state, actual_diagnostic, read_back_end) = partial.into_parts();
+        let (created, state, actual_diagnostic, read_back_end) = partial.into_parts();
 
-        let SentRecord::Persisted(envelope) = identified.sent() else {
+        let SentRecord::Persisted(envelope) = created.sent() else {
             panic!("resumed partial read-back fabricated request sent authority")
         };
         assert_eq!(

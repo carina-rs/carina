@@ -2801,11 +2801,11 @@ async fn resume_resumed_publishes_observed() {
         ),
         (2, 0, 0)
     );
-    let Some(Applied::Observed(identified)) = result.applied_states.get(&source_id) else {
+    let Some(Applied::Observed(created)) = result.applied_states.get(&source_id) else {
         panic!("completed resume did not write an observed create")
     };
     assert!(matches!(
-        identified.observation(),
+        created.observation(),
         crate::provider::CreateObservation::Observed(_)
     ));
     assert!(matches!(
@@ -2864,14 +2864,14 @@ async fn resumed_partial_success_reports_once_and_preserves_partial_binding() {
             .any(|event| event == &format!("succeeded:{source_id}")
                 || event.starts_with(&format!("failed:{source_id}:")))
     );
-    let Some(Applied::Observed(identified)) = result.applied_states.get(&source_id) else {
+    let Some(Applied::Observed(created)) = result.applied_states.get(&source_id) else {
         panic!("partial resume must retain its observed create")
     };
     assert!(matches!(
-        identified.sent(),
+        created.sent(),
         crate::provider::SentRecord::Persisted(_)
     ));
-    assert!(identified.observed_state().partial_read.is_some());
+    assert!(created.observed_state().partial_read.is_some());
     assert!(result.applied_states.contains_key(&dependent_id));
     assert_eq!(
         result.partial_diagnostics[0].1.reason(),
