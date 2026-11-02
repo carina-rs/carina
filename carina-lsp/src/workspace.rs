@@ -1,10 +1,12 @@
 //! Workspace scanning: discover provider configurations from .crn files.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use carina_core::parser::{self, ProviderConfig, ProviderContext};
+use carina_core::paths::{CanonicalPath, PathIdentity, ResolvedPath};
 use carina_core::resource::ParserPlaceholder;
 
 #[derive(Debug, Clone)]
@@ -74,33 +76,42 @@ pub(crate) fn discover_providers_by_dir(
     environment: &carina_core::EnvironmentSnapshot,
 ) -> HashMap<PathBuf, Vec<DiscoveredProviderConfig>> {
     let mut result: HashMap<PathBuf, Vec<DiscoveredProviderConfig>> = HashMap::new();
-    discover_by_dir_recursive(workspace_root, &mut result, environment);
+    if let Ok(root) = ResolvedPath::new(workspace_root) {
+        discover_by_dir_recursive(&root, &mut result, &mut HashSet::new(), environment);
+    }
     result
 }
 
 fn discover_by_dir_recursive(
-    dir: &Path,
+    dir: &ResolvedPath,
     result: &mut HashMap<PathBuf, Vec<DiscoveredProviderConfig>>,
+    visited: &mut HashSet<CanonicalPath>,
     environment: &carina_core::EnvironmentSnapshot,
 ) {
-    let entries = match fs::read_dir(dir) {
+    if !visited.insert(dir.identity()) {
+        return;
+    }
+    let entries = match dir.entries() {
         Ok(entries) => entries,
         Err(_) => return,
     };
-    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
-    paths.sort();
-
-    for path in paths {
+    for entry in entries {
+        if !entry.is_dir() && entry.display().extension().is_none_or(|ext| ext != "crn") {
+            continue;
+        }
+        let Ok(path) = entry.resolve() else {
+            continue;
+        };
         if path.is_dir() {
-            discover_by_dir_recursive(&path, result, environment);
-        } else if path.extension().is_some_and(|ext| ext == "crn")
-            && let Ok(content) = fs::read_to_string(&path)
+            discover_by_dir_recursive(&path, result, visited, environment);
+        } else if path.display().extension().is_some_and(|ext| ext == "crn")
+            && let Ok(content) = path.read_to_string()
         {
             let ctx = ProviderContext::new(environment.clone());
-            if let Ok(parsed) = parser::parse_file(&content, &path, &ctx)
+            if let Ok(parsed) = parser::parse_file(&content, &path.source_label(), &ctx)
                 && !parsed.providers.is_empty()
             {
-                let source_dir = path.parent().unwrap_or(dir).to_path_buf();
+                let source_dir = path.parent().unwrap_or_else(|| dir.clone()).source_label();
                 let dir_providers = result.entry(source_dir).or_default();
                 let mut seen: HashSet<ProviderInstanceKey> = dir_providers
                     .iter()
@@ -123,59 +134,73 @@ fn discover_by_dir_recursive(
 /// the relative paths to absolute module directories, and maps each module
 /// to the directories that import it. This allows module files to inherit
 /// their callers' provider schemas.
+pub type ModuleImportMap = HashMap<PathIdentity, BTreeSet<PathIdentity>>;
+
 pub fn discover_import_map(
     workspace_root: &Path,
     environment: &carina_core::EnvironmentSnapshot,
-) -> HashMap<PathBuf, BTreeSet<PathBuf>> {
-    let mut result: HashMap<PathBuf, BTreeSet<PathBuf>> = HashMap::new();
-    discover_imports_recursive(workspace_root, &mut result, environment);
+) -> ModuleImportMap {
+    let mut result = ModuleImportMap::new();
+    if let Ok(root) = ResolvedPath::new(workspace_root) {
+        discover_imports_recursive(&root, &mut result, &mut HashSet::new(), environment);
+    }
     result
 }
 
 fn discover_imports_recursive(
-    dir: &Path,
-    result: &mut HashMap<PathBuf, BTreeSet<PathBuf>>,
+    dir: &ResolvedPath,
+    result: &mut ModuleImportMap,
+    visited: &mut HashSet<CanonicalPath>,
     environment: &carina_core::EnvironmentSnapshot,
 ) {
-    let entries = match fs::read_dir(dir) {
+    if !visited.insert(dir.identity()) {
+        return;
+    }
+    let entries = match dir.entries() {
         Ok(entries) => entries,
         Err(_) => return,
     };
-    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
-    paths.sort();
-
-    for path in paths {
+    for entry in entries {
+        if !entry.is_dir() && entry.display().extension().is_none_or(|ext| ext != "crn") {
+            continue;
+        }
+        let Ok(path) = entry.resolve() else {
+            continue;
+        };
         if path.is_dir() {
-            discover_imports_recursive(&path, result, environment);
-        } else if path.extension().is_some_and(|ext| ext == "crn")
-            && let Ok(content) = fs::read_to_string(&path)
+            discover_imports_recursive(&path, result, visited, environment);
+        } else if path.display().extension().is_some_and(|ext| ext == "crn")
+            && let Ok(content) = path.read_to_string()
         {
             let ctx = ProviderContext::new(environment.clone());
-            if let Ok(parsed) = parser::parse_file(&content, &path, &ctx) {
-                let caller_dir = path.parent().unwrap_or(dir);
+            if let Ok(parsed) = parser::parse_file(&content, &path.source_label(), &ctx) {
+                let caller_dir = path.parent().unwrap_or_else(|| dir.clone());
                 for import in &parsed.uses {
-                    let module_path = caller_dir.join(&import.path);
-                    // Resolve to canonical directory (strip .crn extension, handle dirs)
+                    let Ok(module_path) = caller_dir.join(&import.path) else {
+                        continue;
+                    };
                     let module_dir = if module_path.is_dir() {
                         module_path
-                    } else if module_path.extension().is_some_and(|ext| ext == "crn") {
-                        module_path.parent().unwrap_or(&module_path).to_path_buf()
+                    } else if module_path
+                        .display()
+                        .extension()
+                        .is_some_and(|ext| ext == "crn")
+                    {
+                        module_path.parent().unwrap_or(module_path)
                     } else {
-                        // Try with .crn extension
-                        let with_ext = module_path.with_extension("crn");
+                        let Ok(with_ext) = module_path.with_extension("crn") else {
+                            continue;
+                        };
                         if with_ext.exists() {
-                            with_ext.parent().unwrap_or(&module_path).to_path_buf()
+                            with_ext.parent().unwrap_or(module_path)
                         } else {
-                            // Might be a directory module
                             module_path
                         }
                     };
-                    // Canonicalize to resolve .. and symlinks
-                    let module_dir = module_dir.canonicalize().unwrap_or(module_dir);
-                    let caller_dir = caller_dir
-                        .canonicalize()
-                        .unwrap_or(caller_dir.to_path_buf());
-                    result.entry(module_dir).or_default().insert(caller_dir);
+                    result
+                        .entry(PathIdentity::from(module_dir.identity()))
+                        .or_default()
+                        .insert(PathIdentity::from(caller_dir.identity()));
                 }
             }
         }
@@ -185,8 +210,52 @@ fn discover_imports_recursive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
     use tempfile::TempDir;
+
+    // macOS APFS rejects non-UTF-8 names.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_directory_keys_preserve_non_utf8_project_directory() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = TempDir::new().unwrap();
+        let directory = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"project-\xff".to_vec()));
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("main.crn"), "provider mock {}\n").unwrap();
+
+        let providers =
+            discover_providers_by_dir(&directory, &carina_core::EnvironmentSnapshot::empty());
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[&directory][0].name, "mock");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_discovery_skips_unrelated_looping_symlink() {
+        let dir = TempDir::new().unwrap();
+        let module = dir.path().join("module");
+        fs::create_dir(&module).unwrap();
+        fs::write(
+            dir.path().join("main.crn"),
+            "provider mock {}\nlet module = use { source = './module' }\n",
+        )
+        .unwrap();
+        fs::write(module.join("main.crn"), "provider aws {}\n").unwrap();
+        for directory in [dir.path(), module.as_path()] {
+            std::os::unix::fs::symlink("notes.txt", directory.join("notes.txt")).unwrap();
+        }
+        let environment = carina_core::EnvironmentSnapshot::empty();
+
+        let providers = discover_providers_by_dir(dir.path(), &environment);
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[dir.path()][0].name, "mock");
+        assert_eq!(providers[&module][0].name, "aws");
+        let imports = discover_import_map(dir.path(), &environment);
+        assert!(imports[&PathIdentity::new(&module)].contains(&PathIdentity::new(dir.path())));
+    }
 
     #[test]
     fn discovery_uses_environment_snapshot() {
@@ -204,9 +273,7 @@ mod tests {
         let providers = discover_providers_by_dir(dir.path(), &environment);
         assert_eq!(providers[dir.path()][0].name, "mock");
         let imports = discover_import_map(dir.path(), &environment);
-        assert!(
-            imports[&module.canonicalize().unwrap()].contains(&dir.path().canonicalize().unwrap())
-        );
+        assert!(imports[&PathIdentity::new(&module)].contains(&PathIdentity::new(dir.path())));
     }
 
     #[test]
@@ -526,7 +593,7 @@ mod tests {
         let import_map =
             discover_import_map(dir.path(), &carina_core::EnvironmentSnapshot::empty());
 
-        let module_canonical = module.canonicalize().unwrap();
+        let module_canonical = PathIdentity::new(&module);
         assert!(
             import_map.contains_key(&module_canonical),
             "import_map should contain module dir. Keys: {:?}",
@@ -534,7 +601,7 @@ mod tests {
         );
 
         let callers = &import_map[&module_canonical];
-        let caller_canonical = caller.canonicalize().unwrap();
+        let caller_canonical = PathIdentity::new(&caller);
         assert!(
             callers.contains(&caller_canonical),
             "callers should contain the caller dir. Got: {:?}",
@@ -558,12 +625,12 @@ mod tests {
             fs::write(caller.join("a_import.crn"), import).unwrap();
         }
 
-        let import_map: HashMap<PathBuf, BTreeSet<PathBuf>> =
+        let import_map =
             discover_import_map(dir.path(), &carina_core::EnvironmentSnapshot::empty());
-        let module = module.canonicalize().unwrap();
-        let expected: BTreeSet<PathBuf> = ["alpha", "middle", "zeta"]
+        let module = PathIdentity::new(&module);
+        let expected: BTreeSet<PathIdentity> = ["alpha", "middle", "zeta"]
             .into_iter()
-            .map(|name| callers_root.join(name).canonicalize().unwrap())
+            .map(|name| PathIdentity::new(callers_root.join(name)))
             .collect();
 
         assert_eq!(import_map[&module], expected);
@@ -575,5 +642,31 @@ mod tests {
         let import_map =
             discover_import_map(dir.path(), &carina_core::EnvironmentSnapshot::empty());
         assert!(import_map.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_import_map_deduplicates_symlink_callers() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        let link = temp.path().join("link");
+        fs::create_dir_all(real.join("module")).unwrap();
+        fs::write(
+            real.join("main.crn"),
+            "let m = use { source = './module' }\n",
+        )
+        .unwrap();
+        fs::write(
+            real.join("module/main.crn"),
+            "arguments { value: String }\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let imports = discover_import_map(temp.path(), &carina_core::EnvironmentSnapshot::empty());
+        let callers = &imports[&PathIdentity::new(real.join("module"))];
+        assert_eq!(callers.len(), 1);
+        assert!(callers.contains(&PathIdentity::new(&link)));
+        assert!(callers.contains(&PathIdentity::new(&real)));
     }
 }

@@ -60,7 +60,10 @@ let instance = component { }
     }
 
     fn validate(&self) -> Vec<String> {
-        carina_cli::commands::validate::validate_with_factories(&self.caller, Vec::new())
+        carina_cli::commands::validate::validate_with_factories(
+            &carina_core::paths::ResolvedPath::new(&self.caller).unwrap(),
+            Vec::new(),
+        )
     }
 }
 
@@ -211,8 +214,10 @@ fn directly_validated_module_with_backend_reports_only_the_backend_rule() {
     );
     write(temp.path(), "backend.crn", BACKEND_BLOCK);
 
-    let diagnostics =
-        carina_cli::commands::validate::validate_with_factories(temp.path(), Vec::new());
+    let diagnostics = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
+        Vec::new(),
+    );
 
     assert_eq!(
         diagnostics.len(),

@@ -1,12 +1,9 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::output_style::Colorize;
 use serde::Serialize;
 
-use carina_core::config_loader::{
-    find_crn_files_in_dir, get_base_dir, load_configuration_with_config,
-};
+use carina_core::config_loader::{find_crn_files_in_dir, load_configuration_with_config};
 use carina_core::lint::find_duplicate_attrs;
 use carina_core::parser::{ProviderContext, ResourceRef, UpstreamState};
 use carina_core::resource::{BindingAddress, ResourceId};
@@ -60,7 +57,7 @@ pub(crate) fn print_provider_type_warning(warning: &carina_core::parser::ParseWa
 /// Not used outside test code.
 #[cfg(any(test, feature = "test-utils"))]
 pub fn validate_with_factories(
-    path: &Path,
+    path: &carina_core::paths::ResolvedPath,
     factories: Vec<crate::wiring::LoadedProviderFactory>,
 ) -> Vec<String> {
     let diagnostics = validate_diagnostics_with_factories(path, factories, Default::default());
@@ -83,7 +80,7 @@ pub struct ValidateDiagnostics {
 
 #[cfg(any(test, feature = "test-utils"))]
 pub fn validate_diagnostics_with_factories(
-    path: &Path,
+    path: &carina_core::paths::ResolvedPath,
     factories: Vec<crate::wiring::LoadedProviderFactory>,
     load_errors: std::collections::HashMap<String, String>,
 ) -> ValidateDiagnostics {
@@ -103,7 +100,7 @@ pub fn validate_diagnostics_with_factories(
         }
     };
     let parsed = loaded.parsed;
-    let base_dir = get_base_dir(path);
+    let base_dir = path;
     let providers = ProviderLoad::for_test_with_load_errors(
         &runtime,
         factories,
@@ -128,7 +125,7 @@ pub fn validate_diagnostics_with_factories(
 /// Not used outside test code.
 #[cfg(any(test, feature = "test-utils"))]
 pub fn validated_resource_ids_with_factories(
-    path: &Path,
+    path: &carina_core::paths::ResolvedPath,
     factories: Vec<crate::wiring::LoadedProviderFactory>,
 ) -> Vec<String> {
     let runtime = crate::test_support::TestCommandRuntime::new();
@@ -142,7 +139,7 @@ pub fn validated_resource_ids_with_factories(
         Err(e) => panic!("fixture failed to load: {e}"),
     };
     let parsed = loaded.parsed;
-    let base_dir = get_base_dir(path);
+    let base_dir = path;
     let providers =
         ProviderLoad::for_test_with_provider_phase(&runtime, factories, &parsed.providers);
 
@@ -289,9 +286,12 @@ pub fn run_validate(
     json: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
+    let project = carina_core::paths::ResolvedPath::new(path)
+        .map_err(|error| AppError::Config(error.to_string()))?;
+    let base_dir = &project;
     let color_mode = runtime.color_mode();
     let loaded = match load_configuration_with_config(
-        path,
+        base_dir,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     ) {
@@ -299,7 +299,7 @@ pub fn run_validate(
         Err(error) => {
             return crate::wiring::settle_type_checks(
                 crate::wiring::failed_configuration_report(
-                    path,
+                    base_dir,
                     error.into(),
                     runtime.environment().clone(),
                 ),
@@ -308,8 +308,6 @@ pub fn run_validate(
         }
     };
     let parsed = loaded.parsed;
-
-    let base_dir = get_base_dir(path);
 
     // Collect every static error before reporting, so the user sees
     // them all in one pass instead of fixing one, re-running, and
@@ -364,12 +362,13 @@ pub fn run_validate(
 
     // Check for duplicate attribute keys
     let source_files: Vec<(PathBuf, String)> = {
-        let files = find_crn_files_in_dir(path)?;
+        let files = find_crn_files_in_dir(base_dir)?;
         let mut texts = Vec::new();
         for file in files {
-            let content = fs::read_to_string(&file)
+            let content = file
+                .read_to_string()
                 .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
-            texts.push((file, content));
+            texts.push((file.source_label(), content));
         }
         texts
     };
@@ -457,12 +456,15 @@ pub fn run_validate(
 /// I/O) — this is a lightweight early signal run during `validate`. All
 /// failures are accumulated so the user sees every bad path at once.
 fn check_upstream_state_sources(
-    base_dir: &std::path::Path,
+    base_dir: &carina_core::paths::ResolvedPath,
     upstream_states: &[UpstreamState],
 ) -> Result<(), AppError> {
     let mut errors = Vec::new();
     for us in upstream_states {
-        if !base_dir.join(&us.source).is_dir() {
+        if !base_dir
+            .join(&us.source)
+            .is_ok_and(|source| source.is_dir())
+        {
             errors.push(format!(
                 "upstream_state '{}': source '{}' does not exist",
                 us.binding,
@@ -487,8 +489,9 @@ mod tests {
         let path = fixture.path().join("main.crn");
         std::fs::write(&path, "provider broken { source = 'file:///definitely-missing/broken.wasm' }\nfn f(x: Arn) { x }\nlet a = f('arn:aws:s3:::bucket')\nattributes {\n  x: AwsAccountId = '123'\n}\n").unwrap();
         let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let project = carina_core::paths::ResolvedPath::new(fixture.path()).unwrap();
         let loaded = load_configuration_with_config(
-            fixture.path(),
+            &project,
             &config,
             &carina_core::schema::SchemaRegistry::new(),
         )
@@ -502,7 +505,7 @@ mod tests {
                 "broken provider failed to load".into(),
             )]),
         );
-        let report = providers.validation_report(&loaded.parsed, fixture.path(), false, &[]);
+        let report = providers.validation_report(&loaded.parsed, &project, false, &[]);
         let warnings = report.provider_type_warnings();
         assert_eq!(warnings.len(), 3, "{warnings:#?}");
         for (warning, name, line) in [
@@ -540,8 +543,9 @@ mod tests {
     fn validate_loaded_catalog_reports_unknown_types_without_unloaded_warnings() {
         let fixture = tempfile::tempdir().unwrap();
         std::fs::write(fixture.path().join("main.crn"), "fn f(x: Arn) { x }\nlet a = f('arn:aws:s3:::bucket')\nattributes { x: AwsAccountId = '123' }\n").unwrap();
+        let project = carina_core::paths::ResolvedPath::new(fixture.path()).unwrap();
         let loaded = load_configuration_with_config(
-            fixture.path(),
+            &project,
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
         )
@@ -551,7 +555,7 @@ mod tests {
             Vec::new(),
             &loaded.parsed.providers,
         );
-        let report = providers.validation_report(&loaded.parsed, fixture.path(), false, &[]);
+        let report = providers.validation_report(&loaded.parsed, &project, false, &[]);
         assert!(report.provider_type_warnings().is_empty());
         for name in ["Arn", "AwsAccountId"] {
             assert!(
@@ -591,7 +595,7 @@ mod tests {
             |session| {
                 carina_core::module_resolver::resolve_modules_providerless(
                     carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-                    std::path::Path::new("."),
+                    &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                     session,
                 )
                 .expect("test fixture crosses module resolution")
@@ -613,7 +617,10 @@ mod tests {
         )
         .expect("write export fixture");
 
-        let errors = validate_with_factories(fixture.path(), Vec::new());
+        let errors = validate_with_factories(
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            Vec::new(),
+        );
         let empty_interpolations = errors
             .iter()
             .filter(|error| error.contains("empty interpolation `${}`"))
@@ -685,7 +692,10 @@ backend s3 {
     fn validate_reports_multifile_unknown_provider_instance_once() {
         let fixture = unknown_provider_instance_fixture();
 
-        let errors = validate_with_factories(fixture.path(), Vec::new());
+        let errors = validate_with_factories(
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            Vec::new(),
+        );
         let routing_error = "`typo` is not a known provider instance";
         let occurrences = errors
             .iter()
@@ -702,7 +712,7 @@ backend s3 {
     fn plan_validation_reports_multifile_unknown_provider_instance_once() {
         let fixture = unknown_provider_instance_fixture();
         let loaded = load_configuration_with_config(
-            fixture.path(),
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
         )
@@ -716,7 +726,7 @@ backend s3 {
         let error = match providers.validate_config_pair(
             loaded.parsed,
             loaded.unresolved_parsed,
-            fixture.path(),
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
             false,
             &loaded.duplicate_declarations,
         ) {
@@ -750,7 +760,7 @@ backend s3 {
         .expect("write undefined iterable fixture");
 
         let loaded = load_configuration_with_config(
-            fixture.path(),
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
         )
@@ -768,7 +778,10 @@ backend s3 {
             other => panic!("unexpected scope error: {other}"),
         }
 
-        let errors = validate_with_factories(fixture.path(), Vec::new());
+        let errors = validate_with_factories(
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            Vec::new(),
+        );
         let occurrences = errors
             .iter()
             .filter(|error| error.contains("Undefined identifier `does_not_exist`"))
@@ -798,7 +811,10 @@ let attach = mock.test.resource {
         )
         .expect("write reference producer");
 
-        let errors = validate_with_factories(fixture.path(), Vec::new());
+        let errors = validate_with_factories(
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            Vec::new(),
+        );
 
         assert!(
             errors
@@ -827,7 +843,10 @@ let observed_names = roles.names
         )
         .expect("write data-source reference producer");
 
-        let errors = validate_with_factories(fixture.path(), Vec::new());
+        let errors = validate_with_factories(
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            Vec::new(),
+        );
 
         assert!(
             errors
@@ -874,7 +893,10 @@ let observed_names = roles.names
         )
         .unwrap();
 
-        let errors = validate_with_factories(fixture.path(), Vec::new());
+        let errors = validate_with_factories(
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            Vec::new(),
+        );
 
         assert_eq!(errors.len(), 1, "unexpected validation errors: {errors:#?}");
         assert!(errors[0].contains("Undefined identifier `itmes`"));
@@ -899,7 +921,10 @@ let observed_names = roles.names
         )
         .unwrap();
 
-        let errors = validate_with_factories(fixture.path(), Vec::new());
+        let errors = validate_with_factories(
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            Vec::new(),
+        );
         let rendered = errors.join("\n");
 
         assert!(
@@ -938,7 +963,10 @@ let observed_names = roles.names
         )
         .unwrap();
 
-        let errors = validate_with_factories(fixture.path(), Vec::new());
+        let errors = validate_with_factories(
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            Vec::new(),
+        );
 
         assert_eq!(errors.len(), 1, "unexpected validation errors: {errors:#?}");
         assert!(errors[0].contains("Undefined identifier `itmes`"));
@@ -966,7 +994,10 @@ let observed_names = roles.names
         )
         .unwrap();
 
-        let errors = validate_with_factories(fixture.path(), Vec::new());
+        let errors = validate_with_factories(
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            Vec::new(),
+        );
 
         assert_eq!(errors.len(), 1, "unexpected validation errors: {errors:#?}");
         assert!(errors[0].contains("Undefined identifier `itmes`"));
@@ -1012,7 +1043,7 @@ let observed_names = roles.names
             |session| {
                 carina_core::module_resolver::resolve_modules_providerless(
                     carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-                    std::path::Path::new("."),
+                    &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                     session,
                 )
                 .expect("cross the deferred-body resolution seam")
@@ -1142,7 +1173,11 @@ let observed_names = roles.names
         std::fs::create_dir(&base).unwrap();
         std::fs::create_dir(tmp.path().join("upstream")).unwrap();
 
-        check_upstream_state_sources(&base, &[upstream("orgs", "../upstream")]).unwrap();
+        check_upstream_state_sources(
+            &carina_core::paths::ResolvedPath::new(&base).unwrap(),
+            &[upstream("orgs", "../upstream")],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1151,8 +1186,11 @@ let observed_names = roles.names
         let base = tmp.path().join("project");
         std::fs::create_dir(&base).unwrap();
 
-        let err = check_upstream_state_sources(&base, &[upstream("orgs", "../nonexistent")])
-            .expect_err("missing source should error");
+        let err = check_upstream_state_sources(
+            &carina_core::paths::ResolvedPath::new(&base).unwrap(),
+            &[upstream("orgs", "../nonexistent")],
+        )
+        .expect_err("missing source should error");
         let msg = err.to_string();
         assert!(
             msg.contains("upstream_state 'orgs'") && msg.contains("../nonexistent"),
@@ -1167,7 +1205,7 @@ let observed_names = roles.names
         std::fs::create_dir(&base).unwrap();
 
         let err = check_upstream_state_sources(
-            &base,
+            &carina_core::paths::ResolvedPath::new(&base).unwrap(),
             &[upstream("a", "../missing_a"), upstream("b", "../missing_b")],
         )
         .expect_err("missing sources should error");

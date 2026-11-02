@@ -24,6 +24,8 @@
 
 use std::path::PathBuf;
 
+use carina_core::paths::ResolvedPath;
+
 use crate::backend::{BackendError, BackendResult, StateBackend};
 use crate::backend_selection::BackendSelection;
 use crate::state::{PublishedExports, StateFile};
@@ -77,11 +79,14 @@ impl LocalStateFile {
 /// let _ = load_local_state_file(&remote);
 /// ```
 pub async fn load_local_state_file(file: &LocalStateFile) -> BackendResult<StateFile> {
-    super::LocalBackend::with_path(file.path.clone())
+    let path = ResolvedPath::new(&file.path)
+        .map_err(|error| BackendError::Io(format!("Failed to locate state file: {error}")))?;
+    let location = path.display().clone();
+    super::LocalBackend::with_resolved_path(path)?
         .read_state()
         .await?
         .map(|loaded| loaded.into_state())
-        .ok_or_else(|| BackendError::InvalidState(format!("No state at {}", file.path.display())))
+        .ok_or_else(|| BackendError::InvalidState(format!("No state at {location}")))
 }
 
 /// A parsed `--state-url` argument.
@@ -438,5 +443,37 @@ mod tests {
 
         assert!(error.to_string().contains(&path.display().to_string()));
         assert!(error.to_string().contains("Please upgrade Carina"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn published_exports_error_preserves_symlink_state_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let path = link.join("future-exports.json");
+        let state = serde_json::json!({
+            "version": StateFile::CURRENT_VERSION,
+            "exports_version": PublishedExports::CURRENT_VERSION + 1,
+            "exports": {}
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+        let url = StateUrl::parse(path.to_str().unwrap()).unwrap();
+        let error = load_published_exports_from_url(&url)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(!error.contains(&real.display().to_string()), "{error}");
+        assert!(error.contains("Please upgrade Carina"), "{error}");
+
+        std::fs::write(&path, b"{").unwrap();
+        let error = load_state_from_url(&url).await.unwrap_err().to_string();
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(!error.contains(&real.display().to_string()), "{error}");
+        assert!(error.contains("EOF"), "{error}");
     }
 }

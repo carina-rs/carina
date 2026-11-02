@@ -49,6 +49,26 @@ impl ProviderTypeCheckSite {
     }
 }
 
+#[cfg(all(test, unix))]
+#[test]
+fn deferred_type_diagnostics_preserve_symlink_parent_source_spelling() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("private/nested")).unwrap();
+    std::fs::create_dir(temp.path().join("private/bad")).unwrap();
+    std::os::unix::fs::symlink("private/nested", temp.path().join("jump")).unwrap();
+    let source = temp.path().join("jump/../bad/main.crn");
+    std::fs::write(&source, "arguments { value: MissingType }\n").unwrap();
+    let span = SourceSpan::dummy();
+    assert_eq!(
+        ProviderTypeCheckSite::new(&source, span, "annotation").source,
+        source
+    );
+    assert_eq!(
+        ProviderTypeCheckSite::at_line(&source, 1, 1, "annotation").source,
+        source
+    );
+}
+
 /// The evidence belongs exclusively to one run, never to a cloneable catalog.
 #[derive(Debug)]
 struct DeferredProviderTypeChecks<'s> {
@@ -1071,7 +1091,7 @@ mod producer_tests {
             |context| {
                 let schemas = crate::schema::SchemaRegistry::new();
                 let loaded = crate::config_loader::load_configuration_with_config(
-                    directory.path(),
+                    &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
                     context.catalog(),
                     &schemas,
                 )
@@ -1079,7 +1099,7 @@ mod producer_tests {
                 let resolution =
                     crate::module_resolver::resolve_module_template_with_providerless_config(
                         loaded.parsed,
-                        directory.path(),
+                        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
                         context,
                         &schemas,
                     );
@@ -1117,7 +1137,7 @@ mod producer_tests {
                 |context| {
                     let schemas = crate::schema::SchemaRegistry::new();
                     let loaded = crate::config_loader::load_configuration_with_config(
-                        directory.path(),
+                        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
                         context.catalog(),
                         &schemas,
                     )
@@ -1125,7 +1145,7 @@ mod producer_tests {
                     let resolution =
                         crate::module_resolver::resolve_module_template_with_providerless_config(
                             loaded.parsed,
-                            directory.path(),
+                            &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
                             context,
                             &schemas,
                         );
@@ -1157,7 +1177,7 @@ mod producer_tests {
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |context| {
                 let loaded = crate::config_loader::load_configuration_with_config(
-                    directory.path(),
+                    &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
                     context.catalog(),
                     &crate::schema::SchemaRegistry::new(),
                 )

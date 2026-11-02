@@ -19,6 +19,7 @@ use time::format_description::well_known::Rfc3339;
 use carina_core::UserDirs;
 use carina_core::hint::ProjectCommand;
 use carina_core::parser::ProviderConfig;
+use carina_core::paths::{DisplayPath, PersistedPath, ResolvedPath};
 use carina_core::provider_source::{
     FileSource, GithubSource, ProviderSource, RegistrySource, RemoteSource, RemoteSourceKey,
 };
@@ -56,7 +57,7 @@ use crate::version_resolver::{
     resolve_release_at_version, verify_fresh_release_asset,
 };
 
-const PROVIDER_LOCK_FILE_NAME: &str = "carina-providers.lock";
+pub(crate) const PROVIDER_LOCK_FILE_NAME: &str = "carina-providers.lock";
 
 /// Return the provider lock-file path for a project directory.
 pub fn provider_lock_path(project_dir: &Path) -> PathBuf {
@@ -2210,11 +2211,11 @@ pub struct LegacyLockEntry {
 }
 
 impl LegacyLockEntry {
-    fn error(&self, project_dir: &Path) -> LegacyLockEntryError {
+    fn error(&self, project_dir: &ResolvedPath) -> LegacyLockEntryError {
         LegacyLockEntryError {
             source: self.source.clone(),
             reason: self.reason.clone(),
-            project_dir: project_dir.to_path_buf(),
+            project_dir: project_dir.source_label(),
         }
     }
 }
@@ -3166,7 +3167,7 @@ fn finish_legacy_lock_migration(
     body: ParsedLegacyLockBody,
     legacy: Vec<LegacyLockEntry>,
     path: &Path,
-    project_dir: &Path,
+    project_dir: &ResolvedPath,
 ) -> Result<LoadedLockFile, LockFileError> {
     let legacy_sources = legacy.iter().map(|entry| entry.source.clone()).collect();
     let ParsedLegacyLockBody {
@@ -3198,7 +3199,7 @@ fn finish_legacy_lock_migration(
         project_dir,
     )?;
     let migration = LockFileMigration {
-        project_dir: project_dir.to_path_buf(),
+        project_dir: project_dir.source_label(),
         from,
         to: LockFile::CURRENT_VERSION,
         discarded_discovery_pins,
@@ -3627,6 +3628,7 @@ impl PreparedRegistryDiscoveryRepin<'_> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_parent(path: &Path) -> &Path {
     // Empty parents (bare relative filenames) and paths with no parent (such as
     // roots) both fall back to the current directory. For bare filenames, this
@@ -3636,68 +3638,9 @@ pub(crate) fn resolve_parent(path: &Path) -> &Path {
         .unwrap_or(Path::new("."))
 }
 
-// Linux allows at most 40 symlink traversals during pathname resolution. Use
-// the same bound so dangling-chain fallback cannot loop forever on platforms
-// where canonicalize does not diagnose a cycle first.
-const MAX_LOCK_FILE_SYMLINK_HOPS: usize = 40;
-
-#[cfg(unix)]
-fn filesystem_loop_error() -> io::Error {
-    // ErrorKind::FilesystemLoop is not yet directly constructible on stable
-    // Rust, but std maps the platform's ELOOP code to that kind.
-    io::Error::from_raw_os_error(libc::ELOOP)
-}
-
-#[cfg(windows)]
-fn filesystem_loop_error() -> io::Error {
-    // WinError.h's ERROR_CANT_RESOLVE_FILENAME maps to FilesystemLoop in std.
-    const ERROR_CANT_RESOLVE_FILENAME: i32 = 1921;
-    io::Error::from_raw_os_error(ERROR_CANT_RESOLVE_FILENAME)
-}
-
-pub(crate) fn resolve_lock_file_save_path(path: &Path) -> io::Result<PathBuf> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(path.to_path_buf());
-        }
-        Err(error) => return Err(error),
-    };
-    if !metadata.file_type().is_symlink() {
-        return Ok(path.to_path_buf());
-    }
-
-    match fs::canonicalize(path) {
-        Ok(target) => Ok(target),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let mut link_path = path.to_path_buf();
-            for _ in 0..MAX_LOCK_FILE_SYMLINK_HOPS {
-                let target = fs::read_link(&link_path)?;
-                let target = if target.is_absolute() {
-                    target
-                } else {
-                    resolve_parent(&link_path).join(target)
-                };
-
-                match fs::symlink_metadata(&target) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
-                        link_path = target;
-                    }
-                    Ok(_) => return Ok(target),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        return Ok(target);
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            Err(filesystem_loop_error())
-        }
-        Err(error) => Err(error),
-    }
-}
-
 #[cfg(test)]
-type LockFileRenameHook = Box<dyn FnOnce(&Path, &Path) -> io::Result<()>>;
+type LockFileRenameHook =
+    Box<dyn FnOnce(&mut carina_core::paths::StagedFile, &ResolvedPath) -> io::Result<()>>;
 
 #[cfg(test)]
 std::thread_local! {
@@ -3706,11 +3649,13 @@ std::thread_local! {
 }
 
 #[cfg(test)]
-pub(crate) fn rename_lock_file_for_test(from: &Path, to: &Path) -> io::Result<()> {
-    if let Some(rename) = LOCK_FILE_RENAME_HOOK.with(|hook| hook.borrow_mut().take()) {
-        return rename(from, to);
-    }
-    fs::rename(from, to)
+pub(crate) fn replace_lock_file_for_test(
+    staged: &mut carina_core::paths::StagedFile,
+    target: &ResolvedPath,
+) -> Option<io::Result<()>> {
+    LOCK_FILE_RENAME_HOOK
+        .with(|hook| hook.borrow_mut().take())
+        .map(|replace| replace(staged, target))
 }
 
 impl LockFile {
@@ -3781,34 +3726,51 @@ impl LockFile {
     /// `project_dir` is also the user-facing project argument used in
     /// remediation commands; callers must not derive it from a canonicalized
     /// lock path.
-    pub fn load(project_dir: &Path) -> Result<Option<LoadedLockFile>, LockFileError> {
-        let path = provider_lock_path(project_dir);
+    pub fn load(project_dir: &ResolvedPath) -> Result<Option<LoadedLockFile>, LockFileError> {
+        let project = project_dir.clone();
+        let path = project
+            .join(PROVIDER_LOCK_FILE_NAME)
+            .map_err(|source| LockFileError::Read {
+                path: project_dir.source_label().join(PROVIDER_LOCK_FILE_NAME),
+                source,
+            })?;
         let Some(content) = Self::read_from_path(&path)? else {
             return Ok(None);
         };
-        Self::parse_toml_str(&content, &path, project_dir).map(Some)
+        Self::parse_toml_str(&content, &path.source_label(), project_dir).map(Some)
     }
 
-    fn read_from_path(path: &Path) -> Result<Option<String>, LockFileError> {
-        let content = match fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => {
-                return Err(LockFileError::Read {
-                    path: path.to_path_buf(),
-                    source,
-                });
-            }
-        };
-        Ok(Some(content))
+    fn read_from_path(path: &ResolvedPath) -> Result<Option<String>, LockFileError> {
+        match path.read_to_string() {
+            Ok(content) => Ok(Some(content)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(LockFileError::Read {
+                path: path.source_label(),
+                source,
+            }),
+        }
     }
 
     #[cfg(test)]
     fn load_from_path(path: &Path) -> Result<Option<LoadedLockFile>, LockFileError> {
-        let Some(content) = Self::read_from_path(path)? else {
+        let Some(content) = Self::read_from_path(&ResolvedPath::new(path).map_err(|source| {
+            LockFileError::Read {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?)?
+        else {
             return Ok(None);
         };
-        Self::parse_toml_str(&content, path, resolve_parent(path)).map(Some)
+        Self::parse_toml_str(
+            &content,
+            path,
+            &ResolvedPath::new(resolve_parent(path)).map_err(|source| LockFileError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?,
+        )
+        .map(Some)
     }
 
     /// Validated parse seam. It is private so callers cannot deserialize a
@@ -3816,7 +3778,7 @@ impl LockFile {
     fn parse_toml_str(
         content: &str,
         path: &Path,
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
     ) -> Result<LoadedLockFile, LockFileError> {
         let version: LockFileVersion = parse_lock_toml(content, path)?;
         let version = version
@@ -3846,7 +3808,7 @@ impl LockFile {
                     Ok(LoadedLockFile::Migrated {
                         lock_file,
                         migration: LockFileMigration {
-                            project_dir: project_dir.to_path_buf(),
+                            project_dir: project_dir.source_label(),
                             from: version,
                             to: Self::CURRENT_VERSION,
                             discarded_discovery_pins: BTreeMap::new(),
@@ -3887,7 +3849,7 @@ impl LockFile {
                 Ok(LoadedLockFile::Migrated {
                     lock_file,
                     migration: LockFileMigration {
-                        project_dir: project_dir.to_path_buf(),
+                        project_dir: project_dir.source_label(),
                         from: version,
                         to: Self::CURRENT_VERSION,
                         discarded_discovery_pins: BTreeMap::new(),
@@ -3956,15 +3918,19 @@ impl LockFile {
 
     #[cfg(test)]
     fn from_toml_str(content: &str, path: &Path) -> Result<Self, LockFileError> {
-        Self::parse_toml_str(content, path, resolve_parent(path))
-            .map(LoadedLockFile::into_lock_file)
+        Self::parse_toml_str(
+            content,
+            path,
+            &ResolvedPath::new(resolve_parent(path)).unwrap(),
+        )
+        .map(LoadedLockFile::into_lock_file)
     }
 
     fn from_unchecked(
         unchecked: UncheckedLockFile,
         legacy: Vec<LegacyLockEntry>,
         path: &Path,
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
     ) -> Result<Self, LockFileError> {
         let UncheckedLockFile {
             _version: _,
@@ -4001,7 +3967,7 @@ impl LockFile {
         unpinned_registry_ratchets: UnpinnedRegistryRatchets,
         legacy: Vec<LegacyLockEntry>,
         path: &Path,
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
     ) -> Result<Self, LockFileError> {
         let unpinned_registry_ratchets =
             unpinned_registry_ratchets
@@ -4053,7 +4019,7 @@ impl LockFile {
             };
             if !registry_host.contains_key(registry.resolved_hostname()) {
                 return Err(LockFileError::MissingRegistryHostRecord {
-                    project_dir: project_dir.to_path_buf(),
+                    project_dir: project_dir.source_label(),
                     provider: canonical_lock_source(&entry.source),
                     hostname: registry.resolved_hostname().to_owned(),
                 });
@@ -4146,7 +4112,7 @@ impl LockFile {
     pub fn locked_egress(
         &self,
         declaration: &crate::VerifiedEgressDeclaration,
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
     ) -> Option<crate::LockedEgress> {
         self.locked_egress_for_artifact(
             declaration.source(),
@@ -4159,7 +4125,7 @@ impl LockFile {
         &self,
         source: &crate::CanonicalSource,
         sha256: &str,
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
     ) -> Option<crate::LockedEgress> {
         let entry = self.find_by_verified_artifact(source, sha256, project_dir)?;
         let locked_source = crate::CanonicalSource::from_lock_source(&entry.source, project_dir)?;
@@ -4179,15 +4145,12 @@ impl LockFile {
         &self,
         source: &crate::CanonicalSource,
         sha256: &str,
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
     ) -> Option<&LockEntry<RegistryLock>> {
         self.provider.iter().find(|entry| {
-            let source_matches = if source.is_file() {
+            let source_matches =
                 crate::CanonicalSource::from_lock_source(&entry.source, project_dir).as_ref()
-                    == Some(source)
-            } else {
-                Self::sources_match(&entry.source, &source.to_string())
-            };
+                    == Some(source);
             source_matches && (source.is_file() || entry.sha256 == sha256)
         })
     }
@@ -4195,7 +4158,7 @@ impl LockFile {
     fn egress_record_for_display(
         &self,
         source: &crate::CanonicalSource,
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
     ) -> Option<&crate::EgressLockRecord> {
         self.provider.iter().find_map(|entry| {
             let locked_source =
@@ -4210,7 +4173,7 @@ impl LockFile {
     fn explicit_egress_for_carry_over(
         &self,
         declaration: &crate::VerifiedEgressDeclaration,
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
     ) -> Option<crate::LockedEgress> {
         self.provider.iter().find_map(|entry| {
             let locked_source =
@@ -4236,7 +4199,7 @@ impl LockFile {
         &mut self,
         declaration: &crate::VerifiedEgressDeclaration,
         consent: crate::EgressConsent,
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
     ) -> Result<(), crate::EgressConsentError> {
         crate::ConsentedEgress::from_consent(declaration.clone(), consent.clone())?;
         let record = match consent {
@@ -4262,7 +4225,7 @@ impl LockFile {
     fn clear_empty_egress_declaration(
         &mut self,
         declaration: crate::VerifiedEgressDeclaration,
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
     ) -> Result<(), crate::EgressConsentError> {
         crate::ConsentedEgress::nothing_declared(declaration.clone())?;
         let entry = self
@@ -4711,7 +4674,7 @@ impl std::error::Error for LockedEgressLoadError {
 /// Load the optional egress record for the canonical source of these exact
 /// verified bytes. The host binds it to the declaration from the same load.
 pub fn load_locked_egress(
-    project_dir: &Path,
+    project_dir: &ResolvedPath,
     load: &VerifiedLoad,
 ) -> Result<Option<crate::LockedEgress>, LockedEgressLoadError> {
     let Some(loaded) = LockFile::load(project_dir).map_err(LockedEgressLoadError::LockFile)? else {
@@ -4722,7 +4685,7 @@ pub fn load_locked_egress(
     Ok(lock_file.locked_egress_for_artifact(&source, load.artifact().sha256(), project_dir))
 }
 
-fn load_lock_file(project_dir: &Path) -> Result<Option<LockFile>, LockFileError> {
+fn load_lock_file(project_dir: &ResolvedPath) -> Result<Option<LockFile>, LockFileError> {
     let loaded = LockFile::load(project_dir)?;
     Ok(loaded.map(LoadedLockFile::into_resolution_lock_file))
 }
@@ -4770,13 +4733,18 @@ impl<'borrow, 'lock> PersistentLockFile<'borrow, 'lock> {
         observation: &str,
         update: impl FnOnce(&mut GuardedLockFile<'lock>) -> Result<(), String>,
     ) -> Result<(), String> {
-        let path = provider_lock_path(self.lock_file.install_lock().project_dir());
+        let path = self
+            .lock_file
+            .install_lock()
+            .project_dir()
+            .display()
+            .join(PROVIDER_LOCK_FILE_NAME);
         let mut persisted = self.lock_file.clone_for_save();
         let result = update(&mut persisted).and_then(|()| {
             persisted.save().map_err(|error| {
                 format!(
                     "Failed to persist registry {observation} observation to {}: {error}",
-                    path.display()
+                    path
                 )
             })
         });
@@ -4934,7 +4902,12 @@ impl<'borrow, 'lock> PersistentLockFile<'borrow, 'lock> {
 /// A resolved provider artifact path that is guaranteed to have a `.wasm`
 /// extension.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WasmArtifactPath(PathBuf);
+pub struct WasmArtifactPath {
+    // Byte-preserving bridge for locator APIs that still take `&Path`.
+    path: PathBuf,
+    io_locator: PersistedPath,
+    display: DisplayPath,
+}
 
 impl WasmArtifactPath {
     pub(crate) fn new(path: PathBuf, provider_name: &str) -> Result<Self, String> {
@@ -4942,7 +4915,13 @@ impl WasmArtifactPath {
             .extension()
             .is_some_and(|extension| extension == "wasm")
         {
-            Ok(Self(path))
+            let display = DisplayPath::new(&path).map_err(|error| error.to_string())?;
+            let io_locator = PersistedPath::new(&path).map_err(|error| error.to_string())?;
+            Ok(Self {
+                path,
+                io_locator,
+                display,
+            })
         } else {
             Err(format!(
                 "Provider '{provider_name}': native binaries are no longer supported. Use a .wasm component instead."
@@ -4951,7 +4930,52 @@ impl WasmArtifactPath {
     }
 
     pub fn as_path(&self) -> &Path {
-        &self.0
+        &self.path
+    }
+
+    pub fn display(&self) -> &DisplayPath {
+        &self.display
+    }
+
+    pub(crate) fn io_locator(&self) -> &PersistedPath {
+        &self.io_locator
+    }
+
+    /// Build the IO locator and diagnostic spelling together from the same child.
+    pub(crate) fn in_project_cache(base_dir: &ResolvedPath, child: &Path) -> Self {
+        let io_locator = base_dir
+            .persisted_path()
+            .join(child)
+            .expect("an absolute cache locator has a nonempty path");
+        Self {
+            path: io_locator.to_path_buf(),
+            io_locator,
+            display: base_dir.display().join(child),
+        }
+    }
+
+    /// Pin this complete locator without treating it as a project child.
+    pub(crate) fn resolve(&self, project: &ResolvedPath) -> io::Result<ResolvedPath> {
+        let locator = self.io_locator.to_path_buf();
+        let base = project.persisted_path().to_path_buf();
+        match locator.strip_prefix(&base) {
+            Ok(child) => project.join(child),
+            Err(_) => self.io_locator.resolve(),
+        }
+    }
+}
+
+impl AsRef<Path> for WasmArtifactPath {
+    fn as_ref(&self) -> &Path {
+        self.as_path()
+    }
+}
+
+impl std::ops::Deref for WasmArtifactPath {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        self.as_path()
     }
 }
 
@@ -4977,43 +5001,35 @@ pub struct InstalledProvider {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InstalledArtifact {
     LockFile(Box<VerifiedArtifact>),
-    File {
-        path: WasmArtifactPath,
-        bytes: ProviderArtifactBytes,
-        source: FileSource,
-        canonical_source: PathBuf,
-        project_dir: PathBuf,
-    },
+    File(Box<InstalledFileArtifact>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstalledFileArtifact {
+    path: WasmArtifactPath,
+    bytes: ProviderArtifactBytes,
+    source: FileSource,
+    source_path: ResolvedPath,
+    consent_source: carina_core::paths::DisplayPath,
+    project_dir: ResolvedPath,
 }
 
 impl InstalledProvider {
     pub fn path(&self) -> &WasmArtifactPath {
         match &self.artifact {
             InstalledArtifact::LockFile(artifact) => artifact.path(),
-            InstalledArtifact::File {
-                path,
-                bytes: _,
-                source: _,
-                canonical_source: _,
-                project_dir: _,
-            } => path,
+            InstalledArtifact::File(artifact) => &artifact.path,
         }
     }
 
     pub fn provenance(&self) -> ProviderArtifactProvenance {
         match &self.artifact {
             InstalledArtifact::LockFile(artifact) => ProviderArtifactProvenance::LockFile {
-                project_dir: artifact.project_dir().to_path_buf(),
+                project_dir: artifact.project_dir().source_label(),
                 pin: artifact.pin().clone(),
             },
-            InstalledArtifact::File {
-                path: _,
-                bytes: _,
-                source,
-                canonical_source: _,
-                project_dir: _,
-            } => ProviderArtifactProvenance::File {
-                source: format!("file://{}", source.path()),
+            InstalledArtifact::File(artifact) => ProviderArtifactProvenance::File {
+                source: format!("file://{}", artifact.source.path()),
             },
         }
     }
@@ -5033,30 +5049,50 @@ impl InstalledProvider {
         path: WasmArtifactPath,
         provider_name: String,
         source: FileSource,
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
     ) -> Result<Self, String> {
-        let bytes = ProviderArtifactBytes::read(path.as_path()).map_err(|error| {
+        let io_path = path
+            .resolve(project_dir)
+            .map_err(|error| error.to_string())?;
+        Self::file_source_at(path, provider_name, source, project_dir, &io_path)
+    }
+
+    fn file_source_at(
+        path: WasmArtifactPath,
+        provider_name: String,
+        source: FileSource,
+        project_dir: &ResolvedPath,
+        io_path: &ResolvedPath,
+    ) -> Result<Self, String> {
+        let project_dir = project_dir.clone();
+        let bytes = ProviderArtifactBytes::read(io_path).map_err(|error| {
             format!(
                 "Failed to read provider artifact {}: {error}",
-                path.as_path().display()
+                path.display()
             )
         })?;
-        let canonical_source =
-            crate::egress::canonical_project_relative_path(project_dir, Path::new(source.path()))
-                .map_err(|error| {
+        let source_display = carina_core::paths::DisplayPath::new(source.path())
+            .map_err(|error| error.to_string())?;
+        let source_path = project_dir.join_display(&source_display).map_err(|error| {
+            format!("Failed to locate provider source {source_display}: {error}")
+        })?;
+        let consent_source = source_path
+            .persisted_path()
+            .lexical_relative_to(project_dir.persisted_path())
+            .ok_or_else(|| {
                 format!(
-                    "Failed to derive project-relative provider source {}: {error}",
-                    source.path()
+                    "Failed to derive project-relative provider source {source_display}: file provider and project directory are on different filesystem roots"
                 )
             })?;
         Ok(Self {
-            artifact: InstalledArtifact::File {
+            artifact: InstalledArtifact::File(Box::new(InstalledFileArtifact {
                 path,
                 bytes,
                 source,
-                canonical_source,
-                project_dir: project_dir.to_path_buf(),
-            },
+                source_path,
+                consent_source,
+                project_dir,
+            })),
             provider_name,
         })
     }
@@ -5064,13 +5100,7 @@ impl InstalledProvider {
     fn artifact_bytes(&self) -> ProviderArtifactBytes {
         match &self.artifact {
             InstalledArtifact::LockFile(artifact) => artifact.bytes().clone(),
-            InstalledArtifact::File {
-                path: _,
-                bytes,
-                source: _,
-                canonical_source: _,
-                project_dir: _,
-            } => bytes.clone(),
+            InstalledArtifact::File(artifact) => artifact.bytes.clone(),
         }
     }
 
@@ -5088,22 +5118,25 @@ impl InstalledProvider {
                     source: artifact.source().clone(),
                 },
             ),
-            InstalledArtifact::File {
-                path: _,
-                bytes,
-                source,
-                canonical_source,
-                project_dir,
-            } => {
-                let (trust, notice, path) =
-                    local_provider_trust(source, bytes, project_dir, grants, notice_sink);
+            InstalledArtifact::File(artifact) => {
+                let (trust, notice, _) = local_provider_trust(
+                    &artifact.source,
+                    &artifact.bytes,
+                    &artifact.project_dir,
+                    grants,
+                    notice_sink,
+                )
+                .map_err(|error| ProviderLoadIdentityError::Absolutize {
+                    path: PathBuf::from(artifact.source.path()),
+                    source: error,
+                })?;
                 (
                     trust,
                     notice,
-                    ProviderLoadSource::LocalFile {
-                        path,
-                        canonical_source: canonical_source.clone(),
-                    },
+                    ProviderLoadSource::local_file(
+                        &artifact.source_path,
+                        artifact.consent_source.clone(),
+                    ),
                 )
             }
         };
@@ -5128,7 +5161,7 @@ impl InstalledProvider {
             InstalledArtifact::LockFile(artifact) => {
                 LoadedArtifactIdentity::locked(&bytes, artifact.source().clone(), artifact.pin())
             }
-            InstalledArtifact::File { .. } => LoadedArtifactIdentity::file(&bytes),
+            InstalledArtifact::File(_) => LoadedArtifactIdentity::file(&bytes),
         };
         Ok(VerifiedLoad::new(bytes, identity, artifact))
     }
@@ -5139,7 +5172,7 @@ impl InstalledProvider {
         ProviderArtifactLoadError {
             error: ProviderArtifactLoadFailure::Loader(Box::new(error)),
             provider_name: self.provider_name.clone(),
-            artifact_path: self.path().as_path().to_path_buf(),
+            artifact_path: self.path().display().clone(),
             provenance: Box::new(self.provenance()),
         }
     }
@@ -5151,7 +5184,7 @@ impl InstalledProvider {
         ProviderArtifactLoadError {
             error: ProviderArtifactLoadFailure::Identity(Box::new(error)),
             provider_name: self.provider_name.clone(),
-            artifact_path: self.path().as_path().to_path_buf(),
+            artifact_path: self.path().display().clone(),
             provenance: Box::new(self.provenance()),
         }
     }
@@ -5193,7 +5226,7 @@ impl InstalledProvider {
             InstalledArtifact::LockFile(artifact) => {
                 LoadedArtifactIdentity::locked(&bytes, artifact.source().clone(), artifact.pin())
             }
-            InstalledArtifact::File { .. } => LoadedArtifactIdentity::file(&bytes),
+            InstalledArtifact::File(_) => LoadedArtifactIdentity::file(&bytes),
         };
         loader(VerifiedLoad::new(bytes, identity, artifact))
             .await
@@ -5213,16 +5246,16 @@ fn remote_provider_trust(
         Ok(Some(identity)) => ProviderTrust::from_verified_remote(&identity).ok_or_else(|| {
             ProviderLoadIdentityError::non_carina_official_signer(
                 artifact.source(),
-                artifact.project_dir(),
+                &artifact.project_dir().source_label(),
             )
         }),
         Ok(None) => Err(ProviderLoadIdentityError::missing_official_record(
             artifact.source(),
-            artifact.project_dir(),
+            &artifact.project_dir().source_label(),
         )),
         Err(error) => Err(ProviderLoadIdentityError::invalid_official_record(
             artifact.source(),
-            artifact.project_dir(),
+            &artifact.project_dir().source_label(),
             error,
         )),
     }
@@ -5231,32 +5264,38 @@ fn remote_provider_trust(
 fn local_provider_trust(
     source: &FileSource,
     installed_bytes: &ProviderArtifactBytes,
-    project_dir: &Path,
+    project_dir: &ResolvedPath,
     grants: &TrustedLocalGrants,
     notice_sink: &mut impl FnMut(&str),
-) -> (ProviderTrust, Option<String>, PathBuf) {
-    let canonical_path = match fs::canonicalize(source.path()) {
-        Ok(canonical_path) => canonical_path,
-        Err(_canonicalize_error) => {
-            let label_path = std::path::absolute(source.path())
-                .unwrap_or_else(|_absolute_error| PathBuf::from(source.path()));
-            return (ProviderTrust::untrusted(), None, label_path);
-        }
-    };
-    let Some(grant) = grants.matching(&canonical_path) else {
-        return (ProviderTrust::untrusted(), None, canonical_path);
+) -> io::Result<(
+    ProviderTrust,
+    Option<String>,
+    carina_core::paths::PersistedPath,
+)> {
+    let display_path = carina_core::paths::DisplayPath::new(source.path())?;
+    let resolved = project_dir.join_display(&display_path)?;
+    let label_path = resolved.persisted_path().clone();
+    if resolved.metadata().is_err() {
+        return Ok((ProviderTrust::untrusted(), None, label_path));
+    }
+    let Some(grant) = grants.matching(&resolved.identity()) else {
+        return Ok((ProviderTrust::untrusted(), None, label_path));
     };
     let installed_sha256 = format!("{:x}", Sha256::digest(installed_bytes.as_bytes()));
-    let current_sha256 = sha256_file(&canonical_path).ok();
+    let current_sha256 = resolved
+        .open_read()
+        .and_then(sha256_reader_digest)
+        .map(|digest| sha256_digest_hex(&digest))
+        .ok();
     if current_sha256.as_deref() != Some(installed_sha256.as_str()) {
         notice_sink(&format!(
             "carina: local provider {} does not match the installed bytes; re-run `{}` before trusting it",
-            canonical_path.display(),
-            ProjectCommand::new("init", project_dir),
+            display_path,
+            ProjectCommand::for_display_path("init", project_dir.display()),
         ));
-        return (ProviderTrust::untrusted(), None, canonical_path);
+        return Ok((ProviderTrust::untrusted(), None, label_path));
     }
-    (grant.trust(), Some(grant.notice()), canonical_path)
+    Ok((grant.trust(), Some(grant.notice()), label_path))
 }
 
 /// Where an installed provider artifact came from. Locked variants cannot
@@ -5368,7 +5407,7 @@ impl fmt::Display for ProviderArtifactProvenance {
 pub struct ProviderArtifactLoadError<E> {
     error: ProviderArtifactLoadFailure<E>,
     provider_name: String,
-    artifact_path: PathBuf,
+    artifact_path: DisplayPath,
     provenance: Box<ProviderArtifactProvenance>,
 }
 
@@ -5421,10 +5460,7 @@ impl<E: fmt::Display> fmt::Display for ProviderArtifactLoadError<E> {
         write!(
             f,
             "{}\nProvider: {}\nArtifact: {}\n{}",
-            error,
-            self.provider_name,
-            self.artifact_path.display(),
-            self.provenance
+            error, self.provider_name, self.artifact_path, self.provenance
         )
     }
 }
@@ -5915,10 +5951,14 @@ enum RegistryRefusal {
 }
 
 impl RegistryRefusal {
-    fn from_signer_rejection(rejection: SignerRejection, source: &str, project_dir: &Path) -> Self {
+    fn from_signer_rejection(
+        rejection: SignerRejection,
+        source: &str,
+        project_dir: &ResolvedPath,
+    ) -> Self {
         Self::Signer {
             rejection,
-            target: ProviderRefusalTarget::new(source, project_dir),
+            target: ProviderRefusalTarget::new(source, project_dir.source_label()),
         }
     }
 
@@ -6682,7 +6722,7 @@ mod registry_listing_validation {
             versions: &RegistryVersions,
             locked: &RegistryRatchets,
             previous_sequence_state: RegistrySequencePreviousState,
-            project_dir: &Path,
+            project_dir: &ResolvedPath,
         ) -> Result<Self, String> {
             enum SequenceValidation {
                 Accepted(RegistrySequenceTransition),
@@ -6690,7 +6730,8 @@ mod registry_listing_validation {
             }
 
             let source_key = source.source_key();
-            let target = ProviderRefusalTarget::new(source_key.as_str(), project_dir);
+            let target =
+                ProviderRefusalTarget::new(source_key.as_str(), project_dir.source_label());
             let valid_until_present = versions.valid_until.is_some();
 
             let sequence_validation = match (previous_sequence_state, versions.sequence) {
@@ -6850,7 +6891,7 @@ mod registry_listing_validation {
                 },
                 &RegistryRatchets::default(),
                 previous,
-                Path::new("."),
+                &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
             )
         }
 
@@ -7172,13 +7213,13 @@ fn same_consumed_discovery_values(
 fn resolve_registry<H: RegistryHttp>(
     source: &RegistrySource,
     existing_host: Option<&RegistryHostLock>,
-    project_dir: &Path,
+    project_dir: &ResolvedPath,
     http: &H,
 ) -> Result<ResolvedRegistry, String> {
     let existing_discovery = match existing_host {
         Some(host) => Some(host.authorized_discovery().map_err(|_| {
             RegistryRefusal::DiscoveryMigrationAuthorizationRequired {
-                target: HostRefusalTarget::new(source.hostname(), project_dir),
+                target: HostRefusalTarget::new(source.hostname(), project_dir.source_label()),
             }
             .to_string()
         })?),
@@ -7205,7 +7246,7 @@ fn resolve_registry<H: RegistryHttp>(
         return Err(RegistryRefusal::DiscoveryPinMismatch {
             pinned: existing_pin.api_base_url().to_string(),
             resolved: discovery_pin.api_base_url().to_string(),
-            target: HostRefusalTarget::new(host, project_dir),
+            target: HostRefusalTarget::new(host, project_dir.source_label()),
         }
         .to_string());
     }
@@ -7667,7 +7708,7 @@ fn convert_obtainable_legacy_signer_pin<H: RegistryHttp>(
             resolved: download.shasum.clone(),
             target: ProviderRefusalTarget::new(
                 source_key.as_str(),
-                lock_file.install_lock().project_dir(),
+                lock_file.install_lock().project_dir().source_label(),
             ),
         }
         .to_string());
@@ -7677,7 +7718,7 @@ fn convert_obtainable_legacy_signer_pin<H: RegistryHttp>(
             version: locked_version.clone(),
             target: ProviderRefusalTarget::new(
                 source_key.as_str(),
-                lock_file.install_lock().project_dir(),
+                lock_file.install_lock().project_dir().source_label(),
             ),
         }
         .to_string()
@@ -7695,7 +7736,6 @@ fn convert_obtainable_legacy_signer_pin<H: RegistryHttp>(
             install_lock: lock_file.install_lock(),
             source: source_key,
             version: &locked_version,
-            provider_name: &locked_name,
             download_url: &download_url,
             expected_shasum: &locked_sha256,
             context: &artifact_context,
@@ -7734,11 +7774,11 @@ fn convert_obtainable_legacy_signer_pin<H: RegistryHttp>(
         }
     };
     debug_assert_eq!(acceptance.transition, SignerTransition::LegacyConverted);
-    let artifact_path = artifact.path().as_path().to_path_buf();
+    let artifact_path = artifact.path().display().clone();
     artifact.publish().map_err(|error| {
         format!(
             "legacy-pinned version {source_key}@{locked_version}: Failed to publish provider artifact {}: {error}",
-            artifact_path.display()
+            artifact_path
         )
     })?;
     lock_file.record_signer_acceptance(source_key, acceptance)?;
@@ -7768,30 +7808,37 @@ fn global_cache_path_github_release(
 }
 
 /// Resolve the cache path for a WASM provider component.
-pub fn cache_path_wasm(base_dir: &Path, source: &RemoteSourceKey, version: &str) -> PathBuf {
-    base_dir
-        .join(".carina")
+pub fn cache_path_wasm(
+    base_dir: &ResolvedPath,
+    source: &RemoteSourceKey,
+    version: &str,
+) -> WasmArtifactPath {
+    let child = Path::new(".carina")
         .join("providers")
         .join(source.as_str())
         .join(version)
-        .join(format!("{}.wasm", source.artifact_name()))
+        .join(format!("{}.wasm", source.artifact_name()));
+    WasmArtifactPath::in_project_cache(base_dir, &child)
 }
 
 pub(crate) fn cache_path_github_release(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     source: &RemoteSourceKey,
     version: &Version,
-) -> PathBuf {
+) -> WasmArtifactPath {
     cache_path_wasm(base_dir, source, &version.to_string())
 }
 
 /// Compute SHA256 hex digest of a file.
-pub fn sha256_file(path: &Path) -> io::Result<String> {
+pub fn sha256_file(path: &ResolvedPath) -> io::Result<String> {
     Ok(sha256_digest_hex(&sha256_file_digest(path)?))
 }
 
-fn sha256_file_digest(path: &Path) -> io::Result<Sha256> {
-    let mut file = fs::File::open(path)?;
+fn sha256_file_digest(path: &ResolvedPath) -> io::Result<Sha256> {
+    sha256_reader_digest(path.open_read()?)
+}
+
+fn sha256_reader_digest(mut file: impl Read) -> io::Result<Sha256> {
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 8192];
     loop {
@@ -7809,18 +7856,30 @@ fn sha256_digest_hex(digest: &Sha256) -> String {
 }
 
 fn hash_and_check(
-    wasm_path: &Path,
+    wasm_path: &ResolvedPath,
     expected_shasum: &str,
     context: &str,
-    project_dir: &Path,
+    project_dir: &ResolvedPath,
 ) -> Result<Sha256, String> {
-    let artifact_digest = sha256_file_digest(wasm_path)
+    let file = wasm_path
+        .open_read()
+        .map_err(|error| format!("Failed to hash WASM binary: {error}"))?;
+    hash_and_check_reader(file, expected_shasum, context, project_dir)
+}
+
+fn hash_and_check_reader(
+    file: impl Read,
+    expected_shasum: &str,
+    context: &str,
+    project_dir: &ResolvedPath,
+) -> Result<Sha256, String> {
+    let artifact_digest = sha256_reader_digest(file)
         .map_err(|error| format!("Failed to hash WASM binary: {error}"))?;
     let actual_hash = sha256_digest_hex(&artifact_digest);
     if actual_hash != expected_shasum {
         return Err(format!(
             "SHA256 mismatch for {context}. Expected registry shasum {expected_shasum}, got {actual_hash}. Re-run `{}` to re-download.",
-            ProjectCommand::new("init", project_dir)
+            ProjectCommand::for_display_path("init", project_dir.display())
         ));
     }
     Ok(artifact_digest)
@@ -7908,7 +7967,6 @@ struct RegistryArtifactRequest<'lock, 'request> {
     install_lock: &'lock ProviderInstallLock,
     source: &'request RemoteSourceKey,
     version: &'request str,
-    provider_name: &'request str,
     download_url: &'request RegistryResourceUrl,
     expected_shasum: &'request str,
     context: &'request str,
@@ -7923,20 +7981,21 @@ fn obtain_registry_artifact<'lock, H: RegistryHttp>(
         install_lock,
         source,
         version,
-        provider_name,
         download_url,
         expected_shasum,
         context,
     } = request;
     let project_dir = install_lock.project_dir();
-    let path = WasmArtifactPath::new(cache_path_wasm(project_dir, source, version), provider_name)
-        .map_err(RegistryArtifactError::Invalid)?;
-    let (state, digest) = if path.as_path().exists()
+    let path = cache_path_wasm(project_dir, source, version);
+    let io_path = install_lock
+        .project_artifact(&path)
+        .map_err(|error| RegistryArtifactError::Invalid(error.to_string()))?;
+    let (state, digest) = if io_path.exists()
         && (!ProviderTrust::remote_source_is_allowlisted(source)
             || user_trust_record_exists(user_dirs, expected_shasum, source))
     {
         match hash_and_check(
-            path.as_path(),
+            &io_path,
             expected_shasum,
             &format!("cached {context}"),
             project_dir,
@@ -7951,7 +8010,7 @@ fn obtain_registry_artifact<'lock, H: RegistryHttp>(
         let mut staged = StagedArtifact::for_project(install_lock, &path).map_err(|error| {
             RegistryArtifactError::Invalid(format!(
                 "Failed to stage provider artifact {}: {error}",
-                path.as_path().display()
+                path.display()
             ))
         })?;
         if let Err(error) = http.download_into(download_url, &mut staged) {
@@ -7962,8 +8021,17 @@ fn obtain_registry_artifact<'lock, H: RegistryHttp>(
                 RegistryArtifactError::Invalid(message)
             });
         }
-        let digest = hash_and_check(staged.path(), expected_shasum, context, project_dir)
-            .map_err(RegistryArtifactError::Invalid)?;
+        let digest = hash_and_check_reader(
+            std::io::Cursor::new(staged.read_bytes().map_err(|error| {
+                RegistryArtifactError::Invalid(format!(
+                    "Failed to read staged WASM binary: {error}"
+                ))
+            })?),
+            expected_shasum,
+            context,
+            project_dir,
+        )
+        .map_err(RegistryArtifactError::Invalid)?;
         (
             RegistryArtifactState::Staged {
                 artifact: staged,
@@ -7981,7 +8049,7 @@ fn verify_and_decide_signer<H: RegistryHttp>(
     expected_signer: &SignerPinState,
     version: &ListedVersion,
     source: &str,
-    project_dir: &Path,
+    project_dir: &ResolvedPath,
     http: &H,
 ) -> Result<(signing::VerifiedSignerIdentity, SignerAcceptance), String> {
     let identity = signing::verify_artifact(artifact_digest, bundle)?;
@@ -8030,7 +8098,7 @@ fn verify_registry_lock_pin(
     signature: Option<&RegistrySignature>,
     transparency_log_present: bool,
 ) -> Result<VerifiedRegistryLockPin, String> {
-    let project_dir = lock_file.install_lock().project_dir().to_path_buf();
+    let project_dir = lock_file.install_lock().project_dir().clone();
     let current_lock = lock_file.lock_file();
     let entry = current_lock.find_by_source_key(source_key);
     let existing_constraint = entry.and_then(|entry| match &entry.kind {
@@ -8063,7 +8131,7 @@ fn verify_registry_lock_pin(
             version: version.to_string(),
             locked: entry.sha256.clone(),
             resolved: expected_shasum.to_string(),
-            target: ProviderRefusalTarget::new(source_key.as_str(), project_dir),
+            target: ProviderRefusalTarget::new(source_key.as_str(), project_dir.source_label()),
         }
         .to_string());
     }
@@ -8074,7 +8142,7 @@ fn verify_registry_lock_pin(
         return Err(RegistryRefusal::HostnamePinMismatch {
             locked: locked_registry.resolved_hostname().to_string(),
             resolved: registry.hostname.clone(),
-            target: ProviderRefusalTarget::new(source_key.as_str(), project_dir),
+            target: ProviderRefusalTarget::new(source_key.as_str(), project_dir.source_label()),
         }
         .to_string());
     }
@@ -8083,7 +8151,7 @@ fn verify_registry_lock_pin(
         .map_err(|error| error.to_string())?;
     if ratchets.signature.is_required() && signature.is_none() {
         return Err(RegistryRefusal::SignatureFieldDisappeared {
-            target: ProviderRefusalTarget::new(source_key.as_str(), project_dir),
+            target: ProviderRefusalTarget::new(source_key.as_str(), project_dir.source_label()),
         }
         .to_string());
     }
@@ -8096,7 +8164,7 @@ fn verify_registry_lock_pin(
     });
     if ratchets.transparency_log_present && !transparency_log_present {
         return Err(RegistryRefusal::TransparencyLogFieldDisappeared {
-            target: ProviderRefusalTarget::new(source_key.as_str(), project_dir),
+            target: ProviderRefusalTarget::new(source_key.as_str(), project_dir.source_label()),
         }
         .to_string());
     }
@@ -8399,7 +8467,6 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
             install_lock,
             source: source_key,
             version: version_string,
-            provider_name: name,
             download_url: &download_url,
             expected_shasum: &download.shasum,
             context: &provider_context,
@@ -8459,11 +8526,11 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
         }
     };
 
-    let artifact_path = artifact.path().as_path().to_path_buf();
+    let artifact_path = artifact.path().display().clone();
     let artifact = artifact.publish().map_err(|error| {
         format!(
             "Failed to publish provider artifact {}: {error}",
-            artifact_path.display()
+            artifact_path
         )
     })?;
 
@@ -8656,19 +8723,19 @@ where
     // matching lock pin and a user-owned trust record, project and global cache
     // entries are skipped and the artifact is downloaded from its origin.
     // This deliberately preserves issue #2032 only for user-verified cache hits.
-    let wasm_path = WasmArtifactPath::new(
-        cache_path_github_release(project_dir, &source_key, version),
-        name,
-    )?;
-    if wasm_path.as_path().exists()
+    let wasm_path = cache_path_github_release(project_dir, &source_key, version);
+    if install_lock
+        .project_artifact(&wasm_path)
+        .map_err(|error| error.to_string())?
+        .exists()
         && let Some((lock_entry, pin)) = artifact_pin.pinned(user_dirs)
     {
         let pin = pin.clone();
-        let verified = match VerifiedArtifact::from_existing(lock_entry, name, project_dir) {
+        let verified = match VerifiedArtifact::from_existing(lock_entry, name, install_lock) {
             Ok(verified) => verified,
             Err(VerifiedArtifactError::ChecksumMismatch(mismatch)) => {
                 let removal = install_lock.remove_project_artifact(&wasm_path);
-                return Err((*mismatch).after_cache_removal(wasm_path.as_path(), removal));
+                return Err((*mismatch).after_cache_removal(wasm_path.display(), removal));
             }
             Err(VerifiedArtifactError::Other(message)) => return Err(message),
         };
@@ -8684,7 +8751,7 @@ where
         let pin = pin.clone();
         let verified = match install_project_artifact_from_global_cache(
             install_lock,
-            global_wasm.as_path(),
+            &ResolvedPath::new(global_wasm.as_path()).map_err(|error| error.to_string())?,
             &wasm_path,
             lock_entry,
             name,
@@ -8692,7 +8759,7 @@ where
             Ok(verified) => verified,
             Err(VerifiedArtifactError::ChecksumMismatch(mismatch)) => {
                 let removal = fs::remove_file(global_wasm.as_path());
-                return Err((*mismatch).after_cache_removal(global_wasm.as_path(), removal));
+                return Err((*mismatch).after_cache_removal(global_wasm.display(), removal));
             }
             Err(VerifiedArtifactError::Other(message)) => return Err(message),
         };
@@ -8708,7 +8775,7 @@ where
     let mut staged = StagedArtifact::for_project(install_lock, &wasm_path).map_err(|error| {
         format!(
             "Failed to stage provider artifact {}: {error}",
-            wasm_path.as_path().display()
+            wasm_path.display()
         )
     })?;
     eprintln!(
@@ -8760,7 +8827,12 @@ where
     };
     // Save to global cache
     if let Some(global_wasm) = global_cache_path_github_release(user_dirs, &source_key, version) {
-        let _ = install_global_artifact_atomically(installed_path.as_path(), &global_wasm);
+        let _ = install_global_artifact_atomically(
+            &install_lock
+                .project_artifact(&installed_path)
+                .map_err(|error| error.to_string())?,
+            &global_wasm,
+        );
     }
     eprintln!(
         "Installed WASM provider '{}' ({}@{})",
@@ -8940,14 +9012,20 @@ fn resolve_file_provider(
     lock_file: &mut LockFile,
 ) -> Result<WasmArtifactPath, String> {
     let src_path = WasmArtifactPath::new(PathBuf::from(file_path), provider_name)?;
-    if !src_path.as_path().exists() {
+    let source_label = carina_core::paths::DisplayPath::new(src_path.as_path())
+        .map_err(|error| error.to_string())?;
+    let source_path = install_lock
+        .project_dir()
+        .join_display(&source_label)
+        .map_err(|error| error.to_string())?;
+    if !source_path.exists() {
         return Err(format!(
             "Provider '{}': file source not found: {}",
             provider_name, file_path
         ));
     }
     let dest = file_provider_cache_path(install_lock.project_dir(), &src_path, provider_name)?;
-    let sha = install_project_artifact_atomically(install_lock, src_path.as_path(), &dest)
+    let sha = install_project_artifact_atomically(install_lock, &source_path, &dest)
         .map_err(|e| format!("Failed to link file:// provider: {e}"))?;
 
     lock_file.upsert(LockEntry {
@@ -8962,17 +9040,15 @@ fn resolve_file_provider(
 }
 
 fn file_provider_cache_path(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     src_path: &WasmArtifactPath,
-    provider_name: &str,
+    _provider_name: &str,
 ) -> Result<WasmArtifactPath, String> {
     let file_name = src_path
         .as_path()
         .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("provider");
-    let dest = base_dir
-        .join(".carina")
+        .unwrap_or_else(|| std::ffi::OsStr::new("provider"));
+    let dest = Path::new(".carina")
         .join("providers")
         .join("file")
         .join(file_name)
@@ -8980,10 +9056,9 @@ fn file_provider_cache_path(
             src_path
                 .as_path()
                 .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("provider.wasm"),
+                .unwrap_or_else(|| std::ffi::OsStr::new("provider.wasm")),
         );
-    WasmArtifactPath::new(dest, provider_name)
+    Ok(WasmArtifactPath::in_project_cache(base_dir, &dest))
 }
 
 /// Resolve a `file://` provider at its source path without copying it.
@@ -8991,7 +9066,7 @@ fn file_provider_cache_path(
 /// The LSP uses this direct-source view so its drift poll observes the same
 /// file it loads, while still retaining typed file provenance.
 pub fn find_file_provider_source(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     config: &ProviderConfig,
 ) -> Result<InstalledProvider, String> {
     let source = config
@@ -9009,7 +9084,13 @@ pub fn find_file_provider_source(
     };
     let file_path = file_source.path();
     let path = PathBuf::from(file_path);
-    if !path.exists() {
+    let source_label =
+        carina_core::paths::DisplayPath::new(&path).map_err(|error| error.to_string())?;
+    if !base_dir
+        .join_display(&source_label)
+        .map_err(|error| error.to_string())?
+        .exists()
+    {
         return Err(format!("file not found: {file_path}"));
     }
     let path = WasmArtifactPath::new(path, &config.name)?;
@@ -9144,11 +9225,25 @@ fn lock_entry_matches_remote_config<P: PlaceholderKind, B: BindingAddress>(
 }
 
 fn select_locked_artifact<'lock, P: PlaceholderKind, B: BindingAddress>(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     config: &ProviderConfig<P, B>,
     remote_source: &RemoteSource,
     lock_file: &'lock LockFile,
 ) -> Result<Option<LockArtifactSelection<'lock>>, FindInstalledProviderError> {
+    select_locked_entry(base_dir, config, remote_source, lock_file)?
+        .map(|lock_entry| {
+            lock_artifact_selection(base_dir, lock_entry, &config.name)
+                .map_err(FindInstalledProviderError::from)
+        })
+        .transpose()
+}
+
+fn select_locked_entry<'lock, P: PlaceholderKind, B: BindingAddress>(
+    base_dir: &ResolvedPath,
+    config: &ProviderConfig<P, B>,
+    remote_source: &RemoteSource,
+    lock_file: &'lock LockFile,
+) -> Result<Option<&'lock LockEntry<RegistryLock>>, FindInstalledProviderError> {
     let source_key = remote_source.source_key();
     if let Some(legacy) = lock_file
         .legacy
@@ -9159,20 +9254,13 @@ fn select_locked_artifact<'lock, P: PlaceholderKind, B: BindingAddress>(
             legacy.error(base_dir),
         ));
     }
-    let selected = lock_file.find_by_remote_config(config, remote_source);
-
-    selected
-        .map(|lock_entry| {
-            lock_artifact_selection(base_dir, lock_entry, &config.name)
-                .map_err(FindInstalledProviderError::from)
-        })
-        .transpose()
+    Ok(lock_file.find_by_remote_config(config, remote_source))
 }
 
 fn installed_provider_from_lock(
     provider_name: &str,
     selection: LockArtifactSelection<'_>,
-    project_dir: &Path,
+    project_dir: &ResolvedPath,
 ) -> Result<InstalledProvider, String> {
     // Registry pins are recorded only after registry shasum and signature
     // verification. Matching the installed bytes to that lock SHA is the
@@ -9204,8 +9292,8 @@ pub struct ProviderArtifactFingerprint {
     pub lock_file: Option<FileMetadataFingerprint>,
 }
 
-fn file_metadata_fingerprint(path: &Path) -> Option<FileMetadataFingerprint> {
-    let metadata = fs::metadata(path).ok()?;
+fn file_metadata_fingerprint(path: &ResolvedPath) -> Option<FileMetadataFingerprint> {
+    let metadata = path.metadata().ok()?;
     if !metadata.is_file() {
         return None;
     }
@@ -9225,15 +9313,23 @@ fn file_metadata_fingerprint(path: &Path) -> Option<FileMetadataFingerprint> {
 /// It is suitable for frequent drift polling; actual loads still go through
 /// [`find_installed_provider`] and lock-pin verification.
 pub fn provider_artifact_fingerprint(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     config: &ProviderConfig,
 ) -> Result<ProviderArtifactFingerprint, LegacyLockEntryError> {
-    let lock_file = file_metadata_fingerprint(&provider_lock_path(base_dir));
+    let lock_file = base_dir
+        .join(PROVIDER_LOCK_FILE_NAME)
+        .ok()
+        .and_then(|path| file_metadata_fingerprint(&path));
     let artifact = match config.source.as_ref() {
         Some(ProviderSource::File(file_source)) => {
             WasmArtifactPath::new(PathBuf::from(file_source.path()), &config.name)
                 .ok()
-                .and_then(|path| file_metadata_fingerprint(path.as_path()))
+                .and_then(|path| {
+                    carina_core::paths::DisplayPath::new(path.as_path())
+                        .and_then(|label| base_dir.join_display(&label))
+                        .ok()
+                        .and_then(|path| file_metadata_fingerprint(&path))
+                })
         }
         Some(ProviderSource::Remote(remote_source)) => {
             let Some(loaded_lock) = load_lock_file(base_dir).ok().flatten() else {
@@ -9243,7 +9339,7 @@ pub fn provider_artifact_fingerprint(
                 });
             };
             match select_locked_artifact(base_dir, config, remote_source, &loaded_lock) {
-                Ok(Some(selection)) => file_metadata_fingerprint(selection.path.as_path()),
+                Ok(Some(selection)) => file_metadata_fingerprint(&selection.path),
                 Ok(None) | Err(FindInstalledProviderError::Other(_)) => None,
                 Err(FindInstalledProviderError::LegacyEntry(error)) => return Err(error),
             }
@@ -9264,9 +9360,11 @@ pub fn provider_artifact_fingerprint(
 /// editor-triggered downloads as well as by CLI load paths after `carina init`
 /// has installed the artifact.
 pub fn find_installed_provider<P: PlaceholderKind, B: BindingAddress>(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     config: &ProviderConfig<P, B>,
 ) -> Result<InstalledProvider, FindInstalledProviderError> {
+    let io_base = base_dir.clone();
+    let base_dir = &io_base;
     let source = config
         .source
         .as_ref()
@@ -9276,22 +9374,26 @@ pub fn find_installed_provider<P: PlaceholderKind, B: BindingAddress>(
         ProviderSource::File(file_source) => {
             let src = WasmArtifactPath::new(PathBuf::from(file_source.path()), &config.name)?;
             let dest = file_provider_cache_path(base_dir, &src, &config.name)?;
-            if dest.as_path().exists() {
+            if dest
+                .resolve(&io_base)
+                .map_err(|error| FindInstalledProviderError::Other(error.to_string()))?
+                .exists()
+            {
                 return Ok(InstalledProvider::file_source(
                     dest,
                     config.name.clone(),
                     file_source.clone(),
-                    base_dir,
+                    &io_base,
                 )?);
             }
             return Err(FindInstalledProviderError::Other(format!(
                 "not installed. Run `{}`",
-                ProjectCommand::new("init", base_dir)
+                ProjectCommand::for_display_path("init", base_dir.display())
             )));
         }
         ProviderSource::Remote(remote_source) => remote_source,
     };
-    let lock_file = load_lock_file(base_dir)
+    let lock_file = load_lock_file(&io_base)
         .map_err(|error| FindInstalledProviderError::Other(error.to_string()))?
         .unwrap_or_default();
 
@@ -9301,25 +9403,29 @@ pub fn find_installed_provider<P: PlaceholderKind, B: BindingAddress>(
     // project already pulled this provider and the current project has no
     // local install yet (issue #2018).
     if let Some(selection) = select_locked_artifact(base_dir, config, remote_source, &lock_file)? {
-        if selection.path.as_path().exists() {
-            return installed_provider_from_lock(&config.name, selection, base_dir)
+        if selection.path.exists() {
+            return installed_provider_from_lock(&config.name, selection, &io_base)
                 .map_err(FindInstalledProviderError::Other);
         }
         return Err(FindInstalledProviderError::Other(
-            missing_locked_artifact_error(base_dir, &selection.pin, config.revision.as_deref()),
+            missing_locked_artifact_error(
+                &base_dir.source_label(),
+                &selection.pin,
+                config.revision.as_deref(),
+            ),
         ));
     }
 
     if let Some(revision) = &config.revision {
         return Err(FindInstalledProviderError::Other(format!(
             "not installed. Run `{}` to install (revision: {revision})",
-            ProjectCommand::new("init", base_dir)
+            ProjectCommand::for_display_path("init", base_dir.display())
         )));
     }
 
     Err(FindInstalledProviderError::Other(format!(
         "not installed. Run `{}`",
-        ProjectCommand::new("init", base_dir)
+        ProjectCommand::for_display_path("init", base_dir.display())
     )))
 }
 
@@ -9681,7 +9787,7 @@ pub fn check_lock_mismatch(
     providers: &[ProviderConfig],
     lock_file: &LockFile,
     mode: LockMode,
-    project_dir: &Path,
+    project_dir: &ResolvedPath,
 ) -> Result<(), LockMismatchError> {
     if mode == LockMode::Upgrade {
         return Ok(());
@@ -9766,7 +9872,7 @@ pub fn check_lock_mismatch(
                          hint: running with --locked requires the lock to be committed up-to-date;\n\
                                re-run without --locked (or `{}`) to populate it.",
                         config.name,
-                        ProjectCommand::new("init --upgrade", project_dir)
+                        ProjectCommand::for_display_path("init --upgrade", project_dir.display())
                     )));
                 }
                 continue;
@@ -10009,7 +10115,7 @@ fn mismatch_error(
     name: &str,
     lock_shape: &str,
     crn_shape: &str,
-    project_dir: &Path,
+    project_dir: &ResolvedPath,
 ) -> LockMismatchError {
     LockMismatchError::Mismatch(format!(
         "lock file does not match providers.crn\n  \
@@ -10018,7 +10124,7 @@ fn mismatch_error(
          lock:           {lock_shape}\n  \
          hint: run `{}` to resolve providers from the current\n        \
          configuration and rewrite carina-providers.lock",
-        ProjectCommand::new("init --upgrade", project_dir)
+        ProjectCommand::for_display_path("init --upgrade", project_dir.display())
     ))
 }
 
@@ -10177,7 +10283,7 @@ where
             ResolveEgress::Skip => {}
             ResolveEgress::Initialize(accepted_sources) => {
                 let installed = installed_provider_from_resolved(
-                    base_dir,
+                    install_lock,
                     config,
                     source,
                     &artifact_path,
@@ -10213,24 +10319,28 @@ struct ResolvedEgressDeclaration {
     signed: Option<crate::CarinaRsSigned>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct EgressDeclarationKey {
-    source: String,
-    patterns: BTreeSet<crate::HostPattern>,
+    source: crate::CanonicalSource,
+    patterns: Vec<String>,
 }
 
 impl From<&crate::VerifiedEgressDeclaration> for EgressDeclarationKey {
     fn from(declaration: &crate::VerifiedEgressDeclaration) -> Self {
         Self {
-            source: declaration.source().to_string(),
-            patterns: declaration.patterns().clone(),
+            source: declaration.source().clone(),
+            patterns: declaration
+                .patterns()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
         }
     }
 }
 
 #[derive(Default)]
 struct InitializedEgressDeclarations {
-    explicit: BTreeMap<EgressDeclarationKey, crate::ExplicitConsent>,
+    explicit: HashMap<EgressDeclarationKey, crate::ExplicitConsent>,
 }
 
 fn resolved_egress_declaration(
@@ -10251,7 +10361,7 @@ fn resolved_egress_declaration(
 }
 
 fn initialize_resolved_egress(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     resolved: ResolvedEgressDeclaration,
     previous_lock_file: &LockFile,
     lock_file: &mut LockFile,
@@ -10271,7 +10381,7 @@ fn initialize_resolved_egress(
 }
 
 fn initialize_resolved_egress_with(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     resolved: ResolvedEgressDeclaration,
     previous_lock_file: &LockFile,
     lock_file: &mut LockFile,
@@ -10402,22 +10512,26 @@ fn explicit_consent_given(
 }
 
 fn installed_provider_from_resolved(
-    base_dir: &Path,
+    install_lock: &ProviderInstallLock,
     config: &ProviderConfig,
     source: &ProviderSource,
     artifact_path: &WasmArtifactPath,
     lock_file: &LockFile,
 ) -> Result<InstalledProvider, ResolveAllError> {
+    let base_dir = install_lock.project_dir();
     match source {
-        ProviderSource::File(file_source) => InstalledProvider::file_source(
+        ProviderSource::File(file_source) => InstalledProvider::file_source_at(
             artifact_path.clone(),
             config.name.clone(),
             file_source.clone(),
             base_dir,
+            &install_lock
+                .project_artifact(artifact_path)
+                .map_err(|error| ResolveAllError::Other(error.to_string()))?,
         )
         .map_err(ResolveAllError::Other),
         ProviderSource::Remote(remote_source) => {
-            let selection = select_locked_artifact(base_dir, config, remote_source, lock_file)
+            let entry = select_locked_entry(base_dir, config, remote_source, lock_file)
                 .map_err(EgressInitializationError::Installed)?
                 .ok_or_else(|| {
                     ResolveAllError::Other(format!(
@@ -10425,8 +10539,12 @@ fn installed_provider_from_resolved(
                         remote_source.source_key()
                     ))
                 })?;
-            installed_provider_from_lock(&config.name, selection, base_dir)
-                .map_err(ResolveAllError::Other)
+            let verified = VerifiedArtifact::from_existing(entry, &config.name, install_lock)
+                .map_err(|error| ResolveAllError::Other(error.to_string()))?;
+            Ok(InstalledProvider::from_verified(
+                verified,
+                config.name.clone(),
+            ))
         }
     }
 }
@@ -10511,7 +10629,7 @@ fn print_any_depth_warning(patterns: &BTreeSet<crate::HostPattern>) {
 /// Called before plan/apply to catch cases where the lock file and constraints have
 /// drifted out of sync (e.g., the user tightened a constraint after last `carina init`).
 pub fn validate_lock_constraints<P: PlaceholderKind, B: BindingAddress>(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     providers: &[ProviderConfig<P, B>],
 ) -> Result<(), LockConstraintError> {
     let lock_file = match load_lock_file(base_dir)? {
@@ -10581,7 +10699,7 @@ pub fn validate_lock_constraints<P: PlaceholderKind, B: BindingAddress>(
                     provider: config.name.clone(),
                     locked_version: version,
                     constraint: constraint.raw.clone(),
-                    project_dir: base_dir.to_path_buf(),
+                    project_dir: base_dir.source_label(),
                 });
             }
         }
@@ -10774,7 +10892,7 @@ version = "0.1.0"
 sha256 = "abc"
 "#,
             Path::new("carina-providers.lock"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .unwrap();
         let (_, migration) = loaded.into_parts();
@@ -10839,7 +10957,7 @@ asset_id = 42
 sha256 = "abc"
 "#,
             Path::new("carina-providers.lock"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .expect_err("a release lock version must be derived from its exact tag");
 
@@ -10878,7 +10996,7 @@ sha256 = "abc"
             let error = LockFile::parse_toml_str(
                 &content,
                 Path::new("carina-providers.lock"),
-                Path::new("."),
+                &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
             )
             .expect_err("injected release coordinates must fail typed lock loading");
 
@@ -10921,7 +11039,7 @@ version = "0.7.0"
 sha256 = "def"
 "#,
             Path::new("carina-providers.lock"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .unwrap();
         let (lock, migration) = loaded.into_parts();
@@ -10963,7 +11081,7 @@ sha256 = "def"
             let loaded = LockFile::parse_toml_str(
                 &content,
                 Path::new("carina-providers.lock"),
-                Path::new("."),
+                &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
             )
             .unwrap();
             let (lock, migration) = loaded.into_parts();
@@ -11055,7 +11173,11 @@ sha256 = "def"
         let lock_before = fs::read(&lock_path).unwrap();
         let global_before = snapshot_tree(global);
         let trust_before = snapshot_tree(trust);
-        let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
+        let project_wasm = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source_key(source),
+            version,
+        );
         let global_wasm = global_cache_path_wasm(&user_dirs, &source_key(source), version).unwrap();
         let release_url = github_release_by_tag_url(source, tag);
         let asset_url = github_asset_url(source, 42);
@@ -11118,7 +11240,9 @@ sha256 = "def"
         lock_file: &mut LockFile,
         github: &GithubApi<'_, G>,
     ) -> Result<WasmArtifactPath, String> {
-        let install_lock = ProviderInstallLock::acquire(base_dir).unwrap();
+        let install_lock =
+            ProviderInstallLock::acquire(&carina_core::paths::ResolvedPath::new(base_dir).unwrap())
+                .unwrap();
         with_guarded_lock_file(&install_lock, lock_file, |lock_file| {
             let source = github_source(source);
             super::resolve_github_provider_with_clients(
@@ -11172,7 +11296,9 @@ sha256 = "def"
         lock_file: &mut LockFile,
         http: &H,
     ) -> Result<WasmArtifactPath, String> {
-        let install_lock = ProviderInstallLock::acquire(base_dir).unwrap();
+        let install_lock =
+            ProviderInstallLock::acquire(&carina_core::paths::ResolvedPath::new(base_dir).unwrap())
+                .unwrap();
         with_guarded_lock_file(&install_lock, lock_file, |lock_file| match source {
             RemoteSource::Registry(source) => super::resolve_registry_provider_with_http(
                 user_dirs,
@@ -11205,7 +11331,9 @@ sha256 = "def"
         config: &ProviderConfig,
         http: &H,
     ) -> Result<WasmArtifactPath, String> {
-        let install_lock = ProviderInstallLock::acquire(base_dir).unwrap();
+        let install_lock =
+            ProviderInstallLock::acquire(&carina_core::paths::ResolvedPath::new(base_dir).unwrap())
+                .unwrap();
         let github_http = FixtureGithubHttp::default();
         let github = GithubApi::new(&github_http, None);
         let mut lock_file = install_lock
@@ -11237,7 +11365,9 @@ sha256 = "def"
         mode: LockMode,
         http: &H,
     ) -> Result<HashMap<String, WasmArtifactPath>, String> {
-        let install_lock = ProviderInstallLock::acquire(base_dir).unwrap();
+        let install_lock =
+            ProviderInstallLock::acquire(&carina_core::paths::ResolvedPath::new(base_dir).unwrap())
+                .unwrap();
         let github_http = FixtureGithubHttp::default();
         let github = GithubApi::new(&github_http, None);
         super::resolve_all_with_http(user_dirs, &install_lock, providers, mode, http, &github)
@@ -11263,7 +11393,9 @@ sha256 = "def"
         registry_http: &R,
         github: &GithubApi<'_, G>,
     ) -> Result<HashMap<String, WasmArtifactPath>, String> {
-        let install_lock = ProviderInstallLock::acquire(base_dir).unwrap();
+        let install_lock =
+            ProviderInstallLock::acquire(&carina_core::paths::ResolvedPath::new(base_dir).unwrap())
+                .unwrap();
         super::resolve_all_with_http(
             user_dirs,
             &install_lock,
@@ -11288,7 +11420,9 @@ sha256 = "def"
         mode: LockMode,
         http: &H,
     ) -> Result<WasmArtifactPath, String> {
-        let install_lock = ProviderInstallLock::acquire(base_dir).unwrap();
+        let install_lock =
+            ProviderInstallLock::acquire(&carina_core::paths::ResolvedPath::new(base_dir).unwrap())
+                .unwrap();
         with_guarded_lock_file(&install_lock, lock_file, |lock_file| {
             super::resolve_registry_revision_with_http(
                 user_dirs, source, revision, name, lock_file, mode, http,
@@ -11309,7 +11443,9 @@ sha256 = "def"
         lock_file: &mut LockFile,
         http: &H,
     ) -> Result<String, String> {
-        let install_lock = ProviderInstallLock::acquire(base_dir).unwrap();
+        let install_lock =
+            ProviderInstallLock::acquire(&carina_core::paths::ResolvedPath::new(base_dir).unwrap())
+                .unwrap();
         with_guarded_lock_file(&install_lock, lock_file, |lock_file| {
             super::resolve_registry_version_with_http(
                 user_dirs,
@@ -11411,7 +11547,7 @@ sha256 = "def"
         .unwrap();
         lock.provider[0].registry.as_mut().unwrap().signature =
             signature_pin(SIGNED_FIXTURE_IDENTITY, SIGNED_FIXTURE_ISSUER);
-        lock.save(&provider_lock_path(base_dir)).unwrap();
+        lock.save(&base_dir.join(PROVIDER_LOCK_FILE_NAME)).unwrap();
         lock
     }
 
@@ -11420,7 +11556,12 @@ sha256 = "def"
         existing_host: Option<&RegistryHostLock>,
         http: &H,
     ) -> Result<ResolvedRegistry, String> {
-        super::resolve_registry(source, existing_host, Path::new("."), http)
+        super::resolve_registry(
+            source,
+            existing_host,
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+            http,
+        )
     }
 
     fn check_lock_mismatch(
@@ -11428,7 +11569,12 @@ sha256 = "def"
         lock_file: &LockFile,
         mode: LockMode,
     ) -> Result<(), LockMismatchError> {
-        super::check_lock_mismatch(providers, lock_file, mode, Path::new("."))
+        super::check_lock_mismatch(
+            providers,
+            lock_file,
+            mode,
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+        )
     }
 
     fn resolve_api_base_url_for_host(hostname: &str, providers_v1: &str) -> Result<String, String> {
@@ -11447,7 +11593,8 @@ sha256 = "def"
     }
 
     fn with_lock_file_rename_hook<T>(
-        rename: impl FnOnce(&Path, &Path) -> io::Result<()> + 'static,
+        rename: impl FnOnce(&mut carina_core::paths::StagedFile, &ResolvedPath) -> io::Result<()>
+        + 'static,
         operation: impl FnOnce() -> T,
     ) -> T {
         LOCK_FILE_RENAME_HOOK.with(|hook| {
@@ -11757,7 +11904,7 @@ sha256 = "def"
         let dir = tempfile::tempdir().unwrap();
         let mut lock = signed_fixture_legacy_lock(&user_dirs, dir.path());
         fs::remove_file(cache_path_wasm(
-            dir.path(),
+            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
             &source_key("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
         ))
@@ -11857,7 +12004,7 @@ sha256 = "def"
             let dir = tempfile::tempdir().unwrap();
             let mut lock = signed_fixture_legacy_lock(&user_dirs, dir.path());
             fs::remove_file(cache_path_wasm(
-                dir.path(),
+                &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
                 &source_key("carina-rs/aws"),
                 SIGNED_FIXTURE_VERSION,
             ))
@@ -11890,7 +12037,7 @@ sha256 = "def"
         let dir = tempfile::tempdir().unwrap();
         let mut lock = signed_fixture_legacy_lock(&user_dirs, dir.path());
         let locked_path = cache_path_wasm(
-            dir.path(),
+            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
             &source_key("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
         );
@@ -11932,7 +12079,7 @@ sha256 = "def"
         let dir = tempfile::tempdir().unwrap();
         let mut lock = signed_fixture_legacy_lock(&user_dirs, dir.path());
         let locked_path = cache_path_wasm(
-            dir.path(),
+            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
             &source_key("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
         );
@@ -12033,7 +12180,7 @@ sha256 = "def"
             let dir = tempfile::tempdir().unwrap();
             let mut lock = signed_fixture_legacy_lock(&user_dirs, dir.path());
             fs::remove_file(cache_path_wasm(
-                dir.path(),
+                &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
                 &source_key("carina-rs/aws"),
                 SIGNED_FIXTURE_VERSION,
             ))
@@ -12091,7 +12238,7 @@ sha256 = "def"
             let dir = tempfile::tempdir().unwrap();
             let mut lock = signed_fixture_legacy_lock(&user_dirs, dir.path());
             fs::remove_file(cache_path_wasm(
-                dir.path(),
+                &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
                 &source_key("carina-rs/aws"),
                 SIGNED_FIXTURE_VERSION,
             ))
@@ -12892,7 +13039,7 @@ transparency_log_present = false
             &listing,
             &known,
             lock.registry_sequence_previous_state("carina-rs/aws"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         ) {
             Ok(_) => panic!("an explicitly recorded yank must not be reversible"),
             Err(error) => error,
@@ -13030,7 +13177,10 @@ sha256 = "legacy"
 
         let project = tempfile::tempdir().unwrap();
         fs::write(provider_lock_path(project.path()), &serialized).unwrap();
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let error = resolve_all(
             &user_dirs,
             &install_lock,
@@ -13343,7 +13493,12 @@ sha256 = "malformed"
             ),
         ] {
             assert_eq!(
-                cache_path_wasm(base, &source_key(source), "0.1.0"),
+                cache_path_wasm(
+                    &carina_core::paths::ResolvedPath::new(base).unwrap(),
+                    &source_key(source),
+                    "0.1.0"
+                )
+                .as_path(),
                 PathBuf::from(expected)
             );
         }
@@ -13361,14 +13516,19 @@ sha256 = "malformed"
         let source = "github.com/carina-rs/carina-provider-awscc";
         let version = "0.1.0";
 
-        let wasm_path = cache_path_wasm(base, &source_key(source), version);
+        let wasm_path = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(base).unwrap(),
+            &source_key(source),
+            version,
+        );
         fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         fs::File::create(&wasm_path)
             .unwrap()
             .write_all(b"fake wasm content")
             .unwrap();
 
-        let cached_sha256 = sha256_file(&wasm_path).unwrap();
+        let cached_sha256 =
+            sha256_file(&carina_core::paths::ResolvedPath::new(&wasm_path).unwrap()).unwrap();
         let mut lock_file = LockFile::default();
         let mut lock_entry = github_release_entry(source, version);
         lock_entry.sha256 = cached_sha256.clone();
@@ -13722,7 +13882,7 @@ hosts = ["z.example.com", "**.example.com", "a.example.com"]
         let mut initialized = InitializedEgressDeclarations::default();
 
         initialize_resolved_egress_with(
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
             ResolvedEgressDeclaration {
                 declaration,
                 signed: Some(signed),
@@ -13817,9 +13977,14 @@ hosts = ["z.example.com", "**.example.com", "a.example.com"]
         ] {
             let config = versioned_config(source, constraint);
             let remote_source = provider_source(source);
-            let selection = select_locked_artifact(project.path(), &config, &remote_source, &lock)
-                .unwrap()
-                .expect("each configured version selects its own lock entry");
+            let selection = select_locked_artifact(
+                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+                &config,
+                &remote_source,
+                &lock,
+            )
+            .unwrap()
+            .expect("each configured version selects its own lock entry");
             assert_eq!(selection.lock_entry.sha256, expected_sha256);
         }
 
@@ -13829,9 +13994,12 @@ hosts = ["z.example.com", "**.example.com", "a.example.com"]
             (&first, "first.example.com", "second.example.com"),
             (&second, "second.example.com", "first.example.com"),
         ] {
-            let locked = load_locked_egress(project.path(), load)
-                .unwrap()
-                .expect("each artifact has its own egress record");
+            let locked = load_locked_egress(
+                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+                load,
+            )
+            .unwrap()
+            .expect("each artifact has its own egress record");
             let declaration = crate::VerifiedEgressDeclaration::read(load).unwrap();
             let consented =
                 crate::ConsentedEgress::from_lock(Some(&locked), declaration, None).unwrap();
@@ -13862,7 +14030,7 @@ hosts = ["z.example.com", "**.example.com", "a.example.com"]
         for load in loads {
             let declaration = crate::VerifiedEgressDeclaration::read(load).unwrap();
             initialize_resolved_egress_with(
-                Path::new("."),
+                &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
                 ResolvedEgressDeclaration {
                     declaration,
                     signed: None,
@@ -14010,19 +14178,13 @@ hosts = ["*.com"]
             name: Cow::Borrowed("carina:egress"),
             data: Cow::Borrowed(br#"{"version":1,"hosts":["b.example.com"]}"#),
         });
-        let canonical_source = crate::egress::canonical_project_relative_path(
-            project_dir,
-            Path::new("project/mock-http.wasm"),
-        )
-        .unwrap();
-        assert_eq!(canonical_source, Path::new("mock-http.wasm"));
         let identity = ProviderLoadIdentity::new(
             "provider-b".into(),
             ProviderTrust::untrusted(),
-            ProviderLoadSource::LocalFile {
-                path: std::path::absolute("project/mock-http.wasm").unwrap(),
-                canonical_source,
-            },
+            ProviderLoadSource::local_file(
+                &ResolvedPath::new("project/mock-http.wasm").unwrap(),
+                carina_core::paths::DisplayPath::new("project/mock-http.wasm").unwrap(),
+            ),
         )
         .unwrap();
         let load = VerifiedLoad::for_test(component.finish(), identity);
@@ -14038,8 +14200,12 @@ hosts = ["*.com"]
         let consent =
             crate::EgressConsent::Explicit(crate::ExplicitConsent::granted(&declaration, given));
 
-        lock.record_egress_consent(&declaration, consent, project_dir)
-            .unwrap();
+        lock.record_egress_consent(
+            &declaration,
+            consent,
+            &carina_core::paths::ResolvedPath::new(project_dir).unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(
             lock.egress.get(&provider_a_key).unwrap().hosts().unwrap(),
@@ -14199,38 +14365,23 @@ sha256 = "abc"
 
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("carina-providers.lock");
-        let expected_parent = fs::canonicalize(dir.path()).unwrap();
+        let expected_parent = carina_core::paths::CanonicalPath::new(dir.path()).unwrap();
         let hook_parent = expected_parent.clone();
 
         with_lock_file_rename_hook(
-            move |temporary_path, target_path| {
-                let temporary_parent = temporary_path
-                    .parent()
-                    .ok_or_else(|| io::Error::other("temporary file has no parent"))?;
-                let temporary_parent = fs::canonicalize(temporary_parent)?;
-                let target_parent = target_path
+            move |staged, target| {
+                let parent = target
                     .parent()
                     .ok_or_else(|| io::Error::other("lock file has no parent"))?;
-                let target_parent = fs::canonicalize(target_parent)?;
-
-                if temporary_parent != hook_parent || target_parent != hook_parent {
-                    return Err(io::Error::other(format!(
-                        "temporary file parent {} and target parent {} must both be {}",
-                        temporary_parent.display(),
-                        target_parent.display(),
-                        hook_parent.display()
-                    )));
-                }
-
-                let temporary_device = fs::metadata(temporary_path)?.dev();
-                let target_device = fs::metadata(&target_parent)?.dev();
-                if temporary_device != target_device {
-                    return Err(io::Error::other(format!(
-                        "temporary file device {temporary_device} differs from target directory device {target_device}"
-                    )));
-                }
-
-                fs::rename(temporary_path, target_path)
+                assert_eq!(parent.identity(), hook_parent);
+                assert_eq!(staged.metadata()?.dev(), parent.metadata()?.dev());
+                assert!(parent.entries()?.iter().any(|entry| {
+                    entry.display().file_name().is_some_and(|name| {
+                        name.to_string_lossy()
+                            .starts_with(".carina-providers.lock.tmp.")
+                    })
+                }));
+                Ok(())
             },
             || LockFile::default().save(&lock_path),
         )
@@ -14238,7 +14389,7 @@ sha256 = "abc"
 
         load_lock_file_for_test(&lock_path).unwrap().unwrap();
         assert_eq!(
-            fs::canonicalize(lock_path.parent().unwrap()).unwrap(),
+            carina_core::paths::CanonicalPath::new(lock_path.parent().unwrap()).unwrap(),
             expected_parent
         );
     }
@@ -14410,6 +14561,46 @@ sha256 = "abc"
 
     #[cfg(unix)]
     #[test]
+    fn lock_file_save_symlink_rename_failure_hides_target_and_cleans_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("real");
+        fs::create_dir(&target_dir).unwrap();
+        let target = target_dir.join("target.lock");
+        fs::write(&target, "original lock").unwrap();
+        let link = dir.path().join("link.lock");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let error = with_lock_file_rename_hook(
+            |_, _| Err(io::Error::from_raw_os_error(libc::EACCES)),
+            || LockFile::default().save(&link),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert_eq!(
+            message,
+            format!(
+                "Failed to replace provider lock file at {}: {}",
+                link.display(),
+                io::Error::from_raw_os_error(libc::EACCES),
+            ),
+        );
+        assert!(message.contains(&link.display().to_string()), "{message}");
+        assert!(
+            !message.contains(&target_dir.display().to_string()),
+            "{message}"
+        );
+        assert!(!format!("{error:?}").contains(&target_dir.display().to_string()));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original lock");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_dir(&target_dir).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn lock_file_save_follows_dangling_relative_symlink() {
         use std::os::unix::fs::symlink;
 
@@ -14488,7 +14679,7 @@ sha256 = "abc"
         let b_path = dir.path().join("b.lock");
         symlink(Path::new("b.lock"), &a_path).unwrap();
         symlink(Path::new("a.lock"), &b_path).unwrap();
-        let filesystem_loop_kind = fs::canonicalize(&a_path)
+        let filesystem_loop_kind = carina_core::paths::CanonicalPath::new(&a_path)
             .expect_err("the operating system must reject a symlink cycle")
             .kind();
 
@@ -14531,14 +14722,18 @@ sha256 = "abc"
 
         let save_error = with_lock_file_rename_hook(
             move |temporary_path, target_path| {
-                if target_path != expected_target {
+                if target_path.source_label() != expected_target {
                     return Err(io::Error::other(format!(
                         "rename target {} differs from expected {}",
                         target_path.display(),
                         expected_target.display()
                     )));
                 }
-                if fs::read_to_string(temporary_path)? != expected_temporary_content {
+                use std::io::Seek;
+                temporary_path.rewind()?;
+                let mut staged_content = String::new();
+                temporary_path.read_to_string(&mut staged_content)?;
+                if staged_content != expected_temporary_content {
                     return Err(io::Error::other(
                         "temporary file did not contain the complete replacement document",
                     ));
@@ -14550,7 +14745,14 @@ sha256 = "abc"
         .expect_err("the injected rename failure must make save fail");
 
         assert_eq!(save_error.kind(), io::ErrorKind::Other);
-        assert_eq!(save_error.to_string(), INJECTED_ERROR);
+        assert_eq!(
+            save_error.to_string(),
+            format!(
+                "Failed to replace provider lock file at {}: {}",
+                lock_path.display(),
+                INJECTED_ERROR,
+            )
+        );
         assert_eq!(fs::read_to_string(&lock_path).unwrap(), original_content);
         load_lock_file_for_test(&lock_path)
             .expect("the preserved lock file must remain parseable")
@@ -14575,7 +14777,10 @@ sha256 = "abc"
 
         if std::env::var_os(CHILD_ENV).is_some() {
             let project = tempfile::tempdir().unwrap();
-            let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+            let install_lock = ProviderInstallLock::acquire(
+                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            )
+            .unwrap();
             let mut lock = install_lock.guard_lock_file_for_test(LockFile::default());
             let source = registry_source("carina-rs/aws");
             let source_key = source.source_key();
@@ -14612,7 +14817,12 @@ sha256 = "abc"
                 || lock.save(),
             )
             .expect_err("the injected rename failure must make save fail");
-            assert_eq!(save_error.to_string(), "injected anchor save failure");
+            assert!(
+                save_error
+                    .to_string()
+                    .contains("Failed to replace provider lock file at"),
+                "{save_error}"
+            );
             return;
         }
 
@@ -14642,7 +14852,10 @@ sha256 = "abc"
             .unwrap();
         initial.save(&lock_path).unwrap();
 
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let mut lock = install_lock.load_lock_file_or_default().unwrap();
         let source = registry_source("carina-rs/aws");
         let source_key = source.source_key();
@@ -14705,7 +14918,10 @@ sha256 = "abc"
 
         if let Ok(scenario) = std::env::var(CHILD_ENV) {
             let project = tempfile::tempdir().unwrap();
-            let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+            let install_lock = ProviderInstallLock::acquire(
+                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            )
+            .unwrap();
             let mut lock = install_lock.guard_lock_file_for_test(LockFile::default());
             let source = registry_source("carina-rs/aws");
             let source_key = source.source_key();
@@ -14762,7 +14978,7 @@ sha256 = "abc"
                     )
                     .expect_err("the injected intermediate save failure must be reported");
                     assert!(
-                        error.contains("injected intermediate save failure"),
+                        error.contains("Failed to replace provider lock file at"),
                         "{error}"
                     );
                     if scenario == "failure-recovery" {
@@ -14941,8 +15157,12 @@ sha256 = "abc"
         let LoadedLockFile::Migrated {
             lock_file,
             migration,
-        } = LockFile::parse_toml_str(&v4, Path::new("carina-providers.lock"), Path::new("."))
-            .unwrap()
+        } = LockFile::parse_toml_str(
+            &v4,
+            Path::new("carina-providers.lock"),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+        )
+        .unwrap()
         else {
             panic!("v4 must produce an explicit v4-to-v5 migration event");
         };
@@ -15030,7 +15250,9 @@ transparency_log_present = false
         let LoadedLockFile::Migrated {
             lock_file,
             migration,
-        } = LockFile::load(dir.path()).unwrap().unwrap()
+        } = LockFile::load(&carina_core::paths::ResolvedPath::new(dir.path()).unwrap())
+            .unwrap()
+            .unwrap()
         else {
             panic!("v3 must produce an explicit v3-to-v5 migration event");
         };
@@ -15082,7 +15304,9 @@ sha256 = "e943c0046f5bc517fa224373e82570d6a3a912a2be544320d6f96b12bde38762"
         let LoadedLockFile::Migrated {
             lock_file,
             migration,
-        } = LockFile::load(dir.path()).unwrap().unwrap()
+        } = LockFile::load(&carina_core::paths::ResolvedPath::new(dir.path()).unwrap())
+            .unwrap()
+            .unwrap()
         else {
             panic!("v1 must produce an explicit v1-to-v5 migration event");
         };
@@ -15133,7 +15357,7 @@ sha256 = "e943c0046f5bc517fa224373e82570d6a3a912a2be544320d6f96b12bde38762"
         let loaded = LockFile::parse_toml_str(
             fully_protected_v1_lock_toml(),
             Path::new("carina-providers.lock"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .expect("v1 registry state must migrate losslessly");
         let (lock, migration) = loaded.into_parts();
@@ -15203,7 +15427,7 @@ certificate_oidc_issuer = "issuer-a"
 transparency_log_present = false
 "#,
             Path::new("carina-providers.lock"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .expect("the initial v1 registry shape must migrate");
         let (lock, migration) = loaded.into_parts();
@@ -15244,7 +15468,7 @@ signature_present = false
 transparency_log_present = false
 "#,
             Path::new("carina-providers.lock"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .expect("the initial unsequenced v1 shape must migrate");
         let lock = loaded.into_lock_file();
@@ -15299,7 +15523,7 @@ transparency_log_present = false
 "carina-rs/random" = ["0.2.0", "0.3.0"]
 "#,
             Path::new("carina-providers.lock"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .expect("the yank-aware v1 shape must migrate");
         let lock = loaded.into_lock_file();
@@ -15359,7 +15583,7 @@ certificate_oidc_issuer = "issuer-b"
 transparency_log_present = true
 "#,
             Path::new("carina-providers.lock"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .expect("the atomic-ratchet v1 shape must migrate");
         let lock = loaded.into_lock_file();
@@ -15408,7 +15632,7 @@ signature_present = true
 transparency_log_present = true
 "#,
             Path::new("carina-providers.lock"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .expect("the typed-recovery v1 shape must migrate");
         let lock = loaded.into_lock_file();
@@ -15429,7 +15653,7 @@ transparency_log_present = true
         let loaded = LockFile::parse_toml_str(
             &distinct,
             Path::new("carina-providers.lock"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .expect("reachable v1 pins with distinct API bases must both migrate");
         let (lock, migration) = loaded.into_parts();
@@ -15462,7 +15686,7 @@ transparency_log_present = true
         let loaded = LockFile::parse_toml_str(
             &distinct,
             Path::new("carina-providers.lock"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .expect("reachable v1 pins with distinct discovery hashes must both migrate");
         let (lock, migration) = loaded.into_parts();
@@ -15508,7 +15732,7 @@ transparency_log_present = false
         let loaded = LockFile::parse_toml_str(
             &identical,
             Path::new("carina-providers.lock"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .expect("identical per-entry host pins must coalesce without dropping providers");
         let (lock, migration) = loaded.into_parts();
@@ -15613,12 +15837,21 @@ transparency_log_present = false
         let rendered = error.to_string();
         assert!(rendered.contains("registry.carina-rs.dev"), "{rendered}");
         assert!(
-            rendered.contains("Lock file infra/foo/carina-providers.lock"),
+            rendered.contains(&format!(
+                "Lock file {}",
+                carina_core::paths::DisplayPath::new("infra/foo/carina-providers.lock").unwrap()
+            )),
             "{rendered}"
         );
         assert!(rendered.contains("host record"), "{rendered}");
         assert!(rendered.contains("must be restored"), "{rendered}");
-        assert!(rendered.contains("`carina init infra/foo`"), "{rendered}");
+        assert!(
+            rendered.contains(&format!(
+                "`carina init {}`",
+                carina_core::paths::DisplayPath::new("infra/foo").unwrap()
+            )),
+            "{rendered}"
+        );
         assert!(
             rendered.contains("re-resolve against that host"),
             "{rendered}"
@@ -15704,7 +15937,7 @@ transparency_log_present = false
         let loaded = LockFile::parse_toml_str(
             &serialized,
             Path::new("carina-providers.lock"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .expect("migration must canonicalize a v2 host key before validating references");
         let (lock, migration) = loaded.into_parts();
@@ -15749,7 +15982,7 @@ discovery_pin_present = false
         let error = LockFile::parse_toml_str(
             &serialized,
             Path::new("carina-providers.lock"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .expect_err("canonicalization must not choose between colliding host security states");
 
@@ -15769,7 +16002,7 @@ discovery_pin_present = false
         let loaded = LockFile::parse_toml_str(
             &unpinned_v2_lock_toml(),
             Path::new("carina-providers.lock"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .expect("an unpinned v2 host must migrate");
         let (lock, migration) = loaded.into_parts();
@@ -15822,7 +16055,7 @@ discovery_pin_present = false
         let loaded = LockFile::parse_toml_str(
             &two_host_v2_lock_toml(),
             Path::new("infra/foo/carina-providers.lock"),
-            Path::new("infra/foo"),
+            &carina_core::paths::ResolvedPath::new(Path::new("infra/foo")).unwrap(),
         )
         .expect("a multi-host v2 lock must migrate");
         let (_, migration) = loaded.into_parts();
@@ -15901,7 +16134,7 @@ discovery_pin_present = false
         let error = super::resolve_registry(
             &source,
             lock.registry_host.get("registry.carina-rs.dev"),
-            project_dir.path(),
+            &carina_core::paths::ResolvedPath::new(project_dir.path()).unwrap(),
             &http,
         )
         .expect_err("migration must not authorize consuming new discovery values");
@@ -15936,7 +16169,7 @@ discovery_pin_present = false
         let original = fully_protected_v2_lock_toml();
         fs::write(&lock_path, original).unwrap();
 
-        let loaded = LockFile::load(dir.path())
+        let loaded = LockFile::load(&carina_core::paths::ResolvedPath::new(dir.path()).unwrap())
             .expect("v2 load must succeed")
             .expect("lock must be present");
         let (lock, migration) = loaded.into_parts();
@@ -16004,7 +16237,7 @@ discovery_sha256 = "legacy-discovery-sha256"
         let loaded = LockFile::parse_toml_str(
             serialized,
             Path::new("carina-providers.lock"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .expect("v4 locks written with the old single-pin key must remain readable");
         let LoadedLockFile::Migrated {
@@ -16268,7 +16501,10 @@ discovery_pin_present = true
             .collect();
         let resolved = resolved_registry(hostname, "https://registry.carina-rs.dev/v1/providers/");
         let dir = tempfile::tempdir().unwrap();
-        let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
+        )
+        .unwrap();
         let mut lock = install_lock.guard_lock_file_for_test(lock);
 
         assert_eq!(lock.registry_host.len(), 1);
@@ -16307,7 +16543,7 @@ discovery_pin_present = true
             let error = match super::resolve_registry(
                 &source,
                 lock.registry_host.get(hostname),
-                dir.path(),
+                &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
                 &FakeRegistryHttp::default().json(
                     "https://registry.carina-rs.dev/.well-known/carina.json",
                     r#"{"providers.v1":"/v1/providers/"}"#,
@@ -16347,7 +16583,10 @@ discovery_pin_present = true
             "https://registry.carina-rs.dev/v1/providers/",
         );
         let dir = tempfile::tempdir().unwrap();
-        let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
+        )
+        .unwrap();
         let mut lock = install_lock.guard_lock_file_for_test(lock);
         let mut persistent = PersistentLockFile::new(&mut lock);
         let error = match verify_registry_lock_pin(
@@ -16386,8 +16625,13 @@ discovery_pin_present = true
             "https://registry.carina-rs.dev/.well-known/carina.json",
             r#"{"providers.v1":"/v2/providers/"}"#,
         );
-        let error = super::resolve_registry(&source, Some(&locked_host), project_dir.path(), &http)
-            .expect_err("changed pinned discovery values must trip the host pin");
+        let error = super::resolve_registry(
+            &source,
+            Some(&locked_host),
+            &carina_core::paths::ResolvedPath::new(project_dir.path()).unwrap(),
+            &http,
+        )
+        .expect_err("changed pinned discovery values must trip the host pin");
 
         assert!(
             error.contains(
@@ -16492,7 +16736,10 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
         let user_dirs = carina_core::TestUserDirs::new();
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("carina-providers.lock"), "version = [\n").unwrap();
-        let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
+        )
+        .unwrap();
 
         let rendered = resolve_all(&user_dirs, &install_lock, &[], LockMode::Normal)
             .expect_err("a malformed lock must fail before provider resolution")
@@ -17207,7 +17454,7 @@ transparency_log_present = false
         let loaded = LockFile::parse_toml_str(
             fully_protected_v2_lock_toml(),
             Path::new("carina-providers.lock"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .unwrap();
         let (mut lock, migration) = loaded.into_parts();
@@ -17519,7 +17766,10 @@ transparency_log_present = false
             "registry.carina-rs.dev",
             "https://registry.carina-rs.dev/v1/providers/",
         );
-        let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
+        )
+        .unwrap();
         let mut lock = install_lock.guard_lock_file_for_test(lock);
         let mut persistent = PersistentLockFile::new(&mut lock);
 
@@ -17605,7 +17855,7 @@ transparency_log_present = false
             &listing_without_sequence,
             &before,
             lock.registry_sequence_previous_state("carina-rs/aws"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         ) {
             Ok(_) => panic!("an established sequence anchor must reject a missing sequence"),
             Err(error) => error,
@@ -17635,7 +17885,7 @@ transparency_log_present = false
             &listing_without_sequence,
             &after,
             lock.registry_sequence_previous_state("carina-rs/aws"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .expect("re-bootstrap must make a sequence-less listing first contact");
         let (_, validated_sequence) = validated.into_parts();
@@ -17663,7 +17913,7 @@ transparency_log_present = false
             &listing(true),
             &locked,
             previous_sequence_state,
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         ) {
             Ok(_) => panic!("a sequence rollback must be refused"),
             Err(error) => error,
@@ -17682,7 +17932,7 @@ transparency_log_present = false
             &listing(false),
             &locked,
             previous_sequence_state,
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         ) {
             Ok(_) => panic!("a rollback that also drops a yank must report both refusals"),
             Err(error) => error,
@@ -18668,7 +18918,7 @@ transparency_log_present = true
             },
             &locked,
             lock.registry_sequence_previous_state(source_name),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .expect_err("an unpinned observation must not disable the pinned rollback floor");
 
@@ -18723,7 +18973,10 @@ transparency_log_present = true
     fn registry_provider_writes_always_create_referenced_host_records() {
         let lock = LockFile::default();
         let dir = tempfile::tempdir().unwrap();
-        let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
+        )
+        .unwrap();
         let mut lock = install_lock.guard_lock_file_for_test(lock);
 
         for (name, source, hostname) in [
@@ -18744,7 +18997,7 @@ transparency_log_present = true
                 },
                 &RegistryRatchets::default(),
                 RegistrySequencePreviousState::FirstContact,
-                dir.path(),
+                &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
             )
             .unwrap();
             let (_, validated_sequence) = validated.into_parts();
@@ -18888,7 +19141,7 @@ transparency_log_present = true
             .write_all(b"hello world")
             .unwrap();
         assert_eq!(
-            sha256_file(&file_path).unwrap(),
+            sha256_file(&carina_core::paths::ResolvedPath::new(&file_path).unwrap()).unwrap(),
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
     }
@@ -18903,10 +19156,10 @@ transparency_log_present = true
         fs::write(&artifact, b"tampered").unwrap();
 
         let error = hash_and_check(
-            &artifact,
+            &carina_core::paths::ResolvedPath::new(&artifact).unwrap(),
             "expected-shasum",
             "cached registry provider 'aws'",
-            Path::new("infra/foo"),
+            &carina_core::paths::ResolvedPath::new(Path::new("infra/foo")).unwrap(),
         )
         .unwrap_err();
 
@@ -18921,7 +19174,11 @@ transparency_log_present = true
         let dir = tempfile::tempdir().unwrap();
         let project_dir = dir.path().join("infra/foo");
         let source = "carina-rs/aws";
-        let artifact = cache_path_wasm(&project_dir, &source_key(source), "1.0.0");
+        let artifact = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(&project_dir).unwrap(),
+            &source_key(source),
+            "1.0.0",
+        );
         fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         fs::write(&artifact, b"tampered").unwrap();
         let mut lock = LockFile::default();
@@ -18931,7 +19188,10 @@ transparency_log_present = true
             lock.find_by_source_key_and_version(&source_key(source), "1.0.0")
                 .unwrap(),
             "aws",
-            &project_dir,
+            &ProviderInstallLock::acquire(
+                &carina_core::paths::ResolvedPath::new(&project_dir).unwrap(),
+            )
+            .unwrap(),
         )
         .unwrap_err()
         .to_string();
@@ -19060,7 +19320,10 @@ transparency_log_present = true
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
         }];
-        let install_lock = ProviderInstallLock::acquire(tmp.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        )
+        .unwrap();
 
         let result = resolve_all(&user_dirs, &install_lock, &providers, LockMode::Normal).unwrap();
         let dest = result.get("test").expect("provider should be resolved");
@@ -19109,7 +19372,10 @@ future_protection_field = "retain-me"
         )
         .unwrap();
         let config = provider_config(&format!("file://{}", configured.display()), None);
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
 
         resolve_all(&user_dirs, &install_lock, &[config], LockMode::Upgrade).unwrap();
 
@@ -19137,7 +19403,10 @@ future_protection_field = "retain-me"
 
         let source = format!("file://{}", wasm_path.display());
         let config = provider_config(&source, None);
-        let install_lock = ProviderInstallLock::acquire(tmp.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        )
+        .unwrap();
 
         resolve_all(&user_dirs, &install_lock, &[config], LockMode::Locked).unwrap();
 
@@ -19214,7 +19483,10 @@ future_protection_field = "retain-me"
         let source_path = tmp.path().join("my-provider.wasm");
         fs::write(&source_path, b"first artifact").unwrap();
         let config = provider_config(&format!("file://{}", source_path.display()), None);
-        let install_lock = ProviderInstallLock::acquire(tmp.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        )
+        .unwrap();
 
         let first = resolve_all(
             &user_dirs,
@@ -19252,7 +19524,10 @@ future_protection_field = "retain-me"
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
         }];
-        let install_lock = ProviderInstallLock::acquire(tmp.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        )
+        .unwrap();
         let err = resolve_all(&user_dirs, &install_lock, &providers, LockMode::Normal).unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
@@ -19266,15 +19541,24 @@ future_protection_field = "retain-me"
         let config = provider_config(&format!("file://{}", native_path.display()), None);
         let expected = "Provider 'awscc': native binaries are no longer supported. Use a .wasm component instead.";
 
-        let direct_error = find_file_provider_source(tmp.path(), &config)
-            .expect_err("a direct file lookup must reject native binaries");
+        let direct_error = find_file_provider_source(
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            &config,
+        )
+        .expect_err("a direct file lookup must reject native binaries");
         assert_eq!(direct_error, expected);
 
-        let installed_error = find_installed_provider(tmp.path(), &config)
-            .expect_err("an installed file lookup must reject native binaries");
+        let installed_error = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            &config,
+        )
+        .expect_err("an installed file lookup must reject native binaries");
         assert_eq!(installed_error.to_string(), expected);
 
-        let install_lock = ProviderInstallLock::acquire(tmp.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        )
+        .unwrap();
         let error = resolve_all(
             &user_dirs,
             &install_lock,
@@ -19492,14 +19776,21 @@ future_protection_field = "retain-me"
     fn interrupted_registry_download_never_exposes_partial_final_artifact() {
         let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let guard = crate::ProviderInstallLock::acquire(project.path()).unwrap();
+        let guard = crate::ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let source = source_key("carina-rs/aws");
-        let final_path = cache_path_wasm(project.path(), &source, "1.0.0");
+        let final_path = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source,
+            "1.0.0",
+        );
         let download_url =
             parse_registry_resource_url("https://downloads.example.test/aws.wasm", "test URL")
                 .unwrap();
         let http = PartialFailingRegistryHttp {
-            final_path: final_path.clone(),
+            final_path: final_path.as_path().to_path_buf(),
         };
 
         let error = obtain_registry_artifact(
@@ -19508,7 +19799,6 @@ future_protection_field = "retain-me"
                 install_lock: &guard,
                 source: &source,
                 version: "1.0.0",
-                provider_name: "aws",
                 download_url: &download_url,
                 expected_shasum: &sha256_bytes(b"complete bytes"),
                 context: "test registry artifact",
@@ -19526,9 +19816,16 @@ future_protection_field = "retain-me"
     fn registry_hash_mismatch_leaves_no_final_artifact_or_temp_residue() {
         let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
-        let guard = crate::ProviderInstallLock::acquire(project.path()).unwrap();
+        let guard = crate::ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let source = source_key("carina-rs/aws");
-        let final_path = cache_path_wasm(project.path(), &source, "1.0.0");
+        let final_path = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source,
+            "1.0.0",
+        );
         let download_url =
             parse_registry_resource_url("https://downloads.example.test/aws.wasm", "test URL")
                 .unwrap();
@@ -19539,7 +19836,6 @@ future_protection_field = "retain-me"
                 install_lock: &guard,
                 source: &source,
                 version: "1.0.0",
-                provider_name: "aws",
                 download_url: &download_url,
                 expected_shasum: &sha256_bytes(b"expected bytes"),
                 context: "test registry artifact",
@@ -21120,7 +21416,11 @@ future_protection_field = "retain-me"
         lock.save(&provider_lock_path(project.path())).unwrap();
         let mut config = provider_config(source, None);
         config.name = "aws".into();
-        let installed = find_installed_provider(project.path(), &config).unwrap();
+        let installed = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &config,
+        )
+        .unwrap();
         let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let called = std::sync::Arc::clone(&loader_called);
         let error = block_on(installed.load_with(
@@ -21504,7 +21804,7 @@ future_protection_field = "retain-me"
         }
 
         let artifact_path = cache_path_wasm(
-            dir.path(),
+            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
             &source_key("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
         );
@@ -21516,7 +21816,7 @@ future_protection_field = "retain-me"
         let http = AssertArtifactUnpublishedOnBundleFetch {
             inner: signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200)
                 .json(SIGNED_FIXTURE_DOWNLOAD_URL, &download_response),
-            final_path: artifact_path.clone(),
+            final_path: artifact_path.as_path().to_path_buf(),
         };
 
         let error = resolve_provider_with_http(
@@ -21743,7 +22043,7 @@ future_protection_field = "retain-me"
             "{error}"
         );
         let artifact_path = cache_path_wasm(
-            dir.path(),
+            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
             &source_key("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
         );
@@ -21780,7 +22080,7 @@ future_protection_field = "retain-me"
         assert!(error.contains("no override"), "{error}");
         assert_eq!(http.request_count(bundle_url), 0);
         let artifact_path = cache_path_wasm(
-            dir.path(),
+            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
             &source_key("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
         );
@@ -21958,7 +22258,7 @@ transparency_log_present = false
         );
         assert!(
             !cache_path_wasm(
-                dir.path(),
+                &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
                 &source_key("carina-rs/aws"),
                 SIGNED_FIXTURE_VERSION
             )
@@ -22078,7 +22378,7 @@ transparency_log_present = false
             "{error}"
         );
         let wasm_path = cache_path_wasm(
-            dir.path(),
+            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
             &source_key("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
         );
@@ -22135,7 +22435,7 @@ transparency_log_present = false
             "{error}"
         );
         let artifact_path = cache_path_wasm(
-            dir.path(),
+            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
             &source_key("carina-rs/aws"),
             SIGNED_FIXTURE_VERSION,
         );
@@ -22954,7 +23254,11 @@ transparency_log_present = false
             &verified_signer,
         )
         .unwrap();
-        let cached_path = cache_path_wasm(dir.path(), &source_key("carina-rs/aws"), "0.5.0");
+        let cached_path = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
+            &source_key("carina-rs/aws"),
+            "0.5.0",
+        );
         fs::create_dir_all(cached_path.parent().unwrap()).unwrap();
         fs::write(&cached_path, b"stale cached wasm bytes").unwrap();
 
@@ -23481,14 +23785,21 @@ transparency_log_present = false
                 .save(&dir.path().join("carina-providers.lock"))
                 .unwrap();
 
-            let found_path =
-                find_installed_provider(dir.path(), &provider_config(requested_source, None))
-                    .unwrap();
+            let found_path = find_installed_provider(
+                &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
+                &provider_config(requested_source, None),
+            )
+            .unwrap();
 
             assert_eq!(found_path.path().as_path(), installed_path.as_path());
             assert_eq!(
                 installed_path.as_path(),
-                cache_path_wasm(dir.path(), &source_key("carina-rs/aws"), "0.5.0")
+                cache_path_wasm(
+                    &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
+                    &source_key("carina-rs/aws"),
+                    "0.5.0"
+                )
+                .as_path()
             );
             assert_eq!(lock_file.provider.len(), 1);
             assert_eq!(lock_file.provider[0].source, "carina-rs/aws");
@@ -23852,7 +24163,10 @@ transparency_log_present = false
         )
         .expect("registry WASM download should stream to disk instead of using capped get");
 
-        assert_eq!(sha256_file(path.as_path()).unwrap(), shasum);
+        assert_eq!(
+            sha256_file(&carina_core::paths::ResolvedPath::new(path.as_path()).unwrap()).unwrap(),
+            shasum
+        );
         assert_eq!(
             fs::metadata(path.as_path()).unwrap().len(),
             body.len() as u64
@@ -24147,10 +24461,17 @@ transparency_log_present = false
             registry: None,
         });
         lock.save(&provider_lock_path(project.path())).unwrap();
-        let wasm_path = cache_path_wasm(project.path(), &source_key(source), version);
+        let wasm_path = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source_key(source),
+            version,
+        );
         fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         fs::write(&wasm_path, bytes).unwrap();
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let github_http = FixtureGithubHttp::default();
         let tokens = CountingGithubTokenProvider {
             calls: AtomicUsize::new(0),
@@ -24571,7 +24892,11 @@ future_protection_field = "retain-me"
             registry: None,
         });
         lock.save(&provider_lock_path(project.path())).unwrap();
-        let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
+        let project_wasm = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source_key(source),
+            version,
+        );
         fs::create_dir_all(project_wasm.parent().unwrap()).unwrap();
         fs::write(&project_wasm, bytes).unwrap();
         let releases_url = "https://api.github.com/repos/acme/widget/releases?per_page=100";
@@ -24709,7 +25034,11 @@ future_protection_field = "retain-me"
         fs::write(global_wasm.as_path(), cached_bytes).unwrap();
         record_test_github_origin_download(&user_dirs, &source_key(source), &expected_sha256, None)
             .unwrap();
-        let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
+        let project_wasm = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source_key(source),
+            version,
+        );
 
         let error = resolve_all_with_http(
             &user_dirs,
@@ -24755,7 +25084,10 @@ future_protection_field = "retain-me"
         )
         .expect("a rerun must download the lock-matching origin artifact");
 
-        assert_eq!(rerun.get("awscc").unwrap().as_path(), project_wasm);
+        assert_eq!(
+            rerun.get("awscc").unwrap().as_path(),
+            project_wasm.as_path()
+        );
         assert_eq!(fs::read(&project_wasm).unwrap(), expected_bytes);
         assert_eq!(fs::read(global_wasm.as_path()).unwrap(), expected_bytes);
         assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
@@ -24788,7 +25120,11 @@ future_protection_field = "retain-me"
         lock.save(&provider_lock_path(project.path())).unwrap();
         let mut config = provider_config(source, None);
         config.name = "aws".into();
-        let installed = find_installed_provider(project.path(), &config).unwrap();
+        let installed = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &config,
+        )
+        .unwrap();
         let class =
             block_on(
                 installed.load_with(&user_dirs, &no_local_grants(), |verified| async move {
@@ -24859,7 +25195,11 @@ future_protection_field = "retain-me"
         let source = "github.com/carina-rs/carina-provider-aws";
         let version = "0.1.0";
         let origin_bytes = b"lock-matching origin provider";
-        let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
+        let project_wasm = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source_key(source),
+            version,
+        );
         fs::create_dir_all(project_wasm.parent().unwrap()).unwrap();
         fs::write(&project_wasm, origin_bytes).unwrap();
         let mut lock = LockFile::default();
@@ -24912,7 +25252,11 @@ future_protection_field = "retain-me"
         let locked_bytes = b"repository-installed locked provider";
         let origin_bytes = b"changed origin provider";
         let locked_sha256 = sha256_bytes(locked_bytes);
-        let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
+        let project_wasm = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source_key(source),
+            version,
+        );
         fs::create_dir_all(project_wasm.parent().unwrap()).unwrap();
         fs::write(&project_wasm, locked_bytes).unwrap();
         let global_wasm = global_cache_path_wasm(&user_dirs, &source_key(source), version).unwrap();
@@ -24995,7 +25339,11 @@ future_protection_field = "retain-me"
             sha256: expected_sha256.clone(),
             registry: None,
         });
-        let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
+        let project_wasm = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source_key(source),
+            version,
+        );
         fs::create_dir_all(project_wasm.parent().unwrap()).unwrap();
         fs::write(&project_wasm, tampered_bytes).unwrap();
         record_test_github_origin_download(&user_dirs, &source_key(source), &expected_sha256, None)
@@ -25050,7 +25398,7 @@ future_protection_field = "retain-me"
         )
         .expect("a rerun must download the lock-matching origin artifact");
 
-        assert_eq!(resolved.as_path(), project_wasm);
+        assert_eq!(resolved.as_path(), project_wasm.as_path());
         assert_eq!(fs::read(resolved.as_path()).unwrap(), locked_bytes);
         assert_eq!(github_http.requests()[0].url(), asset_url);
     }
@@ -25102,9 +25450,16 @@ future_protection_field = "retain-me"
             &github,
         )
         .unwrap();
-        let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
+        let project_wasm = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source_key(source),
+            version,
+        );
 
-        assert_eq!(resolved.get("awscc").unwrap().as_path(), project_wasm);
+        assert_eq!(
+            resolved.get("awscc").unwrap().as_path(),
+            project_wasm.as_path()
+        );
         assert_eq!(fs::read(&project_wasm).unwrap(), cached_bytes);
         assert_eq!(github_http.requested_urls(), [release_url, asset_url]);
         assert!(
@@ -25165,7 +25520,11 @@ future_protection_field = "retain-me"
         let version = "0.1.0";
         let cached_bytes = b"untrusted project-local provider bytes";
         let origin_bytes = b"fresh origin bytes for local replacement";
-        let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
+        let project_wasm = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source_key(source),
+            version,
+        );
         fs::create_dir_all(project_wasm.parent().unwrap()).unwrap();
         fs::write(&project_wasm, cached_bytes).unwrap();
         let asset_url = github_asset_url(source, 42);
@@ -25184,7 +25543,7 @@ future_protection_field = "retain-me"
         )
         .unwrap();
 
-        assert_eq!(resolved.as_path(), project_wasm);
+        assert_eq!(resolved.as_path(), project_wasm.as_path());
         assert_eq!(fs::read(&project_wasm).unwrap(), origin_bytes);
         assert_eq!(
             lock.find_by_source(source).unwrap().sha256,
@@ -25221,7 +25580,11 @@ future_protection_field = "retain-me"
         let asset_url = github_asset_url(source, 42);
         let github_http = FixtureGithubHttp::default().bytes(&asset_url, downloaded_bytes);
         let github = GithubApi::new(&github_http, None);
-        let project_wasm = cache_path_wasm(project.path(), &source_key(source), version);
+        let project_wasm = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source_key(source),
+            version,
+        );
 
         let error = resolve_github_provider_with_client_in(
             &user_dirs,
@@ -25355,8 +25718,11 @@ future_protection_field = "retain-me"
             .unwrap();
 
         let config = provider_config(source, Some("main"));
-        let err = find_installed_provider(base, &config)
-            .expect_err("missing local .carina/ must not be masked by a global-cache hit");
+        let err = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(base).unwrap(),
+            &config,
+        )
+        .expect_err("missing local .carina/ must not be masked by a global-cache hit");
         assert!(err.to_string().contains("carina init"), "got: {err}");
     }
 
@@ -25383,8 +25749,11 @@ future_protection_field = "retain-me"
             .unwrap();
 
         let config = provider_config(source, None);
-        let err = find_installed_provider(base, &config)
-            .expect_err("missing local .carina/ must not be masked by a global-cache hit");
+        let err = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(base).unwrap(),
+            &config,
+        )
+        .expect_err("missing local .carina/ must not be masked by a global-cache hit");
         assert!(err.to_string().contains("carina init"), "got: {err}");
     }
 
@@ -25394,7 +25763,11 @@ future_protection_field = "retain-me"
         let source = "github.com/carina-rs/carina-provider-awscc";
         let version = "0.1.0";
         let artifact_bytes = b"tampered installed provider";
-        let wasm_path = cache_path_wasm(project.path(), &source_key(source), version);
+        let wasm_path = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source_key(source),
+            version,
+        );
         fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         fs::write(&wasm_path, artifact_bytes).unwrap();
         let mut lock = LockFile::default();
@@ -25412,8 +25785,11 @@ future_protection_field = "retain-me"
         });
         lock.save(&provider_lock_path(project.path())).unwrap();
 
-        let fingerprint =
-            provider_artifact_fingerprint(project.path(), &provider_config(source, None)).unwrap();
+        let fingerprint = provider_artifact_fingerprint(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &provider_config(source, None),
+        )
+        .unwrap();
         assert!(
             fingerprint.artifact.is_some(),
             "the drift probe must observe artifact metadata without hashing provider bytes"
@@ -25422,8 +25798,11 @@ future_protection_field = "retain-me"
             fingerprint.lock_file.is_some(),
             "the drift probe must observe lock-file metadata"
         );
-        let error = find_installed_provider(project.path(), &provider_config(source, None))
-            .expect_err("the runtime loader must verify lock-controlled provider bytes");
+        let error = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &provider_config(source, None),
+        )
+        .expect_err("the runtime loader must verify lock-controlled provider bytes");
 
         assert!(
             error.to_string().contains(&format!(
@@ -25448,7 +25827,7 @@ future_protection_field = "retain-me"
 
         assert!(
             provider_artifact_fingerprint(
-                project.path(),
+                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
                 &provider_config(&format!("file://{}", wasm.display()), None),
             )
             .unwrap()
@@ -25457,7 +25836,7 @@ future_protection_field = "retain-me"
         );
         assert!(
             provider_artifact_fingerprint(
-                project.path(),
+                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
                 &provider_config(&format!("file://{}", native.display()), None),
             )
             .unwrap()
@@ -25467,7 +25846,7 @@ future_protection_field = "retain-me"
         fs::remove_file(&wasm).unwrap();
         assert!(
             provider_artifact_fingerprint(
-                project.path(),
+                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
                 &provider_config(&format!("file://{}", wasm.display()), None),
             )
             .unwrap()
@@ -25477,12 +25856,178 @@ future_protection_field = "retain-me"
     }
 
     #[test]
+    fn cached_provider_load_errors_preserve_project_spelling() {
+        let cwd = std::env::current_dir().unwrap();
+        let temp = tempfile::tempdir_in(&cwd).unwrap();
+        let directory = temp.path().join("infra");
+        fs::create_dir(&directory).unwrap();
+        let relative = Path::new(temp.path().file_name().unwrap()).join("infra");
+        let source = "github.com/example/provider-widget";
+        let version = "1.0.0";
+        let sha = commit_sha("abc123def456789012345678901234567890abcd");
+        let bytes = b"malformed wasm component";
+        let source_path = temp.path().join("local.wasm");
+        fs::write(&source_path, bytes).unwrap();
+
+        for spelling in [
+            relative.clone(),
+            Path::new(".").join(&relative),
+            relative.join("..").join("infra"),
+            directory.clone(),
+        ] {
+            let project = ResolvedPath::new(&spelling).unwrap();
+            for cache_kind in ["version", "revision", "file"] {
+                let (config, artifact, suffix, kind) = match cache_kind {
+                    "version" => (
+                        provider_config(source, None),
+                        cache_path_wasm(&project, &source_key(source), version),
+                        ".carina/providers/github.com/example/provider-widget/1.0.0/provider-widget.wasm",
+                        LockEntryKind::GithubRelease {
+                            version: Version::parse(version).unwrap(),
+                            tag: ReleaseTag::from_lock(format!("v{version}")),
+                            asset_id: release_asset_id(42),
+                            constraint: None,
+                        },
+                    ),
+                    "revision" => (
+                        provider_config(source, Some("main")),
+                        crate::revision_resolver::cache_path_revision(
+                            &project,
+                            &github_source(source),
+                            &sha,
+                        ),
+                        ".carina/providers/github.com/example/provider-widget/rev-abc123def456/provider-widget.wasm",
+                        LockEntryKind::Revision {
+                            revision: "main".into(),
+                            resolved_sha: sha.clone(),
+                            artifact_id: ArtifactId::from_lock(42),
+                        },
+                    ),
+                    "file" => {
+                        let config =
+                            provider_config(&format!("file://{}", source_path.display()), None);
+                        let artifact = file_provider_cache_path(
+                            &project,
+                            &WasmArtifactPath::new(source_path.clone(), "awscc").unwrap(),
+                            "awscc",
+                        )
+                        .unwrap();
+                        (
+                            config,
+                            artifact,
+                            ".carina/providers/file/local/local.wasm",
+                            LockEntryKind::File,
+                        )
+                    }
+                    _ => unreachable!(),
+                };
+                fs::create_dir_all(artifact.as_path().parent().unwrap()).unwrap();
+                fs::write(artifact.as_path(), bytes).unwrap();
+                let mut lock = LockFile::default();
+                lock.upsert(LockEntry {
+                    name: config.name.clone(),
+                    source: config.source.as_ref().unwrap().to_string(),
+                    kind,
+                    sha256: sha256_bytes(bytes),
+                    registry: None,
+                });
+                lock.save(&provider_lock_path(&directory)).unwrap();
+
+                let installed = find_installed_provider(&project, &config).unwrap();
+                assert_eq!(installed.artifact_bytes().as_bytes(), bytes);
+                assert_eq!(installed.path().as_path(), artifact.as_path());
+                assert_eq!(
+                    artifact.io_locator(),
+                    &project.persisted_path().join(suffix).unwrap()
+                );
+                assert_eq!(
+                    artifact.display().to_string(),
+                    spelling.join(suffix).display().to_string()
+                );
+                assert_eq!(artifact.resolve(&project).unwrap().read().unwrap(), bytes);
+                let error = installed.with_load_error(io::Error::other("malformed wasm component"));
+                assert_eq!(
+                    error.loader_error().unwrap().to_string(),
+                    "malformed wasm component"
+                );
+                assert_eq!(
+                    error
+                        .to_string()
+                        .lines()
+                        .find(|line| line.starts_with("Artifact: ")),
+                    Some(format!("Artifact: {}", spelling.join(suffix).display()).as_str()),
+                    "{cache_kind} cache must retain the user's project spelling"
+                );
+                let error: ProviderArtifactLoadError<io::Error> = installed.with_identity_error(
+                    ProviderLoadIdentityError::ConfiguredNameMismatch {
+                        configured_name: config.name.clone(),
+                        expected: "aws",
+                    },
+                );
+                assert_eq!(
+                    error
+                        .to_string()
+                        .lines()
+                        .find(|line| line.starts_with("Artifact: ")),
+                    Some(format!("Artifact: {}", spelling.join(suffix).display()).as_str()),
+                    "identity errors must retain the {cache_kind} cache spelling"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn installed_provider_and_fingerprint_accept_a_relative_project_locator() {
+        let cwd = std::env::current_dir().unwrap();
+        let temp = tempfile::tempdir_in(&cwd).unwrap();
+        let directory = temp.path().join("infra");
+        fs::create_dir(&directory).unwrap();
+        let relative = Path::new(temp.path().file_name().unwrap()).join("infra");
+        let project = ResolvedPath::new(&relative).unwrap();
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "0.1.0";
+        let bytes = b"verified installed provider";
+        let artifact = cache_path_wasm(&project, &source_key(source), version);
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, bytes).unwrap();
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "awscc".into(),
+            source: source.into(),
+            kind: LockEntryKind::GithubRelease {
+                version: Version::parse(version).unwrap(),
+                tag: ReleaseTag::from_lock(format!("v{version}")),
+                asset_id: release_asset_id(42),
+                constraint: None,
+            },
+            sha256: sha256_bytes(bytes),
+            registry: None,
+        });
+        lock.save(&provider_lock_path(&directory)).unwrap();
+        let config = provider_config(source, None);
+
+        let installed = find_installed_provider(&project, &config)
+            .expect("a complete cache locator must not be joined to infra again");
+        assert_eq!(installed.path().as_path(), artifact.as_path());
+        let fingerprint = provider_artifact_fingerprint(&project, &config).unwrap();
+        assert!(
+            fingerprint.artifact.is_some(),
+            "drift polling must inspect the same artifact"
+        );
+        assert!(fingerprint.lock_file.is_some());
+    }
+
+    #[test]
     fn find_installed_provider_accepts_artifact_that_matches_lock_sha256() {
         let project = tempfile::tempdir().unwrap();
         let source = "github.com/carina-rs/carina-provider-awscc";
         let version = "0.1.0";
         let artifact_bytes = b"verified installed provider";
-        let wasm_path = cache_path_wasm(project.path(), &source_key(source), version);
+        let wasm_path = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source_key(source),
+            version,
+        );
         fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         fs::write(&wasm_path, artifact_bytes).unwrap();
         let mut lock = LockFile::default();
@@ -25500,10 +26045,13 @@ future_protection_field = "retain-me"
         });
         lock.save(&provider_lock_path(project.path())).unwrap();
 
-        let installed = find_installed_provider(project.path(), &provider_config(source, None))
-            .expect("the lock-matching provider should be loadable");
+        let installed = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &provider_config(source, None),
+        )
+        .expect("the lock-matching provider should be loadable");
 
-        assert_eq!(installed.path().as_path(), wasm_path);
+        assert_eq!(installed.path().as_path(), wasm_path.as_path());
         assert_eq!(
             installed.provenance(),
             ProviderArtifactProvenance::LockFile {
@@ -25526,7 +26074,11 @@ future_protection_field = "retain-me"
         let version = "0.1.0";
         let original_bytes = b"verified installed provider";
         let swapped_bytes = b"provider swapped after verification";
-        let wasm_path = cache_path_wasm(project.path(), &source_key(source), version);
+        let wasm_path = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source_key(source),
+            version,
+        );
         fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         fs::write(&wasm_path, original_bytes).unwrap();
         let mut lock = LockFile::default();
@@ -25544,8 +26096,11 @@ future_protection_field = "retain-me"
         });
         lock.save(&provider_lock_path(project.path())).unwrap();
 
-        let installed = find_installed_provider(project.path(), &provider_config(source, None))
-            .expect("the lock-matching provider should be loadable");
+        let installed = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &provider_config(source, None),
+        )
+        .expect("the lock-matching provider should be loadable");
         fs::write(&wasm_path, swapped_bytes).unwrap();
 
         let (loaded, load_source) = installed
@@ -25578,8 +26133,11 @@ future_protection_field = "retain-me"
         fs::write(&source_path, original_bytes).unwrap();
         let config = provider_config(&format!("file://{}", source_path.display()), None);
 
-        let installed = find_file_provider_source(project.path(), &config)
-            .expect("the file provider should be loadable at lookup");
+        let installed = find_file_provider_source(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &config,
+        )
+        .expect("the file provider should be loadable at lookup");
         fs::write(&source_path, swapped_bytes).unwrap();
 
         let loaded = installed
@@ -25602,7 +26160,10 @@ future_protection_field = "retain-me"
         let rebuilt_bytes = b"local provider rebuilt after init";
         fs::write(&source_path, original_bytes).unwrap();
         let config = provider_config(&format!("file://{}", source_path.display()), None);
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         resolve_all(
             &user_dirs,
             &install_lock,
@@ -25614,7 +26175,11 @@ future_protection_field = "retain-me"
         let rebuilt_path = project.path().join("rebuilt-local-provider.wasm");
         fs::write(&rebuilt_path, rebuilt_bytes).unwrap();
         fs::rename(&rebuilt_path, &source_path).unwrap();
-        let installed = find_installed_provider(project.path(), &config).unwrap();
+        let installed = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &config,
+        )
+        .unwrap();
         let loaded = installed
             .load_with(&user_dirs, &no_local_grants(), |verified| async move {
                 Ok::<_, std::convert::Infallible>(verified.bytes().as_bytes().to_vec())
@@ -25634,7 +26199,10 @@ future_protection_field = "retain-me"
         let source_path = project.path().join("local-provider.wasm");
         fs::write(&source_path, b"local provider installed by init").unwrap();
         let config = provider_config(&format!("file://{}", source_path.display()), None);
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         resolve_all(
             &user_dirs,
             &install_lock,
@@ -25646,7 +26214,11 @@ future_protection_field = "retain-me"
         let replacement = project.path().join("rebuilt-local-provider.wasm");
         fs::write(&replacement, b"different rebuilt provider bytes").unwrap();
         fs::rename(replacement, &source_path).unwrap();
-        let installed = find_installed_provider(project.path(), &config).unwrap();
+        let installed = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &config,
+        )
+        .unwrap();
         let grants =
             TrustedLocalGrants::parse(&[format!("{}=aws", source_path.display())], None).unwrap();
         let mut notices = Vec::new();
@@ -25676,7 +26248,11 @@ future_protection_field = "retain-me"
         let retained_bytes = b"local provider retained at lookup";
         fs::write(&source_path, retained_bytes).unwrap();
         let config = provider_config(&format!("file://{}", source_path.display()), None);
-        let installed = find_file_provider_source(project.path(), &config).unwrap();
+        let installed = find_file_provider_source(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &config,
+        )
+        .unwrap();
         fs::write(&source_path, b"different bytes after lookup").unwrap();
 
         let artifact = installed
@@ -25697,6 +26273,218 @@ future_protection_field = "retain-me"
         TrustedLocalGrants::parse(&[], None).unwrap()
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn init_egress_read_keeps_waiting_install_directory_pin() {
+        for remote in [false, true] {
+            for populated_replacement in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let project = temp.path().join("project");
+                let original = temp.path().join("original");
+                let replacement = temp.path().join("replacement");
+                for directory in [&project, &original, &replacement] {
+                    fs::create_dir(directory).unwrap();
+                }
+                let alias = project.join(".carina");
+                std::os::unix::fs::symlink(&original, &alias).unwrap();
+                let root = ResolvedPath::new(&project).unwrap();
+                let first = ProviderInstallLock::acquire(&root).unwrap();
+                let changed_alias = alias.clone();
+                let changed_target = replacement.clone();
+                ProviderInstallLock::on_blocking_acquire_for_test(move || {
+                    fs::remove_file(&changed_alias).unwrap();
+                    std::os::unix::fs::symlink(&changed_target, &changed_alias).unwrap();
+                    drop(first);
+                });
+                let guard = ProviderInstallLock::acquire(&root).unwrap();
+                // This lock protects the replacement throughout the old pin's read.
+                let other_guard = ProviderInstallLock::acquire(&root).unwrap();
+                let bytes = b"provider installed through original directory pin";
+                let source_file = project.join("source.wasm");
+                fs::write(&source_file, bytes).unwrap();
+                let config = if remote {
+                    provider_config("github.com/carina-rs/carina-provider-awscc", None)
+                } else {
+                    provider_config(&format!("file://{}", source_file.display()), None)
+                };
+                let source = config.source.as_ref().unwrap();
+                let mut lock = LockFile::default();
+                let artifact = if let ProviderSource::Remote(remote_source) = source {
+                    let version = "0.1.0";
+                    lock.upsert(LockEntry {
+                        name: config.name.clone(),
+                        source: remote_source.source_key().to_string(),
+                        kind: LockEntryKind::GithubRelease {
+                            version: Version::parse(version).unwrap(),
+                            tag: ReleaseTag::from_lock(format!("v{version}")),
+                            asset_id: release_asset_id(42),
+                            constraint: None,
+                        },
+                        sha256: sha256_bytes(bytes),
+                        registry: None,
+                    });
+                    cache_path_wasm(&root, &remote_source.source_key(), version)
+                } else {
+                    let source = WasmArtifactPath::new(source_file.clone(), &config.name).unwrap();
+                    file_provider_cache_path(&root, &source, &config.name).unwrap()
+                };
+                install_project_artifact_atomically(
+                    &guard,
+                    &root.join("source.wasm").unwrap(),
+                    &artifact,
+                )
+                .unwrap();
+                if populated_replacement {
+                    let replacement_artifact = other_guard.project_artifact(&artifact).unwrap();
+                    replacement_artifact
+                        .parent()
+                        .unwrap()
+                        .create_dir_all()
+                        .unwrap();
+                    replacement_artifact
+                        .atomic_replace(b"unprotected replacement provider")
+                        .unwrap();
+                }
+
+                let installed =
+                    installed_provider_from_resolved(&guard, &config, source, &artifact, &lock)
+                        .unwrap();
+
+                assert_eq!(
+                    installed.artifact_bytes().as_bytes(),
+                    bytes,
+                    "init must inspect the artifact protected by its install guard"
+                );
+                assert_eq!(installed.path(), &artifact);
+            }
+        }
+    }
+
+    // macOS APFS rejects non-UTF-8 names.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_provider_install_preserves_non_utf8_project_directory() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"project-\xff".to_vec()));
+        fs::create_dir(&project_dir).unwrap();
+        let bytes = wasm_encoder::Component::new().finish();
+        fs::write(temp.path().join("local.wasm"), &bytes).unwrap();
+        let project = ResolvedPath::new(&project_dir).unwrap();
+        let guard = ProviderInstallLock::acquire(&project).unwrap();
+        let mut lock = LockFile::default();
+        let source_path = temp.path().join("local.wasm");
+        let file_path = source_path.to_str().unwrap();
+
+        let installed = resolve_file_provider(
+            &guard,
+            "local",
+            &format!("file://{file_path}"),
+            file_path,
+            &mut lock,
+        )
+        .expect("init must install inside a project with non-UTF-8 path bytes");
+
+        assert_eq!(
+            installed.as_path(),
+            project_dir.join(".carina/providers/file/local/local.wasm")
+        );
+        assert_eq!(
+            guard.project_artifact(&installed).unwrap().read().unwrap(),
+            bytes
+        );
+        assert_eq!(fs::read(installed.as_path()).unwrap(), bytes);
+        assert_eq!(lock.provider.len(), 1);
+        assert_eq!(lock.provider[0].name, "local");
+        assert_eq!(lock.provider[0].sha256, sha256_bytes(&bytes));
+    }
+
+    // macOS APFS rejects non-UTF-8 names.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_provider_cache_preserves_non_utf8_project_directory() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"project-\xff".to_vec()));
+        fs::create_dir(&project_dir).unwrap();
+        let project = ResolvedPath::new(&project_dir).unwrap();
+        let source = source_key("github.com/example/provider-widget");
+
+        let cache = cache_path_wasm(&project, &source, "1.0.0");
+
+        assert_eq!(
+            cache.as_path(),
+            project_dir.join(
+                ".carina/providers/github.com/example/provider-widget/1.0.0/provider-widget.wasm"
+            )
+        );
+        let revision = crate::revision_resolver::cache_path_revision(
+            &project,
+            &github_source("github.com/example/provider-widget"),
+            &commit_sha("abc123def456789012345678901234567890abcd"),
+        );
+        assert_eq!(
+            revision.as_path(),
+            project_dir.join(".carina/providers/github.com/example/provider-widget/rev-abc123def456/provider-widget.wasm")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pinned_provider_lookup_and_egress_ignore_symlink_retarget() {
+        let user_dirs = carina_core::TestUserDirs::new();
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original");
+        let replacement = temp.path().join("replacement");
+        let alias = temp.path().join("alias");
+        fs::create_dir(&original).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        let source = alias.join("provider.wasm");
+        fs::write(&source, b"original provider").unwrap();
+        let config = provider_config(&format!("file://{}", source.display()), None);
+        let wasm = WasmArtifactPath::new(source.clone(), &config.name).unwrap();
+        let cached = file_provider_cache_path(
+            &carina_core::paths::ResolvedPath::new(&alias).unwrap(),
+            &wasm,
+            &config.name,
+        )
+        .unwrap();
+        fs::create_dir_all(cached.as_path().parent().unwrap()).unwrap();
+        fs::write(cached.as_path(), b"original provider").unwrap();
+        let grants =
+            TrustedLocalGrants::parse(&[format!("{}=aws", source.display())], None).unwrap();
+        let pinned = ResolvedPath::new(&alias).unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+        fs::write(
+            alias.join("carina-providers.lock"),
+            b"invalid replacement lock",
+        )
+        .unwrap();
+        fs::write(&source, b"replacement provider").unwrap();
+
+        assert!(LockFile::load(&pinned).unwrap().is_none());
+        validate_lock_constraints(&pinned, std::slice::from_ref(&config)).unwrap();
+        let installed = find_installed_provider(&pinned, &config).unwrap();
+        let load = installed
+            .load_with(&user_dirs, &grants, |verified| async {
+                Ok::<_, std::convert::Infallible>(verified)
+            })
+            .await
+            .unwrap();
+        assert_eq!(load.bytes().as_bytes(), b"original provider");
+        assert_eq!(load.identity().trust().class(), ProviderTrustClass::Aws);
+        assert!(load_locked_egress(&pinned, &load).unwrap().is_none());
+        assert!(installed.path().as_path().starts_with(&alias));
+    }
+
     #[tokio::test]
     async fn load_with_binds_identity_to_retained_artifact_bytes() {
         let user_dirs = carina_core::TestUserDirs::new();
@@ -25705,7 +26493,11 @@ future_protection_field = "retain-me"
         let artifact_bytes = b"resolver-owned local provider";
         fs::write(&source_path, artifact_bytes).unwrap();
         let config = provider_config(&format!("file://{}", source_path.display()), None);
-        let installed = find_file_provider_source(project.path(), &config).unwrap();
+        let installed = find_file_provider_source(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &config,
+        )
+        .unwrap();
         let grants =
             TrustedLocalGrants::parse(&[format!("{}=aws", source_path.display())], None).unwrap();
 
@@ -25726,14 +26518,18 @@ future_protection_field = "retain-me"
     }
 
     #[tokio::test]
-    async fn file_provider_without_grant_is_untrusted_and_has_canonical_local_source() {
+    async fn file_provider_without_grant_is_untrusted_and_preserves_local_source_path() {
         let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
         let source_path = project.path().join("local-provider.wasm");
         fs::write(&source_path, b"local provider").unwrap();
-        let canonical_source_path = fs::canonicalize(&source_path).unwrap();
+        let expected_source_path = carina_core::paths::PersistedPath::new(&source_path).unwrap();
         let config = provider_config(&format!("file://{}", source_path.display()), None);
-        let installed = find_file_provider_source(project.path(), &config).unwrap();
+        let installed = find_file_provider_source(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &config,
+        )
+        .unwrap();
 
         let (class, source) = installed
             .load_with(&user_dirs, &no_local_grants(), |verified| async move {
@@ -25748,9 +26544,9 @@ future_protection_field = "retain-me"
         assert_eq!(class, ProviderTrustClass::Untrusted);
         assert!(matches!(
             source,
-            crate::ProviderLoadSource::LocalFile { path, canonical_source }
-                if path == canonical_source_path
-                    && canonical_source == Path::new("local-provider.wasm")
+            crate::ProviderLoadSource::LocalFile { path, source, .. }
+                if path == expected_source_path
+                    && source == carina_core::paths::DisplayPath::new("local-provider.wasm").unwrap()
         ));
     }
 
@@ -25760,7 +26556,10 @@ future_protection_field = "retain-me"
         assert!(!missing_source.exists());
         let cached_source = tempfile::NamedTempFile::new().unwrap();
         fs::write(cached_source.path(), b"resolver-owned provider bytes").unwrap();
-        let installed_bytes = ProviderArtifactBytes::read(cached_source.path()).unwrap();
+        let installed_bytes = ProviderArtifactBytes::read(
+            &carina_core::paths::ResolvedPath::new(cached_source.path()).unwrap(),
+        )
+        .unwrap();
         let source = local_file_source(&missing_source);
         let expected = std::path::absolute(source.path()).unwrap();
         let mut notices = Vec::new();
@@ -25768,46 +26567,51 @@ future_protection_field = "retain-me"
         let (trust, notice, label_path) = local_provider_trust(
             &source,
             &installed_bytes,
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
             &no_local_grants(),
             &mut |line| notices.push(line.to_string()),
-        );
+        )
+        .unwrap();
 
         assert_eq!(trust.class(), ProviderTrustClass::Untrusted);
         assert!(notice.is_none());
         assert!(notices.is_empty());
-        assert!(label_path.is_absolute());
-        assert_eq!(label_path, expected);
+        assert!(std::path::Path::new(&label_path.to_string()).is_absolute());
+        assert_eq!(label_path.to_string(), expected.display().to_string());
     }
 
     #[test]
     fn local_source_that_disappears_after_grant_is_untrusted_without_notice() {
         let project = tempfile::tempdir().unwrap();
-        let canonical_project = fs::canonicalize(project.path()).unwrap();
-        let source_path = canonical_project.join("removed-provider.wasm");
-        let cached_path = canonical_project.join("cached-provider.wasm");
+        let display_project = carina_core::paths::DisplayPath::new(project.path()).unwrap();
+        let project_label = PathBuf::from(display_project.to_string());
+        let project_path = project_label.as_path();
+        let source_path = project_path.join("removed-provider.wasm");
+        let cached_path = project_path.join("cached-provider.wasm");
         let bytes = b"resolver-owned provider bytes";
         fs::write(&source_path, bytes).unwrap();
         fs::write(&cached_path, bytes).unwrap();
         let grants =
             TrustedLocalGrants::parse(&[format!("{}=aws", source_path.display())], None).unwrap();
         fs::remove_file(&source_path).unwrap();
-        let installed_bytes = ProviderArtifactBytes::read(&cached_path).unwrap();
+        let installed_bytes =
+            ProviderArtifactBytes::read(&ResolvedPath::new(&cached_path).unwrap()).unwrap();
         let source = local_file_source(&source_path);
         let mut notices = Vec::new();
 
         let (trust, notice, label_path) = local_provider_trust(
             &source,
             &installed_bytes,
-            &canonical_project,
+            &ResolvedPath::new(project_path).unwrap(),
             &grants,
             &mut |line| notices.push(line.to_string()),
-        );
+        )
+        .unwrap();
 
         assert_eq!(trust.class(), ProviderTrustClass::Untrusted);
         assert!(notice.is_none());
         assert!(notices.is_empty());
-        assert_eq!(label_path, source_path);
+        assert_eq!(label_path.to_string(), source_path.display().to_string());
     }
 
     #[tokio::test]
@@ -25817,10 +26621,14 @@ future_protection_field = "retain-me"
         let source_path = project.path().join("local-provider.wasm");
         fs::write(&source_path, b"local provider").unwrap();
         let config = provider_config(&format!("file://{}", source_path.display()), None);
-        let installed = find_file_provider_source(project.path(), &config).unwrap();
+        let installed = find_file_provider_source(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &config,
+        )
+        .unwrap();
         let grants =
             TrustedLocalGrants::parse(&[format!("{}=aws", source_path.display())], None).unwrap();
-        let canonical = fs::canonicalize(&source_path).unwrap();
+        let display = carina_core::paths::DisplayPath::new(&source_path).unwrap();
         let mut emitted = Vec::new();
 
         let class = installed
@@ -25840,7 +26648,7 @@ future_protection_field = "retain-me"
             emitted,
             vec![format!(
                 "carina: trusting local provider {} as aws (--trust-local-provider)",
-                canonical.display()
+                display
             )]
         );
     }
@@ -25857,18 +26665,27 @@ future_protection_field = "retain-me"
         fs::write(&target, b"local provider").unwrap();
         symlink(&target, &link).unwrap();
         let config = provider_config(&format!("file://{}", link.display()), None);
-        let installed = find_file_provider_source(project.path(), &config).unwrap();
+        let installed = find_file_provider_source(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &config,
+        )
+        .unwrap();
         let grants =
             TrustedLocalGrants::parse(&[format!("{}=aws", target.display())], None).unwrap();
 
-        let class = installed
+        let (class, label) = installed
             .load_with(&user_dirs, &grants, |verified| async move {
-                Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+                Ok::<_, std::convert::Infallible>((
+                    verified.identity().trust().class(),
+                    verified.identity().source().to_string(),
+                ))
             })
             .await
             .unwrap();
 
         assert_eq!(class, ProviderTrustClass::Aws);
+        assert!(label.contains(&link.display().to_string()), "{label}");
+        assert!(!label.contains(&target.display().to_string()), "{label}");
     }
 
     #[tokio::test]
@@ -25884,7 +26701,11 @@ future_protection_field = "retain-me"
         let granted_path = granted_root.path().join("aws.wasm");
         fs::write(&granted_path, b"official local provider").unwrap();
         let config = provider_config(&format!("file://./{}", relative_source.display()), None);
-        let installed = find_file_provider_source(relative_root.path(), &config).unwrap();
+        let installed = find_file_provider_source(
+            &carina_core::paths::ResolvedPath::new(relative_root.path()).unwrap(),
+            &config,
+        )
+        .unwrap();
         let grants =
             TrustedLocalGrants::parse(&[format!("{}=aws", granted_path.display())], None).unwrap();
 
@@ -25910,7 +26731,7 @@ future_protection_field = "retain-me"
             WasmArtifactPath::new(cached_path, "awscc").unwrap(),
             "awscc".into(),
             local_file_source(&source_path),
-            project.path(),
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         )
         .unwrap();
         let grants =
@@ -25947,7 +26768,11 @@ future_protection_field = "retain-me"
         fs::write(&source_path, b"local provider").unwrap();
         let mut config = provider_config(&format!("file://{}", source_path.display()), None);
         config.name = "foo".into();
-        let installed = find_file_provider_source(project.path(), &config).unwrap();
+        let installed = find_file_provider_source(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &config,
+        )
+        .unwrap();
         let grants =
             TrustedLocalGrants::parse(&[format!("{}=aws", source_path.display())], None).unwrap();
 
@@ -26002,8 +26827,11 @@ future_protection_field = "retain-me"
         )
         .unwrap();
         lock.save(&provider_lock_path(project.path())).unwrap();
-        let installed =
-            find_installed_provider(project.path(), &provider_config(source, None)).unwrap();
+        let installed = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &provider_config(source, None),
+        )
+        .unwrap();
         let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let called = std::sync::Arc::clone(&loader_called);
 
@@ -26031,7 +26859,11 @@ future_protection_field = "retain-me"
         let source = "github.com/carina-rs/carina-provider-aws";
         let version = "0.1.0";
         let bytes = b"repository-controlled provider";
-        let wasm_path = cache_path_wasm(project.path(), &source_key(source), version);
+        let wasm_path = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source_key(source),
+            version,
+        );
         fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         fs::write(&wasm_path, bytes).unwrap();
         let mut lock = LockFile::default();
@@ -26050,7 +26882,11 @@ future_protection_field = "retain-me"
         lock.save(&provider_lock_path(project.path())).unwrap();
         let mut config = provider_config(source, None);
         config.name = "aws".into();
-        let installed = find_installed_provider(project.path(), &config).unwrap();
+        let installed = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &config,
+        )
+        .unwrap();
         let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let called = std::sync::Arc::clone(&loader_called);
 
@@ -26093,7 +26929,11 @@ future_protection_field = "retain-me"
         let version = "0.1.0";
         let bytes = b"repository-controlled provider";
         let sha256 = sha256_bytes(bytes);
-        let wasm_path = cache_path_wasm(project.path(), &source_key(source), version);
+        let wasm_path = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source_key(source),
+            version,
+        );
         fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         fs::write(&wasm_path, bytes).unwrap();
         record_test_github_origin_download(&user_dirs, &source_key(source), &sha256, None).unwrap();
@@ -26118,7 +26958,11 @@ future_protection_field = "retain-me"
         lock.save(&provider_lock_path(project.path())).unwrap();
         let mut config = provider_config(source, None);
         config.name = "aws".into();
-        let installed = find_installed_provider(project.path(), &config).unwrap();
+        let installed = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &config,
+        )
+        .unwrap();
         let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let called = std::sync::Arc::clone(&loader_called);
 
@@ -26171,7 +27015,11 @@ future_protection_field = "retain-me"
         let source = "github.com/carina-rs/carina-provider-aws";
         let version = "0.1.0";
         let bytes = b"repository-controlled provider";
-        let wasm_path = cache_path_wasm(project.path(), &source_key(source), version);
+        let wasm_path = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source_key(source),
+            version,
+        );
         fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         fs::write(&wasm_path, bytes).unwrap();
         let mut lock = LockFile::default();
@@ -26190,7 +27038,11 @@ future_protection_field = "retain-me"
         lock.save(&provider_lock_path(project.path())).unwrap();
         let mut config = provider_config(source, None);
         config.name = "aws".into();
-        let installed = find_installed_provider(project.path(), &config).unwrap();
+        let installed = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &config,
+        )
+        .unwrap();
         let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let called = std::sync::Arc::clone(&loader_called);
 
@@ -26234,7 +27086,7 @@ future_protection_field = "retain-me"
             CommitSha::new("deadbeefcafe1234567890abcdef1234567890ab".into()).unwrap();
         let bytes = b"verified revision provider";
         let wasm_path = crate::revision_resolver::cache_path_revision(
-            project.path(),
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &github_source(source),
             &resolved_sha,
         );
@@ -26258,7 +27110,11 @@ future_protection_field = "retain-me"
         lock.save(&provider_lock_path(project.path())).unwrap();
         let mut config = provider_config(source, Some(revision));
         config.name = "aws".into();
-        let installed = find_installed_provider(project.path(), &config).unwrap();
+        let installed = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &config,
+        )
+        .unwrap();
         let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let called = std::sync::Arc::clone(&loader_called);
 
@@ -26316,7 +27172,11 @@ future_protection_field = "retain-me"
         lock.save(&provider_lock_path(project.path())).unwrap();
         let mut config = provider_config(source, None);
         config.name = "aws".into();
-        let installed = find_installed_provider(project.path(), &config).unwrap();
+        let installed = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &config,
+        )
+        .unwrap();
         let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let called = std::sync::Arc::clone(&loader_called);
 
@@ -26347,7 +27207,11 @@ future_protection_field = "retain-me"
         let source = "github.com/example/provider-widget";
         let version = "1.2.3";
         let bytes = b"third-party provider";
-        let wasm_path = cache_path_wasm(project.path(), &source_key(source), version);
+        let wasm_path = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source_key(source),
+            version,
+        );
         fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         fs::write(&wasm_path, bytes).unwrap();
         let mut lock = LockFile::default();
@@ -26366,7 +27230,11 @@ future_protection_field = "retain-me"
         lock.save(&provider_lock_path(project.path())).unwrap();
         let mut config = provider_config(source, None);
         config.name = "widget".into();
-        let installed = find_installed_provider(project.path(), &config).unwrap();
+        let installed = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &config,
+        )
+        .unwrap();
 
         let class =
             block_on(
@@ -26399,8 +27267,11 @@ future_protection_field = "retain-me"
         fs::create_dir_all(native_path.parent().unwrap()).unwrap();
         fs::write(&native_path, b"stale native provider").unwrap();
 
-        let error = find_installed_provider(base, &provider_config(source, None))
-            .expect_err("a stale native cache entry must not count as an installed provider");
+        let error = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(base).unwrap(),
+            &provider_config(source, None),
+        )
+        .expect_err("a stale native cache entry must not count as an installed provider");
 
         assert!(error.to_string().contains("artifact is missing"), "{error}");
         assert!(error.to_string().contains("carina init"), "{error}");
@@ -26415,7 +27286,11 @@ future_protection_field = "retain-me"
         lock.upsert(version_entry(source, "0.1.0"));
         lock.save(&provider_lock_path(base)).unwrap();
 
-        let error = find_installed_provider(base, &provider_config(source, None)).unwrap_err();
+        let error = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(base).unwrap(),
+            &provider_config(source, None),
+        )
+        .unwrap_err();
 
         assert!(matches!(
             &error,
@@ -26464,18 +27339,20 @@ sha256 = "{}"
         )
         .unwrap();
         let installed_path = cache_path_wasm(
-            project.path(),
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &source_key(installed_source),
             installed_version,
         );
         fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
         fs::write(&installed_path, bytes).unwrap();
 
-        let installed =
-            find_installed_provider(project.path(), &provider_config(installed_source, None))
-                .expect("an unrelated legacy source must not block this installed provider");
+        let installed = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &provider_config(installed_source, None),
+        )
+        .expect("an unrelated legacy source must not block this installed provider");
 
-        assert_eq!(installed.path().as_path(), installed_path);
+        assert_eq!(installed.path().as_path(), installed_path.as_path());
     }
 
     #[test]
@@ -26486,8 +27363,11 @@ sha256 = "{}"
         lock.upsert(version_entry(source, "0.1.0"));
         lock.save(&provider_lock_path(project.path())).unwrap();
 
-        let error = provider_artifact_fingerprint(project.path(), &provider_config(source, None))
-            .unwrap_err();
+        let error = provider_artifact_fingerprint(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &provider_config(source, None),
+        )
+        .unwrap_err();
 
         assert_eq!(error.source, source);
         assert!(matches!(
@@ -26507,8 +27387,11 @@ sha256 = "{}"
         lock.upsert(version_entry(source, "0.1.0"));
         lock.save(&provider_lock_path(tmp.path())).unwrap();
 
-        let error =
-            validate_lock_constraints(tmp.path(), &[versioned_config(source, "^0.1")]).unwrap_err();
+        let error = validate_lock_constraints(
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            &[versioned_config(source, "^0.1")],
+        )
+        .unwrap_err();
 
         assert!(matches!(
             &error,
@@ -26540,8 +27423,11 @@ sha256 = "{}"
         lock.upsert(revision_entry(source, revision, resolved_sha));
         lock.save(&lock_path).unwrap();
 
-        let error = find_installed_provider(base, &provider_config(source, Some(revision)))
-            .expect_err("the locked revision artifact was deliberately not installed");
+        let error = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(base).unwrap(),
+            &provider_config(source, Some(revision)),
+        )
+        .expect_err("the locked revision artifact was deliberately not installed");
         let rendered = error.to_string();
 
         assert!(
@@ -26611,8 +27497,11 @@ sha256 = "{}"
         });
         lock.save(&lock_path).unwrap();
 
-        let error = find_installed_provider(base, &provider_config(source, None))
-            .expect_err("the locked version artifact was deliberately not installed");
+        let error = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(base).unwrap(),
+            &provider_config(source, None),
+        )
+        .expect_err("the locked version artifact was deliberately not installed");
         let rendered = error.to_string();
 
         assert!(
@@ -26679,7 +27568,11 @@ sha256 = "{}"
         let base = tmp.path();
         let source = "carina-rs/aws";
         let version = "0.0.0-main.10.bbb";
-        let wasm_path = cache_path_wasm(base, &source_key(source), version);
+        let wasm_path = cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(base).unwrap(),
+            &source_key(source),
+            version,
+        );
         fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         fs::write(&wasm_path, b"registry revision wasm").unwrap();
 
@@ -26691,18 +27584,22 @@ sha256 = "{}"
                 revision: "main".into(),
                 version: version.into(),
             },
-            sha256: sha256_file(&wasm_path).unwrap(),
+            sha256: sha256_file(&carina_core::paths::ResolvedPath::new(&wasm_path).unwrap())
+                .unwrap(),
             registry: None,
         });
         lock.save(&base.join("carina-providers.lock")).unwrap();
         let config = provider_config(source, Some("main"));
 
         assert_eq!(
-            find_installed_provider(base, &config)
-                .unwrap()
-                .path()
-                .as_path(),
-            wasm_path
+            find_installed_provider(
+                &carina_core::paths::ResolvedPath::new(base).unwrap(),
+                &config
+            )
+            .unwrap()
+            .path()
+            .as_path(),
+            wasm_path.as_path()
         );
     }
 
@@ -26714,7 +27611,7 @@ sha256 = "{}"
         let revision = "main";
         let resolved_sha = commit_sha(TEST_COMMIT_SHA);
         let wasm_path = crate::revision_resolver::cache_path_revision(
-            base,
+            &carina_core::paths::ResolvedPath::new(base).unwrap(),
             &github_source(source),
             &resolved_sha,
         );
@@ -26723,13 +27620,17 @@ sha256 = "{}"
 
         let mut lock = LockFile::default();
         let mut entry = revision_entry(source, revision, resolved_sha.as_str());
-        entry.sha256 = sha256_file(&wasm_path).unwrap();
+        entry.sha256 =
+            sha256_file(&carina_core::paths::ResolvedPath::new(&wasm_path).unwrap()).unwrap();
         lock.upsert(entry);
         lock.save(&base.join("carina-providers.lock")).unwrap();
 
-        let installed = find_installed_provider(base, &provider_config(source, Some(revision)))
-            .expect("revision provider should resolve");
-        assert_eq!(installed.path().as_path(), wasm_path);
+        let installed = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(base).unwrap(),
+            &provider_config(source, Some(revision)),
+        )
+        .expect("revision provider should resolve");
+        assert_eq!(installed.path().as_path(), wasm_path.as_path());
         let error = installed.with_load_error(io::Error::other(
             "Failed to instantiate WASM component (HTTP)",
         ));
@@ -26759,7 +27660,7 @@ sha256 = "{}"
             WasmArtifactPath::new(provider_path.clone(), "aws").unwrap(),
             "aws".to_string(),
             local_file_source(&provider_path),
-            tmp.path(),
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         )
         .unwrap();
 
@@ -26788,8 +27689,11 @@ sha256 = "{}"
         fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
         fs::write(&installed_path, b"installed local provider wasm").unwrap();
 
-        let installed = find_installed_provider(base, &provider_config(&source, None))
-            .expect("file provider should resolve");
+        let installed = find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(base).unwrap(),
+            &provider_config(&source, None),
+        )
+        .expect("file provider should resolve");
         assert_eq!(installed.path().as_path(), installed_path);
         let rendered = installed
             .with_load_error("Failed to instantiate WASM component (HTTP)")
@@ -26833,7 +27737,7 @@ sha256 = "{sha256}"
 "#
             ),
             Path::new("carina-providers.lock"),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .unwrap()
         .into_lock_file()
@@ -26847,9 +27751,13 @@ sha256 = "{sha256}"
         lock.upsert(github_release_entry(SRC, "0.5.2"));
         let cfg = versioned_config(SRC, "~0.6.0");
 
-        let err =
-            super::check_lock_mismatch(&[cfg], &lock, LockMode::Normal, Path::new("infra/foo"))
-                .expect_err("lock version 0.5.2 does not satisfy ~0.6.0 — must error");
+        let err = super::check_lock_mismatch(
+            &[cfg],
+            &lock,
+            LockMode::Normal,
+            &carina_core::paths::ResolvedPath::new(Path::new("infra/foo")).unwrap(),
+        )
+        .expect_err("lock version 0.5.2 does not satisfy ~0.6.0 — must error");
         assert!(err.to_string().contains("awscc"), "{err}");
         assert!(err.to_string().contains("0.5.2"), "{err}");
         assert!(err.to_string().contains("~0.6.0"), "{err}");
@@ -27045,7 +27953,10 @@ sha256 = "{sha256}"
         let mut lock = LockFile::default();
         lock.upsert(version_entry(SRC, "0.5.2"));
         lock.save(&provider_lock_path(project.path())).unwrap();
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
 
         let error = resolve_all(
             &user_dirs,
@@ -27135,7 +28046,9 @@ sha256 = "{sha256}"
         // .crn now wants a version — should error, not fall through to a
         // network fetch, and not rewrite the lock.
         let providers = vec![versioned_config(SRC, "~0.5.0")];
-        let install_lock = ProviderInstallLock::acquire(base).unwrap();
+        let install_lock =
+            ProviderInstallLock::acquire(&carina_core::paths::ResolvedPath::new(base).unwrap())
+                .unwrap();
         let err = resolve_all(&user_dirs, &install_lock, &providers, LockMode::Normal)
             .expect_err("mismatched lock must abort resolve_all");
         assert!(err.to_string().contains("--upgrade"), "{err}");

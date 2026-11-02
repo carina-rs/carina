@@ -2,11 +2,14 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use carina_core::module_resolver::{self, LoadedModule};
+use carina_core::paths::{CanonicalPath, DisplayPath, ResolvedPath};
 
 /// One successfully loaded module in the shared depth-first module walk.
 pub(crate) struct LoadedModuleAtPath {
+    // Retain the import chain for provenance; render diagnostic_label() for users.
     diagnostic_path: PathBuf,
-    module_path: PathBuf,
+    diagnostic_base: ResolvedPath,
+    module_path: ResolvedPath,
     loaded: LoadedModule,
 }
 
@@ -15,7 +18,11 @@ impl LoadedModuleAtPath {
         &self.diagnostic_path
     }
 
-    pub(crate) fn module_path(&self) -> &Path {
+    pub(crate) fn diagnostic_label(&self) -> DisplayPath {
+        DisplayPath::for_diagnostics_from(self.diagnostic_path(), &self.diagnostic_base)
+    }
+
+    pub(crate) fn module_path(&self) -> &ResolvedPath {
         &self.module_path
     }
 
@@ -38,16 +45,21 @@ pub(crate) struct ModuleWalk {
 impl ModuleWalk {
     pub(crate) fn load<E>(
         parsed: &carina_core::parser::File<E>,
-        base_dir: &Path,
+        base_dir: &ResolvedPath,
         environment: &carina_core::EnvironmentSnapshot,
     ) -> Self {
         let context = carina_core::parser::ProviderContext::new(environment.clone());
         let mut walk = Self::default();
+        let base_dir = base_dir.clone();
         let mut visited = HashSet::new();
         for import in &parsed.uses {
+            let Ok(module_path) = base_dir.join(&import.path) else {
+                continue;
+            };
             visit_module(
-                &base_dir.join(&import.path),
+                &module_path,
                 Path::new(&import.path),
+                &base_dir,
                 &mut visited,
                 &mut walk.modules,
                 &context,
@@ -61,40 +73,36 @@ impl ModuleWalk {
     }
 }
 
-fn canonical_guard_path(module_path: &Path) -> PathBuf {
-    std::fs::canonicalize(module_path).unwrap_or_else(|_| module_path.to_path_buf())
-}
-
 fn visit_module(
-    module_path: &Path,
+    module_path: &ResolvedPath,
     diagnostic_path: &Path,
-    visited: &mut HashSet<PathBuf>,
+    diagnostic_base: &ResolvedPath,
+    visited: &mut HashSet<CanonicalPath>,
     modules: &mut Vec<LoadedModuleAtPath>,
     context: &carina_core::parser::ProviderContext,
 ) {
-    let guard_path = canonical_guard_path(module_path);
-    if !visited.insert(guard_path.clone()) {
+    if !visited.insert(module_path.identity()) {
         return;
     }
 
-    let Some(loaded) = module_resolver::load_module_with_diagnostics(&guard_path, context) else {
+    let Some(loaded) = module_resolver::load_module_with_diagnostics(module_path, context) else {
         return;
     };
-    let diagnostic_path = carina_core::utils::normalize_source_path(diagnostic_path);
     let child_paths: Vec<_> = loaded
         .parsed
         .uses
         .iter()
-        .map(|import| {
-            (
-                guard_path.join(&import.path),
+        .filter_map(|import| {
+            Some((
+                module_path.join(&import.path).ok()?,
                 diagnostic_path.join(&import.path),
-            )
+            ))
         })
         .collect();
     modules.push(LoadedModuleAtPath {
-        diagnostic_path,
-        module_path: guard_path,
+        diagnostic_path: diagnostic_path.to_path_buf(),
+        diagnostic_base: diagnostic_base.clone(),
+        module_path: module_path.clone(),
         loaded,
     });
 
@@ -102,9 +110,64 @@ fn visit_module(
         visit_module(
             &child_module_path,
             &child_diagnostic_path,
+            diagnostic_base,
             visited,
             modules,
             context,
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_walk_preserves_symlink_parent_diagnostic_spelling() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let private = temp.path().join("private");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(private.join("nested")).unwrap();
+        std::fs::create_dir_all(private.join("bad/child")).unwrap();
+        std::os::unix::fs::symlink(private.join("nested"), project.join("jump")).unwrap();
+        std::fs::write(
+            private.join("bad/main.crn"),
+            "arguments { value: String }\nlet child = use { source = './child' }\nchild { value = value }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            private.join("bad/child/main.crn"),
+            "arguments { value: String }\n",
+        )
+        .unwrap();
+        let context =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let parsed = carina_core::parser::parse_file(
+            "let bad = use { source = './jump/../bad' }\nbad { value = 'hello' }\n",
+            &project.join("main.crn"),
+            &context,
+        )
+        .unwrap();
+        let walk = ModuleWalk::load(
+            &parsed,
+            &ResolvedPath::new(&project).unwrap(),
+            &carina_core::EnvironmentSnapshot::empty(),
+        );
+        assert_eq!(
+            walk.iter()
+                .map(|module| module.diagnostic_path())
+                .collect::<Vec<_>>(),
+            vec![
+                Path::new("./jump/../bad"),
+                Path::new("./jump/../bad/./child")
+            ]
+        );
+        assert_eq!(
+            walk.iter()
+                .map(|module| module.diagnostic_label().to_string())
+                .collect::<Vec<_>>(),
+            vec!["jump/../bad", "jump/../bad/child"]
         );
     }
 }

@@ -1,5 +1,6 @@
 use super::TestCommandRuntime;
 use crate::commands::{apply, destroy, plan, state};
+use carina_core::paths::ResolvedPath;
 use carina_core::{parser::ProviderContext, shutdown::ShutdownToken};
 use carina_provider_mock::{MockBehavior, MockObservations, MockScope};
 use carina_state::{ResourceState, StateFile};
@@ -50,7 +51,7 @@ impl Fixture {
         };
         fixture.config(false);
         crate::commands::ensure_backend_lock(
-            fixture.dir.path(),
+            &ResolvedPath::new(fixture.dir.path()).unwrap(),
             None::<&carina_core::parser::ExpandedBackendConfig>,
         )
         .unwrap();
@@ -97,6 +98,7 @@ impl Fixture {
     async fn apply(&self) -> Result<(), crate::error::AppError> {
         apply::run_apply(
             &self.runtime,
+            &ResolvedPath::new(self.dir.path()).unwrap(),
             self.dir.path(),
             true,
             true,
@@ -272,6 +274,7 @@ async fn removed_no_refresh_saved_plan_apply() {
     Fixture::assert_read_error(
         apply::run_apply_from_plan(
             &f.runtime,
+            &ResolvedPath::new(&unclaimed_path).unwrap(),
             &unclaimed_path,
             true,
             true,
@@ -290,6 +293,7 @@ async fn removed_no_refresh_saved_plan_apply() {
     f.config(false);
     apply::run_apply_from_plan(
         &f.runtime,
+        &ResolvedPath::new(&out).unwrap(),
         &out,
         true,
         true,

@@ -1459,13 +1459,19 @@ impl DiagnosticRun<'_> {
     fn module_call_findings_for_resolution(
         &self,
         parsed: &ParsedFile,
-        base_path: &std::path::Path,
+        base_path: &carina_core::paths::ResolvedPath,
     ) -> Vec<carina_core::validation::ModuleCallFinding> {
-        let signatures = carina_core::module_resolver::load_resolved_module_signatures(
-            parsed,
-            base_path,
-            self.provider_context.catalog(),
-        );
+        let pinned_base = Some(base_path.clone());
+        let signatures = pinned_base
+            .as_ref()
+            .map(|base| {
+                carina_core::module_resolver::load_resolved_module_signatures(
+                    parsed,
+                    base,
+                    self.provider_context.catalog(),
+                )
+            })
+            .unwrap_or_default();
         let validation_context = carina_core::validation::ValidationTypeContext::in_session(
             parsed,
             &self.schemas,
@@ -1485,7 +1491,7 @@ impl DiagnosticRun<'_> {
         carina_core::validation::check_module_calls(carina_core::validation::ModuleCallCheckInput {
             authored: parsed,
             semantic: Some(parsed),
-            base_dir: Some(base_path),
+            base_dir: pinned_base.as_ref(),
             imported_signatures: &signatures,
             provider_context: self.provider_context,
             schemas: &self.schemas,
@@ -1510,7 +1516,7 @@ impl DiagnosticRun<'_> {
         &self,
         doc: &Document,
         current_file_name: Option<&str>,
-        base_path: &std::path::Path,
+        base_path: &carina_core::paths::ResolvedPath,
     ) -> Result<MergedParseResult, carina_core::config_loader::DirectoryParseFailure> {
         let mut overrides: HashMap<String, String> = HashMap::new();
         if let Some(name) = current_file_name {
@@ -1565,7 +1571,7 @@ impl DiagnosticRun<'_> {
         doc: &Document,
         parsed: &ParsedFile,
         residual: &carina_core::module_resolver::ResidualModuleResolutionError,
-        base_path: &std::path::Path,
+        base_path: &carina_core::paths::ResolvedPath,
         current_source: Option<&std::path::Path>,
     ) -> Vec<Diagnostic> {
         let Some(current_source) = current_source else {
@@ -1576,7 +1582,7 @@ impl DiagnosticRun<'_> {
         let Some(residual_diagnostic) = residual.diagnostic() else {
             return Vec::new();
         };
-        let relative_message = residual.display_relative_to(base_path);
+        let relative_message = residual.display_relative_to(&base_path.source_label());
         if matches!(
             call_source,
             carina_core::module_resolver::ModuleErrorCallSource::Unavailable
@@ -1588,7 +1594,7 @@ impl DiagnosticRun<'_> {
             let error_source = if error_source.is_absolute() {
                 error_source.to_path_buf()
             } else {
-                base_path.join(error_source)
+                base_path.source_label().join(error_source)
             };
             if current_source == error_source.as_path() {
                 let mut diagnostic = parse_error_to_diagnostic(error);
@@ -1656,7 +1662,7 @@ impl DiagnosticRun<'_> {
             let error_source = if error_source.is_absolute() {
                 error_source.to_path_buf()
             } else {
-                base_path.join(error_source)
+                base_path.source_label().join(error_source)
             };
             if current_source == error_source.as_path() {
                 let line = (line as u32).saturating_sub(1);
@@ -1685,7 +1691,7 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_mixed_tag_key_styles(
         &self,
         current_file_name: &str,
-        base_path: &std::path::Path,
+        base_path: &carina_core::paths::ResolvedPath,
         merged_result: &DirectoryParseResult,
     ) -> Vec<Diagnostic> {
         // Reuse the exact root sources that fed the merged parse. The shared
@@ -1696,7 +1702,7 @@ impl DiagnosticRun<'_> {
             base_path,
         );
 
-        let current_path = base_path.join(current_file_name);
+        let current_path = base_path.source_label().join(current_file_name);
         carina_core::lint::find_mixed_tag_key_styles(&tag_keys)
             .into_iter()
             .filter(|warning| warning.file.as_deref() == Some(current_path.as_path()))
@@ -1870,7 +1876,7 @@ impl DiagnosticRun<'_> {
         &self,
         doc: &Document,
         current_file_name: Option<&str>,
-        base_path: &std::path::Path,
+        base_path: &carina_core::paths::ResolvedPath,
     ) -> Option<carina_core::parser::ParseError> {
         let mut overrides: HashMap<String, String> = HashMap::new();
         if let Some(name) = current_file_name {
@@ -1947,24 +1953,26 @@ impl DiagnosticRun<'_> {
         &self,
         buffer_text: &str,
         current_file_name: Option<&str>,
-        base_path: &std::path::Path,
+        base_path: &carina_core::paths::ResolvedPath,
     ) -> HashSet<String> {
         let mut out: HashSet<String> = HashSet::new();
         let Ok(files) = carina_core::config_loader::find_crn_files_in_dir(base_path) else {
             return out;
         };
         for file in files {
-            let file_name = file.file_name().and_then(|n| n.to_str());
+            let file_name = file.display().file_name().and_then(|n| n.to_str());
             let content = match (file_name, current_file_name) {
                 (Some(name), Some(current)) if name == current => buffer_text.to_string(),
-                _ => match std::fs::read_to_string(&file) {
+                _ => match file.read_to_string() {
                     Ok(text) => text,
                     Err(_) => continue,
                 },
             };
-            let Ok(parsed) =
-                carina_core::parser::parse_file(&content, &file, self.provider_context.catalog())
-            else {
+            let Ok(parsed) = carina_core::parser::parse_file(
+                &content,
+                &file.source_label(),
+                self.provider_context.catalog(),
+            ) else {
                 continue;
             };
             out.extend(
@@ -2207,13 +2215,16 @@ impl DiagnosticRun<'_> {
         &self,
         doc: &Document,
         parsed: &ParsedFile,
-        base_path: &std::path::Path,
+        base_path: &carina_core::paths::ResolvedPath,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
         let text = doc.text();
 
         for us in &parsed.upstream_states {
-            if base_path.join(&us.source).is_dir() {
+            if base_path
+                .join(&us.source)
+                .is_ok_and(|source| source.is_dir())
+            {
                 continue;
             }
             let source_str = us.source.to_string_lossy();

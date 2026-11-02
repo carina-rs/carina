@@ -74,7 +74,9 @@ fn plan_path_argument_reads_local_state_from_config_dir_when_cwd_differs() {
     )
     .unwrap();
     fs::write(project.join("state.json"), state_json()).unwrap();
-    local_backend_lock("state.json").save(&project).unwrap();
+    local_backend_lock("state.json")
+        .save(&carina_core::paths::ResolvedPath::new(&project).unwrap())
+        .unwrap();
 
     let output = plain_text_command(env!("CARGO_BIN_EXE_carina"))
         .current_dir(&foreign_cwd)

@@ -1439,7 +1439,7 @@ mod tests {
         )
         .expect("write deferred loop fixture");
         let parsed = carina_core::config_loader::parse_directory(
-            fixture.path(),
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .expect("parse deferred loop fixture");
@@ -1448,7 +1448,7 @@ mod tests {
             |session| {
                 carina_core::module_resolver::resolve_modules_providerless(
                     parsed,
-                    fixture.path(),
+                    &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
                     session,
                 )
                 .expect("cross the deferred-body resolution seam")

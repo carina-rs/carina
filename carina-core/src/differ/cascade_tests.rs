@@ -836,15 +836,19 @@ fn binding_identity_collision_fixture() -> BindingIdentityCollisionFixture {
     let mut directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     directory.push("tests/fixtures/dependency_key_collision");
     let parsed = crate::config_loader::parse_directory(
-        &directory,
+        &crate::paths::ResolvedPath::new(&directory).unwrap(),
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("multi-file collision fixture parses");
     let parsed = crate::validation::deferred_types::with_session_for_test(
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
-            crate::module_resolver::resolve_modules_providerless(parsed, &directory, session)
-                .expect("multi-file collision fixture crosses root expansion")
+            crate::module_resolver::resolve_modules_providerless(
+                parsed,
+                &crate::paths::ResolvedPath::new(&directory).unwrap(),
+                session,
+            )
+            .expect("multi-file collision fixture crosses root expansion")
         },
     )
     .into_expanded(

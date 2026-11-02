@@ -3,8 +3,10 @@
 //! Modules are directory-scoped: every helper here treats a module as a
 //! directory containing one or more `.crn` files, never as a single file.
 
+use crate::paths::ResolvedPath;
+#[cfg(test)]
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::parser::{ParsedFile, ProviderContext};
 
@@ -18,9 +20,13 @@ pub struct LoadedModule {
 }
 
 /// Get parsed file info for display (supports both module definitions and root configs)
-pub fn get_parsed_file(path: &Path, config: &ProviderContext) -> Result<ParsedFile, ModuleError> {
-    let content = fs::read_to_string(path)?;
-    let parsed = crate::parser::parse_file(&content, path, config)?;
+pub fn get_parsed_file(
+    path: &ResolvedPath,
+    config: &ProviderContext,
+) -> Result<ParsedFile, ModuleError> {
+    let path = path.clone();
+    let content = path.read_to_string()?;
+    let parsed = crate::parser::parse_file(&content, &path.source_label(), config)?;
     Ok(parsed)
 }
 
@@ -31,7 +37,7 @@ pub fn get_parsed_file(path: &Path, config: &ProviderContext) -> Result<ParsedFi
 ///
 /// Returns `None` if `path` is not a directory, cannot be read/parsed, or
 /// contains no module definitions (no inputs or outputs).
-pub fn load_module(path: &Path, config: &ProviderContext) -> Option<ParsedFile> {
+pub fn load_module(path: &ResolvedPath, config: &ProviderContext) -> Option<ParsedFile> {
     load_module_with_diagnostics(path, config).map(|loaded| loaded.parsed)
 }
 
@@ -42,16 +48,23 @@ pub fn load_module(path: &Path, config: &ProviderContext) -> Option<ParsedFile> 
 /// consumers that already own an enriched provider context must therefore use
 /// that context while parsing, or a valid bare handle in `depends_on` can be
 /// rejected before the signature is available to diagnose its call site.
-pub(crate) fn load_module_with_config(path: &Path, config: &ProviderContext) -> Option<ParsedFile> {
+pub(crate) fn load_module_with_config(
+    path: &ResolvedPath,
+    config: &ProviderContext,
+) -> Option<ParsedFile> {
     load_module(path, config)
 }
 
 /// Diagnostic-preserving variant of [`load_module`].
-pub fn load_module_with_diagnostics(path: &Path, config: &ProviderContext) -> Option<LoadedModule> {
+pub fn load_module_with_diagnostics(
+    path: &ResolvedPath,
+    config: &ProviderContext,
+) -> Option<LoadedModule> {
+    let path = path.clone();
     if !path.is_dir() {
         return None;
     }
-    load_directory_module_with_diagnostics_and_config(path, config)
+    load_directory_module_with_diagnostics_and_config(&path, config)
 }
 
 /// Collect `.crn` file paths directly inside `dir_path`, sorted by path.
@@ -60,14 +73,8 @@ pub fn load_module_with_diagnostics(path: &Path, config: &ProviderContext) -> Op
 /// and downstream consumers (LSP first-match-wins lookups, CLI diagnostic
 /// ordering) must not depend on filesystem iteration order, which varies
 /// across ext4/APFS/tmpfs.
-pub(super) fn sorted_crn_paths_in(dir_path: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut crn_files: Vec<PathBuf> = fs::read_dir(dir_path)?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "crn"))
-        .collect();
-    crn_files.sort();
-    Ok(crn_files)
+pub(super) fn sorted_crn_paths_in(dir_path: &ResolvedPath) -> std::io::Result<Vec<ResolvedPath>> {
+    dir_path.crn_files()
 }
 
 /// Load all `.crn` files from a directory and merge them into a single `ParsedFile`.
@@ -78,24 +85,27 @@ pub(super) fn sorted_crn_paths_in(dir_path: &Path) -> std::io::Result<Vec<PathBu
 /// Routed through [`crate::config_loader::parse_directory_files`] so
 /// every file's `ParseContext` is seeded with the binding-name union
 /// from sibling `.crn` files (#2817).
-pub fn load_directory_module(dir_path: &Path, config: &ProviderContext) -> Option<ParsedFile> {
+pub fn load_directory_module(
+    dir_path: &ResolvedPath,
+    config: &ProviderContext,
+) -> Option<ParsedFile> {
     load_directory_module_with_diagnostics_and_config(dir_path, config).map(|loaded| loaded.parsed)
 }
 
 fn load_directory_module_with_diagnostics_and_config(
-    dir_path: &Path,
+    dir_path: &ResolvedPath,
     config: &ProviderContext,
 ) -> Option<LoadedModule> {
     let paths = sorted_crn_paths_in(dir_path).ok()?;
     let mut files: Vec<(PathBuf, String)> = Vec::with_capacity(paths.len());
     for path in paths {
-        if let Ok(content) = fs::read_to_string(&path) {
-            files.push((path, content));
+        if let Ok(content) = path.read_to_string() {
+            files.push((path.source_label(), content));
         }
     }
     let parsed_files = crate::config_loader::parse_directory_files(&files, config).ok()?;
     let duplicate_declarations =
-        crate::config_loader::find_duplicate_declarations(dir_path, &parsed_files);
+        crate::config_loader::find_duplicate_declarations(&dir_path.source_label(), &parsed_files);
 
     let mut merged = ParsedFile::default();
     for (_, parsed) in parsed_files {
@@ -119,23 +129,24 @@ fn load_directory_module_with_diagnostics_and_config(
 /// - `modules/web_tier/main.crn` → `web_tier` (directory-based)
 /// - `modules/web_tier.crn` → `web_tier` (file-based)
 /// - `web_tier.crn` → `web_tier`
-pub fn derive_module_name(path: &Path) -> String {
+pub fn derive_module_name(path: &ResolvedPath) -> String {
+    let label = path.source_label();
     if path.is_dir() {
-        return path
+        return label
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown")
             .to_string();
     }
 
-    let file_stem = path
+    let file_stem = label
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown");
 
     // If file is named main.crn, use the parent directory name
     if file_stem == "main"
-        && let Some(parent) = path.parent()
+        && let Some(parent) = label.parent()
         && let Some(parent_name) = parent.file_name()
         && let Some(name) = parent_name.to_str()
     {
@@ -153,17 +164,19 @@ pub fn derive_module_name(path: &Path) -> String {
 /// Routed through [`crate::config_loader::parse_directory_files`] for
 /// directory-aware parse (#2817).
 pub fn load_module_from_directory(
-    dir: &Path,
+    dir: &ResolvedPath,
     config: &ProviderContext,
 ) -> Result<ParsedFile, String> {
-    let paths = sorted_crn_paths_in(dir)
+    let dir = dir.clone();
+    let paths = sorted_crn_paths_in(&dir)
         .map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?;
 
     let mut files: Vec<(PathBuf, String)> = Vec::with_capacity(paths.len());
     for path in paths {
-        let content = fs::read_to_string(&path)
+        let content = path
+            .read_to_string()
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        files.push((path, content));
+        files.push((path.source_label(), content));
     }
 
     let parsed_files = crate::config_loader::parse_directory_files(&files, config)
@@ -188,7 +201,7 @@ mod tests {
         fs::write(tmp.path().join("broken.crn"), "let =\n").unwrap();
 
         let error = load_module_from_directory(
-            tmp.path(),
+            &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect_err("invalid module syntax must fail to load");
@@ -223,7 +236,7 @@ mod tests {
         .unwrap();
 
         let parsed = load_module(
-            dir,
+            &crate::paths::ResolvedPath::new(dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("module should load when arguments are declared");
@@ -246,7 +259,7 @@ mod tests {
         fs::write(dir.join("m_middle.crn"), "arguments {\n  b: String\n}\n").unwrap();
 
         let parsed = load_module(
-            dir,
+            &crate::paths::ResolvedPath::new(dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("module should load");
@@ -271,7 +284,7 @@ mod tests {
         .unwrap();
 
         let loaded = load_module_with_diagnostics(
-            dir,
+            &crate::paths::ResolvedPath::new(dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("module should load");
@@ -297,7 +310,7 @@ mod tests {
         fs::write(&single, "arguments {\n  x: String\n}\n").unwrap();
         assert!(
             load_module(
-                &single,
+                &crate::paths::ResolvedPath::new(&single).unwrap(),
                 &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
             )
             .is_none()
@@ -313,7 +326,7 @@ mod tests {
         fs::write(dir.join("b.crn"), "arguments {\n  b: String\n}\n").unwrap();
 
         let parsed = load_module_from_directory(
-            dir,
+            &crate::paths::ResolvedPath::new(dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("dir should load");
@@ -325,7 +338,10 @@ mod tests {
         let tmp = tempdir().unwrap();
         let dir = tmp.path().join("web_tier");
         fs::create_dir_all(&dir).unwrap();
-        assert_eq!(derive_module_name(&dir), "web_tier");
+        assert_eq!(
+            derive_module_name(&crate::paths::ResolvedPath::new(&dir).unwrap()),
+            "web_tier"
+        );
     }
 
     #[test]
@@ -335,7 +351,10 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let main = dir.join("main.crn");
         fs::write(&main, "").unwrap();
-        assert_eq!(derive_module_name(&main), "web_tier");
+        assert_eq!(
+            derive_module_name(&crate::paths::ResolvedPath::new(&main).unwrap()),
+            "web_tier"
+        );
     }
 
     #[test]
@@ -343,6 +362,9 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("custom.crn");
         fs::write(&path, "").unwrap();
-        assert_eq!(derive_module_name(&path), "custom");
+        assert_eq!(
+            derive_module_name(&crate::paths::ResolvedPath::new(&path).unwrap()),
+            "custom"
+        );
     }
 }

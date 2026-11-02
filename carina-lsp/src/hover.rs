@@ -25,7 +25,7 @@ type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 /// so unsaved edits are honored.
 fn find_use_import_path(
     doc: &Document,
-    base_path: &Path,
+    base_path: &carina_core::paths::ResolvedPath,
     current_file_name: Option<&str>,
     alias: &str,
 ) -> Option<String> {
@@ -37,15 +37,16 @@ fn find_use_import_path(
     let files = carina_core::config_loader::find_crn_files_in_dir(base_path).ok()?;
     let ctx = doc.provider_context();
     for file in files {
-        let file_name = file.file_name().and_then(|n| n.to_str());
+        let file_name = file.display().file_name().and_then(|n| n.to_str());
         let content = match (file_name, current_file_name) {
             (Some(name), Some(current)) if name == current => doc.text(),
-            _ => match std::fs::read_to_string(&file) {
+            _ => match file.read_to_string() {
                 Ok(text) => text,
                 Err(_) => continue,
             },
         };
-        let Ok(parsed) = carina_core::parser::parse_file(&content, &file, ctx) else {
+        let Ok(parsed) = carina_core::parser::parse_file(&content, &file.source_label(), ctx)
+        else {
             continue;
         };
         if let Some(import) = parsed.uses.iter().find(|imp| imp.alias == alias) {
@@ -205,7 +206,8 @@ impl HoverProvider {
         base_path: Option<&Path>,
         current_file_name: Option<&str>,
     ) -> Option<Hover> {
-        self.hover_in_context(doc, position, base_path, current_file_name)
+        let root = base_path.and_then(|path| carina_core::paths::ResolvedPath::new(path).ok());
+        self.hover_in_context(doc, position, root.as_ref(), current_file_name)
             .map(format_hover_display)
     }
 
@@ -213,7 +215,7 @@ impl HoverProvider {
         &self,
         doc: &Document,
         position: Position,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
         current_file_name: Option<&str>,
     ) -> Option<Hover> {
         let word = doc.word_at(position)?;
@@ -307,13 +309,13 @@ impl HoverProvider {
         &self,
         doc: &Document,
         word: &str,
-        base_path: &Path,
+        base_path: &carina_core::paths::ResolvedPath,
         current_file_name: Option<&str>,
     ) -> Option<Hover> {
         let import_path = find_use_import_path(doc, base_path, current_file_name, word)?;
 
         // Load the module to get its definition
-        let module_path = base_path.join(&import_path);
+        let module_path = base_path.join(&import_path).ok()?;
         let module_parsed =
             carina_core::module_resolver::load_module(&module_path, doc.provider_context())?;
 
@@ -366,14 +368,14 @@ impl HoverProvider {
         &self,
         word: &str,
         module_name: &str,
-        base_path: &Path,
+        base_path: &carina_core::paths::ResolvedPath,
         doc: &Document,
         current_file_name: Option<&str>,
     ) -> Option<Hover> {
         let import_path = find_use_import_path(doc, base_path, current_file_name, module_name)?;
 
         // Load the module to get argument definitions
-        let module_path = base_path.join(&import_path);
+        let module_path = base_path.join(&import_path).ok()?;
         let module_parsed =
             carina_core::module_resolver::load_module(&module_path, doc.provider_context())?;
 

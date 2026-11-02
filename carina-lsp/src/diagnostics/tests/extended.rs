@@ -2477,7 +2477,7 @@ let orphan = mock.test.resource {
         let diagnostics = engine.analyze(&create_document_at(&main, path.clone()), Some(&path));
         let lsp_unused = unused_binding_names(&diagnostics);
         let loaded = carina_core::config_loader::load_configuration_with_config(
-            fixture.path(),
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &schemas,
         )
@@ -2552,7 +2552,7 @@ let orphan = mock.test.resource {
 
     let directory_parse =
         carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
-            fixture.path(),
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &std::collections::HashMap::new(),
         );
@@ -8631,7 +8631,7 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
                 |session| {
                     carina_core::module_resolver::resolve_modules_with_diagnostics(
                         &resolver_input,
-                        fixture.path(),
+                        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
                         session,
                         &engine.schemas,
                         &[],
@@ -8645,7 +8645,7 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
                 |session| {
                     carina_core::module_resolver::resolve_modules_with_providerless_diagnostics(
                         &resolver_input,
-                        fixture.path(),
+                        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
                         session,
                         &engine.schemas,
                         &[],
@@ -13256,7 +13256,11 @@ provider awscc {
     let doc = create_document(providers);
     let finalize_error = engine
         .with_run_for_test(|run| {
-            run.finalize_provider_diagnostic(&doc, Some("providers.crn"), root.path())
+            run.finalize_provider_diagnostic(
+                &doc,
+                Some("providers.crn"),
+                &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
+            )
         })
         .expect("independent provider finalization must survive a module witness failure");
     assert!(finalize_error.to_string().contains("default_tags"));
@@ -13297,7 +13301,7 @@ let instance = module { count = 'wrong' }
             .with_run_for_test(|run| run.finalize_provider_diagnostic(
                 &doc,
                 Some("providers.crn"),
-                root.path()
+                &carina_core::paths::ResolvedPath::new(root.path()).unwrap()
             ))
             .is_none(),
         "a provider value downstream of failed expansion cannot be finalized independently"
@@ -15222,7 +15226,11 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() 
     );
     let merged = engine
         .with_run_for_test(|run| {
-            run.parse_merged_with_buffer(&call_doc, Some("call.crn"), root.path())
+            run.parse_merged_with_buffer(
+                &call_doc,
+                Some("call.crn"),
+                &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
+            )
         })
         .expect("root directory parses before module expansion");
     let errors = match &merged.module_resolution {
@@ -15262,7 +15270,7 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() 
             &module_doc,
             merged.directory.parsed.parsed(),
             error,
-            root.path(),
+            &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
             Some(&module_path),
         )
     });
@@ -16154,7 +16162,7 @@ fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
     std::fs::write(temp.path().join("defaults.crn"), sibling_source).unwrap();
     let mut merged_result =
         carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
-            temp.path(),
+            &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &std::collections::HashMap::new(),
         )
@@ -16162,12 +16170,20 @@ fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
     let (_, parsed_source) = merged_result
         .source_files
         .iter_mut()
-        .find(|(path, _)| path.ends_with("main.crn"))
+        .find(|(path, _)| {
+            path.display()
+                .file_name()
+                .is_some_and(|name| name == "main.crn")
+        })
         .expect("parsed directory retains main.crn source");
     *parsed_source = current_source.to_string();
 
     let diagnostics = test_engine().with_run_for_test(|run| {
-        run.check_mixed_tag_key_styles("main.crn", temp.path(), &merged_result)
+        run.check_mixed_tag_key_styles(
+            "main.crn",
+            &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
+            &merged_result,
+        )
     });
 
     assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:#?}");

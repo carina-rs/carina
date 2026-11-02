@@ -762,11 +762,7 @@ fn explicit_test_egress(
 ) -> Option<carina_provider_resolver::LockedEgress> {
     let declaration = VerifiedEgressDeclaration::read(load)
         .expect("test provider must carry a valid or empty egress declaration");
-    let canonical_source = declaration.source().to_string();
-    let source = canonical_source
-        .strip_prefix("file://")
-        .map(|path| format!("file://{}", lock_dir.join(path).display()))
-        .unwrap_or(canonical_source);
+    let source = declaration.source().to_string();
     let sha256 = declaration.sha256().as_str();
     let hosts = declaration
         .patterns()
@@ -781,12 +777,16 @@ fn explicit_test_egress(
         "version = 5\n\n[[provider]]\nname = \"ignored-consent-name\"\nsource = {source:?}\nmode = \"file\"\nsha256 = {sha256:?}\n\n[provider.egress]\nconsent = \"explicit\"\nhosts = [\n{hosts}\n]\n"
     );
     std::fs::write(lock_dir.join("carina-providers.lock"), lock).expect("write test egress lock");
-    let (lock, _migration) = LockFile::load(lock_dir)
-        .expect("load test egress lock")
-        .expect("test egress lock exists")
-        .into_parts();
+    let (lock, _migration) =
+        LockFile::load(&carina_core::paths::ResolvedPath::new(lock_dir).unwrap())
+            .expect("load test egress lock")
+            .expect("test egress lock exists")
+            .into_parts();
     let locked = lock
-        .locked_egress(&declaration, lock_dir)
+        .locked_egress(
+            &declaration,
+            &carina_core::paths::ResolvedPath::new(lock_dir).unwrap(),
+        )
         .expect("test lock has egress consent for the canonical source");
     Some(locked)
 }

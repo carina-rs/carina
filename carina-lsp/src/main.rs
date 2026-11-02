@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use carina_core::EnvironmentSnapshot;
 use carina_core::parser::{ProviderConfig, ProviderContext};
@@ -35,7 +35,7 @@ impl std::fmt::Display for InstallRejection {
 /// matching path selection and cheap file metadata, so its two-second poll
 /// never hashes provider WASM bytes.
 fn resolve_install(
-    source_dir: &Path,
+    source_dir: &carina_core::paths::ResolvedPath,
     config: &ProviderConfig,
 ) -> Result<carina_provider_resolver::InstalledProvider, InstallRejection> {
     let source = config
@@ -60,7 +60,12 @@ fn resolve_install(
 }
 
 fn install_prober() -> carina_lsp::backend::ProviderInstallProber {
-    std::sync::Arc::new(carina_provider_resolver::provider_artifact_fingerprint)
+    std::sync::Arc::new(|path, config| {
+        carina_core::paths::ResolvedPath::new(path)
+            .ok()
+            .map(|root| carina_provider_resolver::provider_artifact_fingerprint(&root, config))
+            .unwrap_or_else(|| Ok(Default::default()))
+    })
 }
 
 /// Build provider factories from discovered provider configs.
@@ -77,11 +82,18 @@ fn build_factories(
         Vec::with_capacity(providers.len());
 
     for (source_dir, config) in providers {
+        let project = match carina_core::paths::ResolvedPath::new(source_dir) {
+            Ok(project) => project,
+            Err(error) => {
+                errors.insert(config.name.clone(), error.to_string());
+                continue;
+            }
+        };
         fingerprint.push((
             config.name.clone(),
-            carina_provider_resolver::provider_artifact_fingerprint(source_dir, config),
+            carina_provider_resolver::provider_artifact_fingerprint(&project, config),
         ));
-        let installed = match resolve_install(source_dir, config) {
+        let installed = match resolve_install(&project, config) {
             Ok(installed) => installed,
             Err(rejection) => {
                 // Named instances inherit the kind default's source. Their
@@ -126,7 +138,7 @@ fn build_factories(
                 log::info!(
                     "LSP: loaded provider '{}' from {}",
                     config.name,
-                    installed.path().as_path().display()
+                    installed.path().display()
                 );
                 factories.push(Box::new(factory));
             }
@@ -361,8 +373,11 @@ mod tests {
         std::fs::write(&wasm, b"fixture").unwrap();
         let providers = cfg("local", Some(&format!("file://{}", wasm.display())), None);
 
-        let installed = resolve_install(&providers.0, &providers.1)
-            .expect("direct file source should be observed by the LSP");
+        let installed = resolve_install(
+            &carina_core::paths::ResolvedPath::new(&providers.0).unwrap(),
+            &providers.1,
+        )
+        .expect("direct file source should be observed by the LSP");
         assert_eq!(installed.path().as_path(), wasm);
         let rendered = installed.with_load_error("load failed").to_string();
         assert!(rendered.contains(&format!("Artifact: {}", wasm.display())));
@@ -381,7 +396,7 @@ mod tests {
             panic!("registry source must parse as remote")
         };
         let wasm = carina_provider_resolver::cache_path_wasm(
-            tmp.path(),
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
             &remote_source.source_key(),
             version,
         );
@@ -396,17 +411,23 @@ mod tests {
                 version: version.into(),
                 constraint: None,
             },
-            sha256: carina_provider_resolver::sha256_file(&wasm).unwrap(),
+            sha256: carina_provider_resolver::sha256_file(
+                &carina_core::paths::ResolvedPath::new(&wasm).unwrap(),
+            )
+            .unwrap(),
             registry: None,
         });
         lock.save(&tmp.path().join("carina-providers.lock"))
             .unwrap();
 
         let (_, config) = cfg("awscc", Some(source), None);
-        let installed = resolve_install(tmp.path(), &config)
-            .expect("registry source should resolve through the shared provider source type");
+        let installed = resolve_install(
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            &config,
+        )
+        .expect("registry source should resolve through the shared provider source type");
 
-        assert_eq!(installed.path().as_path(), wasm);
+        assert_eq!(installed.path().as_path(), wasm.as_path());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -421,7 +442,7 @@ mod tests {
             panic!("GitHub source must parse as remote")
         };
         let wasm = carina_provider_resolver::cache_path_wasm(
-            tmp.path(),
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
             &remote_source.source_key(),
             version,
         );
@@ -437,7 +458,10 @@ mod tests {
                 asset_id: serde_json::from_str("42").unwrap(),
                 constraint: None,
             },
-            sha256: carina_provider_resolver::sha256_file(&wasm).unwrap(),
+            sha256: carina_provider_resolver::sha256_file(
+                &carina_core::paths::ResolvedPath::new(&wasm).unwrap(),
+            )
+            .unwrap(),
             registry: None,
         });
         lock.save(&tmp.path().join("carina-providers.lock"))
@@ -475,7 +499,7 @@ mod tests {
             panic!("GitHub source must parse as remote")
         };
         let wasm = carina_provider_resolver::cache_path_wasm(
-            tmp.path(),
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
             &remote_source.source_key(),
             version,
         );

@@ -4,6 +4,7 @@
 //! such as detecting list literal syntax where block syntax is preferred.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -401,12 +402,12 @@ pub fn collect_tag_keys_for_file(source: &str, file: &Path) -> Vec<TagKeyEntry> 
 /// semantics. Root inputs are collected first; called module directories are
 /// then scanned from disk.
 ///
-/// Every file has one vote. Canonical paths deduplicate root/module overlap,
-/// symlink aliases, repeated imports, and multiple aliases to one module. When
-/// canonicalization fails, the original path is the identity, matching the
-/// module walk's cycle-guard convention.
+/// Every file has one vote. Pinned identities deduplicate root/module overlap,
+/// symlink aliases, repeated imports, and multiple aliases to one module.
+/// Root inputs retain the pins used to read their source text; resolution
+/// failures are reported by the caller when collecting these inputs.
 pub fn collect_all_tag_keys<E, D, S: AsRef<str>, B: crate::resource::BindingAddress>(
-    root_inputs: &[(PathBuf, S)],
+    root_inputs: &[(crate::paths::ResolvedPath, S)],
     parsed: &crate::parser::File<
         E,
         crate::resource::ParserPlaceholder,
@@ -414,17 +415,16 @@ pub fn collect_all_tag_keys<E, D, S: AsRef<str>, B: crate::resource::BindingAddr
         D,
         B,
     >,
-    base_dir: &Path,
+    base_dir: &crate::paths::ResolvedPath,
 ) -> Vec<TagKeyEntry> {
-    fn canonical_guard_path(path: &Path) -> PathBuf {
-        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-    }
-
     let mut seen_files = HashSet::new();
     let mut entries = Vec::new();
     for (file, source) in root_inputs {
-        if seen_files.insert(canonical_guard_path(file)) {
-            entries.extend(collect_tag_keys_for_file(source.as_ref(), file));
+        if seen_files.insert(file.identity()) {
+            entries.extend(collect_tag_keys_for_file(
+                source.as_ref(),
+                &file.source_label(),
+            ));
         }
     }
 
@@ -437,29 +437,34 @@ pub fn collect_all_tag_keys<E, D, S: AsRef<str>, B: crate::resource::BindingAddr
     // The caller already supplied the complete root directory population.
     // Mark it visited so `source = "."` and symlinks back to the root do not
     // trigger a redundant directory read.
-    let mut seen_module_dirs = HashSet::from([canonical_guard_path(base_dir)]);
+    let mut seen_module_dirs = HashSet::from([base_dir.identity()]);
     for import in &parsed.uses {
         if !aliases_used.contains(import.alias.as_str()) {
             continue;
         }
-        let module_dir = base_dir.join(&import.path);
+        let Ok(module_dir) = base_dir.join(&import.path) else {
+            continue;
+        };
         if !module_dir.is_dir() {
             continue;
         }
-        if !seen_module_dirs.insert(canonical_guard_path(&module_dir)) {
+        if !seen_module_dirs.insert(module_dir.identity()) {
             continue;
         }
         let Ok(module_files) = crate::config_loader::find_crn_files_in_dir(&module_dir) else {
             continue;
         };
         for module_file in module_files {
-            if !seen_files.insert(canonical_guard_path(&module_file)) {
+            if !seen_files.insert(module_file.identity()) {
                 continue;
             }
-            let Ok(content) = fs::read_to_string(&module_file) else {
+            let Ok(content) = module_file.read_to_string() else {
                 continue;
             };
-            entries.extend(collect_tag_keys_for_file(&content, &module_file));
+            entries.extend(collect_tag_keys_for_file(
+                &content,
+                &module_file.source_label(),
+            ));
         }
     }
     entries
@@ -1888,9 +1893,16 @@ tags = {
             vec![("first", "./shared"), ("second", "./shared")],
             vec!["first", "second"],
         );
-        let root_inputs = vec![(root_file, root_source.to_string())];
+        let root_inputs = vec![(
+            crate::paths::ResolvedPath::new(root_file).unwrap(),
+            root_source.to_string(),
+        )];
 
-        let entries = collect_all_tag_keys(&root_inputs, &parsed, temp.path());
+        let entries = collect_all_tag_keys(
+            &root_inputs,
+            &parsed,
+            &crate::paths::ResolvedPath::new(temp.path()).unwrap(),
+        );
         let warnings = find_mixed_tag_key_styles(&entries);
         let warned_keys: Vec<_> = warnings
             .iter()
@@ -1918,11 +1930,21 @@ tags = {
 
         let parsed = parsed_with_uses(vec![("self_module", ".")], vec!["self_module"]);
         let root_inputs = vec![
-            (main_file, main_source.to_string()),
-            (db_file.clone(), db_source.to_string()),
+            (
+                crate::paths::ResolvedPath::new(main_file).unwrap(),
+                main_source.to_string(),
+            ),
+            (
+                crate::paths::ResolvedPath::new(&db_file).unwrap(),
+                db_source.to_string(),
+            ),
         ];
 
-        let entries = collect_all_tag_keys(&root_inputs, &parsed, temp.path());
+        let entries = collect_all_tag_keys(
+            &root_inputs,
+            &parsed,
+            &crate::paths::ResolvedPath::new(temp.path()).unwrap(),
+        );
         let warnings = find_mixed_tag_key_styles(&entries);
 
         assert_eq!(entries.len(), 3, "each root tag key must be counted once");
@@ -1958,7 +1980,11 @@ tags = {
 
         let parsed = parsed_with_uses(vec![("net", "./modules/network")], vec!["net"]);
 
-        let results = collect_all_tag_keys::<_, _, String, _>(&[], &parsed, temp.path());
+        let results = collect_all_tag_keys::<_, _, String, _>(
+            &[],
+            &parsed,
+            &crate::paths::ResolvedPath::new(temp.path()).unwrap(),
+        );
         assert!(
             results.iter().any(|entry| entry.key == "Name"),
             "tag key 'Name' must be collected from the module's main.crn; got {:?}",
@@ -1979,7 +2005,11 @@ tags = {
 
         let parsed = parsed_with_uses(vec![("unused", "./unused")], vec![]);
 
-        let results = collect_all_tag_keys::<_, _, String, _>(&[], &parsed, temp.path());
+        let results = collect_all_tag_keys::<_, _, String, _>(
+            &[],
+            &parsed,
+            &crate::paths::ResolvedPath::new(temp.path()).unwrap(),
+        );
         assert!(
             results.is_empty(),
             "tag keys from uncalled imports must not be collected; got {:?}",
@@ -1992,7 +2022,11 @@ tags = {
         let temp = tempfile::tempdir().unwrap();
         let parsed = parsed_with_uses(vec![("missing", "./does-not-exist")], vec!["missing"]);
 
-        let results = collect_all_tag_keys::<_, _, String, _>(&[], &parsed, temp.path());
+        let results = collect_all_tag_keys::<_, _, String, _>(
+            &[],
+            &parsed,
+            &crate::paths::ResolvedPath::new(temp.path()).unwrap(),
+        );
 
         assert!(results.is_empty());
     }
@@ -2018,7 +2052,11 @@ tags = {
             vec!["real", "alias"],
         );
 
-        let results = collect_all_tag_keys::<_, _, String, _>(&[], &parsed, temp.path());
+        let results = collect_all_tag_keys::<_, _, String, _>(
+            &[],
+            &parsed,
+            &crate::paths::ResolvedPath::new(temp.path()).unwrap(),
+        );
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "Name");

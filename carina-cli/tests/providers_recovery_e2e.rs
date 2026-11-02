@@ -245,7 +245,7 @@ fn registry_provider_config() -> ProviderConfig {
 fn fixture_artifact_sha256() -> String {
     let artifact = tempfile::NamedTempFile::new().unwrap();
     fs::write(artifact.path(), FIXTURE_ARTIFACT).unwrap();
-    sha256_file(artifact.path()).unwrap()
+    sha256_file(&carina_core::paths::ResolvedPath::new(artifact.path()).unwrap()).unwrap()
 }
 
 fn registry_fixture(sequence: Option<u64>) -> FixtureRegistryHttp {
@@ -331,7 +331,9 @@ transparency_log_present = false
 }
 
 fn resolve_with_fixture(base_dir: &Path, user_dirs: &UserDirs, http: &FixtureRegistryHttp) {
-    let install_lock = ProviderInstallLock::acquire(base_dir).unwrap();
+    let install_lock =
+        ProviderInstallLock::acquire(&carina_core::paths::ResolvedPath::new(base_dir).unwrap())
+            .unwrap();
     resolve_all_with_fixture_registry(
         user_dirs,
         &install_lock,
@@ -552,7 +554,10 @@ fn v2_lock_migration_keeps_all_recovery_commands_reachable_without_authorizing_d
         }
 
         if operation != "repin-discovery" {
-            let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
+            let install_lock = ProviderInstallLock::acquire(
+                &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
+            )
+            .unwrap();
             let error = resolve_all(
                 &carina_core::UserDirs::under(&dir.path().join("test-user")),
                 &install_lock,
@@ -802,7 +807,9 @@ fn declining_migrated_discovery_repin_preserves_pin_and_resolution_block() {
         "declining must leave the v2 pin intact on disk"
     );
 
-    let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
+    let install_lock =
+        ProviderInstallLock::acquire(&carina_core::paths::ResolvedPath::new(dir.path()).unwrap())
+            .unwrap();
     let error = resolve_all(
         &carina_core::UserDirs::under(&dir.path().join("test-user")),
         &install_lock,
@@ -853,9 +860,11 @@ fn repin_discovery_prints_and_clears_consumed_host_values_only() {
     assert!(!stdout.contains("Enter registry host"), "{stdout}");
 
     let lock_path = dir.path().join("carina-providers.lock");
-    carina_provider_resolver::LockFile::load(dir.path())
-        .expect("re-pinned lock must remain parseable")
-        .expect("re-pinned lock must remain present");
+    carina_provider_resolver::LockFile::load(
+        &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
+    )
+    .expect("re-pinned lock must remain parseable")
+    .expect("re-pinned lock must remain present");
     let saved = fs::read_to_string(lock_path).unwrap();
     assert!(saved.contains("discovery_pin_present = false"), "{saved}");
     assert!(!saved.contains("discovery_values"), "{saved}");
@@ -958,9 +967,11 @@ fn repin_identity_prints_discarded_pin_and_preserves_other_lock_state() {
     assert!(!stdout.contains("Enter provider source"), "{stdout}");
 
     let lock_path = dir.path().join("carina-providers.lock");
-    carina_provider_resolver::LockFile::load(dir.path())
-        .expect("repinned lock must remain parseable")
-        .expect("repinned lock must remain present");
+    carina_provider_resolver::LockFile::load(
+        &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
+    )
+    .expect("repinned lock must remain parseable")
+    .expect("repinned lock must remain present");
     let saved = fs::read_to_string(lock_path).unwrap();
     assert!(saved.contains("sha256 = \"pinned-shasum\""), "{saved}");
     assert!(saved.contains("sequence = 7"), "{saved}");
@@ -1047,9 +1058,11 @@ fn rebootstrap_prints_and_clears_both_freshness_values_only() {
     );
 
     let lock_path = dir.path().join("carina-providers.lock");
-    carina_provider_resolver::LockFile::load(dir.path())
-        .expect("re-bootstrapped lock must remain parseable")
-        .expect("re-bootstrapped lock must remain present");
+    carina_provider_resolver::LockFile::load(
+        &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
+    )
+    .expect("re-bootstrapped lock must remain parseable")
+    .expect("re-bootstrapped lock must remain present");
     let saved = fs::read_to_string(lock_path).unwrap();
     assert!(saved.contains("sha256 = \"pinned-shasum\""), "{saved}");
     assert!(saved.contains("sequence_present = false"), "{saved}");

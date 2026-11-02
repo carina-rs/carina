@@ -41,6 +41,7 @@ pub mod module_resolver;
 pub mod name_override;
 pub(crate) mod non_empty;
 pub mod parser;
+pub mod paths;
 pub mod plan;
 pub mod plan_tree;
 pub mod protocol_convert;

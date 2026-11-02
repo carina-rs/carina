@@ -1,5 +1,5 @@
+use carina_core::paths::ResolvedPath;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::Path;
 
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::differ::{Orphan, Orphans, restore_current_move_source};
@@ -236,7 +236,7 @@ impl ProviderBoundPlanFile {
     pub(super) fn reload_in_flight_from_locked_state(
         self,
         state_file: Option<&carina_state::StateFile>,
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
     ) -> Result<ReloadedProviderBoundPlanFile, AppError> {
         match self {
             Self::Verified {
@@ -255,7 +255,9 @@ impl ProviderBoundPlanFile {
                     },
                     providers,
                 })
-                .map_err(|source| AppError::from_locked_state_reload(source, project_dir)),
+                .map_err(|source| {
+                    AppError::from_locked_state_reload(source, &project_dir.source_label())
+                }),
             Self::NeedsSecretVerification {
                 plan:
                     PendingPlanFile {
@@ -274,7 +276,9 @@ impl ProviderBoundPlanFile {
                         providers,
                     },
                 )
-                .map_err(|source| AppError::from_locked_state_reload(source, project_dir)),
+                .map_err(|source| {
+                    AppError::from_locked_state_reload(source, &project_dir.source_label())
+                }),
         }
     }
 
@@ -282,7 +286,7 @@ impl ProviderBoundPlanFile {
     pub(super) fn for_test(
         plan: InspectedPlanFile,
         providers: CompleteProviderLoad,
-        base_dir: &std::path::Path,
+        base_dir: &ResolvedPath,
     ) -> Result<Self, AppError> {
         match plan {
             InspectedPlanFile::Verified(plan) => Ok(Self::verified(plan, providers)),
@@ -518,6 +522,7 @@ fn saved_orphan_from_current(current: Current, row: &ResourceState) -> Orphan {
 /// [`ExpandedCanonicalResources`] witness, so a pending saved plan cannot be
 /// verified accidentally against the parser's pre-expansion resource view.
 pub(super) struct SavedPlanSecretCandidates {
+    pub(super) source: carina_core::paths::ResolvedPath,
     validated: ValidatedConfig<
         ExpandedCanonicalResources<carina_core::parser::ExpandedInferredExportParam>,
     >,
@@ -551,8 +556,10 @@ impl SavedPlanSecretCandidates {
             ExpandedCanonicalResources<carina_core::parser::ExpandedInferredExportParam>,
         >,
         provider_inputs: ResolvedProviderInputs,
+        source: carina_core::paths::ResolvedPath,
     ) -> Self {
         Self {
+            source,
             validated,
             provider_inputs,
         }
@@ -1193,6 +1200,7 @@ impl ExecutablePlanFile {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    #[cfg(test)]
     use std::path::Path;
 
     use carina_core::data_source_value::DataSourceValue;
@@ -1373,7 +1381,8 @@ mod tests {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-10-28T00:00:00Z".to_string(),
-            source_path: "main.crn".to_string(),
+            source_path: carina_core::paths::PersistedPath::new("main.crn").unwrap(),
+            source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
             state_lineage: None,
             state_serial: None,
             provider_configs: saved_provider_configs(provider_configs),
@@ -1953,7 +1962,8 @@ mod tests {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-10-28T00:00:00Z".to_string(),
-            source_path: "main.crn".to_string(),
+            source_path: carina_core::paths::PersistedPath::new("main.crn").unwrap(),
+            source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
             state_lineage: None,
             state_serial: None,
             provider_configs: serde_json::from_value(serde_json::json!([]))

@@ -1099,11 +1099,7 @@ impl GuestNetwork {
 #[cfg(test)]
 fn test_explicit_egress(declaration: &VerifiedEgressDeclaration) -> LockedEgress {
     let directory = tempfile::tempdir().expect("create egress lock directory");
-    let canonical_source = declaration.source().to_string();
-    let source = canonical_source
-        .strip_prefix("file://")
-        .map(|path| format!("file://{}", directory.path().join(path).display()))
-        .unwrap_or(canonical_source);
+    let source = declaration.source().to_string();
     let sha256 = declaration.sha256().as_str();
     let hosts = declaration
         .patterns()
@@ -1118,11 +1114,13 @@ fn test_explicit_egress(declaration: &VerifiedEgressDeclaration) -> LockedEgress
         ),
     )
     .expect("write egress lock");
-    let (lock, _migration) = carina_provider_resolver::LockFile::load(directory.path())
+    let project =
+        carina_core::paths::ResolvedPath::new(directory.path()).expect("pin fixture project");
+    let (lock, _migration) = carina_provider_resolver::LockFile::load(&project)
         .expect("load egress lock")
         .expect("egress lock exists")
         .into_parts();
-    lock.locked_egress(declaration, directory.path())
+    lock.locked_egress(declaration, &project)
         .expect("lock has consent for the declaration source")
 }
 
@@ -1265,11 +1263,7 @@ impl fmt::Display for EgressDenied {
                 | Some(ProviderKind::Aws)
                 | Some(ProviderKind::GitHub)
                 | Some(ProviderKind::Untrusted),
-                ProviderLoadSource::LocalFile {
-                    path: _,
-                    canonical_source: _,
-                }
-                | ProviderLoadSource::Remote { source: _ },
+                ProviderLoadSource::LocalFile { .. } | ProviderLoadSource::Remote { source: _ },
                 DestinationDenied::HostNotAllowed
                 | DestinationDenied::MetadataWithheld(_)
                 | DestinationDenied::LoopbackAddressDenied(_)
@@ -8208,10 +8202,11 @@ mod tests {
     fn local_provider_label(name: &str) -> Arc<ProviderLabel> {
         Arc::new(ProviderLabel {
             name: name.to_string(),
-            source: ProviderLoadSource::LocalFile {
-                path: PathBuf::from(format!("/test-providers/{name}.wasm")),
-                canonical_source: PathBuf::from(format!("{name}.wasm")),
-            },
+            source: ProviderLoadSource::local_file(
+                &carina_core::paths::ResolvedPath::new(format!("/test-providers/{name}.wasm"))
+                    .unwrap(),
+                carina_core::paths::DisplayPath::new(format!("{name}.wasm")).unwrap(),
+            ),
         })
     }
 
@@ -10808,10 +10803,11 @@ mod tests {
         let error = EgressDenied::new(
             Arc::new(ProviderLabel {
                 name: "mock_http".to_string(),
-                source: ProviderLoadSource::LocalFile {
-                    path: PathBuf::from("/opt/providers/mock_http.wasm"),
-                    canonical_source: PathBuf::from("mock_http.wasm"),
-                },
+                source: ProviderLoadSource::local_file(
+                    &carina_core::paths::ResolvedPath::new("/opt/providers/mock_http.wasm")
+                        .unwrap(),
+                    carina_core::paths::DisplayPath::new("mock_http.wasm").unwrap(),
+                ),
             }),
             Some(ProviderKind::Untrusted),
             "169.254.169.254".to_string(),

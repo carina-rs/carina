@@ -522,7 +522,7 @@ mod tests {
             |session| {
                 crate::module_resolver::resolve_modules_providerless(
                     crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-                    std::path::Path::new("."),
+                    &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                     session,
                 )
                 .map_err(Box::new)
@@ -665,7 +665,7 @@ mod tests {
                     |session| {
                         crate::module_resolver::resolve_modules_providerless(
                             crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-                            std::path::Path::new("."),
+                            &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                             session,
                         )
                         .map_err(Box::new)
@@ -748,7 +748,7 @@ mod tests {
                     |session| {
                         crate::module_resolver::resolve_modules_providerless(
                             crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-                            std::path::Path::new("."),
+                            &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                             session,
                         )
                         .map_err(Box::new)
@@ -861,7 +861,7 @@ mod tests {
                     |session| {
                         crate::module_resolver::resolve_modules_providerless(
                             crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-                            std::path::Path::new("."),
+                            &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                             session,
                         )
                         .map_err(Box::new)

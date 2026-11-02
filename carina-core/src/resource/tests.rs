@@ -3209,7 +3209,7 @@ fn deserialized_unbound_loop_template_still_rejects_read_without_a_source_span()
         |session| {
             crate::module_resolver::resolve_modules_providerless(
                 crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-                std::path::Path::new("."),
+                &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                 session,
             )
             .expect("deferred fixture crosses the module-resolution seam")

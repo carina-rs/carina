@@ -1,4 +1,5 @@
 //! Explicit storage ownership and transaction synchronization for builtin mocks.
+use carina_core::paths::{CanonicalPath, ResolvedPath};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -17,12 +18,12 @@ struct ScopeInner {
 
 // This identity map shares synchronization for an external file; it does not
 // hold test configuration. Weak entries let unused scopes drop.
-static FILE_SCOPES: LazyLock<Mutex<HashMap<PathBuf, Weak<ScopeInner>>>> =
+static FILE_SCOPES: LazyLock<Mutex<HashMap<CanonicalPath, Weak<ScopeInner>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 enum Store {
     Memory(Mutex<MockStates>),
-    File(PathBuf),
+    File(ResolvedPath),
 }
 
 pub(crate) struct ScopeLock<'a> {
@@ -48,33 +49,36 @@ impl MockScope {
                 "mock state path has no file name",
             )
         })?;
-        let mut parent = PathBuf::new();
+        // Mock stores can be configured before their directories exist. Pin
+        // each component, but cancel a missing planned directory locally;
+        // ResolvedPath itself must still reject traversing a missing ancestor.
+        let mut parent = ResolvedPath::new(path.ancestors().last().unwrap())?;
         for component in path.parent().unwrap().components() {
             match component {
-                Component::CurDir => {}
+                Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
                 Component::ParentDir => {
-                    parent.pop();
-                }
-                _ => {
-                    parent.push(component);
-                    match parent.canonicalize() {
-                        Ok(canonical) => parent = canonical,
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    parent = match parent.join("..") {
+                        Ok(parent) => parent,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            parent.parent().ok_or(error)?
+                        }
                         Err(error) => return Err(error),
-                    }
+                    };
                 }
+                Component::Normal(name) => parent = parent.join(name)?,
             }
         }
-        let path = parent.join(file_name);
+        let path = parent.join(file_name)?;
+        let identity = path.identity();
         let mut scopes = FILE_SCOPES
             .lock()
             .map_err(|_| io::Error::other("mock scope identity map poisoned"))?;
         scopes.retain(|_, scope| scope.strong_count() > 0);
-        if let Some(scope) = scopes.get(&path).and_then(Weak::upgrade) {
+        if let Some(scope) = scopes.get(&identity).and_then(Weak::upgrade) {
             return Ok(Self(scope));
         }
-        let scope = Self::new(Store::File(path.clone()));
-        scopes.insert(path, Arc::downgrade(&scope.0));
+        let scope = Self::new(Store::File(path));
+        scopes.insert(identity, Arc::downgrade(&scope.0));
         Ok(scope)
     }
 
@@ -105,7 +109,7 @@ impl ScopeLock<'_> {
                 .lock()
                 .map_err(|_| io::Error::other("mock store poisoned"))?
                 .clone()),
-            Store::File(path) => match fs::read_to_string(path) {
+            Store::File(path) => match path.read_to_string() {
                 Ok(content) => crate::MockProvider::decode_state_file(&content),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(MockStates::new()),
                 Err(error) => Err(error),
@@ -123,30 +127,13 @@ impl ScopeLock<'_> {
             }
             Store::File(path) => {
                 if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
+                    parent.create_dir_all()?;
                 }
                 let content = carina_core::utils::pretty_with_newline(&crate::MockStateFileRef {
                     version: crate::MOCK_STATE_VERSION,
                     states,
                 })?;
-                let temporary = path.with_file_name(format!(
-                    ".{}.tmp-{}",
-                    path.file_name().unwrap().to_string_lossy(),
-                    uuid::Uuid::new_v4()
-                ));
-                let result = (|| {
-                    let mut file = OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&temporary)?;
-                    file.write_all(content.as_bytes())?;
-                    file.sync_all()?;
-                    fs::rename(&temporary, path)
-                })();
-                if result.is_err() {
-                    let _ = fs::remove_file(&temporary);
-                }
-                result
+                path.atomic_replace(content.as_bytes())
             }
         }
     }
@@ -271,9 +258,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing/state.json");
         let scope = MockScope::file(path.clone()).unwrap();
-        let canonical_parent = dir.path().canonicalize().unwrap();
-        let alias =
-            MockScope::file(canonical_parent.join("missing/../missing/state.json")).unwrap();
+        let alias = MockScope::file(dir.path().join("missing/../missing/state.json")).unwrap();
         assert!(Arc::ptr_eq(&scope.0, &alias.0));
         fs::create_dir(dir.path().join("missing")).unwrap();
         let reopened = MockScope::file(path).unwrap();
@@ -293,6 +278,24 @@ mod tests {
         let scope = MockScope::file(dir.path().join("state.json")).unwrap();
         let alias = MockScope::file(link.join("state.json")).unwrap();
         assert!(Arc::ptr_eq(&scope.0, &alias.0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_scope_cancels_missing_directories_after_resolving_symlink_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let private = dir.path().join("private");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir_all(private.join("nested")).unwrap();
+        std::os::unix::fs::symlink(private.join("nested"), project.join("jump")).unwrap();
+        let scope = MockScope::file(private.join("state.json")).unwrap();
+        let alias = MockScope::file(project.join("jump/../missing/../state.json")).unwrap();
+        assert!(Arc::ptr_eq(&scope.0, &alias.0));
+        assert!(!private.join("missing").exists());
+        alias.lock().unwrap().save(&MockStates::new()).unwrap();
+        assert!(private.join("state.json").is_file());
+        assert!(!project.join("state.json").exists());
     }
 
     #[test]

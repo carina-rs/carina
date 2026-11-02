@@ -14,10 +14,12 @@
 //! Both are pure functions so `validate`, LSP diagnostics, and any other
 //! surface can share the same logic without duplicating traversal code.
 
+use crate::paths::ResolvedPath;
 use std::collections::HashMap;
+#[cfg(test)]
 use std::path::Path;
 
-use crate::config_loader::{find_crn_files_in_dir, parse_directory};
+use crate::config_loader::parse_directory;
 #[cfg(test)]
 use crate::parser::{LoadedProviderContext, ProviderContext};
 use crate::parser::{ResourceContext, ResourceRef, TypeExpr, UpstreamState};
@@ -190,7 +192,7 @@ impl UpstreamRefDiagnostic for UpstreamFieldError {
 /// An empty directory (no `.crn` files) is treated as "exports nothing"
 /// rather than a parse failure; the user may be mid-setup.
 pub fn resolve_upstream_exports<B: BindingAddress>(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     upstream_states: &[UpstreamState<B>],
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> (UpstreamExports<B>, Vec<UpstreamResolveError>) {
@@ -200,7 +202,7 @@ pub fn resolve_upstream_exports<B: BindingAddress>(
 /// Bootstrap/discovery variant of [`resolve_upstream_exports`]. Module value
 /// checks are limited to provider-independent types.
 pub fn resolve_upstream_exports_providerless<B: BindingAddress>(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     upstream_states: &[UpstreamState<B>],
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> (UpstreamExports<B>, Vec<UpstreamResolveError>) {
@@ -215,7 +217,7 @@ pub fn resolve_upstream_exports_providerless<B: BindingAddress>(
 /// real schema registry so unannotated exports become typed before
 /// downstream type-checks see them.
 pub fn resolve_upstream_exports_with_schemas<B: BindingAddress>(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     upstream_states: &[UpstreamState<B>],
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
@@ -226,7 +228,7 @@ pub fn resolve_upstream_exports_with_schemas<B: BindingAddress>(
 /// Bootstrap/discovery variant of
 /// [`resolve_upstream_exports_with_schemas`].
 pub fn resolve_upstream_exports_providerless_with_schemas<B: BindingAddress>(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     upstream_states: &[UpstreamState<B>],
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
@@ -235,7 +237,7 @@ pub fn resolve_upstream_exports_providerless_with_schemas<B: BindingAddress>(
 }
 
 fn resolve_upstream_exports_with_context<B: BindingAddress>(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     upstream_states: &[UpstreamState<B>],
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
@@ -245,11 +247,21 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
     let mut out: UpstreamExports<B> = HashMap::new();
     let mut errors: Vec<UpstreamResolveError> = Vec::new();
     for us in upstream_states {
-        let source_abs = base_dir.join(&us.source);
+        let source_abs = match base_dir.join(&us.source) {
+            Ok(source) => source,
+            Err(error) => {
+                errors.push(UpstreamResolveError {
+                    binding: us.binding.to_string(),
+                    source: us.source.clone(),
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+        };
         if !source_abs.is_dir() {
             continue;
         }
-        if matches!(find_crn_files_in_dir(&source_abs), Ok(files) if files.is_empty()) {
+        if matches!(source_abs.crn_files(), Ok(files) if files.is_empty()) {
             out.insert(us.binding.clone(), HashMap::new());
             continue;
         }
@@ -1415,9 +1427,12 @@ mod tests {
     fn parse_project(source: &str) -> ParsedFile {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("main.crn"), source).unwrap();
-        parse_directory(tmp.path(), &ctx())
-            .expect("parse_directory")
-            .into_parsed()
+        parse_directory(
+            &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            &ctx(),
+        )
+        .expect("parse_directory")
+        .into_parsed()
     }
 
     fn inference_not_run_entry() -> UpstreamExportEntry {
@@ -1446,7 +1461,7 @@ mod tests {
         let (exports, errors) =
             crate::validation::deferred_types::with_session_for_test(&ctx(), |session| {
                 resolve_upstream_exports_with_schemas(
-                    root.path(),
+                    &crate::paths::ResolvedPath::new(root.path()).unwrap(),
                     &[upstream("up", "upstream")],
                     session,
                     Some(&SchemaRegistry::new()),
@@ -1497,7 +1512,7 @@ mod tests {
             let (exports, errors) =
                 crate::validation::deferred_types::with_session_for_test(&context, |session| {
                     resolve_upstream_exports_with_context(
-                        root.path(),
+                        &crate::paths::ResolvedPath::new(root.path()).unwrap(),
                         &[upstream("up", "upstream")],
                         session,
                         schemas,
@@ -1559,7 +1574,11 @@ mod tests {
         // relative source string resolves the same way for every declaration.
         let (got, errs) =
             crate::validation::deferred_types::with_session_for_test(&ctx(), |session| {
-                resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], session)
+                resolve_upstream_exports(
+                    &crate::paths::ResolvedPath::new(&base).unwrap(),
+                    &[upstream("orgs", "../organizations")],
+                    session,
+                )
             });
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         assert!(got.get("orgs").unwrap().contains_key("accounts"));
@@ -1569,7 +1588,11 @@ mod tests {
         // declaring-file state.
         let (got2, errs2) =
             crate::validation::deferred_types::with_session_for_test(&ctx(), |session| {
-                resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], session)
+                resolve_upstream_exports(
+                    &crate::paths::ResolvedPath::new(&base).unwrap(),
+                    &[upstream("orgs", "../organizations")],
+                    session,
+                )
             });
         assert!(errs2.is_empty());
         assert_eq!(got, got2);
@@ -1593,7 +1616,11 @@ mod tests {
 
         let (got, errs) =
             crate::validation::deferred_types::with_session_for_test(&ctx(), |session| {
-                resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], session)
+                resolve_upstream_exports(
+                    &crate::paths::ResolvedPath::new(&base).unwrap(),
+                    &[upstream("orgs", "../organizations")],
+                    session,
+                )
             });
 
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
@@ -1620,7 +1647,11 @@ mod tests {
 
         let (got, errs) =
             crate::validation::deferred_types::with_session_for_test(&ctx(), |session| {
-                resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], session)
+                resolve_upstream_exports(
+                    &crate::paths::ResolvedPath::new(&base).unwrap(),
+                    &[upstream("orgs", "../organizations")],
+                    session,
+                )
             });
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let keys = got.get("orgs").expect("resolved");
@@ -1656,7 +1687,11 @@ mod tests {
 
         let (got, errs) =
             crate::validation::deferred_types::with_session_for_test(&ctx(), |session| {
-                resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], session)
+                resolve_upstream_exports(
+                    &crate::paths::ResolvedPath::new(&base).unwrap(),
+                    &[upstream("orgs", "../organizations")],
+                    session,
+                )
             });
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let keys = got.get("orgs").expect("resolved");
@@ -1705,7 +1740,11 @@ mod tests {
 
         let (got, errs) =
             crate::validation::deferred_types::with_session_for_test(&ctx(), |session| {
-                resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], session)
+                resolve_upstream_exports(
+                    &crate::paths::ResolvedPath::new(&base).unwrap(),
+                    &[upstream("orgs", "../organizations")],
+                    session,
+                )
             });
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let keys = got.get("orgs").expect("resolved");
@@ -1747,7 +1786,11 @@ mod tests {
 
         let (got, errs) =
             crate::validation::deferred_types::with_session_for_test(&ctx(), |session| {
-                resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], session)
+                resolve_upstream_exports(
+                    &crate::paths::ResolvedPath::new(&base).unwrap(),
+                    &[upstream("orgs", "../organizations")],
+                    session,
+                )
             });
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let entries = got.get("orgs").expect("resolved");
@@ -1781,7 +1824,11 @@ mod tests {
 
         let (got, errs) =
             crate::validation::deferred_types::with_session_for_test(&ctx(), |session| {
-                resolve_upstream_exports(&base, &[upstream("orgs", "../missing")], session)
+                resolve_upstream_exports(
+                    &crate::paths::ResolvedPath::new(&base).unwrap(),
+                    &[upstream("orgs", "../missing")],
+                    session,
+                )
             });
         assert!(got.is_empty());
         assert!(errs.is_empty());
@@ -1804,7 +1851,11 @@ mod tests {
 
         let (got, errs) =
             crate::validation::deferred_types::with_session_for_test(&ctx(), |session| {
-                resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], session)
+                resolve_upstream_exports(
+                    &crate::paths::ResolvedPath::new(&base).unwrap(),
+                    &[upstream("orgs", "../organizations")],
+                    session,
+                )
             });
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let keys = got.get("orgs").expect("binding should be resolved");
@@ -1822,7 +1873,11 @@ mod tests {
 
         let (got, errs) =
             crate::validation::deferred_types::with_session_for_test(&ctx(), |session| {
-                resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], session)
+                resolve_upstream_exports(
+                    &crate::paths::ResolvedPath::new(&base).unwrap(),
+                    &[upstream("orgs", "../organizations")],
+                    session,
+                )
             });
         assert!(errs.is_empty());
         assert!(got.get("orgs").expect("resolved").is_empty());
@@ -1841,7 +1896,11 @@ mod tests {
 
         let (got, errs) =
             crate::validation::deferred_types::with_session_for_test(&ctx(), |session| {
-                resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], session)
+                resolve_upstream_exports(
+                    &crate::paths::ResolvedPath::new(&base).unwrap(),
+                    &[upstream("orgs", "../organizations")],
+                    session,
+                )
             });
         assert!(!got.contains_key("orgs"));
         assert_eq!(errs.len(), 1);
@@ -1878,7 +1937,11 @@ mod tests {
 
         let (got, errs) =
             crate::validation::deferred_types::with_session_for_test(&ctx(), |session| {
-                resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], session)
+                resolve_upstream_exports(
+                    &crate::paths::ResolvedPath::new(&base).unwrap(),
+                    &[upstream("orgs", "../organizations")],
+                    session,
+                )
             });
         assert!(!got.contains_key("orgs"));
         assert_eq!(errs.len(), 1);
@@ -2129,7 +2192,11 @@ mod tests {
             let arn = bootstrap.oidc_provider_arn
             "#,
         );
-        let parsed = parse_directory(tmp.path(), &ctx()).expect("parse_directory");
+        let parsed = parse_directory(
+            &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            &ctx(),
+        )
+        .expect("parse_directory");
         // Whitebox: the bare-binding seed surfaces as `BindingRef`,
         // not `ResourceRef`. The type itself proves the seeded shape
         // can no longer impersonate an attribute reference.
@@ -2264,9 +2331,12 @@ mod tests {
             provider_name, source
         );
         fs::write(tmp.path().join("main.crn"), full).unwrap();
-        parse_directory(tmp.path(), &ctx())
-            .expect("parse_directory")
-            .into_parsed()
+        parse_directory(
+            &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            &ctx(),
+        )
+        .expect("parse_directory")
+        .into_parsed()
     }
 
     /// Preserve the historical positional-walker coverage while exercising
@@ -3271,10 +3341,15 @@ mod tests {
                 }
             "#,
         );
-        let parsed = parse_directory(&base, &ctx()).expect("parse_directory");
+        let parsed = parse_directory(&crate::paths::ResolvedPath::new(&base).unwrap(), &ctx())
+            .expect("parse_directory");
         let (exports, resolve_errs) =
             crate::validation::deferred_types::with_session_for_test(&ctx(), |session| {
-                resolve_upstream_exports(&base, &parsed.upstream_states, session)
+                resolve_upstream_exports(
+                    &crate::paths::ResolvedPath::new(&base).unwrap(),
+                    &parsed.upstream_states,
+                    session,
+                )
             });
         assert!(
             resolve_errs.is_empty(),
@@ -3887,10 +3962,15 @@ mod tests {
                 }
             "#,
         );
-        let parsed = parse_directory(&base, &ctx()).expect("parse_directory");
+        let parsed = parse_directory(&crate::paths::ResolvedPath::new(&base).unwrap(), &ctx())
+            .expect("parse_directory");
         let (exports, resolve_errs) =
             crate::validation::deferred_types::with_session_for_test(&ctx(), |session| {
-                resolve_upstream_exports(&base, &parsed.upstream_states, session)
+                resolve_upstream_exports(
+                    &crate::paths::ResolvedPath::new(&base).unwrap(),
+                    &parsed.upstream_states,
+                    session,
+                )
             });
         assert!(
             resolve_errs.is_empty(),
@@ -4361,7 +4441,7 @@ mod tests {
         let (exports, _errors) =
             crate::validation::deferred_types::with_session_for_test(&ctx(), |session| {
                 resolve_upstream_exports_with_schemas(
-                    tmp.path(),
+                    &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
                     &[upstream_state],
                     session,
                     Some(&crate::schema::SchemaRegistry::new()),
@@ -4428,7 +4508,7 @@ mod tests {
         let (exports, errors) =
             crate::validation::deferred_types::with_session_for_test(&config, |session| {
                 resolve_upstream_exports_with_schemas(
-                    tmp.path(),
+                    &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
                     &[upstream("ups", "upstream")],
                     session,
                     Some(&schemas),
@@ -4467,7 +4547,7 @@ exports { out: Int = instance.out }
         let (exports, errors) =
             crate::validation::deferred_types::with_session_for_test(&ctx(), |session| {
                 resolve_upstream_exports_with_schemas(
-                    tmp.path(),
+                    &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
                     &[upstream("ups", "upstream")],
                     session,
                     Some(&crate::schema::SchemaRegistry::new()),
@@ -4512,7 +4592,7 @@ exports { out: String = instance.out }
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 resolve_upstream_exports_providerless_with_schemas(
-                    tmp.path(),
+                    &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
                     &[upstream("ups", "upstream")],
                     session,
                     Some(&crate::schema::SchemaRegistry::new()),

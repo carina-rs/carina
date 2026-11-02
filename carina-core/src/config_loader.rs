@@ -1,8 +1,8 @@
 //! Configuration loading and .crn file discovery utilities
 
+use crate::paths::{CanonicalPath, ResolvedPath};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
@@ -420,7 +420,16 @@ pub struct LoadedConfig {
     /// snapshot may contain folded function calls and must not be used as the
     /// authored reference graph.
     pub unresolved_parsed: UnresolvedConfigSnapshot,
-    pub backend_file: Option<PathBuf>,
+    /// The complete, pinned file that supplied the backend block. Callers
+    /// must use it directly rather than join it to the project again.
+    ///
+    /// ```compile_fail,E0277
+    /// use carina_core::{config_loader::LoadedConfig, paths::ResolvedPath};
+    /// fn target(project: &ResolvedPath, loaded: &LoadedConfig) {
+    ///     let _ = project.join(loaded.backend_file.as_ref().unwrap());
+    /// }
+    /// ```
+    pub backend_file: Option<ResolvedPath>,
     /// Directory-wide declaration collisions. These are non-blocking at the
     /// load boundary so editor callers retain the parsed tree; validation
     /// commands decide whether to treat them as hard errors.
@@ -592,7 +601,10 @@ pub fn find_duplicate_declarations_in_parsed_file(
 }
 
 /// Load configuration from a directory containing .crn files
-pub fn load_configuration(path: &Path, config: &ProviderContext) -> Result<LoadedConfig, String> {
+pub fn load_configuration(
+    path: &ResolvedPath,
+    config: &ProviderContext,
+) -> Result<LoadedConfig, String> {
     load_configuration_with_config(path, config, &SchemaRegistry::new())
 }
 
@@ -600,15 +612,20 @@ pub fn load_configuration(path: &Path, config: &ProviderContext) -> Result<Loade
 ///
 /// File paths are rejected — pass a directory instead.
 pub fn load_configuration_with_config(
-    path: &Path,
+    path: &ResolvedPath,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
 ) -> Result<LoadedConfig, String> {
-    if path.is_file() {
+    let resolved = path.clone();
+    let path_label = resolved.source_label();
+    let path = path_label.as_path();
+    if resolved.is_file() {
         Err(format!("expected directory, got file: {}", path.display()))
-    } else if path.is_dir() {
+    } else if resolved.is_dir() {
         // Directory mode
-        let files = find_crn_files_in_dir(path)?;
+        let files = resolved
+            .crn_files()
+            .map_err(|error| format!("Failed to read directory {}: {error}", resolved.display()))?;
         if files.is_empty() {
             return Err(format!("No .crn files found in {}", path.display()));
         }
@@ -620,9 +637,10 @@ pub fn load_configuration_with_config(
         // interpolations in sibling `role.crn` (#2815, #2817).
         let mut file_inputs: Vec<(PathBuf, String)> = Vec::with_capacity(files.len());
         for file in &files {
-            let content = fs::read_to_string(file)
+            let content = file
+                .read_to_string()
                 .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
-            file_inputs.push((file.clone(), content));
+            file_inputs.push((file.source_label(), content));
         }
         let parsed_files = match parse_directory_files_located(&file_inputs, config) {
             Ok(v) => v,
@@ -637,9 +655,9 @@ pub fn load_configuration_with_config(
         let mut merged = empty_parsed();
         let mut unresolved_merged = empty_parsed();
         let mut parse_errors: Vec<String> = Vec::new();
-        let mut backend_file: Option<PathBuf> = None;
+        let mut backend_file: Option<ResolvedPath> = None;
 
-        for (file, resolved) in parsed_files {
+        for ((file, resolved), io_file) in parsed_files.into_iter().zip(files) {
             let mut parsed = resolved.into_inner();
             let mut unresolved = parsed.clone();
             if let Err(e) =
@@ -671,7 +689,7 @@ pub fn load_configuration_with_config(
                     ));
                 } else {
                     merged.backend = Some(backend);
-                    backend_file = Some(file.clone());
+                    backend_file = Some(io_file);
                 }
             }
         }
@@ -722,7 +740,7 @@ pub fn load_configuration_with_config(
 /// resolved against the combined binding map. Both CLI and LSP should
 /// use this to ensure consistent results.
 pub fn parse_directory(
-    dir: &Path,
+    dir: &ResolvedPath,
     config: &ProviderContext,
 ) -> Result<ParsedRootDirectory, String> {
     parse_directory_with_overrides(dir, config, &HashMap::new())
@@ -735,7 +753,7 @@ pub fn parse_directory(
 /// LSP uses this to analyze the open document's in-memory buffer alongside
 /// the on-disk siblings, so edits show diagnostics before the user saves.
 pub fn parse_directory_with_overrides(
-    dir: &Path,
+    dir: &ResolvedPath,
     config: &ProviderContext,
     overrides: &HashMap<String, String>,
 ) -> Result<ParsedRootDirectory, String> {
@@ -753,7 +771,7 @@ pub struct DirectoryParseResult {
     pub authored_bindings: AuthoredBindingView,
     pub duplicate_declarations: Vec<DuplicateDeclaration>,
     /// Exact source inputs used for the parse, including in-memory overrides.
-    pub source_files: Vec<(PathBuf, String)>,
+    pub source_files: Vec<(ResolvedPath, String)>,
     /// Source file that owns the backend when the directory has exactly one.
     /// `None` means the directory has either zero or multiple backend blocks.
     pub sole_backend_file: Option<PathBuf>,
@@ -836,7 +854,7 @@ impl DirectoryParseResult {
 /// Duplicate declarations do not make the parse fail: LSP callers need the
 /// merged tree to survive while a user is editing a collision.
 pub fn parse_directory_with_overrides_and_diagnostics(
-    dir: &Path,
+    dir: &ResolvedPath,
     config: &ProviderContext,
     overrides: &HashMap<String, String>,
 ) -> Result<DirectoryParseResult, DirectoryParseFailure> {
@@ -844,16 +862,22 @@ pub fn parse_directory_with_overrides_and_diagnostics(
 }
 
 fn parse_directory_with_overrides_impl(
-    dir: &Path,
+    dir: &ResolvedPath,
     config: &ProviderContext,
     overrides: &HashMap<String, String>,
     preserve_failed_user_calls: bool,
 ) -> Result<DirectoryParseResult, DirectoryParseFailure> {
-    let files = find_crn_files_in_dir(dir).map_err(DirectoryParseFailure::Message)?;
-    let mut paths: Vec<(std::path::PathBuf, String)> = files
+    let resolved = dir.clone();
+    let dir_label = resolved.source_label();
+    let dir = dir_label.as_path();
+    let files = resolved
+        .crn_files()
+        .map_err(|error| DirectoryParseFailure::Message(error.to_string()))?;
+    let mut paths: Vec<(ResolvedPath, String)> = files
         .into_iter()
         .filter_map(|p| {
-            p.file_name()
+            p.display()
+                .file_name()
                 .and_then(|n| n.to_str().map(|s| (p.clone(), s.to_string())))
         })
         .collect();
@@ -861,7 +885,12 @@ fn parse_directory_with_overrides_impl(
     // buffer the user hasn't saved). Keep the list de-duplicated by name.
     for name in overrides.keys() {
         if !paths.iter().any(|(_, n)| n == name) {
-            paths.push((dir.join(name), name.clone()));
+            paths.push((
+                resolved
+                    .join(name)
+                    .map_err(|error| DirectoryParseFailure::Message(error.to_string()))?,
+                name.clone(),
+            ));
         }
     }
     if paths.is_empty() {
@@ -877,11 +906,11 @@ fn parse_directory_with_overrides_impl(
     for (file, name) in &paths {
         let content = match overrides.get(name) {
             Some(buffer) => buffer.clone(),
-            None => fs::read_to_string(file).map_err(|e| {
+            None => file.read_to_string().map_err(|e| {
                 DirectoryParseFailure::Message(format!("Failed to read {}: {}", file.display(), e))
             })?,
         };
-        file_inputs.push((file.clone(), content));
+        file_inputs.push((file.source_label(), content));
     }
 
     let parsed_files = match parse_directory_files_located(&file_inputs, config) {
@@ -972,7 +1001,11 @@ fn parse_directory_with_overrides_impl(
         parsed: RootDirectoryParse::new(merged),
         authored_bindings,
         duplicate_declarations,
-        source_files: file_inputs,
+        source_files: paths
+            .into_iter()
+            .zip(file_inputs)
+            .map(|((file, _), (_, source))| (file, source))
+            .collect(),
         sole_backend_file,
         semantic_files,
     })
@@ -1487,60 +1520,56 @@ pub fn get_base_dir(path: &Path) -> &Path {
 /// The returned paths are sorted lexicographically by `PathBuf` ordering so
 /// callers get deterministic results across filesystems (#2851). This matches
 /// the contract of [`find_crn_files_in_dir`].
-pub fn find_crn_files_recursive(dir: &Path) -> Result<Vec<PathBuf>, String> {
+pub fn find_crn_files_recursive(dir: &ResolvedPath) -> Result<Vec<ResolvedPath>, String> {
     let mut files = Vec::new();
-    collect_crn_files_recursive(dir, &mut files)?;
-    files.sort();
+    collect_resolved_crn_files_recursive(dir, &mut files, &mut HashSet::new())?;
+    files.sort_by(|left, right| left.display().cmp(right.display()));
     Ok(files)
 }
 
-fn collect_crn_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries = fs::read_dir(dir)
-        .map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?;
-
-    // Sort directory entries before descending so traversal order is
-    // independent of the underlying filesystem's `readdir` order.
-    let mut paths: Vec<PathBuf> = entries
-        .map(|entry| entry.map(|e| e.path()).map_err(|e| e.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
-    paths.sort();
-
-    for path in paths {
-        if path.is_dir() {
-            // Skip hidden directories and common non-source directories
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
+fn collect_resolved_crn_files_recursive(
+    dir: &ResolvedPath,
+    files: &mut Vec<ResolvedPath>,
+    visited: &mut HashSet<CanonicalPath>,
+) -> Result<(), String> {
+    if !visited.insert(dir.identity()) {
+        return Ok(());
+    }
+    let entries = dir
+        .entries()
+        .map_err(|error| format!("Failed to read directory {}: {error}", dir.display()))?;
+    for entry in entries {
+        if entry.is_dir() {
+            let name = entry
+                .display()
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
             if !name.starts_with('.') && name != "target" && name != "node_modules" {
-                collect_crn_files_recursive(&path, files)?;
+                let path = entry
+                    .resolve()
+                    .map_err(|error| format!("Failed to resolve {}: {error}", entry.display()))?;
+                collect_resolved_crn_files_recursive(&path, files, visited)?;
             }
-        } else if path.extension().is_some_and(|ext| ext == "crn") {
-            files.push(path);
+        } else if entry
+            .display()
+            .extension()
+            .is_some_and(|extension| extension == "crn")
+        {
+            files.push(
+                entry
+                    .resolve()
+                    .map_err(|error| format!("Failed to resolve {}: {error}", entry.display()))?,
+            );
         }
     }
-
     Ok(())
 }
 
-/// Find .crn files in a single directory (non-recursive).
-///
-/// The returned paths are sorted by `PathBuf` ordering, which for a
-/// single-directory listing degenerates to filename order. Callers that
-/// walk siblings independently (rather than going through
-/// `parse_directory`'s merge path) get deterministic order across
-/// filesystems (#2449).
-pub fn find_crn_files_in_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
-    let entries = fs::read_dir(dir)
-        .map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?;
-
-    let mut files = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "crn") {
-            files.push(path);
-        }
-    }
-    files.sort();
-    Ok(files)
+/// Sorted, pinned `.crn` children of one directory.
+pub fn find_crn_files_in_dir(dir: &ResolvedPath) -> Result<Vec<ResolvedPath>, String> {
+    dir.crn_files()
+        .map_err(|error| format!("Failed to read directory {}: {error}", dir.display()))
 }
 
 #[cfg(test)]
@@ -1549,6 +1578,55 @@ mod tests {
     use crate::parser::ModuleCall;
     use crate::resource::{DeferredValue, Value};
     use std::fs;
+
+    // macOS APFS rejects non-UTF-8 names.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn diagnostic_source_lookup_preserves_non_utf8_project_directory() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"project-\xff".to_vec()));
+        fs::create_dir(&directory).unwrap();
+        let main_path = directory.join("main.crn");
+        fs::write(&main_path, "backend local { path = 'carina.state.json' }\n").unwrap();
+        let root = ResolvedPath::new(&directory).unwrap();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+
+        let parsed =
+            parse_directory_with_overrides_and_diagnostics(&root, &context, &HashMap::new())
+                .unwrap();
+
+        assert!(parsed.semantic_file(&main_path).is_some());
+        assert_eq!(
+            parsed.sole_backend_file.as_deref(),
+            Some(main_path.as_path())
+        );
+        assert_eq!(
+            parsed.source_files[0].0.identity(),
+            root.join("main.crn").unwrap().identity()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_discovery_skips_unrelated_looping_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("nested")).unwrap();
+        fs::write(directory.path().join("nested/main.crn"), "exports {}\n").unwrap();
+        std::os::unix::fs::symlink("notes.txt", directory.path().join("notes.txt")).unwrap();
+        let root = ResolvedPath::new(directory.path()).unwrap();
+
+        let files = find_crn_files_recursive(&root).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].display(),
+            root.join("nested/main.crn").unwrap().display()
+        );
+    }
 
     #[test]
     fn directory_load_preserves_resource_handle_export_type_for_boundary_validation() {
@@ -1560,7 +1638,7 @@ mod tests {
         .expect("write fixture");
 
         let loaded = load_configuration_with_config(
-            directory.path(),
+            &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             &SchemaRegistry::new(),
         )
@@ -1597,7 +1675,7 @@ mod tests {
         fs::write(dir.join("broken.crn"), "let =\n").unwrap();
 
         let error = match load_configuration(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         ) {
             Ok(_) => panic!("invalid syntax unexpectedly loaded"),
@@ -1623,7 +1701,8 @@ mod tests {
     #[test]
     fn find_crn_files_in_dir_empty_directory() {
         let dir = create_temp_dir("in_dir_empty");
-        let result = find_crn_files_in_dir(&dir).unwrap();
+        let result =
+            find_crn_files_in_dir(&crate::paths::ResolvedPath::new(&dir).unwrap()).unwrap();
         assert!(result.is_empty());
         cleanup(&dir);
     }
@@ -1634,10 +1713,11 @@ mod tests {
         fs::write(dir.join("a.crn"), "").unwrap();
         fs::write(dir.join("b.crn"), "").unwrap();
 
-        let result = find_crn_files_in_dir(&dir).unwrap();
+        let result =
+            find_crn_files_in_dir(&crate::paths::ResolvedPath::new(&dir).unwrap()).unwrap();
         assert_eq!(result.len(), 2);
-        assert!(result[0].ends_with("a.crn"));
-        assert!(result[1].ends_with("b.crn"));
+        assert!(result[0].display().file_name().unwrap() == "a.crn");
+        assert!(result[1].display().file_name().unwrap() == "b.crn");
         cleanup(&dir);
     }
 
@@ -1653,10 +1733,17 @@ mod tests {
         for name in ["z.crn", "m.crn", "a.crn", "providers.crn", "main.crn"] {
             fs::write(dir.join(name), "").unwrap();
         }
-        let result = find_crn_files_in_dir(&dir).unwrap();
+        let result =
+            find_crn_files_in_dir(&crate::paths::ResolvedPath::new(&dir).unwrap()).unwrap();
         let names: Vec<String> = result
             .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .map(|p| {
+                p.display()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect();
         assert_eq!(
             names,
@@ -1668,7 +1755,7 @@ mod tests {
     // #2465: pin the signature as `&Path`-accepting at compile time, so a
     // future revert to `&PathBuf` fails to build instead of silently
     // re-introducing the `.to_path_buf()` ceremony at every LSP callsite.
-    const _: fn(&Path) -> Result<Vec<PathBuf>, String> = find_crn_files_in_dir;
+    const _: fn(&ResolvedPath) -> Result<Vec<ResolvedPath>, String> = find_crn_files_in_dir;
 
     #[test]
     fn find_crn_files_in_dir_ignores_non_crn_files() {
@@ -1677,9 +1764,10 @@ mod tests {
         fs::write(dir.join("b.txt"), "").unwrap();
         fs::write(dir.join("c.rs"), "").unwrap();
 
-        let result = find_crn_files_in_dir(&dir).unwrap();
+        let result =
+            find_crn_files_in_dir(&crate::paths::ResolvedPath::new(&dir).unwrap()).unwrap();
         assert_eq!(result.len(), 1);
-        assert!(result[0].ends_with("a.crn"));
+        assert!(result[0].display().file_name().unwrap() == "a.crn");
         cleanup(&dir);
     }
 
@@ -1691,16 +1779,17 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
         fs::write(sub.join("nested.crn"), "").unwrap();
 
-        let result = find_crn_files_in_dir(&dir).unwrap();
+        let result =
+            find_crn_files_in_dir(&crate::paths::ResolvedPath::new(&dir).unwrap()).unwrap();
         assert_eq!(result.len(), 1);
-        assert!(result[0].ends_with("top.crn"));
+        assert!(result[0].display().file_name().unwrap() == "top.crn");
         cleanup(&dir);
     }
 
     #[test]
     fn find_crn_files_in_dir_nonexistent_directory() {
         let dir = PathBuf::from("/tmp/carina_config_loader_test_nonexistent_dir_xyz");
-        let result = find_crn_files_in_dir(&dir);
+        let result = find_crn_files_in_dir(&crate::paths::ResolvedPath::new(&dir).unwrap());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Failed to read directory"));
     }
@@ -1710,7 +1799,8 @@ mod tests {
     #[test]
     fn find_crn_files_recursive_empty_directory() {
         let dir = create_temp_dir("recursive_empty");
-        let result = find_crn_files_recursive(&dir).unwrap();
+        let result =
+            find_crn_files_recursive(&crate::paths::ResolvedPath::new(&dir).unwrap()).unwrap();
         assert!(result.is_empty());
         cleanup(&dir);
     }
@@ -1726,8 +1816,9 @@ mod tests {
         fs::create_dir_all(&deep).unwrap();
         fs::write(deep.join("deep.crn"), "").unwrap();
 
-        let mut result = find_crn_files_recursive(&dir).unwrap();
-        result.sort();
+        let mut result =
+            find_crn_files_recursive(&crate::paths::ResolvedPath::new(&dir).unwrap()).unwrap();
+        result.sort_by(|a, b| a.display().cmp(b.display()));
         assert_eq!(result.len(), 3);
         cleanup(&dir);
     }
@@ -1740,9 +1831,10 @@ mod tests {
         fs::create_dir_all(&hidden).unwrap();
         fs::write(hidden.join("secret.crn"), "").unwrap();
 
-        let result = find_crn_files_recursive(&dir).unwrap();
+        let result =
+            find_crn_files_recursive(&crate::paths::ResolvedPath::new(&dir).unwrap()).unwrap();
         assert_eq!(result.len(), 1);
-        assert!(result[0].ends_with("visible.crn"));
+        assert!(result[0].display().file_name().unwrap() == "visible.crn");
         cleanup(&dir);
     }
 
@@ -1754,9 +1846,10 @@ mod tests {
         fs::create_dir_all(&target).unwrap();
         fs::write(target.join("build.crn"), "").unwrap();
 
-        let result = find_crn_files_recursive(&dir).unwrap();
+        let result =
+            find_crn_files_recursive(&crate::paths::ResolvedPath::new(&dir).unwrap()).unwrap();
         assert_eq!(result.len(), 1);
-        assert!(result[0].ends_with("main.crn"));
+        assert!(result[0].display().file_name().unwrap() == "main.crn");
         cleanup(&dir);
     }
 
@@ -1768,9 +1861,10 @@ mod tests {
         fs::create_dir_all(&nm).unwrap();
         fs::write(nm.join("dep.crn"), "").unwrap();
 
-        let result = find_crn_files_recursive(&dir).unwrap();
+        let result =
+            find_crn_files_recursive(&crate::paths::ResolvedPath::new(&dir).unwrap()).unwrap();
         assert_eq!(result.len(), 1);
-        assert!(result[0].ends_with("app.crn"));
+        assert!(result[0].display().file_name().unwrap() == "app.crn");
         cleanup(&dir);
     }
 
@@ -1781,16 +1875,17 @@ mod tests {
         fs::write(dir.join("b.txt"), "").unwrap();
         fs::write(dir.join("c.json"), "").unwrap();
 
-        let result = find_crn_files_recursive(&dir).unwrap();
+        let result =
+            find_crn_files_recursive(&crate::paths::ResolvedPath::new(&dir).unwrap()).unwrap();
         assert_eq!(result.len(), 1);
-        assert!(result[0].ends_with("a.crn"));
+        assert!(result[0].display().file_name().unwrap() == "a.crn");
         cleanup(&dir);
     }
 
     #[test]
     fn find_crn_files_recursive_nonexistent_directory() {
         let dir = PathBuf::from("/tmp/carina_config_loader_test_recursive_nonexistent_xyz");
-        let result = find_crn_files_recursive(&dir);
+        let result = find_crn_files_recursive(&crate::paths::ResolvedPath::new(&dir).unwrap());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Failed to read directory"));
     }
@@ -1819,10 +1914,11 @@ mod tests {
         fs::write(root.join("z_top.crn"), "").unwrap();
         fs::write(root.join("a_top.crn"), "").unwrap();
 
-        let result = find_crn_files_recursive(root).unwrap();
+        let result =
+            find_crn_files_recursive(&crate::paths::ResolvedPath::new(root).unwrap()).unwrap();
 
         let mut expected = result.clone();
-        expected.sort();
+        expected.sort_by(|a, b| a.display().cmp(b.display()));
         assert_eq!(
             result, expected,
             "find_crn_files_recursive must return paths in lexicographic order"
@@ -1872,7 +1968,7 @@ mod tests {
         .unwrap();
 
         let loaded = load_configuration_with_config(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             &SchemaRegistry::new(),
         )
@@ -1901,7 +1997,7 @@ mod tests {
         fs::write(dir.join("main.crn"), "exports {\n  name = \"carina\"\n}\n").unwrap();
 
         let loaded = load_configuration_with_config(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             &SchemaRegistry::new(),
         )
@@ -1928,7 +2024,7 @@ mod tests {
         .unwrap();
 
         let config = load_configuration(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap();
@@ -1952,7 +2048,7 @@ mod tests {
         .unwrap();
 
         let config = load_configuration(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap();
@@ -1965,7 +2061,7 @@ mod tests {
     fn load_configuration_nonexistent_path() {
         let path = PathBuf::from("/tmp/carina_config_loader_test_nonexistent_file_xyz");
         let result = load_configuration(
-            &path,
+            &crate::paths::ResolvedPath::new(&path).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         match result {
@@ -1978,7 +2074,7 @@ mod tests {
     fn load_configuration_empty_directory() {
         let dir = create_temp_dir("load_empty_dir");
         let result = load_configuration(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         match result {
@@ -2001,7 +2097,7 @@ mod tests {
         .unwrap();
 
         let config = load_configuration(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap();
@@ -2033,7 +2129,7 @@ mod tests {
         .unwrap();
 
         let config = load_configuration(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap();
@@ -2057,7 +2153,7 @@ mod tests {
         fs::write(dir.join("other.crn"), "let marker = \"other\"\n").unwrap();
 
         let error = match load_configuration(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         ) {
             Ok(_) => panic!("the strict merged pass accepted an unavailable let binding"),
@@ -2092,7 +2188,7 @@ mod tests {
         fs::write(dir.join("other.crn"), "let marker = \"other\"\n").unwrap();
 
         let error = match load_configuration(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         ) {
             Ok(_) => panic!("the strict merged pass accepted an unavailable backend attribute"),
@@ -2120,7 +2216,7 @@ mod tests {
         fs::write(dir.join("other.crn"), "let marker = \"other\"\n").unwrap();
 
         let loaded = load_configuration(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("the strict merged pass must not descend into a typed secret");
@@ -2147,7 +2243,7 @@ mod tests {
         fs::write(dir.join("notes.txt"), "not a crn file").unwrap();
 
         let config = load_configuration(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap();
@@ -2161,7 +2257,7 @@ mod tests {
         fs::write(dir.join("bad.crn"), "this is not valid crn syntax {{{").unwrap();
 
         let result = load_configuration(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert!(result.is_err());
@@ -2183,7 +2279,7 @@ mod tests {
         fs::write(dir.join("providers.crn"), "provider mock {}\n").unwrap();
 
         let error = match load_configuration(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         ) {
             Ok(_) => panic!("invalid function body unexpectedly loaded"),
@@ -2213,7 +2309,7 @@ mod tests {
         fs::write(dir.join("providers.crn"), "provider mock {}\n").unwrap();
 
         let error = match load_configuration(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         ) {
             Ok(_) => panic!("invalid function body unexpectedly loaded"),
@@ -2242,7 +2338,7 @@ mod tests {
         .unwrap();
 
         let result = load_configuration(
-            &file,
+            &crate::paths::ResolvedPath::new(&file).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         match result {
@@ -2263,7 +2359,7 @@ mod tests {
         fs::write(&file, "this is not valid crn syntax {{{").unwrap();
 
         let result = load_configuration(
-            &file,
+            &crate::paths::ResolvedPath::new(&file).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         match result {
@@ -2302,7 +2398,7 @@ let _ = for unused_var in empty_list {
         .unwrap();
 
         let config = load_configuration(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap();
@@ -2338,7 +2434,7 @@ for account_id in orgs.accounts {
         .unwrap();
 
         let config = load_configuration(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("directory fixture loads");
@@ -2347,7 +2443,7 @@ for account_id in orgs.accounts {
             |session| {
                 crate::module_resolver::resolve_modules_with_providerless_config(
                     config.parsed,
-                    &dir,
+                    &crate::paths::ResolvedPath::new(&dir).unwrap(),
                     session,
                     &SchemaRegistry::new(),
                 )
@@ -2417,7 +2513,7 @@ for account_id in orgs.accounts {
         .unwrap();
 
         let config = load_configuration(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap();
@@ -2451,7 +2547,7 @@ for account_id in orgs.accounts {
         .unwrap();
 
         let result = load_configuration(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         match result {
@@ -2490,7 +2586,7 @@ let orgs = upstream_state {
         .unwrap();
 
         let result = parse_directory(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         cleanup(&dir);
@@ -2525,7 +2621,7 @@ let orgs = upstream_state {
     ) -> Result<crate::parser::ModuleResolvedInferredFile, crate::module_resolver::ModuleError>
     {
         let parsed = load_configuration(
-            fixture.path(),
+            &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("the parser-side deferred body must survive directory loading")
@@ -2535,7 +2631,7 @@ let orgs = upstream_state {
             |session| {
                 crate::module_resolver::resolve_modules_with_providerless_config(
                     parsed,
-                    fixture.path(),
+                    &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
                     session,
                     &SchemaRegistry::new(),
                 )
@@ -2559,7 +2655,7 @@ let orgs = upstream_state {
         .expect("sibling values fixture");
 
         let loaded = load_configuration(
-            fixture.path(),
+            &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("a sibling plan-time list must expand during the final parse pass");
@@ -2589,7 +2685,7 @@ let orgs = upstream_state {
         );
 
         let loaded = load_configuration(
-            fixture.path(),
+            &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("a later plan-time list must expand during the final parse pass");
@@ -2611,7 +2707,7 @@ let orgs = upstream_state {
         .expect("sibling lookup fixture");
 
         let loaded = load_configuration(
-            fixture.path(),
+            &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("provisional template errors must be retried in the final parse pass");
@@ -2929,7 +3025,7 @@ awscc.ec2.SecurityGroup {
         .unwrap();
 
         let result = load_configuration(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         let loaded = result.expect("load should succeed");
@@ -2963,7 +3059,7 @@ awscc.ec2.SecurityGroup {
         .unwrap();
 
         let result = parse_directory(
-            &dir,
+            &crate::paths::ResolvedPath::new(&dir).unwrap(),
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         cleanup(&dir);
@@ -3023,7 +3119,7 @@ awscc.ec2.SecurityGroup {
         .unwrap();
 
         let directory = parse_directory_with_overrides_and_diagnostics(
-            temp.path(),
+            &crate::paths::ResolvedPath::new(temp.path()).unwrap(),
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             &HashMap::new(),
         )

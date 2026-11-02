@@ -17,7 +17,7 @@ fn depends_on_resolves_across_sibling_files_in_directory() {
     dir.push("tests/fixtures/depends_on/basic");
 
     let parsed = parse_directory(
-        &dir,
+        &carina_core::paths::ResolvedPath::new(&dir).unwrap(),
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("parse_directory should succeed for valid fixture");
