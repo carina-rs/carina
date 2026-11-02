@@ -1904,7 +1904,7 @@ pub struct ResolvedBinding<
     P: PlaceholderKind = crate::resource::NoPlaceholder,
     B: BindingAddress = AbsoluteBindingAddress,
 > {
-    pub attributes: HashMap<String, Value<P, B>>,
+    pub attributes: HashMap<String, crate::resource::SnapshotValue<P, B>>,
     pub source: BindingValueSource<B>,
     pub completeness: BindingCompleteness,
     /// Attributes whose present values are authoritative even when the
@@ -1943,19 +1943,30 @@ impl<P: PlaceholderKind, B: BindingAddress> ResolvedBinding<P, B> {
 /// installed as the source for downstream references.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SecretPreservingAttributes {
-    attributes: HashMap<String, Value>,
+    attributes: HashMap<String, crate::resource::SnapshotValue>,
 }
 
 impl SecretPreservingAttributes {
     /// Combine resolved desired values with the provider-facing values made
     /// from them. Desired-only keys are retained (notably write-only inputs),
     /// while provider values win after inheriting every secret marker.
-    pub(crate) fn from_provider_values(
-        resolved_shapes: &HashMap<String, Value>,
-        provider_values: &HashMap<String, Value>,
+    pub(crate) fn from_provider_values<
+        P: crate::resource::StateValueLeaf,
+        Q: crate::resource::StateValueLeaf,
+    >(
+        resolved_shapes: &HashMap<String, Value<P>>,
+        provider_values: &HashMap<String, Value<Q>>,
     ) -> Self {
+        let resolved_shapes = resolved_shapes
+            .iter()
+            .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
+            .collect::<HashMap<_, _>>();
+        let provider_values = provider_values
+            .iter()
+            .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
+            .collect::<HashMap<_, _>>();
         let mut attributes = resolved_shapes.clone();
-        for (key, value) in provider_values {
+        for (key, value) in &provider_values {
             let protected = resolved_shapes.get(key).map_or_else(
                 || value.clone(),
                 |shape| crate::value::mask_plaintext_using_secret_shape_fail_closed(value, shape),
@@ -1967,7 +1978,7 @@ impl SecretPreservingAttributes {
 
     /// Read-only access for state writeback. Construction remains confined to
     /// the secret-preserving resolution paths above.
-    pub fn values(&self) -> &HashMap<String, Value> {
+    pub fn values(&self) -> &HashMap<String, crate::resource::SnapshotValue> {
         &self.attributes
     }
 }
@@ -1997,7 +2008,10 @@ impl<P: PlaceholderKind, B: BindingAddress> Default for ResolvedBindings<P, B> {
 }
 
 impl<P: PlaceholderKind, B: BindingAddress> ResolvedBindings<P, B> {
-    pub fn get(&self, name: &str) -> Option<&HashMap<String, Value<P, B>>> {
+    pub fn get(
+        &self,
+        name: &str,
+    ) -> Option<&HashMap<String, crate::resource::SnapshotValue<P, B>>> {
         self.by_name.get(name).map(|binding| &binding.attributes)
     }
 
@@ -2096,7 +2110,7 @@ pub struct SavedPreApplyInputs<'a> {
         crate::resource::AbsoluteBindingAddress,
         (),
     >],
-    pub compositions: &'a [SavedComposition],
+    pub compositions: &'a [SavedComposition<crate::resource::NoPlaceholder>],
     pub managed_current: &'a HashMap<ResourceId, PlanInputCurrent>,
     pub data_source_values: &'a DataSourceValues<SavedModuleSource, ()>,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
@@ -2166,7 +2180,7 @@ impl ResolvedBindings<ParserPlaceholder> {
             let attributes = resource
                 .attributes
                 .iter()
-                .map(|(name, value)| (name.clone(), map_value(value)))
+                .map(|(name, value)| (name.clone(), map_value(value).to_snapshot()))
                 .collect::<HashMap<_, _>>();
             let definitive_attributes = attributes.keys().cloned().collect();
             by_name.insert(
@@ -2190,7 +2204,7 @@ impl ResolvedBindings<ParserPlaceholder> {
             let attributes = data_source
                 .attributes
                 .iter()
-                .map(|(name, value)| (name.clone(), map_value(value)))
+                .map(|(name, value)| (name.clone(), map_value(value).to_snapshot()))
                 .collect::<HashMap<_, _>>();
             let definitive_attributes = attributes.keys().cloned().collect();
             by_name.insert(
@@ -2218,7 +2232,7 @@ impl ResolvedBindings<ParserPlaceholder> {
                 .filter_map(|(name, attribute)| {
                     attribute
                         .value()
-                        .map(|value| (name.clone(), map_value(&value)))
+                        .map(|value| (name.clone(), map_value(&value).to_snapshot()))
                 })
                 .collect::<HashMap<_, _>>();
             let definitive_attributes = attributes.keys().cloned().collect();
@@ -2469,7 +2483,11 @@ impl ResolvedBindings {
             let Some(binding_name) = resource.binding.as_ref() else {
                 continue;
             };
-            let mut merged: HashMap<String, Value> = resource.resolved_attributes();
+            let mut merged = resource
+                .resolved_attributes()
+                .into_iter()
+                .map(|(key, value)| (key, value.to_snapshot()))
+                .collect::<HashMap<_, _>>();
             let definitive_attributes: HashSet<String> = merged.keys().cloned().collect();
             let (changed_attributes, refreshable_attributes) = match managed_stability
                 .get(&resource.id)
@@ -2537,7 +2555,10 @@ impl ResolvedBindings {
             by_name.insert(
                 remote_binding.clone(),
                 ResolvedBinding {
-                    attributes: remote_attrs.clone(),
+                    attributes: remote_attrs
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.to_snapshot()))
+                        .collect(),
                     source: BindingValueSource::Upstream,
                     completeness: BindingCompleteness::Complete,
                     definitive_attributes: HashSet::new(),
@@ -2629,7 +2650,7 @@ impl ResolvedBindings {
 
     pub fn layer_saved_compositions_post_apply(
         &mut self,
-        compositions: &[SavedComposition],
+        compositions: &[SavedComposition<crate::resource::NoPlaceholder>],
     ) -> Result<(), String> {
         self.layer_saved_compositions(compositions);
         Ok(())
@@ -2639,7 +2660,10 @@ impl ResolvedBindings {
         self.layer_composition_views(compositions.iter().map(CompositionRuntimeRef::Live));
     }
 
-    fn layer_saved_compositions(&mut self, compositions: &[SavedComposition]) {
+    fn layer_saved_compositions(
+        &mut self,
+        compositions: &[SavedComposition<crate::resource::NoPlaceholder>],
+    ) {
         self.layer_composition_views(compositions.iter().map(CompositionRuntimeRef::Saved));
     }
 
@@ -2659,7 +2683,10 @@ impl ResolvedBindings {
             self.by_name.insert(
                 binding_name.to_string(),
                 ResolvedBinding {
-                    attributes: crate::resource::attrs_to_hashmap(&value_attrs),
+                    attributes: value_attrs
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.to_snapshot()))
+                        .collect(),
                     source: BindingValueSource::Local,
                     completeness: BindingCompleteness::Complete,
                     definitive_attributes,
@@ -2729,7 +2756,11 @@ impl ResolvedBindings {
             let Some(binding_name) = d.binding.as_ref() else {
                 continue;
             };
-            let mut merged = crate::resource::attrs_to_hashmap(&d.attributes);
+            let mut merged = d
+                .attributes
+                .iter()
+                .map(|(key, value)| (key.clone(), value.to_snapshot()))
+                .collect::<HashMap<_, _>>();
             let definitive_attributes = merged.keys().cloned().collect();
             let mut completeness = BindingCompleteness::Incomplete;
             match value {
@@ -2765,7 +2796,11 @@ impl ResolvedBindings {
             let Some(binding_name) = data_source.binding.as_ref() else {
                 continue;
             };
-            let attributes = crate::resource::attrs_to_hashmap(&data_source.attributes);
+            let attributes = data_source
+                .attributes
+                .iter()
+                .map(|(key, value)| (key.clone(), value.to_snapshot()))
+                .collect::<HashMap<_, _>>();
             let definitive_attributes = attributes.keys().cloned().collect();
             self.by_name.insert(
                 binding_name.to_string(),
@@ -2829,7 +2864,9 @@ impl ResolvedBindings {
                     binding.removed_sensitive_attributes.clear();
                     for attribute in changed_attributes {
                         if let Some(value) = desired.get(attribute) {
-                            binding.attributes.insert(attribute.clone(), value.clone());
+                            binding
+                                .attributes
+                                .insert(attribute.clone(), value.to_snapshot());
                         } else {
                             if binding
                                 .attributes
@@ -2884,11 +2921,11 @@ impl ResolvedBindings {
     /// we trust the provider.
     ///
     /// Replaces the executor's `update_binding_map` helper (#2300).
-    pub fn record_applied(
+    pub fn record_applied<P: crate::resource::StateValueLeaf>(
         &mut self,
         binding: Option<&str>,
         resource_attrs: &SecretPreservingAttributes,
-        state: &State,
+        state: &State<P>,
         completeness: BindingCompleteness,
     ) {
         let Some(name) = binding else {
@@ -2896,9 +2933,10 @@ impl ResolvedBindings {
         };
         let mut merged = resource_attrs.values().clone();
         for (k, v) in &state.attributes {
+            let v = crate::resource::state_value_snapshot(v);
             let value = resource_attrs.values().get(k).map_or_else(
                 || v.clone(),
-                |shape| crate::value::mask_plaintext_using_secret_shape_fail_closed(v, shape),
+                |shape| crate::value::mask_plaintext_using_secret_shape_fail_closed(&v, shape),
             );
             merged.insert(k.clone(), value);
         }
@@ -2920,10 +2958,10 @@ impl ResolvedBindings {
     /// as the secret-shape authority. The caller resolves the wait alias to
     /// its target before dispatch, then this lookup happens again at completion
     /// so a just-created or just-updated target supplies the current shape.
-    pub(crate) fn secret_preserving_wait_snapshot(
+    pub(crate) fn secret_preserving_wait_snapshot<P: crate::resource::StateValueLeaf>(
         &self,
         target_binding: &str,
-        state: &State,
+        state: &State<P>,
     ) -> Result<SecretPreservingAttributes, String> {
         let target = self.by_name.get(target_binding).ok_or_else(|| {
             format!("wait target binding `{target_binding}` is unavailable after completion")
@@ -2959,6 +2997,26 @@ impl ResolvedBindings {
         &mut self,
         name: &str,
         attrs: HashMap<String, Value>,
+        source: BindingValueSource,
+        completeness: BindingCompleteness,
+    ) {
+        self.set_historical_with_completeness(
+            name,
+            attrs
+                .into_iter()
+                .map(|(key, value)| (key, value.to_snapshot()))
+                .collect(),
+            source,
+            completeness,
+        );
+    }
+
+    /// Install historical binding evidence. Resolution selects an attribute
+    /// before the snapshot-to-value conversion, so unrelated hashes stay opaque.
+    pub(crate) fn set_historical_with_completeness(
+        &mut self,
+        name: &str,
+        attrs: HashMap<String, crate::resource::SnapshotValue>,
         source: BindingValueSource,
         completeness: BindingCompleteness,
     ) {
@@ -3111,7 +3169,10 @@ impl<'a> IterableBindings<'a> {
                         (
                             name,
                             ResolvedBinding {
-                                attributes,
+                                attributes: attributes
+                                    .into_iter()
+                                    .map(|(key, value)| (key, value.to_snapshot()))
+                                    .collect(),
                                 source: BindingValueSource::Upstream,
                                 completeness: BindingCompleteness::Complete,
                                 definitive_attributes: HashSet::new(),
@@ -3127,7 +3188,7 @@ impl<'a> IterableBindings<'a> {
     }
 
     /// Resolve a binding's attribute map (the iterable's source).
-    pub fn get(&self, binding: &str) -> Option<&HashMap<String, Value>> {
+    pub fn get(&self, binding: &str) -> Option<&HashMap<String, crate::resource::SnapshotValue>> {
         self.bindings.get(binding)
     }
 
@@ -3144,7 +3205,7 @@ impl<'a> IterableBindings<'a> {
         &self,
         value: &Value,
         context: &crate::parser::ProviderContext,
-    ) -> Result<crate::resolver::ValueResolution, String> {
+    ) -> Result<crate::resolver::ValueResolution, crate::resolver::ResolutionError> {
         crate::resolver::project_ref_value_status(value, self.bindings.as_ref(), context)
     }
 
@@ -4390,7 +4451,7 @@ mod resolved_bindings_tests {
         DataSourceValues::from_data_sources(data_sources, |data_source| {
             states.get(&data_source.id).map_or_else(
                 || DataSourceValue::deferred_to_apply(Vec::new()),
-                |state| DataSourceValue::read(state.clone()),
+                |state| DataSourceValue::read(state.to_snapshot()),
             )
         })
     }
@@ -4430,9 +4491,7 @@ mod resolved_bindings_tests {
         let attrs = resolved.get("vpc").expect("vpc binding present");
         assert_eq!(
             attrs.get("cidr_block"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "10.0.0.0/16".into()
-            )))
+            Some(&(Value::Concrete(ConcreteValue::String("10.0.0.0/16".into()))).to_snapshot())
         );
         assert_eq!(resolved.source("vpc"), Some(&BindingValueSource::Local));
     }
@@ -4491,14 +4550,12 @@ mod resolved_bindings_tests {
         let attrs = resolved.get("vpc").expect("vpc binding present");
         assert_eq!(
             attrs.get("id"),
-            Some(&Value::Concrete(ConcreteValue::String("vpc-abc".into()))),
+            Some(&(Value::Concrete(ConcreteValue::String("vpc-abc".into()))).to_snapshot()),
             "state-only attribute must be merged in",
         );
         assert_eq!(
             attrs.get("cidr_block"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "10.0.0.0/16".into()
-            ))),
+            Some(&(Value::Concrete(ConcreteValue::String("10.0.0.0/16".into()))).to_snapshot()),
             "DSL value must win when both sides define a key",
         );
     }
@@ -4548,7 +4605,7 @@ mod resolved_bindings_tests {
             .expect("partial-read missing attribute must be materialized");
         assert!(matches!(
             a_dns_name,
-            Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(pending)))
+            crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(pending)))
                 if pending == &PendingReRead::incomplete("read after create did not return dns_name")
         ));
 
@@ -4569,7 +4626,7 @@ mod resolved_bindings_tests {
             .expect("target attribute should remain present");
         assert!(matches!(
             target,
-            Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(pending)))
+            crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(pending)))
                 if pending == &PendingReRead::incomplete("read after create did not return dns_name")
         ));
     }
@@ -4604,7 +4661,7 @@ mod resolved_bindings_tests {
         let attrs = resolved.get("network").expect("upstream binding present");
         assert_eq!(
             attrs.get("vpc_id"),
-            Some(&Value::Concrete(ConcreteValue::String("vpc-123".into())))
+            Some(&(Value::Concrete(ConcreteValue::String("vpc-123".into()))).to_snapshot())
         );
         assert_eq!(
             resolved.source("network"),
@@ -4681,7 +4738,7 @@ mod resolved_bindings_tests {
         let attrs = resolved.get("shared").expect("shared binding present");
         assert_eq!(
             attrs.get("kind"),
-            Some(&Value::Concrete(ConcreteValue::String("upstream".into()))),
+            Some(&(Value::Concrete(ConcreteValue::String("upstream".into()))).to_snapshot()),
             "upstream binding must override local one with the same name",
         );
         assert_eq!(
@@ -4797,20 +4854,16 @@ mod resolved_bindings_tests {
         let attrs = resolved.get("vpc").expect("vpc binding present");
         assert_eq!(
             attrs.get("name"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "vpc-applied".into()
-            ))),
+            Some(&(Value::Concrete(ConcreteValue::String("vpc-applied".into()))).to_snapshot()),
             "state must win over resource_attrs on conflict",
         );
         assert_eq!(
             attrs.get("id"),
-            Some(&Value::Concrete(ConcreteValue::String("vpc-abc".into())))
+            Some(&(Value::Concrete(ConcreteValue::String("vpc-abc".into()))).to_snapshot())
         );
         assert_eq!(
             attrs.get("cidr_block"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "10.0.0.0/16".into()
-            ))),
+            Some(&(Value::Concrete(ConcreteValue::String("10.0.0.0/16".into()))).to_snapshot()),
         );
         assert_eq!(resolved.source("vpc"), Some(&BindingValueSource::Local));
     }
@@ -4845,9 +4898,10 @@ mod resolved_bindings_tests {
             resolved
                 .get("secret")
                 .and_then(|attrs| attrs.get("comment")),
-            Some(&Value::Deferred(crate::resource::DeferredValue::Secret(
-                Box::new(plaintext)
-            )))
+            Some(
+                &(Value::Deferred(crate::resource::DeferredValue::Secret(Box::new(plaintext))))
+                    .to_snapshot()
+            )
         );
     }
 
@@ -4855,7 +4909,7 @@ mod resolved_bindings_tests {
     fn record_applied_with_no_binding_is_a_noop() {
         let mut resolved = ResolvedBindings::default();
         let attrs: HashMap<String, Value> = HashMap::new();
-        let state = State {
+        let state: crate::resource::State = State {
             id: ResourceId::with_identity("test.resource", "anon"),
             identifier: None,
             exists: true,
@@ -4953,7 +5007,7 @@ mod resolved_bindings_tests {
         );
         assert_eq!(
             resolved.get("registry").and_then(|a| a.get("kind")),
-            Some(&Value::Concrete(ConcreteValue::String("first".into())))
+            Some(&(Value::Concrete(ConcreteValue::String("first".into()))).to_snapshot())
         );
 
         let replacement: HashMap<String, Value> = vec![(
@@ -4970,7 +5024,7 @@ mod resolved_bindings_tests {
         );
         assert_eq!(
             resolved.get("registry").and_then(|a| a.get("kind")),
-            Some(&Value::Concrete(ConcreteValue::String("second".into())))
+            Some(&(Value::Concrete(ConcreteValue::String("second".into()))).to_snapshot())
         );
     }
 
@@ -5009,9 +5063,12 @@ mod resolved_bindings_tests {
             resolved
                 .get("cert_issued")
                 .and_then(|a| a.get("certificate_arn")),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "arn:aws:acm:us-east-1:1:certificate/abc".into()
-            ))),
+            Some(
+                &(Value::Concrete(ConcreteValue::String(
+                    "arn:aws:acm:us-east-1:1:certificate/abc".into()
+                )))
+                .to_snapshot()
+            ),
             "cert_issued.certificate_arn must passthrough to cert's value"
         );
         assert_eq!(
@@ -5064,7 +5121,7 @@ mod resolved_bindings_tests {
         });
         assert_eq!(
             resolved.get("waited").and_then(|a| a.get("id")),
-            Some(&Value::Concrete(ConcreteValue::String("up-1".into())))
+            Some(&(Value::Concrete(ConcreteValue::String("up-1".into()))).to_snapshot())
         );
     }
 
@@ -5099,7 +5156,7 @@ mod resolved_bindings_tests {
             resolved
                 .get("cert_issued")
                 .and_then(|a| a.get("certificate_arn")),
-            Some(&Value::Concrete(ConcreteValue::String("arn:old".into()))),
+            Some(&(Value::Concrete(ConcreteValue::String("arn:old".into()))).to_snapshot()),
             "wait alias is a snapshot: a later set('cert', …) must not mutate it"
         );
     }
@@ -5141,7 +5198,7 @@ mod resolved_bindings_tests {
         assert_eq!(a, b);
         assert_eq!(
             a,
-            Some(Value::Concrete(ConcreteValue::String("arn:shared".into())))
+            Some((Value::Concrete(ConcreteValue::String("arn:shared".into()))).to_snapshot())
         );
     }
 
@@ -5232,7 +5289,7 @@ mod resolved_bindings_tests {
             .get("arns")
             .expect("read-state attribute `arns` must be visible on the binding");
         match arns {
-            Value::Concrete(ConcreteValue::List(items)) => {
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(items)) => {
                 assert_eq!(items.len(), 1, "one role arn returned");
             }
             other => panic!("expected concrete List, got {:?}", other),
@@ -5317,9 +5374,7 @@ mod resolved_bindings_tests {
             resolved
                 .get("caller")
                 .and_then(|attributes| attributes.get("account_id")),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "111111111111".into()
-            )))
+            Some(&(Value::Concrete(ConcreteValue::String("111111111111".into()))).to_snapshot())
         );
     }
 
@@ -5371,9 +5426,7 @@ mod resolved_bindings_tests {
         let attrs = resolved.get("echo").expect("echo binding present");
         assert_eq!(
             attrs.get("filter"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "provider-result".into()
-            ))),
+            Some(&(Value::Concrete(ConcreteValue::String("provider-result".into()))).to_snapshot()),
             "read-state attribute must override DSL input on collision",
         );
     }
@@ -5422,9 +5475,7 @@ mod resolved_bindings_tests {
         let attrs = resolved.get("caller").expect("caller binding present");
         assert_eq!(
             attrs.get("account_id"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "111111111111".into()
-            ))),
+            Some(&(Value::Concrete(ConcreteValue::String("111111111111".into()))).to_snapshot()),
             "with no DSL inputs, the binding's content is entirely the \
              read state's attributes",
         );

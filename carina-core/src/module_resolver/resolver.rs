@@ -310,6 +310,7 @@ impl ResidualModuleResolutionError {
                     )
                 }
                 ParseError::Syntax(_)
+                | ParseError::UnavailableSecret(_)
                 | ParseError::InvalidExpression {
                     line: _,
                     message: _,

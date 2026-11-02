@@ -53,9 +53,13 @@ impl HistoricalDisplaySource for HashMap<DeletedInstanceKey, HashMap<String, Val
         let mut display = HistoricalDisplayAttributes::for_plan(plan);
         let empty_nested_write_only = carina_core::provider::NestedWriteOnlyRecord::new();
         for (key, attributes) in self {
+            let attributes = attributes
+                .iter()
+                .map(|(key, value)| (key.clone(), value.to_snapshot()))
+                .collect();
             display.set_delete_from_provider_and_persisted(
                 key.clone(),
-                attributes,
+                &attributes,
                 None,
                 &empty_nested_write_only,
             );

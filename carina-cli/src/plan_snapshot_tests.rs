@@ -3609,9 +3609,18 @@ fn round2_saved_plan_matches_existing_nested_and_tags_snapshots() {
         let runtime = crate::test_support::TestCommandRuntime::new();
         let fp = build_plan_from_fixture_name(&runtime, fixture)
             .expect("fixture mock inputs must be valid");
-        let wire = serde_json::to_vec(&carina_core::plan::SavedPlan::from(fp.plan)).unwrap();
+        let wire =
+            serde_json::to_vec(&carina_core::plan::SavedPlan::from(fp.plan.to_snapshot())).unwrap();
         let saved: carina_core::plan::UnresolvedSavedPlan = serde_json::from_slice(&wire).unwrap();
-        let plan = saved.resolve_with_schemas(&fp.schemas).unwrap();
+        let snapshot = saved.resolve_with_schemas(&fp.schemas).unwrap();
+        let plan = carina_core::value::rehydrate_plan_desired_secrets(
+            &snapshot,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            carina_core::parser::ExpandedInferredFile::default().deferred_for_expressions(),
+        )
+        .expect("ordinary desired values cross the saved-plan snapshot boundary");
         let provider =
             provider_router_for_plan(&runtime, &plan).expect("fixture mock inputs must be valid");
         let summary = PlanChangeSummary::new(&plan, &[], &fp.deferred_for_expressions, &[]);

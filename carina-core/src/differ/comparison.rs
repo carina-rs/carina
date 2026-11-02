@@ -10,15 +10,49 @@ use crate::provider::{InitializedProvider, NestedWriteOnlyRecord, ReferenceScope
 use crate::references::{ReferenceOperand, ReferenceSide};
 use crate::resource::{
     ApplyTimeUnknown, CanonicalComparisonAttributes, ConcreteValue, DeferredValue,
-    InterpolationPart, MaskedComparisonAttributes, ResolvedIgnoreChanges, SavedValueViews, Value,
-    ValueString, merge_with_saved, value_at_leaf,
+    InterpolationPart, MaskedComparisonAttributes, ResolvedIgnoreChanges, SavedValueViews,
+    SnapshotValue as Value, ValueString, merge_with_saved, value_at_leaf,
 };
 use crate::schema::{
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema, DslTransform,
     LeafPath, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms, TypeIdentity,
     empty_defs_for_schema_walks,
 };
-use crate::value::{PersistedValue, canonical_secret_hash_material, contains_secret};
+use crate::value::{PersistedValue, SerializationError, contains_secret};
+
+/// A comparison cannot publish a verdict without its required evidence.
+#[derive(Debug, thiserror::Error)]
+pub enum ComparisonError {
+    #[error(transparent)]
+    Reference(#[from] Box<crate::references::ReferencePlanError>),
+    #[error(transparent)]
+    Secret(#[from] SerializationError),
+}
+
+impl From<ComparisonError> for crate::provider::ProviderError {
+    fn from(error: ComparisonError) -> Self {
+        Self::invalid_input_caused_by("Failed to compare resource attributes", error)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ComparisonErrors<'a> {
+    Scoped(&'a std::cell::RefCell<Option<ComparisonError>>),
+    #[cfg(any(test, feature = "test-utils"))]
+    Test,
+}
+
+impl ComparisonErrors<'_> {
+    fn retain(self, error: ComparisonError) {
+        match self {
+            Self::Scoped(errors) => {
+                errors.borrow_mut().get_or_insert(error);
+            }
+            #[cfg(any(test, feature = "test-utils"))]
+            Self::Test => panic!("unexpected comparison failure in test fixture: {error}"),
+        }
+    }
+}
 
 /// Scope and schema forms resolved from one initialized provider. This is not
 /// a comparison context: callers must explicitly choose planning or observation.
@@ -34,6 +68,7 @@ pub struct ComparisonSchema<'a> {
 pub struct ComparisonContext<'a, R: ReferenceEquality> {
     schema: ComparisonSchema<'a>,
     references: R,
+    errors: ComparisonErrors<'a>,
     path: &'a str,
     paths: Option<&'a [String; 2]>,
     indices: Option<&'a [Vec<usize>; 2]>,
@@ -115,7 +150,7 @@ impl ReferenceEquality for PlanningEquality<'_> {
             crate::schema::EffectiveType::for_value_walk(ty, defs),
             &operand.path,
         ) {
-            self.0.error.borrow_mut().get_or_insert(error);
+            self.0.error.borrow_mut().get_or_insert(error.into());
         }
     }
 
@@ -133,7 +168,7 @@ impl ReferenceEquality for PlanningEquality<'_> {
         {
             Ok(equal) => equal,
             Err(error) => {
-                self.0.error.borrow_mut().get_or_insert(error);
+                self.0.error.borrow_mut().get_or_insert(error.into());
                 false
             }
         }
@@ -184,7 +219,7 @@ impl ReferenceEquality for DisplayEquality {
 struct ReferenceComparisonSession<'a> {
     references: &'a crate::references::ResolvedReferences,
     resource: &'a crate::resource::ResourceId,
-    error: std::cell::RefCell<Option<Box<crate::references::ReferencePlanError>>>,
+    error: std::cell::RefCell<Option<ComparisonError>>,
 }
 
 impl<'a> ComparisonSchema<'a> {
@@ -210,11 +245,15 @@ impl<'a> ComparisonSchema<'a> {
         Self::from_scope_and_forms(scope, reference_forms)
     }
 
-    /// Explicitly compare refreshed observations or state writeback bytes.
-    pub fn observation(self) -> ObservationComparison<'a> {
+    fn context<'s, R: ReferenceEquality>(
+        &'s self,
+        references: R,
+        errors: ComparisonErrors<'s>,
+    ) -> ComparisonContext<'s, R> {
         ComparisonContext {
-            schema: self,
-            references: ObservationEquality,
+            schema: *self,
+            references,
+            errors,
             path: "",
             paths: None,
             indices: None,
@@ -226,17 +265,55 @@ impl<'a> ComparisonSchema<'a> {
         }
     }
 
-    pub fn authoring<'r>(
-        &'r self,
-        references: Option<&'r crate::references::ResolvedReferences>,
-        resource: &'r crate::resource::ResourceId,
-    ) -> AuthoringComparison<'r> {
-        ComparisonContext {
-            schema: *self,
-            references: AuthoringEquality {
+    fn checked<R: ReferenceEquality, T>(
+        &self,
+        references: R,
+        compare: impl for<'session> FnOnce(ComparisonContext<'session, R>) -> T,
+    ) -> Result<T, ComparisonError> {
+        let errors = std::cell::RefCell::new(None);
+        let result = compare(self.context(references, ComparisonErrors::Scoped(&errors)));
+        match errors.into_inner() {
+            Some(error) => Err(error),
+            None => Ok(result),
+        }
+    }
+
+    /// Compare observations only after every secret verification succeeds.
+    pub fn with_observation<T>(
+        &self,
+        compare: impl for<'session> FnOnce(&ObservationComparison<'session>) -> T,
+    ) -> Result<T, ComparisonError> {
+        self.checked(ObservationEquality, |context| compare(&context))
+    }
+
+    pub fn with_authoring<T>(
+        &self,
+        references: Option<&crate::references::ResolvedReferences>,
+        resource: &crate::resource::ResourceId,
+        compare: impl for<'session> FnOnce(&AuthoringComparison<'session>) -> T,
+    ) -> Result<T, ComparisonError> {
+        let errors = std::cell::RefCell::new(None);
+        let context = self.context(
+            AuthoringEquality {
                 references,
                 resource,
             },
+            ComparisonErrors::Scoped(&errors),
+        );
+        let result = compare(&context);
+        match errors.into_inner() {
+            Some(error) => Err(error),
+            None => Ok(result),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn observation_for_test(self) -> ObservationComparison<'a> {
+        ComparisonContext {
+            schema: self,
+            references: ObservationEquality,
+            errors: ComparisonErrors::Test,
             path: "",
             paths: None,
             indices: None,
@@ -250,30 +327,23 @@ impl<'a> ComparisonSchema<'a> {
 
     /// Only this scope constructs a planning context. Its higher-ranked
     /// callback cannot release output until missing witness entries have been
-    /// checked, and cannot return the context itself.
+    /// checked, and cannot return the context itself. Secret verification errors
+    /// share that boundary and can never become a changed verdict.
     pub fn with_references<T>(
         &self,
         references: &crate::references::ResolvedReferences,
         resource: &crate::resource::ResourceId,
         compare: impl for<'session> FnOnce(&PlanningComparison<'session>) -> T,
-    ) -> Result<T, Box<crate::references::ReferencePlanError>> {
+    ) -> Result<T, ComparisonError> {
         let session = ReferenceComparisonSession {
             references,
             resource,
             error: std::cell::RefCell::new(None),
         };
-        let context = ComparisonContext {
-            schema: *self,
-            references: PlanningEquality(&session),
-            path: "",
-            paths: None,
-            indices: None,
-            reversed_paths: false,
-            sides: [ReferenceSide::Current, ReferenceSide::Desired],
-            origins: [None, None],
-            merge_origins: None,
-            rendered: None,
-        };
+        let context = self.context(
+            PlanningEquality(&session),
+            ComparisonErrors::Scoped(&session.error),
+        );
         let result = compare(&context);
         match session.error.into_inner() {
             Some(error) => Err(error),
@@ -283,27 +353,16 @@ impl<'a> ComparisonSchema<'a> {
 
     pub(crate) fn with_recorded_effects<T>(
         &self,
-        compare: impl FnOnce(SavedPlanComparison<'_>) -> T,
-    ) -> T {
-        compare(ComparisonContext {
-            schema: *self,
-            references: DisplayEquality,
-            path: "",
-            paths: None,
-            indices: None,
-            reversed_paths: false,
-            sides: [ReferenceSide::Current, ReferenceSide::Desired],
-            origins: [None, None],
-            merge_origins: None,
-            rendered: None,
-        })
+        compare: impl for<'session> FnOnce(SavedPlanComparison<'session>) -> T,
+    ) -> Result<T, ComparisonError> {
+        self.checked(DisplayEquality, compare)
     }
 }
 
 impl<'a> ObservationComparison<'a> {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_test(scope: &'a ReferenceScope, reference_forms: &'a ReferenceForms) -> Self {
-        ComparisonSchema::for_test(scope, reference_forms).observation()
+        ComparisonSchema::for_test(scope, reference_forms).observation_for_test()
     }
 }
 
@@ -313,6 +372,33 @@ pub(crate) type OperandOrigins = HashMap<String, ReferenceOperand>;
 pub(crate) type RenderedChanges = std::collections::BTreeSet<(ReferenceSide, String)>;
 
 impl<R: ReferenceEquality> ComparisonContext<'_, R> {
+    /// Observation policy within the same checked comparison scope.
+    pub fn observation(&self) -> ObservationComparison<'_> {
+        ComparisonContext {
+            schema: self.schema,
+            references: ObservationEquality,
+            errors: self.errors,
+            path: self.path,
+            paths: self.paths,
+            indices: self.indices,
+            reversed_paths: self.reversed_paths,
+            sides: self.sides,
+            origins: self.origins,
+            merge_origins: self.merge_origins,
+            rendered: self.rendered,
+        }
+    }
+
+    fn secret_matches_state(&self, inner: &Value, state: &Value) -> bool {
+        match secret_matches_state(inner, state) {
+            Ok(equal) => equal,
+            Err(error) => {
+                self.errors.retain(error.into());
+                false
+            }
+        }
+    }
+
     fn validate_secret_operands(
         &self,
         a: &Value,
@@ -758,15 +844,21 @@ impl<R: ReferenceEquality> ComparisonContext<'_, R> {
 // rows agree with `find_changed_attributes`' own verdict. Reusing it
 // — never reimplementing — is the carina#3073 fix; a second equality
 // notion is precisely the drift this avoids.
-pub(crate) fn type_aware_equal<R: ReferenceEquality>(
-    a: &Value,
-    b: &Value,
+pub(crate) fn type_aware_equal<
+    R: ReferenceEquality,
+    P: crate::resource::StateValueLeaf,
+    Q: crate::resource::StateValueLeaf,
+>(
+    a: &crate::resource::Value<P>,
+    b: &crate::resource::Value<Q>,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
     context: &ComparisonContext<'_, R>,
 ) -> bool {
-    context.validate_secret_operands(a, b, attr_type, defs);
-    type_aware_equal_on_path(a, b, attr_type, defs, &[], context)
+    let a = crate::resource::state_value_snapshot(a);
+    let b = crate::resource::state_value_snapshot(b);
+    context.validate_secret_operands(&a, &b, attr_type, defs);
+    type_aware_equal_on_path(&a, &b, attr_type, defs, &[], context)
 }
 
 fn type_aware_equal_on_path<'a, R: ReferenceEquality>(
@@ -780,10 +872,10 @@ fn type_aware_equal_on_path<'a, R: ReferenceEquality>(
     // Secret comparison: compare the desired secret with the typed hash
     // decoded from state. Desired carries `DeferredValue::Secret(inner)`.
     if let Value::Deferred(DeferredValue::Secret(inner)) = a {
-        return secret_matches_state(inner, b);
+        return context.secret_matches_state(inner, b);
     }
     if let Value::Deferred(DeferredValue::Secret(inner)) = b {
-        return secret_matches_state(inner, a);
+        return context.secret_matches_state(inner, a);
     }
 
     // Retain top-level Ref names across non-consuming Union recursion. Each
@@ -1257,23 +1349,20 @@ fn is_type_default(
 ///    fix for issue #1249 where secrets nested in Maps (e.g., tags) caused false
 ///    diffs because the provider returns plain-text values on read.
 ///
-fn secret_matches_state(inner: &Value, state_value: &Value) -> bool {
-    if let Value::Deferred(DeferredValue::RedactedSecret { hash }) = state_value {
-        let Ok(material) = canonical_secret_hash_material(inner) else {
-            return false;
-        };
-        return hash.verify(material);
+fn secret_matches_state(inner: &Value, state_value: &Value) -> Result<bool, SerializationError> {
+    if state_value.secret_hash().is_some() {
+        return state_value.verify_secret(&inner.to_value_at("comparison.secret")?);
     }
 
     // Case 2: State has plain-text value (from provider read / --refresh=true).
     // Compare the inner secret value directly against the raw state string.
-    match (inner, state_value) {
+    Ok(match (inner, state_value) {
         (
             Value::Concrete(ConcreteValue::String(inner_str)),
             Value::Concrete(ConcreteValue::String(state_str)),
         ) => inner_str == state_str,
         _ => false,
-    }
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -1350,10 +1439,9 @@ fn contains_pending_reread(value: &Value) -> bool {
         | Value::Deferred(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
-            | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_),
         ) => false,
-        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        Value::Deferred(DeferredValue::Placeholder(_)) => false,
     }
 }
 
@@ -1584,7 +1672,6 @@ fn has_observable_content(value: &Value) -> bool {
         | Value::Concrete(ConcreteValue::Float(_))
         | Value::Concrete(ConcreteValue::Bool(_))
         | Value::Concrete(ConcreteValue::Duration(_))
-        | Value::Deferred(DeferredValue::RedactedSecret { .. })
         | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::Coalesce { .. })
@@ -1595,7 +1682,7 @@ fn has_observable_content(value: &Value) -> bool {
         | Value::Deferred(DeferredValue::Access(_))
         | Value::Deferred(DeferredValue::Unknown(_))
         | Value::Deferred(DeferredValue::Unavailable { .. }) => true,
-        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        Value::Deferred(DeferredValue::Placeholder(_)) => true,
     }
 }
 
@@ -1990,9 +2077,20 @@ pub(crate) struct ApplyTimeCreateOnlyChange {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ApplyTimeComparisonError {
     #[error(transparent)]
+    Secret(SerializationError),
+    #[error(transparent)]
     Reference(#[from] Box<crate::references::ReferencePlanError>),
     #[error("Create-only augmentation failed")] // error-chain: caller-renders-sources
     CreateOnly(#[from] ApplyTimeCreateOnlyChange),
+}
+
+impl From<ComparisonError> for ApplyTimeComparisonError {
+    fn from(error: ComparisonError) -> Self {
+        match error {
+            ComparisonError::Reference(error) => Self::Reference(error),
+            ComparisonError::Secret(error) => Self::Secret(error),
+        }
+    }
 }
 
 /// Reconsider only apply-resolved keys excluded by the original plan. The
@@ -2099,6 +2197,74 @@ mod tests {
     }
 
     #[test]
+    fn secret_comparison_propagates_unavailable_material() {
+        let plaintext = crate::resource::ExpandedValue::Concrete(
+            crate::resource::ExpandedConcreteValue::String("saved secret".into()),
+        );
+        let hash =
+            crate::value::redact_secrets_in_value(&crate::resource::ExpandedValue::Deferred(
+                crate::resource::ExpandedDeferredValue::Secret(Box::new(plaintext)),
+            ))
+            .unwrap();
+        let material = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "opaque".into(),
+            hash.clone(),
+        )])));
+        let error = secret_matches_state(&material, &hash)
+            .expect_err("unavailable material must not become a changed verdict");
+        assert!(
+            matches!(error, crate::value::SerializationError::UnavailableSecret(ref error)
+            if error.path() == "comparison.secret.opaque")
+        );
+
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(material)));
+        let schema = crate::differ::exact_comparison_schema_for_tests();
+        let witnesses = crate::references::prepare_empty_for_tests();
+        let resource = crate::resource::ResourceId::with_identity("test.Resource", "example");
+        let planning = schema.with_references(&witnesses, &resource, |comparison| {
+            super::type_aware_equal(
+                &secret,
+                &hash,
+                None,
+                empty_defs_for_schema_walks(),
+                comparison,
+            )
+        });
+        let observation = schema.with_observation(|comparison| {
+            super::type_aware_equal(
+                &secret,
+                &hash,
+                None,
+                empty_defs_for_schema_walks(),
+                comparison,
+            )
+        });
+        let authoring = schema.with_authoring(None, &resource, |comparison| {
+            super::type_aware_equal(
+                &secret,
+                &hash,
+                None,
+                empty_defs_for_schema_walks(),
+                comparison,
+            )
+        });
+        let recorded = schema.with_recorded_effects(|comparison| {
+            super::type_aware_equal(
+                &secret,
+                &hash,
+                None,
+                empty_defs_for_schema_walks(),
+                &comparison,
+            )
+        });
+        for verdict in [planning, observation, authoring, recorded] {
+            assert!(matches!(verdict, Err(ComparisonError::Secret(
+                SerializationError::UnavailableSecret(ref error)
+            )) if error.path() == "comparison.secret.opaque"));
+        }
+    }
+
+    #[test]
     fn saved_plan_display_equality_compares_reference_bytes_without_a_witness() {
         let attr_type = AttributeType::reference(
             TypeIdentity::new(Some("test"), ["keys", "Key"], "Reference"),
@@ -2107,22 +2273,24 @@ mod tests {
         );
         let value = Value::Concrete(ConcreteValue::String("alias/live".into()));
         let other = Value::Concrete(ConcreteValue::String("key/a".into()));
-        crate::differ::exact_comparison_schema_for_tests().with_recorded_effects(|comparison| {
-            assert!(super::type_aware_equal(
-                &value,
-                &value,
-                Some(&attr_type),
-                empty_defs_for_schema_walks(),
-                &comparison
-            ));
-            assert!(!super::type_aware_equal(
-                &value,
-                &other,
-                Some(&attr_type),
-                empty_defs_for_schema_walks(),
-                &comparison
-            ));
-        });
+        crate::differ::exact_comparison_schema_for_tests()
+            .with_recorded_effects(|comparison| {
+                assert!(super::type_aware_equal(
+                    &value,
+                    &value,
+                    Some(&attr_type),
+                    empty_defs_for_schema_walks(),
+                    &comparison
+                ));
+                assert!(!super::type_aware_equal(
+                    &value,
+                    &other,
+                    Some(&attr_type),
+                    empty_defs_for_schema_walks(),
+                    &comparison
+                ));
+            })
+            .expect("recorded comparison must succeed");
     }
 
     #[test]

@@ -15,7 +15,12 @@ where
     T: DeserializeOwned + Serialize,
 {
     let original: Value = serde_json::from_str(fixture).expect("fixture must contain valid JSON");
-    let decoded: T = serde_json::from_value(original.clone()).expect("fixture must deserialize");
+    let decoded: T = serde_json::from_str(fixture).expect("fixture must deserialize");
+    assert_eq!(
+        carina_core::utils::pretty_with_newline(&decoded).expect("current writer"),
+        fixture,
+        "the current format must retain the exact fixture bytes",
+    );
     let reserialized = serde_json::to_value(decoded).expect("fixture must re-serialize");
 
     assert_eq!(reserialized, original);
@@ -52,6 +57,11 @@ fn current_state_binding_addresses_and_resolved_dependencies_round_trip() {
         .flat_map(|resource| resource.binding.iter())
         .map(|address| address.as_str().to_string())
         .collect();
+    assert_eq!(
+        carina_core::utils::pretty_with_newline(&decoded).unwrap(),
+        fixture,
+        "format 21 must retain the exact state fixture bytes"
+    );
     let reserialized = serde_json::to_value(&decoded).expect("fixture must re-serialize");
 
     assert_eq!(reserialized, original);

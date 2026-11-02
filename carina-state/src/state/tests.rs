@@ -2,7 +2,7 @@ use super::*;
 use carina_core::resource::Directives;
 use carina_core::resource::{
     DeferredValue, PendingReRead, ReReadReason, ResolvedDependencies, SavedModuleSource,
-    absolute_binding_address_for_test,
+    SnapshotLeaf, absolute_binding_address_for_test,
 };
 use carina_core::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
@@ -138,9 +138,12 @@ fn round3_carried_reference_list_keeps_removal_provenance_across_alias_and_arn()
     }
 }
 
-fn resource_state_from_provider_state_for_resource_and_schema_for_test<S: Clone>(
+fn resource_state_from_provider_state_for_resource_and_schema_for_test<
+    S: Clone,
+    P: StateValueLeaf,
+>(
     resource: &carina_core::resource::ResolvedResource<S>,
-    state: &State,
+    state: &State<P>,
     existing: Option<&ResourceState>,
     schema: Option<&carina_core::schema::CompiledResourceSchema>,
     row_basis: RowBasis<'_>,
@@ -174,9 +177,9 @@ fn resource_state_from_observation_for_test<S: Clone>(
     )
 }
 
-fn diff(
+fn diff<P: StateValueLeaf>(
     desired: &carina_core::resource::ResolvedResource,
-    current: &State,
+    current: &State<P>,
     saved_attrs: &carina_core::provider::LiftedSavedAttrs,
     prev_explicit: Option<&carina_core::explicit::ExplicitFields>,
     schema: Option<&carina_core::schema::CompiledResourceSchema>,
@@ -1044,7 +1047,7 @@ fn restore_partial_read_markers_shrinks_and_clears_resolved_attributes() {
         .upsert_resource(clearing_row)
         .expect("clearing fixture row is unique");
 
-    let resolved_value = Value::Concrete(ConcreteValue::String("now-known".into()));
+    let resolved_value: Value = Value::Concrete(ConcreteValue::String("now-known".into()));
     let mut refreshed = HashMap::from([
         (
             shrinking_id.clone(),
@@ -1258,7 +1261,7 @@ fn structural_secret_digest(value: &serde_json::Value) -> &str {
 }
 
 fn valid_legacy_marker_shaped_string(plaintext: &str) -> String {
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+    let secret: Value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String(plaintext.into()),
     ))));
     let encoded = PersistedValue::encode_provider_value(&secret, None)
@@ -1453,8 +1456,14 @@ fn v15_state_round_trip_keeps_user_and_provider_marker_strings_plain() {
         }
     };
 
-    assert_eq!(loaded.attributes.get("authored"), Some(&plain));
-    assert_eq!(loaded.attributes.get("provider_only"), Some(&plain));
+    assert_eq!(
+        loaded.attributes.get("authored"),
+        Some(&plain.to_snapshot())
+    );
+    assert_eq!(
+        loaded.attributes.get("provider_only"),
+        Some(&plain.to_snapshot())
+    );
     let raw: serde_json::Value = serde_json::from_str(&json).expect("state JSON");
     assert_eq!(
         raw["resources"][0]["current"]["attributes"]["authored"],
@@ -1552,7 +1561,9 @@ fn release_list_keys_only_demotes_matching_authoring_entries() {
         key_field: key_field.clone(),
         keys: ReleasedListKeys::try_new(vec![ReleasedListKey::new(
             "b",
-            Value::Concrete(ConcreteValue::String("2".into())),
+            Value::<carina_core::resource::NoPlaceholder>::Concrete(ConcreteValue::String(
+                "2".into(),
+            )),
         )])
         .expect("release fixture has one key"),
     };
@@ -2369,7 +2380,7 @@ fn test_from_provider_state() {
         .prefixes
         .insert("bucket_name".to_string(), "my-app-".to_string());
 
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("my-bucket-abcd1234".to_string()),
         attributes: [(
@@ -2418,7 +2429,7 @@ fn test_from_provider_state_without_existing() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
     let resource = Resource::with_provider("aws", "s3.Bucket", "test", None);
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("test-id".to_string()),
         attributes: [(
@@ -2650,7 +2661,7 @@ fn test_from_provider_state_repairs_unrecorded_from_desired_resource() {
 
     let resource = Resource::with_provider("awscc", "sso.Assignment", "x", None);
     // The desired resource intentionally has no authored attributes.
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("identifier".to_string()),
         attributes: [
@@ -2702,7 +2713,7 @@ fn test_from_provider_state_carry_prior_seeds_unrecorded_from_desired_without_pr
 
     let resource = Resource::with_provider("mock", "test.Resource", "main", None)
         .with_attribute("name", Value::Concrete(ConcreteValue::String("x".into())));
-    let provider_state = State::existing(
+    let provider_state: carina_core::resource::State = State::existing(
         resource.id.clone(),
         HashMap::from([
             (
@@ -2784,7 +2795,7 @@ fn test_from_provider_state_carry_prior_seeds_unrecorded_from_desired_without_pr
 fn test_from_provider_state_carry_prior_without_prior_seeds_from_desired() {
     let resource = Resource::with_provider("mock", "test.Resource", "main", None)
         .with_attribute("name", Value::Concrete(ConcreteValue::String("x".into())));
-    let provider_state = State::existing(
+    let provider_state: carina_core::resource::State = State::existing(
         resource.id.clone(),
         HashMap::from([
             (
@@ -2861,7 +2872,7 @@ fn test_from_provider_state_carry_prior_preserves_partially_removed_authored_key
         "name",
         Value::Concrete(ConcreteValue::String("kept".into())),
     );
-    let provider_state = State::existing(
+    let provider_state: carina_core::resource::State = State::existing(
         resource.id.clone(),
         HashMap::from([
             (
@@ -2911,7 +2922,7 @@ fn test_from_provider_state_carry_prior_demotes_retained_list_alignment() {
         "name",
         Value::Concrete(ConcreteValue::String("kept".into())),
     );
-    let provider_state = State::existing(
+    let provider_state: carina_core::resource::State = State::existing(
         resource.id.clone(),
         HashMap::from([
             (
@@ -2969,7 +2980,7 @@ fn test_from_provider_state_carry_prior_drops_removed_key_absent_from_fresh_stat
         "name",
         Value::Concrete(ConcreteValue::String("kept".into())),
     );
-    let provider_state = State::existing(
+    let provider_state: carina_core::resource::State = State::existing(
         resource.id.clone(),
         HashMap::from([(
             "name".to_string(),
@@ -3012,7 +3023,7 @@ fn carried_top_level_unrecorded_child_still_plans_its_removal() {
         "legacy",
         Value::Concrete(ConcreteValue::String("provider-value".into())),
     );
-    let provider_state = State::existing(
+    let provider_state: carina_core::resource::State = State::existing(
         authored.id.clone(),
         HashMap::from([(
             "legacy".to_string(),
@@ -3708,7 +3719,7 @@ fn test_from_provider_state_records_empty_struct_for_fresh_empty_body_resource()
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
     let resource = Resource::with_provider("aws", "sts.CallerIdentity", "caller", None);
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("identifier".to_string()),
         attributes: [(
@@ -3753,7 +3764,7 @@ fn test_from_provider_state_replaces_prior_authored_keys_after_all_attributes_ar
     };
 
     let resource = Resource::with_provider("awscc", "ec2.InternetGateway", "igw", None);
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("id".to_string()),
         attributes: [(
@@ -3844,7 +3855,7 @@ fn test_from_provider_state_replaces_prior_authored_keys_after_all_attributes_ar
 #[test]
 fn test_from_provider_state_replaces_prior_top_level_list_when_resource_attrs_empty() {
     let resource = Resource::with_provider("mock", "test.Resource", "empty", None);
-    let provider_state = State::existing(
+    let provider_state: carina_core::resource::State = State::existing(
         resource.id.clone(),
         HashMap::from([(
             "provider_value".to_string(),
@@ -3988,7 +3999,7 @@ fn test_from_provider_state_replaces_unrecorded_when_desired_and_state_attrs_are
     use carina_core::resource::{Resource, State as ProviderState};
 
     let resource = Resource::with_provider("awscc", "sso.Assignment", "x", None);
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("id".to_string()),
         attributes: HashMap::new(),
@@ -4444,7 +4455,9 @@ fn persisted_secret_hash_enters_plan_state_as_a_typed_placeholder() {
             .and_then(|attributes| attributes.get("comment")),
     ] {
         match loaded {
-            Some(Value::Deferred(DeferredValue::RedactedSecret { hash: loaded })) => {
+            Some(Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret {
+                hash: loaded,
+            }))) => {
                 assert!(
                     loaded.encoded_digest().starts_with("argon2-legacy:"),
                     "state load must retain the typed explicit legacy digest",
@@ -4482,7 +4495,7 @@ fn persisted_attribute_maps_are_the_typed_value_decode_boundary() {
     ] {
         assert!(matches!(
             decoded.get("token"),
-            Some(Value::Deferred(DeferredValue::RedactedSecret { hash: loaded }))
+            Some(Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { hash: loaded })))
                 if loaded.encoded_digest().starts_with("argon2-legacy:")
         ));
     }
@@ -4522,11 +4535,15 @@ fn state_file_persisted_attribute_type_preserves_serialized_bytes() {
     let deposed: &PersistedAttributes = &reloaded.resources()[0].deposed[0].attributes;
     assert!(matches!(
         current.get("token"),
-        Some(Value::Deferred(DeferredValue::RedactedSecret { .. }))
+        Some(Value::Deferred(DeferredValue::Placeholder(
+            SnapshotLeaf::RedactedSecret { .. }
+        )))
     ));
     assert!(matches!(
         deposed.get("token"),
-        Some(Value::Deferred(DeferredValue::RedactedSecret { .. }))
+        Some(Value::Deferred(DeferredValue::Placeholder(
+            SnapshotLeaf::RedactedSecret { .. }
+        )))
     ));
     assert_eq!(
         serde_json::to_vec(&reloaded).expect("serialize reloaded state"),
@@ -4975,7 +4992,7 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
             .expect("resource reference contains no parser placeholder"),
     );
 
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("subnet-123".to_string()),
         attributes: [(
@@ -5137,7 +5154,7 @@ fn refreshing_loaded_orphan_to_absent_cannot_retain_an_identifier() {
         .next()
         .expect("orphan remains visible");
 
-    let refreshed = loaded.with_refreshed_state(State::not_found(id));
+    let refreshed = loaded.with_refreshed_state(SnapshotState::not_found(id));
     match refreshed.current() {
         Current::Absent(state) => assert!(state.state().identifier.is_none()),
         Current::Present(present) => panic!(
@@ -5209,7 +5226,7 @@ fn orphan_provider_refresh_demotes_aligned_list_explicit_tree() {
             children: HashMap::from([("name".to_string(), ExplicitFields::Leaf)]),
         }],
     };
-    let fresh = State::existing(
+    let fresh: carina_core::resource::State = State::existing(
         id,
         HashMap::from([(
             "name".to_string(),
@@ -5237,7 +5254,7 @@ fn orphan_provider_refresh_demotes_aligned_list_explicit_tree() {
 #[test]
 fn orphan_provider_refresh_never_promotes_provider_keys_into_authoring_metadata() {
     let id = ResourceId::with_provider_identity("mock", "test.Resource", "orphan", None);
-    let fresh = State::existing(
+    let fresh: carina_core::resource::State = State::existing(
         id,
         HashMap::from([(
             "tags".to_string(),
@@ -5542,11 +5559,15 @@ fn v13_resource_secret_markers_migrate_to_structural_tags_but_exports_stay_liter
     ] {
         assert!(matches!(
             attributes.get("self_contained"),
-            Some(Value::Deferred(DeferredValue::RedactedSecret { .. }))
+            Some(Value::Deferred(DeferredValue::Placeholder(
+                SnapshotLeaf::RedactedSecret { .. }
+            )))
         ));
         assert!(matches!(
             attributes.get("raw_legacy"),
-            Some(Value::Deferred(DeferredValue::RedactedSecret { .. }))
+            Some(Value::Deferred(DeferredValue::Placeholder(
+                SnapshotLeaf::RedactedSecret { .. }
+            )))
         ));
     }
     assert!(matches!(
@@ -5887,7 +5908,9 @@ fn v11_fixture_migrates_nested_tagged_values_and_dollar_keys() {
 
     assert!(matches!(
         settings.get("$k"),
-        Some(Value::Deferred(DeferredValue::RedactedSecret { .. }))
+        Some(Value::Deferred(DeferredValue::Placeholder(
+            SnapshotLeaf::RedactedSecret { .. }
+        )))
     ));
     assert!(matches!(
         settings.get("legacy_enum"),
@@ -7025,7 +7048,7 @@ fn accepted_create_records_write_only_attributes() {
     );
 
     // Provider returns state without write-only attributes (API doesn't return them)
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("vpc-123".to_string()),
         attributes: [(
@@ -7082,8 +7105,7 @@ fn accepted_create_records_write_only_attributes() {
 
 #[test]
 fn desired_redacted_secret_is_rejected_consistently_when_provider_omits_attribute() {
-    use carina_core::resource::{ConcreteValue, DeferredValue, Resource, State, Value};
-    use carina_core::value::SerializationError;
+    use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 
     let historical = persisted_attributes_from_state_json(&HashMap::from([(
         "placeholder".to_string(),
@@ -7101,43 +7123,19 @@ fn desired_redacted_secret_is_rejected_consistently_when_provider_omits_attribut
         ),
         ("b".to_string(), redacted),
     ])));
-    let resource = Resource::with_provider("mock", "test.Resource", "main", None)
-        .with_attribute("settings", desired);
-
-    for provider_attributes in [
-        HashMap::new(),
-        HashMap::from([(
-            "settings".to_string(),
-            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
-        )]),
-    ] {
-        let provider_state = State::existing(resource.id.clone(), provider_attributes);
-        let error = resource_state_from_provider_state_for_resource_and_schema_for_test(
-            &resolved(&resource),
-            &provider_state,
-            None,
-            None,
-            RowBasis::Applied(&AcceptedRequest::create_for_test()),
-            None,
-        )
-        .expect_err("desired redacted secrets must never be written as new state");
-
-        assert!(matches!(
-            error,
-            ResourceStateEncodingError::Serialization(
-                SerializationError::RedactedSecretNotAllowed { .. }
-            )
-        ));
-    }
+    let error = desired
+        .to_value_at("mock.test.Resource.main.settings")
+        .expect_err("a historical hash cannot become an authored desired value");
+    assert!(matches!(
+        error,
+        carina_core::resource::UnavailableSecretError { .. }
+    ));
+    assert_eq!(error.path(), "mock.test.Resource.main.settings.b");
 }
 
 #[test]
 fn accepted_write_only_rejects_desired_redacted_secret() {
-    use carina_core::resource::{ConcreteValue, DeferredValue, Resource, State, Value};
-    use carina_core::schema::{
-        CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
-    };
-    use carina_core::value::SerializationError;
+    use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 
     let historical = persisted_attributes_from_state_json(&HashMap::from([(
         "placeholder".to_string(),
@@ -7155,29 +7153,14 @@ fn accepted_write_only_rejects_desired_redacted_secret() {
         ),
         ("b".to_string(), redacted),
     ])));
-    let resource = Resource::with_provider("mock", "test.Resource", "main", None)
-        .with_attribute("settings", desired);
-    let schema = ResourceSchema::new("test.Resource").attribute(
-        AttributeSchema::optional("settings", AttributeType::map(AttributeType::string()))
-            .write_only()
-            .build(),
-    );
-    let error = resource_state_from_provider_state_for_resource_and_schema_for_test(
-        &resolved(&resource),
-        &State::existing(resource.id.clone(), HashMap::new()).with_identifier("main-id"),
-        None,
-        Some(&schema),
-        RowBasis::Applied(&AcceptedRequest::create_for_test()),
-        None,
-    )
-    .expect_err("accepted redacted values cannot be encoded as new state");
-
+    let error = desired
+        .to_value_at("mock.test.Resource.main.settings")
+        .expect_err("a historical hash cannot become an authored desired value");
     assert!(matches!(
         error,
-        ResourceStateEncodingError::Serialization(
-            SerializationError::RedactedSecretNotAllowed { .. }
-        )
+        carina_core::resource::UnavailableSecretError { .. }
     ));
+    assert_eq!(error.path(), "mock.test.Resource.main.settings.b");
 }
 
 #[test]
@@ -7194,7 +7177,7 @@ fn accepted_create_does_not_record_write_only_attribute_absent_from_desired() {
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
 
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("vpc-123".to_string()),
         attributes: [(
@@ -7250,7 +7233,7 @@ fn accepted_write_only_does_not_overwrite_protected_provider_value() {
     );
 
     // Provider happens to return this attribute (unusual for write-only but possible)
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("vpc-123".to_string()),
         attributes: [(
@@ -7347,7 +7330,7 @@ fn test_from_provider_state_secret_stored_as_hash() {
         )))),
     );
 
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("my-db-id".to_string()),
         // Provider returns the actual password (since secret was unwrapped before sending)
@@ -7395,7 +7378,7 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
     let existing = ResourceState::try_applied("db.Instance", "main", "awscc", "db-old")
         .expect("fixture identifier is non-empty")
         .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("db-old".to_string()),
         attributes: [(
@@ -7432,11 +7415,56 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
 }
 
 #[test]
+fn deposed_encoders_return_unavailable_secret_errors() {
+    use carina_core::resource::{ConcreteValue, Resource, SnapshotValue};
+    let resource = resolved(&Resource::with_provider(
+        "mock",
+        "test.Resource",
+        "old",
+        None,
+    ));
+    let previous_json = HashMap::from([(
+        "password".into(),
+        structural_legacy_secret(&"ab".repeat(32)),
+    )]);
+    let previous = persisted_attributes_from_state_json(&previous_json);
+    let opaque = previous.get("password").unwrap();
+    let attributes = HashMap::from([(
+        "password".into(),
+        SnapshotValue::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "nested".into(),
+            opaque,
+        )]))),
+    )]);
+    let deposed = DeposedInstance::from_persisted_json(
+        DeposedKey::new_unique(),
+        "old-id".into(),
+        None,
+        previous_json,
+        PersistedDestroyDependencies::default(),
+    );
+    for result in [
+        deposed.refreshed_attributes_for_resource_and_schema(&resource, None, &attributes),
+        ResourceState::deposed_attributes_without_previous(
+            &resource,
+            None,
+            &attributes,
+            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&previous),
+        ),
+    ] {
+        let error = result.expect_err("unavailable material must be returned, not panic");
+        assert!(matches!(error, ResourceStateEncodingError::Serialization(
+            SerializationError::UnavailableSecret(ref error)
+        ) if error.path().ends_with(".nested")));
+    }
+}
+
+#[test]
 fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
     use carina_core::resource::{ConcreteValue, Resource, Value};
 
     let resource = Resource::with_provider("awscc", "db.Instance", "main", None);
-    let attrs = HashMap::from([(
+    let attrs: HashMap<String, Value> = HashMap::from([(
         "password".to_string(),
         Value::Concrete(ConcreteValue::String("plain-secret".into())),
     )]);
@@ -7450,7 +7478,8 @@ fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
-    );
+    )
+    .expect("deposed attributes must encode");
     let stored = state_json_from_persisted_attributes(stored.as_persisted());
     let password =
         structural_secret_digest(stored.get("password").expect("password remains stored"));
@@ -7464,7 +7493,7 @@ fn with_attributes_from_state_reuses_matching_secret_digest() {
     use carina_core::resource::{ConcreteValue, DeferredValue, ResourceId, State, Value};
 
     let id = ResourceId::with_provider_identity("mock", "test.resource", "stable", None);
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+    let secret: Value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String("stable-secret".into()),
     ))));
     let provider_state = State::existing(id, HashMap::from([("comment".to_string(), secret)]));
@@ -7504,7 +7533,7 @@ fn with_attributes_from_state_keeps_raw_legacy_shaped_text_plain() {
 
     let id = ResourceId::with_provider_identity("mock", "test.resource", "plain", None);
     let marker = format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32));
-    let provider_state = State::existing(
+    let provider_state: carina_core::resource::State = State::existing(
         id,
         HashMap::from([(
             "comment".to_string(),
@@ -7543,7 +7572,11 @@ fn accepted_write_only_keeps_raw_legacy_shaped_text_plain() {
     );
     let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&resource),
-        &State::existing(resource.id.clone(), HashMap::new()).with_identifier("plain-id"),
+        &State::<carina_core::resource::NoPlaceholder>::existing(
+            resource.id.clone(),
+            HashMap::new(),
+        )
+        .with_identifier("plain-id"),
         None,
         Some(&schema),
         RowBasis::Applied(&AcceptedRequest::create_for_test()),
@@ -7605,19 +7638,20 @@ fn nested_write_only_state_fixture(
 fn nested_write_only_record_lifecycle_hashes_sent_secrets_and_clears_on_remove() {
     use carina_core::resource::State as ProviderState;
 
-    let provider_state = |resource: &carina_core::resource::Resource| {
-        ProviderState::existing(
-            resource.id.clone(),
-            HashMap::from([(
-                "config".to_string(),
-                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-                    "issuer".to_string(),
-                    Value::Concrete(ConcreteValue::String("https://issuer.example.com".into())),
-                )]))),
-            )]),
-        )
-        .with_identifier("resource-id")
-    };
+    let provider_state =
+        |resource: &carina_core::resource::Resource| -> carina_core::resource::State {
+            ProviderState::existing(
+                resource.id.clone(),
+                HashMap::from([(
+                    "config".to_string(),
+                    Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                        "issuer".to_string(),
+                        Value::Concrete(ConcreteValue::String("https://issuer.example.com".into())),
+                    )]))),
+                )]),
+            )
+            .with_identifier("resource-id")
+        };
 
     // Add: a sent attribute without prior leaf provenance establishes it.
     let (added_resource, schema) = nested_write_only_state_fixture("add-secret");
@@ -7688,8 +7722,11 @@ fn nested_write_only_record_lifecycle_hashes_sent_secrets_and_clears_on_remove()
     let remove = AcceptedRequest::update_for_test(&[], &["config"]);
     let removed = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&removed_resource),
-        &ProviderState::existing(removed_resource.id.clone(), HashMap::new())
-            .with_identifier("resource-id"),
+        &ProviderState::<carina_core::resource::NoPlaceholder>::existing(
+            removed_resource.id.clone(),
+            HashMap::new(),
+        )
+        .with_identifier("resource-id"),
         Some(&reasserted),
         Some(&schema),
         RowBasis::Applied(&remove),
@@ -7736,7 +7773,7 @@ fn nested_write_only_record_hashes_leaf_under_secret_wrapped_struct() {
         )
         .build(),
     );
-    let provider_state = State::existing(
+    let provider_state: carina_core::resource::State = State::existing(
         resource.id.clone(),
         HashMap::from([(
             "config".to_string(),
@@ -7864,8 +7901,11 @@ fn provider_text_partial_create_writeback_preserves_raw_missing_attribute_keys()
                 PersistedAttributes::default(),
                 PersistedAttributes::default(),
             );
-        let diagnostic =
-            PartialReadDiagnostic::new("incomplete".into(), vec![key.clone()]).unwrap();
+        let reason = format!("incomplete {key}");
+        let diagnostic = PartialReadDiagnostic::new(reason.clone(), vec![key.clone()]).unwrap();
+        assert_eq!(diagnostic.raw_reason(), reason);
+        assert!(!diagnostic.reason().contains('\x1b'));
+        assert!(diagnostic.reason().len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
         let label = diagnostic.missing_attributes()[0].to_string();
         assert!(!label.contains('\x1b'));
         assert!(label.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
@@ -7891,6 +7931,10 @@ fn provider_text_partial_create_writeback_preserves_raw_missing_attribute_keys()
         assert_eq!(
             row.partial_read().unwrap().missing_attributes(),
             &BTreeSet::from([key])
+        );
+        assert_eq!(
+            row.partial_read().unwrap().pending(),
+            &PendingReRead::incomplete(reason)
         );
     }
 }
@@ -8309,7 +8353,8 @@ fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
-    );
+    )
+    .expect("deposed attributes must encode");
 
     let stored = state_json_from_persisted_attributes(stored.as_persisted());
     assert_eq!(stored.get("password"), Some(upgraded.as_json()));
@@ -8326,7 +8371,7 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
     let existing = ResourceState::try_applied("db.Instance", "main", "awscc", "db-old")
         .expect("fixture identifier is non-empty")
         .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("db-old".to_string()),
         attributes: [(
@@ -8376,7 +8421,7 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
         .expect("fixture identifier is non-empty")
         .with_attribute("password", structural_legacy_secret(&"ab".repeat(32)));
     existing.set_write_only_attributes_for_test(vec!["password".to_string()]);
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("db-old".to_string()),
         attributes: HashMap::new(),
@@ -8437,8 +8482,11 @@ fn accepted_update_ignores_sent_non_write_only_key_absent_from_writeback_resourc
 
     let row = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved(&resource),
-        &ProviderState::existing(resource.id.clone(), HashMap::new())
-            .with_identifier("resource-id"),
+        &ProviderState::<carina_core::resource::NoPlaceholder>::existing(
+            resource.id.clone(),
+            HashMap::new(),
+        )
+        .with_identifier("resource-id"),
         Some(&existing),
         Some(&schema),
         RowBasis::Applied(&request),
@@ -8465,7 +8513,8 @@ fn orphan_refresh_without_schema_carries_recorded_write_only_value() {
         .expect("fixture identifier is non-empty")
         .with_attribute("password", serde_json::json!("old"));
     existing.set_write_only_attributes_for_test(vec!["password".to_string()]);
-    let fresh = ProviderState::existing(id, HashMap::new()).with_identifier("resource-id");
+    let fresh: carina_core::resource::State =
+        ProviderState::existing(id, HashMap::new()).with_identifier("resource-id");
 
     let refreshed = existing
         .refreshable()
@@ -8501,7 +8550,7 @@ fn orphan_refresh_drops_provider_echoed_write_only_value_absent_from_previous() 
             .write_only()
             .build(),
     );
-    let fresh = ProviderState::existing(
+    let fresh: carina_core::resource::State = ProviderState::existing(
         id,
         HashMap::from([(
             "password".to_string(),
@@ -8555,14 +8604,16 @@ fn managed_refresh_infers_legacy_unlisted_write_only_values_from_schema() {
             .expect("test schema must be valid"),
     );
 
-    let mut omitted = State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
+    let mut omitted =
+        SnapshotState::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
     state_file.restore_recorded_write_only_attributes_in_state(&mut omitted, &schemas);
     assert_eq!(
         omitted.attributes.get("password"),
         Some(&Value::Concrete(ConcreteValue::String("last-sent".into())))
     );
 
-    let provider_value = Value::Concrete(ConcreteValue::String("provider-value".into()));
+    let provider_value: SnapshotValue =
+        Value::Concrete(ConcreteValue::String("provider-value".into()));
     let mut returned = State::existing(
         id,
         HashMap::from([("password".to_string(), provider_value.clone())]),
@@ -8582,7 +8633,7 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
         "Name": "old-name",
         "SecretTag": structural_legacy_secret(&"ab".repeat(32)),
     });
-    let mut provider_tags = IndexMap::new();
+    let mut provider_tags: IndexMap<String, Value> = IndexMap::new();
     provider_tags.insert(
         "Name".to_string(),
         Value::Concrete(ConcreteValue::String("new-name".into())),
@@ -8605,7 +8656,8 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
-    );
+    )
+    .expect("deposed attributes must encode");
     let stored_json = state_json_from_persisted_attributes(stored.as_persisted());
     let stored_tags = stored_json
         .get("tags")
@@ -8633,7 +8685,8 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&second_existing),
-    );
+    )
+    .expect("deposed attributes must encode");
     assert_eq!(
         stored_again.as_persisted().get("tags"),
         stored.as_persisted().get("tags")
@@ -8650,7 +8703,7 @@ fn lossy_state_json_drops_omitted_non_secret_sibling_but_keeps_missing_hash_leaf
         "Name": "old-name",
         "SecretTag": structural_legacy_secret(&"ab".repeat(32)),
     });
-    let attrs = HashMap::from([(
+    let attrs: HashMap<String, Value> = HashMap::from([(
         "tags".to_string(),
         Value::Concrete(ConcreteValue::Map(IndexMap::new())),
     )]);
@@ -8662,7 +8715,8 @@ fn lossy_state_json_drops_omitted_non_secret_sibling_but_keeps_missing_hash_leaf
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
-    );
+    )
+    .expect("deposed attributes must encode");
     let stored = state_json_from_persisted_attributes(stored.as_persisted());
     let stored_tags = stored
         .get("tags")
@@ -8694,7 +8748,7 @@ fn lossy_state_json_hashes_whole_array_when_secret_hash_alignment_is_untrusted()
             "Public": "kept",
         }
     ]);
-    let mut first_provider_item = IndexMap::new();
+    let mut first_provider_item: IndexMap<String, Value> = IndexMap::new();
     first_provider_item.insert(
         "Name".to_string(),
         Value::Concrete(ConcreteValue::String("two".into())),
@@ -8729,7 +8783,8 @@ fn lossy_state_json_hashes_whole_array_when_secret_hash_alignment_is_untrusted()
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
-    );
+    )
+    .expect("deposed attributes must encode");
     let stored = state_json_from_persisted_attributes(stored.as_persisted());
     let stored_items = structural_secret_digest(
         stored
@@ -8764,7 +8819,7 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
         Value::Concrete(ConcreteValue::Map(tags_map)),
     );
 
-    let mut state_tags = IndexMap::new();
+    let mut state_tags: IndexMap<String, Value> = IndexMap::new();
     state_tags.insert(
         "Name".to_string(),
         Value::Concrete(ConcreteValue::String("test".into())),
@@ -8840,7 +8895,7 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
     );
 
     // Provider returns extra keys (e.g., CloudControl adds Name automatically)
-    let mut state_tags = IndexMap::new();
+    let mut state_tags: IndexMap<String, Value> = IndexMap::new();
     state_tags.insert(
         "Name".to_string(),
         Value::Concrete(ConcreteValue::String("test".into())),
@@ -8919,7 +8974,7 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
         ])),
     );
 
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("res-123".to_string()),
         attributes: [(
@@ -9147,7 +9202,7 @@ fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
     use carina_core::resource::{DeferredValue, Resource, State as ProviderState, Value};
 
     let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
-    let provider_state = ProviderState {
+    let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("my-bucket".to_string()),
         attributes: [(
@@ -9373,7 +9428,7 @@ fn v9_legacy_list_survives_current_lift_stays_conservative_and_self_heals_on_wri
     let current = State::existing(desired.id.clone(), current_attributes.clone())
         .with_identifier("listener-id");
     let persisted =
-        PersistedAttributes::from_typed_persisted_wire_values(current_attributes.clone())
+        PersistedAttributes::from_typed_persisted_wire_values(current.to_snapshot().attributes)
             .expect("fixture attributes are persistable");
     let saved = RawSavedAttrs::from_persisted(
         HashMap::from([(desired.id.clone(), persisted)]),

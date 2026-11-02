@@ -294,7 +294,6 @@ fn value_has_authored_plan_time_expression<P: PlaceholderKind, B: BindingAddress
         Value::Deferred(DeferredValue::Secret(_)) => false,
         Value::Deferred(
             DeferredValue::Unavailable { .. }
-            | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => false,
@@ -313,7 +312,7 @@ enum IdentityPathInput<'a, P: PlaceholderKind, B: BindingAddress> {
 }
 
 /// Missing roots or fields are absent; an unavailable ancestor shape is an error.
-fn value_at_identity_path<'a, P: PlaceholderKind, B: BindingAddress>(
+fn value_at_identity_path<'a, P: crate::resource::ValueKind, B: BindingAddress>(
     root: Option<&'a Value<P, B>>,
     path: &IdentityPath,
 ) -> Result<Option<&'a Value<P, B>>, ()> {
@@ -1605,7 +1604,7 @@ pub fn reconcile_prefixed_names(
 ///
 /// Unlike `format!("{:?}", value)`, this ensures Map entries are sorted by key,
 /// so the output is consistent across runs (HashMap iteration order is random).
-fn deterministic_value_string<P: PlaceholderKind, B: BindingAddress>(
+fn deterministic_value_string<P: crate::resource::ValueKind, B: BindingAddress>(
     value: &Value<P, B>,
 ) -> String {
     match value {
@@ -1705,12 +1704,7 @@ fn deterministic_value_string<P: PlaceholderKind, B: BindingAddress>(
         Value::Deferred(DeferredValue::Secret(inner)) => {
             format!("Secret({})", deterministic_value_string(inner))
         }
-        Value::Deferred(DeferredValue::RedactedSecret { hash }) => {
-            format!(
-                "RedactedSecret({})",
-                crate::resource::legacy_secret_identity_material(hash)
-            )
-        }
+
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             use crate::resource::ApplyTimeUnknown;
             // Variant labels feed identity hashes; keep them stable across Rust renames.
@@ -1723,16 +1717,27 @@ fn deterministic_value_string<P: PlaceholderKind, B: BindingAddress>(
                 }
                 ApplyTimeUnknown::PendingReRead(pending) => match pending.reason() {
                     crate::resource::ReReadReason::Incomplete { detail } => {
-                        format!("Unknown(PendingReRead(Incomplete({detail:?})))")
+                        format!("Unknown(PendingReRead(Incomplete({:?})))", detail.as_str())
                     }
                     crate::resource::ReReadReason::ReadFailed { detail } => {
-                        format!("Unknown(PendingReRead(ReadFailed({detail:?})))")
+                        format!("Unknown(PendingReRead(ReadFailed({:?})))", detail.as_str())
                     }
                     crate::resource::ReReadReason::NotFound => {
                         "Unknown(PendingReRead(NotFound))".to_string()
                     }
                 },
             }
+        }
+        Value::Deferred(DeferredValue::Placeholder(placeholder))
+            if placeholder.redacted_secret_hash().is_some() =>
+        {
+            format!(
+                "RedactedSecret(_secret:{})",
+                placeholder
+                    .redacted_secret_hash()
+                    .expect("checked hash leaf")
+                    .encoded_digest()
+            )
         }
         Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
             format!("Placeholder({placeholder})")
@@ -1743,7 +1748,7 @@ fn deterministic_value_string<P: PlaceholderKind, B: BindingAddress>(
 /// Stable concrete-value spelling used to decide whether a create-only value
 /// can participate in reconciliation. Provider-independent schema
 /// canonicalization is layered on top by [`schema_canonical_value_string`].
-fn comparable_create_only_value_string<P: PlaceholderKind, B: BindingAddress>(
+fn comparable_create_only_value_string<P: crate::resource::ValueKind, B: BindingAddress>(
     value: &Value<P, B>,
 ) -> Option<String> {
     match value {
@@ -1790,7 +1795,7 @@ fn comparable_create_only_value_string<P: PlaceholderKind, B: BindingAddress>(
     }
 }
 
-fn comparable_create_only_feature_string<P: PlaceholderKind, B: BindingAddress>(
+fn comparable_create_only_feature_string<P: crate::resource::ValueKind, B: BindingAddress>(
     value: &Value<P, B>,
 ) -> String {
     comparable_create_only_value_string(value).unwrap_or_else(|| deterministic_value_string(value))
@@ -1799,7 +1804,7 @@ fn comparable_create_only_feature_string<P: PlaceholderKind, B: BindingAddress>(
 /// Provider-independent canonical spelling for identity and create-only keys.
 /// Enum identifiers, provider/state strings, and already-canonical enum values
 /// all reduce to the schema's API value.
-fn schema_canonical_value_string<P: PlaceholderKind, B: BindingAddress>(
+fn schema_canonical_value_string<P: crate::resource::ValueKind, B: BindingAddress>(
     value: &Value<P, B>,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
@@ -1834,8 +1839,8 @@ fn schema_canonical_value_string<P: PlaceholderKind, B: BindingAddress>(
 /// so a bare reference and its long form cannot compare equal while producing
 /// different prefix-match keys. Resolved candidates do not use this key; they
 /// compare only through `type_aware_equal`.
-fn canonical_create_only_value_string(
-    value: &Value,
+fn canonical_create_only_value_string<P: crate::resource::ValueKind>(
+    value: &Value<P>,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
     context: &ObservationComparison<'_>,
@@ -2815,11 +2820,11 @@ impl AnonymousIdStateInfo {
     /// identity fields. Schema-declared identity values use each name
     /// override's original value, so callers do not need to distinguish a
     /// temporary unique name from the resource's authored identity.
-    pub fn try_from_state_row(
+    pub fn try_from_state_row<P: crate::resource::StateValueLeaf>(
         origin_id: ResolvedResourceId,
         projected_id: Option<ResolvedResourceId>,
         schema: &ValidatedResourceSchema,
-        attributes: &HashMap<String, Value>,
+        attributes: &HashMap<String, Value<P>>,
         name_overrides: &HashMap<String, NameOverride>,
     ) -> Option<Self> {
         Self::try_from_comparable_values(
@@ -2911,12 +2916,12 @@ struct StateRowIdentityValues {
 #[derive(Clone)]
 enum StateIdentityValue {
     Absent,
-    Comparable(ResolvedCreateOnlyValue),
+    Comparable(ResolvedCreateOnlyValue<crate::resource::SnapshotLeaf>),
     Uncomparable,
 }
 
 impl StateIdentityValue {
-    fn at_path(root: Option<&Value>, path: &IdentityPath) -> Self {
+    fn at_path(root: Option<&crate::resource::SnapshotValue>, path: &IdentityPath) -> Self {
         match value_at_identity_path(root, path) {
             Ok(None) => Self::Absent,
             Ok(Some(value)) => ResolvedCreateOnlyValue::from_value(value.clone())
@@ -2928,12 +2933,15 @@ impl StateIdentityValue {
 }
 
 impl StateRowIdentityValues {
-    fn from_state_row(
+    fn from_state_row<P: crate::resource::StateValueLeaf>(
         schema: &ValidatedResourceSchema,
-        observed_attributes: &HashMap<String, Value>,
+        observed_attributes: &HashMap<String, Value<P>>,
         name_overrides: &HashMap<String, NameOverride>,
     ) -> Self {
-        let mut canonical = observed_attributes.clone();
+        let mut canonical = observed_attributes
+            .iter()
+            .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
+            .collect::<HashMap<_, _>>();
         let identity_attributes = schema
             .identity_paths()
             .iter()
@@ -2956,7 +2964,7 @@ impl StateRowIdentityValues {
                 }
             }
         }
-        crate::value::canonicalize_state_attribute_map_with_schema(
+        crate::value::canonicalize_snapshot_attribute_map_with_schema(
             &mut canonical,
             schema.as_schema(),
         );
@@ -3031,32 +3039,29 @@ impl DesiredIdentityValues {
         schema: &ValidatedResourceSchema,
         find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
         provider_context: &crate::parser::ProviderContext,
-    ) -> Self {
-        let values = schema
-            .identity_paths()
-            .iter()
-            .filter_map(|path| match identity_path_input(resource, path) {
+    ) -> Result<Self, crate::resource::UnavailableSecretError> {
+        let mut values = BTreeMap::new();
+        for path in schema.identity_paths() {
+            let value = match identity_path_input(resource, path) {
                 IdentityPathInput::Absent => schema
                     .effective_node_at_identity_path(path)
                     .is_some_and(|node| node.identity_mode() == IdentityMode::WhenPresent)
-                    .then(|| (path.clone(), DesiredIdentityValue::Absent)),
+                    .then_some(DesiredIdentityValue::Absent),
                 IdentityPathInput::Unavailable => None,
-                IdentityPathInput::GeneratedPrefix(prefix) => Some((
-                    path.clone(),
-                    DesiredIdentityValue::Prefix(prefix.to_string()),
-                )),
+                IdentityPathInput::GeneratedPrefix(prefix) => {
+                    Some(DesiredIdentityValue::Prefix(prefix.to_string()))
+                }
                 IdentityPathInput::AuthoredPrefix(Value::Concrete(ConcreteValue::String(
                     prefix,
-                ))) => Some((
-                    path.clone(),
-                    DesiredIdentityValue::Prefix(prefix.expose_plaintext().to_string()),
+                ))) => Some(DesiredIdentityValue::Prefix(
+                    prefix.expose_plaintext().to_string(),
                 )),
                 IdentityPathInput::AuthoredPrefix(value) => {
                     let value = resolve_deferred_create_only_value(
                         value,
                         find_state_by_binding,
                         provider_context,
-                    )
+                    )?
                     .and_then(|resolved| match resolved {
                         Value::Concrete(ConcreteValue::String(prefix)) => Some(
                             DesiredIdentityValue::Prefix(prefix.expose_plaintext().to_string()),
@@ -3075,40 +3080,48 @@ impl DesiredIdentityValues {
                         | Value::Deferred(_) => None,
                     })
                     .unwrap_or(DesiredIdentityValue::Unresolved);
-                    Some((path.clone(), value))
+                    Some(value)
                 }
                 IdentityPathInput::Value(value) if path.segments().len() == 1 => {
-                    let value = canonical_create_only_value(
-                        resolve_deferred_create_only_value(
-                            value,
-                            find_state_by_binding,
-                            provider_context,
-                        )
-                        .unwrap_or_else(|| value.clone()),
+                    let resolved = resolve_deferred_create_only_value(
+                        value,
+                        find_state_by_binding,
+                        provider_context,
+                    )?
+                    .unwrap_or_else(|| value.clone());
+                    let value = match canonical_create_only_value(
+                        resolved,
                         schema.as_schema(),
                         path.attribute_name(),
-                    )
-                    .ok()
-                    .flatten()
-                    .map(DesiredIdentityValue::Resolved)
-                    .unwrap_or(DesiredIdentityValue::Unresolved);
-                    Some((path.clone(), value))
+                    ) {
+                        Ok(value) => value
+                            .map(DesiredIdentityValue::Resolved)
+                            .unwrap_or(DesiredIdentityValue::Unresolved),
+                        Err(UnresolvedReason::Type(_) | UnresolvedReason::NotComparable) => {
+                            DesiredIdentityValue::Unresolved
+                        }
+                    };
+                    Some(value)
                 }
                 IdentityPathInput::Value(value) => {
                     let resolved = resolve_deferred_create_only_value(
                         value,
                         find_state_by_binding,
                         provider_context,
-                    )
+                    )?
                     .unwrap_or_else(|| value.clone());
-                    let value = ResolvedCreateOnlyValue::from_value(resolved)
-                        .map(DesiredIdentityValue::Resolved)
-                        .unwrap_or(DesiredIdentityValue::Unresolved);
-                    Some((path.clone(), value))
+                    Some(
+                        ResolvedCreateOnlyValue::from_value(resolved)
+                            .map(DesiredIdentityValue::Resolved)
+                            .unwrap_or(DesiredIdentityValue::Unresolved),
+                    )
                 }
-            })
-            .collect();
-        Self { values }
+            };
+            if let Some(value) = value {
+                values.insert(path.clone(), value);
+            }
+        }
+        Ok(Self { values })
     }
 
     fn compare_row(
@@ -3218,7 +3231,7 @@ fn legacy_row_stable_identity_matches(
     comparison_provider: &dyn ResourceComparisonResolver,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
     provider_context: &crate::parser::ProviderContext,
-) -> Result<Option<bool>, ComparisonResolutionError> {
+) -> Result<Option<bool>, AnonymousIdentifierReconciliationError> {
     let Some(schema) = registry.get_for(candidate.resource) else {
         return Ok(None);
     };
@@ -3230,13 +3243,11 @@ fn legacy_row_stable_identity_matches(
             schema,
             find_state_by_binding,
             provider_context,
-        );
+        )?;
         return Ok(
-            match desired_identity.compare_row(
-                &state_entry.identity_values,
-                schema,
-                &comparison.context().observation(),
-            ) {
+            match comparison.context().with_observation(|observation| {
+                desired_identity.compare_row(&state_entry.identity_values, schema, observation)
+            })? {
                 DeclaredIdentityRowOutcome::Match => Some(true),
                 DeclaredIdentityRowOutcome::Mismatch => Some(false),
                 DeclaredIdentityRowOutcome::Undecidable(
@@ -3256,15 +3267,18 @@ fn legacy_row_stable_identity_matches(
         schema.as_schema(),
         find_state_by_binding,
         provider_context,
-    );
+    )?;
     if state_entry.create_only_values.is_empty() {
         return Ok(None);
     }
-    let (create_only_count, create_only_matches) = desired_create_only.resolved_subset_match(
-        state_entry.create_only_values(),
-        schema.as_schema(),
-        &comparison.context().observation(),
-    );
+    let (create_only_count, create_only_matches) =
+        comparison.context().with_observation(|observation| {
+            desired_create_only.resolved_subset_match(
+                state_entry.create_only_values(),
+                schema.as_schema(),
+                observation,
+            )
+        })?;
     Ok((create_only_count > 0).then_some(create_only_matches))
 }
 
@@ -3300,7 +3314,7 @@ pub fn detect_legacy_loop_address_moves(
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
     claims: &StateBlockClaims,
     reserved_moves: &[ResolvedMove],
-) -> Result<Vec<ResolvedMove>, ComparisonResolutionError> {
+) -> Result<Vec<ResolvedMove>, AnonymousIdentifierReconciliationError> {
     let IdentityEvaluationContext {
         schemas: registry,
         provider_context,
@@ -3445,7 +3459,7 @@ pub struct AnonymousIdBindingStateInfo {
     pub name: String,
     /// Persisted attribute values keyed by DSL attribute name (the state JSON
     /// attribute key). The consuming create-only schema canonicalizes them.
-    pub attribute_values: HashMap<String, Value>,
+    pub attribute_values: HashMap<String, crate::resource::SnapshotValue>,
 }
 
 fn state_entry_matches_binding_scope(binding: &str, state_name: &str) -> bool {
@@ -3456,10 +3470,10 @@ fn resolve_deferred_create_only_value(
     value: &Value,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
     provider_context: &crate::parser::ProviderContext,
-) -> Option<Value> {
+) -> Result<Option<Value>, crate::resource::UnavailableSecretError> {
     let root_bindings = value.root_bindings();
     if root_bindings.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut bindings = ResolvedBindings::default();
     for binding in root_bindings {
@@ -3470,18 +3484,20 @@ fn resolve_deferred_create_only_value(
         let [entry] = candidates.as_slice() else {
             continue;
         };
-        bindings.set_with_completeness(
+        bindings.set_historical_with_completeness(
             binding.as_str(),
             entry.attribute_values.clone(),
             BindingValueSource::Local,
             BindingCompleteness::Complete,
         );
     }
-    match crate::resolver::project_ref_value_status(value, &bindings, provider_context).ok()? {
-        crate::resolver::ValueResolution::Present(resolved) => Some(resolved),
-        crate::resolver::ValueResolution::Absent | crate::resolver::ValueResolution::Unknown(_) => {
-            None
-        }
+    match crate::resolver::project_ref_value_status(value, &bindings, provider_context) {
+        Ok(crate::resolver::ValueResolution::Present(resolved)) => Ok(Some(resolved)),
+        Ok(
+            crate::resolver::ValueResolution::Absent | crate::resolver::ValueResolution::Unknown(_),
+        )
+        | Err(crate::resolver::ResolutionError::Message(_)) => Ok(None),
+        Err(crate::resolver::ResolutionError::UnavailableSecret(error)) => Err(error),
     }
 }
 
@@ -3504,19 +3520,20 @@ fn canonical_create_only_value(
 }
 
 #[derive(Clone)]
-struct ResolvedCreateOnlyValue {
-    value: Value,
+struct ResolvedCreateOnlyValue<P: crate::resource::StateValueLeaf = crate::resource::NoPlaceholder>
+{
+    value: Value<P>,
 }
 
-impl ResolvedCreateOnlyValue {
-    fn from_value(value: Value) -> Option<Self> {
+impl<P: crate::resource::StateValueLeaf> ResolvedCreateOnlyValue<P> {
+    fn from_value(value: Value<P>) -> Option<Self> {
         comparable_create_only_value_string(&value)?;
         Some(Self { value })
     }
 
-    fn semantically_equal(
+    fn semantically_equal<Q: crate::resource::StateValueLeaf>(
         &self,
-        other: &Self,
+        other: &ResolvedCreateOnlyValue<Q>,
         schema: &ResourceSchema,
         attr_type: &AttributeType,
         context: &ObservationComparison<'_>,
@@ -3540,7 +3557,9 @@ impl ResolvedCreateOnlyValue {
         let state_key =
             canonical_create_only_value_string(&self.value, Some(attr_type), &schema.defs, context);
         let prefix_key = canonical_create_only_value_string(
-            &Value::Concrete(ConcreteValue::String(prefix.into())),
+            &Value::<crate::resource::NoPlaceholder>::Concrete(ConcreteValue::String(
+                prefix.into(),
+            )),
             Some(attr_type),
             &schema.defs,
             context,
@@ -3561,7 +3580,7 @@ enum DesiredCreateOnlyValue {
 impl DesiredCreateOnlyValue {
     fn matches_state(
         &self,
-        state: &ResolvedCreateOnlyValue,
+        state: &ResolvedCreateOnlyValue<crate::resource::SnapshotLeaf>,
         schema: &ResourceSchema,
         attribute: &str,
         context: &ObservationComparison<'_>,
@@ -3600,7 +3619,7 @@ pub struct DesiredCreateOnlyValues {
     values: HashMap<String, DesiredCreateOnlyValue>,
 }
 
-fn desired_comparable_values<'attribute, S, D>(
+fn desired_comparable_values<'attribute, S, D, E>(
     resource: &Resource<
         S,
         crate::resource::NoPlaceholder,
@@ -3609,47 +3628,50 @@ fn desired_comparable_values<'attribute, S, D>(
     >,
     schema: &ResourceSchema,
     attributes: impl IntoIterator<Item = &'attribute str>,
-    resolve_value: impl Fn(&Value) -> Value,
+    resolve_value: impl Fn(&Value) -> Result<Value, E>,
     prefer_prefixes: bool,
-) -> HashMap<String, DesiredCreateOnlyValue> {
-    attributes
-        .into_iter()
-        .filter_map(|attribute| {
-            if prefer_prefixes && let Some(prefix) = resource.prefixes.get(attribute) {
-                return Some((
-                    attribute.to_string(),
-                    DesiredCreateOnlyValue::Prefix(prefix.clone()),
-                ));
+) -> Result<HashMap<String, DesiredCreateOnlyValue>, E> {
+    let mut values = HashMap::new();
+    for attribute in attributes {
+        if prefer_prefixes && let Some(prefix) = resource.prefixes.get(attribute) {
+            values.insert(
+                attribute.to_string(),
+                DesiredCreateOnlyValue::Prefix(prefix.clone()),
+            );
+            continue;
+        }
+        let Some(value) = resource.get_attr(attribute) else {
+            continue;
+        };
+        let canonical = canonical_create_only_value(resolve_value(value)?, schema, attribute);
+        let value = match canonical {
+            Ok(None) => continue,
+            Ok(Some(value)) => DesiredCreateOnlyValue::Resolved(value),
+            Err(UnresolvedReason::NotComparable) => {
+                tracing::debug!(
+                    attribute = %crate::provider_text::ProviderText::new(attribute),
+                    reason = "value has no stable comparison form",
+                    "stable value is not available for identity comparison"
+                );
+                DesiredCreateOnlyValue::Unresolved
             }
-            let value = resource.get_attr(attribute)?;
-            let canonical = canonical_create_only_value(resolve_value(value), schema, attribute);
-            let value = match canonical {
-                Ok(None) => return None,
-                Ok(Some(value)) => DesiredCreateOnlyValue::Resolved(value),
-                Err(error) => {
-                    match error {
-                        UnresolvedReason::NotComparable => tracing::debug!(
-                            attribute = %crate::provider_text::ProviderText::new(attribute),
-                            reason = "value has no stable comparison form",
-                            "stable value is not available for identity comparison"
-                        ),
-                        UnresolvedReason::Type(error) => tracing::debug!(
-                            attribute = %crate::provider_text::ProviderText::new(attribute),
-                            error = %crate::provider_text::ProviderText::new(error.to_string()),
-                            "stable value is not available for identity comparison"
-                        ),
-                    }
-                    DesiredCreateOnlyValue::Unresolved
-                }
-            };
-            Some((attribute.to_string(), value))
-        })
-        .collect()
+            Err(UnresolvedReason::Type(error)) => {
+                tracing::debug!(
+                    attribute = %crate::provider_text::ProviderText::new(attribute),
+                    error = %crate::provider_text::ProviderText::new(error.to_string()),
+                    "stable value is not available for identity comparison"
+                );
+                DesiredCreateOnlyValue::Unresolved
+            }
+        };
+        values.insert(attribute.to_string(), value);
+    }
+    Ok(values)
 }
 
 fn resolved_subset_match(
     desired_values: &HashMap<String, DesiredCreateOnlyValue>,
-    state_values: &HashMap<String, ResolvedCreateOnlyValue>,
+    state_values: &HashMap<String, ResolvedCreateOnlyValue<crate::resource::SnapshotLeaf>>,
     schema: &ResourceSchema,
     context: &ObservationComparison<'_>,
 ) -> (usize, bool) {
@@ -3685,18 +3707,24 @@ impl DesiredCreateOnlyValues {
         schema: &ResourceSchema,
         find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
         provider_context: &crate::parser::ProviderContext,
-    ) -> Self {
+    ) -> Result<Self, crate::resource::UnavailableSecretError> {
         let values = desired_comparable_values(
             resource,
             schema,
             schema.create_only_attributes(),
             |value| {
-                resolve_deferred_create_only_value(value, find_state_by_binding, provider_context)
-                    .unwrap_or_else(|| value.clone())
+                Ok::<_, crate::resource::UnavailableSecretError>(
+                    resolve_deferred_create_only_value(
+                        value,
+                        find_state_by_binding,
+                        provider_context,
+                    )?
+                    .unwrap_or_else(|| value.clone()),
+                )
             },
             true,
-        );
-        Self { values }
+        )?;
+        Ok(Self { values })
     }
 
     /// Extract desired values when binding resolution is intentionally not
@@ -3714,9 +3742,13 @@ impl DesiredCreateOnlyValues {
             resource,
             schema,
             schema.create_only_attributes(),
-            Value::clone,
+            |value| Ok::<_, std::convert::Infallible>(value.clone()),
             true,
         );
+        let values = match values {
+            Ok(values) => values,
+            Err(never) => match never {},
+        };
         Self { values }
     }
 
@@ -3804,21 +3836,25 @@ impl DesiredCreateOnlyValues {
 /// [`crate::resource::Current`] attributes. Construction applies each schema attribute's
 /// `canonicalize_state` conversion before comparison. Unlike
 /// [`DesiredCreateOnlyValues`], this type cannot represent an unresolved
-/// configured value.
+/// configured value. Historical hash leaves stay in the snapshot and are
+/// verified by the shared type-aware comparison.
 #[derive(Clone, Default)]
 pub struct StateCreateOnlyValues {
-    values: HashMap<String, ResolvedCreateOnlyValue>,
+    values: HashMap<String, ResolvedCreateOnlyValue<crate::resource::SnapshotLeaf>>,
 }
 
 impl StateCreateOnlyValues {
     /// Canonicalize and select create-only values from observed state-side
     /// attributes. Missing or non-comparable attributes remain absent.
-    pub fn from_state_attributes(
+    pub fn from_state_attributes<P: crate::resource::StateValueLeaf>(
         schema: &ValidatedResourceSchema,
-        observed_attributes: &HashMap<String, Value>,
+        observed_attributes: &HashMap<String, Value<P>>,
     ) -> Self {
-        let mut canonical = observed_attributes.clone();
-        crate::value::canonicalize_state_attribute_map_with_schema(
+        let mut canonical = observed_attributes
+            .iter()
+            .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
+            .collect::<HashMap<_, _>>();
+        crate::value::canonicalize_snapshot_attribute_map_with_schema(
             &mut canonical,
             schema.as_schema(),
         );
@@ -3988,6 +4024,11 @@ pub enum AnonymousIdentifierReconciliationError {
     /// The initialized provider comparison context was unavailable.
     #[error(transparent)]
     Comparison(#[from] ComparisonResolutionError),
+    #[error(transparent)]
+    SecretComparison(#[from] crate::differ::ComparisonError),
+    /// Resolving a desired identity selected historical secret evidence.
+    #[error(transparent)]
+    UnavailableSecret(#[from] crate::resource::UnavailableSecretError),
     /// More than one legacy row has the same complete declared identity.
     #[error(transparent)]
     AmbiguousDeclaredIdentity(#[from] AmbiguousDeclaredIdentityMatch),
@@ -4136,17 +4177,19 @@ pub fn reconcile_anonymous_identifiers(
                 validated_schema,
                 find_state_by_binding,
                 provider_context,
-            );
-            let candidate_outcomes = available_candidates
-                .map(|entry| {
-                    let outcome = desired_identity.compare_row(
-                        &entry.identity_values,
-                        validated_schema,
-                        &comparison.context().observation(),
-                    );
-                    (entry, outcome)
-                })
-                .collect::<Vec<_>>();
+            )?;
+            let candidate_outcomes = comparison.context().with_observation(|observation| {
+                available_candidates
+                    .map(|entry| {
+                        let outcome = desired_identity.compare_row(
+                            &entry.identity_values,
+                            validated_schema,
+                            observation,
+                        );
+                        (entry, outcome)
+                    })
+                    .collect::<Vec<_>>()
+            })?;
 
             let mut unknown_override_rows = candidate_outcomes
                 .iter()
@@ -4236,7 +4279,7 @@ pub fn reconcile_anonymous_identifiers(
             schema,
             find_state_by_binding,
             provider_context,
-        );
+        )?;
 
         if !resource_co_values.has_resolved_values() {
             // No create-only properties or none set: use SimHash-based Hamming distance
@@ -4286,11 +4329,9 @@ pub fn reconcile_anonymous_identifiers(
                 continue;
             }
 
-            let (matched, mismatched) = resource_co_values.match_counts(
-                entry.create_only_values(),
-                schema,
-                &comparison.context().observation(),
-            );
+            let (matched, mismatched) = comparison.context().with_observation(|observation| {
+                resource_co_values.match_counts(entry.create_only_values(), schema, observation)
+            })?;
 
             if matched > 0 && mismatched == 0 {
                 full_matches.push(entry);
@@ -4474,7 +4515,7 @@ pub fn detect_anonymous_to_named_renames(
     providers: &CanonicalizedProviderConfigs,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
     claims: &StateBlockClaims,
-) -> Result<AnonymousToNamedRenameDetection, ComparisonResolutionError> {
+) -> Result<AnonymousToNamedRenameDetection, AnonymousIdentifierReconciliationError> {
     let IdentityEvaluationContext {
         schemas: registry,
         provider_context,
@@ -4543,29 +4584,31 @@ pub fn detect_anonymous_to_named_renames(
             schema,
             state_lookup.find_by_binding,
             provider_context,
-        );
+        )?;
 
         let simhash_match = || {
-            let resource_hash =
-                compute_resource_simhash(resource, providers, identity_attributes_fn);
-            let candidates = state_entries
-                .candidates()
-                .filter(|entry| !used_in_dsl.contains(entry.name()))
-                .filter(|entry| !candidates.claimed_origins.contains(entry.origin_id()))
-                .filter(|entry| {
-                    let (_matched, mismatched) = resource_co_values.match_counts(
-                        entry.create_only_values(),
-                        schema,
-                        &comparison.context().observation(),
-                    );
-                    mismatched == 0
-                })
-                .filter_map(|entry| match extract_hash_from_identifier(entry.name()) {
-                    Some(AnonymousHashSuffix::SimHash(hash)) => Some((entry, hash)),
-                    _ => None,
-                });
-            closest_unique_simhash_match(resource_hash, candidates, |(_, hash)| hash)
-                .map(|(entry, _)| entry)
+            comparison.context().with_observation(|observation| {
+                let resource_hash =
+                    compute_resource_simhash(resource, providers, identity_attributes_fn);
+                let candidates = state_entries
+                    .candidates()
+                    .filter(|entry| !used_in_dsl.contains(entry.name()))
+                    .filter(|entry| !candidates.claimed_origins.contains(entry.origin_id()))
+                    .filter(|entry| {
+                        let (_matched, mismatched) = resource_co_values.match_counts(
+                            entry.create_only_values(),
+                            schema,
+                            observation,
+                        );
+                        mismatched == 0
+                    })
+                    .filter_map(|entry| match extract_hash_from_identifier(entry.name()) {
+                        Some(AnonymousHashSuffix::SimHash(hash)) => Some((entry, hash)),
+                        _ => None,
+                    });
+                closest_unique_simhash_match(resource_hash, candidates, |(_, hash)| hash)
+                    .map(|(entry, _)| entry)
+            })
         };
 
         let matched_entry: Option<&AnonymousIdStateInfo> = if resource_co_values
@@ -4582,11 +4625,9 @@ pub fn detect_anonymous_to_named_renames(
                 if extract_hash_from_identifier(anonymous_identity).is_none() {
                     continue;
                 }
-                let all_match = resource_co_values.all_match(
-                    entry.create_only_values(),
-                    schema,
-                    &comparison.context().observation(),
-                );
+                let all_match = comparison.context().with_observation(|observation| {
+                    resource_co_values.all_match(entry.create_only_values(), schema, observation)
+                })?;
                 if !all_match {
                     continue;
                 }
@@ -4599,7 +4640,7 @@ pub fn detect_anonymous_to_named_renames(
             if prior_claimed_matches.is_empty() {
                 match matches.as_slice() {
                     [entry] => Some(*entry),
-                    [] => simhash_match(),
+                    [] => simhash_match()?,
                     _ => None,
                 }
             } else {
@@ -4617,7 +4658,7 @@ pub fn detect_anonymous_to_named_renames(
             // comparison nor SimHash is safe enough to select a prior row.
             None
         } else {
-            simhash_match()
+            simhash_match()?
         };
 
         if let Some(entry) = matched_entry {

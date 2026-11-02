@@ -121,21 +121,21 @@ fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
     ResolvedDataSource::new(resource.with_dependency_phase(()))
 }
 
-fn test_data_source_values(
+fn test_data_source_values<P: crate::resource::StateValueLeaf>(
     data_sources: &[DataSource],
-    states: &HashMap<ResourceId, State>,
+    states: &HashMap<ResourceId, crate::resource::State<P>>,
 ) -> DataSourceValues {
     DataSourceValues::from_data_sources(data_sources, |data_source| {
         states.get(&data_source.id).map_or_else(
             || DataSourceValue::deferred_to_apply(Vec::new()),
-            |state| DataSourceValue::read(state.clone()),
+            |state| DataSourceValue::read(state.to_snapshot()),
         )
     })
 }
 
-fn executable_data_source_values(
+fn executable_data_source_values<P: crate::resource::StateValueLeaf>(
     data_sources: &[DataSource],
-    states: &HashMap<ResourceId, State>,
+    states: &HashMap<ResourceId, crate::resource::State<P>>,
 ) -> ExecutableDataSourceValues {
     test_data_source_values(data_sources, states)
         .into_executable()
@@ -616,8 +616,11 @@ fn applied_state_for_test(state: State) -> AppliedState {
     let identifier = state
         .identifier
         .expect("mutation fixtures must carry a provider identifier");
-    AppliedState::new(state.id, identifier, state.attributes)
-        .expect("mutation fixture identifier must be non-empty")
+    AppliedState::from_snapshot_parts(
+        state.id,
+        AppliedIdentifier::new(identifier).expect("mutation fixture identifier must be non-empty"),
+        state.attributes,
+    )
 }
 
 impl Provider for MockProvider {
@@ -646,7 +649,7 @@ impl Provider for MockProvider {
     fn read_data_source(
         &self,
         resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
         self.data_source_reads
             .lock()
             .unwrap()
@@ -656,7 +659,7 @@ impl Provider for MockProvider {
             .unwrap()
             .push(("read".to_string(), resource.id.to_string()));
         let result = self.read_results.lock().unwrap().remove(0);
-        Box::pin(async move { result })
+        Box::pin(async move { result.map(crate::test_support::available_state) })
     }
 
     fn create(
@@ -785,7 +788,9 @@ impl Provider for MockProvider {
                     Ok(resumed.partial(
                         HashMap::from([(
                             "id".to_string(),
-                            Value::Concrete(ConcreteValue::String(identifier.into())),
+                            crate::resource::Value::Concrete(
+                                crate::resource::ConcreteValue::String(identifier.into()),
+                            ),
                         )]),
                         crate::provider::PartialReadDiagnostic::new(
                             "resumed read-back is incomplete".into(),
@@ -1097,9 +1102,11 @@ struct CanonicalizingNormalizer;
 fn canonicalize_value(v: &Value) -> Option<Value> {
     match v {
         Value::Concrete(ConcreteValue::String(s)) if s == "raw_dsl" => {
-            Some(Value::Concrete(ConcreteValue::String("CANONICAL".into())))
+            Some(crate::resource::Value::Concrete(
+                crate::resource::ConcreteValue::String("CANONICAL".into()),
+            ))
         }
-        Value::Concrete(ConcreteValue::Map(m)) => {
+        crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(m)) => {
             let mut out = m.clone();
             let mut changed = false;
             for (k, val) in m {
@@ -1110,7 +1117,7 @@ fn canonicalize_value(v: &Value) -> Option<Value> {
             }
             changed.then_some(Value::Concrete(ConcreteValue::Map(out)))
         }
-        Value::Concrete(ConcreteValue::List(items)) => {
+        crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(items)) => {
             let mut out = items.clone();
             let mut changed = false;
             for (i, item) in items.iter().enumerate() {
@@ -1170,9 +1177,12 @@ impl crate::provider::ProviderNormalizer for SecretListToScalarNormalizer {
     ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         Box::pin(async move {
             for resource in resources {
-                if let Some(Value::Concrete(ConcreteValue::List(items))) =
-                    resource.get_attr("master_password")
-                    && let Some(Value::Concrete(ConcreteValue::String(first))) = items.first()
+                if let Some(crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(
+                    items,
+                ))) = resource.get_attr("master_password")
+                    && let Some(crate::resource::Value::Concrete(
+                        crate::resource::ConcreteValue::String(first),
+                    )) = items.first()
                 {
                     resource.set_attr(
                         "master_password",
@@ -1447,7 +1457,8 @@ fn ok_state(id: &ResourceId) -> State {
         "id".to_string(),
         Value::Concrete(ConcreteValue::String("id-123".into())),
     );
-    State::existing(id.clone(), attrs).with_identifier("id-123")
+    State::existing(id.clone(), crate::test_support::snapshot_attributes(attrs))
+        .with_identifier("id-123")
 }
 
 fn empty_execution_result() -> ExecutionResult {
@@ -1548,7 +1559,7 @@ impl Provider for DelayedCountingProvider {
     fn read_data_source(
         &self,
         _resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
         Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
     }
 
@@ -1678,7 +1689,8 @@ impl Provider for PendingWaitProvider {
                 Value::Concrete(ConcreteValue::String("PENDING".into())),
             );
             Ok(fixture_read_outcome(
-                State::existing(id, attrs).with_identifier("pending-id"),
+                State::existing(id, crate::test_support::snapshot_attributes(attrs))
+                    .with_identifier("pending-id"),
             ))
         })
     }
@@ -1686,7 +1698,7 @@ impl Provider for PendingWaitProvider {
     fn read_data_source(
         &self,
         _resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
         Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
     }
 
@@ -1926,7 +1938,7 @@ impl Provider for PendingRefreshProvider {
     fn read_data_source(
         &self,
         _resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
         Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
     }
 
@@ -2008,7 +2020,7 @@ impl Provider for CheckpointBlockingProvider {
     fn read_data_source(
         &self,
         _resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
         Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
     }
 
@@ -2094,7 +2106,7 @@ impl Provider for ControlledReadyCreateProvider {
     fn read_data_source(
         &self,
         _resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
         Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
     }
 
@@ -2986,7 +2998,7 @@ async fn create_before_destroy_outcome_unknown_records_replacement_create_state(
     let result = execute_lifecycle_fixture(
         &provider,
         &plan,
-        HashMap::from([(source_id.clone(), Current::from_state(old))]),
+        HashMap::from([(source_id.clone(), Current::from_snapshot(old))]),
     )
     .await;
 
@@ -3725,10 +3737,10 @@ async fn invalid_resolved_update_value_never_reaches_provider() {
     let id = resource.id.clone();
     let from = State::existing(
         id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "target".to_string(),
             Value::Concrete(ConcreteValue::String("good-before".into())),
-        )]),
+        )])),
     )
     .with_identifier("id-123");
     let mut plan = Plan::new();
@@ -3791,10 +3803,10 @@ async fn execute_plan_missing_update_schema_fails_before_provider_update() {
             let id = resource.id.clone();
             let from = State::existing(
                 id.clone(),
-                HashMap::from([(
+                crate::test_support::snapshot_attributes(HashMap::from([(
                     "description".to_string(),
                     Value::Concrete(ConcreteValue::String("before".into())),
-                )]),
+                )])),
             )
             .with_identifier("id-123");
             let mut plan = Plan::new();
@@ -3894,7 +3906,7 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
     let update_id = updated.id.clone();
     let from = State::existing(
         update_id.clone(),
-        HashMap::from([
+        crate::test_support::snapshot_attributes(HashMap::from([
             (
                 "target".to_string(),
                 Value::Concrete(ConcreteValue::String("good-before".into())),
@@ -3914,7 +3926,7 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
                     Value::Concrete(ConcreteValue::String("https://issuer.example.com".into())),
                 )]))),
             ),
-        ]),
+        ])),
     )
     .with_identifier("id-123");
 
@@ -4024,10 +4036,10 @@ async fn absent_entirely_write_only_struct_stays_reassert_during_apply_augmentat
     let id = updated.id.clone();
     let from = State::existing(
         id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "target".to_string(),
             Value::Concrete(ConcreteValue::String("good-before".into())),
-        )]),
+        )])),
     )
     .with_identifier("id-123");
     let mut plan = Plan::new();
@@ -4136,10 +4148,10 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_create() {
 
     provider.push_create(Ok(State::existing(
         producer_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "value".to_string(),
             Value::Concrete(ConcreteValue::String("bad".into())),
-        )]),
+        )])),
     )
     .with_identifier("producer-id")));
 
@@ -4229,19 +4241,19 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_update() {
     let consumer_id = planned_consumer.id.clone();
     let from = State::existing(
         consumer_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "target".to_string(),
             Value::Concrete(ConcreteValue::String("good-before".into())),
-        )]),
+        )])),
     )
     .with_identifier("consumer-id");
 
     provider.push_create(Ok(State::existing(
         producer_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "value".to_string(),
             Value::Concrete(ConcreteValue::String("bad".into())),
-        )]),
+        )])),
     )
     .with_identifier("producer-id")));
 
@@ -4324,7 +4336,7 @@ async fn invalid_apply_time_value_blocks_deferred_dispatch_child() {
     let cert_id = cert.id.clone();
     provider.push_create(Ok(State::existing(
         cert_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "domain_validation_options".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::Map(indexmap::IndexMap::from([(
@@ -4341,7 +4353,7 @@ async fn invalid_apply_time_value_blocks_deferred_dispatch_child() {
                     ]))),
                 )])),
             )])),
-        )]),
+        )])),
     )
     .with_identifier("cert-id")));
 
@@ -4405,10 +4417,10 @@ async fn invalid_deferred_data_source_input_never_reaches_provider() {
 
     provider.push_create(Ok(State::existing(
         upstream_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "value".to_string(),
             Value::Concrete(ConcreteValue::String("bad".into())),
-        )]),
+        )])),
     )
     .with_identifier("producer-id")));
     provider.push_read(Ok(State::existing(data_source_id.clone(), HashMap::new())));
@@ -4428,7 +4440,7 @@ async fn invalid_deferred_data_source_input_never_reaches_provider() {
         managed: &[upstream],
         compositions: &[],
         managed_current: &HashMap::new(),
-        data_source_values: &test_data_source_values(
+        data_source_values: &test_data_source_values::<crate::resource::SnapshotLeaf>(
             std::slice::from_ref(&data_source),
             &HashMap::new(),
         ),
@@ -4493,10 +4505,10 @@ async fn plan_normalized_apply_resolved_data_source_schema_violation_blocks_read
 
     provider.push_create(Ok(State::existing(
         upstream_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "value".to_string(),
             Value::Concrete(ConcreteValue::String("bad".into())),
-        )]),
+        )])),
     )
     .with_identifier("producer-id")));
     provider.push_read(Ok(State::existing(data_source_id.clone(), HashMap::new())));
@@ -4516,7 +4528,7 @@ async fn plan_normalized_apply_resolved_data_source_schema_violation_blocks_read
         managed: std::slice::from_ref(&upstream),
         compositions: &[],
         managed_current: &HashMap::new(),
-        data_source_values: &test_data_source_values(
+        data_source_values: &test_data_source_values::<crate::resource::SnapshotLeaf>(
             std::slice::from_ref(&data_source),
             &HashMap::new(),
         ),
@@ -4679,10 +4691,10 @@ async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read
 
     provider.push_create(Ok(State::existing(
         upstream_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "value".to_string(),
             Value::Concrete(ConcreteValue::String("bad".into())),
-        )]),
+        )])),
     )
     .with_identifier("producer-id")));
     provider.push_read(Ok(State::existing(data_source_id.clone(), HashMap::new())));
@@ -4710,7 +4722,7 @@ async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read
         managed: std::slice::from_ref(&upstream),
         compositions: std::slice::from_ref(&composition),
         managed_current: &HashMap::new(),
-        data_source_values: &test_data_source_values(
+        data_source_values: &test_data_source_values::<crate::resource::SnapshotLeaf>(
             std::slice::from_ref(&data_source),
             &HashMap::new(),
         ),
@@ -4816,7 +4828,7 @@ async fn pending_module_validation_and_require_block_first_consuming_effect() {
 
     provider.push_create(Ok(State::existing(
         producer_id.clone(),
-        HashMap::from([
+        crate::test_support::snapshot_attributes(HashMap::from([
             (
                 "value".to_string(),
                 Value::Concrete(ConcreteValue::String("bad".into())),
@@ -4825,7 +4837,7 @@ async fn pending_module_validation_and_require_block_first_consuming_effect() {
                 "other".to_string(),
                 Value::Concrete(ConcreteValue::String("different".into())),
             ),
-        ]),
+        ])),
     )
     .with_identifier("producer-id")));
     provider.push_create(Ok(ok_state(&consumer_id)));
@@ -5172,10 +5184,10 @@ async fn module_constraint_rechecks_after_binding_changes_in_same_apply() {
     provider.push_create(Ok(ok_state(&first_id)));
     provider.push_create(Ok(State::existing(
         updater_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "value".to_string(),
             Value::Concrete(ConcreteValue::String("bad".into())),
-        )]),
+        )])),
     )
     .with_identifier("source-id")));
     provider.push_create(Ok(ok_state(&second_id)));
@@ -5294,10 +5306,10 @@ async fn unapplied_module_argument_reference_stays_pending_at_early_gate() {
     provider.push_create(Ok(ok_state(&early_id)));
     provider.push_create(Ok(State::existing(
         producer_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "value".to_string(),
             Value::Concrete(ConcreteValue::String("good".into())),
-        )]),
+        )])),
     )
     .with_identifier("producer-id")));
 
@@ -5574,10 +5586,10 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
     )]);
     let pending_state = State::existing(
         target_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "status".to_string(),
             Value::Concrete(ConcreteValue::String("PENDING".into())),
-        )]),
+        )])),
     )
     .with_identifier("target-id");
     provider.push_read(Ok(pending_state.clone()));
@@ -5647,6 +5659,75 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
 }
 
 #[test]
+fn module_constraint_resolution_keeps_unavailable_secret_typed() {
+    use crate::binding_index::{BindingCompleteness, BindingValueSource};
+    use crate::parser::ValidateExpr;
+
+    let hash = crate::value::redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("private".into()))),
+    )))
+    .unwrap();
+    let mut bindings = ResolvedBindings::default();
+    bindings.set_historical_with_completeness(
+        "history",
+        HashMap::from([("secret".into(), hash)]),
+        BindingValueSource::Local,
+        BindingCompleteness::Complete,
+    );
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            for bound in [false, true] {
+                let reference = Value::root_resource_ref("history", "secret", vec![]);
+                let mut constraint = module_not_bad_constraint("value");
+                if bound {
+                    let ValidateExpr::Compare { lhs, .. } = &mut constraint.expression else {
+                        unreachable!("test comparison constraint");
+                    };
+                    **lhs = ValidateExpr::BoundArgument {
+                        argument: "value".into(),
+                        operand: "argument.value".into(),
+                        value: reference.clone(),
+                    };
+                }
+                let composition = pending_module_composition(
+                    "root.checked",
+                    vec![("value", reference)],
+                    vec![constraint],
+                );
+                let gate = ModuleConstraintGate::from_live_compositions(std::slice::from_ref(
+                    &composition,
+                ));
+                for result in [
+                    gate.check(&bindings, session),
+                    gate.finish(&bindings, true, session),
+                ] {
+                    let ModuleConstraintGateError::UnavailableSecret(error) = result.unwrap_err()
+                    else {
+                        panic!(
+                            "unavailable secrets must not become evaluated constraint diagnostics"
+                        );
+                    };
+                    assert_eq!(error.composition_id.as_ref(), composition.id.as_inner());
+                    assert_eq!(error.error.path(), "history.secret");
+                    let mut sink = FailureSink::default();
+                    sink.record(
+                        &MockObserver::new(),
+                        FailureReport::ModuleConstraintResolution(error),
+                    );
+                    let EffectFailureKind::Execution { error } = sink.failures()[0].kind() else {
+                        panic!(
+                            "terminal constraint resolution failure must retain its typed error"
+                        );
+                    };
+                    assert!(error.as_error().downcast_ref::<crate::module_resolver::ModuleConstraintResolutionError>().is_some());
+                }
+            }
+        },
+    );
+}
+
+#[test]
 fn terminal_gate_still_reports_decidable_violations_when_pending_is_suppressed() {
     crate::validation::deferred_types::with_session_for_test(
         &crate::parser::LoadedProviderContext::empty_for_test(),
@@ -5666,7 +5747,10 @@ fn terminal_gate_still_reports_decidable_violations_when_pending_is_suppressed()
                 .finish(&ResolvedBindings::default(), false, session)
                 .expect_err("a known violation must not be suppressed with pending inputs");
 
-            assert_eq!(error.failures().len(), 1);
+            let ModuleConstraintGateError::Violations(violations) = &error else {
+                panic!("expected an evaluated constraint violation: {error:?}");
+            };
+            assert_eq!(violations.failures().len(), 1);
             assert!(error.to_string().contains("value must not be bad"));
             assert!(!error.to_string().contains("still unresolved"));
         },
@@ -6191,7 +6275,10 @@ async fn execute_plan_cleanup_priority_abandons_a_pending_failure_refresh() {
     let id = desired.id.clone();
     let current = State::existing(
         id,
-        HashMap::from([("value".to_string(), Value::Concrete(ConcreteValue::Int(1)))]),
+        crate::test_support::snapshot_attributes(HashMap::from([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::Int(1)),
+        )])),
     )
     .with_identifier("target-id");
     let mut plan = Plan::new();
@@ -6603,10 +6690,10 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
 
     provider.push_create(Ok(State::existing(
         producer_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "value".to_string(),
             Value::Concrete(ConcreteValue::String("known-at-apply".into())),
-        )]),
+        )])),
     )
     .with_identifier("producer-id")));
     provider.push_read(Ok(
@@ -6629,7 +6716,7 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
         managed: std::slice::from_ref(&producer),
         compositions: &[],
         managed_current: &HashMap::new(),
-        data_source_values: &test_data_source_values(
+        data_source_values: &test_data_source_values::<crate::resource::SnapshotLeaf>(
             std::slice::from_ref(&authored),
             &HashMap::new(),
         ),
@@ -6782,7 +6869,11 @@ async fn test_apply_reapplies_host_enum_canonicalization_update_path() {
         "ip_protocol".to_string(),
         Value::Concrete(ConcreteValue::String("tcp".into())),
     );
-    let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
+    let from_state = State::existing(
+        rid.clone(),
+        crate::test_support::snapshot_attributes(from_attrs),
+    )
+    .with_identifier("id-123");
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
@@ -6829,7 +6920,7 @@ async fn test_apply_reapplies_host_enum_canonicalization_update_path() {
     assert!(
         matches!(
             op.sent_value(),
-            Some(Value::Concrete(ConcreteValue::CanonicalEnum(canonical)))
+            Some(crate::resource::Value::Concrete(crate::resource::ConcreteValue::CanonicalEnum(canonical)))
                 if canonical.identity().to_string() == "test.ec2.SecurityGroup.IpProtocol"
                     && canonical.api_value() == "all"
         ),
@@ -6914,7 +7005,11 @@ async fn test_apply_renormalizes_update_path() {
         "marker".to_string(),
         Value::Concrete(ConcreteValue::String("old".into())),
     );
-    let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
+    let from_state = State::existing(
+        rid.clone(),
+        crate::test_support::snapshot_attributes(from_attrs),
+    )
+    .with_identifier("id-123");
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
@@ -6994,7 +7089,11 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
         "tags".to_string(),
         Value::Concrete(ConcreteValue::Map(current_tags)),
     );
-    let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
+    let from_state = State::existing(
+        rid.clone(),
+        crate::test_support::snapshot_attributes(from_attrs),
+    )
+    .with_identifier("id-123");
 
     let mut default_tags = indexmap::IndexMap::new();
     default_tags.insert(
@@ -7048,7 +7147,9 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
         .iter()
         .find(|op| op.key() == "tags")
         .expect("patch must contain the changed `tags` attribute");
-    let Some(Value::Concrete(ConcreteValue::Map(tags))) = tags_op.sent_value() else {
+    let Some(crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(tags))) =
+        tags_op.sent_value()
+    else {
         panic!(
             "expected tags Replace value to be a map, got {:?}",
             tags_op.sent_value()
@@ -7223,7 +7324,11 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
         "mode".to_string(),
         Value::Concrete(ConcreteValue::String("AES256".into())),
     );
-    let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
+    let from_state = State::existing(
+        rid.clone(),
+        crate::test_support::snapshot_attributes(from_attrs),
+    )
+    .with_identifier("id-123");
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
@@ -7287,7 +7392,11 @@ async fn test_apply_effective_changed_includes_resource_ref_changed_during_resol
         "description".to_string(),
         Value::Concrete(ConcreteValue::String("old".into())),
     );
-    let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
+    let from_state = State::existing(
+        rid.clone(),
+        crate::test_support::snapshot_attributes(from_attrs),
+    )
+    .with_identifier("id-123");
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
@@ -7374,7 +7483,11 @@ async fn test_apply_effective_changed_includes_updatable_and_skips_create_only_w
         "description".to_string(),
         Value::Concrete(ConcreteValue::String("old".into())),
     );
-    let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
+    let from_state = State::existing(
+        rid.clone(),
+        crate::test_support::snapshot_attributes(from_attrs),
+    )
+    .with_identifier("id-123");
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
@@ -7707,9 +7820,11 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
         "identifier".to_string(),
         Value::Concrete(ConcreteValue::String("role-0-id".into())),
     );
-    provider.push_create(Ok(
-        State::existing(role.id.clone(), role_attrs).with_identifier("role-0-id")
-    ));
+    provider.push_create(Ok(State::existing(
+        role.id.clone(),
+        crate::test_support::snapshot_attributes(role_attrs),
+    )
+    .with_identifier("role-0-id")));
     provider.push_create(Ok(ok_state(&consumer.id)));
 
     let plan = create_plan_from_fixture_resources(vec![role, consumer.clone()]);
@@ -8426,7 +8541,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
         fn read_data_source(
             &self,
             _resource: &ProviderReadyDataSource,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
             Box::pin(async { Err(ProviderError::internal("not implemented")) })
         }
 
@@ -8592,7 +8707,7 @@ impl Provider for YieldingUpdateProvider {
     fn read_data_source(
         &self,
         _resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
         Box::pin(async { Err(ProviderError::internal("not implemented")) })
     }
 
@@ -8614,7 +8729,7 @@ impl Provider for YieldingUpdateProvider {
         request: UpdateRequest,
     ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         let id = id.clone();
-        let identifier = identifier.to_string();
+        let identifier = identifier.clone();
         let change_unrelated_id = self.change_unrelated_id;
         let active = self.active.clone();
         let max_active = self.max_active.clone();
@@ -8627,17 +8742,17 @@ impl Provider for YieldingUpdateProvider {
             let mut attrs = request.from().attributes.clone();
             attrs.insert(
                 "tags".to_string(),
-                Value::Concrete(ConcreteValue::String("new".into())),
+                (Value::Concrete(ConcreteValue::String("new".into()))).to_snapshot(),
             );
             if change_unrelated_id && id.identity_str().expect("resolved identity") == "vpc" {
                 attrs.insert(
                     "id".to_string(),
-                    Value::Concrete(ConcreteValue::String("provider-violated-id".into())),
+                    (Value::Concrete(ConcreteValue::String("provider-violated-id".into())))
+                        .to_snapshot(),
                 );
             }
             Ok(crate::provider::UpdateOutcome::success(
-                AppliedState::new(id, identifier, attrs)
-                    .expect("provider input identifier is non-empty"),
+                AppliedState::from_snapshot_parts(id, identifier, attrs),
             ))
         })
     }
@@ -8680,7 +8795,7 @@ fn tag_update_resource(binding: &str, parent_ref: Option<&str>) -> Resource {
 fn tag_update_state(id: &ResourceId, binding: &str) -> State {
     State::existing(
         id.clone(),
-        HashMap::from([
+        crate::test_support::snapshot_attributes(HashMap::from([
             (
                 "id".to_string(),
                 Value::Concrete(ConcreteValue::String(format!("{binding}-id").into())),
@@ -8689,7 +8804,7 @@ fn tag_update_state(id: &ResourceId, binding: &str) -> State {
                 "tags".to_string(),
                 Value::Concrete(ConcreteValue::String("old".into())),
             ),
-        ]),
+        ])),
     )
     .with_identifier(format!("{binding}-id"))
 }
@@ -8939,12 +9054,16 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
         );
         m
     };
-    provider.push_create(Ok(
-        State::existing(a_id, id_attr("id-a")).with_identifier("id-a")
-    ));
-    provider.push_create(Ok(
-        State::existing(c_id, id_attr("id-c")).with_identifier("id-c")
-    ));
+    provider.push_create(Ok(State::existing(
+        a_id,
+        crate::test_support::snapshot_attributes(id_attr("id-a")),
+    )
+    .with_identifier("id-a")));
+    provider.push_create(Ok(State::existing(
+        c_id,
+        crate::test_support::snapshot_attributes(id_attr("id-c")),
+    )
+    .with_identifier("id-c")));
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
@@ -9036,10 +9155,10 @@ fn orphan_delete_waits_for_update_that_previously_depended_on_it() {
         .with_attribute("version", Value::Concrete(ConcreteValue::Int(2)));
     let consumer_state = State::existing(
         consumer_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "version".to_string(),
             Value::Concrete(ConcreteValue::Int(1)),
-        )]),
+        )])),
     )
     .with_identifier("consumer-id")
     .with_dependency_bindings(crate::test_support::persisted([ResolvedResourceId::new(
@@ -9229,10 +9348,10 @@ async fn update_protocol_violation_preserves_identifier_for_recovery_refresh() {
     )));
     provider.push_read(Ok(State::existing(
         id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "recovered".to_string(),
             Value::Concrete(ConcreteValue::Bool(true)),
-        )]),
+        )])),
     )));
 
     let input = ExecutionInput {
@@ -9243,7 +9362,7 @@ async fn update_protocol_violation_preserves_identifier_for_recovery_refresh() {
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
-        managed_current: HashMap::from([(id.clone(), Current::from_state(from))]),
+        managed_current: HashMap::from([(id.clone(), Current::from_snapshot(from))]),
         data_source_values: ExecutableDataSourceValues::empty(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
@@ -9284,7 +9403,7 @@ async fn update_protocol_violation_preserves_identifier_for_recovery_refresh() {
     assert_eq!(recovered.identifier().as_str(), "stable-update-id");
     assert_eq!(
         recovered.state().attributes.get("recovered"),
-        Some(&Value::Concrete(ConcreteValue::Bool(true)))
+        Some(&(Value::Concrete(ConcreteValue::Bool(true))).to_snapshot())
     );
 }
 
@@ -9374,6 +9493,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
             Value::Concrete(ConcreteValue::String("vpc-12345".into())),
         )]
         .into_iter()
+        .map(|(key, value)| (key, value.to_snapshot()))
         .collect(),
     )
     .with_identifier("vpc-12345");
@@ -9387,6 +9507,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
             Value::Concrete(ConcreteValue::String("subnet-67890".into())),
         )]
         .into_iter()
+        .map(|(key, value)| (key, value.to_snapshot()))
         .collect(),
     )
     .with_identifier("subnet-67890");
@@ -9484,7 +9605,7 @@ impl Provider for RecordingMockProvider {
     fn read_data_source(
         &self,
         _resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
         Box::pin(async { Err(ProviderError::internal("not implemented")) })
     }
 
@@ -9569,7 +9690,7 @@ impl Provider for CascadeReplaceProvider {
     fn read_data_source(
         &self,
         _resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
         Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
     }
 
@@ -9677,6 +9798,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
             attrs
                 .iter()
                 .map(|(key, value)| ((*key).to_string(), value.clone()))
+                .map(|(key, value)| (key, value.to_snapshot()))
                 .collect(),
         )
         .with_identifier(identifier)
@@ -9954,9 +10076,11 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
         "status".to_string(),
         Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".into())),
     );
-    provider.push_create(Ok(
-        State::existing(cert_id.clone(), create_attrs).with_identifier("acm-cert-id")
-    ));
+    provider.push_create(Ok(State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(create_attrs),
+    )
+    .with_identifier("acm-cert-id")));
     // wait reads: PENDING → PENDING → ISSUED
     let mut pending = HashMap::new();
     pending.insert(
@@ -9972,9 +10096,18 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
         "arn".to_string(),
         Value::Concrete(ConcreteValue::String("arn:aws:acm:...".into())),
     );
-    provider.push_read(Ok(State::existing(cert_id.clone(), pending.clone())));
-    provider.push_read(Ok(State::existing(cert_id.clone(), pending)));
-    provider.push_read(Ok(State::existing(cert_id.clone(), issued)));
+    provider.push_read(Ok(State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(pending.clone()),
+    )));
+    provider.push_read(Ok(State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(pending),
+    )));
+    provider.push_read(Ok(State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(issued),
+    )));
     // create dist → succeeds
     provider.push_create(Ok(ok_state(&dist_id)));
 
@@ -10119,9 +10252,11 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
         "status".to_string(),
         Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".into())),
     );
-    provider.push_create(Ok(
-        State::existing(cert_id.clone(), create_attrs).with_identifier("acm-cert-id")
-    ));
+    provider.push_create(Ok(State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(create_attrs),
+    )
+    .with_identifier("acm-cert-id")));
     let mut pending = HashMap::new();
     pending.insert(
         "status".to_string(),
@@ -10140,8 +10275,14 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
                 .into(),
         )),
     );
-    provider.push_read(Ok(State::existing(cert_id.clone(), pending)));
-    provider.push_read(Ok(State::existing(cert_id.clone(), issued)));
+    provider.push_read(Ok(State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(pending),
+    )));
+    provider.push_read(Ok(State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(issued),
+    )));
     provider.push_create(Ok(ok_state(&dist_id)));
 
     let input = ExecutionInput {
@@ -10227,10 +10368,15 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
         "status".to_string(),
         Value::Concrete(ConcreteValue::String("ISSUED".into())),
     );
-    provider.push_create(Ok(
-        State::existing(cert_id.clone(), issued.clone()).with_identifier("acm-cert-id")
-    ));
-    provider.push_read(Ok(State::existing(cert_id.clone(), issued)));
+    provider.push_create(Ok(State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(issued.clone()),
+    )
+    .with_identifier("acm-cert-id")));
+    provider.push_read(Ok(State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(issued),
+    )));
 
     let input = ExecutionInput {
         provider_context: crate::parser::ProviderContext::clone(
@@ -10630,6 +10776,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
             )])),
         )]
         .into_iter()
+        .map(|(key, value)| (key, value.to_snapshot()))
         .collect(),
     )
     .with_identifier("acm-cert-id");
@@ -10775,7 +10922,7 @@ impl Provider for IdentifierAwareProvider {
     fn read_data_source(
         &self,
         _resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
         Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
     }
 
@@ -10849,8 +10996,11 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
         "status".to_string(),
         Value::Concrete(ConcreteValue::String("issued".into())),
     );
-    let created_state =
-        State::existing(cert_id.clone(), created_attrs).with_identifier("cert-arn-real");
+    let created_state = State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(created_attrs),
+    )
+    .with_identifier("cert-arn-real");
 
     let provider = IdentifierAwareProvider::new("cert-arn-real", created_state);
 
@@ -11047,7 +11197,7 @@ async fn apply_time_unbound_child_collision_with_unabsorbed_state_row_is_typed_e
     plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
         Box::new(template),
     )));
-    let current = Current::from_state(
+    let current = Current::from_snapshot(
         State::existing(collision_id.clone(), HashMap::new()).with_identifier("existing"),
     );
     let input = ExecutionInput {
@@ -11117,7 +11267,7 @@ async fn unbound_deferred_replace_creates_children_before_deleting_legacy_rows()
 
     let mut plan = Plan::new();
     plan.add(legacy_unbound_deferred_replace(template, &legacy_id));
-    let current = Current::from_state(
+    let current = Current::from_snapshot(
         State::existing(legacy_id.clone(), HashMap::new()).with_identifier("existing"),
     );
     let input = ExecutionInput {
@@ -11159,7 +11309,7 @@ async fn unbound_deferred_replace_keeps_legacy_rows_when_gate_fails() {
     let provider = MockProvider::new();
     let mut plan = Plan::new();
     plan.add(legacy_unbound_deferred_replace(template, &legacy_id));
-    let current = Current::from_state(
+    let current = Current::from_snapshot(
         State::existing(legacy_id.clone(), HashMap::new()).with_identifier("existing"),
     );
     let input = ExecutionInput {
@@ -11225,7 +11375,7 @@ async fn completed_plain_anonymous_delete_releases_id_for_unbound_deferred_child
     plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
         Box::new(template),
     )));
-    let current = Current::from_state(
+    let current = Current::from_snapshot(
         State::existing(child_id.clone(), HashMap::new()).with_identifier("existing"),
     );
     let input = ExecutionInput {
@@ -11317,10 +11467,10 @@ async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
     let cert_id = cert.id.clone();
     let cert_state = State::existing(
         cert_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "domain_validation_options".to_string(),
             Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::new())),
-        )]),
+        )])),
     )
     .with_identifier("cert-id");
 
@@ -11371,7 +11521,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
     let cert_id = ResourceId::with_identity("test", "cert");
     let cert_state = State::existing(
         cert_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "domain_validation_options".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::Map(indexmap::IndexMap::from([(
@@ -11388,7 +11538,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
                     ]))),
                 )])),
             )])),
-        )]),
+        )])),
     )
     .with_identifier("cert-id");
     let validation_id = ResourceId::with_identity("test", "validation_records[0]");
@@ -11487,7 +11637,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
     let cert_id = ResourceId::with_identity("test", "cert");
     let cert_state = State::existing(
         cert_id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "domain_validation_options".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::Map(indexmap::IndexMap::from([(
@@ -11504,7 +11654,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
                     ]))),
                 )])),
             )])),
-        )]),
+        )])),
     )
     .with_identifier("cert-id");
     let provider = MockProvider::new();
@@ -11713,7 +11863,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
         fn read_data_source(
             &self,
             _resource: &ProviderReadyDataSource,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<crate::resource::State>> {
             Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
         }
 
@@ -11870,7 +12020,7 @@ fn resource_with_binding(name: &'static str, binding: &str) -> Resource {
 fn cert_state_for_deferred_replace_deadlock(id: &ResourceId) -> State {
     State::existing(
         id.clone(),
-        HashMap::from([(
+        crate::test_support::snapshot_attributes(HashMap::from([(
             "domain_validation_options".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::Map(indexmap::IndexMap::from([(
@@ -11887,7 +12037,7 @@ fn cert_state_for_deferred_replace_deadlock(id: &ResourceId) -> State {
                     ]))),
                 )])),
             )])),
-        )]),
+        )])),
     )
     .with_identifier("cert-id")
 }
@@ -11951,6 +12101,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
                 )])),
             )]
             .into_iter()
+            .map(|(key, value)| (key, value.to_snapshot()))
             .collect(),
         ),
     );
@@ -12111,7 +12262,7 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
         )]),
     )
     .with_identifier("target-id");
-    provider.push_create(Ok(upstream_state));
+    provider.push_create(Ok((upstream_state).to_snapshot()));
 
     let read_state = State::existing(
         ds_id.clone(),
@@ -12123,7 +12274,7 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
         )]),
     )
     .with_identifier("roles-id");
-    provider.push_read(Ok(read_state));
+    provider.push_read(Ok((read_state).to_snapshot()));
 
     let consumer_state =
         State::existing(consumer_id.clone(), HashMap::new()).with_identifier("consumer-id");
@@ -12263,14 +12414,15 @@ async fn test_apply_time_data_source_read_failure_skips_downstream_resource() {
         }),
     );
 
-    provider.push_create(Ok(State::existing(
+    provider.push_create(Ok((State::existing(
         upstream_id.clone(),
         HashMap::from([(
             "generated".to_string(),
             Value::Concrete(ConcreteValue::String("target-generated".into())),
         )]),
     )
-    .with_identifier("target-id")));
+    .with_identifier("target-id"))
+    .to_snapshot()));
     provider.push_read(Err(ProviderError::api_error("lookup failed")));
 
     let (mut resolved_managed, mut resolved_data_sources) = resolved_fixture_graph(
@@ -12381,7 +12533,7 @@ async fn test_apply_time_data_source_read_retries_throttling_errors() {
         managed: &[] as &[Resource],
         compositions: &[],
         managed_current: &HashMap::new(),
-        data_source_values: &test_data_source_values(
+        data_source_values: &test_data_source_values::<crate::resource::SnapshotLeaf>(
             std::slice::from_ref(&data_source),
             &HashMap::new(),
         ),

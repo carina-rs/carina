@@ -219,7 +219,13 @@ impl ResolvedProviderConfigs {
 /// revalidates every construction-time attribute.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct SavedProviderConfigs(Vec<RuntimeProviderConfig>);
+#[serde(bound(
+    serialize = "P: crate::resource::PlanValueKind",
+    deserialize = "P: crate::resource::PlanValueKind"
+))]
+pub struct SavedProviderConfigs<P: crate::resource::PlanValueKind = crate::resource::SnapshotLeaf>(
+    Vec<ProviderConfig<P, AbsoluteBindingAddress>>,
+);
 
 #[derive(Clone, Copy)]
 enum ProviderConfigSection {
@@ -232,28 +238,28 @@ const PROVIDER_CONFIG_SECTIONS: [ProviderConfigSection; 2] = [
     ProviderConfigSection::DefaultTag,
 ];
 
-fn provider_config_section(
-    config: &RuntimeProviderConfig,
+fn provider_config_section<P: crate::resource::ValueKind>(
+    config: &ProviderConfig<P, AbsoluteBindingAddress>,
     section: ProviderConfigSection,
-) -> &IndexMap<String, RuntimeValue> {
+) -> &IndexMap<String, GenericValue<P>> {
     match section {
         ProviderConfigSection::Attribute => &config.attributes,
         ProviderConfigSection::DefaultTag => &config.default_tags,
     }
 }
 
-fn provider_config_section_mut(
-    config: &mut RuntimeProviderConfig,
+fn provider_config_section_mut<P: crate::resource::ValueKind>(
+    config: &mut ProviderConfig<P, AbsoluteBindingAddress>,
     section: ProviderConfigSection,
-) -> &mut IndexMap<String, RuntimeValue> {
+) -> &mut IndexMap<String, GenericValue<P>> {
     match section {
         ProviderConfigSection::Attribute => &mut config.attributes,
         ProviderConfigSection::DefaultTag => &mut config.default_tags,
     }
 }
 
-fn provider_config_secret_location(
-    config: &RuntimeProviderConfig,
+fn provider_config_secret_location<P: crate::resource::ValueKind>(
+    config: &ProviderConfig<P, AbsoluteBindingAddress>,
     section: ProviderConfigSection,
     key: &str,
 ) -> String {
@@ -267,117 +273,115 @@ fn provider_config_secret_location(
     }
 }
 
-impl SavedProviderConfigs {
-    /// Borrow the serialized provider configuration projection.
-    pub fn as_provider_configs(&self) -> &[RuntimeProviderConfig] {
+impl<P: crate::resource::PlanValueKind> SavedProviderConfigs<P> {
+    pub fn as_provider_configs(&self) -> &[ProviderConfig<P, AbsoluteBindingAddress>] {
         &self.0
     }
 
     pub fn contains_redacted_secret(&self) -> bool {
         self.0.iter().any(|config| {
-            let ProviderConfig {
-                name: _name,
-                attributes,
-                default_tags,
-                source: _source,
-                version: _version,
-                revision: _revision,
-                unresolved_attributes,
-                binding: _binding,
-            } = config;
-            attributes
+            config
+                .attributes
                 .values()
-                .chain(default_tags.values())
-                .chain(unresolved_attributes.values())
+                .chain(config.default_tags.values())
+                .chain(config.unresolved_attributes.values())
                 .any(crate::value::contains_redacted_secret)
         })
     }
 
-    /// Replace provider-configuration secrets with typed saved-plan
-    /// placeholders while preserving the historical transparent array shape.
-    pub fn redact_secrets(&self) -> Result<Self, crate::value::SerializationError> {
+    pub fn redact_secrets(&self) -> Result<SavedProviderConfigs, crate::value::SerializationError> {
         let configs = self
             .0
             .iter()
             .map(|config| {
-                let mut out = config.clone();
-                for section in PROVIDER_CONFIG_SECTIONS {
-                    let values = provider_config_section(config, section)
-                        .iter()
-                        .map(|(key, value)| {
-                            crate::value::redact_secrets_in_value(value)
-                                .map(|value| (key.clone(), value))
-                        })
-                        .collect::<Result<_, _>>()?;
-                    *provider_config_section_mut(&mut out, section) = values;
-                }
-                Ok(out)
+                config.try_map_value_stage(&mut |value| {
+                    crate::value::redact_state_snapshot_value(
+                        &crate::resource::state_value_snapshot(value),
+                    )
+                })
             })
-            .collect::<Result<Vec<_>, crate::value::SerializationError>>()?;
-        Ok(Self(configs))
+            .collect::<Result<_, _>>()?;
+        Ok(SavedProviderConfigs(configs))
     }
+}
 
-    /// Restore provider-configuration placeholders from freshly evaluated
-    /// provider configs and verify every plan-time hash.
+impl SavedProviderConfigs {
     pub fn rehydrate_secrets(
         &self,
         evaluated: &Self,
-    ) -> Result<Self, crate::value::SecretRehydrationSiteError> {
+    ) -> Result<SavedProviderConfigs<NoPlaceholder>, crate::value::SecretRehydrationSiteError> {
         let configs = self
             .0
             .iter()
             .map(|saved| {
-                let has_placeholder = saved
-                    .attributes
-                    .values()
-                    .chain(saved.default_tags.values())
-                    .any(crate::value::contains_redacted_secret);
-                if !has_placeholder {
-                    return Ok(saved.clone());
-                }
-                let candidate = evaluated
-                    .0
-                    .iter()
-                    .find(|candidate| {
-                        candidate.name == saved.name && candidate.binding == saved.binding
-                    })
-                    .ok_or_else(|| crate::value::SecretRehydrationSiteError {
-                        location: format!("provider {}", saved.name),
-                        source: crate::value::SecretRehydrationError::ShapeMismatch,
-                    })?;
-                let mut out = saved.clone();
+                let candidate = evaluated.0.iter().find(|candidate| {
+                    candidate.name == saved.name && candidate.binding == saved.binding
+                });
+                let mut out = saved.loading_projection();
                 for section in PROVIDER_CONFIG_SECTIONS {
-                    for (key, saved_value) in provider_config_section(saved, section) {
-                        let value = crate::value::rehydrate_secret_entry(
-                            saved_value,
-                            provider_config_section(candidate, section).get(key),
-                            provider_config_secret_location(saved, section, key),
+                    for (key, value) in provider_config_section(saved, section) {
+                        let location = provider_config_secret_location(saved, section, key);
+                        let candidate = candidate
+                            .and_then(|candidate| {
+                                provider_config_section(candidate, section).get(key)
+                            })
+                            .map(|value| value.to_value_at(&location))
+                            .transpose()?;
+                        let restored = crate::value::rehydrate_secret_entry(
+                            value,
+                            candidate.as_ref(),
+                            location.clone(),
                             crate::value::SecretRehydrationCandidate::Evaluated,
                         )?;
-                        if let Some(value) = value {
-                            provider_config_section_mut(&mut out, section)
-                                .insert(key.clone(), value);
-                        }
+                        let restored = match restored {
+                            Some(value) => value,
+                            None => value.to_value_at(location)?,
+                        };
+                        provider_config_section_mut(&mut out, section)
+                            .insert(key.clone(), restored);
                     }
                 }
                 Ok(out)
             })
-            .collect::<Result<Vec<_>, crate::value::SecretRehydrationSiteError>>()?;
-        Ok(Self(configs))
+            .collect::<Result<_, crate::value::SecretRehydrationSiteError>>()?;
+        Ok(SavedProviderConfigs(configs))
     }
 }
 
 impl From<&ResolvedProviderConfigs> for SavedProviderConfigs {
     fn from(configs: &ResolvedProviderConfigs) -> Self {
-        Self(configs.provider_configs.clone())
+        Self(
+            configs
+                .provider_configs
+                .iter()
+                .map(|config| {
+                    config.try_map_value_stage(&mut |value| {
+                        Ok::<_, std::convert::Infallible>(value.to_snapshot())
+                    })
+                })
+                .collect::<Result<_, _>>()
+                .expect("infallible snapshot projection"),
+        )
     }
 }
 
-impl TryFrom<SavedProviderConfigs> for ResolvedProviderConfigs {
+impl<P: crate::resource::PlanValueKind> TryFrom<SavedProviderConfigs<P>>
+    for ResolvedProviderConfigs
+{
     type Error = ProviderConfigInvariantError;
-
-    fn try_from(configs: SavedProviderConfigs) -> Result<Self, Self::Error> {
-        Self::from_resolved(configs.0)
+    fn try_from(configs: SavedProviderConfigs<P>) -> Result<Self, Self::Error> {
+        let configs = configs
+            .0
+            .into_iter()
+            .map(|config| {
+                config.try_map_value_stage(&mut |value| {
+                    crate::resource::state_value_snapshot(value)
+                        .to_value_at(format!("provider {}", config.name))
+                })
+            })
+            .collect::<Result<_, _>>()
+            .map_err(ProviderConfigInvariantError::UnavailableSecret)?;
+        Self::from_resolved(configs)
     }
 }
 
@@ -405,9 +409,29 @@ mod saved_provider_config_secret_tests {
         }
     }
 
-    fn placeholder_hash(value: &RuntimeValue) -> &crate::resource::RedactedSecretHash {
+    fn snapshot_configs(configs: &SavedProviderConfigs<NoPlaceholder>) -> SavedProviderConfigs {
+        SavedProviderConfigs(
+            configs
+                .0
+                .iter()
+                .map(|config| {
+                    config
+                        .try_map_value_stage(&mut |value| {
+                            Ok::<_, std::convert::Infallible>(value.to_snapshot())
+                        })
+                        .expect("infallible saved config projection")
+                })
+                .collect(),
+        )
+    }
+
+    fn placeholder_hash(
+        value: &crate::resource::SnapshotValue,
+    ) -> &crate::resource::RedactedSecretHash {
         match value {
-            GenericValue::Deferred(GenericDeferredValue::RedactedSecret { hash }) => hash,
+            crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                crate::resource::SnapshotLeaf::RedactedSecret { hash },
+            )) => hash,
             other => panic!("expected saved-plan secret placeholder, got {other:?}"),
         }
     }
@@ -428,7 +452,7 @@ mod saved_provider_config_secret_tests {
 
         assert_eq!(
             redacted
-                .rehydrate_secrets(&evaluated)
+                .rehydrate_secrets(&snapshot_configs(&evaluated))
                 .expect("unchanged provider secrets should rehydrate"),
             evaluated,
         );
@@ -442,7 +466,7 @@ mod saved_provider_config_secret_tests {
         mismatched.binding = Some("different-instance".to_string());
 
         let error = redacted
-            .rehydrate_secrets(&SavedProviderConfigs(vec![mismatched]))
+            .rehydrate_secrets(&snapshot_configs(&SavedProviderConfigs(vec![mismatched])))
             .expect_err("a placeholder must map to its provider instance");
         assert!(matches!(
             error.source,
@@ -471,6 +495,9 @@ fn validate_resolved_provider_configs(
 
 #[derive(Debug, Error)]
 pub enum ProviderConfigInvariantError {
+    #[error(transparent)]
+    UnavailableSecret(#[from] crate::resource::UnavailableSecretError),
+
     #[error("provider {provider}: {attribute}: {error}")]
     UnresolvedAttribute {
         provider: String,
@@ -1264,7 +1291,6 @@ fn collect_reference_roots(
             | ConcreteValue::CanonicalEnum(_)
             | ConcreteValue::StringList(_),
         )
-        | Value::Deferred(DeferredValue::RedactedSecret { .. })
         | Value::Deferred(DeferredValue::Unknown(_))
         | Value::Deferred(DeferredValue::Placeholder(_)) => {}
     }
@@ -1796,7 +1822,6 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
         | GenericValue::Deferred(
             DeferredValue::BindingRef { .. }
             | DeferredValue::Secret(_)
-            | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => Ok(value.clone()),
@@ -1963,7 +1988,6 @@ fn resolve_function_calls_only<B: ProviderAttributeBindingPhase>(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Secret(_)
-            | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => Ok(value.clone()),
@@ -2080,6 +2104,7 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
 ) -> Result<ResolvedProviderConfigs, ProviderConfigResolutionError> {
     let mut bindings =
         crate::binding_index::ResolvedBindings::<NoPlaceholder, AbsoluteBindingAddress>::default();
+    let mut parser_bindings = HashMap::new();
     for rref in parsed.iter_top_level_resources() {
         if let Some(binding_name) = rref.binding() {
             let attributes = match rref {
@@ -2096,6 +2121,7 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
                     })
                     .collect(),
             };
+            parser_bindings.insert(binding_name.to_string(), attributes.clone());
             bindings.set_with_completeness(
                 binding_name,
                 attributes,
@@ -2105,6 +2131,7 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
         }
     }
     for (binding, attrs) in remote_bindings {
+        parser_bindings.insert(binding.clone(), attrs.clone());
         bindings.set_with_completeness(
             binding,
             attrs.clone(),
@@ -2126,7 +2153,7 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
                 let parser_resolved = resolve_value_with_binding_lookup(
                     &parser_expr,
                     &|binding: &AbsoluteBindingAddress, attribute: &str| {
-                        bindings
+                        parser_bindings
                             .get(binding.as_str())
                             .and_then(|attributes| attributes.get(attribute))
                             .cloned()
@@ -2145,7 +2172,10 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
                 })?;
                 let value =
                     crate::resolver::resolve_ref_value_with_config(&expanded, &bindings, config)
-                        .map_err(|message| ParseError::InvalidExpression { line: 0, message })?;
+                        .map_err(|message| ParseError::InvalidExpression {
+                            line: 0,
+                            message: message.to_string(),
+                        })?;
                 resolved.insert(key.clone(), value);
             }
             *section = resolved;

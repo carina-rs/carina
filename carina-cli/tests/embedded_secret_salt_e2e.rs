@@ -197,10 +197,14 @@ fn secret_digest(value: &Value) -> &str {
 fn assert_digest_verifies(encoded_digest: &str, plaintext: &str) {
     let digest = RedactedSecretHash::from_encoded_digest(encoded_digest)
         .unwrap_or_else(|| panic!("invalid persisted secret digest: {encoded_digest}"));
-    let material = serde_json::to_vec(&Value::String(plaintext.to_string()))
-        .expect("serialize secret material");
+    let snapshot = carina_core::resource::SnapshotValue::redacted(digest);
+    let material = carina_core::resource::ExpandedValue::Concrete(
+        carina_core::resource::ConcreteValue::String(plaintext.into()),
+    );
     assert!(
-        digest.verify(material),
+        snapshot
+            .verify_secret(&material)
+            .expect("secret material is serializable"),
         "digest did not verify its plaintext"
     );
 }

@@ -233,9 +233,7 @@ fn format_value(value: &Value) -> String {
                 }
             }
         }
-        Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => {
-            "(secret)".to_string()
-        }
+        Value::Deferred(DeferredValue::Secret(_)) => "(secret)".to_string(),
         Value::Deferred(DeferredValue::Unknown(reason)) => crate::value::render_unknown(reason),
         Value::Deferred(DeferredValue::Placeholder(placeholder)) => placeholder.to_string(),
     }
@@ -605,9 +603,7 @@ impl RootConfigSignature {
             Value::Deferred(DeferredValue::Unknown(_)) => {
                 // Unknown is upstream-deferred and carries no resource-binding edge.
             }
-            Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
-                // Saved-plan placeholders never carry dependency expressions.
-            }
+
             Value::Deferred(DeferredValue::Placeholder(_)) => {}
         }
     }
@@ -1258,9 +1254,6 @@ impl ModuleSignature {
             Value::Deferred(DeferredValue::Unknown(_)) => {
                 // Other unknowns are upstream-deferred and carry no
                 // resource-binding edge.
-            }
-            Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
-                // Saved-plan placeholders never carry dependency expressions.
             }
         }
     }

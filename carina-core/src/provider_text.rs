@@ -581,6 +581,7 @@ mod tests {
         let json = serde_json::json!({"reason": raw, "missing_attributes": [raw]});
         let decoded: PartialReadDiagnostic = serde_json::from_value(json).unwrap();
         assert_eq!(decoded.reason(), "\\u{1b}[2J\\u{7}");
+        assert_eq!(decoded.raw_reason(), raw);
         assert_eq!(decoded.missing_attributes()[0].as_str(), raw);
         assert_eq!(
             decoded.missing_attributes()[0].to_string(),
@@ -591,7 +592,7 @@ mod tests {
         }))
         .unwrap();
         assert!(
-            matches!(decoded.reason(), ReReadReason::Incomplete { detail } if detail.as_str() == "\\u{1b}[2J\\u{7}")
+            matches!(decoded.reason(), ReReadReason::Incomplete { detail } if detail.as_str() == raw && detail.to_string() == "\\u{1b}[2J\\u{7}")
         );
     }
 

@@ -72,6 +72,10 @@ impl UnresolvedTypeToken {
 /// Parse error
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
+    /// A runtime function selected historical evidence without its plaintext.
+    #[error(transparent)]
+    UnavailableSecret(#[from] crate::resource::UnavailableSecretError),
+
     /// A semantic parse/evaluation error whose expression is owned by another
     /// file in the same directory. The inner error retains the precise line;
     /// this wrapper retains which document that line belongs to.

@@ -5183,8 +5183,8 @@ fn provider_default_tags_remain_deferred_and_saved_plan_validation_accepts_them(
     let saved = SavedProviderConfigs::from(&resolved);
     assert!(matches!(
         saved.as_provider_configs()[0].default_tags.get("Owner"),
-        Some(crate::resource::ExpandedValue::Deferred(
-            crate::resource::ExpandedDeferredValue::ResourceRef { .. }
+        Some(crate::resource::Value::Deferred(
+            crate::resource::DeferredValue::ResourceRef { .. }
         ))
     ));
     assert_eq!(

@@ -29,6 +29,7 @@ fn state(id: &ResourceId, attrs: &[(&str, Value)], identifier: &str) -> State {
         attrs
             .iter()
             .map(|(key, value)| ((*key).to_string(), value.clone()))
+            .map(|(key, value)| (key, value.to_snapshot()))
             .collect(),
     )
     .with_identifier(identifier)

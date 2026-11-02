@@ -360,7 +360,8 @@ mod tests {
                     id.clone(),
                     [("value".to_string(), old)].into_iter().collect(),
                 )
-                .with_identifier("example-id"),
+                .with_identifier("example-id")
+                .to_snapshot(),
             ),
             to: ResolvedResource::new(
                 (Resource::new("test.Widget", "example").with_attribute("value", new))

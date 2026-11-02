@@ -781,6 +781,21 @@ impl ReferencePreparation {
                     source: ReferenceFailure::Call(error.into()),
                 }))
             }
+            Err(crate::differ::PlanComparisonError::Secret(error)) => {
+                Err(Box::new(ReferencePlanError {
+                    instance: ProviderInstanceKey::from(&desired[0].id),
+                    resource: desired[0].id.clone(),
+                    path: "<planning>".into(),
+                    raw: "<planning>".into(),
+                    source: ReferenceFailure::Call(
+                        ProviderError::invalid_input_caused_by(
+                            "Failed to verify secret comparison",
+                            error,
+                        )
+                        .into(),
+                    ),
+                }))
+            }
             Err(crate::differ::PlanComparisonError::Resource(error)) => {
                 Err(Box::new(ReferencePlanError {
                     instance: ProviderInstanceKey::from(&desired[0].id),
@@ -1119,9 +1134,9 @@ fn collect_attributes(
     Ok(())
 }
 
-fn collect_leaf(
+fn collect_leaf<P: crate::resource::ValueKind>(
     resource: &ResourceId,
-    value: &Value,
+    value: &Value<P>,
     ty: &TypeIdentity,
     path: &str,
     secret: bool,
@@ -1175,14 +1190,19 @@ struct ReferenceValidation<'a> {
 }
 impl ReferenceValidation<'_> {
     #[allow(clippy::too_many_arguments)]
-    fn record_leaf(
+    fn record_leaf<P: crate::resource::ValueKind>(
         &self,
-        value: &Value,
+        value: &Value<P>,
         ty: crate::schema::EffectiveType<'_>,
         segments: &[crate::schema::LeafPathSegment],
         path: &str,
         depth: usize,
-        visit: &mut impl FnMut(&Value, &TypeIdentity, &str, bool) -> Result<(), Box<ReferencePlanError>>,
+        visit: &mut impl FnMut(
+            &Value<P>,
+            &TypeIdentity,
+            &str,
+            bool,
+        ) -> Result<(), Box<ReferencePlanError>>,
     ) -> Result<(), Box<ReferencePlanError>> {
         use crate::schema::LeafPathSegment;
         let Some((segment, rest)) = segments.split_first().filter(|_| depth < 64) else {
@@ -1240,9 +1260,9 @@ impl ReferenceValidation<'_> {
         }
         Ok(())
     }
-    fn validate(
+    fn validate<P: crate::resource::ValueKind>(
         &self,
-        value: &Value,
+        value: &Value<P>,
         ty: crate::schema::EffectiveType<'_>,
         path: &str,
         secret: bool,
@@ -1267,14 +1287,19 @@ impl ReferenceValidation<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn walk(
+    fn walk<P: crate::resource::ValueKind>(
         &self,
-        value: &Value,
+        value: &Value<P>,
         ty: crate::schema::EffectiveType<'_>,
         path: &str,
         secret: bool,
         depth: usize,
-        visit: &mut impl FnMut(&Value, &TypeIdentity, &str, bool) -> Result<(), Box<ReferencePlanError>>,
+        visit: &mut impl FnMut(
+            &Value<P>,
+            &TypeIdentity,
+            &str,
+            bool,
+        ) -> Result<(), Box<ReferencePlanError>>,
     ) -> Result<(), Box<ReferencePlanError>> {
         if depth >= 64 {
             return Err(Box::new(ReferencePlanError {
@@ -1345,9 +1370,9 @@ impl ReferenceValidation<'_> {
     }
 }
 
-pub(crate) fn validate_secret_operand(
+pub(crate) fn validate_secret_operand<P: crate::resource::ValueKind>(
     resource: &ResourceId,
-    value: &Value,
+    value: &Value<P>,
     ty: crate::schema::EffectiveType<'_>,
     path: &str,
 ) -> Result<(), Box<ReferencePlanError>> {

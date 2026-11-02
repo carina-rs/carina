@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use carina_core::provider::{NestedWriteOnlyRecord, PersistedAttributes};
-use carina_core::resource::{ConcreteValue, DeferredValue, Value};
+use carina_core::resource::{ConcreteValue, DeferredValue, SnapshotLeaf, SnapshotValue, Value};
 use carina_core::schema::{LeafPath, LeafPathSegment};
 use carina_state::{CurrentInstance, LegacyDependencyNames, ResourceState, StateFile};
 use serde::Serialize;
@@ -219,7 +219,7 @@ fn public_attributes(
         .collect()
 }
 
-fn public_json_value(value: &Value) -> Result<serde_json::Value, &'static str> {
+fn public_json_value(value: &SnapshotValue) -> Result<serde_json::Value, &'static str> {
     match value {
         Value::Deferred(DeferredValue::ModuleIf(_)) => {
             Err("the value contains an unresolved module-template conditional")
@@ -262,7 +262,9 @@ fn public_json_value(value: &Value) -> Result<serde_json::Value, &'static str> {
             Ok(serde_json::Value::Object(sorted.into_iter().collect()))
         }
         Value::Deferred(DeferredValue::Secret(_))
-        | Value::Deferred(DeferredValue::RedactedSecret { hash: _ }) => Ok(redacted_marker()),
+        | Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { .. })) => {
+            Ok(redacted_marker())
+        }
         Value::Deferred(DeferredValue::ResourceRef { path: _path }) => {
             Err("the value contains an unresolved resource reference")
         }
@@ -302,7 +304,9 @@ fn public_json_value(value: &Value) -> Result<serde_json::Value, &'static str> {
         Value::Deferred(DeferredValue::Unknown(_reason)) => {
             Err("the value contains an unknown value")
         }
-        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::Expression(never))) => {
+            match *never {}
+        }
     }
 }
 

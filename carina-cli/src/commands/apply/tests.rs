@@ -91,7 +91,7 @@ fn validate_with_test_factories(
 
 fn complete_create(state: carina_core::resource::State) -> carina_core::executor::Applied {
     carina_core::executor::Applied::Complete {
-        state,
+        state: state.to_snapshot(),
         request: carina_core::executor::AcceptedRequest::create_for_test(),
     }
 }
@@ -148,7 +148,7 @@ fn complete_update(
     removed: &[&str],
 ) -> carina_core::executor::Applied {
     carina_core::executor::Applied::Complete {
-        state,
+        state: state.to_snapshot(),
         request: carina_core::executor::AcceptedRequest::update_for_test(sent, removed),
     }
 }
@@ -576,7 +576,7 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
     desired.directives.create_before_destroy = true;
     let replacement_id = desired.id.clone();
     let old_resource = mock_http_resource("replacement-trap", server_address, "normal");
-    let old_state = State::existing(
+    let old_state = State::<carina_core::resource::NoPlaceholder>::existing(
         replacement_id.clone(),
         old_resource.attributes.into_iter().collect(),
     )
@@ -899,7 +899,12 @@ fn resolved_inner(
     carina_core::resource::AbsoluteBindingAddress,
     (),
 > {
-    resolved(resource).into_inner()
+    carina_core::resource::ResolvedResource::resolve_with_schemas(
+        resource.into_value_snapshot(),
+        &carina_core::schema::SchemaRegistry::new(),
+    )
+    .expect("fixture identity and directives resolve")
+    .into_inner()
 }
 
 fn resolved_provider_configs(
@@ -988,7 +993,12 @@ fn record_with_test_context(contents: PlanFileContents) -> PlanFile {
         &crate::test_support::TestCommandRuntime::new(),
         (),
         Vec::new(),
-        contents.provider_configs.as_provider_configs(),
+        &contents
+            .provider_configs
+            .as_provider_configs()
+            .iter()
+            .map(carina_core::parser::ProviderConfig::loading_projection)
+            .collect::<Vec<_>>(),
     );
     contents
         .record_for_test(&ctx, Vec::new())
@@ -1004,7 +1014,12 @@ fn record_with_test_schemas(contents: PlanFileContents, schemas: &SchemaRegistry
         &crate::test_support::TestCommandRuntime::new(),
         (),
         Vec::new(),
-        contents.provider_configs.as_provider_configs(),
+        &contents
+            .provider_configs
+            .as_provider_configs()
+            .iter()
+            .map(carina_core::parser::ProviderConfig::loading_projection)
+            .collect::<Vec<_>>(),
         additional_schemas,
     );
     contents
@@ -1126,11 +1141,15 @@ for account_id in orgs.accounts {
             binding: None,
         }]),
         backend_config: None,
-        plan,
-        sorted_resources: vec![resource.clone().into_value_snapshot()],
+        plan: plan.to_snapshot(),
+        sorted_resources: (vec![resource.clone().into_value_snapshot()])
+            .into_iter()
+            .map(|value| value.to_snapshot())
+            .collect(),
         unresolved_resources: vec![resource]
             .into_iter()
             .map(|resource| resource.into_value_snapshot())
+            .map(|value| value.to_snapshot())
             .collect(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
@@ -1230,8 +1249,6 @@ async fn run_saved_plan_schema_fingerprint_case(
             "name",
             Value::Deferred(DeferredValue::Secret(Box::new(string_value(identity)))),
         );
-        resource = carina_core::value::redact_secrets_in_resource(&resource)
-            .expect("redact saved-plan secret fixture");
     }
     let resource_id = resource.id.clone();
     let mut plan = Plan::new();
@@ -1256,19 +1273,25 @@ async fn run_saved_plan_schema_fingerprint_case(
             binding: None,
         }]),
         backend_config: None,
-        plan,
-        sorted_resources: vec![resource.clone().into_value_snapshot()],
-        unresolved_resources: vec![resource]
-            .into_iter()
-            .map(|resource| resource.into_value_snapshot())
-            .collect(),
+        plan: carina_core::value::redact_secrets_in_plan(&plan)
+            .expect("redact saved-plan secret fixture"),
+        sorted_resources: vec![
+            carina_core::value::redact_secrets_in_resource(&resource)
+                .unwrap()
+                .into_value_snapshot(),
+        ],
+        unresolved_resources: vec![
+            carina_core::value::redact_secrets_in_resource(&resource)
+                .unwrap()
+                .into_value_snapshot(),
+        ],
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
         data_source_values: Vec::new(),
         current_states: vec![crate::commands::plan::CurrentStateEntry::managed(
             resource_id.clone(),
-            State::not_found(resource_id),
+            State::<carina_core::resource::NoPlaceholder>::not_found(resource_id),
         )],
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
@@ -1371,7 +1394,7 @@ fn concurrent_cli_invocations_keep_mock_runtime_separate() {
                 assert!(!operations.contains("removed.Widget"));
                 let saved = fixture.read_state().await;
                 let row = saved.find_resource("mock", "test.resource", "orphan").unwrap();
-                assert_eq!(row.persisted_attributes().unwrap().get("name"), Some(string_value("scope-b")));
+                assert_eq!(row.persisted_attributes().unwrap().get("name"), Some(string_value("scope-b").to_snapshot()));
             });
         });
         a.join().unwrap();
@@ -1521,7 +1544,7 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
             binding: None,
         }]),
         backend_config: None,
-        plan: Plan::new(),
+        plan: carina_core::plan::SnapshotPlan::default(),
         sorted_resources: Vec::new(),
         unresolved_resources: Vec::new(),
         compositions: Vec::new(),
@@ -1530,7 +1553,7 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
         data_source_values: Vec::new(),
         current_states: vec![crate::commands::plan::CurrentStateEntry::managed(
             id.clone(),
-            State::not_found(id),
+            State::<carina_core::resource::NoPlaceholder>::not_found(id),
         )],
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
@@ -1750,7 +1773,8 @@ fn saved_plan_import_rehydration_respects_current_provider_instance() {
     let identifiers = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::LoadedProviderContext::empty_for_test(),
         |session| import_identifiers_from_current_config(&plan, &parsed, session),
-    );
+    )
+    .expect("current import identifiers resolve");
 
     assert!(
         !identifiers.contains_key(&planned_id),
@@ -1775,11 +1799,10 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     saved.call_path = crate::test_composition_call_path_in(&saved_source);
     let mut source_identities = CompositionSourceIdentityResolver::new(tmp.path())
         .expect("create composition source identity resolver");
-    let saved = saved
+    let saved = carina_core::value::redact_secrets_in_live_composition(&saved)
+        .expect("redact composition")
         .into_saved_with_resolver(&mut source_identities)
         .expect("save anonymous composition");
-    let saved = carina_core::value::redact_secrets_in_saved_composition(&saved)
-        .expect("redact saved composition");
 
     let mut current = saved_module_composition(secret, "rejected");
     current.id = carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -1810,7 +1833,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         state_serial: None,
         provider_configs: saved_provider_configs(Vec::new()),
         backend_config: None,
-        plan: Plan::new(),
+        plan: carina_core::plan::SnapshotPlan::default(),
         sorted_resources: Vec::new(),
         unresolved_resources: Vec::new(),
         compositions: vec![saved],
@@ -1837,13 +1860,13 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     )
     .expect("test plan provider evidence must be valid");
 
-    let mut plan_file = plan_file
+    let plan_file = plan_file
         .reload_in_flight_from_locked_state(None)
         .expect("test plan should cross the locked-state reload boundary")
         .resolve_with_schemas(&carina_core::schema::SchemaRegistry::new())
         .expect("test plan should cross schema resolution");
     let result = rehydrate_desired_plan_file_from_parts(
-        &mut plan_file,
+        plan_file.clone(),
         candidates.parsed(),
         candidates.provider_inputs(),
         ApplyTarget::SavedPlan {
@@ -1868,7 +1891,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
 
     std::fs::remove_file(&current_source).expect("remove current composition source");
     let error = rehydrate_desired_plan_file_from_parts(
-        &mut plan_file,
+        plan_file.clone(),
         candidates.parsed(),
         candidates.provider_inputs(),
         ApplyTarget::SavedPlan {
@@ -1899,7 +1922,8 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
     composition.call_path = crate::test_composition_call_path_in(&source_file);
     let mut source_identities = CompositionSourceIdentityResolver::new(tmp.path())
         .expect("create composition source identity resolver");
-    let saved = composition
+    let saved = carina_core::value::redact_secrets_in_live_composition(&composition)
+        .expect("capture composition snapshot")
         .into_saved_with_resolver(&mut source_identities)
         .expect("save composition");
     let plan_file = record_with_test_context(PlanFileContents {
@@ -1911,7 +1935,7 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
         state_serial: None,
         provider_configs: saved_provider_configs(Vec::new()),
         backend_config: None,
-        plan: Plan::new(),
+        plan: carina_core::plan::SnapshotPlan::default(),
         sorted_resources: Vec::new(),
         unresolved_resources: Vec::new(),
         compositions: vec![saved],
@@ -2027,7 +2051,7 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
     let mut resource = Resource::with_provider("mock", "test.resource", "example", None);
     resource.set_attr("name", string_value("planned"));
     let id = resource.id.clone();
-    let planned_state = State::existing(
+    let planned_state = State::<carina_core::resource::NoPlaceholder>::existing(
         id.clone(),
         HashMap::from([("name".to_string(), string_value("planned"))]),
     )
@@ -2078,14 +2102,18 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
             binding: None,
         }]),
         backend_config: None,
-        plan: Plan::new(),
-        sorted_resources: vec![resolved_inner(resource.clone())],
+        plan: carina_core::plan::SnapshotPlan::default(),
+        sorted_resources: (vec![resolved_inner(resource.clone())])
+            .into_iter()
+            .map(|value| value.to_snapshot())
+            .collect(),
         sorted_value_destroy_dependencies: vec![Default::default()],
         sorted_explicit_destroy_dependencies: vec![Default::default()],
         legacy_dependency_classification,
         unresolved_resources: vec![resource]
             .into_iter()
             .map(|resource| resource.into_value_snapshot())
+            .map(|value| value.to_snapshot())
             .collect(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
@@ -2216,7 +2244,7 @@ async fn saved_plan_classifies_v20_dependency_names_before_early_migration_write
             .expect("saved-plan migration graph validates")
             .classification,
     );
-    let planned_example = State::existing(
+    let planned_example = State::<carina_core::resource::NoPlaceholder>::existing(
         example_id.clone(),
         HashMap::from([("name".to_string(), string_value("planned"))]),
     )
@@ -2239,17 +2267,21 @@ async fn saved_plan_classifies_v20_dependency_names_before_early_migration_write
             binding: None,
         }]),
         backend_config: None,
-        plan: Plan::new(),
-        sorted_resources: vec![
+        plan: carina_core::plan::SnapshotPlan::default(),
+        sorted_resources: (vec![
             resolved_inner(dependency.clone()),
             resolved_inner(example.clone()),
-        ],
+        ])
+        .into_iter()
+        .map(|value| value.to_snapshot())
+        .collect(),
         sorted_value_destroy_dependencies: vec![Default::default(), Default::default()],
         sorted_explicit_destroy_dependencies: vec![Default::default(), Default::default()],
         legacy_dependency_classification,
         unresolved_resources: vec![dependency, example]
             .into_iter()
             .map(|resource| resource.into_value_snapshot())
+            .map(|value| value.to_snapshot())
             .collect(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
@@ -2258,7 +2290,7 @@ async fn saved_plan_classifies_v20_dependency_names_before_early_migration_write
         current_states: vec![
             crate::commands::plan::CurrentStateEntry::managed(
                 dependency_id.clone(),
-                State::not_found(dependency_id.clone()),
+                State::<carina_core::resource::NoPlaceholder>::not_found(dependency_id.clone()),
             ),
             crate::commands::plan::CurrentStateEntry::managed(example_id, planned_example),
         ],
@@ -2427,7 +2459,7 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
         state_serial: None,
         provider_configs: saved_provider_configs(vec![provider_config]),
         backend_config: None,
-        plan: Plan::new(),
+        plan: carina_core::plan::SnapshotPlan::default(),
         sorted_resources: Vec::new(),
         unresolved_resources: Vec::new(),
         compositions: Vec::new(),
@@ -2527,7 +2559,7 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
         state_serial: None,
         provider_configs: deserialize_saved_provider_configs(provider_configs),
         backend_config: None,
-        plan: Plan::new(),
+        plan: carina_core::plan::SnapshotPlan::default(),
         sorted_resources: Vec::new(),
         unresolved_resources: Vec::new(),
         compositions: Vec::new(),
@@ -3028,7 +3060,7 @@ impl Provider for FailBCreateProvider {
         resource: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = resource.id.clone();
-        Box::pin(async move { Ok(State::not_found(id)) })
+        Box::pin(async move { Ok(State::<carina_core::resource::NoPlaceholder>::not_found(id)) })
     }
 
     fn create(
@@ -3440,7 +3472,7 @@ impl Provider for ApplyCascadeProvider {
         let identifier = identifier.as_str().to_string();
         Box::pin(async move {
             let state = match (id.resource_type.as_str(), identifier.as_str()) {
-                ("ec2.Vpc", "vpc-new") => State::existing(
+                ("ec2.Vpc", "vpc-new") => State::<carina_core::resource::NoPlaceholder>::existing(
                     id,
                     HashMap::from([
                         ("cidr_block".to_string(), string_value("10.221.0.0/16")),
@@ -3448,27 +3480,31 @@ impl Provider for ApplyCascadeProvider {
                     ]),
                 )
                 .with_identifier("vpc-new"),
-                ("ec2.Vpc", "vpc-old" | "vpc-older" | "vpc-oldest") => State::existing(
-                    id,
-                    HashMap::from([
-                        ("cidr_block".to_string(), string_value("10.220.0.0/16")),
-                        ("vpc_id".to_string(), string_value(identifier.as_str())),
-                    ]),
-                )
-                .with_identifier(identifier.as_str()),
-                ("ec2.Subnet", "subnet-old") => State::existing(
-                    id,
-                    HashMap::from([
-                        ("vpc_id".to_string(), string_value("vpc-old")),
-                        ("cidr_block".to_string(), string_value("10.220.1.0/24")),
-                        (
-                            "availability_zone".to_string(),
-                            string_value("ap-northeast-1c"),
-                        ),
-                    ]),
-                )
-                .with_identifier("subnet-old"),
-                _ => State::not_found(id),
+                ("ec2.Vpc", "vpc-old" | "vpc-older" | "vpc-oldest") => {
+                    State::<carina_core::resource::NoPlaceholder>::existing(
+                        id,
+                        HashMap::from([
+                            ("cidr_block".to_string(), string_value("10.220.0.0/16")),
+                            ("vpc_id".to_string(), string_value(identifier.as_str())),
+                        ]),
+                    )
+                    .with_identifier(identifier.as_str())
+                }
+                ("ec2.Subnet", "subnet-old") => {
+                    State::<carina_core::resource::NoPlaceholder>::existing(
+                        id,
+                        HashMap::from([
+                            ("vpc_id".to_string(), string_value("vpc-old")),
+                            ("cidr_block".to_string(), string_value("10.220.1.0/24")),
+                            (
+                                "availability_zone".to_string(),
+                                string_value("ap-northeast-1c"),
+                            ),
+                        ]),
+                    )
+                    .with_identifier("subnet-old")
+                }
+                _ => State::<carina_core::resource::NoPlaceholder>::not_found(id),
             };
             Ok(fixture_read_outcome(state))
         })
@@ -3479,7 +3515,7 @@ impl Provider for ApplyCascadeProvider {
         resource: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = resource.id.clone();
-        Box::pin(async move { Ok(State::not_found(id)) })
+        Box::pin(async move { Ok(State::<carina_core::resource::NoPlaceholder>::not_found(id)) })
     }
 
     fn create(
@@ -3829,7 +3865,8 @@ impl Provider for ApplyTimeReadProvider {
                         .or_insert_with(|| Value::Concrete(ConcreteValue::Map(IndexMap::new())));
                 }
                 Ok(fixture_read_outcome(
-                    State::existing(id, attrs).with_identifier("mock-id"),
+                    State::<carina_core::resource::NoPlaceholder>::existing(id, attrs)
+                        .with_identifier("mock-id"),
                 ))
             } else {
                 Ok(ReadOutcome::not_found(id))
@@ -3867,7 +3904,7 @@ impl Provider for ApplyTimeReadProvider {
                 .map(|role_name| Value::Concrete(ConcreteValue::String(role_name.into())))
                 .collect();
 
-            Ok(State::existing(
+            Ok(State::<carina_core::resource::NoPlaceholder>::existing(
                 resource.id.clone(),
                 HashMap::from([(
                     "names".to_string(),
@@ -3939,7 +3976,23 @@ impl Provider for ApplyTimeReadProvider {
                 return Err(ProviderError::internal("unexpected update").for_resource(id));
             }
 
-            let mut attrs = request.from().attributes.clone();
+            let mut attrs = request
+                .from()
+                .attributes
+                .iter()
+                .map(|(key, value)| {
+                    value
+                        .to_value_at(format!("{id}.{key}"))
+                        .map(|value| (key.clone(), value))
+                })
+                .collect::<Result<HashMap<_, _>, _>>()
+                .map_err(|error| {
+                    ProviderError::internal_caused_by(
+                        "test provider update requires observed attribute values",
+                        error,
+                    )
+                    .for_resource(id.clone())
+                })?;
             for op in &request.patch().ops {
                 match op {
                     PatchOp::Add { key, value }
@@ -4607,11 +4660,14 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         state_serial: None,
         provider_configs,
         backend_config: None,
-        plan,
-        sorted_resources: vec![
+        plan: plan.to_snapshot(),
+        sorted_resources: (vec![
             target.clone().into_value_snapshot(),
             consumer.clone().into_value_snapshot(),
-        ],
+        ])
+        .into_iter()
+        .map(|value| value.to_snapshot())
+        .collect(),
         sorted_value_destroy_dependencies: vec![
             Default::default(),
             carina_core::resource::PersistedDestroyDependencies::from_test_dependencies([
@@ -4623,10 +4679,17 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         unresolved_resources: vec![target, consumer]
             .into_iter()
             .map(|resource| resource.into_value_snapshot())
+            .map(|value| value.to_snapshot())
             .collect(),
         compositions: Vec::new(),
-        data_sources: vec![lookup.clone().into_value_snapshot()],
-        data_source_origins: vec![lookup.clone().into_value_snapshot()],
+        data_sources: (vec![lookup.clone().into_value_snapshot()])
+            .into_iter()
+            .map(|value| value.to_snapshot())
+            .collect(),
+        data_source_origins: (vec![lookup.clone().into_value_snapshot()])
+            .into_iter()
+            .map(|value| value.to_snapshot())
+            .collect(),
         data_source_values: vec![crate::commands::plan::SavedDataSourceValue {
             id: lookup.id.clone(),
             value: DataSourceValue::deferred_to_apply(Vec::new()),
@@ -4634,21 +4697,15 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         current_states: vec![
             crate::commands::plan::CurrentStateEntry::managed(
                 target_id,
-                State::not_found(ResourceId::with_provider_identity(
-                    "mock",
-                    "test.resource",
-                    "target",
-                    None,
-                )),
+                State::<carina_core::resource::NoPlaceholder>::not_found(
+                    ResourceId::with_provider_identity("mock", "test.resource", "target", None),
+                ),
             ),
             crate::commands::plan::CurrentStateEntry::managed(
                 consumer_id,
-                State::not_found(ResourceId::with_provider_identity(
-                    "mock",
-                    "test.resource",
-                    "consumer",
-                    None,
-                )),
+                State::<carina_core::resource::NoPlaceholder>::not_found(
+                    ResourceId::with_provider_identity("mock", "test.resource", "consumer", None),
+                ),
             ),
         ],
         upstream_snapshot: HashMap::new(),
@@ -4695,7 +4752,8 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
             .persisted_attributes()
             .expect("consumer has applied attributes")
             .get("comment"),
-        carina_core::value::json_to_dsl_value(&serde_json::json!("target")),
+        carina_core::value::json_to_dsl_value(&serde_json::json!("target"))
+            .map(|value| value.to_snapshot()),
         "consumer must receive the value published by the apply-time read"
     );
 }
@@ -4738,7 +4796,8 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         saved_module_composition(root_resource_ref("producer", "identifier"), "bad-id");
     let mut source_identities = CompositionSourceIdentityResolver::new(tmp.path())
         .expect("create composition source identity resolver");
-    let saved_composition = composition
+    let saved_composition = carina_core::value::redact_secrets_in_live_composition(&composition)
+        .expect("capture composition snapshot")
         .into_saved_with_resolver(&mut source_identities)
         .expect("save composition");
     let mut graph_file = carina_core::parser::ExpandedParsedFile::default();
@@ -4773,8 +4832,11 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
             binding: None,
         }]),
         backend_config: None,
-        plan,
-        sorted_resources: vec![resolved_inner(producer.clone()), consumer_for_sorted],
+        plan: plan.to_snapshot(),
+        sorted_resources: (vec![resolved_inner(producer.clone()), consumer_for_sorted])
+            .into_iter()
+            .map(|value| value.to_snapshot())
+            .collect(),
         sorted_value_destroy_dependencies: vec![
             Default::default(),
             carina_core::resource::PersistedDestroyDependencies::from_test_dependencies([
@@ -4783,7 +4845,10 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         ],
         sorted_explicit_destroy_dependencies: vec![Default::default(), Default::default()],
         legacy_dependency_classification: None,
-        unresolved_resources: vec![producer.into_value_snapshot(), consumer_for_unresolved],
+        unresolved_resources: (vec![producer.into_value_snapshot(), consumer_for_unresolved])
+            .into_iter()
+            .map(|value| value.to_snapshot())
+            .collect(),
         compositions: vec![saved_composition],
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
@@ -4791,11 +4856,11 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         current_states: vec![
             crate::commands::plan::CurrentStateEntry::managed(
                 producer_id.clone(),
-                State::not_found(producer_id.clone()),
+                State::<carina_core::resource::NoPlaceholder>::not_found(producer_id.clone()),
             ),
             crate::commands::plan::CurrentStateEntry::managed(
                 consumer_id.clone(),
-                State::not_found(consumer_id),
+                State::<carina_core::resource::NoPlaceholder>::not_found(consumer_id),
             ),
         ],
         upstream_snapshot: HashMap::new(),
@@ -4847,9 +4912,12 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut source_identities = CompositionSourceIdentityResolver::new(tmp.path())
         .expect("create composition source identity resolver");
-    let saved_composition = saved_module_composition(string_value("bad"), "bad")
-        .into_saved_with_resolver(&mut source_identities)
-        .expect("save composition");
+    let saved_composition = carina_core::value::redact_secrets_in_live_composition(
+        &saved_module_composition(string_value("bad"), "bad"),
+    )
+    .expect("capture composition snapshot")
+    .into_saved_with_resolver(&mut source_identities)
+    .expect("save composition");
     let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
@@ -4859,7 +4927,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         state_serial: None,
         provider_configs: saved_provider_configs(Vec::new()),
         backend_config: None,
-        plan: Plan::new(),
+        plan: carina_core::plan::SnapshotPlan::default(),
         sorted_resources: Vec::new(),
         sorted_value_destroy_dependencies: Vec::new(),
         sorted_explicit_destroy_dependencies: Vec::new(),
@@ -4935,7 +5003,7 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
             binding: None,
         }]),
         backend_config: None,
-        plan: Plan::new(),
+        plan: carina_core::plan::SnapshotPlan::default(),
         sorted_resources: Vec::new(),
         unresolved_resources: Vec::new(),
         compositions: Vec::new(),
@@ -5058,7 +5126,7 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
         state_serial: None,
         provider_configs: carina_core::parser::SavedProviderConfigs::from(plan_inputs.configs()),
         backend_config: None,
-        plan: Plan::new(),
+        plan: carina_core::plan::SnapshotPlan::default(),
         sorted_resources: Vec::new(),
         unresolved_resources: Vec::new(),
         compositions: Vec::new(),
@@ -5299,7 +5367,7 @@ fn apply_does_not_require_flag_after_v7_to_v8_migration() {
     );
     let id = resource.id.clone();
     let sorted_resources = vec![resolved(resource)];
-    let applied_state = State::existing(
+    let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
         id.clone(),
         HashMap::from([(
             "name".to_string(),
@@ -5487,11 +5555,15 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
             binding: None,
         }]),
         backend_config: None,
-        plan,
-        sorted_resources: vec![resource.clone().into_value_snapshot()],
+        plan: plan.to_snapshot(),
+        sorted_resources: (vec![resource.clone().into_value_snapshot()])
+            .into_iter()
+            .map(|value| value.to_snapshot())
+            .collect(),
         unresolved_resources: vec![resource]
             .into_iter()
             .map(|resource| resource.into_value_snapshot())
+            .map(|value| value.to_snapshot())
             .collect(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
@@ -5499,7 +5571,7 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
         data_source_values: Vec::new(),
         current_states: vec![crate::commands::plan::CurrentStateEntry::managed(
             resource_id.clone(),
-            State::not_found(resource_id),
+            State::<carina_core::resource::NoPlaceholder>::not_found(resource_id),
         )],
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
@@ -6301,7 +6373,8 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
             .persisted_attributes()
             .expect("target has applied attributes")
             .get("path"),
-        carina_core::value::json_to_dsl_value(&serde_json::json!("/")),
+        carina_core::value::json_to_dsl_value(&serde_json::json!("/"))
+            .map(|value| value.to_snapshot()),
         "fixture must mirror AWS read-back defaults that are absent from config"
     );
     assert_eq!(
@@ -6309,7 +6382,8 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
             .persisted_attributes()
             .expect("target has applied attributes")
             .get("max_session_duration"),
-        carina_core::value::json_to_dsl_value(&serde_json::json!(3600)),
+        carina_core::value::json_to_dsl_value(&serde_json::json!(3600))
+            .map(|value| value.to_snapshot()),
         "fixture must mirror AWS read-back defaults that are absent from config"
     );
 
@@ -7128,7 +7202,7 @@ impl Provider for BootstrapRecordingProvider {
         resource: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = resource.id.clone();
-        Box::pin(async move { Ok(State::not_found(id)) })
+        Box::pin(async move { Ok(State::<carina_core::resource::NoPlaceholder>::not_found(id)) })
     }
 
     fn create(
@@ -7541,7 +7615,7 @@ async fn declared_state_bucket_bootstrap_seed_prevents_phantom_create_plan() {
         Current::Present(present) => present.into_parts().0,
         current => panic!("seeded bucket must be present, got {current:?}"),
     };
-    let plan_input_states = crate::plan_input_current_from_states(
+    let plan_input_states = crate::plan_input_current_from_snapshots(
         HashMap::from([(id.clone(), current_state)]),
         &schemas,
         std::slice::from_ref(&resource),
@@ -8225,7 +8299,10 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
-    let applied_state = State::existing(sorted_resources[0].id.clone(), applied_attrs);
+    let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
+        sorted_resources[0].id.clone(),
+        applied_attrs,
+    );
     let mut applied_states = HashMap::new();
     applied_states.insert(
         sorted_resources[0].id.clone(),
@@ -8262,7 +8339,8 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
             .persisted_attributes()
             .expect("saved resource has applied attributes")
             .get("ipv4_netmask_length"),
-        carina_core::value::json_to_dsl_value(&serde_json::Value::String("16".to_string())),
+        carina_core::value::json_to_dsl_value(&serde_json::Value::String("16".to_string()))
+            .map(|value| value.to_snapshot()),
         "write-only attribute should be persisted in state"
     );
 }
@@ -8359,8 +8437,11 @@ fn build_state_after_apply_preserves_block_unique_name_attribute() {
             ),
         )])),
     );
-    let applied_state = State::existing(sorted_resources[0].id.clone(), applied_attrs)
-        .with_identifier("some-identifier");
+    let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
+        sorted_resources[0].id.clone(),
+        applied_attrs,
+    )
+    .with_identifier("some-identifier");
     let mut applied_states = HashMap::new();
     applied_states.insert(
         sorted_resources[0].id.clone(),
@@ -8512,10 +8593,12 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
             ),
         )])),
     );
-    let current = State::existing(resource.id.clone(), state_attrs).with_identifier("some-id");
+    let current =
+        State::<carina_core::resource::NoPlaceholder>::existing(resource.id.clone(), state_attrs)
+            .with_identifier("some-id");
 
     // Saved attrs: same as current (from previous apply)
-    let saved: HashMap<String, Value> = current.attributes.clone();
+    let saved = current.to_snapshot().attributes;
     let saved = carina_core::provider::RawSavedAttrs::from_decoded_values_for_test(HashMap::from(
         [(resource.id.clone(), saved)],
     ))
@@ -8628,8 +8711,11 @@ fn block_unique_name_attribute_state_roundtrip() {
             ),
         )])),
     );
-    let applied_state = State::existing(sorted_resources[0].id.clone(), applied_attrs)
-        .with_identifier("ipam-12345");
+    let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
+        sorted_resources[0].id.clone(),
+        applied_attrs,
+    )
+    .with_identifier("ipam-12345");
     let mut applied_states = HashMap::new();
     applied_states.insert(
         sorted_resources[0].id.clone(),
@@ -8752,7 +8838,9 @@ fn move_plus_update_keeps_post_update_attributes() {
         "value".to_string(),
         Value::Concrete(ConcreteValue::String("prod".into())),
     );
-    let applied = State::existing(new_id.clone(), applied_attrs).with_identifier("tag-abc");
+    let applied =
+        State::<carina_core::resource::NoPlaceholder>::existing(new_id.clone(), applied_attrs)
+            .with_identifier("tag-abc");
     let mut applied_states = HashMap::new();
     applied_states.insert(new_id.clone(), complete_update(applied, &["value"], &[]));
 
@@ -8770,7 +8858,14 @@ fn move_plus_update_keeps_post_update_attributes() {
     let from_id = ResourceId::with_provider_identity("awscc", "ec2.Tag", "tag_old", None);
     plan.add(Effect::Update {
         identifier: crate::fixture_applied_identifier("tag-abc"),
-        from: Box::new(State::existing(from_id.clone(), HashMap::new()).with_identifier("tag-abc")),
+        from: Box::new(
+            (State::<carina_core::resource::NoPlaceholder>::existing(
+                from_id.clone(),
+                HashMap::new(),
+            )
+            .with_identifier("tag-abc"))
+            .to_snapshot(),
+        ),
         to: sorted_resources[0].clone(),
         changed_attributes: vec!["value".to_string()],
     });
@@ -8808,7 +8903,8 @@ fn move_plus_update_keeps_post_update_attributes() {
             .persisted_attributes()
             .expect("new row has applied attributes")
             .get("value"),
-        carina_core::value::json_to_dsl_value(&serde_json::Value::String("prod".to_string())),
+        carina_core::value::json_to_dsl_value(&serde_json::Value::String("prod".to_string()))
+            .map(|value| value.to_snapshot()),
         "Move must not overwrite Update's post-apply value",
     );
 }
@@ -8849,7 +8945,9 @@ fn move_alone_carries_attributes_via_managed_current() {
         "bucket_name".to_string(),
         Value::Concrete(ConcreteValue::String("my-bucket".into())),
     );
-    let current = State::existing(new_id.clone(), current_attrs).with_identifier("my-bucket");
+    let current =
+        State::<carina_core::resource::NoPlaceholder>::existing(new_id.clone(), current_attrs)
+            .with_identifier("my-bucket");
     let mut managed_current = HashMap::new();
     managed_current.insert(new_id.clone(), Current::from_state(current));
 
@@ -8906,7 +9004,8 @@ fn move_alone_carries_attributes_via_managed_current() {
             .persisted_attributes()
             .expect("new row has applied attributes")
             .get("bucket_name"),
-        carina_core::value::json_to_dsl_value(&serde_json::Value::String("my-bucket".to_string(),)),
+        carina_core::value::json_to_dsl_value(&serde_json::Value::String("my-bucket".to_string(),))
+            .map(|value| value.to_snapshot()),
     );
 }
 
@@ -9047,7 +9146,10 @@ fn move_from_overlapping_desired_resource_errors() {
     let mut applied = HashMap::new();
     applied.insert(
         id.clone(),
-        complete_create(State::existing(id.clone(), HashMap::new()).with_identifier("x")),
+        complete_create(
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("x"),
+        ),
     );
 
     let to_id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "elsewhere", None);
@@ -9113,7 +9215,10 @@ fn remove_overlapping_desired_resource_errors() {
     let mut applied = HashMap::new();
     applied.insert(
         id.clone(),
-        complete_create(State::existing(id.clone(), HashMap::new()).with_identifier("x")),
+        complete_create(
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("x"),
+        ),
     );
 
     let mut plan = Plan::new();
@@ -9174,7 +9279,10 @@ fn self_move_overlapping_desired_resource_errors() {
     let mut applied = HashMap::new();
     applied.insert(
         id.clone(),
-        complete_create(State::existing(id.clone(), HashMap::new()).with_identifier("x")),
+        complete_create(
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("x"),
+        ),
     );
 
     let mut plan = Plan::new();
@@ -9634,7 +9742,10 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
             Value::Concrete(ConcreteValue::String(pre_apply_arn.to_string().into())),
         );
         let mut m = HashMap::new();
-        m.insert(id.clone(), ResourceState::existing(id, attrs));
+        m.insert(
+            id.clone(),
+            ResourceState::<carina_core::resource::NoPlaceholder>::existing(id, attrs),
+        );
         m
     };
 
@@ -9820,7 +9931,10 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
             )])),
         );
         let mut m = HashMap::new();
-        m.insert(ds_id.clone(), ResourceState::existing(ds_id, attrs));
+        m.insert(
+            ds_id.clone(),
+            ResourceState::<carina_core::resource::NoPlaceholder>::existing(ds_id, attrs),
+        );
         m
     };
 
@@ -9832,7 +9946,7 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
     )];
 
     let data_source_values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
-        DataSourceValue::read(data_source_states[&data_source.id].clone())
+        DataSourceValue::read((data_source_states[&data_source.id].clone()).to_snapshot())
     });
     let post_apply_states =
         crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
@@ -10111,7 +10225,8 @@ mod apply_deferred_for_parity {
         let mut states = HashMap::new();
         states.insert(
             cert.id.clone(),
-            State::existing(cert.id.clone(), attrs).with_identifier("cert-id"),
+            State::<carina_core::resource::NoPlaceholder>::existing(cert.id.clone(), attrs)
+                .with_identifier("cert-id"),
         );
         states
     }
@@ -11296,16 +11411,17 @@ mod saved_plan_version_tests {
             )),
         );
         let id = resource.id.clone();
-        let current_state = carina_core::resource::State::existing(
-            id.clone(),
-            std::collections::HashMap::from([(
-                "cidr_block".to_string(),
-                carina_core::resource::Value::Concrete(
-                    carina_core::resource::ConcreteValue::String("10.0.0.0/16".into()),
-                ),
-            )]),
-        )
-        .with_identifier("vpc-old");
+        let current_state =
+            carina_core::resource::State::<carina_core::resource::NoPlaceholder>::existing(
+                id.clone(),
+                std::collections::HashMap::from([(
+                    "cidr_block".to_string(),
+                    carina_core::resource::Value::Concrete(
+                        carina_core::resource::ConcreteValue::String("10.0.0.0/16".into()),
+                    ),
+                )]),
+            )
+            .with_identifier("vpc-old");
         let current_states = std::collections::HashMap::from([(id.clone(), current_state.clone())]);
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
@@ -11349,14 +11465,18 @@ mod saved_plan_version_tests {
             state_serial: None,
             provider_configs: saved_provider_configs(Vec::new()),
             backend_config: None,
-            plan,
-            sorted_resources: vec![resolved_inner(resource.clone())],
+            plan: plan.to_snapshot(),
+            sorted_resources: (vec![resolved_inner(resource.clone())])
+                .into_iter()
+                .map(|value| value.to_snapshot())
+                .collect(),
             sorted_value_destroy_dependencies: vec![Default::default()],
             sorted_explicit_destroy_dependencies: vec![Default::default()],
             legacy_dependency_classification: None,
             unresolved_resources: vec![resource]
                 .into_iter()
                 .map(|resource| resource.into_value_snapshot())
+                .map(|value| value.to_snapshot())
                 .collect(),
             compositions: Vec::new(),
             data_sources: Vec::new(),

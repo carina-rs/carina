@@ -20,8 +20,8 @@ use carina_core::provider::{
     ResumeOutcomeKind,
 };
 use carina_core::resource::{
-    BindingAddress, ConcreteValue, PlaceholderKind, Resource, ResourceId, State, Value,
-    legacy_secret_migration,
+    BindingAddress, ConcreteValue, PlaceholderKind, Resource, ResourceId, SnapshotValue, State,
+    StateValueLeaf, Value, legacy_secret_migration,
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, StructField, ValidatedConfigSchema,
@@ -664,10 +664,10 @@ impl MockProvider {
         Ok(references::resolve(&table, requests))
     }
 
-    fn canonicalize_mock_reference_write(
+    fn canonicalize_mock_reference_write<P: StateValueLeaf>(
         &self,
         id: &ResourceId,
-        attributes: &mut HashMap<String, Value>,
+        attributes: &mut HashMap<String, Value<P>>,
     ) -> ProviderResult<()> {
         if id.resource_type != "test.reference" || self.behavior.reference_echo_alias {
             return Ok(());
@@ -931,7 +931,7 @@ impl MockProvider {
             generated_attribute(&id.resource_type, id.identity_str(), name.as_deref())
         {
             attrs.entry(attribute.to_string()).or_insert_with(|| {
-                PersistedValue::encode_provider_value(
+                PersistedValue::encode_provider_value::<carina_core::resource::NoPlaceholder>(
                     &Value::Concrete(ConcreteValue::String(value.clone().into())),
                     None,
                 )
@@ -957,7 +957,9 @@ impl MockProvider {
         }
     }
 
-    fn strip_unobservable_nested_write_only(attributes: &mut HashMap<String, Value>) {
+    fn strip_unobservable_nested_write_only<P: StateValueLeaf>(
+        attributes: &mut HashMap<String, Value<P>>,
+    ) {
         let Some(Value::Concrete(ConcreteValue::Map(config))) =
             attributes.get_mut(NESTED_WRITE_ONLY_ATTRIBUTE)
         else {
@@ -966,7 +968,10 @@ impl MockProvider {
         config.shift_remove(NESTED_WRITE_ONLY_FIELD);
     }
 
-    fn add_server_list_defaults(id: &ResourceId, attributes: &mut HashMap<String, Value>) {
+    fn add_server_list_defaults<P: StateValueLeaf>(
+        id: &ResourceId,
+        attributes: &mut HashMap<String, Value<P>>,
+    ) {
         if id.resource_type != SERVER_ADDED_LIST_RESOURCE_TYPE
             && id.resource_type != KEYED_PARTIAL_UPDATE_RESOURCE_TYPE
         {
@@ -1015,7 +1020,7 @@ impl MockProvider {
     fn add_server_list_update_out_of_band_element(
         &self,
         id: &ResourceId,
-        attributes: &mut HashMap<String, Value>,
+        attributes: &mut HashMap<String, SnapshotValue>,
     ) {
         if id.resource_type != SERVER_ADDED_LIST_RESOURCE_TYPE {
             return;
@@ -1046,7 +1051,7 @@ impl MockProvider {
 
     fn merge_keyed_partial_update_list(
         id: &ResourceId,
-        attributes: &mut HashMap<String, Value>,
+        attributes: &mut HashMap<String, SnapshotValue>,
         key: &str,
         value: &Value,
     ) -> bool {
@@ -1088,9 +1093,9 @@ impl MockProvider {
                         )
                 )
             }) {
-                *existing = sent_element.clone();
+                *existing = sent_element.to_snapshot();
             } else {
-                current.push(sent_element.clone());
+                current.push(sent_element.to_snapshot());
             }
         }
         true
@@ -1342,7 +1347,7 @@ impl MockProvider {
     async fn read_attributes(
         &self,
         id: &ResourceId,
-    ) -> ProviderResult<Option<HashMap<String, Value>>> {
+    ) -> ProviderResult<Option<HashMap<String, SnapshotValue>>> {
         self.append_op_log_if_configured("read", id)?;
         let mut read_outcome = None;
         if let Some(delay) = self
@@ -1502,7 +1507,9 @@ impl Provider for MockProvider {
         let identifier = identifier.clone();
         Box::pin(async move {
             let outcome = if let Some(attributes) = self.read_attributes(&id).await? {
-                ReadOutcome::found(AppliedState::from_identifier(id, identifier, attributes))
+                ReadOutcome::found(AppliedState::from_snapshot_parts(
+                    id, identifier, attributes,
+                ))
             } else {
                 ReadOutcome::not_found(id)
             };
@@ -1517,7 +1524,23 @@ impl Provider for MockProvider {
         let id = resource.id.clone();
         Box::pin(async move {
             Ok(match self.read_attributes(&id).await? {
-                Some(attributes) => State::existing(id, attributes),
+                Some(attributes) => {
+                    let attributes = attributes
+                        .into_iter()
+                        .map(|(name, value)| {
+                            value
+                                .to_value_at(format!("{id}.{name}"))
+                                .map(|value| (name, value))
+                        })
+                        .collect::<Result<_, _>>()
+                        .map_err(|source| {
+                            ProviderError::internal_caused_by(
+                                "mock data-source output contains an unavailable secret",
+                                source,
+                            )
+                        })?;
+                    State::existing(id, attributes)
+                }
                 None => State::not_found(id),
             })
         })
@@ -1688,7 +1711,7 @@ impl Provider for MockProvider {
                     | PatchOp::Reassert { key, value } => {
                         if !Self::merge_keyed_partial_update_list(&id, &mut attributes, key, value)
                         {
-                            attributes.insert(key.clone(), value.clone());
+                            attributes.insert(key.clone(), value.to_snapshot());
                         }
                     }
                     PatchOp::Remove { key } => {
@@ -1734,13 +1757,14 @@ impl Provider for MockProvider {
                 .update_result_identifier
                 .clone()
                 .unwrap_or(identifier);
-            let state =
-                AppliedState::new(id, applied_identifier, attributes).map_err(|source| {
+            let applied_identifier =
+                AppliedIdentifier::new(applied_identifier).map_err(|source| {
                     ProviderError::internal_caused_by(
                         "mock update result identifier must not be empty",
                         source,
                     )
                 })?;
+            let state = AppliedState::from_snapshot_parts(id, applied_identifier, attributes);
             if let Some(config) = partial_update {
                 return Ok(UpdateOutcome::partial_success(
                     state,
@@ -2482,7 +2506,7 @@ mod tests {
         else {
             panic!("legacy payload should remain a user map")
         };
-        assert_eq!(payload.get("$x"), Some(&string_value("kept")));
+        assert_eq!(payload.get("$x"), Some(&string_value("kept").to_snapshot()));
         let Some(Value::Concrete(ConcreteValue::CanonicalEnum(mode))) =
             state.attributes.get("mode")
         else {
@@ -2528,7 +2552,7 @@ mod tests {
             attrs["raw"].decode(),
             Some(string_value(
                 "_secret:argon2:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            )),
+            ).to_snapshot()),
             "mock v1 never assigned row-aware semantics to raw legacy strings",
         );
     }
@@ -2580,11 +2604,11 @@ mod tests {
             ))
             .expect("fresh mock v2 state should reload")
             .into_state();
-        assert_eq!(state.attributes.get("comment"), Some(&plain));
+        assert_eq!(state.attributes.get("comment"), Some(&plain.to_snapshot()));
         assert!(matches!(
             state.attributes.get("tags"),
             Some(Value::Concrete(ConcreteValue::Map(values)))
-                if values.get("nested") == Some(&plain)
+                if values.get("nested") == Some(&plain.to_snapshot())
         ));
     }
 
@@ -2707,7 +2731,10 @@ mod tests {
             ))
             .expect("new mock state should reload")
             .into_state();
-        assert_eq!(state.attributes.get("payload"), Some(&payload));
+        assert_eq!(
+            state.attributes.get("payload"),
+            Some(&payload.to_snapshot())
+        );
     }
 
     #[test]
@@ -2735,7 +2762,12 @@ mod tests {
             .decode()
             .expect("canonical enum fixture is non-null");
         let resource = Resource::with_provider("mock", "test.resource", "enum", None)
-            .with_attribute("mode", canonical.clone());
+            .with_attribute(
+                "mode",
+                canonical
+                    .to_value_at("mock.test.resource.enum.mode")
+                    .expect("ordinary enum fixture is available as an authored value"),
+            );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -2832,7 +2864,9 @@ mod tests {
             let mut from_attrs = HashMap::new();
             from_attrs.insert("name".to_string(), string_value("web-acl-new"));
             from_attrs.insert("comment".to_string(), string_value("v1"));
-            let from = State::existing(id.clone(), from_attrs).with_identifier("mock-id");
+            let from =
+                State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), from_attrs)
+                    .with_identifier("mock-id");
             let bindings = carina_core::binding_index::ResolvedBindings::default();
             let module_gate =
                 carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
@@ -2862,7 +2896,7 @@ mod tests {
                     );
                     let request = carina_core::executor::prepare_update_request(
                         update_resource,
-                        from,
+                        from.to_snapshot(),
                         &["comment".to_string()],
                         &preparation,
                     )

@@ -142,7 +142,7 @@ use carina_core::resource::DeferredValue;
 use carina_core::resource::{
     AbsoluteBindingAddress, BindingAddress, ConcreteValue, Current, DataSource, LiveComposition,
     ModuleSource, NoPlaceholder, ParserPlaceholder, PartialReadMarker, PlaceholderKind,
-    ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
+    ResolvedResource, ResolvedResourceId, Resource, ResourceId, SnapshotState as State, Value,
 };
 #[cfg(any(test, feature = "test-utils"))]
 use carina_core::schema::ValidatedResourceSchema;
@@ -3570,7 +3570,8 @@ fn detect_legacy_loop_moves_with_ctx(
         &|binding| state_view.entries_by_binding(claims, binding),
         claims,
         reserved_moves,
-    )?)
+    )
+    .map_err(Box::new)?)
 }
 
 fn detect_anonymous_to_named_moves_with_ctx(
@@ -3612,7 +3613,8 @@ fn detect_anonymous_to_named_moves_with_ctx(
                 .unwrap_or_default()
         },
         claims,
-    )?)
+    )
+    .map_err(Box::new)?)
 }
 
 fn detect_anonymous_to_named_moves_to_fixed_point(
@@ -4111,6 +4113,8 @@ impl NonEmptyPlanErrors {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlanPreparationError {
+    #[error(transparent)]
+    ModuleConstraint(#[from] carina_core::executor::ModuleConstraintGateError),
     #[error("plan validation failed")]
     Plan(NonEmptyPlanErrors),
     #[error(transparent)]
@@ -4252,8 +4256,14 @@ fn append_resolved_value_constraint_errors(
 /// is not a new diagnostic outcome, so it becomes `None` here.
 pub(crate) fn module_constraint_plan_errors(
     error: carina_core::executor::ModuleConstraintGateError,
-) -> Option<NonEmptyPlanErrors> {
-    let errors: Vec<PlanError> = error
+) -> Result<Option<NonEmptyPlanErrors>, carina_core::executor::ModuleConstraintGateError> {
+    let violations = match error {
+        error @ carina_core::executor::ModuleConstraintGateError::UnavailableSecret(_) => {
+            return Err(error);
+        }
+        carina_core::executor::ModuleConstraintGateError::Violations(violations) => violations,
+    };
+    let errors: Vec<PlanError> = violations
         .failures()
         .iter()
         .cloned()
@@ -4264,7 +4274,7 @@ pub(crate) fn module_constraint_plan_errors(
             )
         })
         .collect();
-    NonEmptyPlanErrors::try_from(errors).ok()
+    Ok(NonEmptyPlanErrors::try_from(errors).ok())
 }
 
 impl<'a> PlanPreprocessor<'a> {
@@ -4305,7 +4315,7 @@ impl<'a> PlanPreprocessor<'a> {
                         data_source_origins,
                     );
                     if let Err(error) = module_gate.check(resources.bindings(), session)
-                        && let Some(module_errors) = module_constraint_plan_errors(error)
+                        && let Some(module_errors) = module_constraint_plan_errors(error)?
                     {
                         errors.extend(module_errors.into_vec());
                     }
@@ -5857,7 +5867,11 @@ async fn read_addressed_data_sources_phase2(
         {
             continue;
         }
-        orphan_resources.push(orphan.binding_resource());
+        // This live resource supplies only binding identity. Historical values
+        // are selected from ManagedCurrentView below, across the checked seam.
+        let mut resource: Resource = Resource::from_id(id.clone());
+        resource.binding = orphan.binding_address().cloned();
+        orphan_resources.push(resource);
     }
     let managed = addressed
         .sorted_resources
@@ -6171,7 +6185,7 @@ pub async fn derive_managed_binding_stability<E>(
         &parsed.upstream_binding_names(),
         session,
     )
-    .map_err(AppError::Validation)?;
+    .map_err(AppError::ValueResolution)?;
     // Keep dependency operands unexpanded until the single graph transition.
     let stability = reference_preparation
         .pre_graph_stability(
@@ -6777,6 +6791,9 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                         PlanPreparationError::Provider(error) => {
                             return Err(AppError::Provider(error));
                         }
+                        PlanPreparationError::ModuleConstraint(error) => {
+                            return Err(AppError::ModuleConstraint(error));
+                        }
                     };
                     let mut plan = Plan::new();
                     for error in errors.as_slice().iter().cloned() {
@@ -6975,6 +6992,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                         &outcome_unknown_import_replacements,
                     )
                     .await?;
+                let mut state_block_result = Ok(());
                 let mut plan = prepared.value.finish(|plan| {
                     add_deposed_delete_effects(plan, state_file, &addressed.moved_pairs);
                     block_deletes_on_prior_consumer_updates(plan, &directives_map);
@@ -6986,7 +7004,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
 
                     // State blocks run after differ/deposed identifier errors so `removed`
                     // remains the explicit recovery that can suppress those diagnostics.
-                    add_state_block_effects(
+                    state_block_result = add_state_block_effects(
                         plan,
                         &parsed.state_blocks,
                         state_file,
@@ -7000,6 +7018,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                         },
                     );
                 });
+                state_block_result?;
 
                 let analysis = carina_core::effect::deps::build_effect_dependency_analysis(
                     plan.effects(),
@@ -7587,7 +7606,7 @@ async fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTa
                             Err(_) => DeferredForExpansionChoice::Expand,
                         }
                     })
-                    .map_err(|error| AppError::Validation(error.to_string()))?;
+                    .map_err(AppError::DeferredForExpansion)?;
                 let providers = target.parsed().providers.clone();
                 target.compute_anonymous_identifiers(identity_context, &providers)?;
                 let printed_warnings = warning_policy == DeferredForWarningPolicy::Print
@@ -8392,7 +8411,9 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         .await?;
     let refresh_module_constraint_errors = phase2
         .module_constraint_error
-        .and_then(module_constraint_plan_errors);
+        .map(module_constraint_plan_errors)
+        .transpose()?
+        .flatten();
     let data_source_values = phase2.values;
     let prepared_expansion = reconciled_expansion.seal(data_source_values);
 
@@ -8957,26 +8978,39 @@ fn state_block_import(
     state_file: Option<&StateFile>,
     identifier: impl FnOnce() -> Value,
 ) -> Option<StateBlockImport> {
+    match try_state_block_import(id, state_file, || {
+        Ok::<_, std::convert::Infallible>(identifier())
+    }) {
+        Ok(import) => import,
+        Err(never) => match never {},
+    }
+}
+
+fn try_state_block_import<E>(
+    id: ResolvedResourceId,
+    state_file: Option<&StateFile>,
+    identifier: impl FnOnce() -> Result<Value, E>,
+) -> Result<Option<StateBlockImport>, E> {
     let disposition = state_file
         .map(|state| state.import_target_disposition_for_id(id.as_inner()))
         .unwrap_or(carina_state::ImportTargetDisposition::Vacant);
-    match disposition {
+    Ok(match disposition {
         carina_state::ImportTargetDisposition::Vacant => Some(StateBlockImport {
             effect: Effect::Import {
                 id,
-                identifier: identifier(),
+                identifier: identifier()?,
             },
             outcome_unknown_replacement: None,
         }),
         carina_state::ImportTargetDisposition::ReplaceCreateOutcomeUnknown => {
-            let (effect, replacement) = Effect::import_replacing_outcome_unknown(id, identifier());
+            let (effect, replacement) = Effect::import_replacing_outcome_unknown(id, identifier()?);
             Some(StateBlockImport {
                 effect,
                 outcome_unknown_replacement: Some(replacement),
             })
         }
         carina_state::ImportTargetDisposition::Occupied => None,
-    }
+    })
 }
 
 pub struct StateBlockEvaluationContext<'a> {
@@ -9012,7 +9046,7 @@ pub fn add_state_block_effects<D>(
         D,
     >],
     context: StateBlockEvaluationContext<'_>,
-) {
+) -> Result<(), carina_core::resolver::ResolutionError> {
     // Import identifier expressions use the same binding authority and
     // upstream deferral policy as ordinary resource attributes.
     let StateBlockEvaluationContext {
@@ -9043,7 +9077,7 @@ pub fn add_state_block_effects<D>(
                 // against the same binding view as resource attributes.
                 // Deferred upstream-state refs remain typed placeholders for
                 // display and apply-time resolution.
-                let Some(import) = state_block_import(
+                let Some(import) = try_state_block_import(
                     resolve_import_target(to, desired_resources),
                     state_file.as_ref(),
                     || {
@@ -9054,7 +9088,8 @@ pub fn add_state_block_effects<D>(
                             session,
                         )
                     },
-                ) else {
+                )?
+                else {
                     continue;
                 };
                 let StateBlockImport {
@@ -9172,6 +9207,7 @@ pub fn add_state_block_effects<D>(
     for effect in new_effects {
         plan.add(effect);
     }
+    Ok(())
 }
 
 /// Add delete-pending deposed generations from state to the plan.
@@ -9361,7 +9397,7 @@ pub async fn refresh_loaded_resource_with_retry(
     match loaded.read_target() {
         Some(target) => read_managed_state_with_retry(provider, &target, state_file, schemas)
             .await
-            .map(Current::from_state),
+            .map(Current::from_snapshot),
         None => Ok(loaded.into_current()),
     }
 }
@@ -9985,7 +10021,10 @@ async fn read_data_sources_phase2_pass(
                             if let Some(progress) = progress {
                                 progress.finish();
                             }
-                            Ok(Some((resource.id, DataSourceValue::read(state))))
+                            Ok(Some((
+                                resource.id,
+                                DataSourceValue::read(state.to_snapshot()),
+                            )))
                         }
                     }
                 }
@@ -10091,7 +10130,7 @@ fn resolve_data_source_refs_for_refresh_from_refs(
             &bindings,
             session,
         )
-        .map_err(AppError::Validation)?;
+        .map_err(AppError::ValueResolution)?;
         carina_core::value::canonicalize_data_sources_with_schemas(
             std::slice::from_mut(&mut resolved),
             schemas,
@@ -10344,14 +10383,14 @@ pub(crate) fn prepare_data_sources_for_plan(
                     upstream_bindings,
                     session,
                 )
-                .map_err(AppError::Validation)?;
+                .map_err(AppError::ValueResolution)?;
             } else {
                 carina_core::resolver::resolve_data_source_refs(
                     std::slice::from_mut(&mut resource),
                     bindings,
                     session,
                 )
-                .map_err(AppError::Validation)?;
+                .map_err(AppError::ValueResolution)?;
             }
         }
         prepared.push(resource);
@@ -10716,10 +10755,10 @@ impl MigrationCheckConfig {
                         &self.resources.data_sources,
                         |data_source| match state_file.build_state_for_resource(&data_source.id) {
                             Current::Present(present) => {
-                                DataSourceValue::read(present.state().clone())
+                                DataSourceValue::read((present.state().clone()).to_snapshot())
                             }
                             Current::MissingIdentifier(state) => {
-                                DataSourceValue::read(state.state().clone())
+                                DataSourceValue::read((state.state().clone()).to_snapshot())
                             }
                             Current::Absent(_)
                             | Current::CreateInFlight(_)
@@ -10747,7 +10786,7 @@ impl MigrationCheckConfig {
                             &bindings.project_iterable_bindings(),
                             session,
                         )
-                        .map_err(|error| AppError::Validation(error.to_string()))?;
+                        .map_err(AppError::DeferredForExpansion)?;
 
                     let after = self.resources.deferred_for_expressions().len();
                     if after == before {

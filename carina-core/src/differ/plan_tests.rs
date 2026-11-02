@@ -1,4 +1,5 @@
 use super::{create_plan_for_tests as create_plan, *};
+type State = crate::resource::State;
 use crate::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
@@ -22,10 +23,10 @@ fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
     RootScope::new().resolve(RelativeBindingName::new(binding))
 }
 
-fn diff_test(
+fn diff_test<P: crate::resource::StateValueLeaf>(
     desired: &Resource,
-    current: &State,
-    saved: Option<&HashMap<String, Value>>,
+    current: &crate::resource::State<P>,
+    saved: Option<&HashMap<String, crate::resource::SnapshotValue>>,
     prev_explicit: Option<&ExplicitFields>,
     schema: Option<&ResourceSchema>,
 ) -> Diff {
@@ -88,6 +89,149 @@ fn ignore_path(parts: &[&str]) -> crate::resource::ParsedIgnorePath {
             .map(|part| crate::resource::ParsedIgnorePathSegment::Attribute((*part).to_string()))
             .collect(),
     )
+}
+
+fn plan_with_historical_secret(desired_secret: &str) -> crate::plan::Plan {
+    let secret = |value: &str| {
+        Value::Deferred(crate::resource::DeferredValue::Secret(Box::new(
+            Value::Concrete(ConcreteValue::String(value.into())),
+        )))
+    };
+    let desired = Resource::with_provider("mock", "Widget", "example", None)
+        .with_attribute("password", secret(desired_secret));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("Widget")
+            .attribute(
+                PatternAttributeSchema::optional("password", PatternAttributeType::string())
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let hash = crate::value::redact_secrets_in_value(&secret("old-password")).unwrap();
+    let state = crate::resource::SnapshotState::existing(
+        desired.id.clone(),
+        HashMap::from([("password".into(), hash)]),
+    )
+    .with_identifier("widget-id");
+    let current = crate::resource::into_plan_input_current_map(
+        HashMap::from([(desired.id.clone(), Current::from_snapshot(state))]),
+        &schemas,
+        std::slice::from_ref(&desired),
+    );
+    create_plan(
+        &[desired],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &current,
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    )
+}
+
+#[test]
+fn plan_unchanged_secret_hash_produces_no_change() {
+    let plan = plan_with_historical_secret("old-password");
+    assert!(plan.errors().is_empty(), "{:?}", plan.errors());
+    assert!(plan.effects().is_empty(), "{:?}", plan.effects());
+}
+
+#[test]
+fn plan_changed_secret_hash_produces_update() {
+    let plan = plan_with_historical_secret("new-password");
+    assert!(plan.errors().is_empty(), "{:?}", plan.errors());
+    assert!(
+        matches!(plan.effects(), [Effect::Update { changed_attributes, .. }]
+        if changed_attributes == &["password".to_string()])
+    );
+}
+
+#[test]
+fn plan_rejects_historical_hash_needed_by_ignored_readable_patch() {
+    let mut desired = Resource::with_provider("mock", "Widget", "example", None).with_attribute(
+        "config",
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "comment".into(),
+                Value::Concrete(ConcreteValue::String("authored".into())),
+            ),
+            ("memory".into(), Value::Concrete(ConcreteValue::Int(2))),
+        ]))),
+    );
+    desired.directives.ignore_changes = vec![ignore_path(&["config", "comment"])];
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("Widget")
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "config",
+                    PatternAttributeType::struct_(
+                        "Config",
+                        vec![
+                            PatternStructField::optional("comment", PatternAttributeType::string())
+                                .build(),
+                            PatternStructField::optional("memory", PatternAttributeType::int())
+                                .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let hash = crate::value::redact_secrets_in_value(&Value::Deferred(
+        crate::resource::DeferredValue::Secret(Box::new(Value::Concrete(ConcreteValue::String(
+            "old".into(),
+        )))),
+    ))
+    .unwrap();
+    let state = crate::resource::SnapshotState::existing(
+        desired.id.clone(),
+        HashMap::from([(
+            "config".into(),
+            crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::Map(
+                IndexMap::from([
+                    ("comment".into(), hash),
+                    (
+                        "memory".into(),
+                        crate::resource::SnapshotValue::Concrete(
+                            crate::resource::ConcreteValue::Int(1),
+                        ),
+                    ),
+                ]),
+            )),
+        )]),
+    )
+    .with_identifier("widget-id");
+    let current = crate::resource::into_plan_input_current_map(
+        HashMap::from([(desired.id.clone(), Current::from_snapshot(state))]),
+        &schemas,
+        std::slice::from_ref(&desired),
+    );
+    let plan = create_plan(
+        &[desired],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &current,
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+    assert!(plan.effects().is_empty());
+    assert!(matches!(plan.errors(), [crate::plan::PlanError {
+        kind: PlanErrorKind::UnavailableSecret(error), ..
+    }] if error.path().ends_with(".config.comment")));
 }
 
 #[test]
@@ -1587,7 +1731,7 @@ fn create_before_destroy_with_missing_schema_reports_schema_not_registered() {
     );
     let schemas = SchemaRegistry::new();
 
-    let err = plan::temporary_name_for_cbd(&resource, &from, &schemas).unwrap_err();
+    let err = plan::temporary_name_for_cbd(&resource, &(from).to_snapshot(), &schemas).unwrap_err();
 
     assert_eq!(
         PlanErrorKind::from(err),
@@ -1827,7 +1971,9 @@ fn server_default_struct_field_does_not_appear_in_diff() {
     let result = diff_test(
         &desired,
         &current,
-        Some(&saved_attrs),
+        Some(&crate::test_support::snapshot_attributes(
+            (saved_attrs).clone(),
+        )),
         Some(&prev_explicit),
         None,
     );
@@ -1861,7 +2007,10 @@ fn nested_authored_field_removal_produces_update_patch_without_removed_field() {
     ])));
     let current_attrs = HashMap::from([("distribution_config".to_string(), current_config)]);
     let current = existing_state(distribution_id.clone(), current_attrs.clone());
-    let saved_attrs = HashMap::from([(distribution_id, current_attrs)]);
+    let saved_attrs = HashMap::from([(
+        distribution_id,
+        crate::test_support::snapshot_attributes(current_attrs),
+    )]);
     let prev_explicit = ExplicitFields::Struct {
         children: HashMap::from([(
             "distribution_config".to_string(),
@@ -1948,7 +2097,9 @@ fn saved_server_default_nested_field_not_authored_remains_no_change() {
     let result = diff_test(
         &desired,
         &current,
-        Some(&current_attrs),
+        Some(&crate::test_support::snapshot_attributes(
+            (current_attrs).clone(),
+        )),
         Some(&prev_explicit),
         None,
     );
@@ -2012,7 +2163,9 @@ fn list_union_authoring_does_not_turn_provider_field_into_removal() {
     let result = diff_test(
         &desired,
         &current,
-        Some(&current_attrs),
+        Some(&crate::test_support::snapshot_attributes(
+            (current_attrs).clone(),
+        )),
         Some(&prev_explicit),
         None,
     );
@@ -2071,34 +2224,40 @@ fn list_elements_authored_field_removal_produces_update_for_paired_element() {
         unreachable!();
     };
     let effective_desired = crate::resource::merge_with_saved(
-        &desired.attributes["rules"],
-        crate::resource::SavedValueViews::same(&current_attrs["rules"]),
+        &(desired.attributes["rules"]).to_snapshot(),
+        crate::resource::SavedValueViews::same(&(current_attrs["rules"]).to_snapshot()),
         &children["rules"],
         None,
         crate::schema::empty_defs_for_schema_walks(),
         &super::exact_comparison_context_for_tests(),
     );
-    let Value::Concrete(ConcreteValue::List(effective_rules)) = effective_desired else {
+    let crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(effective_rules)) =
+        effective_desired
+    else {
         panic!("expected effective desired rules list");
     };
-    let Value::Concrete(ConcreteValue::Map(port_80)) = &effective_rules[0] else {
+    let crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(port_80)) =
+        &effective_rules[0]
+    else {
         panic!("expected port 80 map");
     };
-    let Value::Concrete(ConcreteValue::Map(port_443)) = &effective_rules[1] else {
+    let crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(port_443)) =
+        &effective_rules[1]
+    else {
         panic!("expected port 443 map");
     };
     assert!(!port_80.contains_key("description"));
     assert_eq!(
         port_443.get("description"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "provider-default".into()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("provider-default".into())).to_snapshot())
     );
 
     let result = diff_test(
         &desired,
         &current,
-        Some(&current_attrs),
+        Some(&crate::test_support::snapshot_attributes(
+            (current_attrs).clone(),
+        )),
         Some(&prev_explicit),
         None,
     );
@@ -2139,7 +2298,9 @@ fn legacy_migrated_leaf_list_authoring_preserves_provider_nested_fields() {
     let result = diff_test(
         &desired,
         &current,
-        Some(&current_attrs),
+        Some(&crate::test_support::snapshot_attributes(
+            (current_attrs).clone(),
+        )),
         Some(&prev_explicit),
         None,
     );
@@ -2181,7 +2342,9 @@ fn whole_value_list_authoring_compares_and_sends_the_full_desired_list() {
     let result = diff_test(
         &desired,
         &current,
-        Some(&current_attrs),
+        Some(&crate::test_support::snapshot_attributes(
+            (current_attrs).clone(),
+        )),
         Some(&prev_explicit),
         None,
     );
@@ -2281,7 +2444,9 @@ fn unchanged_dsl_after_writeback_pairs_raw_saved_list_without_phantom_removal() 
     let result = diff_test(
         &authored,
         &current,
-        Some(&saved_attributes),
+        Some(&crate::test_support::snapshot_attributes(
+            (saved_attributes).clone(),
+        )),
         Some(&prior),
         None,
     );
@@ -2320,7 +2485,9 @@ fn migrated_leaf_authoring_for_map_preserves_provider_nested_fields() {
     let result = diff_test(
         &desired,
         &current,
-        Some(&current_attrs),
+        Some(&crate::test_support::snapshot_attributes(
+            (current_attrs).clone(),
+        )),
         Some(&prev_explicit),
         None,
     );
@@ -2360,9 +2527,10 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
     let web_acl_state = existing_state(web_acl_id.clone(), HashMap::new())
         .with_identifier("arn:aws:wafv2:acl/test");
     let current_states = HashMap::from([(distribution_id.clone(), distribution_state)]);
-    let saved_attrs = crate::provider::RawSavedAttrs::from_decoded_values_for_test(HashMap::from(
-        [(distribution_id.clone(), distribution_attrs)],
-    ))
+    let saved_attrs = crate::test_support::raw_saved_attrs(HashMap::from([(
+        distribution_id.clone(),
+        distribution_attrs,
+    )]))
     .lift(&SchemaRegistry::new());
     let prev_explicit = HashMap::from([(
         distribution_id.clone(),
@@ -2421,7 +2589,7 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
     let patch = crate::provider::build_update_patch(changed_attributes, &ready, from, &schema)
         .expect("fixture update patch is valid");
     let crate::provider::PatchOp::Replace {
-        value: Value::Concrete(ConcreteValue::Map(patch_config)),
+        value: crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(patch_config)),
         ..
     } = &patch.ops[0]
     else {
@@ -2473,22 +2641,21 @@ fn orphan_delete_uses_typed_binding_without_state_attribute() {
         crate::resource::PersistedDirectives::default(),
     )]);
 
-    let plan = create_plan(
-        &[],
-        &[],
-        &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_current_map_from_states(
-            HashMap::new(),
-            &crate::schema::SchemaRegistry::new(),
+    let plan =
+        create_plan(
             &[],
-        ),
-        &HashMap::new(),
-        &SchemaRegistry::new(),
-        &empty_lifted_saved_attrs(),
-        &HashMap::new(),
-        &orphans,
-        &[],
-    );
+            &[],
+            &crate::provider::ProviderRouter::new(),
+            &crate::resource::into_plan_input_current_map_from_states::<
+                crate::resource::NoPlaceholder,
+            >(HashMap::new(), &crate::schema::SchemaRegistry::new(), &[]),
+            &HashMap::new(),
+            &SchemaRegistry::new(),
+            &empty_lifted_saved_attrs(),
+            &HashMap::new(),
+            &orphans,
+            &[],
+        );
 
     let delete = plan
         .effects()
@@ -2528,22 +2695,21 @@ fn desired_resource_uses_same_id_orphan_as_its_current_state_without_explicit_pr
         crate::resource::PersistedDirectives::default(),
     );
 
-    let plan = create_plan(
-        &[desired],
-        &[],
-        &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_current_map_from_states(
-            HashMap::new(),
-            &SchemaRegistry::new(),
+    let plan =
+        create_plan(
+            &[desired],
             &[],
-        ),
-        &HashMap::new(),
-        &SchemaRegistry::new(),
-        &empty_lifted_saved_attrs(),
-        &HashMap::new(),
-        &Orphans::from([orphan]),
-        &[],
-    );
+            &crate::provider::ProviderRouter::new(),
+            &crate::resource::into_plan_input_current_map_from_states::<
+                crate::resource::NoPlaceholder,
+            >(HashMap::new(), &SchemaRegistry::new(), &[]),
+            &HashMap::new(),
+            &SchemaRegistry::new(),
+            &empty_lifted_saved_attrs(),
+            &HashMap::new(),
+            &Orphans::from([orphan]),
+            &[],
+        );
 
     assert_eq!(plan.effects().len(), 1, "plan was {plan:#?}");
     let Effect::Update {
@@ -2598,8 +2764,10 @@ async fn prior_state_transform_keeps_managed_and_data_source_key_spaces_separate
         id.clone(),
         existing_state(id.clone(), HashMap::new()),
     )]));
-    let mut data_source_states =
-        HashMap::from([(id.clone(), State::existing(id.clone(), HashMap::new()))]);
+    let mut data_source_states = HashMap::from([(
+        id.clone(),
+        crate::resource::SnapshotState::existing(id.clone(), HashMap::new()),
+    )]);
     let mut orphans = Orphans::new();
 
     transform_prior_provider_states(
@@ -2610,7 +2778,7 @@ async fn prior_state_transform_keeps_managed_and_data_source_key_spaces_separate
             for state in states.values_mut() {
                 state.attributes.insert(
                     "managed_normalized".to_string(),
-                    Value::Concrete(ConcreteValue::Bool(true)),
+                    (Value::Concrete(ConcreteValue::Bool(true))).to_snapshot(),
                 );
             }
             Ok::<(), crate::provider::ProviderError>(())
@@ -2619,7 +2787,7 @@ async fn prior_state_transform_keeps_managed_and_data_source_key_spaces_separate
             for state in states.values_mut() {
                 state.attributes.insert(
                     "data_source_normalized".to_string(),
-                    Value::Concrete(ConcreteValue::Bool(true)),
+                    (Value::Concrete(ConcreteValue::Bool(true))).to_snapshot(),
                 );
             }
             Ok::<(), crate::provider::ProviderError>(())
@@ -2633,7 +2801,7 @@ async fn prior_state_transform_keeps_managed_and_data_source_key_spaces_separate
     };
     assert_eq!(
         managed.state().attributes.get("managed_normalized"),
-        Some(&Value::Concrete(ConcreteValue::Bool(true)))
+        Some(&(Value::Concrete(ConcreteValue::Bool(true))).to_snapshot())
     );
     assert!(
         !managed
@@ -2645,7 +2813,7 @@ async fn prior_state_transform_keeps_managed_and_data_source_key_spaces_separate
         data_source_states[&id]
             .attributes
             .get("data_source_normalized"),
-        Some(&Value::Concrete(ConcreteValue::Bool(true)))
+        Some(&(Value::Concrete(ConcreteValue::Bool(true))).to_snapshot())
     );
     assert!(
         !data_source_states[&id]
@@ -2671,7 +2839,7 @@ async fn prior_state_transform_rebuilds_managed_current_after_provider_transform
         async |states| {
             states.get_mut(&id).unwrap().attributes.insert(
                 "normalized".to_string(),
-                Value::Concrete(ConcreteValue::Bool(true)),
+                (Value::Concrete(ConcreteValue::Bool(true))).to_snapshot(),
             );
             Ok::<(), crate::provider::ProviderError>(())
         },
@@ -2697,7 +2865,7 @@ async fn prior_state_transform_rebuilds_managed_current_after_provider_transform
     };
     assert_eq!(
         state.attributes.get("normalized"),
-        Some(&Value::Concrete(ConcreteValue::Bool(true)))
+        Some(&(Value::Concrete(ConcreteValue::Bool(true))).to_snapshot())
     );
 }
 
@@ -2720,7 +2888,7 @@ async fn prior_state_transform_preserves_typed_managed_identifier() {
         async |states| {
             states.get_mut(&id).unwrap().attributes.insert(
                 "normalized".to_string(),
-                Value::Concrete(ConcreteValue::Bool(true)),
+                (Value::Concrete(ConcreteValue::Bool(true))).to_snapshot(),
             );
             Ok::<(), crate::provider::ProviderError>(())
         },
@@ -2738,7 +2906,7 @@ async fn prior_state_transform_preserves_typed_managed_identifier() {
     assert_eq!(present.identifier().as_str(), "typed-provider-id");
     assert_eq!(
         present.state().attributes.get("normalized"),
-        Some(&Value::Concrete(ConcreteValue::Bool(true)))
+        Some(&(Value::Concrete(ConcreteValue::Bool(true))).to_snapshot())
     );
 }
 
@@ -2758,22 +2926,21 @@ fn orphan_delete_keeps_persisted_explicit_dependencies_without_binding_dependenc
         directives,
     )]);
 
-    let plan = create_plan(
-        &[],
-        &[],
-        &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_current_map_from_states(
-            HashMap::new(),
-            &SchemaRegistry::new(),
+    let plan =
+        create_plan(
             &[],
-        ),
-        &HashMap::new(),
-        &SchemaRegistry::new(),
-        &empty_lifted_saved_attrs(),
-        &HashMap::new(),
-        &orphans,
-        &[],
-    );
+            &[],
+            &crate::provider::ProviderRouter::new(),
+            &crate::resource::into_plan_input_current_map_from_states::<
+                crate::resource::NoPlaceholder,
+            >(HashMap::new(), &SchemaRegistry::new(), &[]),
+            &HashMap::new(),
+            &SchemaRegistry::new(),
+            &empty_lifted_saved_attrs(),
+            &HashMap::new(),
+            &orphans,
+            &[],
+        );
 
     let delete = plan
         .effects()
@@ -3190,8 +3357,6 @@ fn plan_drops_unwritten_empty_all_optional_struct_from_state() {
 
 #[test]
 fn plan_canonicalizes_empty_nested_structs_loaded_from_saved_state() {
-    use crate::provider::RawSavedAttrs;
-
     let settings = |include_empty_config| {
         let mut fields = IndexMap::from([(
             "enabled".to_string(),
@@ -3253,7 +3418,7 @@ fn plan_canonicalizes_empty_nested_structs_loaded_from_saved_state() {
         &schemas,
         std::slice::from_ref(&desired),
     );
-    let saved = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+    let saved = crate::test_support::raw_saved_attrs(HashMap::from([(
         id,
         HashMap::from([("settings".to_string(), settings(true))]),
     )]))
@@ -4201,22 +4366,21 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
         crate::resource::PersistedDirectives::default().with_prevent_destroy(true),
     )]);
 
-    let plan = create_plan(
-        &[],
-        &[],
-        &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_current_map_from_states(
-            HashMap::new(),
-            &crate::schema::SchemaRegistry::new(),
+    let plan =
+        create_plan(
             &[],
-        ),
-        &HashMap::new(),
-        &SchemaRegistry::new(),
-        &empty_lifted_saved_attrs(),
-        &HashMap::new(),
-        &orphans,
-        &[],
-    );
+            &[],
+            &crate::provider::ProviderRouter::new(),
+            &crate::resource::into_plan_input_current_map_from_states::<
+                crate::resource::NoPlaceholder,
+            >(HashMap::new(), &crate::schema::SchemaRegistry::new(), &[]),
+            &HashMap::new(),
+            &SchemaRegistry::new(),
+            &empty_lifted_saved_attrs(),
+            &HashMap::new(),
+            &orphans,
+            &[],
+        );
 
     // Should have NO delete effects
     assert!(
@@ -4258,22 +4422,21 @@ fn schema_default_prevent_destroy_blocks_orphan_delete_when_schema_is_available(
             .expect("schema fixture must validate"),
     );
 
-    let plan = create_plan(
-        &[],
-        &[],
-        &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_current_map_from_states(
-            HashMap::new(),
-            &crate::schema::SchemaRegistry::new(),
+    let plan =
+        create_plan(
             &[],
-        ),
-        &HashMap::new(),
-        &schemas,
-        &empty_lifted_saved_attrs(),
-        &HashMap::new(),
-        &orphans,
-        &[],
-    );
+            &[],
+            &crate::provider::ProviderRouter::new(),
+            &crate::resource::into_plan_input_current_map_from_states::<
+                crate::resource::NoPlaceholder,
+            >(HashMap::new(), &crate::schema::SchemaRegistry::new(), &[]),
+            &HashMap::new(),
+            &schemas,
+            &empty_lifted_saved_attrs(),
+            &HashMap::new(),
+            &orphans,
+            &[],
+        );
 
     assert!(plan.effects().is_empty());
     assert_eq!(
@@ -4294,22 +4457,21 @@ fn unspecified_orphan_without_a_registered_schema_keeps_existing_delete_behavior
         PersistedDirectives::default(),
     )]);
 
-    let plan = create_plan(
-        &[],
-        &[],
-        &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_current_map_from_states(
-            HashMap::new(),
-            &crate::schema::SchemaRegistry::new(),
+    let plan =
+        create_plan(
             &[],
-        ),
-        &HashMap::new(),
-        &SchemaRegistry::new(),
-        &empty_lifted_saved_attrs(),
-        &HashMap::new(),
-        &orphans,
-        &[],
-    );
+            &[],
+            &crate::provider::ProviderRouter::new(),
+            &crate::resource::into_plan_input_current_map_from_states::<
+                crate::resource::NoPlaceholder,
+            >(HashMap::new(), &crate::schema::SchemaRegistry::new(), &[]),
+            &HashMap::new(),
+            &SchemaRegistry::new(),
+            &empty_lifted_saved_attrs(),
+            &HashMap::new(),
+            &orphans,
+            &[],
+        );
 
     assert!(!plan.has_errors());
     assert!(matches!(plan.effects(), [Effect::Delete { .. }]));
@@ -4662,22 +4824,21 @@ fn without_prevent_destroy_delete_works_normally() {
         crate::resource::PersistedDirectives::default(),
     )]);
 
-    let plan = create_plan(
-        &[],
-        &[],
-        &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_current_map_from_states(
-            HashMap::new(),
-            &crate::schema::SchemaRegistry::new(),
+    let plan =
+        create_plan(
             &[],
-        ),
-        &HashMap::new(), // no directives (prevent_destroy is unspecified)
-        &SchemaRegistry::new(),
-        &empty_lifted_saved_attrs(),
-        &HashMap::new(),
-        &orphans,
-        &[],
-    );
+            &[],
+            &crate::provider::ProviderRouter::new(),
+            &crate::resource::into_plan_input_current_map_from_states::<
+                crate::resource::NoPlaceholder,
+            >(HashMap::new(), &crate::schema::SchemaRegistry::new(), &[]),
+            &HashMap::new(), // no directives (prevent_destroy is unspecified)
+            &SchemaRegistry::new(),
+            &empty_lifted_saved_attrs(),
+            &HashMap::new(),
+            &orphans,
+            &[],
+        );
 
     // Should generate a Delete effect
     assert_eq!(plan.effects().len(), 1);
@@ -4717,22 +4878,21 @@ fn prevent_destroy_collects_multiple_errors() {
         Orphan::from_state(existing_state(second_id, attrs2), None, prevent_destroy),
     ]);
 
-    let plan = create_plan(
-        &[],
-        &[],
-        &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_current_map_from_states(
-            HashMap::new(),
-            &crate::schema::SchemaRegistry::new(),
+    let plan =
+        create_plan(
             &[],
-        ),
-        &HashMap::new(),
-        &SchemaRegistry::new(),
-        &empty_lifted_saved_attrs(),
-        &HashMap::new(),
-        &orphans,
-        &[],
-    );
+            &[],
+            &crate::provider::ProviderRouter::new(),
+            &crate::resource::into_plan_input_current_map_from_states::<
+                crate::resource::NoPlaceholder,
+            >(HashMap::new(), &crate::schema::SchemaRegistry::new(), &[]),
+            &HashMap::new(),
+            &SchemaRegistry::new(),
+            &empty_lifted_saved_attrs(),
+            &HashMap::new(),
+            &orphans,
+            &[],
+        );
 
     assert!(plan.effects().is_empty());
     assert_eq!(

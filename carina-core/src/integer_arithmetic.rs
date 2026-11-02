@@ -8,6 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::resource::{
     AbsoluteBindingAddress, BindingAddress, ConcreteValue, DeferredValue, PlaceholderKind, Value,
+    ValueKind,
 };
 
 /// The closed set of binary integer operators in the Carina DSL.
@@ -197,7 +198,7 @@ impl std::error::Error for IntegerExpressionError {}
 /// A sealed, structurally valid deferred integer expression.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedIntegerExpr<
-    P: PlaceholderKind = crate::resource::NoPlaceholder,
+    P: ValueKind = crate::resource::NoPlaceholder,
     B: BindingAddress = AbsoluteBindingAddress,
 > {
     lhs: Box<Value<P, B>>,
@@ -206,7 +207,7 @@ pub struct ValidatedIntegerExpr<
     operator_span: IntegerOperatorSpan,
 }
 
-impl<P: PlaceholderKind, B: BindingAddress> ValidatedIntegerExpr<P, B> {
+impl<P: ValueKind, B: BindingAddress> ValidatedIntegerExpr<P, B> {
     pub fn new(
         lhs: Value<P, B>,
         op: IntegerOp,
@@ -223,7 +224,7 @@ impl<P: PlaceholderKind, B: BindingAddress> ValidatedIntegerExpr<P, B> {
         })
     }
 
-    fn from_post_validation(
+    pub(crate) fn from_post_validation(
         lhs: Value<P, B>,
         op: IntegerOp,
         rhs: Value<P, B>,
@@ -279,13 +280,16 @@ impl<P: PlaceholderKind, B: BindingAddress> ValidatedIntegerExpr<P, B> {
         &self,
         lhs: Value<P, B>,
         rhs: Value<P, B>,
-    ) -> Result<Value<P, B>, IntegerExpressionError> {
+    ) -> Result<Value<P, B>, IntegerExpressionError>
+    where
+        P: PlaceholderKind,
+    {
         evaluate_integer_values_inner(lhs, self.op, rhs, self.operator_span, |value, side| {
             validate_post_validation_operand_shape(value, side)
         })
     }
 
-    pub(crate) fn try_map_stage<Q: PlaceholderKind, E>(
+    pub(crate) fn try_map_stage<Q: ValueKind, E>(
         self,
         mut map: impl FnMut(Value<P, B>) -> Result<Value<Q, B>, E>,
     ) -> Result<ValidatedIntegerExpr<Q, B>, E> {
@@ -310,22 +314,28 @@ impl<P: PlaceholderKind, B: BindingAddress> ValidatedIntegerExpr<P, B> {
     }
 }
 
-pub fn evaluate_integer_values<P: PlaceholderKind, B: BindingAddress>(
+pub fn evaluate_integer_values<P, B: BindingAddress>(
     lhs: Value<P, B>,
     op: IntegerOp,
     rhs: Value<P, B>,
     operator_span: IntegerOperatorSpan,
-) -> Result<Value<P, B>, IntegerExpressionError> {
+) -> Result<Value<P, B>, IntegerExpressionError>
+where
+    P: ValueKind + PlaceholderKind,
+{
     evaluate_integer_values_inner(lhs, op, rhs, operator_span, validate_operand_shape)
 }
 
-fn evaluate_integer_values_inner<P: PlaceholderKind, B: BindingAddress>(
+fn evaluate_integer_values_inner<P, B: BindingAddress>(
     lhs: Value<P, B>,
     op: IntegerOp,
     rhs: Value<P, B>,
     operator_span: IntegerOperatorSpan,
     validate: impl Fn(&Value<P, B>, IntegerOperandSide) -> Result<(), IntegerOperandError>,
-) -> Result<Value<P, B>, IntegerExpressionError> {
+) -> Result<Value<P, B>, IntegerExpressionError>
+where
+    P: ValueKind + PlaceholderKind,
+{
     let (lhs, lhs_secret_depth) = crate::resource::peel_secrets(lhs);
     let (rhs, rhs_secret_depth) = crate::resource::peel_secrets(rhs);
     let secret = lhs_secret_depth > 0 || rhs_secret_depth > 0;
@@ -369,21 +379,21 @@ fn evaluate_integer_values_inner<P: PlaceholderKind, B: BindingAddress>(
     })
 }
 
-fn validate_post_validation_operand_shape<P: PlaceholderKind, B: BindingAddress>(
+fn validate_post_validation_operand_shape<P: ValueKind, B: BindingAddress>(
     value: &Value<P, B>,
     side: IntegerOperandSide,
 ) -> Result<(), IntegerOperandError> {
     validate_operand_shape_at_stage(value, side, IntegerOperandAdmission::PostValidation)
 }
 
-fn validate_operand_shape<P: PlaceholderKind, B: BindingAddress>(
+fn validate_operand_shape<P: ValueKind, B: BindingAddress>(
     value: &Value<P, B>,
     side: IntegerOperandSide,
 ) -> Result<(), IntegerOperandError> {
     validate_operand_shape_at_stage(value, side, IntegerOperandAdmission::Parser)
 }
 
-fn validate_saved_plan_operand_shape<P: PlaceholderKind, B: BindingAddress>(
+fn validate_saved_plan_operand_shape<P: ValueKind, B: BindingAddress>(
     value: &Value<P, B>,
     side: IntegerOperandSide,
 ) -> Result<(), IntegerOperandError> {
@@ -397,7 +407,7 @@ enum IntegerOperandAdmission {
     SavedPlan,
 }
 
-fn validate_operand_shape_at_stage<P: PlaceholderKind, B: BindingAddress>(
+fn validate_operand_shape_at_stage<P: ValueKind, B: BindingAddress>(
     value: &Value<P, B>,
     side: IntegerOperandSide,
     admission: IntegerOperandAdmission,
@@ -421,6 +431,12 @@ fn validate_operand_shape_at_stage<P: PlaceholderKind, B: BindingAddress>(
             | DeferredValue::Access(_)
             | DeferredValue::IntegerArithmetic(_),
         ) => Ok(()),
+        Value::Deferred(DeferredValue::Placeholder(leaf))
+            if matches!(admission, IntegerOperandAdmission::SavedPlan)
+                && leaf.redacted_secret_hash().is_some() =>
+        {
+            Ok(())
+        }
         Value::Deferred(DeferredValue::Placeholder(_))
             if matches!(
                 admission,
@@ -476,31 +492,17 @@ fn validate_operand_shape_at_stage<P: PlaceholderKind, B: BindingAddress>(
             side,
             actual: "Map",
         }),
-        Value::Deferred(DeferredValue::RedactedSecret { .. })
-            if matches!(
-                admission,
-                IntegerOperandAdmission::PostValidation | IntegerOperandAdmission::SavedPlan
-            ) =>
-        {
-            Ok(())
-        }
-        Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
-            Err(IntegerOperandError::NonInteger {
-                side,
-                actual: "redacted Secret",
-            })
-        }
     }
 }
 
 impl<P, B> Serialize for ValidatedIntegerExpr<P, B>
 where
-    P: PlaceholderKind + Serialize,
+    P: ValueKind + Serialize,
     B: BindingAddress + Serialize,
 {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
-        struct Wire<'a, P: PlaceholderKind, B: BindingAddress> {
+        struct Wire<'a, P: ValueKind, B: BindingAddress> {
             lhs: &'a Value<P, B>,
             op: IntegerOp,
             rhs: &'a Value<P, B>,
@@ -517,16 +519,16 @@ where
 
 impl<'de, P, B> Deserialize<'de> for ValidatedIntegerExpr<P, B>
 where
-    P: PlaceholderKind + Deserialize<'de>,
+    P: ValueKind + Deserialize<'de>,
     B: BindingAddress + Deserialize<'de>,
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         #[serde(bound(
-            deserialize = "P: PlaceholderKind + Deserialize<'de>, B: BindingAddress + Deserialize<'de>"
+            deserialize = "P: ValueKind + Deserialize<'de>, B: BindingAddress + Deserialize<'de>"
         ))]
         #[serde(deny_unknown_fields)]
-        struct Wire<P: PlaceholderKind, B: BindingAddress> {
+        struct Wire<P: ValueKind, B: BindingAddress> {
             lhs: Value<P, B>,
             op: IntegerOp,
             rhs: Value<P, B>,
@@ -736,9 +738,6 @@ mod tests {
             Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(
                 crate::resource::PendingReRead::incomplete("test pending reread"),
             ))),
-            Value::Deferred(DeferredValue::RedactedSecret {
-                hash: crate::resource::RedactedSecretHash::generate(b"arithmetic operand"),
-            }),
         ] {
             let stamped_value = expression
                 .evaluate_with_operands(runtime_operand, Value::Concrete(ConcreteValue::Int(1)))

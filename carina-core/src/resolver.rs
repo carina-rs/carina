@@ -15,8 +15,47 @@ use crate::resource::{
     AbsoluteBindingAddress, AccessMissPolicy, BindingAddress, ConcreteValue, DataSource,
     DeferredValue, InterpolationPart, LiveComposition, NoPlaceholder, PlaceholderKind,
     PlanInputCurrent, Resource, ResourceId, Value, ValueAccessError, ValuePathSegmentResult,
-    apply_value_path_segment,
 };
+
+/// Failure to evaluate a reference after selecting its historical input.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ResolutionError {
+    #[error(transparent)]
+    UnavailableSecret(#[from] crate::resource::UnavailableSecretError),
+    #[error("{0}")]
+    Message(String),
+}
+
+impl From<String> for ResolutionError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl From<crate::parser::ParseError> for ResolutionError {
+    fn from(error: crate::parser::ParseError) -> Self {
+        match error {
+            crate::parser::ParseError::UnavailableSecret(error) => Self::UnavailableSecret(error),
+            crate::parser::ParseError::Located { path, error } => match Self::from(*error) {
+                Self::Message(message) => Self::Message(format!("{}: {message}", path.display())),
+                unavailable @ Self::UnavailableSecret(_) => unavailable,
+            },
+            error => Self::Message(error.to_string()),
+        }
+    }
+}
+
+impl From<crate::resource::SnapshotSelectionError> for ResolutionError {
+    fn from(error: crate::resource::SnapshotSelectionError) -> Self {
+        match error {
+            crate::resource::SnapshotSelectionError::UnavailableSecret(error) => error.into(),
+            crate::resource::SnapshotSelectionError::Access(error)
+            | crate::resource::SnapshotSelectionError::DeferredMiss(error) => {
+                Self::Message(error.to_string())
+            }
+        }
+    }
+}
 
 /// Resolve all ResourceRef values in resources using current state.
 ///
@@ -35,7 +74,7 @@ pub fn resolve_refs_with_state(
     resources: &mut [Resource],
     managed_current: &HashMap<ResourceId, PlanInputCurrent>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> Result<(), ResolutionError> {
     let bindings = crate::binding_index::ResolvedBindings::pre_apply_live(
         crate::binding_index::LivePreApplyInputs {
             managed: resources,
@@ -66,7 +105,7 @@ pub fn resolve_refs_with_state_and_remote(
     resources: &mut [Resource],
     bindings: &ResolvedBindings,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> Result<(), ResolutionError> {
     resolve_refs_inner(
         resources,
         bindings,
@@ -86,7 +125,7 @@ pub fn resolve_refs_for_plan(
     bindings: &ResolvedBindings,
     unresolved_upstream_bindings: &std::collections::HashSet<&str>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> Result<(), ResolutionError> {
     resolve_refs_inner(resources, bindings, unresolved_upstream_bindings, config)
 }
 
@@ -95,7 +134,7 @@ fn resolve_refs_inner(
     bindings: &ResolvedBindings,
     unresolved_upstream_bindings: &std::collections::HashSet<&str>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> Result<(), ResolutionError> {
     // Save dependency bindings before resolution destroys ResourceRef values.
     // This metadata is used by plan tree building to recover parent-child
     // relationships (see build_plan_tree in display.rs and app.rs).
@@ -160,7 +199,7 @@ pub fn resolve_managed_refs_with_state_and_remote(
     managed: &mut [Resource],
     bindings: &ResolvedBindings,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> Result<(), ResolutionError> {
     resolve_refs_inner(managed, bindings, &std::collections::HashSet::new(), config)
 }
 
@@ -177,7 +216,7 @@ pub fn resolve_data_source_refs(
     data_sources: &mut [DataSource],
     bindings: &ResolvedBindings,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> Result<(), ResolutionError> {
     resolve_data_source_refs_inner(
         data_sources,
         bindings,
@@ -195,7 +234,7 @@ pub fn resolve_data_source_refs_for_plan(
     bindings: &ResolvedBindings,
     unresolved_upstream_bindings: &std::collections::HashSet<&str>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> Result<(), ResolutionError> {
     resolve_data_source_refs_inner(data_sources, bindings, unresolved_upstream_bindings, config)
 }
 
@@ -204,7 +243,7 @@ fn resolve_data_source_refs_inner(
     bindings: &ResolvedBindings,
     unresolved_upstream_bindings: &std::collections::HashSet<&str>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> Result<(), ResolutionError> {
     for data_source in data_sources.iter_mut() {
         let deps =
             crate::deps::get_resource_value_ref_dependencies(crate::parser::ResourceRef::<
@@ -259,7 +298,7 @@ pub fn resolve_live_composition_refs_post_apply(
     compositions: &mut [LiveComposition],
     bindings: &ResolvedBindings,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> Result<(), ResolutionError> {
     for v in compositions.iter_mut() {
         v.signature.attributes =
             resolve_composition_attributes(&v.signature.attributes, bindings, config)?;
@@ -268,10 +307,10 @@ pub fn resolve_live_composition_refs_post_apply(
 }
 
 pub fn resolve_saved_composition_refs_post_apply(
-    compositions: &mut [crate::resource::SavedComposition],
+    compositions: &mut [crate::resource::SavedComposition<crate::resource::NoPlaceholder>],
     bindings: &ResolvedBindings,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<(), String> {
+) -> Result<(), ResolutionError> {
     for composition in compositions {
         composition.signature.attributes =
             resolve_composition_attributes(&composition.signature.attributes, bindings, config)?;
@@ -294,7 +333,9 @@ impl RuntimeCompositionAttribute for crate::resource::LiveCompositionAttribute {
     }
 }
 
-impl RuntimeCompositionAttribute for crate::resource::SavedCompositionAttribute {
+impl RuntimeCompositionAttribute
+    for crate::resource::SavedCompositionAttribute<crate::resource::NoPlaceholder>
+{
     fn runtime_value(&self) -> Option<Value> {
         Some(self.to_value())
     }
@@ -308,7 +349,7 @@ fn resolve_composition_attributes<A: RuntimeCompositionAttribute>(
     attributes: &IndexMap<String, A>,
     bindings: &ResolvedBindings,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<IndexMap<String, A>, String> {
+) -> Result<IndexMap<String, A>, ResolutionError> {
     attributes
         .iter()
         .map(|(key, attribute)| {
@@ -455,7 +496,6 @@ fn stamp_unresolved_upstream(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Unavailable { .. }
-            | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_),
         ) => value,
         Value::Deferred(DeferredValue::Placeholder(never)) => match never {},
@@ -475,23 +515,25 @@ fn stamp_unresolved_upstream(
 /// interpolation that references a deferred upstream-state value must
 /// either fold to a concrete cloud identifier (when `X.attr` is in
 /// scope) or carry the deferred marker through plan display (carina#3329).
-/// Errors are converted into the input value untouched — same shape as
-/// the resource-attribute path, where a non-evaluable interpolation
-/// stays a `Value::Deferred(DeferredValue::Interpolation)` rather than
-/// aborting the plan.
+/// Failed live expressions retain their authored form for plan display.
+/// Selecting an unavailable historical secret returns its typed error.
 pub fn resolve_value_for_plan(
     value: &Value,
     bindings: &ResolvedBindings,
     unresolved_upstream_bindings: &std::collections::HashSet<&str>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Value {
-    let resolved = resolve_ref_value(value, bindings, config).unwrap_or_else(|_| value.clone());
-    if unresolved_upstream_bindings.is_empty() {
+) -> Result<Value, ResolutionError> {
+    let resolved = match resolve_ref_value(value, bindings, config) {
+        Ok(value) => value,
+        Err(error @ ResolutionError::UnavailableSecret(_)) => return Err(error),
+        Err(ResolutionError::Message(_)) => value.clone(),
+    };
+    Ok(if unresolved_upstream_bindings.is_empty() {
         resolved
     } else {
         stamp_unresolved_upstream(resolved, unresolved_upstream_bindings)
             .unwrap_or_else(|_| value.clone())
-    }
+    })
 }
 
 /// Recursively resolve a single Value, replacing ResourceRef with the referenced value.
@@ -502,7 +544,7 @@ pub fn resolve_ref_value<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &ResolvedBindings<P, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<Value<P, B>, String> {
+) -> Result<Value<P, B>, ResolutionError> {
     resolve_ref_value_inner(value, bindings, RuntimeContext::Session(config))
 }
 
@@ -512,7 +554,7 @@ pub(crate) fn project_ref_value_status<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &ResolvedBindings<P, B>,
     context: &crate::parser::ProviderContext,
-) -> Result<ValueResolution<P, B>, String> {
+) -> Result<ValueResolution<P, B>, ResolutionError> {
     resolve_ref_value_status_inner(value, bindings, RuntimeContext::Projection(context), false)
 }
 
@@ -548,7 +590,7 @@ pub fn resolve_ref_value_status<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &ResolvedBindings<P, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<ValueResolution<P, B>, String> {
+) -> Result<ValueResolution<P, B>, ResolutionError> {
     resolve_ref_value_status_inner(value, bindings, RuntimeContext::Session(config), false)
 }
 
@@ -561,7 +603,7 @@ pub fn resolve_ref_value_with_config<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &ResolvedBindings<P, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<Value<P, B>, String> {
+) -> Result<Value<P, B>, ResolutionError> {
     resolve_ref_value_inner(value, bindings, RuntimeContext::Session(config))
 }
 
@@ -588,16 +630,83 @@ fn missing_access(error: &ValueAccessError) -> bool {
     )
 }
 
+enum HistoricalSelectionError {
+    Access(ValueAccessError),
+    Resolution(ResolutionError),
+}
+
+/// Resolve ordinary expressions before applying access steps, as for live
+/// bindings. If a hash blocks whole-attribute conversion, select the requested
+/// subtree first so unrelated historical evidence remains opaque.
+fn resolve_historical_selection<P: PlaceholderKind, B: BindingAddress>(
+    attribute: &crate::resource::SnapshotValue<P, B>,
+    path: &crate::resource::AccessPath<B>,
+    bindings: &ResolvedBindings<P, B>,
+    config: RuntimeContext<'_>,
+    policy: AccessMissPolicy,
+    require_fully_resolved: bool,
+) -> Result<Option<Value<P, B>>, HistoricalSelectionError> {
+    let root_path = format!("{}.{}", path.binding(), path.attribute());
+    // Find the first selectable subtree that can cross the checked conversion.
+    // Resolve its live expressions before applying the remaining access steps.
+    // In particular, a hash sibling must not change deferral behavior beneath
+    // an ordinary child selected from the same historical container.
+    let mut selected_segments = 0;
+    let selected = loop {
+        match attribute.select_path(&path.segments()[..selected_segments], &root_path, policy) {
+            Ok(value) => break value,
+            Err(crate::resource::SnapshotSelectionError::UnavailableSecret(_))
+                if selected_segments < path.segments().len() =>
+            {
+                selected_segments += 1;
+            }
+            Err(crate::resource::SnapshotSelectionError::UnavailableSecret(error)) => {
+                return Err(HistoricalSelectionError::Resolution(error.into()));
+            }
+            Err(crate::resource::SnapshotSelectionError::Access(error)) => {
+                return Err(HistoricalSelectionError::Access(error));
+            }
+            Err(crate::resource::SnapshotSelectionError::DeferredMiss(_)) => return Ok(None),
+        }
+    };
+    let mut resolved = resolve_ref_value_inner(&selected, bindings, config)
+        .map_err(HistoricalSelectionError::Resolution)?;
+    if require_fully_resolved && !resolved.is_fully_resolved() {
+        return Ok(None);
+    }
+    for segment in &path.segments()[selected_segments..] {
+        resolved =
+            match crate::resource::apply_value_path_segment(resolved, segment.clone(), 0, policy) {
+                Ok(ValuePathSegmentResult::Resolved(next)) => {
+                    resolve_ref_value_inner(&next, bindings, config)
+                        .map_err(HistoricalSelectionError::Resolution)?
+                }
+                Ok(
+                    ValuePathSegmentResult::Deferred(_) | ValuePathSegmentResult::DeferredMiss(_),
+                ) => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(HistoricalSelectionError::Access(error)),
+            };
+        if require_fully_resolved && !resolved.is_fully_resolved() {
+            return Ok(None);
+        }
+    }
+    Ok(Some(resolved))
+}
+
 fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &ResolvedBindings<P, B>,
     config: RuntimeContext<'_>,
     allow_absent_default: bool,
-) -> Result<ValueResolution<P, B>, String> {
+) -> Result<ValueResolution<P, B>, ResolutionError> {
     match value {
-        Value::Deferred(DeferredValue::ModuleIf(_)) => {
-            Err("unresolved module-template conditional reached runtime resolver".to_string())
-        }
+        Value::Deferred(DeferredValue::ModuleIf(_)) => Err(
+            "unresolved module-template conditional reached runtime resolver"
+                .to_string()
+                .into(),
+        ),
         Value::Deferred(DeferredValue::Coalesce {
             value: left,
             default,
@@ -638,37 +747,31 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
                 return Ok(ValueResolution::Unknown(value.clone()));
             }
 
-            let mut resolved = resolve_ref_value_inner(attribute, bindings, config)?;
-            if !resolved.is_fully_resolved() {
-                return Ok(ValueResolution::Unknown(value.clone()));
-            }
-            for segment in path.segments() {
-                match apply_value_path_segment(
-                    resolved,
-                    segment.clone(),
-                    0,
-                    AccessMissPolicy::Error,
-                ) {
-                    Ok(ValuePathSegmentResult::Resolved(next)) => {
-                        resolved = resolve_ref_value_inner(&next, bindings, config)?;
-                        if !resolved.is_fully_resolved() {
-                            return Ok(ValueResolution::Unknown(value.clone()));
-                        }
-                    }
-                    Ok(
-                        ValuePathSegmentResult::Deferred(_)
-                        | ValuePathSegmentResult::DeferredMiss(_),
-                    ) => return Ok(ValueResolution::Unknown(value.clone())),
-                    Err(error) if missing_access(&error) && absence_is_definitive => {
-                        return Ok(ValueResolution::Absent);
-                    }
-                    Err(error) if missing_access(&error) => {
-                        return Ok(ValueResolution::Unknown(value.clone()));
-                    }
-                    Err(error) => return Err(error.format_for_path(&path.to_string())),
+            let selected = resolve_historical_selection(
+                attribute,
+                path,
+                bindings,
+                config,
+                AccessMissPolicy::Error,
+                true,
+            );
+            let selected = match selected {
+                Ok(Some(value)) => value,
+                Ok(None) => return Ok(ValueResolution::Unknown(value.clone())),
+                Err(HistoricalSelectionError::Access(error))
+                    if missing_access(&error) && absence_is_definitive =>
+                {
+                    return Ok(ValueResolution::Absent);
                 }
-            }
-            Ok(ValueResolution::Present(resolved))
+                Err(HistoricalSelectionError::Access(error)) if missing_access(&error) => {
+                    return Ok(ValueResolution::Unknown(value.clone()));
+                }
+                Err(HistoricalSelectionError::Access(error)) => {
+                    return Err(error.format_for_path(&path.to_string()).into());
+                }
+                Err(HistoricalSelectionError::Resolution(error)) => return Err(error),
+            };
+            Ok(ValueResolution::Present(selected))
         }
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             let Some(attributes) = bindings.get(binding.as_str()) else {
@@ -681,8 +784,12 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
             keys.sort();
             let values = keys
                 .into_iter()
-                .map(|key| (key.clone(), attributes[key].clone()))
-                .collect();
+                .map(|key| {
+                    attributes[key]
+                        .to_value_at(format!("{binding}.{key}"))
+                        .map(|value| (key.clone(), value))
+                })
+                .collect::<Result<_, _>>()?;
             let resolved = Value::Concrete(ConcreteValue::Map(values));
             if resolved.is_fully_resolved() {
                 Ok(ValueResolution::Present(resolved))
@@ -715,12 +822,14 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
                     ValuePathSegmentResult::Deferred(_) | ValuePathSegmentResult::DeferredMiss(_),
                 ) => Ok(ValueResolution::Unknown(value.clone())),
                 Err(error) if missing_access(&error) => Ok(ValueResolution::Absent),
-                Err(error) => Err(error.format_for_path(&crate::value::format_value(value))),
+                Err(error) => Err(error
+                    .format_for_path(&crate::value::format_value(value))
+                    .into()),
             }
         }
         Value::Deferred(DeferredValue::Unknown(_)) => Ok(ValueResolution::Unknown(value.clone())),
         Value::Deferred(DeferredValue::Unavailable { name, reason, .. }) => {
-            Err(format!("{name}(): {reason}"))
+            Err(format!("{name}(): {reason}").into())
         }
         Value::Concrete(_)
         | Value::Deferred(
@@ -728,8 +837,7 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
             | DeferredValue::IntegerArithmetic(_)
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
-            | DeferredValue::Secret(_)
-            | DeferredValue::RedactedSecret { .. },
+            | DeferredValue::Secret(_),
         ) => {
             let resolved = resolve_ref_value_inner(value, bindings, config)?;
             if !resolved.is_fully_resolved() {
@@ -750,7 +858,7 @@ fn resolve_required_value_status<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &ResolvedBindings<P, B>,
     config: RuntimeContext<'_>,
-) -> Result<ValueResolution<P, B>, String> {
+) -> Result<ValueResolution<P, B>, ResolutionError> {
     let resolved = resolve_ref_value_inner(value, bindings, config)?;
     if resolved.is_fully_resolved() {
         Ok(ValueResolution::Present(resolved))
@@ -771,11 +879,15 @@ fn locate_user_function_error<B: BindingAddress>(
 
 fn user_function_runtime_error(
     line: usize,
-    message: impl Into<String>,
+    error: impl Into<ResolutionError>,
 ) -> crate::parser::ParseError {
-    crate::parser::ParseError::InvalidExpression {
-        line,
-        message: message.into(),
+    match error.into() {
+        ResolutionError::UnavailableSecret(error) => {
+            crate::parser::ParseError::UnavailableSecret(error)
+        }
+        ResolutionError::Message(message) => {
+            crate::parser::ParseError::InvalidExpression { line, message }
+        }
     }
 }
 
@@ -994,7 +1106,7 @@ fn resolve_function_arguments<P: PlaceholderKind, B: BindingAddress>(
     args: &[crate::resource::FunctionArgument<P, B>],
     bindings: &ResolvedBindings<P, B>,
     config: RuntimeContext<'_>,
-) -> Result<FunctionArgumentResolution<P, B>, String> {
+) -> Result<FunctionArgumentResolution<P, B>, ResolutionError> {
     let args = args
         .iter()
         .map(|argument| {
@@ -1015,11 +1127,13 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &ResolvedBindings<P, B>,
     config: RuntimeContext<'_>,
-) -> Result<Value<P, B>, String> {
+) -> Result<Value<P, B>, ResolutionError> {
     match value {
-        Value::Deferred(DeferredValue::ModuleIf(_)) => {
-            Err("unresolved module-template conditional reached runtime resolver".to_string())
-        }
+        Value::Deferred(DeferredValue::ModuleIf(_)) => Err(
+            "unresolved module-template conditional reached runtime resolver"
+                .to_string()
+                .into(),
+        ),
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
             match resolve_ref_value_status_inner(value, bindings, config, false)? {
                 ValueResolution::Present(value) | ValueResolution::Unknown(value) => Ok(value),
@@ -1036,24 +1150,22 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
             if let Some(attrs) = bindings.get(binding_name)
                 && let Some(attr_value) = attrs.get(attribute_name)
             {
-                // Resolve the initial attribute value
-                let mut resolved = resolve_ref_value_inner(attr_value, bindings, config)?;
                 let miss_policy = binding_access_miss_policy(binding_name, bindings);
-
-                for segment in path.segments() {
-                    match apply_value_path_segment(resolved, segment.clone(), 0, miss_policy) {
-                        Ok(ValuePathSegmentResult::Resolved(next)) => {
-                            resolved = resolve_ref_value_inner(&next, bindings, config)?;
-                        }
-                        Ok(
-                            ValuePathSegmentResult::Deferred(_)
-                            | ValuePathSegmentResult::DeferredMiss(_),
-                        ) => return Ok(value.clone()),
-                        Err(error) => return Err(error.format_for_path(&path.to_string())),
+                return match resolve_historical_selection(
+                    attr_value,
+                    path,
+                    bindings,
+                    config,
+                    miss_policy,
+                    false,
+                ) {
+                    Ok(Some(selected)) => Ok(selected),
+                    Ok(None) => Ok(value.clone()),
+                    Err(HistoricalSelectionError::Access(error)) => {
+                        Err(error.format_for_path(&path.to_string()).into())
                     }
-                }
-
-                return Ok(resolved);
+                    Err(HistoricalSelectionError::Resolution(error)) => Err(error),
+                };
             }
             // Keep as-is if not found
             Ok(value.clone())
@@ -1065,17 +1177,17 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                 .evaluate_with_operands(lhs, rhs)
                 .map_err(|error| {
                     let span = expression.operator_span();
-                    match (span.line(), span.column()) {
+                    ResolutionError::from(match (span.line(), span.column()) {
                         (Some(line), Some(column)) => {
                             format!("at line {line}, column {column}: {error}")
                         }
                         _ => error.to_string(),
-                    }
+                    })
                 })
         }
         Value::Deferred(DeferredValue::BindingRef { .. }) => Ok(value.clone()),
         Value::Concrete(ConcreteValue::List(items)) => {
-            let resolved: Result<Vec<Value<P, B>>, String> = items
+            let resolved: Result<Vec<Value<P, B>>, ResolutionError> = items
                 .iter()
                 .map(|v| resolve_ref_value_inner(v, bindings, config))
                 .collect();
@@ -1089,7 +1201,7 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
             Ok(Value::Concrete(ConcreteValue::Map(resolved)))
         }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            let resolved_parts: Result<Vec<InterpolationPart<P, B>>, String> = parts
+            let resolved_parts: Result<Vec<InterpolationPart<P, B>>, ResolutionError> = parts
                 .iter()
                 .map(|p| match p {
                     InterpolationPart::Expr(v) => Ok(InterpolationPart::Expr(
@@ -1143,12 +1255,12 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                     .map_err(|error| format!("{name}(): {error}"))?
                     .into_expanded()
                     .map(|value| value.into_placeholder_type())
-                    .map_err(|error| format!("{name}(): {error}")),
-                Err(e) => Err(format!("{}(): {}", name, e)),
+                    .map_err(|error| ResolutionError::from(format!("{name}(): {error}"))),
+                Err(e) => Err(format!("{}(): {}", name, e).into()),
             }
         }
         Value::Deferred(DeferredValue::Unavailable { name, reason, .. }) => {
-            Err(format!("{name}(): {reason}"))
+            Err(format!("{name}(): {reason}").into())
         }
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
@@ -1188,7 +1300,7 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                 session,
                 source_line.get().unwrap_or(function.body.source_line),
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(ResolutionError::from)?;
             let evaluated = evaluated
                 .into_expanded()
                 .map(Value::into_placeholder_type)
@@ -1205,11 +1317,11 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                 .rebuild_with_base(resolved_base, AccessMissPolicy::Error)
                 .map_err(|error| {
                     let message = error.format_for_path(&access_expression);
-                    if access.source_line() == 0 {
+                    ResolutionError::from(if access.source_line() == 0 {
                         message
                     } else {
                         format!("at line {}: {message}", access.source_line())
-                    }
+                    })
                 })
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
@@ -1230,8 +1342,7 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
             | ConcreteValue::Bool(_)
             | ConcreteValue::Duration(_)
             | ConcreteValue::StringList(_),
-        )
-        | Value::Deferred(DeferredValue::RedactedSecret { .. }) => Ok(value.clone()),
+        ) => Ok(value.clone()),
         Value::Deferred(DeferredValue::Placeholder(_)) => Ok(value.clone()),
     }
 }
@@ -1372,7 +1483,9 @@ mod tests {
                 &crate::parser::LoadedProviderContext::empty_for_test(),
                 |session| resolve_ref_value(&divide_by_deferred_zero, &zero, session)
             ),
-            Err("integer division by zero".to_string())
+            Err(ResolutionError::Message(
+                "integer division by zero".to_string()
+            ))
         );
 
         let overflow = integer_expression(
@@ -1389,7 +1502,9 @@ mod tests {
                 &crate::parser::LoadedProviderContext::empty_for_test(),
                 |session| resolve_ref_value(&overflow, &minimum, session)
             ),
-            Err("integer arithmetic overflow".to_string())
+            Err(ResolutionError::Message(
+                "integer arithmetic overflow".to_string()
+            ))
         );
     }
 
@@ -1424,6 +1539,31 @@ mod tests {
         assert_eq!(
             error,
             IntegerExpressionError::SecretEvaluation(IntegerArithmeticError::DivideByZero),
+        );
+    }
+
+    #[test]
+    fn user_function_errors_preserve_unavailable_secret_through_parser_context() {
+        let snapshot = crate::value::redact_secrets_in_value(&Value::Deferred(
+            DeferredValue::Secret(Box::new(Value::Concrete(ConcreteValue::String(
+                "historical secret".into(),
+            )))),
+        ))
+        .unwrap();
+        let unavailable = snapshot.to_value_at("state.credentials.token").unwrap_err();
+        let located =
+            user_function_runtime_error(8, ResolutionError::UnavailableSecret(unavailable.clone()))
+                .in_file("/project/functions.crn");
+        assert_eq!(
+            ResolutionError::from(located),
+            ResolutionError::UnavailableSecret(unavailable),
+        );
+
+        let ordinary = user_function_runtime_error(8, "ordinary failure".to_string())
+            .in_file("/project/functions.crn");
+        assert_eq!(
+            ResolutionError::from(ordinary).to_string(),
+            "/project/functions.crn: Invalid expression at line 8: ordinary failure",
         );
     }
 
@@ -1600,7 +1740,10 @@ mod tests {
             |session| resolve_ref_value_status(&expression, &ResolvedBindings::default(), session),
         )
         .expect_err("function errors must not select the coalesce default");
-        assert!(error.contains("upper()"), "unexpected error: {error}");
+        assert!(
+            error.to_string().contains("upper()"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -1630,9 +1773,9 @@ mod tests {
                 &crate::parser::LoadedProviderContext::empty_for_test(),
                 |session| resolve_ref_value_status(&expression, &bindings, session)
             ),
-            Err(format!(
+            Err(ResolutionError::Message(format!(
                 "env(): environment variable '{missing}' is not set"
-            )),
+            ))),
         );
     }
 
@@ -1870,10 +2013,10 @@ mod tests {
     #[test]
     fn post_apply_complete_binding_treats_missing_output_as_absent() {
         let resource = make_resource("producer", Some("producer"), vec![]);
-        let state =
+        let state: crate::resource::State =
             State::existing(resource.id.clone(), HashMap::new()).with_identifier("provider-id");
         let mut bindings = ResolvedBindings::default();
-        let empty = HashMap::new();
+        let empty: HashMap<String, Value> = HashMap::new();
         let resolved = SecretPreservingAttributes::from_provider_values(&empty, &empty);
         bindings.record_applied(
             Some("producer"),
@@ -1928,7 +2071,7 @@ mod tests {
         )
         .expect_err("wrong-shaped access must remain an error");
         assert!(
-            error.contains("cannot apply access"),
+            error.to_string().contains("cannot apply access"),
             "unexpected error: {error}"
         );
     }
@@ -1982,7 +2125,10 @@ mod tests {
             |session| resolve_ref_value_status(&expression, &bindings, session),
         )
         .expect_err("only an access chain rooted at a reference is optional");
-        assert!(error.contains("missing"), "unexpected error: {error}");
+        assert!(
+            error.to_string().contains("missing"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -2010,7 +2156,7 @@ mod tests {
         current_states: &HashMap<ResourceId, State>,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         wait_aliases: &[crate::binding_index::WaitAliasSpec],
-    ) -> Result<(), String> {
+    ) -> Result<(), ResolutionError> {
         let plan_input_states = crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
@@ -2037,7 +2183,7 @@ mod tests {
         current_states: &HashMap<ResourceId, State>,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         wait_aliases: &[crate::binding_index::WaitAliasSpec],
-    ) -> Result<(), String> {
+    ) -> Result<(), ResolutionError> {
         let plan_input_states = crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
@@ -2474,12 +2620,12 @@ mod tests {
         );
         let err = result.expect_err("missing key in concrete upstream Secret(Map) must error");
         assert_eq!(
-            err,
+            err.to_string(),
             "h.creds['missing']: key not found; available keys: <redacted, 3 entries>"
         );
         for k in ["db_pwd", "api_key", "slack_token"] {
             assert!(
-                !err.contains(k),
+                !err.to_string().contains(k),
                 "Secret(Map) key {k:?} leaked into error: {err}"
             );
         }
@@ -2531,12 +2677,12 @@ mod tests {
         )
         .expect_err("missing dot-form field in concrete upstream Secret(Map) must error");
         assert_eq!(
-            err,
+            err.to_string(),
             "h.creds.missing: key not found; available keys: <redacted, 2 entries>"
         );
         for k in ["db_pwd", "api_key"] {
             assert!(
-                !err.contains(k),
+                !err.to_string().contains(k),
                 "Secret(Map) key {k:?} leaked into field_path error: {err}"
             );
         }
@@ -2574,7 +2720,7 @@ mod tests {
         )
         .expect_err("missing key in empty upstream Secret(Map) must error");
         assert_eq!(
-            err,
+            err.to_string(),
             "h.creds['missing']: key not found; available keys: <redacted, 0 entries>"
         );
     }
@@ -2619,6 +2765,50 @@ mod tests {
             resolved, ref_value,
             "Secret(ResourceRef) projection must keep the outer ref unchanged"
         );
+    }
+
+    #[test]
+    fn test_resolve_unresolved_secret_projection_with_hashed_sibling_stays_deferred() {
+        use crate::resource::SnapshotValue;
+
+        let hash = crate::value::redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "unrelated secret".into(),
+            ))),
+        )))
+        .unwrap();
+        let pending = Value::Deferred(DeferredValue::Secret(Box::new(Value::root_resource_ref(
+            "missing",
+            "x",
+            vec![],
+        ))));
+        let historical = SnapshotValue::Concrete(crate::resource::ConcreteValue::Map(
+            indexmap::IndexMap::from([
+                ("hash".into(), hash),
+                ("pending".into(), pending.to_snapshot()),
+            ]),
+        ));
+        let mut bindings = ResolvedBindings::default();
+        bindings.set_historical_with_completeness(
+            "h",
+            HashMap::from([("creds".into(), historical)]),
+            crate::binding_index::BindingValueSource::Local,
+            BindingCompleteness::Incomplete,
+        );
+        let reference = Value::Deferred(DeferredValue::ResourceRef {
+            path: crate::resource::AccessPath::root_with_fields_and_subscripts(
+                "h",
+                "creds",
+                vec!["pending".into()],
+                vec![crate::resource::Subscript::Str { key: "k".into() }],
+            ),
+        });
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&reference, &bindings, session),
+        )
+        .unwrap();
+        assert_eq!(resolved, reference);
     }
 
     #[test]
@@ -3030,7 +3220,9 @@ mod tests {
         )
         .expect_err("apply-time out-of-range access must be an error");
         assert!(
-            error.contains("index 5 out of range for list of length 3"),
+            error
+                .to_string()
+                .contains("index 5 out of range for list of length 3"),
             "unexpected error: {error}"
         );
     }
@@ -3070,11 +3262,13 @@ mod tests {
         )
         .expect_err("a computed list is final even when an input ref is local");
         assert!(
-            error.contains("index 5 out of range for list of length 3"),
+            error
+                .to_string()
+                .contains("index 5 out of range for list of length 3"),
             "unexpected error: {error}"
         );
         assert!(
-            !error.contains("wait"),
+            !error.to_string().contains("wait"),
             "range errors must not suggest wait: {error}"
         );
     }
@@ -3159,8 +3353,9 @@ mod tests {
 
         assert_eq!(postfix_access, resource_path);
 
-        let expected =
-            Err("res.tags['missing']: key not found; available keys: 'present'".to_string());
+        let expected = Err(ResolutionError::Message(
+            "res.tags['missing']: key not found; available keys: 'present'".to_string(),
+        ));
         assert_eq!(
             crate::validation::deferred_types::with_session_for_test(
                 &crate::parser::LoadedProviderContext::empty_for_test(),
@@ -3248,11 +3443,13 @@ mod tests {
         )
         .expect_err("a String cannot become indexable after apply");
         assert!(
-            error.contains("cannot apply access [0] to string"),
+            error
+                .to_string()
+                .contains("cannot apply access [0] to string"),
             "unexpected apply-time error: {error}",
         );
         assert!(
-            !error.contains("wait"),
+            !error.to_string().contains("wait"),
             "wrong-shape access must never be reported as a deferred miss: {error}",
         );
     }
@@ -3408,7 +3605,9 @@ mod tests {
         );
         let err_msg = result.unwrap_err();
         assert!(
-            err_msg.contains("CARINA_RESOLVER_TEST_NONEXISTENT_VAR_12345"),
+            err_msg
+                .to_string()
+                .contains("CARINA_RESOLVER_TEST_NONEXISTENT_VAR_12345"),
             "Error should mention the missing env var, got: {}",
             err_msg
         );
@@ -3481,7 +3680,9 @@ mod tests {
         );
         let err_msg = result.unwrap_err();
         assert!(
-            err_msg.contains("CARINA_RESOLVER_STATE_TEST_NONEXISTENT_VAR_12345"),
+            err_msg
+                .to_string()
+                .contains("CARINA_RESOLVER_STATE_TEST_NONEXISTENT_VAR_12345"),
             "Error should mention the missing env var, got: {}",
             err_msg
         );
@@ -3647,12 +3848,12 @@ mod tests {
         )
         .expect_err("missing key in concrete upstream map must error");
         assert!(
-            err.contains("registry_qa"),
+            err.to_string().contains("registry_qa"),
             "error must name the missing key, got: {err}"
         );
         // Should also list available keys so the user can fix the typo.
         assert!(
-            err.contains("registry_prod") && err.contains("registry_dev"),
+            err.to_string().contains("registry_prod") && err.to_string().contains("registry_dev"),
             "error should list known keys, got: {err}"
         );
     }
@@ -3695,7 +3896,7 @@ mod tests {
         )
         .expect_err("empty map subscript must error");
         assert!(
-            err.contains("<no keys>"),
+            err.to_string().contains("<no keys>"),
             "empty-map error must say '<no keys>', got: {err}"
         );
     }
@@ -3838,7 +4039,7 @@ mod tests {
         )
         .expect_err("chained subscript with missing key must error");
         assert!(
-            err.contains("eu") && err.contains("us"),
+            err.to_string().contains("eu") && err.to_string().contains("us"),
             "error must mention the missing key and known keys, got: {err}"
         );
     }
@@ -3903,9 +4104,9 @@ mod tests {
             .unwrap();
 
         match resources[0].get_attr("vpc_id") {
-            Some(Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
-                path,
-            }))) => {
+            Some(crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(
+                ApplyTimeUnknown::UpstreamExport { path },
+            ))) => {
                 assert_eq!(path.to_dot_string(), "network.vpc.vpc_id");
             }
             other => panic!("expected Value::Unknown(UpstreamExport), got {:?}", other),
@@ -4016,14 +4217,16 @@ mod tests {
             .unwrap();
 
         match resources[0].get_attr("raws") {
-            Some(Value::Concrete(ConcreteValue::List(items))) => {
+            Some(crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(items))) => {
                 assert_eq!(items.len(), 2);
                 let bindings: Vec<&str> = items
                     .iter()
                     .map(|v| match v {
-                        Value::Deferred(DeferredValue::Unknown(
-                            ApplyTimeUnknown::UpstreamAllExports { binding },
-                        )) => binding.as_str(),
+                        crate::resource::Value::Deferred(
+                            crate::resource::DeferredValue::Unknown(
+                                ApplyTimeUnknown::UpstreamAllExports { binding },
+                            ),
+                        ) => binding.as_str(),
                         other => panic!("expected UpstreamAllExports, got {:?}", other),
                     })
                     .collect();
@@ -4158,10 +4361,14 @@ mod tests {
             .unwrap();
 
         match resources[0].get_attr("tags") {
-            Some(Value::Concrete(ConcreteValue::Map(m))) => match m.get("VpcId") {
-                Some(Value::Deferred(DeferredValue::Unknown(_))) => {}
-                other => panic!("nested entry should be Value::Unknown, got {:?}", other),
-            },
+            Some(crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(m))) => {
+                match m.get("VpcId") {
+                    Some(crate::resource::Value::Deferred(
+                        crate::resource::DeferredValue::Unknown(_),
+                    )) => {}
+                    other => panic!("nested entry should be Value::Unknown, got {:?}", other),
+                }
+            }
             other => panic!("expected Map, got {:?}", other),
         }
     }

@@ -59,8 +59,8 @@ pub use signature::{
 pub use validation::{
     ConstraintEvaluation, ConstraintOrigin, EvaluatedModuleConstraint, ModuleConstraintCall,
     ModuleConstraintDiagnostic, ModuleConstraintFailure, ModuleConstraintKind,
-    ModuleConstraintViolation, ModuleConstraints, evaluate_constraint,
-    evaluate_live_pending_constraints, evaluate_module_constraints,
+    ModuleConstraintResolutionError, ModuleConstraintViolation, ModuleConstraints,
+    evaluate_constraint, evaluate_live_pending_constraints, evaluate_module_constraints,
     evaluate_saved_pending_constraints, referenced_constraint_arguments,
 };
 

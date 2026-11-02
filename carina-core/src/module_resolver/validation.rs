@@ -35,6 +35,14 @@ pub struct ModuleConstraintFailure {
     pub diagnostic: ModuleConstraintDiagnostic,
 }
 
+/// A historical secret selected while resolving a module constraint.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("could not resolve module constraint for {composition_id}: {error}")]
+pub struct ModuleConstraintResolutionError {
+    pub composition_id: Box<ResourceId>,
+    pub error: crate::resource::UnavailableSecretError,
+}
+
 /// Lifecycle of the composition call that produced a constraint diagnostic.
 /// Live diagnostics retain their parser identity for editor routing; saved
 /// diagnostics deliberately name the absence of live parser state.
@@ -526,7 +534,7 @@ pub fn evaluate_live_pending_constraints(
     bindings: &ResolvedBindings,
     terminal: bool,
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Vec<ModuleConstraintFailure> {
+) -> Result<Vec<ModuleConstraintFailure>, ModuleConstraintResolutionError> {
     evaluate_pending_constraint_views(
         compositions
             .iter()
@@ -538,11 +546,11 @@ pub fn evaluate_live_pending_constraints(
 }
 
 pub fn evaluate_saved_pending_constraints(
-    compositions: &[crate::resource::SavedComposition],
+    compositions: &[crate::resource::SavedComposition<crate::resource::NoPlaceholder>],
     bindings: &ResolvedBindings,
     terminal: bool,
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Vec<ModuleConstraintFailure> {
+) -> Result<Vec<ModuleConstraintFailure>, ModuleConstraintResolutionError> {
     evaluate_pending_constraint_views(
         compositions
             .iter()
@@ -558,7 +566,7 @@ fn evaluate_pending_constraint_views<'a>(
     bindings: &ResolvedBindings,
     terminal: bool,
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Vec<ModuleConstraintFailure> {
+) -> Result<Vec<ModuleConstraintFailure>, ModuleConstraintResolutionError> {
     let mut failures = Vec::new();
 
     for composition in compositions {
@@ -566,17 +574,23 @@ fn evaluate_pending_constraint_views<'a>(
         let resolved_constraints = composition
             .pending_constraints()
             .iter()
-            .map(|constraint| PendingModuleConstraint {
-                id: constraint.id.clone(),
-                expression: resolve_bound_constraint_values(
-                    constraint.expression(),
-                    bindings,
-                    &mut resolution_errors,
-                    session,
-                ),
-                message: constraint.message.clone(),
+            .map(|constraint| {
+                Ok(PendingModuleConstraint {
+                    id: constraint.id.clone(),
+                    expression: resolve_bound_constraint_values(
+                        constraint.expression(),
+                        bindings,
+                        &mut resolution_errors,
+                        session,
+                    )?,
+                    message: constraint.message.clone(),
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, crate::resource::UnavailableSecretError>>()
+            .map_err(|error| ModuleConstraintResolutionError {
+                composition_id: Box::new(composition.id().as_inner().clone()),
+                error,
+            })?;
         let raw_arguments = resolved_constraints
             .iter()
             .flat_map(|constraint| raw_constraint_arguments(constraint.expression()))
@@ -588,8 +602,14 @@ fn evaluate_pending_constraint_views<'a>(
                     Ok(value) => {
                         resolved_arguments.insert(name.clone(), value);
                     }
-                    Err(error) => {
-                        resolution_errors.insert(name.clone(), error);
+                    Err(crate::resolver::ResolutionError::UnavailableSecret(error)) => {
+                        return Err(ModuleConstraintResolutionError {
+                            composition_id: Box::new(composition.id().as_inner().clone()),
+                            error,
+                        });
+                    }
+                    Err(crate::resolver::ResolutionError::Message(message)) => {
+                        resolution_errors.insert(name.clone(), message);
                         resolved_arguments.insert(name.clone(), argument.clone());
                     }
                 }
@@ -665,7 +685,7 @@ fn evaluate_pending_constraint_views<'a>(
         }
     }
 
-    failures
+    Ok(failures)
 }
 
 fn resolve_bound_constraint_values(
@@ -673,84 +693,17 @@ fn resolve_bound_constraint_values(
     bindings: &ResolvedBindings,
     errors: &mut HashMap<String, String>,
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> ValidateExpr {
-    match expression {
-        ValidateExpr::BoundArgument {
-            argument,
-            operand,
-            value,
-        } => match crate::resolver::resolve_ref_value(value, bindings, session) {
-            Ok(value) => ValidateExpr::BoundArgument {
-                argument: argument.clone(),
-                operand: operand.clone(),
-                value,
-            },
-            Err(error) => {
-                errors.insert(argument.clone(), error);
-                expression.clone()
+) -> Result<ValidateExpr, crate::resource::UnavailableSecretError> {
+    expression.try_map_bound_arguments(&mut |argument, _, value| {
+        match crate::resolver::resolve_ref_value(value, bindings, session) {
+            Ok(value) => Ok(value),
+            Err(crate::resolver::ResolutionError::UnavailableSecret(error)) => Err(error),
+            Err(crate::resolver::ResolutionError::Message(message)) => {
+                errors.insert(argument.to_string(), message);
+                Ok(value.clone())
             }
-        },
-        ValidateExpr::Compare { lhs, op, rhs } => ValidateExpr::Compare {
-            lhs: Box::new(resolve_bound_constraint_values(
-                lhs, bindings, errors, session,
-            )),
-            op: op.clone(),
-            rhs: Box::new(resolve_bound_constraint_values(
-                rhs, bindings, errors, session,
-            )),
-        },
-        ValidateExpr::IntegerArithmetic {
-            lhs,
-            op,
-            rhs,
-            operator_span,
-        } => ValidateExpr::IntegerArithmetic {
-            lhs: Box::new(resolve_bound_constraint_values(
-                lhs, bindings, errors, session,
-            )),
-            op: *op,
-            rhs: Box::new(resolve_bound_constraint_values(
-                rhs, bindings, errors, session,
-            )),
-            operator_span: *operator_span,
-        },
-        ValidateExpr::And(lhs, rhs) => ValidateExpr::And(
-            Box::new(resolve_bound_constraint_values(
-                lhs, bindings, errors, session,
-            )),
-            Box::new(resolve_bound_constraint_values(
-                rhs, bindings, errors, session,
-            )),
-        ),
-        ValidateExpr::Or(lhs, rhs) => ValidateExpr::Or(
-            Box::new(resolve_bound_constraint_values(
-                lhs, bindings, errors, session,
-            )),
-            Box::new(resolve_bound_constraint_values(
-                rhs, bindings, errors, session,
-            )),
-        ),
-        ValidateExpr::Not(inner) => ValidateExpr::Not(Box::new(resolve_bound_constraint_values(
-            inner, bindings, errors, session,
-        ))),
-        ValidateExpr::FunctionCall { name, args } => ValidateExpr::FunctionCall {
-            name: name.clone(),
-            args: args
-                .iter()
-                .map(|argument| {
-                    resolve_bound_constraint_values(argument, bindings, errors, session)
-                })
-                .collect(),
-        },
-        ValidateExpr::Bool(_)
-        | ValidateExpr::Int(_)
-        | ValidateExpr::Float(_)
-        | ValidateExpr::Duration(_)
-        | ValidateExpr::String(_)
-        | ValidateExpr::Var(_)
-        | ValidateExpr::Access { .. }
-        | ValidateExpr::Null => expression.clone(),
-    }
+        }
+    })
 }
 
 fn raw_constraint_arguments(expression: &ValidateExpr) -> BTreeSet<String> {
@@ -933,7 +886,6 @@ impl<P: PlaceholderKind, B: BindingAddress> EvalValue<P, B> {
             },
             Self::Value(Value::Deferred(DeferredValue::ModuleIf(_))) => "module conditional",
             Self::Value(Value::Deferred(DeferredValue::Secret(_))) => "secret",
-            Self::Value(Value::Deferred(DeferredValue::RedactedSecret { .. })) => "secret",
             Self::Value(Value::Deferred(DeferredValue::ResourceRef { .. })) => "resource reference",
             Self::Value(Value::Deferred(DeferredValue::BindingRef { .. })) => "binding reference",
             Self::Value(Value::Deferred(DeferredValue::Coalesce { .. })) => "coalesce expression",
@@ -1240,10 +1192,10 @@ mod tests {
 
     type ValidateExpr = crate::parser::ValidateExpr<crate::resource::NoPlaceholder>;
 
-    fn redacted_secret() -> Value {
-        Value::Deferred(DeferredValue::RedactedSecret {
-            hash: crate::resource::RedactedSecretHash::generate(b"validation-test"),
-        })
+    fn secret_value() -> Value {
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("validation-test".into()),
+        ))))
     }
 
     fn length_at_least(variable: &str, minimum: i64) -> ValidateExpr {
@@ -1414,7 +1366,7 @@ mod tests {
                 "list".to_string(),
                 Value::Concrete(ConcreteValue::StringList(vec!["a".into(), "b".into()])),
             ),
-            ("secret".to_string(), redacted_secret()),
+            ("secret".to_string(), secret_value()),
         ])));
         assert_eq!(
             format_constraint_actual(&nested),
@@ -1468,7 +1420,7 @@ mod tests {
                 "dotted_text".to_string(),
                 Value::Concrete(ConcreteValue::String("aws.Region.us_east_1".into())),
             ),
-            ("secret_hash".to_string(), redacted_secret()),
+            ("secret_hash".to_string(), secret_value()),
         ]);
 
         assert_eq!(

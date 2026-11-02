@@ -18,7 +18,7 @@ use crate::provider::{
 use crate::resource::{
     AbsoluteBindingAddress, CanonicalComparisonAttributes, Current, MaskedComparisonAttributes,
     PlanInputCurrent, PlanInputDesired, PresentResourceState, ResolvedResource, Resource,
-    ResourceId, State, UnidentifiedState, Value, into_plan_input_current_map,
+    ResourceId, SnapshotState as State, UnidentifiedState, Value, into_plan_input_current_map,
 };
 use crate::schema::{
     CompiledResourceSchema as ResourceSchema, SchemaRegistry, ValidatedResourceSchema,
@@ -41,7 +41,18 @@ pub enum PlanComparisonError {
     #[error(transparent)]
     Reference(#[from] Box<crate::references::ReferencePlanError>),
     #[error(transparent)]
+    Secret(crate::value::SerializationError),
+    #[error(transparent)]
     Resource(#[from] crate::resource::ResolvedResourceError),
+}
+
+impl From<ComparisonError> for PlanComparisonError {
+    fn from(error: ComparisonError) -> Self {
+        match error {
+            ComparisonError::Reference(error) => Self::Reference(error),
+            ComparisonError::Secret(error) => Self::Secret(error),
+        }
+    }
 }
 
 impl From<crate::provider::ComparisonResolutionError> for PlanComparisonError {
@@ -236,7 +247,7 @@ pub(crate) fn managed_binding_stability_for_resources<'a, D: 'a + Clone>(
                     prev_explicit: prev_explicit.get(&resource.id),
                     schema: Some(schema.as_schema()),
                     context,
-                    observations: &resolved_comparison.context().observation(),
+                    observations: &context.observation(),
                 },
                 schema,
             )
@@ -328,13 +339,13 @@ impl Orphan {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_state(
-        state: State,
+    pub(crate) fn from_state<P: crate::resource::StateValueLeaf>(
+        state: crate::resource::State<P>,
         binding: Option<AbsoluteBindingAddress>,
         directives: PersistedDirectives,
     ) -> Self {
         Self {
-            current: Current::from_state(state),
+            current: Current::from_snapshot(state.to_snapshot()),
             binding,
             directives,
         }
@@ -423,7 +434,9 @@ impl Orphan {
     /// shape used by binding resolution. Provider state remains authoritative
     /// for its values; the projection exists only so a data-source input can
     /// resolve a binding that is no longer present in the configuration.
-    pub fn binding_resource(&self) -> Resource {
+    pub fn binding_resource(
+        &self,
+    ) -> Resource<crate::resource::ModuleSource, crate::resource::SnapshotLeaf> {
         let attributes = match &self.current {
             Current::Absent(state) => &state.state().attributes,
             Current::Present(present) => &present.state().attributes,
@@ -499,7 +512,7 @@ impl Orphan {
         };
         fresh.id = prior.id.clone();
         fresh.dependency_bindings = prior.dependency_bindings.clone();
-        self.current = Current::from_state(fresh);
+        self.current = Current::from_snapshot(fresh);
         self
     }
 }
@@ -1075,14 +1088,14 @@ use crate::plan::Plan;
 #[cfg(test)]
 use crate::schema::CompiledAttributeType as AttributeType;
 pub use comparison::{
-    AuthoringComparison, AuthoringEquality, ComparisonContext, ComparisonSchema,
+    AuthoringComparison, AuthoringEquality, ComparisonContext, ComparisonError, ComparisonSchema,
     ObservationComparison, ObservationEquality, PlanningComparison, PlanningEquality,
     ReferenceEquality,
 };
 
 #[cfg(any(test, feature = "test-utils"))]
 pub fn exact_comparison_context_for_tests() -> ObservationComparison<'static> {
-    exact_comparison_schema_for_tests().observation()
+    exact_comparison_schema_for_tests().observation_for_test()
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -1208,14 +1221,17 @@ struct PresentDiffResult<D = ()> {
     releases: Vec<PlannedListKeyRelease>,
 }
 
-fn concrete_list(value: &Value) -> Option<&[Value]> {
+fn concrete_list<P: crate::resource::ValueKind>(value: &Value<P>) -> Option<&[Value<P>]> {
     let Value::Concrete(crate::resource::ConcreteValue::List(items)) = value else {
         return None;
     };
     Some(items)
 }
 
-fn keyed_element_key<'a>(element: &'a Value, key_field: &str) -> Option<&'a str> {
+fn keyed_element_key<'a, P: crate::resource::ValueKind>(
+    element: &'a Value<P>,
+    key_field: &str,
+) -> Option<&'a str> {
     let Value::Concrete(crate::resource::ConcreteValue::Map(fields)) = element else {
         return None;
     };
@@ -1226,7 +1242,10 @@ fn keyed_element_key<'a>(element: &'a Value, key_field: &str) -> Option<&'a str>
     Some(key.expose_plaintext())
 }
 
-fn retained_key_value(element: &Value, key_field: &str) -> Value {
+fn retained_key_value<P: crate::resource::ValueKind>(
+    element: &Value<P>,
+    key_field: &str,
+) -> Value<P> {
     let Value::Concrete(crate::resource::ConcreteValue::Map(fields)) = element else {
         return element.clone();
     };
@@ -1239,10 +1258,10 @@ fn retained_key_value(element: &Value, key_field: &str) -> Value {
     }
 }
 
-fn unique_elements_by_key<'a>(
-    value: &'a Value,
+fn unique_elements_by_key<'a, P: crate::resource::ValueKind>(
+    value: &'a Value<P>,
     key_field: &str,
-) -> Option<std::collections::BTreeMap<&'a str, &'a Value>> {
+) -> Option<std::collections::BTreeMap<&'a str, &'a Value<P>>> {
     let mut by_key = std::collections::BTreeMap::new();
     for element in concrete_list(value)? {
         let key = keyed_element_key(element, key_field)?;
@@ -1253,8 +1272,8 @@ fn unique_elements_by_key<'a>(
     Some(by_key)
 }
 
-fn authored_saved_keys(
-    saved_value: &Value,
+fn authored_saved_keys<P: crate::resource::ValueKind>(
+    saved_value: &Value<P>,
     authoring: &crate::explicit::ExplicitFields,
     key_field: &str,
 ) -> std::collections::BTreeSet<String> {
@@ -1368,7 +1387,11 @@ fn find_keyed_partial_update_releases(
         .collect()
 }
 
-fn remove_keys_from_list(value: &mut Value, key_field: &str, released: &HashSet<&str>) {
+fn remove_keys_from_list<P: crate::resource::ValueKind>(
+    value: &mut Value<P>,
+    key_field: &str,
+    released: &HashSet<&str>,
+) {
     let Value::Concrete(crate::resource::ConcreteValue::List(elements)) = value else {
         return;
     };
@@ -1377,9 +1400,9 @@ fn remove_keys_from_list(value: &mut Value, key_field: &str, released: &HashSet<
     });
 }
 
-fn filter_explicit_list_elements(
+fn filter_explicit_list_elements<P: crate::resource::ValueKind>(
     explicit: &mut crate::explicit::ExplicitFields,
-    saved_value: &Value,
+    saved_value: &Value<P>,
     key_field: &str,
     released: &HashSet<&str>,
 ) {
@@ -1641,7 +1664,7 @@ pub fn diff(
         prev_explicit,
         schema,
         context,
-        &comparison.context().observation(),
+        &context.observation(),
     )
 }
 
@@ -1649,15 +1672,16 @@ pub fn diff(
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-pub fn diff_for_test(
+pub fn diff_for_test<P: crate::resource::StateValueLeaf>(
     desired: &ResolvedResource,
-    current: &State,
+    current: &crate::resource::State<P>,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
     context_schema: &ComparisonSchema<'_>,
     references: &crate::references::ResolvedReferences,
 ) -> PlanComparisonResult<Diff> {
+    let current = &current.to_snapshot();
     context_schema.with_references(references, &desired.id, |context| {
         diff_with_comparison_schema(
             desired,
@@ -1666,7 +1690,7 @@ pub fn diff_for_test(
             prev_explicit,
             schema,
             context,
-            &context_schema.observation(),
+            &context.observation(),
         )
     })?
 }
@@ -1764,14 +1788,15 @@ fn diff_with_saved_parts(
 }
 
 #[cfg(test)]
-pub(crate) fn diff_test(
+pub(crate) fn diff_test<P: crate::resource::StateValueLeaf>(
     desired: &Resource,
-    current: &State,
-    saved: Option<&HashMap<String, Value>>,
+    current: &crate::resource::State<P>,
+    saved: Option<&HashMap<String, crate::resource::SnapshotValue>>,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
     context_schema: &ComparisonSchema<'_>,
 ) -> Diff {
+    let current = &current.to_snapshot();
     let current_attributes = match schema {
         Some(schema) => {
             CanonicalComparisonAttributes::canonicalize(current.attributes.clone(), schema)
@@ -1812,7 +1837,7 @@ pub(crate) fn diff_test(
                         prev_explicit,
                         schema,
                         context,
-                        observations: &context_schema.observation(),
+                        observations: &context.observation(),
                     },
                 )
             },

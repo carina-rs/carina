@@ -25,8 +25,8 @@ use crate::resolver::resolve_ref_value;
 #[cfg(test)]
 use crate::resource::Resource;
 use crate::resource::{
-    AbsoluteBindingAddress, ConcreteValue, Current, DataSource, DeferredValue, ResourceId, State,
-    Value,
+    AbsoluteBindingAddress, ConcreteValue, Current, DataSource, DeferredValue, ResourceId,
+    SnapshotState as State, Value,
 };
 use crate::schema::SchemaKind;
 use crate::value::{SerializationContext, SerializationError};
@@ -161,7 +161,7 @@ pub(super) async fn refresh_pending_states<S: Clone>(
                 accumulator.mutate(|result| {
                     result
                         .managed_current
-                        .insert(id.clone(), Current::from_state(outcome.into_state()));
+                        .insert(id.clone(), Current::from_snapshot(outcome.into_state()));
                 });
             }
             Err(error) => {
@@ -201,7 +201,7 @@ pub(super) async fn resolve_resource<S: Clone>(
             let mut resolved = source.clone();
             for (key, expr) in &source.attributes {
                 let resolved_value = resolve_ref_value(expr, bindings, context.type_checks())
-                    .map_err(EffectFailureKind::message)?;
+                    .map_err(EffectFailureKind::execution)?;
                 assert_fully_resolved(&resolved_value, key, bindings)
                     .map_err(|error| EffectFailureKind::Execution { error })?;
                 resolved.attributes.insert(key.clone(), resolved_value);
@@ -222,7 +222,7 @@ pub(super) async fn resolve_resource<S: Clone>(
                     .filter(|source_expr| needs_apply_resolution(source_expr))
                     .unwrap_or(target_expr);
                 let resolved_value = resolve_ref_value(expr, bindings, context.type_checks())
-                    .map_err(EffectFailureKind::message)?;
+                    .map_err(EffectFailureKind::execution)?;
                 assert_fully_resolved(&resolved_value, key, bindings)
                     .map_err(|error| EffectFailureKind::Execution { error })?;
                 if resolves_at_apply {
@@ -237,7 +237,7 @@ pub(super) async fn resolve_resource<S: Clone>(
                 }
                 let resolved_value =
                     resolve_ref_value(source_expr, bindings, context.type_checks())
-                        .map_err(EffectFailureKind::message)?;
+                        .map_err(EffectFailureKind::execution)?;
                 assert_fully_resolved(&resolved_value, key, bindings)
                     .map_err(|error| EffectFailureKind::Execution { error })?;
                 if needs_apply_resolution(source_expr) {
@@ -276,7 +276,6 @@ fn needs_apply_resolution(value: &Value) -> bool {
             | DeferredValue::Unavailable { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Access(_)
-            | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_),
         ) => true,
         Value::Deferred(DeferredValue::Secret(inner)) => needs_apply_resolution(inner),
@@ -311,7 +310,7 @@ pub(super) fn resolve_data_source<S: Clone>(
             let mut resolved = source.clone();
             for (key, expr) in &source.attributes {
                 let resolved_value = resolve_ref_value(expr, bindings, context.type_checks())
-                    .map_err(ReportedError::message)?;
+                    .map_err(ReportedError::new)?;
                 assert_fully_resolved(&resolved_value, key, bindings)?;
                 resolved.attributes.insert(key.clone(), resolved_value);
             }
@@ -331,7 +330,7 @@ pub(super) fn resolve_data_source<S: Clone>(
                     .filter(|source_expr| needs_apply_resolution(source_expr))
                     .unwrap_or(target_expr);
                 let resolved_value = resolve_ref_value(expr, bindings, context.type_checks())
-                    .map_err(ReportedError::message)?;
+                    .map_err(ReportedError::new)?;
                 assert_fully_resolved(&resolved_value, key, bindings)?;
                 if resolves_at_apply {
                     validation_attributes.insert(key.clone(), resolved_value.clone());
@@ -345,7 +344,7 @@ pub(super) fn resolve_data_source<S: Clone>(
                 }
                 let resolved_value =
                     resolve_ref_value(source_expr, bindings, context.type_checks())
-                        .map_err(ReportedError::message)?;
+                        .map_err(ReportedError::new)?;
                 assert_fully_resolved(&resolved_value, key, bindings)?;
                 if needs_apply_resolution(source_expr) {
                     validation_attributes.insert(key.clone(), resolved_value.clone());
@@ -408,12 +407,7 @@ fn assert_fully_resolved(
             "Attribute '{}' contains an unresolved module-template conditional",
             attribute_key
         ))),
-        Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
-            Err(ReportedError::message(format!(
-                "Attribute '{}' contains a saved-plan secret that was not rehydrated; create a new saved plan before applying",
-                attribute_key
-            )))
-        }
+
         Value::Deferred(DeferredValue::ResourceRef { path }) => Err(unresolved_binding_message(
             attribute_key,
             UnresolvedSite::Ref {
@@ -599,7 +593,7 @@ fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
                 .into_iter()
                 .for_each(|value| collect_unresolved_bindings(value, out));
         }
-        Value::Deferred(DeferredValue::RedactedSecret { .. }) => {}
+
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             for p in parts {
                 if let InterpolationPart::Expr(v) = p {
@@ -1196,9 +1190,13 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                 {
                     continue;
                 }
-                if let Some(value) =
-                    secret_grafted_comparison_view(new_value, resolve_source_attributes.get(key))
-                {
+                if let Some(value) = secret_grafted_comparison_view(
+                    &new_value.to_snapshot(),
+                    resolve_source_attributes
+                        .get(key)
+                        .map(Value::to_snapshot)
+                        .as_ref(),
+                ) {
                     candidates.insert(key.clone(), value.into_owned());
                 }
             }
@@ -1230,6 +1228,9 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     Ok(additional) => effective_changed.extend(additional.value),
                     Err(error) => {
                         let failure = match error {
+                            crate::differ::ApplyTimeComparisonError::Secret(error) => {
+                                EffectFailureKind::execution(error)
+                            }
                             crate::differ::ApplyTimeComparisonError::CreateOnly(error) => {
                                 EffectFailureKind::execution(error)
                             }
@@ -1451,8 +1452,10 @@ mod process_basic_result_tests {
             pending_refreshes: &mut pending_refreshes,
         };
 
-        let resolved_attrs =
-            SecretPreservingAttributes::from_provider_values(&HashMap::new(), &HashMap::new());
+        let resolved_attrs = SecretPreservingAttributes::from_provider_values::<
+            crate::resource::NoPlaceholder,
+            crate::resource::NoPlaceholder,
+        >(&HashMap::new(), &HashMap::new());
         let effect = Effect::Create(crate::resource::ResolvedResource::new(
             resource.into_value_snapshot(),
         ));
@@ -1569,10 +1572,10 @@ mod process_basic_result_tests {
                 resource_id: id,
                 diagnostic: diagnostic.clone(),
                 read_back_end: ReadBackEnd::ProviderReported,
-                resolved_attrs: Some(SecretPreservingAttributes::from_provider_values(
-                    &HashMap::new(),
-                    &HashMap::new(),
-                )),
+                resolved_attrs: Some(SecretPreservingAttributes::from_provider_values::<
+                    crate::resource::NoPlaceholder,
+                    crate::resource::NoPlaceholder,
+                >(&HashMap::new(), &HashMap::new())),
                 binding: Some(crate::resource::absolute_binding_address_for_test("source")),
             },
             &mut exec,
@@ -1627,10 +1630,10 @@ mod process_basic_result_tests {
                 resource_id: id,
                 diagnostic,
                 read_back_end: ReadBackEnd::ProviderReported,
-                resolved_attrs: Some(SecretPreservingAttributes::from_provider_values(
-                    &HashMap::new(),
-                    &HashMap::new(),
-                )),
+                resolved_attrs: Some(SecretPreservingAttributes::from_provider_values::<
+                    crate::resource::NoPlaceholder,
+                    crate::resource::NoPlaceholder,
+                >(&HashMap::new(), &HashMap::new())),
                 binding: Some(crate::resource::absolute_binding_address_for_test("source")),
             },
             &mut exec,
@@ -1773,13 +1776,13 @@ mod assert_fully_resolved_tests {
 
     #[test]
     fn saved_plan_secret_placeholder_is_rejected_at_apply_seam() {
-        let v = Value::Deferred(DeferredValue::RedactedSecret {
-            hash: crate::resource::RedactedSecretHash::generate(b"placeholder"),
-        });
-        let err = assert_fully_resolved(&v, "password", &empty_bindings())
-            .expect_err("saved-plan placeholder must be rejected before provider dispatch");
-        assert!(err.to_string().contains("not rehydrated"), "got: {err}");
-        assert!(err.to_string().contains("new saved plan"), "got: {err}");
+        let snapshot: crate::resource::SnapshotValue = crate::resource::SnapshotValue::redacted(
+            crate::resource::RedactedSecretHash::generate(b"placeholder"),
+        );
+        let error = snapshot
+            .to_value_at("state.password")
+            .expect_err("historical hashes cannot enter apply evaluation");
+        assert_eq!(error.path(), "state.password");
     }
 
     #[test]
@@ -1833,7 +1836,7 @@ mod assert_fully_resolved_tests {
                     .to_string();
                 assert!(error.contains("add a `wait` block"), "{error}");
                 assert!(!error.contains("read-back"), "{error}");
-                assert!(!error.contains(diagnostic.reason()), "{error}");
+                assert!(!error.contains(diagnostic.reason().as_str()), "{error}");
             }
         }
     }
@@ -2030,10 +2033,16 @@ mod assert_fully_resolved_tests {
             &crate::parser::LoadedProviderContext::empty_for_test(),
             |session| resolve_ref_value(&value, &bindings, session),
         )
-        .map_err(ReportedError::message)
+        .map_err(ReportedError::new)
         .and_then(|resolved| assert_fully_resolved(&resolved, "name", &bindings))
         .expect_err("the apply path must reject the final computed list access");
 
+        assert!(matches!(
+            error
+                .as_error()
+                .downcast_ref::<crate::resolver::ResolutionError>(),
+            Some(crate::resolver::ResolutionError::Message(_))
+        ));
         assert!(
             error
                 .to_string()

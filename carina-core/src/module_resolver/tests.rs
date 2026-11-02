@@ -10299,7 +10299,7 @@ fn anonymous_module_handle_output_resolves_after_instance_reconciliation() {
     assert_ne!(prior_hash, new_hash, "argument edit must move the SimHash");
     assert!(prior_hash.distance(new_hash) < crate::identifier::SIMHASH_HAMMING_THRESHOLD);
     let prior_record = &previous.resources[0].id;
-    let prior_state = crate::resource::State::existing(
+    let prior_state: crate::resource::State = crate::resource::State::existing(
         prior_record.clone(),
         HashMap::from([(
             "name".to_string(),

@@ -36,7 +36,8 @@ use crate::provider::{
 };
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, RedactedSecretHash, Resource, ResourceId,
-    ResourceIdentity, ResourceIdentityError, ResourceIdentityState, State, Value,
+    ResourceIdentity, ResourceIdentityError, ResourceIdentityState, SnapshotLeaf, SnapshotState,
+    SnapshotValue, State, Value,
 };
 use crate::schema::{
     AttributeSchema as DraftAttributeSchema, AttributeSchemaParts,
@@ -136,6 +137,7 @@ pub enum ProtocolConvertError {
     NonFiniteFloat,
     DurationOutOfRange,
     InvalidRedactedSecretDigest,
+    UnavailableSecret(crate::resource::UnavailableSecretError),
     NonWireValue {
         variant: &'static str,
     },
@@ -188,6 +190,7 @@ impl fmt::Display for ProtocolConvertError {
             }
             Self::DurationOutOfRange => formatter
                 .write_str("duration in seconds does not fit the provider protocol integer domain"),
+            Self::UnavailableSecret(error) => fmt::Display::fmt(error, formatter),
             Self::InvalidRedactedSecretDigest => {
                 formatter.write_str("persisted state contains an invalid redacted-secret digest")
             }
@@ -273,6 +276,7 @@ impl Error for ProtocolConvertError {
             Self::NonFiniteFloat => None,
             Self::DurationOutOfRange => None,
             Self::InvalidRedactedSecretDigest => None,
+            Self::UnavailableSecret(error) => error.source(),
             Self::NonWireValue { variant: _variant } => None,
             Self::NonWireAttributeType { kind: _kind } => None,
             Self::ValidatorWithoutIdentity { kind: _kind } => None,
@@ -1986,7 +1990,7 @@ pub fn try_core_to_protocol_value(value: &Value) -> Result<protocol::Value, Prot
     }
 }
 
-fn deferred_value_variant(value: &DeferredValue) -> &'static str {
+fn deferred_value_variant<P: crate::resource::ValueKind>(value: &DeferredValue<P>) -> &'static str {
     match value {
         DeferredValue::ModuleIf(_) => "ModuleIf",
         DeferredValue::ResourceRef { path: _path } => "ResourceRef",
@@ -2016,9 +2020,8 @@ fn deferred_value_variant(value: &DeferredValue) -> &'static str {
         } => "ResolvedFunctionCall",
         DeferredValue::Access(_access) => "Access",
         DeferredValue::Secret(_inner) => "Secret",
-        DeferredValue::RedactedSecret { hash: _hash } => "RedactedSecret",
         DeferredValue::Unknown(_reason) => "Unknown",
-        DeferredValue::Placeholder(never) => match *never {},
+        DeferredValue::Placeholder(_leaf) => "Placeholder",
     }
 }
 
@@ -2147,7 +2150,7 @@ pub fn protocol_to_core_value_map(
 /// Convert a value at a persisted-state position. Only this typed boundary
 /// may transport a redacted-secret digest.
 pub fn try_core_to_protocol_persisted_value(
-    value: &Value,
+    value: &SnapshotValue,
 ) -> Result<protocol::PersistedValue, ProtocolConvertError> {
     match value {
         Value::Concrete(ConcreteValue::String(value)) => Ok(protocol::PersistedValue::String(
@@ -2203,7 +2206,7 @@ pub fn try_core_to_protocol_persisted_value(
                 })
                 .collect::<Result<_, _>>()?,
         )),
-        Value::Deferred(DeferredValue::RedactedSecret { hash }) => Ok(
+        Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { hash })) => Ok(
             protocol::PersistedValue::RedactedSecret(hash.encoded_digest()),
         ),
         Value::Deferred(deferred) => Err(ProtocolConvertError::NonWireValue {
@@ -2215,7 +2218,7 @@ pub fn try_core_to_protocol_persisted_value(
 /// Decode a value from a persisted-state position.
 pub fn protocol_to_core_persisted_value(
     value: &protocol::PersistedValue,
-) -> Result<Value, ProtocolConvertError> {
+) -> Result<SnapshotValue, ProtocolConvertError> {
     match value {
         protocol::PersistedValue::Bool(value) => Ok(Value::Concrete(ConcreteValue::Bool(*value))),
         protocol::PersistedValue::Int(value) => Ok(Value::Concrete(ConcreteValue::Int(*value))),
@@ -2232,7 +2235,9 @@ pub fn protocol_to_core_persisted_value(
         protocol::PersistedValue::RedactedSecret(digest) => {
             let hash = RedactedSecretHash::from_encoded_digest(digest)
                 .ok_or(ProtocolConvertError::InvalidRedactedSecretDigest)?;
-            Ok(Value::Deferred(DeferredValue::RedactedSecret { hash }))
+            Ok(Value::Deferred(DeferredValue::Placeholder(
+                SnapshotLeaf::RedactedSecret { hash },
+            )))
         }
         protocol::PersistedValue::StringList(values) => Ok(Value::Concrete(
             ConcreteValue::StringList(values.iter().cloned().map(Into::into).collect()),
@@ -2264,7 +2269,7 @@ pub fn protocol_to_core_persisted_value(
 
 /// Convert a core map at a persisted-state position.
 pub fn try_core_to_protocol_persisted_value_map(
-    values: &HashMap<String, Value>,
+    values: &HashMap<String, SnapshotValue>,
 ) -> Result<BTreeMap<String, protocol::PersistedValue>, ProtocolConvertError> {
     values
         .iter()
@@ -2279,7 +2284,7 @@ pub fn try_core_to_protocol_persisted_value_map(
 /// Decode a persisted protocol value map.
 pub fn protocol_to_core_persisted_value_map(
     values: &BTreeMap<String, protocol::PersistedValue>,
-) -> Result<HashMap<String, Value>, ProtocolConvertError> {
+) -> Result<HashMap<String, SnapshotValue>, ProtocolConvertError> {
     values
         .iter()
         .map(|(key, value)| {
@@ -2552,7 +2557,7 @@ pub fn protocol_to_state(state: &protocol::State) -> Result<State, ProtocolConve
 
 /// Encode generic state through the persisted value domain.
 pub fn try_state_to_persisted_protocol(
-    state: &State,
+    state: &SnapshotState,
 ) -> Result<protocol::PersistedState, ProtocolConvertError> {
     let State {
         id,
@@ -2573,7 +2578,7 @@ pub fn try_state_to_persisted_protocol(
 /// Decode generic persisted state.
 pub fn protocol_persisted_state_to_core(
     state: &protocol::PersistedState,
-) -> Result<State, ProtocolConvertError> {
+) -> Result<SnapshotState, ProtocolConvertError> {
     let protocol::PersistedState {
         id,
         identifier,
@@ -2606,7 +2611,17 @@ pub fn try_applied_state_to_protocol(
     Ok(protocol::AppliedState {
         id: resource_id_to_protocol(id),
         identifier: identifier.clone(),
-        attributes: try_core_to_protocol_value_map(attributes)?,
+        attributes: attributes
+            .iter()
+            .map(|(key, value)| {
+                let value = value
+                    .to_value_at(format!("{id}.{key}"))
+                    .map_err(ProtocolConvertError::UnavailableSecret)?;
+                try_core_to_protocol_value(&value)
+                    .map(|value| (key.clone(), value))
+                    .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone().into())))
+            })
+            .collect::<Result<_, _>>()?,
     })
 }
 
@@ -2698,7 +2713,7 @@ pub fn try_update_outcome_to_protocol(
             Ok(protocol::UpdateOutcome::PartialSuccess {
                 state: try_applied_update_state_to_protocol(state, state_after_patch)?,
                 diagnostic: protocol::PartialReadDiagnostic {
-                    reason: reason.to_string(),
+                    reason: reason.as_str().to_owned(),
                     missing_attributes: missing_attributes
                         .iter()
                         .map(|name| name.as_str().to_owned())
@@ -2717,7 +2732,7 @@ fn protocol_applied_persisted_state_to_core(
         identifier,
         attributes,
     } = state;
-    Ok(AppliedState::from_identifier(
+    Ok(AppliedState::from_snapshot_parts(
         protocol_to_resource_id(id),
         identifier.clone(),
         protocol_to_core_persisted_value_map(attributes)?,
@@ -3506,14 +3521,12 @@ mod tests {
         let digest = format!("argon2-legacy:73616c74:{}", "ab".repeat(32));
         let hash =
             RedactedSecretHash::from_encoded_digest(&digest).expect("fixture digest must be valid");
-        let value = Value::Deferred(DeferredValue::RedactedSecret { hash });
-
-        assert!(matches!(
-            try_core_to_protocol_value(&value),
-            Err(ProtocolConvertError::NonWireValue {
-                variant: "RedactedSecret"
-            })
+        let value = crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+            crate::resource::SnapshotLeaf::RedactedSecret { hash },
         ));
+
+        let unavailable = value.to_value_at("state.password").unwrap_err();
+        assert_eq!(unavailable.path(), "state.password");
 
         let encoded = try_core_to_protocol_persisted_value(&value)
             .expect("persisted positions may carry a redacted secret");
@@ -3717,9 +3730,6 @@ mod tests {
             crate::resource::AccessMissPolicy::Defer,
         )
         .expect("unknown field access must remain deferred");
-        let digest = format!("argon2-legacy:73616c74:{}", "ab".repeat(32));
-        let hash =
-            RedactedSecretHash::from_encoded_digest(&digest).expect("fixture digest must be valid");
         let non_wire = [
             Value::Concrete(ConcreteValue::enum_identifier("test.Mode.enabled")),
             crate::resource::AuthoredValue::resource_ref("source", "value", Vec::new())
@@ -3761,7 +3771,6 @@ mod tests {
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
                 ConcreteValue::String("secret".into()),
             )))),
-            Value::Deferred(DeferredValue::RedactedSecret { hash }),
             Value::Deferred(DeferredValue::Unknown(
                 crate::resource::ApplyTimeUnknown::UpstreamAllExports {
                     binding: absolute_binding("upstream"),

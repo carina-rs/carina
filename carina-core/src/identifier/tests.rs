@@ -42,7 +42,7 @@ fn canonical_create_only_value_string_for_test(value: &Value) -> Option<String> 
     )
 }
 
-fn anonymous_state_entry<I, K>(
+fn anonymous_state_entry<I, K, P: crate::resource::StateValueLeaf>(
     registry: &SchemaRegistry,
     provider: &str,
     resource_type: &str,
@@ -52,7 +52,7 @@ fn anonymous_state_entry<I, K>(
     attributes: I,
 ) -> AnonymousIdStateInfo
 where
-    I: IntoIterator<Item = (K, Value)>,
+    I: IntoIterator<Item = (K, crate::resource::Value<P>)>,
     K: Into<String>,
 {
     let attributes = attributes
@@ -254,7 +254,10 @@ fn redacted_secret_identifier_material_bytes_are_legacy_compatible() {
     let digest = format!("argon2-legacy:73616c74:{}", "ab".repeat(32));
     let hash = crate::resource::RedactedSecretHash::from_encoded_digest(&digest)
         .expect("valid explicit legacy digest");
-    let value = Value::Deferred(DeferredValue::RedactedSecret { hash });
+    let value: crate::resource::SnapshotValue =
+        crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+            crate::resource::SnapshotLeaf::RedactedSecret { hash },
+        ));
 
     assert_eq!(
         deterministic_value_string(&value).as_bytes(),
@@ -286,6 +289,37 @@ fn pending_reread_identifier_material_has_stable_typed_bytes() {
         assert_eq!(
             deterministic_value_string(&value).as_bytes(),
             expected.as_bytes()
+        );
+    }
+}
+
+#[test]
+fn provider_text_pending_reread_identity_material_retains_raw_detail() {
+    let raw = format!("\x1b[2J\x07\u{9b}{}", "x".repeat(20 * 1024));
+    for pending in [
+        PendingReRead::incomplete(raw.clone()),
+        PendingReRead::read_failed(raw.clone()),
+    ] {
+        let rendered = pending.to_string();
+        assert!(!rendered.contains(['\x1b', '\x07', '\u{9b}']));
+        assert!(rendered.contains("truncated,"));
+        let variant = match pending.reason() {
+            ReReadReason::Incomplete { detail } => {
+                assert_eq!(detail.as_str(), raw);
+                "Incomplete"
+            }
+            ReReadReason::ReadFailed { detail } => {
+                assert_eq!(detail.as_str(), raw);
+                "ReadFailed"
+            }
+            ReReadReason::NotFound => unreachable!(),
+        };
+        let value = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(
+            pending,
+        )));
+        assert_eq!(
+            deterministic_value_string(&value),
+            format!("Unknown(PendingReRead({variant}({raw:?})))")
         );
     }
 }
@@ -1477,13 +1511,19 @@ fn longer_reference_chain_resolves_from_state_for_legacy_identity_migration() {
         Value::root_resource_ref("source", "details", vec!["generated_name".to_string()]);
     let source = AnonymousIdBindingStateInfo {
         name: "source".to_string(),
-        attribute_values: HashMap::from([(
-            "details".to_string(),
-            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-                "generated_name".to_string(),
-                concrete_string("resolved-name"),
-            )]))),
-        )]),
+        attribute_values: {
+            let attributes: HashMap<String, Value> = HashMap::from([(
+                "details".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "generated_name".to_string(),
+                    concrete_string("resolved-name"),
+                )]))),
+            )]);
+            attributes
+                .into_iter()
+                .map(|(key, value)| (key, value.to_snapshot()))
+                .collect()
+        },
     };
 
     let resolved = resolve_deferred_create_only_value(
@@ -1495,62 +1535,63 @@ fn longer_reference_chain_resolves_from_state_for_legacy_identity_migration() {
                 .collect()
         },
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-    );
+    )
+    .expect("historical identity fixture remains available");
 
     assert_eq!(resolved, Some(concrete_string("resolved-name")));
 }
 
 #[test]
-fn identity_projection_evaluates_env_from_the_caller_snapshot() {
-    let schema = PatternResourceSchema::new("test.resource")
-        .attribute(
-            PatternAttributeSchema::required("name", PatternAttributeType::string())
-                .create_only()
-                .identity()
-                .build(),
-        )
-        .validate()
-        .expect("identity schema");
-    let mut desired = Resource::with_provider("mock", "test.resource", "desired", None);
-    desired.set_attr(
-        "name",
-        Value::Deferred(DeferredValue::FunctionCall {
-            name: crate::builtins::BuiltinFunction::env,
-            args: vec![Value::root_resource_ref("source", "variable", Vec::new()).into()],
-            source_line: 1.into(),
-        }),
-    );
+fn historical_identity_binding_selects_siblings_and_rejects_hashes_with_typed_paths() {
+    let hash = serde_json::json!({
+        "RedactedSecret": {
+            "hash": format!("argon2-legacy:73616c74:{}", "ab".repeat(32)),
+        },
+    });
+    let attributes: HashMap<String, crate::resource::SnapshotValue> =
+        serde_json::from_value(serde_json::json!({
+            "password": hash,
+            "details": {"Map": {
+                "name": {"String": "ordinary"},
+                "password": hash,
+            }},
+        }))
+        .expect("historical binding fixture");
     let find_state = |binding: &str| {
-        assert_eq!(binding, "source");
-        vec![AnonymousIdBindingStateInfo {
-            name: binding.to_string(),
-            attribute_values: HashMap::from([(
-                "variable".to_string(),
-                concrete_string("IDENTITY_VARIABLE"),
-            )]),
-        }]
+        (binding == "source")
+            .then(|| AnonymousIdBindingStateInfo {
+                name: "source".to_string(),
+                attribute_values: attributes.clone(),
+            })
+            .into_iter()
+            .collect()
     };
-    for expected in ["first", "second"] {
-        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::new([(
-            "IDENTITY_VARIABLE".to_string(),
-            expected.into(),
-        )]));
-        let create_only = DesiredCreateOnlyValues::from_resource(
-            &desired,
-            schema.as_schema(),
+    let ordinary = Value::root_resource_ref("source", "details", vec!["name".to_string()]);
+    assert_eq!(
+        resolve_deferred_create_only_value(
+            &ordinary,
             &find_state,
-            &context,
-        );
-        let Some(DesiredCreateOnlyValue::Resolved(actual)) = create_only.values.get("name") else {
-            panic!("the state-backed env call must resolve for create-only comparison");
-        };
-        assert_eq!(actual.value, concrete_string(expected));
-        let identity =
-            DesiredIdentityValues::from_resource(&desired, &schema, &find_state, &context);
-        let Some(DesiredIdentityValue::Resolved(actual)) = identity.values.values().next() else {
-            panic!("the state-backed env call must resolve for declared-identity comparison");
-        };
-        assert_eq!(actual.value, concrete_string(expected));
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
+        )
+        .expect("a sibling hash does not make an ordinary selection unavailable"),
+        Some(concrete_string("ordinary")),
+    );
+    for (attribute, segments, path) in [
+        ("password", vec![], "source.password"),
+        (
+            "details",
+            vec!["password".to_string()],
+            "source.details.password",
+        ),
+    ] {
+        let reference = Value::root_resource_ref("source", attribute, segments);
+        let error = resolve_deferred_create_only_value(
+            &reference,
+            &find_state,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("a selected hash cannot supply a desired identity");
+        assert_eq!(error.path(), path);
     }
 }
 
@@ -2395,9 +2436,11 @@ fn test_anonymous_id_stable_for_nested_canonical_enum_create_only_values() {
         );
         resource.set_attr(
             "domain_by_name".to_string(),
-            Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
-                "primary".to_string() => enum_value,
-            })),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(
+                indexmap::indexmap! {
+                    "primary".to_string() => enum_value,
+                },
+            )),
         );
         resource
     };
@@ -2993,12 +3036,10 @@ fn test_reconcile_prefixed_names_reuses_state_name_when_prefix_matches() {
             prefixes: vec![("bucket_name".to_string(), "my-app-".to_string())]
                 .into_iter()
                 .collect(),
-            attribute_values: vec![(
+            attribute_values: HashMap::from([(
                 "bucket_name".to_string(),
                 PrefixStateValue::Known("my-app-existing1".to_string()),
-            )]
-            .into_iter()
-            .collect(),
+            )]),
         })
     });
 
@@ -3028,12 +3069,10 @@ fn test_reconcile_prefixed_names_generates_new_name_when_prefix_changes() {
             prefixes: vec![("bucket_name".to_string(), "old-prefix-".to_string())]
                 .into_iter()
                 .collect(),
-            attribute_values: vec![(
+            attribute_values: HashMap::from([(
                 "bucket_name".to_string(),
                 PrefixStateValue::Known("old-prefix-existing1".to_string()),
-            )]
-            .into_iter()
-            .collect(),
+            )]),
         })
     });
 
@@ -3194,7 +3233,8 @@ fn state_row_identity_values_use_the_original_permanent_name_override() {
         &schema,
         &|_| Vec::new(),
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-    );
+    )
+    .expect("historical identity fixture remains available");
     let attributes = HashMap::from([("name".to_string(), concrete_string("role-a1b2c3d4"))]);
     let without_override =
         StateRowIdentityValues::from_state_row(&schema, &attributes, &HashMap::new());
@@ -4067,11 +4107,13 @@ fn reconcile_when_present_absence_matches_only_a_state_row_with_the_attribute_ab
     );
 }
 
-fn redacted_identity_value() -> Value {
+fn redacted_identity_value() -> crate::resource::SnapshotValue {
     let digest = format!("argon2-legacy:73616c74:{}", "ab".repeat(32));
     let hash = crate::resource::RedactedSecretHash::from_encoded_digest(&digest)
         .expect("valid persisted secret digest");
-    Value::Deferred(DeferredValue::RedactedSecret { hash })
+    crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+        crate::resource::SnapshotLeaf::RedactedSecret { hash },
+    ))
 }
 
 #[test]
@@ -4100,7 +4142,8 @@ fn reconcile_when_present_absence_does_not_match_a_redacted_secret() {
         schema,
         &|_| Vec::new(),
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-    );
+    )
+    .expect("historical identity fixture remains available");
 
     assert_eq!(
         desired_values.compare_row(
@@ -4199,11 +4242,12 @@ fn nested_when_present_absence_does_not_match_redacted_state() {
         &schema,
         &|_| Vec::new(),
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-    );
-    let redacted_leaf = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-        "name".to_string(),
-        redacted_identity_value(),
-    )])));
+    )
+    .expect("historical identity fixture remains available");
+    let redacted_leaf =
+        crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::Map(
+            IndexMap::from([("name".to_string(), redacted_identity_value())]),
+        ));
 
     for settings in [redacted_leaf, redacted_identity_value()] {
         let state = StateRowIdentityValues::from_state_row(
@@ -4239,7 +4283,8 @@ fn declared_identity_resolved_and_prefix_values_are_undecidable_against_redacted
             schema,
             &|_| Vec::new(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        );
+        )
+        .expect("historical identity fixture remains available");
         let state = StateRowIdentityValues::from_state_row(
             schema,
             &HashMap::from([("name".to_string(), redacted_identity_value())]),
@@ -4251,8 +4296,11 @@ fn declared_identity_resolved_and_prefix_values_are_undecidable_against_redacted
             desired_values.compare_row(&state, schema, &context),
             DeclaredIdentityRowOutcome::Undecidable(_),
         ));
-        let absent =
-            StateRowIdentityValues::from_state_row(schema, &HashMap::new(), &HashMap::new());
+        let absent = StateRowIdentityValues::from_state_row(
+            schema,
+            &HashMap::<String, crate::resource::ExpandedValue>::new(),
+            &HashMap::new(),
+        );
         assert_eq!(
             desired_values.compare_row(&absent, schema, &context),
             DeclaredIdentityRowOutcome::Mismatch,
@@ -4745,15 +4793,21 @@ fn binding_state_entry(
         binding.to_string(),
         AnonymousIdBindingStateInfo {
             name: name.to_string(),
-            attribute_values: attrs
-                .iter()
-                .map(|(attr, value)| {
-                    (
-                        (*attr).to_string(),
-                        Value::Concrete(ConcreteValue::String((*value).to_string().into())),
-                    )
-                })
-                .collect(),
+            attribute_values: {
+                let attributes: HashMap<String, Value> = attrs
+                    .iter()
+                    .map(|(attr, value)| {
+                        (
+                            (*attr).to_string(),
+                            Value::Concrete(ConcreteValue::String((*value).to_string().into())),
+                        )
+                    })
+                    .collect();
+                attributes
+                    .into_iter()
+                    .map(|(key, value)| (key, value.to_snapshot()))
+                    .collect()
+            },
         },
     )
 }
@@ -4767,6 +4821,58 @@ fn binding_state_entries_for(
         .filter(|(entry_binding, _)| entry_binding == binding)
         .map(|(_, entry)| entry.clone())
         .collect()
+}
+
+#[test]
+fn create_only_snapshot_container_verifies_secret_leaves() {
+    let schema = PatternResourceSchema::new("test.SecretIdentity")
+        .attribute(
+            PatternAttributeSchema::optional(
+                "settings",
+                PatternAttributeType::map(PatternAttributeType::string()),
+            )
+            .create_only()
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let settings = |token: &str, name: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "token".into(),
+                Value::Deferred(DeferredValue::Secret(Box::new(concrete_string(token)))),
+            ),
+            ("name".into(), concrete_string(name)),
+        ])))
+    };
+    let snapshot = crate::value::redact_secrets_in_value(&settings("original", "legacy")).unwrap();
+    let state = StateCreateOnlyValues::from_state_attributes(
+        &schema,
+        &HashMap::from([("settings".into(), snapshot)]),
+    );
+    let context = crate::differ::exact_comparison_context_for_tests();
+    for (token, name, matches) in [
+        ("original", "legacy", true),
+        ("changed", "legacy", false),
+        ("original", "changed", false),
+    ] {
+        let desired = Resource::new("test.SecretIdentity", "desired")
+            .with_attribute("settings", settings(token, name));
+        let values =
+            DesiredCreateOnlyValues::without_binding_resolution(&desired, schema.as_schema());
+        assert_eq!(
+            values.all_match(&state, schema.as_schema(), &context),
+            matches
+        );
+        assert_eq!(
+            values.resolved_subset_match(&state, schema.as_schema(), &context),
+            (1, matches)
+        );
+        assert_eq!(
+            values.match_counts(&state, schema.as_schema(), &context),
+            if matches { (1, 0) } else { (0, 1) }
+        );
+    }
 }
 
 #[test]
@@ -4800,7 +4906,14 @@ fn empty_struct_create_only_values_are_absent_inline_deferred_and_in_state() {
         (binding == "source")
             .then(|| AnonymousIdBindingStateInfo {
                 name: "source".to_string(),
-                attribute_values: HashMap::from([("config".to_string(), empty.clone())]),
+                attribute_values: {
+                    let attributes: HashMap<String, Value> =
+                        HashMap::from([("config".to_string(), empty.clone())]);
+                    attributes
+                        .into_iter()
+                        .map(|(key, value)| (key, value.to_snapshot()))
+                        .collect()
+                },
             })
             .into_iter()
             .collect()
@@ -4816,7 +4929,8 @@ fn empty_struct_create_only_values_are_absent_inline_deferred_and_in_state() {
             schema.as_schema(),
             &find_state,
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        );
+        )
+        .expect("historical identity fixture remains available");
         assert!(
             !desired.has_configured_values(),
             "an empty struct must be identical to an unconfigured identity input"
@@ -5740,7 +5854,9 @@ fn test_canonical_create_only_string_matches_state_round_trip() {
             .expect("persisted state value should decode");
         assert_eq!(
             canonical_create_only_value_string_for_test(&value),
-            canonical_create_only_value_string_for_test(&persisted),
+            canonical_create_only_value_string_for_test(&crate::test_support::available_value(
+                &persisted
+            )),
             "round-trip canonical mismatch for {value:?}",
         );
     }
@@ -7651,26 +7767,34 @@ fn test_detect_rename_matches_mixed_canonical_and_identifier_enums_in_list_and_m
     );
     resource.set_attr(
         "domain_by_name".to_string(),
-        Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
-            "canonical".to_string() => canonical,
-            "identifier".to_string() => identifier,
-        })),
+        crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(
+            indexmap::indexmap! {
+                "canonical".to_string() => canonical,
+                "identifier".to_string() => identifier,
+            },
+        )),
     );
 
     let persisted_attributes = HashMap::from([
         (
             "domains".to_string(),
-            Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("vpc".into())),
-                Value::Concrete(ConcreteValue::String("standard".into())),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(vec![
+                crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                    "vpc".into(),
+                )),
+                crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                    "standard".into(),
+                )),
             ])),
         ),
         (
             "domain_by_name".to_string(),
-            Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
-                "canonical".to_string() => Value::Concrete(ConcreteValue::String("vpc".into())),
-                "identifier".to_string() => Value::Concrete(ConcreteValue::String("standard".into())),
-            })),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(
+                indexmap::indexmap! {
+                    "canonical".to_string() => Value::Concrete(ConcreteValue::String("vpc".into())),
+                    "identifier".to_string() => Value::Concrete(ConcreteValue::String("standard".into())),
+                },
+            )),
         ),
     ]);
     let state_entries = vec![anonymous_state_entry(
@@ -9982,5 +10106,100 @@ fn legacy_loop_detector_skips_ambiguous_owner_without_one_exact_input_match() {
             moves.is_empty(),
             "zero or multiple exact stable-input owners must not be guessed: {persisted_value:?}"
         );
+    }
+}
+
+#[test]
+fn historical_identity_inspection_preserves_hashes_and_propagates_selection_errors() {
+    let hash = redacted_identity_value();
+    let snapshot = crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::Map(
+        IndexMap::from([("token".into(), hash)]),
+    ));
+    let path = IdentityPath::attribute("name");
+    let selected = StateIdentityValue::at_path(Some(&snapshot), &path);
+    let StateIdentityValue::Comparable(value) = selected else {
+        panic!("a historical container must retain its hash evidence");
+    };
+    assert_eq!(
+        serde_json::to_value(&value.value).unwrap(),
+        serde_json::to_value(&snapshot).unwrap()
+    );
+    let registry = scalar_identity_registry();
+    let desired = Resource::pending_with_provider("mock", "test.resource", None).with_attribute(
+        "name",
+        Value::root_resource_ref("history", "settings", vec![]),
+    );
+    let schema = registry.get_for(&desired).unwrap();
+    let result = DesiredIdentityValues::from_resource(
+        &desired,
+        schema.schema(),
+        &|_| {
+            vec![AnonymousIdBindingStateInfo {
+                name: "history".into(),
+                attribute_values: HashMap::from([("settings".into(), snapshot.clone())]),
+            }]
+        },
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
+    let error = match result {
+        Ok(_) => panic!("a selected historical secret needs a typed unavailable error"),
+        Err(error) => error,
+    };
+    assert_eq!(error.path(), "history.settings.token");
+}
+
+#[test]
+fn identity_projection_evaluates_env_from_the_caller_snapshot() {
+    let schema = PatternResourceSchema::new("test.resource")
+        .attribute(
+            PatternAttributeSchema::required("name", PatternAttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .validate()
+        .expect("identity schema");
+    let mut desired = Resource::with_provider("mock", "test.resource", "desired", None);
+    desired.set_attr(
+        "name",
+        Value::Deferred(DeferredValue::FunctionCall {
+            name: crate::builtins::BuiltinFunction::env,
+            args: vec![Value::root_resource_ref("source", "variable", Vec::new()).into()],
+            source_line: 1.into(),
+        }),
+    );
+    let find_state = |binding: &str| {
+        assert_eq!(binding, "source");
+        vec![AnonymousIdBindingStateInfo {
+            name: binding.to_string(),
+            attribute_values: HashMap::from([(
+                "variable".to_string(),
+                concrete_string("IDENTITY_VARIABLE").to_snapshot(),
+            )]),
+        }]
+    };
+    for expected in ["first", "second"] {
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::new([(
+            "IDENTITY_VARIABLE".to_string(),
+            expected.into(),
+        )]));
+        let create_only = DesiredCreateOnlyValues::from_resource(
+            &desired,
+            schema.as_schema(),
+            &find_state,
+            &context,
+        )
+        .expect("environment-backed create-only material is available");
+        let Some(DesiredCreateOnlyValue::Resolved(actual)) = create_only.values.get("name") else {
+            panic!("the state-backed env call must resolve for create-only comparison");
+        };
+        assert_eq!(actual.value, concrete_string(expected));
+        let identity =
+            DesiredIdentityValues::from_resource(&desired, &schema, &find_state, &context)
+                .expect("environment-backed identity material is available");
+        let Some(DesiredIdentityValue::Resolved(actual)) = identity.values.values().next() else {
+            panic!("the state-backed env call must resolve for declared-identity comparison");
+        };
+        assert_eq!(actual.value, concrete_string(expected));
     }
 }

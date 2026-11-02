@@ -16,7 +16,7 @@ use carina_core::provider::{
     ProviderResult, ReadOutcome, ReadRequest, Sent, UpdateOutcome, UpdateRequest,
 };
 use carina_core::resource::{
-    ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value,
+    ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
 };
 use carina_core::schema::TypeIdentity;
 use carina_core::value::canonicalize_resources_with_schemas;
@@ -117,6 +117,69 @@ fn static_validation_walks_multifile_modules_using_environment_snapshot() {
 
 fn root_resource_ref(binding: &str, attribute: &str) -> Value {
     Value::resource_ref(binding, attribute, Vec::new()).resolve_root_for_test()
+}
+
+#[test]
+fn state_block_import_propagates_unavailable_historical_secret() {
+    let mut source: Resource = Resource::with_provider("mock", "test.resource", "source", None);
+    source.binding = Some(absolute_binding("source"));
+    let target: Resource = Resource::with_provider("mock", "test.resource", "target", None);
+    let historical =
+        carina_core::value::redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("secret-id".into()))),
+        )))
+        .expect("capture historical secret");
+    let state = carina_core::resource::SnapshotState::existing(
+        source.id.clone(),
+        HashMap::from([("password".into(), historical)]),
+    )
+    .with_identifier("source-id");
+    let current = carina_core::resource::into_plan_input_current_map(
+        HashMap::from([(source.id.clone(), Current::from_snapshot(state))]),
+        &SchemaRegistry::new(),
+        std::slice::from_ref(&source),
+    );
+    let bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+        carina_core::binding_index::LivePreApplyInputs {
+            managed: &[source],
+            compositions: &[],
+            managed_current: &current,
+            data_source_values: &DataSourceValues::empty(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        },
+    );
+    let blocks = vec![StateBlock::Import {
+        to: StateBlockAddress::new("mock", "test.resource", "target"),
+        to_span: None,
+        id: root_resource_ref("source", "password"),
+    }];
+    let mut plan = Plan::new();
+    let removed = ResolvedRemovedClaims::resolve(&blocks, None);
+    let result = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            add_state_block_effects(
+                &mut plan,
+                &blocks,
+                &None,
+                &[],
+                &[target],
+                StateBlockEvaluationContext {
+                    removed: &removed,
+                    bindings: &bindings,
+                    unresolved_upstream_bindings: &HashSet::new(),
+                    session,
+                },
+            )
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(carina_core::resolver::ResolutionError::UnavailableSecret(error))
+            if error.path() == "source.password",
+    ));
+    assert!(plan.effects().is_empty());
 }
 
 fn comparison_provider_for_resources(
@@ -2209,7 +2272,7 @@ fn test_data_source_values(
     DataSourceValues::from_data_sources(data_sources, |data_source| {
         states.get(&data_source.id).map_or_else(
             || DataSourceValue::deferred_to_apply(Vec::new()),
-            |state| DataSourceValue::read(state.clone()),
+            |state| DataSourceValue::read(state.clone().to_snapshot()),
         )
     })
 }
@@ -2327,7 +2390,8 @@ fn build_override_aware_pair_for_test(
     unresolved: CanonicalResourcePair<carina_core::parser::ExpandedParsedExportParam>,
     state_file: Option<&StateFile>,
     inputs: LivePreApplyInputs<'_>,
-) -> Result<(OverrideAwareResources, OverrideAwareResources), String> {
+) -> Result<(OverrideAwareResources, OverrideAwareResources), carina_core::resolver::ResolutionError>
+{
     let state = ProjectedStateRead::for_test_unmoved(state_file);
     carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::LoadedProviderContext::empty_for_test(),
@@ -3139,6 +3203,9 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
             assert_eq!(error.to_string(), "plan normalization failed");
         }
         PlanPreparationError::Plan(errors) => panic!("unexpected plan errors: {errors:#?}"),
+        PlanPreparationError::ModuleConstraint(error) => {
+            panic!("unexpected constraint resolution error: {error:?}")
+        }
     }
     assert!(
         !state_called.load(Ordering::SeqCst),
@@ -3235,7 +3302,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
     .unwrap();
     let resource_origins = resources.paired_unresolved_resources();
     let mut current_states = HashMap::new();
-    let orphan_state = State::existing(
+    let orphan_state = State::<carina_core::resource::NoPlaceholder>::existing(
         old_id.clone(),
         HashMap::from([
             (
@@ -3272,7 +3339,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
     let data_source_id = ResourceId::with_provider_identity("mock", "test.lookup", "source", None);
     let data_source_states = HashMap::from([(
         data_source_id.clone(),
-        State::existing(
+        State::<carina_core::resource::NoPlaceholder>::existing(
             data_source_id.clone(),
             HashMap::from([(
                 "status".to_string(),
@@ -3424,8 +3491,10 @@ async fn combined_hydration_keeps_managed_state_out_of_same_id_data_source() {
         .build_orphans(&HashSet::new())
         .into_plan_orphans();
     let orphan = orphans.remove(&id).expect("orphan row");
-    let refreshed = State::existing(id.clone(), HashMap::new()).with_identifier("resource-123");
-    orphans.insert(orphan.with_refreshed_state(refreshed));
+    let refreshed =
+        State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+            .with_identifier("resource-123");
+    orphans.insert(orphan.with_refreshed_state(refreshed.to_snapshot()));
     let state = match orphans[&id].current() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
@@ -3443,7 +3512,13 @@ async fn combined_hydration_keeps_managed_state_out_of_same_id_data_source() {
     let data_source = DataSource::with_provider("mock", "test.resource", "orphan", None);
     let mut data_source_values =
         DataSourceValues::from_data_sources(std::slice::from_ref(&data_source), |_| {
-            DataSourceValue::read(State::existing(id.clone(), HashMap::new()))
+            DataSourceValue::read(
+                (State::<carina_core::resource::NoPlaceholder>::existing(
+                    id.clone(),
+                    HashMap::new(),
+                ))
+                .to_snapshot(),
+            )
         });
     let projected_state = ProjectedStateRead::for_test_unmoved(Some(&state_file));
     hydrate_prior_data_source_values(
@@ -4331,7 +4406,12 @@ impl Provider for ReadWithRetryProvider {
     ) -> BoxFuture<'_, ProviderResult<State>> {
         self.data_source_read_calls.fetch_add(1, Ordering::SeqCst);
         let id = resource.id.clone();
-        Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+        Box::pin(async move {
+            Ok(State::<carina_core::resource::NoPlaceholder>::existing(
+                id,
+                HashMap::new(),
+            ))
+        })
     }
 
     fn create(
@@ -4743,7 +4823,8 @@ fn test_normalize_state_prevents_false_enum_diff() {
         "instance_tenancy".to_string(),
         Value::Concrete(ConcreteValue::String("default".into())),
     );
-    let state = State::existing(id.clone(), state_attrs).with_identifier("test-vpc");
+    let state = State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), state_attrs)
+        .with_identifier("test-vpc");
     let mut current_states = HashMap::new();
     current_states.insert(id.clone(), Current::from_state(state));
 
@@ -5081,7 +5162,8 @@ fn test_merge_default_tags_prevents_false_diff() {
         "tags".to_string(),
         Value::Concrete(ConcreteValue::Map(tags)),
     );
-    let state = State::existing(id.clone(), state_attrs).with_identifier("test-bucket");
+    let state = State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), state_attrs)
+        .with_identifier("test-bucket");
     let mut current_states = HashMap::new();
     current_states.insert(id.clone(), state);
 
@@ -5576,6 +5658,7 @@ fn removed_block_suppresses_delete_when_state_resource_is_routed_to_named_instan
                     session,
                 },
             )
+            .expect("state block identifiers resolve")
         },
     );
 
@@ -5664,6 +5747,7 @@ fn removed_block_does_not_suppress_deposed_generation_delete() {
                     session,
                 },
             )
+            .expect("state block identifiers resolve")
         },
     );
 
@@ -5789,6 +5873,7 @@ fn removed_suppresses_in_flight_orphan_error_and_keeps_deposed() {
                     session,
                 },
             )
+            .expect("state block identifiers resolve")
         },
     );
 
@@ -5903,7 +5988,7 @@ fn deposed_delete_waits_for_update_that_dropped_prior_reference() {
         .upsert_resource(producer_row)
         .expect("test state setup must be valid");
 
-    let from = State::existing(
+    let from = State::<carina_core::resource::NoPlaceholder>::existing(
         consumer_id.clone(),
         HashMap::from([(
             "version".to_string(),
@@ -5920,7 +6005,7 @@ fn deposed_delete_waits_for_update_that_dropped_prior_reference() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         identifier: crate::fixture_applied_identifier("consumer-id"),
-        from: Box::new(from),
+        from: Box::new(from.to_snapshot()),
         to: resolved(to),
         changed_attributes: vec!["version".to_string()],
     });
@@ -6066,6 +6151,7 @@ fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
                     session,
                 },
             )
+            .expect("state block identifiers resolve")
         },
     );
 
@@ -6163,6 +6249,7 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
                     session,
                 },
             )
+            .expect("state block identifiers resolve")
         },
     );
 
@@ -6188,6 +6275,7 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
                     session,
                 },
             )
+            .expect("state block identifiers resolve")
         },
     );
     assert!(matches!(removed_plan.effects(), [Effect::Remove { .. }]));
@@ -6276,6 +6364,7 @@ fn import_does_not_suppress_unknown_outcome_from_another_provider_instance() {
                     session,
                 },
             )
+            .expect("state block identifiers resolve")
         },
     );
 
@@ -9465,7 +9554,7 @@ fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
     // Managed current state after phase 1: sso has been refreshed and its
     // state carries the concrete identity_store_id.
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
-    let sso_state = State::existing(
+    let sso_state = State::<carina_core::resource::NoPlaceholder>::existing(
         sso.id.clone(),
         HashMap::from([(
             "identity_store_id".to_string(),
@@ -9771,7 +9860,8 @@ fn resolve_data_source_refs_for_refresh_does_not_treat_missing_create_only_readb
     let mut current_states = HashMap::new();
     current_states.insert(
         target.id.clone(),
-        State::existing(target.id.clone(), HashMap::new()).with_identifier("old-id"),
+        State::<carina_core::resource::NoPlaceholder>::existing(target.id.clone(), HashMap::new())
+            .with_identifier("old-id"),
     );
     let mut registry = carina_core::schema::SchemaRegistry::new();
     registry.insert(
@@ -9838,7 +9928,7 @@ fn resolve_data_source_refs_for_refresh_defers_when_any_input_references_new_res
     let mut current_states = HashMap::new();
     current_states.insert(
         existing.id.clone(),
-        State::existing(
+        State::<carina_core::resource::NoPlaceholder>::existing(
             existing.id.clone(),
             HashMap::from([(
                 "name".to_string(),
@@ -9954,7 +10044,7 @@ fn resolve_data_source_refs_for_refresh_reads_existing_resource_even_when_replac
     let mut current_states = HashMap::new();
     current_states.insert(
         target.id.clone(),
-        State::existing(
+        State::<carina_core::resource::NoPlaceholder>::existing(
             target.id.clone(),
             HashMap::from([
                 (
@@ -10477,7 +10567,9 @@ fn prefix_reconciliation_state_file(
     prefixes: &[&str],
 ) -> StateFile {
     let id = ResourceId::with_provider_identity("mock", "test.resource", "example", None);
-    let mut provider_state = State::existing(id, attributes).with_identifier("provider-id");
+    let mut provider_state =
+        State::<carina_core::resource::NoPlaceholder>::existing(id, attributes)
+            .with_identifier("provider-id");
     provider_state.partial_read = partial_read;
     let mut row = carina_state::ResourceState::from_provider_state(
         "test.resource",
@@ -10568,8 +10660,10 @@ fn refreshed_prefix_reconciliation_keeps_stored_name_when_current_omits_it() {
         &["name"],
     );
     let id = resource.id.clone();
-    let current =
-        Current::from_state(State::existing(id, HashMap::new()).with_identifier("provider-id"));
+    let current = Current::from_state(
+        State::<carina_core::resource::NoPlaceholder>::existing(id, HashMap::new())
+            .with_identifier("provider-id"),
+    );
 
     reconcile_prefixes_from_refreshed_current(&mut resource, &state_file, current);
 
@@ -10594,7 +10688,8 @@ fn refreshed_prefix_reconciliation_prefers_current_marker_then_current_value() {
     );
     let id = ResourceId::with_provider_identity("mock", "test.resource", "example", None);
     let mut current_state =
-        State::existing(id.clone(), HashMap::new()).with_identifier("provider-id");
+        State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+            .with_identifier("provider-id");
     current_state.partial_read = Some(marker);
     let mut marked_resource = prefix_reconciliation_resource(&["name"]);
 
@@ -10613,7 +10708,7 @@ fn refreshed_prefix_reconciliation_prefers_current_marker_then_current_value() {
 
     let mut valued_resource = prefix_reconciliation_resource(&["name"]);
     let current_with_value = Current::from_state(
-        State::existing(
+        State::<carina_core::resource::NoPlaceholder>::existing(
             id,
             HashMap::from([(
                 "name".to_string(),
@@ -11596,7 +11691,9 @@ mod read_with_retry_identifier_tests {
             resource: &carina_core::provider::ProviderReadyDataSource,
         ) -> BoxFuture<'_, ProviderResult<State>> {
             let id = resource.id.clone();
-            Box::pin(async move { Ok(State::not_found(id)) })
+            Box::pin(
+                async move { Ok(State::<carina_core::resource::NoPlaceholder>::not_found(id)) },
+            )
         }
 
         fn create(
@@ -11977,7 +12074,8 @@ mod expand_same_config_deferred_for_tests {
         let mut states = HashMap::new();
         states.insert(
             cert.id.clone(),
-            State::existing(cert.id.clone(), attrs).with_identifier("cert-id"),
+            State::<carina_core::resource::NoPlaceholder>::existing(cert.id.clone(), attrs)
+                .with_identifier("cert-id"),
         );
         states
     }
@@ -12160,7 +12258,8 @@ mod expand_same_config_deferred_for_tests {
         assert_eq!(empty.select(&resources, &no_orphans).count(), 0);
 
         let orphan_state =
-            State::existing(r_a.id.clone(), HashMap::new()).with_identifier("resource-a");
+            State::<carina_core::resource::NoPlaceholder>::existing(r_a.id.clone(), HashMap::new())
+                .with_identifier("resource-a");
         let present = match Current::from_state(orphan_state) {
             Current::Absent(state) => panic!("test orphan is absent: {state:?}"),
             Current::Present(present) => present,
@@ -14117,10 +14216,14 @@ mod resolved_value_constraint_gate {
         fn read_data_source(
             &self,
             resource: &carina_core::provider::ProviderReadyDataSource,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
+        ) -> BoxFuture<'_, ProviderResult<carina_core::resource::State>> {
             self.reads.fetch_add(1, Ordering::SeqCst);
             let id = resource.id.clone();
-            Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+            Box::pin(async move {
+                Ok(carina_core::resource::State::<
+                    carina_core::resource::NoPlaceholder,
+                >::existing(id, HashMap::new()))
+            })
         }
 
         fn create(
@@ -14205,6 +14308,9 @@ mod resolved_value_constraint_gate {
     fn into_plan_errors(error: PlanPreparationError) -> Vec<carina_core::plan::PlanError> {
         match error {
             PlanPreparationError::Plan(errors) => errors.into_vec(),
+            PlanPreparationError::ModuleConstraint(error) => {
+                panic!("unexpected constraint resolution error: {error:?}")
+            }
             PlanPreparationError::Provider(error) => {
                 panic!("test normalizer unexpectedly failed: {error}")
             }
@@ -15247,7 +15353,11 @@ async fn round2_binding_stability_reuses_normalized_inputs() {
                     "name",
                     Value::Concrete(ConcreteValue::String("normalized".into())),
                 );
-            let state = State::existing(resource.id.clone(), resource.resolved_attributes())
+            let state =
+                carina_core::resource::State::<carina_core::resource::NoPlaceholder>::existing(
+                    resource.id.clone(),
+                    resource.resolved_attributes(),
+                )
                 .with_identifier("id");
             let current = HashMap::from([(resource.id.clone(), Current::from_state(state))]);
             let mut provider =

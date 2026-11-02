@@ -464,7 +464,7 @@ impl OverrideAwareResources {
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
         mode: OverrideAwareBuildMode<'_>,
         session: &super::ValidationProviderCatalog,
-    ) -> Result<(Self, Self), String> {
+    ) -> Result<(Self, Self), carina_core::resolver::ResolutionError> {
         let (evaluated, unresolved) = resources.resources_for_build()?;
         let evaluated =
             Self::build_inner(evaluated, state, &inputs, managed_stability, mode, session)?;
@@ -479,7 +479,7 @@ impl OverrideAwareResources {
         inputs: LivePreApplyInputs<'_>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
         mode: OverrideAwareBuildMode<'_>,
-    ) -> Result<(Self, Self), String> {
+    ) -> Result<(Self, Self), carina_core::resolver::ResolutionError> {
         let state = ProjectedStateRead::for_test_unmoved(None);
         carina_core::validation::deferred_types::with_session_for_test(
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
@@ -503,7 +503,7 @@ impl OverrideAwareResources {
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
         mode: OverrideAwareBuildMode<'_>,
         session: &super::ValidationProviderCatalog,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, carina_core::resolver::ResolutionError> {
         let mut resources = unresolved.clone();
         let mut bindings = ResolvedBindings::pre_apply_live_with_stability(
             LivePreApplyInputs {
@@ -780,7 +780,7 @@ fn resolve_resources(
     bindings: &ResolvedBindings,
     mode: &OverrideAwareBuildMode<'_>,
     session: &super::ValidationProviderCatalog,
-) -> Result<(), String> {
+) -> Result<(), carina_core::resolver::ResolutionError> {
     match mode {
         OverrideAwareBuildMode::Apply => {
             carina_core::resolver::resolve_refs_with_state_and_remote(resources, bindings, session)

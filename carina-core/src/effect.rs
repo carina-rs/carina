@@ -8,6 +8,7 @@
 /// Centralizes the apply/destroy scheduling graph so the parallel scheduler,
 /// the phased scheduler, and the destroy CLI driver all see the same edges.
 pub mod deps;
+pub(crate) mod value_stage;
 
 #[cfg(test)]
 use crate::resource::Resource;
@@ -28,10 +29,10 @@ use crate::provider::AppliedIdentifier;
 #[cfg(test)]
 use crate::resource::DataSource;
 use crate::resource::{
-    AbsoluteBindingAddress, DeposedKey, Directives, LoopElementOrigin, ModuleSource,
-    PersistedDestroyDependencies, ResolvedDataSource, ResolvedDependencies, ResolvedResource,
-    ResolvedResourceId, ResourceId, ResourceIdentity, SavedModuleSource, SchemaUnresolvedResource,
-    State, Value,
+    AbsoluteBindingAddress, DeposedKey, Directives, LoopElementOrigin, ModuleSource, NoPlaceholder,
+    PersistedDestroyDependencies, PlanValueKind, ResolvedDataSource, ResolvedDependencies,
+    ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity, SavedModuleSource,
+    SchemaUnresolvedResource, SnapshotLeaf, SnapshotValue, State, Value,
 };
 use crate::schema::FieldName;
 use crate::wait::ManagedWaitTarget;
@@ -238,7 +239,7 @@ pub struct DeferredReplaceDelete {
 pub struct PriorInstanceDestroyDependencies(PersistedDestroyDependencies);
 
 impl PriorInstanceDestroyDependencies {
-    pub fn from_refreshed_state(state: &State) -> Self {
+    pub fn from_refreshed_state<P: crate::resource::StateValueLeaf>(state: &State<P>) -> Self {
         Self(state.dependency_bindings.clone())
     }
     pub fn into_persisted(self) -> PersistedDestroyDependencies {
@@ -332,15 +333,15 @@ impl From<NonEmptyDeletes> for Vec<DeferredReplaceDelete> {
 /// The scheduler id is projected from `template` and exists only on the wire,
 /// where deserialization validates it before discarding the duplicate value.
 #[derive(Debug, Clone, PartialEq)]
-pub struct DeferredCreatePayload<S = ModuleSource> {
+pub struct DeferredCreatePayload<S = ModuleSource, V: PlanValueKind = NoPlaceholder> {
     pub dependency_template: crate::resource::DeferredDependencyTemplate,
     /// The for-expression body, replayed against the upstream state.
-    pub template: Box<DeferredForExpression<S>>,
+    pub template: Box<DeferredForExpression<S, V, V::Template>>,
 }
 
-impl<S> DeferredCreatePayload<S> {
+impl<S, V: PlanValueKind> DeferredCreatePayload<S, V> {
     pub fn new(
-        template: Box<DeferredForExpression<S>>,
+        template: Box<DeferredForExpression<S, V, V::Template>>,
         dependency_template: crate::resource::DeferredDependencyTemplate,
     ) -> Self {
         Self {
@@ -354,7 +355,7 @@ impl<S> DeferredCreatePayload<S> {
     }
 }
 
-impl<S: Serialize + Clone> Serialize for DeferredCreatePayload<S> {
+impl<S: Serialize + Clone, V: PlanValueKind> Serialize for DeferredCreatePayload<S, V> {
     fn serialize<Ser>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error>
     where
         Ser: serde::Serializer,
@@ -367,16 +368,18 @@ impl<S: Serialize + Clone> Serialize for DeferredCreatePayload<S> {
     }
 }
 
-impl<'de, S: serde::de::DeserializeOwned> Deserialize<'de> for DeferredCreatePayload<S> {
+impl<'de, S: serde::de::DeserializeOwned, V: PlanValueKind> Deserialize<'de>
+    for DeferredCreatePayload<S, V>
+{
     fn deserialize<De>(deserializer: De) -> Result<Self, De::Error>
     where
         De: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        #[serde(bound(deserialize = "S: serde::de::DeserializeOwned"))]
-        struct Wire<S> {
+        #[serde(bound(deserialize = "S: serde::de::DeserializeOwned, V: PlanValueKind"))]
+        struct Wire<S, V: PlanValueKind> {
             id: ResolvedResourceId,
-            template: Box<DeferredForExpression<S>>,
+            template: Box<DeferredForExpression<S, V, V::Template>>,
             dependency_template: crate::resource::DeferredDependencyTemplate,
         }
 
@@ -385,7 +388,7 @@ impl<'de, S: serde::de::DeserializeOwned> Deserialize<'de> for DeferredCreatePay
             template,
             dependency_template,
         } = Wire::deserialize(deserializer)?;
-        validate_deferred_effect_id::<De::Error, S>(&id, &template)?;
+        validate_deferred_effect_id::<De::Error, S, V>(&id, &template)?;
         Ok(Self {
             template,
             dependency_template,
@@ -395,21 +398,21 @@ impl<'de, S: serde::de::DeserializeOwned> Deserialize<'de> for DeferredCreatePay
 
 /// Payload for [`Effect::DeferredReplace`].
 #[derive(Debug, Clone, PartialEq)]
-pub struct DeferredReplacePayload<S = ModuleSource> {
+pub struct DeferredReplacePayload<S = ModuleSource, V: PlanValueKind = NoPlaceholder> {
     pub dependency_template: crate::resource::DeferredDependencyTemplate,
     /// Pre-apply iterations being destroyed.
     pub deletes: NonEmptyDeletes,
     /// The for-expression body, replayed against the upstream state.
-    pub template: Box<DeferredForExpression<S>>,
+    pub template: Box<DeferredForExpression<S, V, V::Template>>,
 }
 
-impl<S> DeferredReplacePayload<S> {
+impl<S, V: PlanValueKind> DeferredReplacePayload<S, V> {
     pub fn id(&self) -> &ResolvedResourceId {
         self.template.deferred_effect_id()
     }
 }
 
-impl<S: Serialize + Clone> Serialize for DeferredReplacePayload<S> {
+impl<S: Serialize + Clone, V: PlanValueKind> Serialize for DeferredReplacePayload<S, V> {
     fn serialize<Ser>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error>
     where
         Ser: serde::Serializer,
@@ -423,17 +426,19 @@ impl<S: Serialize + Clone> Serialize for DeferredReplacePayload<S> {
     }
 }
 
-impl<'de, S: serde::de::DeserializeOwned> Deserialize<'de> for DeferredReplacePayload<S> {
+impl<'de, S: serde::de::DeserializeOwned, V: PlanValueKind> Deserialize<'de>
+    for DeferredReplacePayload<S, V>
+{
     fn deserialize<De>(deserializer: De) -> Result<Self, De::Error>
     where
         De: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        #[serde(bound(deserialize = "S: serde::de::DeserializeOwned"))]
-        struct Wire<S> {
+        #[serde(bound(deserialize = "S: serde::de::DeserializeOwned, V: PlanValueKind"))]
+        struct Wire<S, V: PlanValueKind> {
             deletes: NonEmptyDeletes,
             id: ResolvedResourceId,
-            template: Box<DeferredForExpression<S>>,
+            template: Box<DeferredForExpression<S, V, V::Template>>,
             dependency_template: crate::resource::DeferredDependencyTemplate,
         }
 
@@ -443,7 +448,7 @@ impl<'de, S: serde::de::DeserializeOwned> Deserialize<'de> for DeferredReplacePa
             template,
             dependency_template,
         } = Wire::deserialize(deserializer)?;
-        validate_deferred_effect_id::<De::Error, S>(&id, &template)?;
+        validate_deferred_effect_id::<De::Error, S, V>(&id, &template)?;
         Ok(Self {
             deletes,
             template,
@@ -452,9 +457,9 @@ impl<'de, S: serde::de::DeserializeOwned> Deserialize<'de> for DeferredReplacePa
     }
 }
 
-fn validate_deferred_effect_id<E: serde::de::Error, S>(
+fn validate_deferred_effect_id<E: serde::de::Error, S, V: PlanValueKind>(
     id: &ResolvedResourceId,
-    template: &DeferredForExpression<S>,
+    template: &DeferredForExpression<S, V, V::Template>,
 ) -> Result<(), E> {
     let expected = template.deferred_effect_id();
     if id.provider() != expected.provider() {
@@ -489,14 +494,14 @@ fn validate_deferred_effect_id<E: serde::de::Error, S>(
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReleasedListKey {
     key: String,
-    retained_value: Value,
+    retained_value: SnapshotValue,
 }
 
 impl ReleasedListKey {
-    pub fn new(key: impl Into<String>, retained_value: Value) -> Self {
+    pub fn new(key: impl Into<String>, retained_value: impl Into<SnapshotValue>) -> Self {
         Self {
             key: key.into(),
-            retained_value,
+            retained_value: retained_value.into(),
         }
     }
 
@@ -504,7 +509,7 @@ impl ReleasedListKey {
         &self.key
     }
 
-    pub fn retained_value(&self) -> &Value {
+    pub fn retained_value(&self) -> &SnapshotValue {
         &self.retained_value
     }
 }
@@ -860,12 +865,12 @@ impl AddressedMoves {
 }
 
 /// The complete move-effect scope of a plan. Only the plan can mint it.
-pub struct SavedMoveEffects<'a, S> {
-    effects: &'a [Effect<S>],
+pub struct SavedMoveEffects<'a, S, V: PlanValueKind = NoPlaceholder> {
+    effects: &'a [Effect<S, V>],
 }
 
-impl<'a, S> SavedMoveEffects<'a, S> {
-    pub(crate) fn from_effects(effects: &'a [Effect<S>]) -> Self {
+impl<'a, S, V: PlanValueKind> SavedMoveEffects<'a, S, V> {
+    pub(crate) fn from_effects(effects: &'a [Effect<S, V>]) -> Self {
         Self { effects }
     }
 }
@@ -1062,30 +1067,30 @@ impl Deref for ResolvedMovePairs {
 /// Effect representing an operation on a resource
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(
-    serialize = "S: Serialize + Clone",
-    deserialize = "S: serde::de::DeserializeOwned"
+    serialize = "S: Serialize + Clone, V: PlanValueKind",
+    deserialize = "S: serde::de::DeserializeOwned, V: PlanValueKind"
 ))]
-pub enum EffectWithSource<S> {
+pub enum EffectWithSource<S, V: PlanValueKind = NoPlaceholder> {
     /// Read the current state of a resource (data source)
-    Read { resource: ResolvedDataSource<S> },
+    Read { resource: ResolvedDataSource<S, V> },
 
     /// Create a new resource
-    Create(ResolvedResource<S>),
+    Create(ResolvedResource<S, V>),
 
     /// Resume a create continuation loaded from locked state. The token is
     /// deliberately absent from the serializable plan and is joined from
     /// `Current::CreateInFlight` immediately before provider dispatch.
     ResumeCreate {
-        resource: ResolvedResource<S>,
+        resource: ResolvedResource<S, V>,
         started_at: crate::provider::Timestamp,
     },
 
     /// Update an existing resource
     Update {
-        from: Box<State>,
+        from: Box<crate::resource::SnapshotState>,
         /// Non-empty provider identifier validated while constructing the plan.
         identifier: AppliedIdentifier,
-        to: ResolvedResource<S>,
+        to: ResolvedResource<S, V>,
         /// Attribute names that changed (including removed attributes)
         changed_attributes: Vec<String>,
     },
@@ -1138,7 +1143,7 @@ pub enum EffectWithSource<S> {
         /// The executor calls `assert_fully_resolved` before passing the
         /// identifier to the provider, so by apply time this is always
         /// a `Value::Concrete(ConcreteValue::String)`.
-        identifier: crate::resource::Value,
+        identifier: Value<V>,
     },
 
     /// Remove a resource from state without destroying it
@@ -1215,27 +1220,24 @@ pub enum EffectWithSource<S> {
     ///
     /// Emitted by the planner when the iterable's plan-time value is
     /// unresolved. State-only: does not call the provider.
-    DeferredCreate(DeferredCreatePayload<S>),
+    DeferredCreate(DeferredCreatePayload<S, V>),
 
     /// A deferred-for replacement whose delete side is known at plan time
     /// and whose create side is materialized after the upstream binding is
     /// available at apply time.
-    DeferredReplace(Box<DeferredReplacePayload<S>>),
+    DeferredReplace(Box<DeferredReplacePayload<S, V>>),
 }
 
-pub type Effect<S = ModuleSource> = EffectWithSource<S>;
-pub type SavedEffect = EffectWithSource<SavedModuleSource>;
+pub type Effect<S = ModuleSource, V = NoPlaceholder> = EffectWithSource<S, V>;
+pub type SavedEffect = EffectWithSource<SavedModuleSource, SnapshotLeaf>;
 
 /// Borrowed view of a graph-resolved resource carried by an effect.
-pub type EffectResourceRef<'a, S = ModuleSource> = crate::parser::ResourceRef<
+pub type EffectResourceRef<'a, S = ModuleSource, V = NoPlaceholder> = crate::parser::ResourceRef<
     'a,
     S,
-    crate::resource::NoPlaceholder,
-    crate::resource::LoopSlot,
-    crate::parser::ResolvedDeferredForPhase<
-        crate::resource::NoPlaceholder,
-        crate::resource::LoopSlot,
-    >,
+    V,
+    <V as PlanValueKind>::Template,
+    crate::parser::ResolvedDeferredForPhase<V, <V as PlanValueKind>::Template>,
     AbsoluteBindingAddress,
     (),
 >;
@@ -1245,17 +1247,17 @@ pub type EffectResourceRef<'a, S = ModuleSource> = crate::parser::ResourceRef<
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum UnresolvedSavedEffect {
     Read {
-        resource: ResolvedDataSource<SavedModuleSource>,
+        resource: ResolvedDataSource<SavedModuleSource, SnapshotLeaf>,
     },
-    Create(SchemaUnresolvedResource<SavedModuleSource>),
+    Create(SchemaUnresolvedResource<SavedModuleSource, SnapshotLeaf>),
     ResumeCreate {
-        resource: SchemaUnresolvedResource<SavedModuleSource>,
+        resource: SchemaUnresolvedResource<SavedModuleSource, SnapshotLeaf>,
         started_at: crate::provider::Timestamp,
     },
     Update {
-        from: Box<State>,
+        from: Box<crate::resource::SnapshotState>,
         identifier: AppliedIdentifier,
-        to: SchemaUnresolvedResource<SavedModuleSource>,
+        to: SchemaUnresolvedResource<SavedModuleSource, SnapshotLeaf>,
         changed_attributes: Vec<String>,
     },
     Delete {
@@ -1279,7 +1281,7 @@ pub enum UnresolvedSavedEffect {
     },
     Import {
         id: ResolvedResourceId,
-        identifier: crate::resource::Value,
+        identifier: SnapshotValue,
     },
     Remove {
         id: ResolvedResourceId,
@@ -1308,8 +1310,8 @@ pub enum UnresolvedSavedEffect {
         #[serde(default)]
         explicit_dependencies: ResolvedDependencies,
     },
-    DeferredCreate(DeferredCreatePayload<SavedModuleSource>),
-    DeferredReplace(Box<DeferredReplacePayload<SavedModuleSource>>),
+    DeferredCreate(DeferredCreatePayload<SavedModuleSource, SnapshotLeaf>),
+    DeferredReplace(Box<DeferredReplacePayload<SavedModuleSource, SnapshotLeaf>>),
 }
 
 impl From<SavedEffect> for UnresolvedSavedEffect {
@@ -1532,8 +1534,8 @@ impl UnresolvedSavedEffect {
     }
 }
 
-impl From<Effect> for SavedEffect {
-    fn from(effect: Effect) -> Self {
+impl<V: PlanValueKind> From<Effect<ModuleSource, V>> for Effect<SavedModuleSource, V> {
+    fn from(effect: Effect<ModuleSource, V>) -> Self {
         match effect {
             Effect::Read { resource } => Self::Read {
                 resource: resource.into(),
@@ -1627,8 +1629,8 @@ impl From<Effect> for SavedEffect {
     }
 }
 
-impl<S> AsRef<EffectWithSource<S>> for EffectWithSource<S> {
-    fn as_ref(&self) -> &EffectWithSource<S> {
+impl<S, V: PlanValueKind> AsRef<EffectWithSource<S, V>> for EffectWithSource<S, V> {
+    fn as_ref(&self) -> &EffectWithSource<S, V> {
         self
     }
 }
@@ -1656,24 +1658,24 @@ impl<S> AsRef<EffectWithSource<S>> for EffectWithSource<S> {
 /// can still forward the original effect into `ExecutionEvent::*`
 /// observer calls.
 #[derive(Debug)]
-pub enum BasicEffect<'a, S = ModuleSource> {
+pub enum BasicEffect<'a, S = ModuleSource, V: PlanValueKind = NoPlaceholder> {
     Create {
-        effect: &'a EffectWithSource<S>,
-        resource: &'a ResolvedResource<S>,
+        effect: &'a EffectWithSource<S, V>,
+        resource: &'a ResolvedResource<S, V>,
     },
     ResumeCreate {
-        effect: &'a EffectWithSource<S>,
-        resource: &'a ResolvedResource<S>,
+        effect: &'a EffectWithSource<S, V>,
+        resource: &'a ResolvedResource<S, V>,
     },
     Update {
-        effect: &'a EffectWithSource<S>,
-        from: &'a State,
+        effect: &'a EffectWithSource<S, V>,
+        from: &'a crate::resource::SnapshotState,
         identifier: &'a AppliedIdentifier,
-        to: &'a ResolvedResource<S>,
+        to: &'a ResolvedResource<S, V>,
         changed_attributes: &'a [String],
     },
     Delete {
-        effect: &'a EffectWithSource<S>,
+        effect: &'a EffectWithSource<S, V>,
         id: &'a ResourceId,
         identifier: &'a AppliedIdentifier,
         generation: &'a EffectGeneration,
@@ -1713,12 +1715,12 @@ impl<'a> ReleaseListKeysEffect<'a> {
     }
 }
 
-impl<'a, S> BasicEffect<'a, S> {
+impl<'a, S, V: PlanValueKind> BasicEffect<'a, S, V> {
     /// Returns the source `&Effect` this `BasicEffect` was narrowed
     /// from. Used by `execute_basic_effect` to forward the original
     /// effect to `ExecutionEvent::*` observer calls without storing it
     /// twice.
-    pub fn as_effect(&self) -> &'a EffectWithSource<S> {
+    pub fn as_effect(&self) -> &'a EffectWithSource<S, V> {
         match *self {
             BasicEffect::Create { effect, .. }
             | BasicEffect::ResumeCreate { effect, .. }
@@ -1728,7 +1730,7 @@ impl<'a, S> BasicEffect<'a, S> {
     }
 }
 
-impl<S> EffectWithSource<S> {
+impl<S, V: PlanValueKind> EffectWithSource<S, V> {
     /// Recover the projected destroy dependencies carried by a Delete's old
     /// generation. Other effect variants have no prior instance to depose.
     pub fn prior_instance_destroy_dependencies(&self) -> Option<PriorInstanceDestroyDependencies> {
@@ -1810,7 +1812,7 @@ impl EffectWithSource<ModuleSource> {
     /// the matching create-outcome-unknown planning error.
     pub fn import_replacing_outcome_unknown(
         id: ResolvedResourceId,
-        identifier: crate::resource::Value,
+        identifier: Value,
     ) -> (Self, OutcomeUnknownImportReplacement) {
         let replacement = OutcomeUnknownImportReplacement { id: id.clone() };
         (Self::Import { id, identifier }, replacement)
@@ -1949,7 +1951,9 @@ impl EffectWithSource<ModuleSource> {
                     key_field: FieldName::declared("key"),
                     keys: ReleasedListKeys::try_new(vec![ReleasedListKey::new(
                         "enabled",
-                        Value::Concrete(ConcreteValue::String("true".into())),
+                        crate::resource::ExpandedValue::Concrete(ConcreteValue::String(
+                            "true".into()
+                        )),
                     )])
                     .expect("test release has one key"),
                 },
@@ -2000,7 +2004,7 @@ impl EffectWithSource<ModuleSource> {
     }
 }
 
-impl<S> EffectWithSource<S> {
+impl<S, V: PlanValueKind> EffectWithSource<S, V> {
     /// Plain display glyph for this effect.
     ///
     /// Color and text styling stay in each UI sink; this method owns the
@@ -2049,7 +2053,7 @@ impl<S> EffectWithSource<S> {
     /// // time (carina#3164). The conversion no longer exists.
     /// let _: BasicEffect = (&effect).into();
     /// ```
-    pub fn as_basic(&self) -> Option<BasicEffect<'_, S>> {
+    pub fn as_basic(&self) -> Option<BasicEffect<'_, S, V>> {
         match self {
             Effect::Create(resource) => Some(BasicEffect::Create {
                 effect: self,
@@ -2250,7 +2254,7 @@ impl<S> EffectWithSource<S> {
     /// type match the variant directly; this helper covers the
     /// shared id/attributes/binding/dependency_bindings accessors
     /// through the borrowing `ResourceRef` enum.
-    pub fn as_resource_ref(&self) -> Option<EffectResourceRef<'_, S>> {
+    pub fn as_resource_ref(&self) -> Option<EffectResourceRef<'_, S, V>> {
         match self {
             Effect::Create(resource) => Some(crate::parser::ResourceRef::Resource(resource)),
             Effect::ResumeCreate { resource, .. } => {
@@ -2573,7 +2577,9 @@ impl<S> EffectWithSource<S> {
 ///    [`crate::value::format_value_with_key`].
 ///
 /// Carina#3329.
-pub fn format_import_identifier(identifier: &crate::resource::Value) -> String {
+pub fn format_import_identifier<P: crate::resource::ValueKind>(
+    identifier: &crate::resource::Value<P>,
+) -> String {
     use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
     match identifier {
         Value::Concrete(ConcreteValue::String(s)) => s.expose_plaintext().to_owned(),
@@ -2921,7 +2927,9 @@ mod tests {
                     key_field: FieldName::declared("key"),
                     keys: ReleasedListKeys::try_new(vec![ReleasedListKey::new(
                         "enabled",
-                        Value::Concrete(ConcreteValue::String("true".into())),
+                        crate::resource::ExpandedValue::Concrete(ConcreteValue::String(
+                            "true".into(),
+                        )),
                     )])
                     .expect("fixture has one release key"),
                 },
@@ -2975,14 +2983,15 @@ mod tests {
         use crate::resource::{
             ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart, Value,
         };
-        let inner = Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
-                ApplyTimeUnknown::UpstreamAllExports {
-                    binding: absolute_binding("u"),
-                },
-            ))),
-            InterpolationPart::Literal("-suffix".into()),
-        ]));
+        let inner: crate::resource::ExpandedValue =
+            Value::Deferred(DeferredValue::Interpolation(vec![
+                InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
+                    ApplyTimeUnknown::UpstreamAllExports {
+                        binding: absolute_binding("u"),
+                    },
+                ))),
+                InterpolationPart::Literal("-suffix".into()),
+            ]));
         let outer = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("prefix-".into()),
             InterpolationPart::Expr(inner),
@@ -2995,7 +3004,9 @@ mod tests {
         );
         // Sanity: a bare concrete still renders bare.
         assert_eq!(
-            format_import_identifier(&Value::Concrete(ConcreteValue::String("plain".into()))),
+            format_import_identifier(&crate::resource::ExpandedValue::Concrete(
+                ConcreteValue::String("plain".into())
+            )),
             "plain"
         );
     }
@@ -3158,7 +3169,10 @@ mod tests {
         let original = deferred_replace_effect();
         let json = serde_json::to_string(&original).expect("serialize");
         let decoded = deserialize_effect(&json);
-        assert_eq!(decoded, SavedEffect::from(original));
+        assert_eq!(
+            decoded,
+            SavedEffect::from(crate::test_support::snapshot_effect(&original))
+        );
     }
 
     #[test]
@@ -3282,10 +3296,15 @@ mod tests {
             .into_iter()
             .find_map(|(label, effect)| (label == "ReleaseListKeys").then_some(effect))
             .expect("release fixture");
-        let json = serde_json::to_string(&SavedEffect::from(effect.clone()))
-            .expect("serialize release effect");
+        let json = serde_json::to_string(&SavedEffect::from(crate::test_support::snapshot_effect(
+            &effect,
+        )))
+        .expect("serialize release effect");
         let decoded = deserialize_effect(&json);
-        assert_eq!(decoded, SavedEffect::from(effect));
+        assert_eq!(
+            decoded,
+            SavedEffect::from(crate::test_support::snapshot_effect(&effect))
+        );
         let Effect::ReleaseListKeys {
             attribute,
             key_field,
@@ -3417,7 +3436,7 @@ mod tests {
             let json = serde_json::to_string(&effect).unwrap();
             let deserialized = deserialize_effect(&json);
             assert_eq!(
-                SavedEffect::from(effect.clone()),
+                SavedEffect::from(crate::test_support::snapshot_effect(&effect)),
                 deserialized,
                 "Round-trip failed for {:?}",
                 effect

@@ -39,7 +39,9 @@ impl ResolvedRemovedClaims {
         )
     }
 
-    pub fn from_effects<S>(effects: &[Effect<S>]) -> Self {
+    pub fn from_effects<S, V: carina_core::resource::PlanValueKind>(
+        effects: &[Effect<S, V>],
+    ) -> Self {
         Self(
             effects
                 .iter()
@@ -473,11 +475,12 @@ mod tests {
     fn snapshots_use_recorded_routed_remove_effects() {
         let removed = id("old", Some("alias"));
         let other_route = id("old", None);
-        let claims = ResolvedRemovedClaims::from_effects::<carina_core::resource::ModuleSource>(&[
-            Effect::Remove {
-                id: removed.clone(),
-            },
-        ]);
+        let claims = ResolvedRemovedClaims::from_effects::<
+            carina_core::resource::ModuleSource,
+            carina_core::resource::NoPlaceholder,
+        >(&[Effect::Remove {
+            id: removed.clone(),
+        }]);
         let rows = PreparedRows::from_snapshots(
             [removed.clone(), other_route.clone()].map(|id| {
                 let state = State::existing(id.as_inner().clone(), HashMap::new())
