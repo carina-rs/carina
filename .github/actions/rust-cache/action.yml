@@ -14,7 +14,10 @@ runs:
     # whichever one applies. The hash is in rust-cache's restore prefix, so each
     # root manifest change forces one full rebuild; rust-cache has no input for
     # hashing extra files outside that prefix.
+    # Merge queue refs are single-use, so caches saved there are never restored
+    # and only evict main's. Queue runs still restore from main.
     - uses: Swatinem/rust-cache@v2
       with:
+        save-if: ${{ github.event_name != 'merge_group' }}
         key: ${{ inputs.shared-key == '' && hashFiles('Cargo.toml') || '' }}
         shared-key: ${{ inputs.shared-key != '' && format('{0}-{1}', inputs.shared-key, hashFiles('Cargo.toml')) || '' }}
