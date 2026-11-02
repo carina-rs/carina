@@ -2,6 +2,9 @@
 
 Tracking: carina-rs/carina#3909
 
+The examples use the cloud-knowledge names introduced by carina#4224; the original #3909 design and behavior are otherwise unchanged.
+The ambiguous-send cases below are historical; current `not-created` means nothing was created: no request left the provider, or the cloud rejected it without creating anything.
+
 ## Problem
 
 `Provider::create` returns `ProviderResult<CreateOutcome>`. Once a create has
@@ -83,7 +86,7 @@ follow-up calls failed. (The same write-only merge after a failed or skipped
 
 ### Why this is a type-level problem
 
-`ProviderError` is the only failure channel, so "nothing reached the cloud"
+`ProviderError` is the only failure channel, so "nothing was created"
 and "a resource exists but its configuration did not finish" have the same
 type. Each provider would have to remember to turn the second case into a
 success-shaped outcome; the aws inventory shows that it does not. awscc does
@@ -97,7 +100,7 @@ it is at every failure site. The value that reaches state has to record
 whether it was observed or only desired. The current-state map has to keep
 three things apart:
 
-- applied: the provider identifier is known; for rows written from a created
+- applied: the provider identifier is known; for rows written from an identifier-reported
   failure, the create observation records whether read-back found the resource;
 - create in flight: the create was sent and has not finished;
 - no current instance.
@@ -124,15 +127,15 @@ three things apart:
   `NotIssued` re-issue. No identifier or pending token exists at that point.
   This needs client tokens per API and is unchanged. A create API that reports
   success without returning an identifier is the same class: nothing can be
-  recorded, and the provider returns `untracked` with that message. Two
+  recorded, and the provider returns `not-created` with that message. Two
   host-side cases also belong to it, because the guest's answer never arrives:
   - a WASM trap or the hard timeout during an initial `create` whose follow-up
     calls ran after the identifier was known;
   - a trap during a resume call that had already re-sent the create
     (`resend`). The next apply re-sends from the old envelope.
   - an unissued initial `pending` whose token cannot be encoded. The WIT create
-    verdict has no better arm, so the guest reports it as `untracked`. The same
-    failure after `resend` is `Resent(Untracked)` and the host reports `Ended`,
+    verdict has no better arm, so the guest reports it as `not-created`. The same
+    failure after `resend` is `Resent(NotCreated)` and the host reports `NoResource`,
     unlike a trap during resend, which keeps the old envelope because no
     provider verdict arrived.
 - Process termination between a provider's answer and the end-of-apply state
@@ -193,9 +196,9 @@ its caller; providers do not construct one.
 /// Handed to an initial create. Not Clone; every method consumes it.
 pub struct CreateAttempt { /* private */ }
 impl CreateAttempt {
-    /// The provider knows no resource exists: nothing was sent, or the
-    /// cloud rejected the request.
-    pub fn untracked(self, error: ProviderError) -> CreateVerdict;
+    /// Nothing was created: no request left the provider, or the cloud rejected
+    /// it without creating anything.
+    pub fn not_created(self, error: ProviderError) -> CreateVerdict;
     /// The create request was accepted and the identifier is known.
     /// `sent` names the attributes whose values that request carried.
     pub fn issued(self, identifier: AppliedIdentifier, sent: Sent) -> IssuedCreate;
@@ -208,11 +211,11 @@ impl CreateAttempt {
 /// `sent` set is the one the pending record carries; it cannot change.
 pub struct PollAttempt { /* private */ }
 impl PollAttempt {
-    pub fn untracked(self, error: ProviderError) -> PollVerdict;
+    pub fn not_created(self, error: ProviderError) -> PollVerdict;
     pub fn issued(self, identifier: AppliedIdentifier) -> IssuedCreate;
     pub fn pending(self, token: PendingToken, poll_after_secs: u32) -> CreateStep;
     /// The provider cannot tell whether a resource exists.
-    pub fn undetermined(self, error: ProviderError) -> PollVerdict;
+    pub fn unchanged(self, error: ProviderError) -> PollVerdict;
 }
 
 pub struct IssuedCreate { /* identifier, sent */ }
@@ -231,18 +234,18 @@ impl IssuedCreate {
     pub fn partial(self, attributes: Attributes, diagnostic: PartialReadDiagnostic)
         -> CreateStep;
     /// A follow-up step failed. The row is built from `read` and `sent`.
-    pub fn failed(self, read: Observation, error: ProviderError) -> CreateVerdict;
+    pub fn identifier_reported(self, read: Observation, error: ProviderError) -> CreateVerdict;
     /// The cloud reports the resource as terminally failed or gone.
-    pub fn discarded(self, error: ProviderError) -> CreateVerdict;
+    pub fn no_resource(self, error: ProviderError) -> CreateVerdict;
 }
-// `FinishingCreate` has `succeeded`, `partial`, `failed` and `discarded`,
+// `FinishingCreate` has `succeeded`, `partial`, `identifier_reported` and `no_resource`,
 // but no `pending`.
 
 /// Handed to a resume of a recorded create that has no identifier.
 pub struct ResumeAttempt { /* private */ }
 impl ResumeAttempt {
-    pub fn untracked(self, error: ProviderError) -> ResumeVerdict;
-    pub fn undetermined(self, error: ProviderError) -> ResumeVerdict;
+    pub fn not_created(self, error: ProviderError) -> ResumeVerdict;
+    pub fn unchanged(self, error: ProviderError) -> ResumeVerdict;
     pub fn issued(self, identifier: AppliedIdentifier) -> ResumedCreate;
     pub fn pending(self, token: PendingToken, poll_after_secs: u32) -> ResumeStep;
     /// The recorded request was never accepted; this call sends the current
@@ -260,10 +263,10 @@ impl ResumedCreate {
     /// Built from a found read and the recorded sent values; the current
     /// request may differ from the one the cloud received. A resumed create
     /// that reads NotFound is still running (`pending`) or gone
-    /// (`discarded`), never completed.
+    /// (`no-resource`), never completed.
     pub fn completed(self, read: FoundRead) -> ResumeStep;
-    pub fn failed(self, read: Observation, error: ProviderError) -> ResumeVerdict;
-    pub fn discarded(self, error: ProviderError) -> ResumeVerdict;
+    pub fn identifier_reported(self, read: Observation, error: ProviderError) -> ResumeVerdict;
+    pub fn no_resource(self, error: ProviderError) -> ResumeVerdict;
 }
 
 pub enum Observation { Read(ReadOutcome), ReadFailed(ProviderError) }
@@ -299,9 +302,9 @@ makes these rules hold:
 - **Choosing a failure kind.** There is no `From<ProviderError>` into any of
   these types, so `?` on a `ProviderResult` does not compile inside a create.
   Every failure site has to name its case.
-- **After `issued`.** The attempt has been moved, so `untracked` and
-  `undetermined` can no longer be called. A follow-up failure is `failed`, and
-  a cloud-reported terminal failure is `discarded`. A poll or resume of a
+- **After `issued`.** The attempt has been moved, so `not-created` and
+  `unchanged` can no longer be called. A follow-up failure is `identifier_reported`, and
+  a cloud-reported terminal failure is `no-resource`. A poll or resume of a
   record that has an identifier receives `Issued`, never an attempt, so it
   cannot give the identifier up.
 - **Only through `issued`.** Outcomes that carry an identifier are reachable
@@ -310,7 +313,7 @@ makes these rules hold:
   actually run. A provider that keeps the identifier without calling `issued`
   has no way to return it.
 - **"Cannot tell" belongs to polls.** On the initial call it would be the
-  ambiguous-send non-goal, so `CreateAttempt` does not offer `undetermined`.
+  ambiguous-send non-goal, so `CreateAttempt` does not offer `unchanged`.
 - **`PendingToken`.** It has a redacted `Debug` and no `Display`. Its raw text
   is reachable only through `expose_for_provider_call`, which the host's WIT
   conversion and the SDK glue use. It has serde so the state file can store
@@ -318,12 +321,12 @@ makes these rules hold:
 
 ### Rows built from an observation
 
-A `failed` create or resume produces an `ObservedCreate`. A successful resume
-produces a `CompletedResume`, whose private `ObservedCreate` can only be built
+An `identifier_reported` create or resume produces an `IdentifiedCreate`. A successful resume
+produces a `CompletedResume`, whose private `IdentifiedCreate` can only be built
 from an `AppliedState`:
 
 ```rust
-pub struct ObservedCreate {
+pub struct IdentifiedCreate {
     id: ResourceId,
     identifier: AppliedIdentifier,
     observation: CreateObservation,
@@ -340,11 +343,11 @@ pub enum UnobservedReason {
     ReadFailed(ProviderError),
 }
 
-pub struct CompletedResume(ObservedCreate); // private field and constructor
+pub struct CompletedResume(IdentifiedCreate); // private field and constructor
 ```
 
 The provider-facing methods still accept the protocol `Observation`; core
-converts it once when constructing `ObservedCreate`, so display and writeback
+converts it once when constructing `IdentifiedCreate`, so display and writeback
 cannot classify the same read-back differently.
 
 Writeback builds its row with `ResourceState::from_observation`. Masking and
@@ -392,8 +395,8 @@ There are two layers:
 
 ```rust
 pub enum CreateFailure {
-    Untracked(ProviderError),
-    Created { created: ObservedCreate, error: ProviderError },
+    NoResource(ProviderError),
+    IdentifierReported { identified: IdentifiedCreate, error: ProviderError },
     InFlight { pending: InFlightCreate, error: ProviderError },
 }
 
@@ -402,9 +405,9 @@ pub enum ResumeOutcome {
     Resent(CreateOutcome),       // after `resend`: an ordinary create
 }
 pub enum ResumeFailure {
-    /// The provider's verdict that the create ended without a resource.
-    Ended(ProviderError),
-    Created { created: ObservedCreate, error: ProviderError },
+    /// The provider's verdict that the create left no resource.
+    NoResource(ProviderError),
+    IdentifierReported { identified: IdentifiedCreate, error: ProviderError },
     InFlight { pending: InFlightCreate, error: ProviderError },
 }
 
@@ -445,20 +448,20 @@ pub trait Provider {
 }
 ```
 
-`CreateFailure`, `ResumeFailure` and `ObservedCreate` have crate-private
+`CreateFailure`, `ResumeFailure` and `IdentifiedCreate` have crate-private
 constructors. The public ways to build them are to convert a provider step or
 verdict, to call `InFlightCreate::from_pending`, and to call `repend` (directly
 or through `Repend`). A native `Provider` (the builtin
 mock, test fakes) therefore classifies through the same attempt types. It
-cannot write `map_err(CreateFailure::Untracked)` after a cloud call. A native
+cannot write `map_err(CreateFailure::NoResource)` after a cloud call. A native
 provider that defers drives its own steps with `drive_pending`, as the aws
 and awscc native impls already do. On over budget it builds `InFlight` with
 `from_pending` and the `over_budget` timeout as the error.
 
-`ResumeFailure::Ended` exists only as the conversion of a provider's
-`untracked` or `discarded` resume verdict. A provider `completed` step or
-`created` resume verdict whose attributes fail host-side decoding becomes
-`Created` with `ReadFailed`: the provider's verdict established an identifier,
+`ResumeFailure::NoResource` exists only as the conversion of a provider's
+`not-created` or `no-resource` resume verdict. A provider `completed` step or
+`identifier-reported` resume verdict whose attributes fail host-side decoding becomes
+`IdentifierReported` with `ReadFailed`: the provider's verdict established an identifier,
 while the failed decode means core cannot say that read-back observed the
 resource. This is the same rule as an initial create result whose identifier
 decoded before its attributes.
@@ -489,7 +492,7 @@ record pending-create {
     identifier: option<applied-identifier>,
     sent: sent-attributes,
 }
-record created-failure {
+record create-identified {
     identifier: applied-identifier,      // canonical if canonicalized
     read: observation,
     sent: sent-attributes,
@@ -501,28 +504,28 @@ variant create-step {
     pending(pending-create),
 }
 variant create-verdict {
-    untracked(provider-error),
-    created(created-failure),
-    discarded(provider-error),
+    not-created(provider-error),
+    identifier-reported(create-identified),
+    no-resource(provider-error),
 }
 variant poll-verdict {
-    untracked(provider-error),
-    created(created-failure),
-    discarded(provider-error),
-    undetermined(provider-error),
+    not-created(provider-error),
+    identifier-reported(create-identified),
+    no-resource(provider-error),
+    unchanged(provider-error),
 }
 record resume-pending { operation: pending-operation, identifier: option<applied-identifier> }
-record resumed-failure { identifier: applied-identifier, read: observation, error: provider-error }
+record resume-identified { identifier: applied-identifier, read: observation, error: provider-error }
 variant resume-step {
     completed(applied-state),            // a found read; canonical identifier if canonicalized
     pending(resume-pending),
     resent(create-step),
 }
 variant resume-verdict {
-    untracked(provider-error),
-    created(resumed-failure),
-    discarded(provider-error),
-    undetermined(provider-error),
+    not-created(provider-error),
+    identifier-reported(resume-identified),
+    no-resource(provider-error),
+    unchanged(provider-error),
     resent(create-verdict),
 }
 
@@ -542,7 +545,7 @@ builds the row through the same core constructors as the builtin mock, so a
 guest cannot send desired values through them.
 
 The guest glue maps a request or token that fails to decode in `poll-create`
-or `resume-create` to `undetermined`, not to an ordinary `provider-error`.
+or `resume-create` to `unchanged`, not to an ordinary `provider-error`.
 Otherwise a token that a build cannot read would end the record.
 
 The create token contract is tightened from "free of secrets" to "free of
@@ -592,18 +595,18 @@ under the remaining budget. From then on the pending record is the new
 | Drive result | `create` | `resume_create` |
 |---|---|---|
 | `Done(step)` | the outcome | `Resumed` (`completed`) or `Resent` |
-| `Verdict(untracked \| discarded)` | `Untracked` | `Ended` |
-| `Verdict(created)` | `Created` | `Created` |
-| `Verdict(undetermined)` | `InFlight` with the last pending value | `InFlight` with the latest record |
-| `Verdict(resent(v))` | — | `untracked` / `discarded` → `Ended`; `created` → `Created`; `undetermined` → `InFlight` with the post-resend record |
+| `Verdict(not-created \| no-resource)` | `NoResource` | `NoResource` |
+| `Verdict(identifier-reported)` | `IdentifierReported` | `IdentifierReported` |
+| `Verdict(unchanged)` | `InFlight` with the last pending value | `InFlight` with the latest record |
+| `Verdict(resent(v))` | — | `not-created` / `no-resource` → `NoResource`; `identifier-reported` → `IdentifierReported`; `unchanged` → `InFlight` with the post-resend record |
 | `OverBudget` | `InFlight` | `InFlight` |
-| `DriveError::Initial` | `Untracked` (ambiguous-send non-goal) | `InFlight` with the record it started from |
+| `DriveError::Initial` | `NoResource` (ambiguous-send non-goal) | `InFlight` with the record it started from |
 | `DriveError::Poll` | `InFlight` | `InFlight` |
 
 The host enforces at the boundary what the SDK types enforce in the guest,
 because the WIT itself admits more:
 
-- On a record that has an identifier, an `untracked` or `undetermined`
+- On a record that has an identifier, a `not-created` or `unchanged`
   verdict is rejected. So is a pending step that drops the identifier or
   changes it. Each becomes `InFlight` with the record the call started from.
 - A returned `pending-create` whose `sent` differs from the one passed in is
@@ -622,9 +625,9 @@ create as a finished one. Every current producer gets its own variant:
 ```rust
 enum Applied {
     Complete(State),                   // Create Ok, Resent, Update Ok: as today
-    Observed(ObservedCreate),          // Resumed, and CreateFailure / ResumeFailure::Created
+    Observed(IdentifiedCreate),          // Resumed, and CreateFailure / ResumeFailure::IdentifierReported
     CreateInFlight(InFlightCreate),
-    CreateEnded,                       // ResumeFailure::Ended
+    CreateEnded,                       // ResumeFailure::NoResource
     Imported(State),                   // as today
     DataSource(State),                 // as today
     WaitSnapshot(State),               // as today; no row is written from it
@@ -635,14 +638,14 @@ enum Applied {
 |---|---|---|---|
 | Create `Ok`, Resume `Resent` | success / partial | run | `Complete` |
 | Resume `Resumed` | success / partial | run | `Observed` |
-| Create `Untracked` | failure | skipped | none |
-| Resume `Ended` | failure | skipped | `CreateEnded` |
-| `Created` (either) | failure | skipped | `Observed` |
+| Create `NoResource` | failure | skipped | none |
+| Resume `NoResource` | failure | skipped | `CreateEnded` |
+| `IdentifierReported` (either) | failure | skipped | `Observed` |
 | `InFlight` (either) | failure | skipped | `CreateInFlight` |
 | ResumeCreate failing before dispatch (resolution error) or not run (dependency failed, cancelled) | failure / skipped | skipped | none |
 
 A missing `Applied` entry for an in-flight address leaves its row unchanged
-in writeback. `Created` and `InFlight` emit `EffectFailed` with an extra line
+in writeback. `IdentifierReported` and `InFlight` emit `EffectFailed` with an extra line
 saying what was recorded:
 
 - for an observed resource, "resource created; recorded in state, the next
@@ -706,7 +709,7 @@ keyed by `ResourceId` across both active declaration kinds.
 `UpsertSource` gets one arm per `Applied` kind that writes a row, plus the
 `Current` kinds, and `is_applied()` is deleted. `classify_replacement_outcome`
 and `plan_displaced_identifier_deposes` switch on the source kind. Otherwise a
-delete-first replacement whose create ends `Created` or `InFlight` would reach
+delete-first replacement whose create ends `IdentifierReported` or `InFlight` would reach
 `DeleteSucceededCreateAbsent` and remove the row.
 
 | Source | Current slot | Old instance (CBD) | Old instance already deleted | Name overrides | Row built by |
@@ -811,7 +814,7 @@ refusing a lineage mismatch and warning on a serial bump.
 
 `create_checked_bootstrap_resource` creates the state bucket before any state
 exists, and today only an auto-created bucket is written into state
-(`with_managed_state_bucket`). A `Created` failure seeds the new state with
+(`with_managed_state_bucket`). An `IdentifierReported` failure seeds the new state with
 the observed row in the same way, then reports the error. An S3 bucket create
 is never pending, so `InFlight` is unreachable there today. It is mapped to the
 same seeding with an in-flight row, because the match is exhaustive.
@@ -824,8 +827,8 @@ same seeding with an in-flight row, because the match is exhaustive.
 - The CreateResource response and progress events call `issued` as soon as an
   `Identifier` appears. The read-back's composite identifier goes through
   `canonicalize`.
-- FAILED with an identifier becomes `failed`, built from the read-back, never
-  `Success`. FAILED without an identifier stays `untracked`, or is re-issued
+- FAILED with an identifier becomes `identifier_reported`, built from the read-back, never
+  `Success`. FAILED without an identifier stays `not-created`, or is re-issued
   when retryable, as today.
 - A `GetResourceRequestStatus` SDK error becomes `pending` with a backoff.
 - On resume:
@@ -835,7 +838,7 @@ same seeding with an in-flight row, because the match is exhaustive.
     mean the create has finished, and many handlers read NotFound until it
     has;
   - a record in the `NotIssued` phase calls `resend`;
-  - an expired or unknown request token with no identifier is `undetermined`.
+  - an expired or unknown request token with no identifier is `unchanged`.
 - The native `create_resource` driver moves to the new types.
 - `main.rs` stops calling `carina_plugin_sdk::run`.
 
@@ -843,14 +846,14 @@ same seeding with an in-flight row, because the match is exhaustive.
 
 - Each create calls `issued` right after its create API returns the
   identifier, with `sent` naming that API's parameters. The follow-up calls in
-  the inventory then fail as `failed`, with an observation from the shared
+  the inventory then fail as `identifier_reported`, with an observation from the shared
   read-back.
 - The NAT gateway tags move after the pending step is built.
 - FlowLog records every id it created. A response where only some ids
-  succeeded becomes `failed` for those ids, without retrying the ones that
+  succeeded becomes `identifier_reported` for those ids, without retrying the ones that
   succeeded.
 - Describe errors while polling become `pending` with a backoff.
-- Terminal cloud states (`failed`, `deleted`) are `discarded`.
+- Terminal cloud states (`failed`, `deleted`) are `no-resource`.
 - The Organizations Account create calls `issued` once the account id is
   known, so a failing `MoveAccount` records the account.
 - `main.rs` stops calling `carina_plugin_sdk::run`.
@@ -870,7 +873,7 @@ PR followed by an awscc PR pinned to it. They merge in that order.
      `Verdict` channel and last-pending errors; JSON-RPC transport removed.
    - WIT: steps, verdicts and `resume-create`; SDK trait and glue, including
      decode failures.
-   - Core: `CreateFailure`, `ObservedCreate`, the resume outcome and failure
+   - Core: `CreateFailure`, `IdentifiedCreate`, the resume outcome and failure
      types, `InFlightCreate`, `ResumeCreateRequest`, the trait methods and
      `ProviderRouter`.
    - Host: the drive-result table and the switch after `resend`.
@@ -886,7 +889,7 @@ PR followed by an awscc PR pinned to it. They merge in that order.
    Tests:
    - each row of the executor table: the count, dependent skipping and the
      state written (CLI e2e with the builtin mock);
-   - `Created` and `InFlight` under create_before_destroy and under a
+   - `IdentifierReported` and `InFlight` under create_before_destroy and under a
      delete-first replace: the row survives with the expected current slot,
      and the old instance's deposed delete waits for the resume;
    - rows built from an observation:
@@ -909,15 +912,15 @@ PR followed by an awscc PR pinned to it. They merge in that order.
      - a ResumeCreate skipped because a dependency failed;
      - a resolution error or a routing error;
      - a poll trap, or a token the guest cannot decode;
-     - `undetermined`;
+     - `unchanged`;
      - a pending step that drops the identifier;
      - running out of budget again;
-   - a resume verdict `untracked` clears the current slot and keeps `deposed`;
+   - a resume verdict `not-created` clears the current slot and keeps `deposed`;
    - a resume of an issued record whose request is still running and whose
      read is NotFound stays in flight, and the next plan proposes no create;
    - a re-pend after the configuration changed keeps the old envelope's
      encoded values and `started_at`;
-   - the host turns an `untracked` or `undetermined` verdict on an issued
+   - the host turns a `not-created` or `unchanged` verdict on an issued
      record, and a pending step with a changed `sent`, into `InFlight`;
    - a resume after the desired configuration changed records only observed
      values and the envelope's sent values. `resend` continues with
@@ -933,12 +936,12 @@ PR followed by an awscc PR pinned to it. They merge in that order.
      identifier;
    - saved-plan apply refuses when an address's in-flight status changed in
      either direction;
-   - the state-bucket bootstrap with a `Created` failure seeds the bucket row.
+   - the state-bucket bootstrap with an `IdentifierReported` failure seeds the bucket row.
 2. **aws + awscc rev bump.** Both providers move to v10 as described under
    Providers. Acceptance: the full aws and awscc suites and the multi-step
    tests pass. A provider-level test covers each inventory row: a failing
-   follow-up call becomes a `created` verdict with the expected `sent` set,
-   and an awscc FAILED event with an identifier becomes `created`. These tests
+   follow-up call becomes an `identifier-reported` verdict with the expected `sent` set,
+   and an awscc FAILED event with an identifier becomes `identifier-reported`. These tests
    use the winterbaume round-trip or the provider's mock clients.
 
 ## Alternatives considered

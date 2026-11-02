@@ -1102,14 +1102,14 @@ pub enum CreateStep<A, D, T> {
 /// Failure payload for a create for which the provider reported an identifier.
 /// The observation says whether the resource was found during read-back.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreatedFailure<R, E> {
+pub struct CreateIdentified<R, E> {
     pub identifier: AppliedIdentifier,
     pub observation: Observation<R, E>,
     pub sent: Sent,
     pub error: E,
 }
 
-impl<R, E> CreatedFailure<R, E> {
+impl<R, E> CreateIdentified<R, E> {
     pub fn into_parts(self) -> (AppliedIdentifier, Observation<R, E>, Sent, E) {
         (self.identifier, self.observation, self.sent, self.error)
     }
@@ -1122,9 +1122,12 @@ impl<R, E> CreatedFailure<R, E> {
 /// their opaque verdict types into this wire representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateVerdict<R, T, E> {
-    Untracked(E),
-    Created(CreatedFailure<R, E>),
-    Discarded(E),
+    /// Nothing was created: no request left the provider, or the cloud rejected
+    /// it without creating anything. Produced from an unissued attempt.
+    NotCreated(E),
+    IdentifierReported(CreateIdentified<R, E>),
+    /// No cloud resource remains, even if one existed earlier.
+    NoResource(E),
     InFlight(CreateInFlight<T, E>),
 }
 
@@ -1132,19 +1135,22 @@ pub enum CreateVerdict<R, T, E> {
 /// the SDK or native core adapter before this value is encoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PollVerdict<R, T, E> {
-    Untracked(E),
-    Created(CreatedFailure<R, E>),
-    Discarded(E),
-    Undetermined(E),
+    /// Nothing was created: no request left the provider, or the cloud rejected
+    /// it without creating anything. Produced from an unissued attempt.
+    NotCreated(E),
+    IdentifierReported(CreateIdentified<R, E>),
+    /// No cloud resource remains, even if one existed earlier.
+    NoResource(E),
+    Unchanged(E),
     InFlight(CreateInFlight<T, E>),
 }
 
 impl<R, T, E> From<CreateVerdict<R, T, E>> for PollVerdict<R, T, E> {
     fn from(verdict: CreateVerdict<R, T, E>) -> Self {
         match verdict {
-            CreateVerdict::Untracked(error) => Self::Untracked(error),
-            CreateVerdict::Created(created) => Self::Created(created),
-            CreateVerdict::Discarded(error) => Self::Discarded(error),
+            CreateVerdict::NotCreated(error) => Self::NotCreated(error),
+            CreateVerdict::IdentifierReported(identified) => Self::IdentifierReported(identified),
+            CreateVerdict::NoResource(error) => Self::NoResource(error),
             CreateVerdict::InFlight(in_flight) => Self::InFlight(in_flight),
         }
     }
@@ -1154,13 +1160,13 @@ impl<R, T, E> From<CreateVerdict<R, T, E>> for PollVerdict<R, T, E> {
 /// identifier. The observation says whether the resource was found during
 /// read-back.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResumedFailure<R, E> {
+pub struct ResumeIdentified<R, E> {
     pub identifier: AppliedIdentifier,
     pub observation: Observation<R, E>,
     pub error: E,
 }
 
-impl<R, E> ResumedFailure<R, E> {
+impl<R, E> ResumeIdentified<R, E> {
     pub fn into_parts(self) -> (AppliedIdentifier, Observation<R, E>, E) {
         (self.identifier, self.observation, self.error)
     }
@@ -1186,10 +1192,13 @@ pub enum ResumeStep<A, D, T> {
 /// enforced by the SDK or native core adapter before this value is encoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeVerdict<R, T, E> {
-    Untracked(E),
-    Created(ResumedFailure<R, E>),
-    Discarded(E),
-    Undetermined(E),
+    /// Nothing was created: no request left the provider, or the cloud rejected
+    /// it without creating anything. Produced from an unissued attempt.
+    NotCreated(E),
+    IdentifierReported(ResumeIdentified<R, E>),
+    /// No cloud resource remains, even if one existed earlier.
+    NoResource(E),
+    Unchanged(E),
     InFlight(ResumeInFlight<T, E>),
     Resent(CreateVerdict<R, T, E>),
 }

@@ -5934,12 +5934,12 @@ impl WasmProvider {
     }
 
     /// Turn a boundary decode failure that happened after a valid create
-    /// identifier into the only safe classification: the resource was
-    /// created, but its post-create observation could not be decoded.
-    fn created_read_decode_failure(
+    /// identifier into the only safe classification: the identifier was
+    /// reported, but its post-create observation could not be decoded.
+    fn identifier_reported_read_decode_failure(
         operation: &'static str,
         id: &ResourceId,
-        failure: wasm_convert::CreatedReadDecodeFailure,
+        failure: wasm_convert::IdentifierReportedReadDecodeFailure,
     ) -> (AppliedIdentifier, Option<Sent>, Observation, ProviderError) {
         let (identifier, sent, declared_error, decode_error) = failure.into_parts();
         let read_error =
@@ -5949,19 +5949,19 @@ impl WasmProvider {
         (identifier, sent, Observation::ReadFailed(read_error), error)
     }
 
-    fn initial_created_read_decode_failure(
+    fn initial_identifier_reported_read_decode_failure(
         id: ResourceId,
         wit_request: &wit_types::CreateRequest,
         attempt: CreateAttempt,
-        failure: wasm_convert::CreatedReadDecodeFailure,
+        failure: wasm_convert::IdentifierReportedReadDecodeFailure,
     ) -> CreateProgress {
         let (identifier, sent, observation, error) =
-            Self::created_read_decode_failure("create", &id, failure);
+            Self::identifier_reported_read_decode_failure("create", &id, failure);
         Self::initial_create_verdict(
             id,
             wit_request,
             attempt,
-            proto::CreateVerdict::Created(proto::CreatedFailure {
+            proto::CreateVerdict::IdentifierReported(proto::CreateIdentified {
                 identifier,
                 observation,
                 sent: sent.unwrap_or(Sent::AllRequestAttributes),
@@ -5970,29 +5970,33 @@ impl WasmProvider {
         )
     }
 
-    fn polled_step_created_read_decode_failure(
+    fn polled_step_identifier_reported_read_decode_failure(
         starting: PendingCreate,
-        failure: wasm_convert::CreatedReadDecodeFailure,
+        failure: wasm_convert::IdentifierReportedReadDecodeFailure,
     ) -> CreateProgress {
         let (identifier, _sent, observation, error) =
-            Self::created_read_decode_failure("poll_create", &starting.id, failure);
+            Self::identifier_reported_read_decode_failure("poll_create", &starting.id, failure);
         let poll = starting.pending.into_poll();
         CreateProgress::Verdict(Box::new(match poll {
-            CorePoll::Unissued(attempt) => attempt.issued(identifier).failed(observation, error),
-            CorePoll::Issued(issued) => issued.canonicalize(identifier).failed(observation, error),
+            CorePoll::Unissued(attempt) => attempt
+                .issued(identifier)
+                .identifier_reported(observation, error),
+            CorePoll::Issued(issued) => issued
+                .canonicalize(identifier)
+                .identifier_reported(observation, error),
         }))
     }
 
-    fn polled_verdict_created_read_decode_failure(
+    fn polled_verdict_identifier_reported_read_decode_failure(
         starting: PendingCreate,
-        failure: wasm_convert::CreatedReadDecodeFailure,
+        failure: wasm_convert::IdentifierReportedReadDecodeFailure,
     ) -> CreateProgress {
         let (identifier, sent, observation, error) =
-            Self::created_read_decode_failure("poll_create", &starting.id, failure);
+            Self::identifier_reported_read_decode_failure("poll_create", &starting.id, failure);
         let sent = sent.unwrap_or_else(|| starting.pending.sent().clone());
         Self::polled_create_verdict(
             starting,
-            proto::PollVerdict::Created(proto::CreatedFailure {
+            proto::PollVerdict::IdentifierReported(proto::CreateIdentified {
                 identifier,
                 observation,
                 sent,
@@ -6001,14 +6005,14 @@ impl WasmProvider {
         )
     }
 
-    fn resumed_created_read_decode_failure(
+    fn resumed_identifier_reported_read_decode_failure(
         id: ResourceId,
         wit_request: wit_types::CreateRequest,
         starting: CoreResume,
-        failure: wasm_convert::CreatedReadDecodeFailure,
+        failure: wasm_convert::IdentifierReportedReadDecodeFailure,
     ) -> ResumeProgress {
         let (identifier, sent, observation, error) =
-            Self::created_read_decode_failure("resume_create", &id, failure);
+            Self::identifier_reported_read_decode_failure("resume_create", &id, failure);
         match sent {
             None => Self::fail_resumed_create(starting, identifier, observation, error),
             Some(sent) => Self::resumed_create_verdict(
@@ -6016,8 +6020,8 @@ impl WasmProvider {
                 &wit_request,
                 starting,
                 proto::PendingPhase::Operation,
-                proto::ResumeVerdict::Resent(proto::CreateVerdict::Created(
-                    proto::CreatedFailure {
+                proto::ResumeVerdict::Resent(proto::CreateVerdict::IdentifierReported(
+                    proto::CreateIdentified {
                         identifier,
                         observation,
                         sent,
@@ -6115,22 +6119,24 @@ impl WasmProvider {
         verdict: wasm_convert::DecodedCreateVerdict,
     ) -> CreateProgress {
         match verdict {
-            proto::CreateVerdict::Untracked(error) | proto::CreateVerdict::Discarded(error) => {
-                CreateProgress::Verdict(Box::new(attempt.untracked(error)))
+            proto::CreateVerdict::NotCreated(error) | proto::CreateVerdict::NoResource(error) => {
+                CreateProgress::Verdict(Box::new(attempt.not_created(error)))
             }
-            proto::CreateVerdict::Created(created) => {
-                let (identifier, observation, mut sent, mut error) = created.into_parts();
+            proto::CreateVerdict::IdentifierReported(identified) => {
+                let (identifier, observation, mut sent, mut error) = identified.into_parts();
                 let request_names = Self::create_request_attribute_names(wit_request);
                 if !sent.is_valid_for(&request_names) {
                     sent.clip_to(&request_names);
                     error = Self::create_boundary_error_with_source(
                         &id,
-                        "created verdict sent attributes are not a subset of the request",
+                        "identifier-reported verdict sent attributes are not a subset of the request",
                         error,
                     );
                 }
                 CreateProgress::Verdict(Box::new(
-                    attempt.issued(identifier, sent).failed(observation, error),
+                    attempt
+                        .issued(identifier, sent)
+                        .identifier_reported(observation, error),
                 ))
             }
             proto::CreateVerdict::InFlight(in_flight) => {
@@ -6241,38 +6247,36 @@ impl WasmProvider {
         verdict: wasm_convert::DecodedPollVerdict,
     ) -> CreateProgress {
         match verdict {
-            proto::PollVerdict::Untracked(error) => {
-                CreateProgress::Verdict(Box::new(starting.pending.untracked(error)))
+            proto::PollVerdict::NotCreated(error) => {
+                CreateProgress::Verdict(Box::new(starting.pending.not_created(error)))
             }
-            proto::PollVerdict::Created(created) => {
-                let (identifier, observation, sent, error) = created.into_parts();
+            proto::PollVerdict::IdentifierReported(identified) => {
+                let (identifier, observation, sent, error) = identified.into_parts();
                 if &sent != starting.pending.sent() {
                     let error = Self::create_boundary_error(
                         &starting.id,
-                        "created verdict changed the sent attributes",
+                        "identifier-reported verdict changed the sent attributes",
                     );
                     return Self::preserve_polled_create(starting, error);
                 }
                 let poll = starting.pending.into_poll();
                 CreateProgress::Verdict(Box::new(match poll {
-                    CorePoll::Unissued(attempt) => {
-                        attempt.issued(identifier).failed(observation, error)
-                    }
-                    CorePoll::Issued(issued) => {
-                        issued.canonicalize(identifier).failed(observation, error)
-                    }
+                    CorePoll::Unissued(attempt) => attempt
+                        .issued(identifier)
+                        .identifier_reported(observation, error),
+                    CorePoll::Issued(issued) => issued
+                        .canonicalize(identifier)
+                        .identifier_reported(observation, error),
                 }))
             }
-            proto::PollVerdict::Discarded(error) => {
+            proto::PollVerdict::NoResource(error) => {
                 let poll = starting.pending.into_poll();
                 CreateProgress::Verdict(Box::new(match poll {
-                    CorePoll::Unissued(attempt) => attempt.untracked(error),
-                    CorePoll::Issued(issued) => issued.discarded(error),
+                    CorePoll::Unissued(attempt) => attempt.not_created(error),
+                    CorePoll::Issued(issued) => issued.no_resource(error),
                 }))
             }
-            proto::PollVerdict::Undetermined(error) => {
-                Self::preserve_polled_create(starting, error)
-            }
+            proto::PollVerdict::Unchanged(error) => Self::preserve_polled_create(starting, error),
             proto::PollVerdict::InFlight(in_flight) => {
                 let proto::CreateInFlight { pending, error } = in_flight;
                 let error = Self::in_flight_poll_error(
@@ -6397,38 +6401,36 @@ impl WasmProvider {
         verdict: wasm_convert::DecodedPollVerdict,
     ) -> ResumeProgress {
         match verdict {
-            proto::PollVerdict::Untracked(error) => {
-                ResumeProgress::Verdict(Box::new(starting.pending.untracked(error)))
+            proto::PollVerdict::NotCreated(error) => {
+                ResumeProgress::Verdict(Box::new(starting.pending.not_created(error)))
             }
-            proto::PollVerdict::Created(created) => {
-                let (identifier, observation, sent, error) = created.into_parts();
+            proto::PollVerdict::IdentifierReported(identified) => {
+                let (identifier, observation, sent, error) = identified.into_parts();
                 if &sent != starting.pending.sent() {
                     let error = Self::create_boundary_error(
                         &starting.id,
-                        "resent created verdict changed the sent attributes",
+                        "resent identifier-reported verdict changed the sent attributes",
                     );
                     return Self::preserve_resent_create(starting, error);
                 }
                 let poll = starting.pending.into_poll();
                 ResumeProgress::Verdict(Box::new(match poll {
-                    CoreResentPoll::Unissued(attempt) => {
-                        attempt.issued(identifier).failed(observation, error)
-                    }
-                    CoreResentPoll::Issued(issued) => {
-                        issued.canonicalize(identifier).failed(observation, error)
-                    }
+                    CoreResentPoll::Unissued(attempt) => attempt
+                        .issued(identifier)
+                        .identifier_reported(observation, error),
+                    CoreResentPoll::Issued(issued) => issued
+                        .canonicalize(identifier)
+                        .identifier_reported(observation, error),
                 }))
             }
-            proto::PollVerdict::Discarded(error) => {
+            proto::PollVerdict::NoResource(error) => {
                 let poll = starting.pending.into_poll();
                 ResumeProgress::Verdict(Box::new(match poll {
-                    CoreResentPoll::Unissued(attempt) => attempt.untracked(error),
-                    CoreResentPoll::Issued(issued) => issued.discarded(error),
+                    CoreResentPoll::Unissued(attempt) => attempt.not_created(error),
+                    CoreResentPoll::Issued(issued) => issued.no_resource(error),
                 }))
             }
-            proto::PollVerdict::Undetermined(error) => {
-                Self::preserve_resent_create(starting, error)
-            }
+            proto::PollVerdict::Unchanged(error) => Self::preserve_resent_create(starting, error),
             proto::PollVerdict::InFlight(in_flight) => {
                 let proto::CreateInFlight { pending, error } = in_flight;
                 let error = Self::in_flight_poll_error(
@@ -6448,16 +6450,16 @@ impl WasmProvider {
         }
     }
 
-    fn polled_resent_created_read_decode_failure(
+    fn polled_resent_identifier_reported_read_decode_failure(
         starting: PendingResentCreate,
-        failure: wasm_convert::CreatedReadDecodeFailure,
+        failure: wasm_convert::IdentifierReportedReadDecodeFailure,
     ) -> ResumeProgress {
         let (identifier, sent, observation, error) =
-            Self::created_read_decode_failure("poll_create", &starting.id, failure);
+            Self::identifier_reported_read_decode_failure("poll_create", &starting.id, failure);
         let sent = sent.unwrap_or_else(|| starting.pending.sent().clone());
         Self::polled_resent_verdict(
             starting,
-            proto::PollVerdict::Created(proto::CreatedFailure {
+            proto::PollVerdict::IdentifierReported(proto::CreateIdentified {
                 identifier,
                 observation,
                 sent,
@@ -6477,10 +6479,12 @@ impl WasmProvider {
         error: ProviderError,
     ) -> ResumeProgress {
         let failure = match resume {
-            CoreResume::Unissued(attempt) => attempt.issued(identifier).failed(observation, error),
-            CoreResume::Issued(resumed) => {
-                resumed.canonicalize(identifier).failed(observation, error)
-            }
+            CoreResume::Unissued(attempt) => attempt
+                .issued(identifier)
+                .identifier_reported(observation, error),
+            CoreResume::Issued(resumed) => resumed
+                .canonicalize(identifier)
+                .identifier_reported(observation, error),
         };
         ResumeProgress::Verdict(Box::new(failure))
     }
@@ -6678,17 +6682,17 @@ impl WasmProvider {
         verdict: wasm_convert::DecodedResumeVerdict,
     ) -> ResumeProgress {
         match verdict {
-            proto::ResumeVerdict::Untracked(error) => {
-                ResumeProgress::Verdict(Box::new(starting.untracked(error)))
+            proto::ResumeVerdict::NotCreated(error) => {
+                ResumeProgress::Verdict(Box::new(starting.not_created(error)))
             }
-            proto::ResumeVerdict::Created(created) => {
-                let (identifier, observation, error) = created.into_parts();
+            proto::ResumeVerdict::IdentifierReported(identified) => {
+                let (identifier, observation, error) = identified.into_parts();
                 Self::fail_resumed_create(starting, identifier, observation, error)
             }
-            proto::ResumeVerdict::Discarded(error) => {
-                ResumeProgress::Verdict(Box::new(starting.discarded(error)))
+            proto::ResumeVerdict::NoResource(error) => {
+                ResumeProgress::Verdict(Box::new(starting.no_resource(error)))
             }
-            proto::ResumeVerdict::Undetermined(error) => {
+            proto::ResumeVerdict::Unchanged(error) => {
                 Self::preserve_resumed_create(starting, error)
             }
             proto::ResumeVerdict::InFlight(in_flight) => {
@@ -6705,7 +6709,8 @@ impl WasmProvider {
                 ResumeProgress::Verdict(Box::new(resume.preserve(error)))
             }
             proto::ResumeVerdict::Resent(verdict) => match verdict {
-                proto::CreateVerdict::Untracked(error) | proto::CreateVerdict::Discarded(error) => {
+                proto::CreateVerdict::NotCreated(error)
+                | proto::CreateVerdict::NoResource(error) => {
                     let attempt = match starting {
                         CoreResume::Unissued(attempt) => attempt.resend(),
                         CoreResume::Issued(resumed) => {
@@ -6718,9 +6723,9 @@ impl WasmProvider {
                             );
                         }
                     };
-                    ResumeProgress::Verdict(Box::new(attempt.untracked(error)))
+                    ResumeProgress::Verdict(Box::new(attempt.not_created(error)))
                 }
-                proto::CreateVerdict::Created(created) => {
+                proto::CreateVerdict::IdentifierReported(identified) => {
                     let attempt = match starting {
                         CoreResume::Unissued(attempt) => attempt.resend(),
                         CoreResume::Issued(resumed) => {
@@ -6733,7 +6738,7 @@ impl WasmProvider {
                             );
                         }
                     };
-                    let (identifier, observation, sent, error) = created.into_parts();
+                    let (identifier, observation, sent, error) = identified.into_parts();
                     let request_names = Self::create_request_attribute_names(wit_request);
                     if !sent.is_valid_for(&request_names) {
                         return ResumeProgress::Verdict(Box::new(attempt.preserve(
@@ -6744,7 +6749,9 @@ impl WasmProvider {
                         )));
                     }
                     ResumeProgress::Verdict(Box::new(
-                        attempt.issued(identifier, sent).failed(observation, error),
+                        attempt
+                            .issued(identifier, sent)
+                            .identifier_reported(observation, error),
                     ))
                 }
                 proto::CreateVerdict::InFlight(in_flight) => {
@@ -6807,8 +6814,13 @@ impl WasmProvider {
                 Ok(wasm_convert::DecodedIssued::Decoded(step)) => {
                     Self::resumed_create_step(id, wit_id, wit_request, resume, step)
                 }
-                Ok(wasm_convert::DecodedIssued::CreatedReadFailed(failure)) => {
-                    Self::resumed_created_read_decode_failure(id, wit_request, resume, failure)
+                Ok(wasm_convert::DecodedIssued::IdentifierReportedReadFailed(failure)) => {
+                    Self::resumed_identifier_reported_read_decode_failure(
+                        id,
+                        wit_request,
+                        resume,
+                        failure,
+                    )
                 }
                 Err(error) => Self::preserve_resumed_create(
                     resume,
@@ -6819,8 +6831,13 @@ impl WasmProvider {
                 Ok(wasm_convert::DecodedIssued::Decoded(verdict)) => {
                     Self::resumed_create_verdict(id, &wit_request, resume, poll.phase, verdict)
                 }
-                Ok(wasm_convert::DecodedIssued::CreatedReadFailed(failure)) => {
-                    Self::resumed_created_read_decode_failure(id, wit_request, resume, failure)
+                Ok(wasm_convert::DecodedIssued::IdentifierReportedReadFailed(failure)) => {
+                    Self::resumed_identifier_reported_read_decode_failure(
+                        id,
+                        wit_request,
+                        resume,
+                        failure,
+                    )
                 }
                 Err(error) => Self::preserve_resumed_create(
                     resume,
@@ -6873,7 +6890,7 @@ impl WasmProvider {
         let call_request = wit_request.clone();
         let locked = match self.instance.acquire("create").await {
             Ok(locked) => locked,
-            Err(error) => return Err(attempt.untracked(error.for_resource(id))),
+            Err(error) => return Err(attempt.not_created(error.for_resource(id))),
         };
         let started = attempt.start_guest_call();
         let returned = locked
@@ -6907,9 +6924,9 @@ impl WasmProvider {
             DecodedInitialCreateCall::Step(wasm_convert::DecodedIssued::Decoded(step)) => Ok(
                 Self::initial_create_step(id, wit_id, wit_request, attempt, step),
             ),
-            DecodedInitialCreateCall::Step(wasm_convert::DecodedIssued::CreatedReadFailed(
-                failure,
-            )) => Ok(Self::initial_created_read_decode_failure(
+            DecodedInitialCreateCall::Step(
+                wasm_convert::DecodedIssued::IdentifierReportedReadFailed(failure),
+            ) => Ok(Self::initial_identifier_reported_read_decode_failure(
                 id,
                 &wit_request,
                 attempt,
@@ -6918,9 +6935,9 @@ impl WasmProvider {
             DecodedInitialCreateCall::Verdict(wasm_convert::DecodedIssued::Decoded(verdict)) => Ok(
                 Self::initial_create_verdict(id, &wit_request, attempt, verdict),
             ),
-            DecodedInitialCreateCall::Verdict(wasm_convert::DecodedIssued::CreatedReadFailed(
-                failure,
-            )) => Ok(Self::initial_created_read_decode_failure(
+            DecodedInitialCreateCall::Verdict(
+                wasm_convert::DecodedIssued::IdentifierReportedReadFailed(failure),
+            ) => Ok(Self::initial_identifier_reported_read_decode_failure(
                 id,
                 &wit_request,
                 attempt,
@@ -6959,8 +6976,8 @@ impl WasmProvider {
                 Ok(wasm_convert::DecodedIssued::Decoded(step)) => {
                     Self::polled_create_step(starting, step)
                 }
-                Ok(wasm_convert::DecodedIssued::CreatedReadFailed(failure)) => {
-                    Self::polled_step_created_read_decode_failure(starting, failure)
+                Ok(wasm_convert::DecodedIssued::IdentifierReportedReadFailed(failure)) => {
+                    Self::polled_step_identifier_reported_read_decode_failure(starting, failure)
                 }
                 Err(error) => Self::preserve_polled_create(
                     starting,
@@ -6971,8 +6988,8 @@ impl WasmProvider {
                 Ok(wasm_convert::DecodedIssued::Decoded(verdict)) => {
                     Self::polled_create_verdict(starting, verdict)
                 }
-                Ok(wasm_convert::DecodedIssued::CreatedReadFailed(failure)) => {
-                    Self::polled_verdict_created_read_decode_failure(starting, failure)
+                Ok(wasm_convert::DecodedIssued::IdentifierReportedReadFailed(failure)) => {
+                    Self::polled_verdict_identifier_reported_read_decode_failure(starting, failure)
                 }
                 Err(error) => Self::preserve_polled_create(
                     starting,
@@ -7016,8 +7033,8 @@ impl WasmProvider {
                 Ok(wasm_convert::DecodedIssued::Decoded(step)) => {
                     Self::polled_resent_step(starting, step)
                 }
-                Ok(wasm_convert::DecodedIssued::CreatedReadFailed(failure)) => {
-                    Self::polled_resent_created_read_decode_failure(starting, failure)
+                Ok(wasm_convert::DecodedIssued::IdentifierReportedReadFailed(failure)) => {
+                    Self::polled_resent_identifier_reported_read_decode_failure(starting, failure)
                 }
                 Err(error) => {
                     let id = starting.id.clone();
@@ -7031,8 +7048,8 @@ impl WasmProvider {
                 Ok(wasm_convert::DecodedIssued::Decoded(verdict)) => {
                     Self::polled_resent_verdict(starting, verdict)
                 }
-                Ok(wasm_convert::DecodedIssued::CreatedReadFailed(failure)) => {
-                    Self::polled_resent_created_read_decode_failure(starting, failure)
+                Ok(wasm_convert::DecodedIssued::IdentifierReportedReadFailed(failure)) => {
+                    Self::polled_resent_identifier_reported_read_decode_failure(starting, failure)
                 }
                 Err(error) => {
                     let id = starting.id.clone();
@@ -8454,7 +8471,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v19_wit_surface_compiles() {
+    fn protocol_v20_wit_surface_compiles() {
         fn assert_type<T>() {}
 
         assert_type::<wit_types::ReferenceScopeValues>();
@@ -8527,7 +8544,9 @@ mod tests {
         )]
     }
 
-    fn decode_failed_create_step(id: &ResourceId) -> wasm_convert::CreatedReadDecodeFailure {
+    fn decode_failed_create_step(
+        id: &ResourceId,
+    ) -> wasm_convert::IdentifierReportedReadDecodeFailure {
         let step = wit_types::CreateStep::Success(wit_types::AppliedState {
             identifier: "decoded-created-id".to_string(),
             attributes: malformed_wit_attributes(),
@@ -8535,16 +8554,18 @@ mod tests {
         match wasm_convert::wit_to_core_create_step(step, id)
             .expect("the valid identifier makes the attribute failure recoverable")
         {
-            wasm_convert::DecodedIssued::CreatedReadFailed(failure) => failure,
+            wasm_convert::DecodedIssued::IdentifierReportedReadFailed(failure) => failure,
             wasm_convert::DecodedIssued::Decoded(_) => {
                 panic!("malformed attributes unexpectedly decoded")
             }
         }
     }
 
-    fn decode_failed_created_verdict(id: &ResourceId) -> wasm_convert::CreatedReadDecodeFailure {
+    fn decode_failed_identifier_reported_verdict(
+        id: &ResourceId,
+    ) -> wasm_convert::IdentifierReportedReadDecodeFailure {
         let error = ProviderError::internal("guest create failure");
-        let verdict = wit_types::PollVerdict::Created(wit_types::CreatedFailure {
+        let verdict = wit_types::PollVerdict::IdentifierReported(wit_types::CreateIdentified {
             identifier: "decoded-created-id".to_string(),
             read: wit_types::Observation::Read(wit_types::ReadOutcome::Found(
                 wit_types::AppliedState {
@@ -8558,21 +8579,24 @@ mod tests {
         match wasm_convert::wit_to_core_poll_verdict(verdict, id)
             .expect("the valid identifier makes the observation failure recoverable")
         {
-            wasm_convert::DecodedIssued::CreatedReadFailed(failure) => failure,
+            wasm_convert::DecodedIssued::IdentifierReportedReadFailed(failure) => failure,
             wasm_convert::DecodedIssued::Decoded(_) => {
                 panic!("malformed observation unexpectedly decoded")
             }
         }
     }
 
-    fn assert_created_after_decode_failure(progress: CreateProgress) {
+    fn assert_identifier_reported_after_decode_failure(progress: CreateProgress) {
         let CreateProgress::Verdict(failure) = progress else {
-            panic!("post-identifier decode failure must be a created verdict")
+            panic!("post-identifier decode failure must be an identifier-reported verdict")
         };
         match failure.into_kind() {
-            CreateFailureKind::Created { created, error: _ } => {
-                assert_eq!(created.identifier().as_str(), "decoded-created-id");
-                match created.observation() {
+            CreateFailureKind::IdentifierReported {
+                identified,
+                error: _,
+            } => {
+                assert_eq!(identified.identifier().as_str(), "decoded-created-id");
+                match identified.observation() {
                     CreateObservation::Observed(state) => {
                         panic!("decode failure became an observed create: {state:?}")
                     }
@@ -8586,8 +8610,8 @@ mod tests {
                     },
                 }
             }
-            CreateFailureKind::Untracked(error) => {
-                panic!("post-identifier decode failure became untracked: {error}")
+            CreateFailureKind::NoResource(error) => {
+                panic!("post-identifier decode failure became not_created: {error}")
             }
             CreateFailureKind::OutcomeUnknown { unknown, error } => {
                 panic!(
@@ -8601,14 +8625,17 @@ mod tests {
         }
     }
 
-    fn assert_created_after_resume_decode_failure(progress: ResumeProgress) {
+    fn assert_identifier_reported_after_resume_decode_failure(progress: ResumeProgress) {
         let ResumeProgress::Verdict(failure) = progress else {
-            panic!("post-identifier resume decode failure must be a created verdict")
+            panic!("post-identifier resume decode failure must be an identifier-reported verdict")
         };
         match failure.into_kind() {
-            ResumeFailureKind::Created { created, error: _ } => {
-                assert_eq!(created.identifier().as_str(), "decoded-created-id");
-                match created.observation() {
+            ResumeFailureKind::IdentifierReported {
+                identified,
+                error: _,
+            } => {
+                assert_eq!(identified.identifier().as_str(), "decoded-created-id");
+                match identified.observation() {
                     CreateObservation::Observed(state) => {
                         panic!("resume decode failure became an observed create: {state:?}")
                     }
@@ -8622,8 +8649,8 @@ mod tests {
                     },
                 }
             }
-            ResumeFailureKind::Ended(error) => {
-                panic!("post-identifier resume decode failure ended the record: {error}")
+            ResumeFailureKind::NoResource(error) => {
+                panic!("post-identifier resume decode failure became no-resource: {error}")
             }
             ResumeFailureKind::InFlight { error, .. } => {
                 panic!("post-identifier resume decode failure stayed in flight: {error}")
@@ -8760,13 +8787,13 @@ mod tests {
                     } => pending.into_fresh().unwrap_or_else(|_| {
                         panic!("fixture provider returned a persisted continuation")
                     }),
-                    CreateFailureKind::Created {
-                        created: _created,
+                    CreateFailureKind::IdentifierReported {
+                        identified: _identified,
                         error,
                     } => {
-                        panic!("fixture create was created: {error}")
+                        panic!("fixture create was classified identifier-reported: {error}")
                     }
-                    CreateFailureKind::Untracked(error) => {
+                    CreateFailureKind::NoResource(error) => {
                         panic!("fixture create was not pending: {error}")
                     }
                     CreateFailureKind::OutcomeUnknown { unknown, error } => {
@@ -8933,8 +8960,8 @@ mod tests {
                     }
                     assert!(!error.to_string().is_empty());
                 }
-                CreateFailureKind::Untracked(error) => {
-                    panic!("issued create was downgraded to untracked: {error}")
+                CreateFailureKind::NoResource(error) => {
+                    panic!("issued create was downgraded to not_created: {error}")
                 }
                 CreateFailureKind::OutcomeUnknown { unknown, error } => {
                     panic!(
@@ -8942,10 +8969,10 @@ mod tests {
                         unknown.id()
                     )
                 }
-                CreateFailureKind::Created { created, error } => {
+                CreateFailureKind::IdentifierReported { identified, error } => {
                     panic!(
-                        "invalid boundary response was accepted as created for {}: {error}",
-                        created.identifier()
+                        "invalid boundary response was accepted as identifier-reported for {}: {error}",
+                        identified.identifier()
                     )
                 }
             },
@@ -8968,13 +8995,13 @@ mod tests {
                     assert_eq!(&pending, expected);
                     assert!(!error.to_string().is_empty());
                 }
-                ResumeFailureKind::Ended(error) => {
-                    panic!("issued resume was incorrectly ended: {error}")
+                ResumeFailureKind::NoResource(error) => {
+                    panic!("issued resume was incorrectly classified no-resource: {error}")
                 }
-                ResumeFailureKind::Created { created, error } => {
+                ResumeFailureKind::IdentifierReported { identified, error } => {
                     panic!(
-                        "invalid resume boundary response was accepted as created for {}: {error}",
-                        created.identifier()
+                        "invalid resume boundary response was accepted as identifier-reported for {}: {error}",
+                        identified.identifier()
                     )
                 }
             },
@@ -9459,7 +9486,7 @@ mod tests {
         let expected_id = starting.id.clone();
         let expected_started_at = starting.pending.started_at().clone();
         let verdict: wasm_convert::DecodedPollVerdict =
-            proto::PollVerdict::Untracked(ProviderError::internal("untracked"));
+            proto::PollVerdict::NotCreated(ProviderError::internal("not_created"));
         assert_original_polled_record(
             WasmProvider::polled_create_verdict(starting, verdict),
             &expected_id,
@@ -9470,7 +9497,7 @@ mod tests {
         let expected_id = starting.id.clone();
         let expected_started_at = starting.pending.started_at().clone();
         let verdict: wasm_convert::DecodedPollVerdict =
-            proto::PollVerdict::Undetermined(ProviderError::internal("undetermined"));
+            proto::PollVerdict::Unchanged(ProviderError::internal("unchanged"));
         assert_original_polled_record(
             WasmProvider::polled_create_verdict(starting, verdict),
             &expected_id,
@@ -9525,22 +9552,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_decode_failure_after_identifier_is_created_not_untracked() {
+    async fn poll_decode_failure_after_identifier_is_identifier_reported_not_no_resource() {
         let starting = pending_create_with_issued_identifier().await;
         let failure = decode_failed_create_step(&starting.id);
-        assert_created_after_decode_failure(WasmProvider::polled_step_created_read_decode_failure(
-            starting, failure,
-        ));
+        assert_identifier_reported_after_decode_failure(
+            WasmProvider::polled_step_identifier_reported_read_decode_failure(starting, failure),
+        );
 
         let starting = pending_create_with_issued_identifier().await;
-        let failure = decode_failed_created_verdict(&starting.id);
-        assert_created_after_decode_failure(
-            WasmProvider::polled_verdict_created_read_decode_failure(starting, failure),
+        let failure = decode_failed_identifier_reported_verdict(&starting.id);
+        assert_identifier_reported_after_decode_failure(
+            WasmProvider::polled_verdict_identifier_reported_read_decode_failure(starting, failure),
         );
     }
 
     #[tokio::test]
-    async fn resume_decode_failure_after_identifier_is_created_not_ended() {
+    async fn resume_decode_failure_after_identifier_is_identifier_reported_not_no_resource() {
         let (id, _wit_id, wit_request) = boundary_resource();
         let starting = persisted_resume_with_issued_identifier();
         let resume = resume_witness(starting).await;
@@ -9551,21 +9578,25 @@ mod tests {
         let failure = match wasm_convert::wit_to_core_resume_step(step, &id)
             .expect("the valid identifier makes the attribute failure recoverable")
         {
-            wasm_convert::DecodedIssued::CreatedReadFailed(failure) => failure,
+            wasm_convert::DecodedIssued::IdentifierReportedReadFailed(failure) => failure,
             wasm_convert::DecodedIssued::Decoded(_) => {
                 panic!("malformed attributes unexpectedly decoded")
             }
         };
 
-        let progress =
-            WasmProvider::resumed_created_read_decode_failure(id, wit_request, resume, failure);
-        assert_created_after_resume_decode_failure(progress);
+        let progress = WasmProvider::resumed_identifier_reported_read_decode_failure(
+            id,
+            wit_request,
+            resume,
+            failure,
+        );
+        assert_identifier_reported_after_resume_decode_failure(progress);
 
         let (id, _wit_id, wit_request) = boundary_resource();
         let starting = persisted_resume_with_issued_identifier();
         let resume = resume_witness(starting).await;
         let declared_error = ProviderError::internal("guest resume failure");
-        let verdict = wit_types::ResumeVerdict::Created(wit_types::ResumedFailure {
+        let verdict = wit_types::ResumeVerdict::IdentifierReported(wit_types::ResumeIdentified {
             identifier: "decoded-created-id".to_string(),
             read: wit_types::Observation::Read(wit_types::ReadOutcome::Found(
                 wit_types::AppliedState {
@@ -9578,14 +9609,18 @@ mod tests {
         let failure = match wasm_convert::wit_to_core_resume_verdict(verdict, &id)
             .expect("the valid identifier makes the verdict observation failure recoverable")
         {
-            wasm_convert::DecodedIssued::CreatedReadFailed(failure) => failure,
+            wasm_convert::DecodedIssued::IdentifierReportedReadFailed(failure) => failure,
             wasm_convert::DecodedIssued::Decoded(_) => {
                 panic!("malformed resume verdict observation unexpectedly decoded")
             }
         };
-        let progress =
-            WasmProvider::resumed_created_read_decode_failure(id, wit_request, resume, failure);
-        assert_created_after_resume_decode_failure(progress);
+        let progress = WasmProvider::resumed_identifier_reported_read_decode_failure(
+            id,
+            wit_request,
+            resume,
+            failure,
+        );
+        assert_identifier_reported_after_resume_decode_failure(progress);
     }
 
     #[tokio::test]
@@ -9594,7 +9629,7 @@ mod tests {
         let starting = persisted_resume_with_issued_identifier();
         let resume = resume_witness(starting.clone()).await;
         let verdict: wasm_convert::DecodedResumeVerdict =
-            proto::ResumeVerdict::Untracked(ProviderError::internal("untracked"));
+            proto::ResumeVerdict::NotCreated(ProviderError::internal("not_created"));
         assert_original_resumed_record(
             WasmProvider::resumed_create_verdict(
                 id,
@@ -9610,7 +9645,7 @@ mod tests {
         let starting = persisted_resume_with_issued_identifier();
         let resume = resume_witness(starting.clone()).await;
         let verdict: wasm_convert::DecodedResumeVerdict =
-            proto::ResumeVerdict::Undetermined(ProviderError::internal("undetermined"));
+            proto::ResumeVerdict::Unchanged(ProviderError::internal("unchanged"));
         assert_original_resumed_record(
             WasmProvider::resumed_create_verdict(
                 id,

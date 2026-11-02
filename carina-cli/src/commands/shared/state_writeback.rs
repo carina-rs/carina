@@ -18,8 +18,8 @@ use carina_core::plan::{Plan, ReplaceDisplayInfo, ReplacementPreviousAttributesF
 #[cfg(test)]
 use carina_core::provider::SentRecord;
 use carina_core::provider::{
-    AppliedIdentifier, ComparisonResolutionError, InFlightCreate, InFlightPersistence,
-    ObservedCreate, PersistedAttributes, ProviderRouter, ResolvedComparisonTable,
+    AppliedIdentifier, ComparisonResolutionError, IdentifiedCreate, InFlightCreate,
+    InFlightPersistence, PersistedAttributes, ProviderRouter, ResolvedComparisonTable,
     UnknownCreateOutcome,
 };
 use carina_core::resource::{
@@ -856,7 +856,7 @@ enum UpsertSource<'a> {
         state: &'a SnapshotState,
         request: &'a AcceptedRequest,
     },
-    Observed(&'a ObservedCreate),
+    Observed(&'a IdentifiedCreate),
     CreateInFlight(&'a InFlightCreate),
     Imported(&'a SnapshotState),
     CurrentPresent(&'a SnapshotState),
@@ -870,7 +870,7 @@ impl<'a> UpsertSource<'a> {
     fn created_identifier(&self) -> Option<&str> {
         match self {
             Self::Complete { state, .. } | Self::Imported(state) => state.identifier.as_deref(),
-            Self::Observed(created) => Some(created.identifier().as_str()),
+            Self::Observed(identified) => Some(identified.identifier().as_str()),
             Self::CreateInFlight(pending) => pending.identifier().map(|value| value.as_str()),
             Self::CurrentPresent(_state) => None,
             Self::CurrentCreateInFlight(_pending) => None,
@@ -883,7 +883,7 @@ impl<'a> UpsertSource<'a> {
     fn is_create_result(&self) -> bool {
         match self {
             Self::Complete { .. } => true,
-            Self::Observed(_created) => true,
+            Self::Observed(_identified) => true,
             Self::CreateInFlight(pending) => {
                 matches!(pending.persistence(), InFlightPersistence::Fresh(_))
             }
@@ -898,7 +898,7 @@ impl<'a> UpsertSource<'a> {
 
     fn preserves_row_after_delete(&self) -> bool {
         match self {
-            Self::Observed(_created) => true,
+            Self::Observed(_identified) => true,
             Self::CreateInFlight(_pending) => true,
             Self::CurrentCreateInFlight(_pending) => true,
             Self::CreateOutcomeUnknown(_unknown) => true,
@@ -1478,7 +1478,9 @@ fn decompose_with_moved_origins<'a, S>(
             Applied::Complete { state, request } => {
                 wb.add_upsert(resource, UpsertSource::Complete { state, request })
             }
-            Applied::Observed(created) => wb.add_upsert(resource, UpsertSource::Observed(created)),
+            Applied::Observed(identified) => {
+                wb.add_upsert(resource, UpsertSource::Observed(identified))
+            }
             Applied::CreateInFlight(pending) => {
                 wb.add_upsert(resource, UpsertSource::CreateInFlight(pending))
             }
@@ -1737,9 +1739,9 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
                             AppError::from_resource_state_encoding(id.clone(), source)
                         })?
                     }
-                    UpsertSource::Observed(created) => ResourceState::from_observation(
+                    UpsertSource::Observed(identified) => ResourceState::from_observation(
                         resource,
-                        created,
+                        identified,
                         existing,
                         schema,
                         preferred_hashes,
@@ -2675,12 +2677,12 @@ mod apply_state_save_tests {
         ))))
     }
 
-    fn observed_create(
+    fn identified_create(
         id: &ResourceId,
         attributes: HashMap<String, Value>,
         sent: carina_core::provider::Sent,
-    ) -> carina_core::provider::ObservedCreate {
-        crate::fixture_observed_create(id, attributes, sent)
+    ) -> carina_core::provider::IdentifiedCreate {
+        crate::fixture_identified_create(id, attributes, sent)
     }
 
     #[test]
@@ -2835,7 +2837,7 @@ mod apply_state_save_tests {
                 .with_identifier("complete-id"),
             ),
             ReplacementAppliedKind::Observed => Applied::Observed(
-                observed_create(
+                identified_create(
                     &id,
                     HashMap::from([(
                         "name".to_string(),
@@ -3992,14 +3994,14 @@ mod apply_state_save_tests {
         schemas: &SchemaRegistry,
     ) -> StateFile {
         let id = resource.id.clone();
-        let created = observed_create(&id, observed_attributes, sent);
+        let identified = identified_create(&id, observed_attributes, sent);
         build_state_after_apply(
             ApplyStateSave {
                 state_file: StateFile::new(),
                 sorted_resources: std::slice::from_ref(&resolved(resource.clone())),
                 runtime_synthesized_resources: &[],
                 managed_current: &HashMap::new(),
-                applied_states: &HashMap::from([(id, Applied::Observed(created.into()))]),
+                applied_states: &HashMap::from([(id, Applied::Observed(identified.into()))]),
                 plan: &Plan::new(),
                 successfully_deleted: &HashSet::new(),
                 failed_refreshes: &HashSet::new(),

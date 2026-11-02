@@ -735,8 +735,8 @@ fn assert_moved_deposed_generation_is_retained(scenario: &Scenario) {
 #[test]
 fn moved_create_ended_keeps_deposed_generation_when_delete_is_blocked() {
     let scenario = moved_pending_replacement_fixture();
-    let output = scenario.apply_with_modes("success", "discarded");
-    assert_failed("moved ended resume", &output);
+    let output = scenario.apply_with_modes("success", "no_resource");
+    assert_failed("moved no-resource resume", &output);
 
     let rendered = combined_output(&output);
     assert!(
@@ -750,7 +750,11 @@ fn moved_create_ended_keeps_deposed_generation_when_delete_is_blocked() {
 #[test]
 fn moved_observed_resume_results_keep_deposed_generation_until_delete_succeeds() {
     for (resume_mode, label, delete_runs) in [
-        ("created_read_failed", "created", false),
+        (
+            "identifier_reported_read_failed",
+            "identifier_reported",
+            false,
+        ),
         ("resumed", "resumed", true),
     ] {
         let scenario = moved_pending_replacement_fixture();
@@ -941,7 +945,7 @@ fn replacement_create_in_flight_keeps_deposed_generation_until_resume() {
 }
 
 #[test]
-fn discarded_resume_clears_only_current_and_keeps_deposed_generation() {
+fn no_resource_resume_clears_only_current_and_keeps_deposed_generation() {
     let scenario = Scenario::new(
         r#"let pending = mock.test.resource {
   name = "before-discard"
@@ -964,15 +968,15 @@ fn discarded_resume_clears_only_current_and_keeps_deposed_generation() {
         &scenario.apply_with_modes("pending", "resumed"),
     );
 
-    let discarded = scenario.apply_with_modes("success", "discarded");
-    assert_failed("discarded resume apply", &discarded);
+    let no_resource = scenario.apply_with_modes("success", "no_resource");
+    assert_failed("no_resource resume apply", &no_resource);
     let state = scenario.state_json();
     let row = only_resource(&state);
     assert_eq!(row["current"]["kind"], "none");
     assert_eq!(
         row["deposed"]
             .as_array()
-            .expect("discarded replacement must retain its old generation")
+            .expect("no_resource replacement must retain its old generation")
             .len(),
         1,
         "only the provider-ended current slot may be cleared"
@@ -983,17 +987,17 @@ fn discarded_resume_clears_only_current_and_keeps_deposed_generation() {
             "plan",
             "--refresh=false",
             "--out",
-            "discarded-next-plan.json",
+            "no_resource-next-plan.json",
             ".",
         ])
         .output()
-        .expect("run plan after discarded resume");
-    assert_success("plan after discarded resume", &plan_output);
+        .expect("run plan after no_resource resume");
+    assert_success("plan after no_resource resume", &plan_output);
     let plan: PlanFile = serde_json::from_str(
-        &fs::read_to_string(scenario.project.join("discarded-next-plan.json"))
-            .expect("read plan after discarded resume"),
+        &fs::read_to_string(scenario.project.join("no_resource-next-plan.json"))
+            .expect("read plan after no_resource resume"),
     )
-    .expect("decode plan after discarded resume");
+    .expect("decode plan after no_resource resume");
     assert_eq!(
         plan.plan
             .effects()
@@ -1021,10 +1025,10 @@ fn discarded_resume_clears_only_current_and_keeps_deposed_generation() {
 }
 
 #[test]
-fn issued_untracked_resume_stays_in_flight() {
+fn issued_not_created_resume_stays_in_flight() {
     let scenario = Scenario::new(
         r#"let pending = mock.test.resource {
-  name = "issued-untracked"
+  name = "issued-not_created"
 }"#,
     );
     scenario.init();
@@ -1040,20 +1044,21 @@ fn issued_untracked_resume_stays_in_flight() {
         Value::String("mock-id".to_string());
     scenario.write_state_json(&state);
 
-    let resumed = scenario.apply_with_modes("success", "untracked");
-    assert_failed("issued untracked resume", &resumed);
+    let resumed = scenario.apply_with_modes("success", "not_created");
+    assert_failed("issued not_created resume", &resumed);
     let state = scenario.state_json();
     let current = only_current(&state);
     assert_eq!(current["kind"], "create_in_flight");
     assert_eq!(current["envelope"]["identifier"], "mock-id");
 
-    let (output, plan, _raw) = scenario.save_plan(false, "issued-untracked-next.json");
-    assert_success("plan after issued untracked resume", &output);
+    let (output, plan, _raw) = scenario.save_plan(false, "issued-not_created-next.json");
+    assert_success("plan after issued not_created resume", &output);
     assert_resume_only(&plan);
 }
 
 #[test]
-fn created_read_failed_resume_marks_unknowns_without_replacing_or_regenerating_prefix() {
+fn identifier_reported_read_failed_resume_marks_unknowns_without_replacing_or_regenerating_prefix()
+{
     let scenario = Scenario::new(
         r#"let pending = mock.test.resource {
   name_prefix = "resume-read-failed-"
@@ -1065,8 +1070,8 @@ fn created_read_failed_resume_marks_unknowns_without_replacing_or_regenerating_p
         &scenario.apply_with_modes("pending", "resumed"),
     );
 
-    let resumed = scenario.apply_with_modes("success", "created_read_failed");
-    assert_failed("created with failed read resume", &resumed);
+    let resumed = scenario.apply_with_modes("success", "identifier_reported_read_failed");
+    assert_failed("identifier-reported with failed read resume", &resumed);
     let state = scenario.state_json();
     let current = only_current(&state);
     assert_eq!(current["kind"], "applied");

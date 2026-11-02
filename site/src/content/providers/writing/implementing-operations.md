@@ -221,10 +221,10 @@ fn create(
     request: CreateRequest,
     attempt: CreateAttempt,
 ) -> Result<CreateStep<CreateToken>, CreateVerdict<CreateToken>> {
-    // Nothing has been sent yet, so a bad request is untracked.
+    // Nothing has been sent yet, so a bad request is not-created.
     let (name, size) = match desired(&request.resource) {
         Ok(values) => values,
-        Err(err) => return Err(attempt.untracked(err)),
+        Err(err) => return Err(attempt.not_created(err)),
     };
     let client_token = self.api.new_client_token();
     match self.api.start_create(&client_token, &name, size) {
@@ -235,7 +235,7 @@ fn create(
         )),
         // The API said no: nothing exists.
         Err(err @ ApiError::Rejected(_)) => {
-            Err(attempt.untracked(api_error("widget.Create", err)))
+            Err(attempt.not_created(api_error("widget.Create", err)))
         }
         // The request may have been accepted. Keep the attempt and
         // retry it with the same client token in poll_create.
@@ -248,7 +248,7 @@ fn create(
 }
 ```
 
-The three outcomes follow the rules from the Overview. Bad input is found before anything is sent, so it is `untracked`, and so is an explicit rejection from the API. When the call fails in a way that does not say whether the API accepted it, the provider cannot know whether a widget exists. Reporting `untracked` there could leave a widget that Carina has forgotten, so the provider returns `pending` with the client token and retries the call in `poll_create`.
+The three outcomes follow the rules from the Overview. `not-created` means nothing was created: no request left the provider, or the cloud rejected it without creating anything. Both bad input found locally and an explicit rejection from the API qualify. The attempt is unissued because no identifier has been reported, even if a request was sent. When the call fails in a way that does not say whether the API accepted it, the provider cannot know whether a widget exists. Reporting `not-created` there could leave a widget that Carina has forgotten, so the provider returns `pending` with the client token and retries the call in `poll_create`.
 
 `Sent::AllRequestAttributes` says that the request carried every attribute in the create request. If your API takes some attributes in a later call, name only the ones the create call carried, with `Sent::only([...])`.
 
@@ -321,7 +321,7 @@ fn poll_create(
             return match self.read_found(id, issued.identifier()) {
                 Ok(ReadOutcome::Found { state }) => Ok(issued.succeeded(state.attributes)),
                 Ok(outcome) => Err(issued
-                    .failed(
+                    .identifier_reported(
                         Observation::Read(outcome),
                         error(ProviderErrorKind::ApiError, "widget vanished after create"),
                     )
@@ -417,7 +417,7 @@ fn poll_create(
                         Err(err) => Observation::ReadFailed(err),
                     };
                     Err(issued
-                        .failed(observation, error(ProviderErrorKind::ApiError, reason))
+                        .identifier_reported(observation, error(ProviderErrorKind::ApiError, reason))
                         .into())
                 }
                 Err(err) => Err(attempt.preserve(
@@ -427,7 +427,7 @@ fn poll_create(
                 )),
             },
             Ok(CreateStatus::Failed { id: None, reason }) => {
-                Err(attempt.untracked(error(ProviderErrorKind::ApiError, reason)))
+                Err(attempt.not_created(error(ProviderErrorKind::ApiError, reason)))
             }
             // The status call failed; the operation is still there.
             Err(_) => Ok(attempt.pending(CreateOperation::OperationId(operation), 5)),
@@ -438,19 +438,19 @@ fn poll_create(
 
 A `Starting` token retries the create with the same client token. Because the API treats the retry as the same request, it either starts the create now or returns the operation the first call started, so the provider does not create a second widget or claim one it did not create. That holds only while the API still remembers the client token; many APIs forget idempotency keys after a day or so.
 
-A rejected retry is `preserve`, not `untracked`. The first call may have created the widget, and the API can refuse the reused token for reasons of its own, for example because the configuration changed before a later apply resumed the create. `preserve` carries the same continuation plus the error, so Carina keeps the attempt while surfacing why this poll stopped. Any other failure keeps the attempt pending.
+A rejected retry is `preserve`, not `not-created`. The first call may have created the widget, and the API can refuse the reused token for reasons of its own, for example because the configuration changed before a later apply resumed the create. `preserve` carries the same continuation plus the error, so Carina keeps the attempt while surfacing why this poll stopped. Any other failure keeps the attempt pending.
 
 When the operation finishes, the provider calls `attempt.issued(identifier)`. On an ordinary poll it returns `pending(CreateToken::ReadBack, ..)`, which records the identifier, starts the host's read-back budget, and makes the next poll go to the `Poll::Issued` arm. If the operation completes on the final attempt, the example settles with `partial` immediately, preserving the identifier for the next refresh.
 
 `poll_request.finality` is `Continue` on ordinary polls and `FinalAttempt` on the one poll at the active deadline. Its rule follows the continuation the host sent: pending after a final attempt sent to the `Poll::Unissued` operation-phase continuation is over budget, even if that result starts read-back; pending in either phase after a final attempt sent to the `Poll::Issued` read-back continuation is a protocol violation. Returning from read-back to operation is always a violation. The example also returns `partial` when the issued read-back receives the final attempt and still cannot read the widget. Neither final-attempt branch has observed attributes, so both return an empty map and mark the unread attributes as missing.
 
-`resume_create` receives the same poll request when Carina resumes a persisted continuation. SDK dispatch rejects only the backward phase pairing: host progress is read-back while the token is operation-phase. For create poll and resume this returns `Undetermined` and keeps the previous continuation; update decoding rejects the same backward pairing. Operation progress with a read-back token is accepted when an identifier is available. This includes the first resume call: the host supplies `operating` because state has no phase metadata, and a saved read-back token can use the identifier-bearing handle to read from a fresh provider instance. Its next pending or preserved result reports read-back progress. A read-back token without an identifier ends create polling with `READ_BACK_WITHOUT_IDENTIFIER`.
+`resume_create` receives the same poll request when Carina resumes a persisted continuation. SDK dispatch rejects only the backward phase pairing: host progress is read-back while the token is operation-phase. For create poll and resume this returns `unchanged` and keeps the previous continuation; update decoding rejects the same backward pairing. Operation progress with a read-back token is accepted when an identifier is available. This includes the first resume call: the host supplies `operating` because state has no phase metadata, and a saved read-back token can use the identifier-bearing handle to read from a fresh provider instance. Its next pending or preserved result reports read-back progress. A read-back token without an identifier ends create polling with `READ_BACK_WITHOUT_IDENTIFIER`.
 
 On the wire, create and resume use `create-progress`: `operating(option<string>)` while the mutation is in progress, or `reading-back(string)` once it has completed. Read-back therefore always carries an identifier. Updates carry their phase in `pending-update`; their request already includes the identifier.
 
-A create for which the provider reported an identifier is `failed` with that identifier, so Carina records the identifier plus only observed or sent values, and the next plan re-checks it. `failed` also takes an `Observation`: what the provider saw when it read the widget, either `Observation::Read` with the read outcome or `Observation::ReadFailed` with the read error. The observation passed to `failed` says whether the resource was found and supplies any observed state Carina can record. `failed` returns a `CreateVerdict<CreateToken>`, and `.into()` turns it into the `PollVerdict<CreateToken>` that `poll_create` returns.
+A create for which the provider reported an identifier is `identifier_reported` with that identifier, so Carina records the identifier plus only observed or sent values, and the next plan re-checks it. `identifier_reported` also takes an `Observation`: what the provider saw when it read the widget, either `Observation::Read` with the read outcome or `Observation::ReadFailed` with the read error. The observation passed to `identifier_reported` says whether the resource was found and supplies any observed state Carina can record. `identifier_reported` returns a `CreateVerdict<CreateToken>`, and `.into()` turns it into the `PollVerdict<CreateToken>` that `poll_create` returns.
 
-`discarded` is not used here. It reports that the provider deleted the resource it had just created, so Carina keeps no record of it. A create that failed without producing a widget is `untracked`. When the status call itself fails, the operation is still there, so the provider polls again. When a provider call has a usable continuation but also needs to report an error, `preserve` returns the error-bearing in-flight verdict. Provider code does not produce `undetermined`; guest transport glue reserves that wire arm for a request or token it cannot decode, when it has no newer continuation to return.
+`no_resource` is not used here. It reports the `no-resource` wire verdict when the provider knows no cloud resource remains, so Carina keeps no record of it. A create that failed without producing a widget is `not-created`. After an identifier is reported, `identifier_reported` retains it together with a read-back observation, which may find the resource, return not found, or fail. When the status call itself fails, the operation is still there, so the provider polls again. When a provider call has a usable continuation but also needs to report an error, `preserve` returns the error-bearing `in-flight` verdict. Provider code does not produce `unchanged`; guest transport glue reserves that wire arm for a request or token it cannot decode, when it has no newer continuation to return.
 
 ## resume_create
 
@@ -470,7 +470,7 @@ fn resume_create(
             Ok(ReadOutcome::Found { state }) => {
                 Ok(resumed.completed(carina_plugin_sdk::FoundRead::from_applied_state(state)))
             }
-            Ok(outcome) => Err(resumed.failed(
+            Ok(outcome) => Err(resumed.identifier_reported(
                 Observation::Read(outcome),
                 error(ProviderErrorKind::ApiError, "widget vanished during create"),
             )),
