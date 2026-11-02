@@ -3228,11 +3228,9 @@ fn legacy_row_stable_identity_matches(
             find_state_by_binding,
         )?;
         return Ok(
-            match desired_identity.compare_row(
-                &state_entry.identity_values,
-                schema,
-                &comparison.context().observation(),
-            ) {
+            match comparison.context().with_observation(|observation| {
+                desired_identity.compare_row(&state_entry.identity_values, schema, observation)
+            })? {
                 DeclaredIdentityRowOutcome::Match => Some(true),
                 DeclaredIdentityRowOutcome::Mismatch => Some(false),
                 DeclaredIdentityRowOutcome::Undecidable(
@@ -3255,11 +3253,14 @@ fn legacy_row_stable_identity_matches(
     if state_entry.create_only_values.is_empty() {
         return Ok(None);
     }
-    let (create_only_count, create_only_matches) = desired_create_only.resolved_subset_match(
-        state_entry.create_only_values(),
-        schema.as_schema(),
-        &comparison.context().observation(),
-    );
+    let (create_only_count, create_only_matches) =
+        comparison.context().with_observation(|observation| {
+            desired_create_only.resolved_subset_match(
+                state_entry.create_only_values(),
+                schema.as_schema(),
+                observation,
+            )
+        })?;
     Ok((create_only_count > 0).then_some(create_only_matches))
 }
 
@@ -3989,6 +3990,8 @@ pub enum AnonymousIdentifierReconciliationError {
     /// The initialized provider comparison context was unavailable.
     #[error(transparent)]
     Comparison(#[from] ComparisonResolutionError),
+    #[error(transparent)]
+    SecretComparison(#[from] crate::differ::ComparisonError),
     /// Resolving a desired identity selected historical secret evidence.
     #[error(transparent)]
     UnavailableSecret(#[from] crate::resource::UnavailableSecretError),
@@ -4136,16 +4139,18 @@ pub fn reconcile_anonymous_identifiers(
                 validated_schema,
                 find_state_by_binding,
             )?;
-            let candidate_outcomes = available_candidates
-                .map(|entry| {
-                    let outcome = desired_identity.compare_row(
-                        &entry.identity_values,
-                        validated_schema,
-                        &comparison.context().observation(),
-                    );
-                    (entry, outcome)
-                })
-                .collect::<Vec<_>>();
+            let candidate_outcomes = comparison.context().with_observation(|observation| {
+                available_candidates
+                    .map(|entry| {
+                        let outcome = desired_identity.compare_row(
+                            &entry.identity_values,
+                            validated_schema,
+                            observation,
+                        );
+                        (entry, outcome)
+                    })
+                    .collect::<Vec<_>>()
+            })?;
 
             let mut unknown_override_rows = candidate_outcomes
                 .iter()
@@ -4281,11 +4286,9 @@ pub fn reconcile_anonymous_identifiers(
                 continue;
             }
 
-            let (matched, mismatched) = resource_co_values.match_counts(
-                entry.create_only_values(),
-                schema,
-                &comparison.context().observation(),
-            );
+            let (matched, mismatched) = comparison.context().with_observation(|observation| {
+                resource_co_values.match_counts(entry.create_only_values(), schema, observation)
+            })?;
 
             if matched > 0 && mismatched == 0 {
                 full_matches.push(entry);
@@ -4533,26 +4536,28 @@ pub fn detect_anonymous_to_named_renames(
             DesiredCreateOnlyValues::from_resource(resource, schema, state_lookup.find_by_binding)?;
 
         let simhash_match = || {
-            let resource_hash =
-                compute_resource_simhash(resource, providers, identity_attributes_fn);
-            let candidates = state_entries
-                .candidates()
-                .filter(|entry| !used_in_dsl.contains(entry.name()))
-                .filter(|entry| !candidates.claimed_origins.contains(entry.origin_id()))
-                .filter(|entry| {
-                    let (_matched, mismatched) = resource_co_values.match_counts(
-                        entry.create_only_values(),
-                        schema,
-                        &comparison.context().observation(),
-                    );
-                    mismatched == 0
-                })
-                .filter_map(|entry| match extract_hash_from_identifier(entry.name()) {
-                    Some(AnonymousHashSuffix::SimHash(hash)) => Some((entry, hash)),
-                    _ => None,
-                });
-            closest_unique_simhash_match(resource_hash, candidates, |(_, hash)| hash)
-                .map(|(entry, _)| entry)
+            comparison.context().with_observation(|observation| {
+                let resource_hash =
+                    compute_resource_simhash(resource, providers, identity_attributes_fn);
+                let candidates = state_entries
+                    .candidates()
+                    .filter(|entry| !used_in_dsl.contains(entry.name()))
+                    .filter(|entry| !candidates.claimed_origins.contains(entry.origin_id()))
+                    .filter(|entry| {
+                        let (_matched, mismatched) = resource_co_values.match_counts(
+                            entry.create_only_values(),
+                            schema,
+                            observation,
+                        );
+                        mismatched == 0
+                    })
+                    .filter_map(|entry| match extract_hash_from_identifier(entry.name()) {
+                        Some(AnonymousHashSuffix::SimHash(hash)) => Some((entry, hash)),
+                        _ => None,
+                    });
+                closest_unique_simhash_match(resource_hash, candidates, |(_, hash)| hash)
+                    .map(|(entry, _)| entry)
+            })
         };
 
         let matched_entry: Option<&AnonymousIdStateInfo> = if resource_co_values
@@ -4569,11 +4574,9 @@ pub fn detect_anonymous_to_named_renames(
                 if extract_hash_from_identifier(anonymous_identity).is_none() {
                     continue;
                 }
-                let all_match = resource_co_values.all_match(
-                    entry.create_only_values(),
-                    schema,
-                    &comparison.context().observation(),
-                );
+                let all_match = comparison.context().with_observation(|observation| {
+                    resource_co_values.all_match(entry.create_only_values(), schema, observation)
+                })?;
                 if !all_match {
                     continue;
                 }
@@ -4586,7 +4589,7 @@ pub fn detect_anonymous_to_named_renames(
             if prior_claimed_matches.is_empty() {
                 match matches.as_slice() {
                     [entry] => Some(*entry),
-                    [] => simhash_match(),
+                    [] => simhash_match()?,
                     _ => None,
                 }
             } else {
@@ -4604,7 +4607,7 @@ pub fn detect_anonymous_to_named_renames(
             // comparison nor SimHash is safe enough to select a prior row.
             None
         } else {
-            simhash_match()
+            simhash_match()?
         };
 
         if let Some(entry) = matched_entry {

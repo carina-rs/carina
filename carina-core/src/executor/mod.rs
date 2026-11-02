@@ -32,10 +32,10 @@ pub use crate::data_source_value::UnresolvedDataSourceInput;
 pub use crate::effect::deps::UnresolvedResource;
 pub use provider_ready::{
     ModuleConstraintFailure, ModuleConstraintGate, ModuleConstraintGateError,
-    ProviderConfigPreparationError, ProviderConfigValidationError, ProviderPreparationContext,
-    ProviderPreparationError, ProviderReadyConfig, ProviderValueConstraintErrors,
-    prepare_create_request, prepare_provider_ready_config, prepare_provider_ready_data_source,
-    prepare_provider_ready_resource, prepare_update_request,
+    ModuleConstraintViolations, ProviderConfigPreparationError, ProviderConfigValidationError,
+    ProviderPreparationContext, ProviderPreparationError, ProviderReadyConfig,
+    ProviderValueConstraintErrors, prepare_create_request, prepare_provider_ready_config,
+    prepare_provider_ready_data_source, prepare_provider_ready_resource, prepare_update_request,
 };
 /// Phase of an executor scheduler endpoint after deferred replacements have
 /// been expanded.
@@ -1393,6 +1393,7 @@ pub enum FailureReport<'a, S> {
         context: FailureEventContext<'a>,
     },
     ModuleConstraint(Box<ModuleConstraintFailure>),
+    ModuleConstraintResolution(crate::module_resolver::ModuleConstraintResolutionError),
 }
 
 impl FailureSink {
@@ -1410,6 +1411,15 @@ impl FailureSink {
             FailureReport::ModuleConstraint(failure) => {
                 (EffectFailure::module_constraint(failure), None)
             }
+            FailureReport::ModuleConstraintResolution(error) => (
+                EffectFailure {
+                    endpoint: None,
+                    kind: EffectFailureKind::Execution {
+                        error: ReportedError::new(error),
+                    },
+                },
+                None,
+            ),
         };
         self.failures.push(failure);
         let recorded = RecordedFailure {
@@ -1826,12 +1836,19 @@ pub(super) fn record_effect_failure<S: Clone>(
 fn record_module_constraint_failure<S: Clone>(
     accumulator: &mut ExecutionAccumulator<S>,
     observer: &dyn ExecutionObserver<S>,
-    failure: ModuleConstraintFailure,
+    error: ModuleConstraintGateError,
 ) {
-    accumulator.mutate(|result| {
-        result
+    accumulator.mutate(|result| match error {
+        ModuleConstraintGateError::UnavailableSecret(error) => result
             .failures
-            .record(observer, FailureReport::ModuleConstraint(Box::new(failure)))
+            .record(observer, FailureReport::ModuleConstraintResolution(error)),
+        ModuleConstraintGateError::Violations(violations) => {
+            for failure in violations.into_failures() {
+                result
+                    .failures
+                    .record(observer, FailureReport::ModuleConstraint(Box::new(failure)));
+            }
+        }
     });
 }
 

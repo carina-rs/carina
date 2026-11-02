@@ -7415,6 +7415,51 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
 }
 
 #[test]
+fn deposed_encoders_return_unavailable_secret_errors() {
+    use carina_core::resource::{ConcreteValue, Resource, SnapshotValue};
+    let resource = resolved(&Resource::with_provider(
+        "mock",
+        "test.Resource",
+        "old",
+        None,
+    ));
+    let previous_json = HashMap::from([(
+        "password".into(),
+        structural_legacy_secret(&"ab".repeat(32)),
+    )]);
+    let previous = persisted_attributes_from_state_json(&previous_json);
+    let opaque = previous.get("password").unwrap();
+    let attributes = HashMap::from([(
+        "password".into(),
+        SnapshotValue::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "nested".into(),
+            opaque,
+        )]))),
+    )]);
+    let deposed = DeposedInstance::from_persisted_json(
+        DeposedKey::new_unique(),
+        "old-id".into(),
+        None,
+        previous_json,
+        PersistedDestroyDependencies::default(),
+    );
+    for result in [
+        deposed.refreshed_attributes_for_resource_and_schema(&resource, None, &attributes),
+        ResourceState::deposed_attributes_without_previous(
+            &resource,
+            None,
+            &attributes,
+            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&previous),
+        ),
+    ] {
+        let error = result.expect_err("unavailable material must be returned, not panic");
+        assert!(matches!(error, ResourceStateEncodingError::Serialization(
+            SerializationError::UnavailableSecret(ref error)
+        ) if error.path().ends_with(".nested")));
+    }
+}
+
+#[test]
 fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
     use carina_core::resource::{ConcreteValue, Resource, Value};
 
@@ -7433,7 +7478,8 @@ fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
-    );
+    )
+    .expect("deposed attributes must encode");
     let stored = state_json_from_persisted_attributes(stored.as_persisted());
     let password =
         structural_secret_digest(stored.get("password").expect("password remains stored"));
@@ -8252,7 +8298,8 @@ fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
-    );
+    )
+    .expect("deposed attributes must encode");
 
     let stored = state_json_from_persisted_attributes(stored.as_persisted());
     assert_eq!(stored.get("password"), Some(upgraded.as_json()));
@@ -8554,7 +8601,8 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
-    );
+    )
+    .expect("deposed attributes must encode");
     let stored_json = state_json_from_persisted_attributes(stored.as_persisted());
     let stored_tags = stored_json
         .get("tags")
@@ -8582,7 +8630,8 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&second_existing),
-    );
+    )
+    .expect("deposed attributes must encode");
     assert_eq!(
         stored_again.as_persisted().get("tags"),
         stored.as_persisted().get("tags")
@@ -8611,7 +8660,8 @@ fn lossy_state_json_drops_omitted_non_secret_sibling_but_keeps_missing_hash_leaf
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
-    );
+    )
+    .expect("deposed attributes must encode");
     let stored = state_json_from_persisted_attributes(stored.as_persisted());
     let stored_tags = stored
         .get("tags")
@@ -8678,7 +8728,8 @@ fn lossy_state_json_hashes_whole_array_when_secret_hash_alignment_is_untrusted()
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
-    );
+    )
+    .expect("deposed attributes must encode");
     let stored = state_json_from_persisted_attributes(stored.as_persisted());
     let stored_items = structural_secret_digest(
         stored

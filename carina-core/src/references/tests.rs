@@ -1360,6 +1360,9 @@ async fn missing_needed_witness_entry_is_typed_error_in_plan_and_binding_stabili
             )
         })
         .unwrap_err();
+    let crate::differ::ComparisonError::Reference(error) = error else {
+        panic!("expected typed reference comparison failure");
+    };
     assert!(matches!(error.source, ReferenceFailure::MissingWitness));
 
     assert!(
@@ -2321,23 +2324,26 @@ async fn round3_reference_list_writeback_preserves_authored_fields_across_alias_
         .router
         .comparison_for(&fixture.registry, &fixture.desired[0].id)
         .unwrap();
-    let carried = crate::explicit::build_carried_from_resource_for_stored_values(
-        fixture.desired[0].as_resource(),
-        &crate::test_support::available_attributes(
-            fixture.saved.get(&fixture.desired[0].id).unwrap().clone(),
-        ),
-        &prior,
-        &match fixture.current[&fixture.desired[0].id].current() {
-            Current::Present(current) => {
-                crate::test_support::available_attributes(current.state().attributes.clone())
-            }
-            _ => unreachable!(),
-        },
-        Some(comparison.owner_schema().schema().as_schema()),
-        &comparison
-            .context()
-            .authoring(Some(&references), &fixture.desired[0].id),
-    );
+    let carried = comparison
+        .context()
+        .with_authoring(Some(&references), &fixture.desired[0].id, |authoring| {
+            crate::explicit::build_carried_from_resource_for_stored_values(
+                fixture.desired[0].as_resource(),
+                &crate::test_support::available_attributes(
+                    fixture.saved.get(&fixture.desired[0].id).unwrap().clone(),
+                ),
+                &prior,
+                &match fixture.current[&fixture.desired[0].id].current() {
+                    Current::Present(current) => crate::test_support::available_attributes(
+                        current.state().attributes.clone(),
+                    ),
+                    _ => unreachable!(),
+                },
+                Some(comparison.owner_schema().schema().as_schema()),
+                authoring,
+            )
+        })
+        .expect("authoring comparison must succeed");
     let ExplicitFields::Struct { children } = carried else {
         panic!("resource authoring")
     };
@@ -2350,21 +2356,26 @@ async fn round3_reference_list_writeback_preserves_authored_fields_across_alias_
         "{elements:?}"
     );
     let calls_before = fixture.calls.lock().unwrap().len();
-    let fallback = crate::explicit::build_carried_from_resource_for_stored_values(
-        fixture.desired[0].as_resource(),
-        &crate::test_support::available_attributes(
-            fixture.saved.get(&fixture.desired[0].id).unwrap().clone(),
-        ),
-        &prior,
-        &match fixture.current[&fixture.desired[0].id].current() {
-            Current::Present(current) => {
-                crate::test_support::available_attributes(current.state().attributes.clone())
-            }
-            _ => unreachable!(),
-        },
-        Some(comparison.owner_schema().schema().as_schema()),
-        &comparison.context().authoring(None, &fixture.desired[0].id),
-    );
+    let fallback = comparison
+        .context()
+        .with_authoring(None, &fixture.desired[0].id, |authoring| {
+            crate::explicit::build_carried_from_resource_for_stored_values(
+                fixture.desired[0].as_resource(),
+                &crate::test_support::available_attributes(
+                    fixture.saved.get(&fixture.desired[0].id).unwrap().clone(),
+                ),
+                &prior,
+                &match fixture.current[&fixture.desired[0].id].current() {
+                    Current::Present(current) => crate::test_support::available_attributes(
+                        current.state().attributes.clone(),
+                    ),
+                    _ => unreachable!(),
+                },
+                Some(comparison.owner_schema().schema().as_schema()),
+                authoring,
+            )
+        })
+        .expect("authoring comparison must succeed");
     let ExplicitFields::Struct { children } = fallback else {
         panic!("resource authoring")
     };

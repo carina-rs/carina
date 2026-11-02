@@ -1257,7 +1257,7 @@ fn create_plan_parts(
                             prev_explicit: prev_explicit_for_resource,
                             schema: Some(schema),
                             context,
-                            observations: &resolved_comparison.context().observation(),
+                            observations: &context.observation(),
                         },
                         validated_schema,
                     )

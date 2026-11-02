@@ -317,19 +317,31 @@ impl<T> ResolvedCheckInput<T> {
     }
 }
 
-/// Aggregate returned by the module constraint gate.
+/// Resolution failures and evaluated violations remain distinct at every gate.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ModuleConstraintGateError {
+    #[error(transparent)]
+    UnavailableSecret(#[from] crate::module_resolver::ModuleConstraintResolutionError),
+    #[error(transparent)]
+    Violations(#[from] ModuleConstraintViolations),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModuleConstraintGateError {
+pub struct ModuleConstraintViolations {
     failures: Vec<ModuleConstraintFailure>,
 }
 
-impl ModuleConstraintGateError {
+impl ModuleConstraintViolations {
     pub fn failures(&self) -> &[ModuleConstraintFailure] {
         &self.failures
     }
+
+    pub fn into_failures(self) -> Vec<ModuleConstraintFailure> {
+        self.failures
+    }
 }
 
-impl fmt::Display for ModuleConstraintGateError {
+impl fmt::Display for ModuleConstraintViolations {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.failures.is_empty() {
             return f.write_str(
@@ -346,7 +358,7 @@ impl fmt::Display for ModuleConstraintGateError {
     }
 }
 
-impl std::error::Error for ModuleConstraintGateError {}
+impl std::error::Error for ModuleConstraintViolations {}
 
 /// Apply-time module constraint gate shared by one execution.
 ///
@@ -386,7 +398,8 @@ impl ModuleConstraintGate {
         bindings: &ResolvedBindings,
         terminal: bool,
         session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-    ) -> Vec<ModuleConstraintFailure> {
+    ) -> Result<Vec<ModuleConstraintFailure>, crate::module_resolver::ModuleConstraintResolutionError>
+    {
         match &self.compositions {
             ModuleConstraintCompositions::Live(compositions) => {
                 evaluate_live_pending_constraints(compositions, bindings, terminal, session)
@@ -413,7 +426,7 @@ impl ModuleConstraintGate {
         bindings: &ResolvedBindings,
         session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<(), ModuleConstraintGateError> {
-        let failures = self.evaluate(bindings, false, session);
+        let failures = self.evaluate(bindings, false, session)?;
         if failures.is_empty() {
             return Ok(());
         }
@@ -429,9 +442,10 @@ impl ModuleConstraintGate {
 
         // An empty diagnostic still returns Err: reporting suppression must
         // never turn a known violation into permission to call a provider.
-        Err(ModuleConstraintGateError {
+        Err(ModuleConstraintViolations {
             failures: new_failures,
-        })
+        }
+        .into())
     }
 
     /// Evaluate every remaining constraint at the end of apply.
@@ -451,7 +465,7 @@ impl ModuleConstraintGate {
         report_unresolved: bool,
         session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<(), ModuleConstraintGateError> {
-        let failures = self.evaluate(bindings, report_unresolved, session);
+        let failures = self.evaluate(bindings, report_unresolved, session)?;
         self.report_new(failures)
     }
 
@@ -470,7 +484,7 @@ impl ModuleConstraintGate {
         if failures.is_empty() {
             Ok(())
         } else {
-            Err(ModuleConstraintGateError { failures })
+            Err(ModuleConstraintViolations { failures }.into())
         }
     }
 }

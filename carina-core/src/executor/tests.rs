@@ -5654,6 +5654,75 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
 }
 
 #[test]
+fn module_constraint_resolution_keeps_unavailable_secret_typed() {
+    use crate::binding_index::{BindingCompleteness, BindingValueSource};
+    use crate::parser::ValidateExpr;
+
+    let hash = crate::value::redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("private".into()))),
+    )))
+    .unwrap();
+    let mut bindings = ResolvedBindings::default();
+    bindings.set_historical_with_completeness(
+        "history",
+        HashMap::from([("secret".into(), hash)]),
+        BindingValueSource::Local,
+        BindingCompleteness::Complete,
+    );
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            for bound in [false, true] {
+                let reference = Value::root_resource_ref("history", "secret", vec![]);
+                let mut constraint = module_not_bad_constraint("value");
+                if bound {
+                    let ValidateExpr::Compare { lhs, .. } = &mut constraint.expression else {
+                        unreachable!("test comparison constraint");
+                    };
+                    *lhs = Box::new(ValidateExpr::BoundArgument {
+                        argument: "value".into(),
+                        operand: "argument.value".into(),
+                        value: reference.clone(),
+                    });
+                }
+                let composition = pending_module_composition(
+                    "root.checked",
+                    vec![("value", reference)],
+                    vec![constraint],
+                );
+                let gate = ModuleConstraintGate::from_live_compositions(std::slice::from_ref(
+                    &composition,
+                ));
+                for result in [
+                    gate.check(&bindings, session),
+                    gate.finish(&bindings, true, session),
+                ] {
+                    let ModuleConstraintGateError::UnavailableSecret(error) = result.unwrap_err()
+                    else {
+                        panic!(
+                            "unavailable secrets must not become evaluated constraint diagnostics"
+                        );
+                    };
+                    assert_eq!(error.composition_id.as_ref(), composition.id.as_inner());
+                    assert_eq!(error.error.path(), "history.secret");
+                    let mut sink = FailureSink::default();
+                    sink.record(
+                        &MockObserver::new(),
+                        FailureReport::ModuleConstraintResolution(error),
+                    );
+                    let EffectFailureKind::Execution { error } = sink.failures()[0].kind() else {
+                        panic!(
+                            "terminal constraint resolution failure must retain its typed error"
+                        );
+                    };
+                    assert!(error.as_error().downcast_ref::<crate::module_resolver::ModuleConstraintResolutionError>().is_some());
+                }
+            }
+        },
+    );
+}
+
+#[test]
 fn terminal_gate_still_reports_decidable_violations_when_pending_is_suppressed() {
     crate::validation::deferred_types::with_session_for_test(
         &crate::parser::LoadedProviderContext::empty_for_test(),
@@ -5673,7 +5742,10 @@ fn terminal_gate_still_reports_decidable_violations_when_pending_is_suppressed()
                 .finish(&ResolvedBindings::default(), false, session)
                 .expect_err("a known violation must not be suppressed with pending inputs");
 
-            assert_eq!(error.failures().len(), 1);
+            let ModuleConstraintGateError::Violations(violations) = &error else {
+                panic!("expected an evaluated constraint violation: {error:?}");
+            };
+            assert_eq!(violations.failures().len(), 1);
             assert!(error.to_string().contains("value must not be bad"));
             assert!(!error.to_string().contains("still unresolved"));
         },

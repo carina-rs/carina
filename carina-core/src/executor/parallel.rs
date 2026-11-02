@@ -1381,9 +1381,7 @@ pub(super) async fn execute_effects_sequential<
             type_checks,
         )
     {
-        for failure in error.failures() {
-            super::record_module_constraint_failure(&mut accumulated, observer, failure.clone());
-        }
+        super::record_module_constraint_failure(&mut accumulated, observer, error);
     }
     let result = accumulated.finish(&input.checkpoint_sink);
     (result, cancelled)

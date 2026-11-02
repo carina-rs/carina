@@ -969,7 +969,7 @@ pub fn build_detail_rows_by_instance<S, V: crate::resource::PlanValueKind>(
                             comparison,
                             true,
                         )
-                    })
+                    })?
                 }
             }
         }
@@ -1883,7 +1883,7 @@ pub fn build_replace_detail_rows_from_display<S, D, V: crate::resource::PlanValu
                     explicit,
                     comparison,
                 )
-            })
+            })?
         }
     };
     if let DetailComparisons::Planning(references) = comparisons {

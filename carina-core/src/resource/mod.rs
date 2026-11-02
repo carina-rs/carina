@@ -6075,8 +6075,8 @@ mod evaluable_leaf {
 pub trait PlaceholderKind: ValueKind + evaluable_leaf::Sealed {
     fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_>;
 
-    /// Stable structured identity for deferred-secret hash material. This is
-    /// independent of compatibility tags used by the saved-plan value wire.
+    /// Persisted serde identity used for deferred-secret hash material.
+    /// Display wording must not affect this representation.
     #[doc(hidden)]
     fn secret_hash_material(&self) -> Result<serde_json::Value, serde_json::Error> {
         serde_json::to_value(self)
@@ -6101,20 +6101,6 @@ impl PlaceholderKind for ParserPlaceholder {
 impl PlaceholderKind for LoopSlot {
     fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_> {
         PlaceholderTypeAuthority::AwaitingSubstitution
-    }
-
-    fn secret_hash_material(&self) -> Result<serde_json::Value, serde_json::Error> {
-        #[derive(Serialize)]
-        enum HashSlot {
-            Key,
-            Index,
-            Value,
-        }
-        serde_json::to_value(match self {
-            Self::Key => HashSlot::Key,
-            Self::Index => HashSlot::Index,
-            Self::Value => HashSlot::Value,
-        })
     }
 }
 

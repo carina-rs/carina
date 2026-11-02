@@ -100,22 +100,26 @@ impl SelectedStateAttributes {
         attributes: &HashMap<String, Value<P>>,
         schema: Option<&ResourceSchema>,
         additionally_recorded: &[String],
-    ) -> Self {
+    ) -> Result<Self, SerializationError> {
         let write_only_keys = Self::write_only_keys(schema, additionally_recorded);
-        let encoded = attributes
-            .iter()
-            .filter(|(key, _)| !write_only_keys.contains(*key))
-            .filter_map(|(key, value)| {
-                PersistedValue::encode_provider_value(value, None)
-                    .ok()
-                    .map(|value| (key.clone(), value))
-            })
-            .collect();
-        Self {
+        let mut encoded = HashMap::new();
+        for (key, value) in attributes {
+            if write_only_keys.contains(key) {
+                continue;
+            }
+            match PersistedValue::encode_provider_value(value, None) {
+                Ok(value) => {
+                    encoded.insert(key.clone(), value);
+                }
+                Err(error @ SerializationError::UnavailableSecret(_)) => return Err(error),
+                Err(_) => {}
+            }
+        }
+        Ok(Self {
             encoded,
             write_only_keys,
             retained_write_only: HashSet::new(),
-        }
+        })
     }
 
     fn try_from_provider_values<P: StateValueLeaf>(
@@ -3396,23 +3400,19 @@ impl DeposedInstance {
         resource: &ResolvedResource<S>,
         schema: Option<&ResourceSchema>,
         fresh_attributes: &HashMap<String, Value<P>>,
-    ) -> DeposedAttributes {
+    ) -> Result<DeposedAttributes, ResourceStateEncodingError> {
         let carried_write_only = recorded_write_only_keys(schema, &self.attributes, &[]);
         let mut selected =
-            SelectedStateAttributes::from_provider_values_lossy(fresh_attributes, schema, &[]);
+            SelectedStateAttributes::from_provider_values_lossy(fresh_attributes, schema, &[])?;
         selected.carry_write_only(&self.attributes, carried_write_only);
-        let selected = selected
-            .protect_for_resource(
-                resource,
-                PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&self.attributes),
-                None,
-                false,
-            )
-            .expect("lossy secret protection does not return serialization errors");
-        let (selected, _write_only_attributes) = selected
-            .finish()
-            .expect("selected persisted values are already validated");
-        DeposedAttributes(selected)
+        let selected = selected.protect_for_resource(
+            resource,
+            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&self.attributes),
+            None,
+            false,
+        )?;
+        let (selected, _write_only_attributes) = selected.finish()?;
+        Ok(DeposedAttributes(selected))
     }
 
     pub fn with_refreshed_attributes(mut self, attributes: DeposedAttributes) -> Self {
@@ -4261,14 +4261,12 @@ impl ResourceState {
         schema: Option<&ResourceSchema>,
         attributes: &HashMap<String, Value<P>>,
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
-    ) -> DeposedAttributes {
-        let selected = SelectedStateAttributes::from_provider_values_lossy(attributes, schema, &[])
-            .protect_for_resource(resource, previous_hash_authority, None, false)
-            .expect("lossy secret protection does not return serialization errors");
-        let (selected, _write_only_attributes) = selected
-            .finish()
-            .expect("selected persisted values are already validated");
-        DeposedAttributes(selected)
+    ) -> Result<DeposedAttributes, ResourceStateEncodingError> {
+        let selected =
+            SelectedStateAttributes::from_provider_values_lossy(attributes, schema, &[])?
+                .protect_for_resource(resource, previous_hash_authority, None, false)?;
+        let (selected, _write_only_attributes) = selected.finish()?;
+        Ok(DeposedAttributes(selected))
     }
 
     /// Encode plan-time replacement history when no persisted generation
@@ -4278,18 +4276,15 @@ impl ResourceState {
         schema: Option<&ResourceSchema>,
         previous: ReplacementPreviousAttributesForStateWriteback<'_>,
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
-    ) -> DeposedAttributes {
+    ) -> Result<DeposedAttributes, ResourceStateEncodingError> {
         let selected = SelectedStateAttributes::from_provider_values_lossy(
             previous.provider_attributes(),
             schema,
             &[],
-        )
-        .protect_for_resource(resource, previous_hash_authority, None, false)
-        .expect("lossy secret protection does not return serialization errors");
-        let (selected, _write_only_attributes) = selected
-            .finish()
-            .expect("selected persisted values are already validated");
-        DeposedAttributes(selected)
+        )?
+        .protect_for_resource(resource, previous_hash_authority, None, false)?;
+        let (selected, _write_only_attributes) = selected.finish()?;
+        Ok(DeposedAttributes(selected))
     }
 
     /// Carry values from this persisted current generation into a deposed
@@ -4298,20 +4293,17 @@ impl ResourceState {
         &self,
         resource: &ResolvedResource<S>,
         schema: Option<&ResourceSchema>,
-    ) -> DeposedAttributes {
+    ) -> Result<DeposedAttributes, ResourceStateEncodingError> {
         let previous = self.persisted_attributes().cloned().unwrap_or_default();
         let selected = SelectedStateAttributes::from_persisted_generation(&previous, schema, &[])
             .protect_for_resource(
-                resource,
-                PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&previous),
-                None,
-                false,
-            )
-            .expect("lossy secret protection does not return serialization errors");
-        let (selected, _write_only_attributes) = selected
-            .finish()
-            .expect("selected persisted values are already validated");
-        DeposedAttributes(selected)
+            resource,
+            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&previous),
+            None,
+            false,
+        )?;
+        let (selected, _write_only_attributes) = selected.finish()?;
+        Ok(DeposedAttributes(selected))
     }
 
     fn selected_sent_attributes<S>(

@@ -41,7 +41,18 @@ pub enum PlanComparisonError {
     #[error(transparent)]
     Reference(#[from] Box<crate::references::ReferencePlanError>),
     #[error(transparent)]
+    Secret(crate::value::SerializationError),
+    #[error(transparent)]
     Resource(#[from] crate::resource::ResolvedResourceError),
+}
+
+impl From<ComparisonError> for PlanComparisonError {
+    fn from(error: ComparisonError) -> Self {
+        match error {
+            ComparisonError::Reference(error) => Self::Reference(error),
+            ComparisonError::Secret(error) => Self::Secret(error),
+        }
+    }
 }
 
 impl From<crate::provider::ComparisonResolutionError> for PlanComparisonError {
@@ -236,7 +247,7 @@ pub(crate) fn managed_binding_stability_for_resources<'a, D: 'a + Clone>(
                     prev_explicit: prev_explicit.get(&resource.id),
                     schema: Some(schema.as_schema()),
                     context,
-                    observations: &resolved_comparison.context().observation(),
+                    observations: &context.observation(),
                 },
                 schema,
             )
@@ -1077,14 +1088,14 @@ use crate::plan::Plan;
 #[cfg(test)]
 use crate::schema::CompiledAttributeType as AttributeType;
 pub use comparison::{
-    AuthoringComparison, AuthoringEquality, ComparisonContext, ComparisonSchema,
+    AuthoringComparison, AuthoringEquality, ComparisonContext, ComparisonError, ComparisonSchema,
     ObservationComparison, ObservationEquality, PlanningComparison, PlanningEquality,
     ReferenceEquality,
 };
 
 #[cfg(any(test, feature = "test-utils"))]
 pub fn exact_comparison_context_for_tests() -> ObservationComparison<'static> {
-    exact_comparison_schema_for_tests().observation()
+    exact_comparison_schema_for_tests().observation_for_test()
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -1653,7 +1664,7 @@ pub fn diff(
         prev_explicit,
         schema,
         context,
-        &comparison.context().observation(),
+        &context.observation(),
     )
 }
 
@@ -1679,7 +1690,7 @@ pub fn diff_for_test<P: crate::resource::StateValueLeaf>(
             prev_explicit,
             schema,
             context,
-            &context_schema.observation(),
+            &context.observation(),
         )
     })?
 }
@@ -1826,7 +1837,7 @@ pub(crate) fn diff_test<P: crate::resource::StateValueLeaf>(
                         prev_explicit,
                         schema,
                         context,
-                        observations: &context_schema.observation(),
+                        observations: &context.observation(),
                     },
                 )
             },

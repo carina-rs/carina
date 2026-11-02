@@ -3082,6 +3082,9 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
             assert_eq!(error.to_string(), "plan normalization failed");
         }
         PlanPreparationError::Plan(errors) => panic!("unexpected plan errors: {errors:#?}"),
+        PlanPreparationError::ModuleConstraint(error) => {
+            panic!("unexpected constraint resolution error: {error:?}")
+        }
     }
     assert!(
         !state_called.load(Ordering::SeqCst),
@@ -13998,6 +14001,9 @@ mod resolved_value_constraint_gate {
     fn into_plan_errors(error: PlanPreparationError) -> Vec<carina_core::plan::PlanError> {
         match error {
             PlanPreparationError::Plan(errors) => errors.into_vec(),
+            PlanPreparationError::ModuleConstraint(error) => {
+                panic!("unexpected constraint resolution error: {error:?}")
+            }
             PlanPreparationError::Provider(error) => {
                 panic!("test normalizer unexpectedly failed: {error}")
             }

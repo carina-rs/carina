@@ -1122,14 +1122,14 @@ fn classify_replacement_outcome<S>(
     moved_origins: &MovedOrigins,
     successfully_deleted: &HashSet<DeletedInstanceKey>,
     schemas: &SchemaRegistry,
-) -> ReplacementOutcome {
+) -> Result<ReplacementOutcome, AppError> {
     let create_upsert = match create_result {
         ReplacementCreateResult::Upsert(upsert) => Some(upsert),
-        ReplacementCreateResult::Ended => return ReplacementOutcome::CurrentRowOnly,
+        ReplacementCreateResult::Ended => return Ok(ReplacementOutcome::CurrentRowOnly),
         ReplacementCreateResult::Absent => None,
     };
     let create_result = create_upsert.filter(|upsert| upsert.source.is_create_result());
-    match create_result {
+    Ok(match create_result {
         Some(_upsert)
             if delete_succeeded(
                 successfully_deleted,
@@ -1143,7 +1143,7 @@ fn classify_replacement_outcome<S>(
         Some(upsert) => {
             let new_identifier = upsert.source.created_identifier();
             if new_identifier == Some(delete.identifier) {
-                return ReplacementOutcome::CurrentRowOnly;
+                return Ok(ReplacementOutcome::CurrentRowOnly);
             }
             ReplacementOutcome::CreateAppliedDeposeOld(planned_depose(
                 delete,
@@ -1154,7 +1154,7 @@ fn classify_replacement_outcome<S>(
                 state_file,
                 managed_current,
                 moved_origins,
-            ))
+            )?)
         }
         None if delete_succeeded(
             successfully_deleted,
@@ -1176,7 +1176,7 @@ fn classify_replacement_outcome<S>(
             ReplacementOutcome::DeleteSucceededCreateAbsent(delete.id.clone())
         }
         None => ReplacementOutcome::KeepOld,
-    }
+    })
 }
 
 fn replacement_create_result<'upsert, 'resource, S>(
@@ -1209,7 +1209,7 @@ fn planned_depose<S>(
     state_file: &StateFile,
     managed_current: &HashMap<ResourceId, Current>,
     moved_origins: &MovedOrigins,
-) -> PlannedDepose {
+) -> Result<PlannedDepose, AppError> {
     let existing = moved_origins.find_persisted_row_at_address(state_file, delete.id.as_inner());
     let current = managed_current.get(delete.id.as_inner());
     let current_state = current.and_then(|current| match current {
@@ -1247,9 +1247,12 @@ fn planned_depose<S>(
                 previous_hash_authority,
             )
         } else {
-            DeposedAttributes::default()
+            Ok(DeposedAttributes::default())
         }
-    };
+    }
+    .map_err(|source| {
+        AppError::from_resource_state_encoding(delete.id.as_inner().clone(), source)
+    })?;
 
     let refreshed_dependencies = current_state
         .map(PriorInstanceDestroyDependencies::from_refreshed_state)
@@ -1261,7 +1264,7 @@ fn planned_depose<S>(
         .or(refreshed_dependencies)
         .unwrap_or_else(|| delete.prior_dependencies.into_persisted());
 
-    PlannedDepose {
+    Ok(PlannedDepose {
         id: delete.id.clone(),
         instance: DeposedInstance::from_persisted_attributes(
             DeposedKey::new_unique(),
@@ -1270,7 +1273,7 @@ fn planned_depose<S>(
             attributes,
             dependency_bindings,
         ),
-    }
+    })
 }
 
 fn delete_input_from_effect<'a, S>(
@@ -1344,7 +1347,7 @@ fn plan_displaced_identifier_deposes<S>(
     wb: &mut WritebackPlan<'_, S>,
     input: &DecomposeInput<'_, '_, S>,
     moved_origins: &MovedOrigins,
-) {
+) -> Result<(), AppError> {
     let create_side_ids = create_side_upsert_ids(input.plan);
     for (id, upsert) in &wb.upserts {
         if !upsert.source.is_create_result() {
@@ -1414,8 +1417,9 @@ fn plan_displaced_identifier_deposes<S>(
             input.state_file,
             input.managed_current,
             moved_origins,
-        ));
+        )?);
     }
+    Ok(())
 }
 
 /// Build the typed writeback plan from the raw apply inputs.
@@ -1441,9 +1445,7 @@ struct DecomposeInput<'a, 's, S = ModuleSource> {
 }
 
 #[cfg(test)]
-fn decompose<'a, S>(
-    input: DecomposeInput<'a, '_, S>,
-) -> Result<WritebackPlan<'a, S>, WritebackConflict> {
+fn decompose<'a, S>(input: DecomposeInput<'a, '_, S>) -> Result<WritebackPlan<'a, S>, AppError> {
     let moved_origins = MovedOrigins::from_plan(input.plan);
     decompose_with_moved_origins(input, &moved_origins)
 }
@@ -1451,7 +1453,7 @@ fn decompose<'a, S>(
 fn decompose_with_moved_origins<'a, S>(
     input: DecomposeInput<'a, '_, S>,
     moved_origins: &MovedOrigins,
-) -> Result<WritebackPlan<'a, S>, WritebackConflict> {
+) -> Result<WritebackPlan<'a, S>, AppError> {
     let state_file = input.state_file;
     let sorted_resources = input.sorted_resources;
     let runtime_synthesized_resources = input.runtime_synthesized_resources;
@@ -1541,7 +1543,7 @@ fn decompose_with_moved_origins<'a, S>(
                     moved_origins,
                     successfully_deleted,
                     schemas,
-                );
+                )?;
                 wb.apply_replacement_outcome(outcome)?;
             }
             continue;
@@ -1560,7 +1562,7 @@ fn decompose_with_moved_origins<'a, S>(
                     moved_origins,
                     successfully_deleted,
                     schemas,
-                );
+                )?;
                 wb.apply_replacement_outcome(outcome)?;
             }
             continue;
@@ -1586,7 +1588,7 @@ fn decompose_with_moved_origins<'a, S>(
         }
     }
 
-    plan_displaced_identifier_deposes(&mut wb, &input, moved_origins);
+    plan_displaced_identifier_deposes(&mut wb, &input, moved_origins)?;
 
     Ok(wb)
 }
@@ -1685,74 +1687,87 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
             .map_err(AppError::from)?;
         let owner_schema = resolved_comparison.owner_schema();
         let comparison_schema = resolved_comparison.context();
-        let comparison = &comparison_schema.authoring(references, &resource.id);
-        let schema = Some(owner_schema.schema().as_schema());
-        let mut resource_state = match &planned.source {
-            UpsertSource::Complete { state, request } => {
-                ResourceState::from_provider_state_for_resource_and_schema(
-                    resource,
-                    state,
-                    existing,
-                    schema,
-                    RowBasis::Applied(request),
-                    preferred_hashes,
-                    comparison,
-                )
-                .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
-            }
-            UpsertSource::Imported(state) => {
-                // Import sends no resource attributes, so it establishes no
-                // write-only baseline. An updatable key is sent by the next
-                // plan; a create-only key remains subject to the #1232 guard.
-                ResourceState::from_provider_state_for_resource_and_schema(
-                    resource,
-                    state,
-                    existing,
-                    schema,
-                    RowBasis::Imported,
-                    preferred_hashes,
-                    comparison,
-                )
-                .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
-            }
-            UpsertSource::CurrentPresent(state) | UpsertSource::CurrentMissingIdentifier(state) => {
-                ResourceState::from_provider_state_for_resource_and_schema(
-                    resource,
-                    state,
-                    existing,
-                    schema,
-                    RowBasis::Carried,
-                    preferred_hashes,
-                    comparison,
-                )
-                .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?
-            }
-            UpsertSource::Observed(created) => ResourceState::from_observation(
-                resource,
-                created,
-                existing,
-                schema,
-                preferred_hashes,
-                comparison,
-            )
-            .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?,
-            UpsertSource::CreateInFlight(pending)
-            | UpsertSource::CurrentCreateInFlight(pending) => ResourceState::from_in_flight(
-                resource,
-                pending,
-                existing,
-                schema,
-                preferred_hashes,
-                comparison,
-            )
-            .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?,
-            UpsertSource::CreateOutcomeUnknown(unknown)
-            | UpsertSource::CurrentCreateOutcomeUnknown(unknown) => {
-                ResourceState::from_unknown_create_outcome(
-                    resource, unknown, existing, schema, comparison,
-                )
-            }
-        };
+        let mut resource_state =
+            comparison_schema.with_authoring(references, &resource.id, |comparison| {
+                let schema = Some(owner_schema.schema().as_schema());
+                Ok::<_, AppError>(match &planned.source {
+                    UpsertSource::Complete { state, request } => {
+                        ResourceState::from_provider_state_for_resource_and_schema(
+                            resource,
+                            state,
+                            existing,
+                            schema,
+                            RowBasis::Applied(request),
+                            preferred_hashes,
+                            comparison,
+                        )
+                        .map_err(|source| {
+                            AppError::from_resource_state_encoding(id.clone(), source)
+                        })?
+                    }
+                    UpsertSource::Imported(state) => {
+                        // Import sends no resource attributes, so it establishes no
+                        // write-only baseline. An updatable key is sent by the next
+                        // plan; a create-only key remains subject to the #1232 guard.
+                        ResourceState::from_provider_state_for_resource_and_schema(
+                            resource,
+                            state,
+                            existing,
+                            schema,
+                            RowBasis::Imported,
+                            preferred_hashes,
+                            comparison,
+                        )
+                        .map_err(|source| {
+                            AppError::from_resource_state_encoding(id.clone(), source)
+                        })?
+                    }
+                    UpsertSource::CurrentPresent(state)
+                    | UpsertSource::CurrentMissingIdentifier(state) => {
+                        ResourceState::from_provider_state_for_resource_and_schema(
+                            resource,
+                            state,
+                            existing,
+                            schema,
+                            RowBasis::Carried,
+                            preferred_hashes,
+                            comparison,
+                        )
+                        .map_err(|source| {
+                            AppError::from_resource_state_encoding(id.clone(), source)
+                        })?
+                    }
+                    UpsertSource::Observed(created) => ResourceState::from_observation(
+                        resource,
+                        created,
+                        existing,
+                        schema,
+                        preferred_hashes,
+                        comparison,
+                    )
+                    .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?,
+                    UpsertSource::CreateInFlight(pending)
+                    | UpsertSource::CurrentCreateInFlight(pending) => {
+                        ResourceState::from_in_flight(
+                            resource,
+                            pending,
+                            existing,
+                            schema,
+                            preferred_hashes,
+                            comparison,
+                        )
+                        .map_err(|source| {
+                            AppError::from_resource_state_encoding(id.clone(), source)
+                        })?
+                    }
+                    UpsertSource::CreateOutcomeUnknown(unknown)
+                    | UpsertSource::CurrentCreateOutcomeUnknown(unknown) => {
+                        ResourceState::from_unknown_create_outcome(
+                            resource, unknown, existing, schema, comparison,
+                        )
+                    }
+                })
+            })??;
         if planned.source.records_name_overrides()
             && let Some(overrides) = permanent_name_overrides.get(id)
         {
@@ -2502,16 +2517,21 @@ mod apply_state_save_tests {
         )
         .with_identifier("id-123");
         let comparison = provider.comparison_for(&schemas, &id).unwrap();
-        let row = ResourceState::from_provider_state_for_resource_and_schema(
-            &resource,
-            &previous,
-            None,
-            Some(comparison.owner_schema().schema().as_schema()),
-            RowBasis::Imported,
-            None,
-            &comparison.context().observation(),
-        )
-        .unwrap();
+        let row = comparison
+            .context()
+            .with_observation(|observation| {
+                ResourceState::from_provider_state_for_resource_and_schema(
+                    &resource,
+                    &previous,
+                    None,
+                    Some(comparison.owner_schema().schema().as_schema()),
+                    RowBasis::Imported,
+                    None,
+                    observation,
+                )
+            })
+            .unwrap()
+            .unwrap();
         let prior_explicit = row.explicit.clone();
         let mut state = StateFile::new();
         state.upsert_resource(row).unwrap();
@@ -6627,7 +6647,8 @@ mod apply_state_save_tests {
             &state_file,
             &managed_current,
             &moved_origins,
-        );
+        )
+        .expect("deposed attributes must encode");
         assert_eq!(from_refreshed.instance.dependency_bindings, expected);
 
         let from_delete = planned_depose(
@@ -6637,7 +6658,8 @@ mod apply_state_save_tests {
             &state_file,
             &HashMap::new(),
             &moved_origins,
-        );
+        )
+        .expect("deposed attributes must encode");
         assert_eq!(
             from_delete.instance.dependency_bindings, expected,
             "the new generation's B dependency must never replace old-generation A"
@@ -7664,7 +7686,13 @@ mod apply_state_save_tests {
             Err(err) => err,
         };
 
-        assert!(matches!(err, WritebackConflict::UpsertCleanupOverlap { id: got } if got == id));
+        let AppError::Validation(message) = err else {
+            panic!("overlapping writeback claims must remain a validation error: {err:?}");
+        };
+        assert_eq!(
+            message,
+            WritebackConflict::UpsertCleanupOverlap { id }.to_string()
+        );
     }
 }
 

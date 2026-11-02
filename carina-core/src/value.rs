@@ -4290,13 +4290,15 @@ pub fn verify_historical_state_secrets(
     let mut drifted_attributes = BTreeSet::new();
     let mut drift_errors = Vec::new();
     for (key, saved_value) in &saved.attributes {
+        if !contains_redacted_secret(saved_value) {
+            continue;
+        }
         // The managed-read seam may fill a provider-omitted write-only value
         // with the exact persisted placeholder from the current state row.
         // That is historical evidence, not provider plaintext to rehydrate.
         // Keep genuinely provider-returned redacted values strict: only an
         // exact match with the saved placeholder represents no drift.
-        if contains_redacted_secret(saved_value) && actual.attributes.get(key) == Some(saved_value)
-        {
+        if actual.attributes.get(key) == Some(saved_value) {
             continue;
         }
         let result = rehydrate_secret_entry(
@@ -6875,6 +6877,52 @@ mod tests {
     type LoopDeferredValue = crate::resource::DeferredValue<LoopSlot>;
 
     #[test]
+    fn loop_slot_secret_material_matches_main_persisted_serde() {
+        for slot in [LoopSlot::Key, LoopSlot::Index, LoopSlot::Value] {
+            let value = LoopValue::Deferred(LoopDeferredValue::Placeholder(slot));
+            let material: serde_json::Value =
+                serde_json::from_slice(&canonical_secret_hash_material(&value).unwrap()).unwrap();
+            assert_eq!(
+                material,
+                serde_json::json!({
+                    "kind": "placeholder", "value": serde_json::to_value(slot).unwrap(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn historical_verification_skips_newly_opaque_hash_free_attributes() {
+        let id = crate::resource::ResourceId::with_identity("mock.Resource", "history");
+        let plaintext = Value::Concrete(ConcreteValue::String("original secret".into()));
+        let hash = redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(Box::new(
+            plaintext.clone(),
+        ))))
+        .unwrap();
+        let ordinary = Value::Concrete(ConcreteValue::String("old ordinary".into())).to_snapshot();
+        let saved = crate::resource::SnapshotState::existing(
+            id.clone(),
+            HashMap::from([
+                ("ordinary".into(), ordinary.clone()),
+                ("password".into(), hash.clone()),
+            ]),
+        );
+        let observed = crate::resource::SnapshotState::existing(
+            id,
+            HashMap::from([
+                ("ordinary".into(), hash),
+                ("password".into(), plaintext.to_snapshot()),
+            ]),
+        );
+        let verified = verify_historical_state_secrets(&saved, &observed)
+            .expect("a newly opaque ordinary field needs no secret verification");
+        assert!(verified.drifted_attributes().is_empty());
+        let state = verified.into_verified_state().unwrap();
+        assert_eq!(state.attributes["ordinary"], ordinary);
+        assert_eq!(state.attributes["password"], plaintext.to_snapshot());
+    }
+
+    #[test]
     fn placeholder_secret_material_uses_structured_serde_not_display_wording() {
         let slot = crate::resource::LoopSlot::Value;
         let value = crate::resource::Value::<crate::resource::LoopSlot>::Deferred(
@@ -6885,7 +6933,7 @@ mod tests {
         let encoded: serde_json::Value = serde_json::from_slice(&material).unwrap();
         assert_eq!(
             encoded,
-            serde_json::json!({"kind": "placeholder", "value": "Value"})
+            serde_json::json!({"kind": "placeholder", "value": "ForValue"})
         );
         assert_ne!(
             encoded["value"],
@@ -6895,11 +6943,11 @@ mod tests {
     }
 
     #[test]
-    fn loop_slot_secret_material_and_saved_plan_wire_keep_distinct_tags() {
+    fn loop_slot_secret_material_and_saved_plan_wire_preserve_serde_tags() {
         for (slot, identity, wire_tag) in [
-            (LoopSlot::Key, "Key", "ForKey"),
-            (LoopSlot::Index, "Index", "ForIndex"),
-            (LoopSlot::Value, "Value", "ForValue"),
+            (LoopSlot::Key, "ForKey", "ForKey"),
+            (LoopSlot::Index, "ForIndex", "ForIndex"),
+            (LoopSlot::Value, "ForValue", "ForValue"),
         ] {
             let value = LoopValue::Deferred(LoopDeferredValue::Placeholder(slot));
             let material = canonical_secret_hash_material(&value).unwrap();

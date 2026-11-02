@@ -12001,7 +12001,7 @@ mod tests {
         let context = router
             .comparison_context_for(&id, schema)
             .expect("the named provider instance must supply its scope")
-            .observation();
+            .observation_for_test();
         let name = string_value("processor");
         let west_arn = string_value("arn:aws:lambda:us-west-2:123456789012:function:processor");
         let east_arn = string_value("arn:aws:lambda:us-east-1:123456789012:function:processor");

@@ -2665,7 +2665,10 @@ where
                 &masking_resource,
                 schema,
                 &fresh_state.attributes,
-            );
+            )
+            .map_err(|source| {
+                AppError::from_resource_state_encoding(target.row_id().as_inner().clone(), source)
+            })?;
 
         if attributes.as_persisted() == target.generation().persisted_attributes() {
             continue;
@@ -2825,126 +2828,135 @@ fn diff_display_update_resource_with_provider(
 
     let resolved_comparison = provider.comparison_for(schemas, id.as_inner())?;
     let owner_schema = resolved_comparison.owner_schema();
-    let comparison = &resolved_comparison.context().observation();
-    let resource_schema = Some(owner_schema.schema().as_schema());
+    let (refreshed_resource_state, has_changes, changes) = resolved_comparison
+        .context()
+        .with_observation(|comparison| {
+            let resource_schema = Some(owner_schema.schema().as_schema());
 
-    let refreshed_resource_state = if exists {
-        match resource {
-            Some(resource) => Some(
-                ResourceState::from_provider_state_for_resource_and_schema(
-                    resource,
-                    fresh_state,
-                    Some(existing_rs),
-                    resource_schema,
-                    RowBasis::Carried,
-                    None,
-                    comparison,
-                )
-                .map_err(|source| {
-                    AppError::from_resource_state_encoding(resource.id.clone(), source)
-                })?,
-            ),
-            None => {
-                let refreshable = existing_rs.refreshable().ok_or_else(|| {
-                    AppError::Config(format!(
-                        "Cannot refresh in-flight resource state for {}",
-                        id.as_inner()
-                    ))
-                })?;
-                Some(
-                    refreshable
-                        .refreshed_from_provider_state(fresh_state, resource_schema)
+            let refreshed_resource_state = if exists {
+                match resource {
+                    Some(resource) => Some(
+                        ResourceState::from_provider_state_for_resource_and_schema(
+                            resource,
+                            fresh_state,
+                            Some(existing_rs),
+                            resource_schema,
+                            RowBasis::Carried,
+                            None,
+                            comparison,
+                        )
                         .map_err(|source| {
-                            AppError::from_resource_state_encoding(id.as_inner().clone(), source)
+                            AppError::from_resource_state_encoding(resource.id.clone(), source)
                         })?,
-                )
+                    ),
+                    None => {
+                        let refreshable = existing_rs.refreshable().ok_or_else(|| {
+                            AppError::Config(format!(
+                                "Cannot refresh in-flight resource state for {}",
+                                id.as_inner()
+                            ))
+                        })?;
+                        Some(
+                            refreshable
+                                .refreshed_from_provider_state(fresh_state, resource_schema)
+                                .map_err(|source| {
+                                    AppError::from_resource_state_encoding(
+                                        id.as_inner().clone(),
+                                        source,
+                                    )
+                                })?,
+                        )
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Build old attributes as DSL values for comparison
+            let old_attrs = carina_core::resource::CanonicalComparisonAttributes::canonicalize(
+                existing_rs
+                    .persisted_attributes()
+                    .map(PersistedAttributes::to_values)
+                    .unwrap_or_default(),
+                owner_schema.schema().as_schema(),
+            );
+            let refreshed_attrs =
+                carina_core::resource::CanonicalComparisonAttributes::canonicalize(
+                    refreshed_resource_state
+                        .as_ref()
+                        .and_then(ResourceState::persisted_attributes)
+                        .map(PersistedAttributes::to_values)
+                        .unwrap_or_default(),
+                    owner_schema.schema().as_schema(),
+                );
+
+            let mut has_changes = false;
+            let mut changes: Vec<String> = Vec::new();
+
+            if !exists {
+                // Resource was deleted externally
+                has_changes = true;
+                changes.push(format!(
+                    "    {} resource no longer exists",
+                    "-".red(color_mode)
+                ));
+            } else {
+                // Check for modified, added, and removed attributes
+                let mut all_keys: HashSet<&String> = old_attrs.keys().collect();
+                all_keys.extend(refreshed_attrs.keys());
+
+                let mut sorted_keys: Vec<&&String> = all_keys.iter().collect();
+                sorted_keys.sort();
+
+                for key in sorted_keys {
+                    let old_val = old_attrs.get(key);
+                    let new_val = refreshed_attrs.get(key);
+
+                    match (old_val, new_val) {
+                        (Some(old), Some(new))
+                            if !carina_core::diff_helpers::resource_attribute_values_equal(
+                                old,
+                                new,
+                                Some(owner_schema.schema()),
+                                key,
+                                comparison,
+                            ) =>
+                        {
+                            has_changes = true;
+                            changes.push(format!(
+                                "    {} {}: {} {} {}",
+                                "~".yellow(color_mode),
+                                key,
+                                format_value(old).red(color_mode),
+                                "\u{2192}".dimmed(color_mode),
+                                format_value(new).green(color_mode),
+                            ));
+                        }
+                        (Some(old), None) => {
+                            has_changes = true;
+                            changes.push(format!(
+                                "    {} {}: {}",
+                                "-".red(color_mode),
+                                key,
+                                format_value(old).red(color_mode),
+                            ));
+                        }
+                        (None, Some(new)) => {
+                            has_changes = true;
+                            changes.push(format!(
+                                "    {} {}: {}",
+                                "+".green(color_mode),
+                                key,
+                                format_value(new).green(color_mode),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
             }
-        }
-    } else {
-        None
-    };
 
-    // Build old attributes as DSL values for comparison
-    let old_attrs = carina_core::resource::CanonicalComparisonAttributes::canonicalize(
-        existing_rs
-            .persisted_attributes()
-            .map(PersistedAttributes::to_values)
-            .unwrap_or_default(),
-        owner_schema.schema().as_schema(),
-    );
-    let refreshed_attrs = carina_core::resource::CanonicalComparisonAttributes::canonicalize(
-        refreshed_resource_state
-            .as_ref()
-            .and_then(ResourceState::persisted_attributes)
-            .map(PersistedAttributes::to_values)
-            .unwrap_or_default(),
-        owner_schema.schema().as_schema(),
-    );
-
-    let mut has_changes = false;
-    let mut changes: Vec<String> = Vec::new();
-
-    if !exists {
-        // Resource was deleted externally
-        has_changes = true;
-        changes.push(format!(
-            "    {} resource no longer exists",
-            "-".red(color_mode)
-        ));
-    } else {
-        // Check for modified, added, and removed attributes
-        let mut all_keys: HashSet<&String> = old_attrs.keys().collect();
-        all_keys.extend(refreshed_attrs.keys());
-
-        let mut sorted_keys: Vec<&&String> = all_keys.iter().collect();
-        sorted_keys.sort();
-
-        for key in sorted_keys {
-            let old_val = old_attrs.get(key);
-            let new_val = refreshed_attrs.get(key);
-
-            match (old_val, new_val) {
-                (Some(old), Some(new))
-                    if !carina_core::diff_helpers::resource_attribute_values_equal(
-                        old,
-                        new,
-                        Some(owner_schema.schema()),
-                        key,
-                        comparison,
-                    ) =>
-                {
-                    has_changes = true;
-                    changes.push(format!(
-                        "    {} {}: {} {} {}",
-                        "~".yellow(color_mode),
-                        key,
-                        format_value(old).red(color_mode),
-                        "\u{2192}".dimmed(color_mode),
-                        format_value(new).green(color_mode),
-                    ));
-                }
-                (Some(old), None) => {
-                    has_changes = true;
-                    changes.push(format!(
-                        "    {} {}: {}",
-                        "-".red(color_mode),
-                        key,
-                        format_value(old).red(color_mode),
-                    ));
-                }
-                (None, Some(new)) => {
-                    has_changes = true;
-                    changes.push(format!(
-                        "    {} {}: {}",
-                        "+".green(color_mode),
-                        key,
-                        format_value(new).green(color_mode),
-                    ));
-                }
-                _ => {}
-            }
-        }
-    }
+            Ok::<_, AppError>((refreshed_resource_state, has_changes, changes))
+        })??;
 
     if has_changes {
         counts.updated += 1;

@@ -1228,6 +1228,9 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     Ok(additional) => effective_changed.extend(additional.value),
                     Err(error) => {
                         let failure = match error {
+                            crate::differ::ApplyTimeComparisonError::Secret(error) => {
+                                EffectFailureKind::execution(error)
+                            }
                             crate::differ::ApplyTimeComparisonError::CreateOnly(error) => {
                                 EffectFailureKind::execution(error)
                             }

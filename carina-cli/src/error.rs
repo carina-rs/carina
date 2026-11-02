@@ -961,6 +961,9 @@ pub enum AppError {
     #[error(transparent)]
     ValueResolution(#[from] carina_core::resolver::ResolutionError),
 
+    #[error(transparent)]
+    DeferredForExpansion(#[from] carina_core::parser::DeferredForExpansionError),
+
     /// Provider installation, egress consent, or initialization failed.
     #[error(transparent)]
     Init(Box<crate::commands::init::InitError>),
@@ -1090,6 +1093,8 @@ pub enum AppError {
 
     #[error(transparent)]
     PlanComparison(#[from] carina_core::differ::PlanComparisonError),
+    #[error(transparent)]
+    Comparison(#[from] carina_core::differ::ComparisonError),
 
     /// Host-side AWS credential resolution failed before a guest started.
     #[error(transparent)]
@@ -1526,6 +1531,22 @@ impl From<carina_core::value::SerializationError> for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_loop_expansion_preserves_unavailable_secret_error() {
+        use carina_core::resource::{ConcreteValue, DeferredValue, Value};
+        let secret: Value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("private".into()),
+        ))));
+        let snapshot = carina_core::value::redact_secrets_in_value(&secret).unwrap();
+        let unavailable = snapshot.to_value_at("loop.items").unwrap_err();
+        let error = AppError::from(
+            carina_core::parser::DeferredForExpansionError::UnavailableSecret(unavailable),
+        );
+        assert!(matches!(error, AppError::DeferredForExpansion(
+            carina_core::parser::DeferredForExpansionError::UnavailableSecret(error)
+        ) if error.path() == "loop.items"));
+    }
 
     #[tokio::test]
     async fn wire_preparation_errors_render_the_typed_reason_once_at_cli_boundaries() {

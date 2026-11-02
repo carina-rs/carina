@@ -210,7 +210,7 @@ pub fn detect_moved_block_hints<S>(
     prior: &HashMap<ResourceId, Current>,
     schemas: &SchemaRegistry,
     comparison_provider: &ProviderRouter,
-) -> Result<MovedBlockHints, ComparisonResolutionError> {
+) -> carina_core::provider::ProviderResult<MovedBlockHints> {
     let mut replacement_creates = HashSet::new();
     let mut replacement_deletes = HashSet::new();
     for replacement in plan.replace_display_info() {
@@ -274,7 +274,7 @@ pub fn detect_moved_block_hints<S>(
     let mut created_to_destroyed = vec![Vec::new(); created.len()];
     for (destroyed_index, destroyed_resource) in destroyed.iter().enumerate() {
         for (created_index, created_resource) in created.iter().enumerate() {
-            if resources_match(destroyed_resource, created_resource) {
+            if resources_match(destroyed_resource, created_resource)? {
                 destroyed_to_created[destroyed_index].push(created_index);
                 created_to_destroyed[created_index].push(destroyed_index);
             }
@@ -368,7 +368,7 @@ struct DestroyCandidate<'a> {
 struct CreateCandidate<'schema> {
     id: ResolvedResourceId,
     schema: &'schema ValidatedResourceSchema,
-    comparison: carina_core::differ::ObservationComparison<'schema>,
+    comparison: carina_core::differ::ComparisonSchema<'schema>,
     create_only_values: DesiredCreateOnlyValues,
 }
 
@@ -412,7 +412,7 @@ fn create_candidate<'schema, S>(
     Ok(Some(CreateCandidate {
         id: created.resolved_id(),
         schema,
-        comparison: comparison.context().observation(),
+        comparison: *comparison.context(),
         create_only_values,
     }))
 }
@@ -421,21 +421,24 @@ fn create_candidate<'schema, S>(
 /// Desired attributes omitted by configuration are intentionally ignored, so
 /// a match means the compared values agree, not that the full states are
 /// identical.
-fn resources_match(destroyed: &DestroyCandidate<'_>, created: &CreateCandidate<'_>) -> bool {
+fn resources_match(
+    destroyed: &DestroyCandidate<'_>,
+    created: &CreateCandidate<'_>,
+) -> Result<bool, carina_core::differ::ComparisonError> {
     if destroyed.id.provider() != created.id.provider()
         || destroyed.id.resource_type() != created.id.resource_type()
         || destroyed.id.provider_instance() != created.id.provider_instance()
     {
-        return false;
+        return Ok(false);
     }
 
     let prior_values =
         StateCreateOnlyValues::from_state_attributes(created.schema, destroyed.attributes);
-    created.create_only_values.all_match(
-        &prior_values,
-        created.schema.as_schema(),
-        &created.comparison,
-    )
+    created.comparison.with_observation(|comparison| {
+        created
+            .create_only_values
+            .all_match(&prior_values, created.schema.as_schema(), comparison)
+    })
 }
 
 fn render_address(id: &ResolvedResourceId) -> String {

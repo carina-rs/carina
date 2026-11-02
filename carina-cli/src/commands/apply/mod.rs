@@ -232,50 +232,55 @@ async fn create_checked_bootstrap_resource(
         carina_core::validation::deferred_types::TypeCheckSession::run_async(
             context.provider_context,
             async |session| {
-        let BootstrapCreateContext {
-            provider_context: _provider_context,
-            backend,
-            parsed,
-            provider_configs,
-            normalizer,
-            factories,
-            schemas,
-        } = context;
-        let id = resource.id.clone();
-        let bindings = bootstrap_resolved_bindings(parsed);
-        let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(
-            &parsed.compositions,
-        );
-        let preparation = carina_core::executor::ProviderPreparationContext::new(
-            &bindings,
-            &module_gate,
-            provider_configs.as_provider_configs(),
-            normalizer,
-            factories,
-            schemas,
-            session,
-        );
-        let request = carina_core::executor::prepare_create_request(resource, &preparation)
-            .await
-            .map_err(AppError::from_state_bucket_preparation)?;
-        let resolved = request.resource().as_inner().clone();
-        let resolved_comparison = comparison_provider.comparison_for(schemas, &resolved.id)?;
-        let owner_schema = resolved_comparison.owner_schema();
-        let comparison = &resolved_comparison.context().observation();
-        let schema = Some(owner_schema.schema().as_schema());
-        let accepted_request = AcceptedRequest::from_create_request(&request);
-        let (create, create_cancellation) =
-            carina_core::executor::dispatch_create(operation_provider, &id, request);
-        let outcome = create.await;
-        // Bootstrap creates are not part of the parallel executor, but they still
-        // retain the reporter until the guest call has settled.
-        drop(create_cancellation);
-        match outcome {
-            Ok(outcome) => {
-                let identifier = outcome.identifier().as_str().to_string();
-                let (state, accepted_request, diagnostic, _read_back_end) =
-                    carina_core::executor::complete_create_for_writeback(outcome, accepted_request);
-                let row = carina_state::ResourceState::from_provider_state_for_resource_and_schema(
+                let BootstrapCreateContext {
+                    provider_context: _provider_context,
+                    backend,
+                    parsed,
+                    provider_configs,
+                    normalizer,
+                    factories,
+                    schemas,
+                } = context;
+                let id = resource.id.clone();
+                let bindings = bootstrap_resolved_bindings(parsed);
+                let module_gate =
+                    carina_core::executor::ModuleConstraintGate::from_live_compositions(
+                        &parsed.compositions,
+                    );
+                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &module_gate,
+                    provider_configs.as_provider_configs(),
+                    normalizer,
+                    factories,
+                    schemas,
+                    session,
+                );
+                let request = carina_core::executor::prepare_create_request(resource, &preparation)
+                    .await
+                    .map_err(AppError::from_state_bucket_preparation)?;
+                let resolved = request.resource().as_inner().clone();
+                let resolved_comparison =
+                    comparison_provider.comparison_for(schemas, &resolved.id)?;
+                let owner_schema = resolved_comparison.owner_schema();
+                let schema = Some(owner_schema.schema().as_schema());
+                let accepted_request = AcceptedRequest::from_create_request(&request);
+                let (create, create_cancellation) =
+                    carina_core::executor::dispatch_create(operation_provider, &id, request);
+                let outcome = create.await;
+                // Bootstrap creates are not part of the parallel executor, but they still
+                // retain the reporter until the guest call has settled.
+                drop(create_cancellation);
+                match outcome {
+                    Ok(outcome) => {
+                        let identifier = outcome.identifier().as_str().to_string();
+                        let (state, accepted_request, diagnostic, _read_back_end) =
+                            carina_core::executor::complete_create_for_writeback(
+                                outcome,
+                                accepted_request,
+                            );
+                        let row = resolved_comparison.context().with_observation(|comparison| {
+carina_state::ResourceState::from_provider_state_for_resource_and_schema(
                     &resolved,
                     &state,
                     None,
@@ -284,73 +289,90 @@ async fn create_checked_bootstrap_resource(
                     None,
                     comparison,
                 )
-                .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?;
-                seed_protected_bootstrap_resource(backend, row)
-                    .await
-                    .map_err(|source| {
-                        let resource_address = format!(
-                            "{} {}",
-                            resolved.id.display_type(),
-                            carina_core::parser::display_string_literal(resolved.identity_str())
-                        );
-                        AppError::StateBucketSeed(Box::new(
-                            crate::error::StateBucketSeedError::new(
-                                identifier.clone(),
-                                resource_address,
-                                source,
-                            ),
+                .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))
+                })??;
+                        seed_protected_bootstrap_resource(backend, row)
+                            .await
+                            .map_err(|source| {
+                                let resource_address = format!(
+                                    "{} {}",
+                                    resolved.id.display_type(),
+                                    carina_core::parser::display_string_literal(
+                                        resolved.identity_str()
+                                    )
+                                );
+                                AppError::StateBucketSeed(Box::new(
+                                    crate::error::StateBucketSeedError::new(
+                                        identifier.clone(),
+                                        resource_address,
+                                        source,
+                                    ),
+                                ))
+                            })?;
+                        if let Some(diagnostic) = diagnostic {
+                            eprintln!(
+                                "{}",
+                                format_partial_state_bucket_create_warning(
+                                    color_mode,
+                                    &identifier,
+                                    &diagnostic
+                                )
+                            );
+                        }
+                        Ok(())
+                    }
+                    Err(error) => {
+                        let row = resolved_comparison
+                            .context()
+                            .with_observation(|comparison| match error.kind() {
+                                carina_core::provider::CreateFailureKind::Untracked(_error) => {
+                                    Ok(None)
+                                }
+                                carina_core::provider::CreateFailureKind::OutcomeUnknown {
+                                    unknown,
+                                    error: _provider_error,
+                                } => Ok(Some(
+                                    carina_state::ResourceState::from_unknown_create_outcome(
+                                        &resolved, unknown, None, schema, comparison,
+                                    ),
+                                )),
+                                carina_core::provider::CreateFailureKind::Created {
+                                    created,
+                                    error: _provider_error,
+                                } => carina_state::ResourceState::from_observation(
+                                    &resolved, created, None, schema, None, comparison,
+                                )
+                                .map(Some)
+                                .map_err(|source| {
+                                    AppError::from_resource_state_encoding(id.clone(), source)
+                                }),
+                                carina_core::provider::CreateFailureKind::InFlight {
+                                    pending,
+                                    error: _provider_error,
+                                } => carina_state::ResourceState::from_in_flight(
+                                    &resolved, pending, None, schema, None, comparison,
+                                )
+                                .map(Some)
+                                .map_err(|source| {
+                                    AppError::from_resource_state_encoding(id.clone(), source)
+                                }),
+                            })
+                            .map_err(AppError::from)
+                            .and_then(|row| row);
+                        let seed_error = match row {
+                            Ok(Some(row)) => seed_protected_bootstrap_resource(backend, row)
+                                .await
+                                .err()
+                                .map(AppError::Backend),
+                            Ok(None) => None,
+                            Err(seed_error) => Some(seed_error),
+                        };
+                        Err(AppError::StateBucketCreate(
+                            crate::error::StateBucketCreateError::new(error, seed_error),
                         ))
-                    })?;
-                if let Some(diagnostic) = diagnostic {
-                    eprintln!(
-                        "{}",
-                        format_partial_state_bucket_create_warning(color_mode, &identifier, &diagnostic)
-                    );
+                    }
                 }
-                Ok(())
-            }
-            Err(error) => {
-                let row = match error.kind() {
-                    carina_core::provider::CreateFailureKind::Untracked(_error) => Ok(None),
-                    carina_core::provider::CreateFailureKind::OutcomeUnknown {
-                        unknown,
-                        error: _provider_error,
-                    } => Ok(Some(
-                        carina_state::ResourceState::from_unknown_create_outcome(
-                            &resolved, unknown, None, schema, comparison,
-                        ),
-                    )),
-                    carina_core::provider::CreateFailureKind::Created {
-                        created,
-                        error: _provider_error,
-                    } => carina_state::ResourceState::from_observation(
-                        &resolved, created, None, schema, None, comparison,
-                    )
-                    .map(Some)
-                    .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source)),
-                    carina_core::provider::CreateFailureKind::InFlight {
-                        pending,
-                        error: _provider_error,
-                    } => carina_state::ResourceState::from_in_flight(
-                        &resolved, pending, None, schema, None, comparison,
-                    )
-                    .map(Some)
-                    .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source)),
-                };
-                let seed_error = match row {
-                    Ok(Some(row)) => seed_protected_bootstrap_resource(backend, row)
-                        .await
-                        .err()
-                        .map(AppError::Backend),
-                    Ok(None) => None,
-                    Err(seed_error) => Some(seed_error),
-                };
-                Err(AppError::StateBucketCreate(
-                    crate::error::StateBucketCreateError::new(error, seed_error),
-                ))
-            }
-        }
-    },
+            },
         )
         .await,
         AppError::Validation,
@@ -1514,67 +1536,70 @@ pub(crate) async fn detect_drift<S: Clone>(
                     schema,
                 );
                 // Compare attributes for existing resources
-                let mut attr_diffs: Vec<String> = Vec::new();
-                for (key, planned_val) in &planned_comparison {
-                    let historical_shape = planned_state
-                        .and_then(|state| state.attributes.get(key))
-                        .unwrap_or(planned_val);
-                    let masked_planned = carina_core::value::mask_plaintext_using_secret_shape(
-                        planned_val,
-                        historical_shape,
-                    );
-                    match actual_comparison.get(key) {
-                        Some(actual_val) if secret_drift.contains(key) => {
-                            let masked = carina_core::value::mask_plaintext_using_secret_shape(
-                                actual_val,
-                                historical_shape,
-                            );
-                            attr_diffs.push(format!(
-                                "      {}: {} → {}",
-                                key,
-                                format_value(&masked_planned),
-                                format_value(&masked)
-                            ));
+                let attr_diffs = typed_comparison.context().with_observation(|comparison| {
+                    let mut attr_diffs: Vec<String> = Vec::new();
+                    for (key, planned_val) in &planned_comparison {
+                        let historical_shape = planned_state
+                            .and_then(|state| state.attributes.get(key))
+                            .unwrap_or(planned_val);
+                        let masked_planned = carina_core::value::mask_plaintext_using_secret_shape(
+                            planned_val,
+                            historical_shape,
+                        );
+                        match actual_comparison.get(key) {
+                            Some(actual_val) if secret_drift.contains(key) => {
+                                let masked = carina_core::value::mask_plaintext_using_secret_shape(
+                                    actual_val,
+                                    historical_shape,
+                                );
+                                attr_diffs.push(format!(
+                                    "      {}: {} → {}",
+                                    key,
+                                    format_value(&masked_planned),
+                                    format_value(&masked)
+                                ));
+                            }
+                            Some(actual_val)
+                                if !carina_core::diff_helpers::resource_attribute_values_equal(
+                                    actual_val,
+                                    planned_val,
+                                    Some(validated_schema),
+                                    key,
+                                    comparison,
+                                ) =>
+                            {
+                                let masked = carina_core::value::mask_plaintext_using_secret_shape(
+                                    actual_val,
+                                    historical_shape,
+                                );
+                                attr_diffs.push(format!(
+                                    "      {}: {} → {}",
+                                    key,
+                                    format_value(&masked_planned),
+                                    format_value(&masked)
+                                ));
+                            }
+                            None => {
+                                attr_diffs.push(format!(
+                                    "      {}: {} → (removed)",
+                                    key,
+                                    format_value(&masked_planned)
+                                ));
+                            }
+                            _ => {}
                         }
-                        Some(actual_val)
-                            if !carina_core::diff_helpers::resource_attribute_values_equal(
-                                actual_val,
-                                planned_val,
-                                Some(validated_schema),
-                                key,
-                                &typed_comparison.context().observation(),
-                            ) =>
-                        {
-                            let masked = carina_core::value::mask_plaintext_using_secret_shape(
-                                actual_val,
-                                historical_shape,
-                            );
-                            attr_diffs.push(format!(
-                                "      {}: {} → {}",
-                                key,
-                                format_value(&masked_planned),
-                                format_value(&masked)
-                            ));
-                        }
-                        None => {
-                            attr_diffs.push(format!(
-                                "      {}: {} → (removed)",
-                                key,
-                                format_value(&masked_planned)
-                            ));
-                        }
-                        _ => {}
                     }
-                }
-                for (key, actual_val) in &actual_comparison {
-                    if !planned_comparison.contains_key(key) {
-                        attr_diffs.push(format!(
-                            "      {}: (none) → {}",
-                            key,
-                            format_value(actual_val)
-                        ));
+                    for (key, actual_val) in &actual_comparison {
+                        if !planned_comparison.contains_key(key) {
+                            attr_diffs.push(format!(
+                                "      {}: (none) → {}",
+                                key,
+                                format_value(actual_val)
+                            ));
+                        }
                     }
-                }
+                    attr_diffs
+                })?;
                 if !attr_diffs.is_empty() {
                     drift_detected = true;
                     drift_messages.push(format!(
@@ -2305,7 +2330,9 @@ async fn run_apply_locked_owned(
                 .await?;
             let refresh_module_constraint_errors = phase2
                 .module_constraint_error
-                .and_then(module_constraint_plan_errors);
+                .map(module_constraint_plan_errors)
+                .transpose()?
+                .flatten();
             let data_source_values = phase2.values;
             let prepared_expansion = reconciled_expansion.seal(data_source_values);
 

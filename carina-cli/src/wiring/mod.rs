@@ -4099,6 +4099,8 @@ impl NonEmptyPlanErrors {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PlanPreparationError {
+    #[error(transparent)]
+    ModuleConstraint(#[from] carina_core::executor::ModuleConstraintGateError),
     #[error("plan validation failed")]
     Plan(NonEmptyPlanErrors),
     #[error(transparent)]
@@ -4240,8 +4242,14 @@ fn append_resolved_value_constraint_errors(
 /// is not a new diagnostic outcome, so it becomes `None` here.
 pub(crate) fn module_constraint_plan_errors(
     error: carina_core::executor::ModuleConstraintGateError,
-) -> Option<NonEmptyPlanErrors> {
-    let errors: Vec<PlanError> = error
+) -> Result<Option<NonEmptyPlanErrors>, carina_core::executor::ModuleConstraintGateError> {
+    let violations = match error {
+        error @ carina_core::executor::ModuleConstraintGateError::UnavailableSecret(_) => {
+            return Err(error);
+        }
+        carina_core::executor::ModuleConstraintGateError::Violations(violations) => violations,
+    };
+    let errors: Vec<PlanError> = violations
         .failures()
         .iter()
         .cloned()
@@ -4252,7 +4260,7 @@ pub(crate) fn module_constraint_plan_errors(
             )
         })
         .collect();
-    NonEmptyPlanErrors::try_from(errors).ok()
+    Ok(NonEmptyPlanErrors::try_from(errors).ok())
 }
 
 impl<'a> PlanPreprocessor<'a> {
@@ -4293,7 +4301,7 @@ impl<'a> PlanPreprocessor<'a> {
                         data_source_origins,
                     );
                     if let Err(error) = module_gate.check(resources.bindings(), session)
-                        && let Some(module_errors) = module_constraint_plan_errors(error)
+                        && let Some(module_errors) = module_constraint_plan_errors(error)?
                     {
                         errors.extend(module_errors.into_vec());
                     }
@@ -6769,6 +6777,9 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                         PlanPreparationError::Provider(error) => {
                             return Err(AppError::Provider(error));
                         }
+                        PlanPreparationError::ModuleConstraint(error) => {
+                            return Err(AppError::ModuleConstraint(error));
+                        }
                     };
                     let mut plan = Plan::new();
                     for error in errors.as_slice().iter().cloned() {
@@ -7580,7 +7591,7 @@ async fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTa
                             Err(_) => DeferredForExpansionChoice::Expand,
                         }
                     })
-                    .map_err(|error| AppError::Validation(error.to_string()))?;
+                    .map_err(AppError::DeferredForExpansion)?;
                 let providers = target.parsed().providers.clone();
                 target.compute_anonymous_identifiers(identity_context, &providers)?;
                 let printed_warnings = warning_policy == DeferredForWarningPolicy::Print
@@ -8385,7 +8396,9 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         .await?;
     let refresh_module_constraint_errors = phase2
         .module_constraint_error
-        .and_then(module_constraint_plan_errors);
+        .map(module_constraint_plan_errors)
+        .transpose()?
+        .flatten();
     let data_source_values = phase2.values;
     let prepared_expansion = reconciled_expansion.seal(data_source_values);
 
@@ -10759,7 +10772,7 @@ impl MigrationCheckConfig {
                             &bindings.project_iterable_bindings(),
                             session,
                         )
-                        .map_err(|error| AppError::Validation(error.to_string()))?;
+                        .map_err(AppError::DeferredForExpansion)?;
 
                     let after = self.resources.deferred_for_expressions().len();
                     if after == before {

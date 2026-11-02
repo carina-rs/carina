@@ -781,6 +781,21 @@ impl ReferencePreparation {
                     source: ReferenceFailure::Call(error.into()),
                 }))
             }
+            Err(crate::differ::PlanComparisonError::Secret(error)) => {
+                Err(Box::new(ReferencePlanError {
+                    instance: ProviderInstanceKey::from(&desired[0].id),
+                    resource: desired[0].id.clone(),
+                    path: "<planning>".into(),
+                    raw: "<planning>".into(),
+                    source: ReferenceFailure::Call(
+                        ProviderError::invalid_input_caused_by(
+                            "Failed to verify secret comparison",
+                            error,
+                        )
+                        .into(),
+                    ),
+                }))
+            }
             Err(crate::differ::PlanComparisonError::Resource(error)) => {
                 Err(Box::new(ReferencePlanError {
                     instance: ProviderInstanceKey::from(&desired[0].id),
@@ -1355,9 +1370,9 @@ impl ReferenceValidation<'_> {
     }
 }
 
-pub(crate) fn validate_secret_operand(
+pub(crate) fn validate_secret_operand<P: crate::resource::ValueKind>(
     resource: &ResourceId,
-    value: &Value,
+    value: &Value<P>,
     ty: crate::schema::EffectiveType<'_>,
     path: &str,
 ) -> Result<(), Box<ReferencePlanError>> {
