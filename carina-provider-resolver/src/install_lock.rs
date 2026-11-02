@@ -22,6 +22,9 @@ const PROVIDER_INSTALL_LOCK_FILE_NAME: &str = "provider-install.lock";
 pub struct ProviderInstallLock {
     _guard_file: File,
     project_dir: ResolvedPath,
+    // Keep the directory used to open the locked inode. A waiter must never
+    // follow a retargeted `.carina` alias after acquiring that inode's lock.
+    carina_dir: ResolvedPath,
 }
 
 /// Provider lock state loaded, or defaulted, while its project's install lock is held.
@@ -173,6 +176,7 @@ impl ProviderInstallLock {
         Ok(Self {
             _guard_file: guard_file,
             project_dir: project_dir.clone(),
+            carina_dir,
         })
     }
 
@@ -216,8 +220,14 @@ impl ProviderInstallLock {
     }
 
     pub(crate) fn remove_project_artifact(&self, artifact: &WasmArtifactPath) -> io::Result<()> {
+        self.project_artifact(artifact)?.remove()
+    }
+
+    /// Artifact IO is available only through the guard that owns its directory pin.
+    pub(crate) fn project_artifact(&self, artifact: &WasmArtifactPath) -> io::Result<ResolvedPath> {
         validate_project_target(self, artifact.as_path())?;
-        project_artifact(self, artifact)?.remove()
+        self.carina_dir
+            .join_display(&DisplayPath::new(artifact.as_path())?)
     }
 }
 
@@ -261,7 +271,7 @@ impl<'a> StagedArtifact<'a> {
         install_lock: &'a ProviderInstallLock,
         destination: &WasmArtifactPath,
     ) -> io::Result<Self> {
-        let target = project_artifact(install_lock, destination)?;
+        let target = install_lock.project_artifact(destination)?;
         if let Some(parent) = target.parent() {
             parent.create_dir_all()?;
         }
@@ -292,6 +302,9 @@ impl<'a> StagedArtifact<'a> {
     }
     pub(crate) fn project_dir(&self) -> &ResolvedPath {
         self.install_lock.project_dir()
+    }
+    pub(crate) fn install_lock(&self) -> &'a ProviderInstallLock {
+        self.install_lock
     }
     pub(crate) fn publish(self) -> io::Result<()> {
         self.file.publish()
@@ -348,10 +361,7 @@ fn validate_project_target(
     install_lock: &ProviderInstallLock,
     destination: &Path,
 ) -> io::Result<()> {
-    let cache = install_lock
-        .project_dir()
-        .display()
-        .join(".carina/providers");
+    let cache = install_lock.carina_dir.display().join("providers");
     let label = DisplayPath::new(destination)?;
     if label.relative_to(&cache).is_some_and(|relative| {
         !Path::new(&relative).components().any(|part| {
@@ -368,16 +378,6 @@ fn validate_project_target(
             format!("project provider artifact {label} is outside {cache}"),
         ))
     }
-}
-
-fn project_artifact(
-    install_lock: &ProviderInstallLock,
-    artifact: &WasmArtifactPath,
-) -> io::Result<ResolvedPath> {
-    validate_project_target(install_lock, artifact.as_path())?;
-    install_lock
-        .project_dir()
-        .join_display(&DisplayPath::new(artifact.as_path())?)
 }
 
 fn locate_lock_file_error(location: &DisplayPath, operation: &str, cause: io::Error) -> io::Error {
@@ -685,6 +685,69 @@ mod tests {
         );
         assert!(!replacement.join(".carina").exists());
         assert!(!replacement.join("carina-providers.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn waiting_install_keeps_carina_directory_pin_after_symlink_retarget() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let original = temp.path().join("original");
+        let replacement = temp.path().join("replacement");
+        for directory in [&project, &original, &replacement] {
+            fs::create_dir(directory).unwrap();
+        }
+        let alias = project.join(".carina");
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        let root = carina_core::paths::ResolvedPath::new(&project).unwrap();
+        let first = ProviderInstallLock::acquire(&root).unwrap();
+        let retargeted_alias = alias.clone();
+        let retargeted_directory = replacement.clone();
+        let (new_guard_tx, new_guard_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let competing_root = root.clone();
+        let competitor = std::thread::spawn(move || {
+            release_rx.recv().unwrap();
+            // Hold the new directory's lock throughout the old directory's install.
+            let guard = ProviderInstallLock::acquire(&competing_root).unwrap();
+            new_guard_tx.send(()).unwrap();
+            guard
+        });
+        super::BLOCKING_ACQUIRE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::remove_file(&retargeted_alias).unwrap();
+                std::os::unix::fs::symlink(&retargeted_directory, &retargeted_alias).unwrap();
+                release_tx.send(()).unwrap();
+                new_guard_rx.recv().unwrap();
+                drop(first);
+            }));
+        });
+        let guard = ProviderInstallLock::acquire(&root).unwrap();
+        let other_guard = competitor.join().unwrap();
+        let source = root.join("source.wasm").unwrap();
+        source.atomic_replace(b"pinned provider").unwrap();
+        let destination =
+            WasmArtifactPath::new(alias.join("providers/test/1.0.0/test.wasm"), "test").unwrap();
+
+        install_project_artifact_atomically(&guard, &source, &destination).unwrap();
+        guard.load_lock_file_or_default().unwrap().save().unwrap();
+        assert_eq!(
+            fs::read(original.join("providers/test/1.0.0/test.wasm")).unwrap(),
+            b"pinned provider"
+        );
+        assert!(!replacement.join("providers").exists());
+        assert!(project.join("carina-providers.lock").exists());
+        guard.remove_project_artifact(&destination).unwrap();
+        assert!(!original.join("providers/test/1.0.0/test.wasm").exists());
+        for directory in [&original, &replacement] {
+            let file =
+                fs::File::open(directory.join(super::PROVIDER_INSTALL_LOCK_FILE_NAME)).unwrap();
+            assert!(matches!(
+                file.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+        }
+        drop(other_guard);
     }
 
     #[test]

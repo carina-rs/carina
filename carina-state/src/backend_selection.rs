@@ -321,7 +321,30 @@ impl BackendSelection {
             Self::configured_target(Some(drift.existing.to_state_config()?), project_dir.clone());
         let target =
             Self::configured_target(Some(drift.configured.to_state_config()?), project_dir);
-        let (source, local_source_path): (Box<dyn crate::StateBackend>, _) = match source.target() {
+        let (source, local_source_path) = source.resolve_migration_backend().await?;
+        let (target, local_target_path) = target.resolve_migration_backend().await?;
+        if let (Some(source), Some(target)) = (&local_source_path, &local_target_path)
+            && source.identity() == target.identity()
+        {
+            return Err(BackendError::Configuration(format!(
+                "The locked backend {} and configured backend {} resolve to the same local state file; \
+                 migration would remove its own destination. Run init without --migrate-state to adopt the new address.",
+                source.display(),
+                target.display(),
+            )));
+        }
+        Ok(MigrationBackends {
+            source,
+            target,
+            local_source_path,
+        })
+    }
+
+    /// Resolve once so migration's alias check and IO use the same pins.
+    async fn resolve_migration_backend(
+        &self,
+    ) -> BackendResult<(Box<dyn crate::StateBackend>, Option<ResolvedPath>)> {
+        match self.target() {
             BackendTarget::Configured {
                 config: Some(BackendConfig::Local(settings)),
                 base_dir,
@@ -329,15 +352,10 @@ impl BackendSelection {
                 let path = crate::backends::anchored_local_path(settings, base_dir)
                     .map_err(|error| BackendError::Io(error.to_string()))?;
                 let backend = crate::backends::LocalBackend::with_resolved_path(path.clone())?;
-                (Box::new(backend), Some(path))
+                Ok((Box::new(backend), Some(path)))
             }
-            _ => (crate::backends::create_backend(&source).await?, None),
-        };
-        Ok(MigrationBackends {
-            source,
-            target: crate::backends::create_backend(&target).await?,
-            local_source_path,
-        })
+            _ => Ok((crate::backends::create_backend(self).await?, None)),
+        }
     }
 
     /// Select the configured S3 backend only when the requested bucket is the

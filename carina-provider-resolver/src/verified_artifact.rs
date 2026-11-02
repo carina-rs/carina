@@ -16,7 +16,7 @@ use crate::github::FetchedLocation;
 use crate::github_location::{
     ArtifactId, AssetId, CommitSha, GithubLocationError, ReleaseTag, RepoSlug,
 };
-use crate::install_lock::StagedArtifact;
+use crate::install_lock::{ProviderInstallLock, StagedArtifact};
 use crate::provider_resolver::{
     LockEntry, LockEntryKind, LockFile, LockedProviderPin, RegistryLock,
     RegistrySignatureProtection, WasmArtifactPath, cache_path_github_release, cache_path_wasm,
@@ -1013,11 +1013,11 @@ impl VerifiedArtifact {
     pub(crate) fn from_existing<R>(
         lock_entry: &LockEntry<R>,
         provider_name: &str,
-        project_dir: &ResolvedPath,
+        install_lock: &ProviderInstallLock,
     ) -> Result<Self, VerifiedArtifactError> {
-        let selection = lock_artifact_selection(project_dir, lock_entry, provider_name)
+        let selection = guarded_lock_artifact_selection(install_lock, lock_entry, provider_name)
             .map_err(VerifiedArtifactError::Other)?;
-        Self::from_selection(selection, provider_name, project_dir)
+        Self::from_selection(selection, provider_name, install_lock.project_dir())
     }
 
     pub(crate) fn from_selection<R>(
@@ -1211,7 +1211,7 @@ pub(crate) fn publish_cached<R>(
         source,
         locked_identity,
         pin,
-    } = lock_artifact_selection(&project_dir, lock_entry, provider_name)
+    } = guarded_lock_artifact_selection(staged.install_lock(), lock_entry, provider_name)
         .map_err(VerifiedArtifactError::Other)?;
     if staged.destination() != &path {
         return Err(VerifiedArtifactError::Other(format!(
@@ -1329,6 +1329,30 @@ pub(crate) fn lock_artifact_selection<'lock, R>(
     lock_entry: &'lock LockEntry<R>,
     provider_name: &str,
 ) -> Result<LockArtifactSelection<'lock, R>, String> {
+    lock_artifact_selection_with(project_dir, lock_entry, provider_name, |path| {
+        path.resolve(project_dir)
+    })
+}
+
+fn guarded_lock_artifact_selection<'lock, R>(
+    install_lock: &ProviderInstallLock,
+    lock_entry: &'lock LockEntry<R>,
+    provider_name: &str,
+) -> Result<LockArtifactSelection<'lock, R>, String> {
+    lock_artifact_selection_with(
+        install_lock.project_dir(),
+        lock_entry,
+        provider_name,
+        |path| install_lock.project_artifact(path),
+    )
+}
+
+fn lock_artifact_selection_with<'lock, R>(
+    project_dir: &ResolvedPath,
+    lock_entry: &'lock LockEntry<R>,
+    provider_name: &str,
+    resolve_artifact: impl FnOnce(&WasmArtifactPath) -> io::Result<ResolvedPath>,
+) -> Result<LockArtifactSelection<'lock, R>, String> {
     let source = lock_entry
         .source
         .parse::<ProviderSource>()
@@ -1438,9 +1462,7 @@ pub(crate) fn lock_artifact_selection<'lock, R>(
     };
 
     let published_path = WasmArtifactPath::new(path, provider_name)?;
-    let path = published_path
-        .resolve(project_dir)
-        .map_err(|error| error.to_string())?;
+    let path = resolve_artifact(&published_path).map_err(|error| error.to_string())?;
     Ok(LockArtifactSelection {
         path,
         published_path,
@@ -1704,6 +1726,25 @@ mod tests {
 
     #[test]
     fn checksum_recovery_hints_retain_the_project_invocation_spelling() {
+        const FIXTURE_CHILD: &str = "CARINA_TEST_CHECKSUM_HINT_FIXTURE";
+        if std::env::var_os(FIXTURE_CHILD).is_none() {
+            // The relative spelling below exercises hint rendering, not a
+            // missing ancestor. Give it a real directory in an isolated CWD.
+            let fixture = tempfile::tempdir().unwrap();
+            std::fs::create_dir(fixture.path().join("infra")).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "verified_artifact::tests::checksum_recovery_hints_retain_the_project_invocation_spelling",
+                    "--nocapture",
+                ])
+                .current_dir(fixture.path())
+                .env(FIXTURE_CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
         let source = "carina-rs/awscc";
         let lock: LockEntry = LockEntry {
             name: "awscc".into(),

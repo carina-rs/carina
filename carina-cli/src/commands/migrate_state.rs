@@ -498,6 +498,44 @@ mod tests {
         assert_eq!(outcome, MigrationOutcome::NotNeeded);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_migration_rejects_source_symlink_to_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = carina_core::paths::ResolvedPath::new(tmp.path()).unwrap();
+        let destination = tmp.path().join("new.json");
+        local_backend_for_test(destination.clone())
+            .write_state(&state_with("same-file", 2))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink("new.json", tmp.path().join("old.json")).unwrap();
+        let old_lock = BackendLock::for_config(Some(&local_config(Path::new("old.json")))).unwrap();
+        old_lock.save(&project).unwrap();
+        let original_bytes = std::fs::read(&destination).unwrap();
+
+        let result = run_init_migrate_state(
+            crate::output_style::ColorMode::Plain,
+            &project,
+            Some(&local_config(Path::new("new.json"))),
+            true,
+        )
+        .await;
+
+        assert_eq!(std::fs::read(&destination).unwrap(), original_bytes);
+        let error = result.expect_err("aliases of one pinned state file cannot be migrated");
+        assert!(
+            error.to_string().contains("same local state file"),
+            "{error}"
+        );
+        assert_eq!(BackendLock::load(&project).unwrap().unwrap(), old_lock);
+        assert!(
+            std::fs::symlink_metadata(tmp.path().join("old.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
     #[tokio::test]
     async fn local_to_local_migration_deletes_source() {
         let color_mode = crate::output_style::ColorMode::Plain;

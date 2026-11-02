@@ -286,7 +286,7 @@ pub(crate) fn duplicate_declaration_errors(
         .map(|duplicate| AppError::Validation(duplicate.to_string()))
         .collect();
     for module in module_walk.iter() {
-        let prefix = module.diagnostic_path().display();
+        let prefix = module.diagnostic_label();
         errors.extend(
             module
                 .loaded()

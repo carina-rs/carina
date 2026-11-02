@@ -373,8 +373,12 @@ fn pin_io_path(path: &Path, links: usize) -> io::Result<PathBuf> {
             let component = components.next_back().ok_or(error)?;
             let parent = pin_io_path(components.as_path(), links)?;
             match component {
-                Component::ParentDir => Ok(parent.parent().unwrap_or(&parent).to_path_buf()),
-                Component::CurDir => Ok(parent),
+                // A missing ancestor cannot be traversed, even if `..` would
+                // lexically cancel it. Require filesystem traversal here;
+                // only normal missing components are valid future destinations.
+                Component::ParentDir | Component::CurDir => {
+                    std::fs::canonicalize(parent.join(component.as_os_str()))
+                }
                 component => Ok(parent.join(component.as_os_str())),
             }
         }
@@ -580,6 +584,72 @@ impl DisplayPath {
             Self(self.0.join(child))
         }
     }
+
+    /// Normalize a source label, interpreting relative paths from the current
+    /// directory. Drop `.` and cancel `directory/..` only for an existing real directory.
+    pub fn for_diagnostics(path: impl AsRef<Path>) -> Self {
+        Self::normalize_diagnostic(path.as_ref(), None)
+    }
+
+    /// Render an import chain relative to a pinned directory. Absolute labels
+    /// under that directory also reuse its pin, even if its alias has changed.
+    pub fn for_diagnostics_from(path: impl AsRef<Path>, base: &ResolvedPath) -> Self {
+        Self::normalize_diagnostic(path.as_ref(), Some(base))
+    }
+
+    fn normalize_diagnostic(path: &Path, base: Option<&ResolvedPath>) -> Self {
+        let mut normalized = PathBuf::new();
+        let mut prefix = PathBuf::new();
+        let needs_resolution = path
+            .components()
+            .any(|component| component == Component::ParentDir);
+        let mut current = if needs_resolution {
+            base.cloned().or_else(|| ResolvedPath::new(".").ok())
+        } else {
+            None
+        };
+        for component in path.components() {
+            if component == Component::CurDir {
+                continue;
+            }
+            if component == Component::ParentDir
+                && matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                )
+                && current
+                    .as_ref()
+                    .and_then(|path| path.symlink_metadata().ok())
+                    .is_some_and(|metadata| metadata.file_type().is_dir())
+            {
+                normalized.pop();
+            } else {
+                normalized.push(component.as_os_str());
+            }
+            prefix.push(component.as_os_str());
+            current = match base {
+                Some(base)
+                    if needs_resolution
+                        && path.is_absolute()
+                        && (prefix == base.display_address || prefix == base.persisted.0.0) =>
+                {
+                    Some(base.clone())
+                }
+                _ => current.and_then(|path| path.join(component.as_os_str()).ok()),
+            };
+        }
+        Self(if normalized.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            normalized
+        })
+    }
+
+    /// Bridge to parser source labels, without exposing an IO address.
+    pub(crate) fn into_source_path(self) -> PathBuf {
+        self.0
+    }
+
     pub fn with_extension(&self, extension: impl AsRef<std::ffi::OsStr>) -> Self {
         Self(self.0.with_extension(extension))
     }
@@ -898,6 +968,86 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn diagnostic_paths_collapse_real_directories_but_preserve_symlink_parents() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join("outer")).unwrap();
+        std::fs::create_dir(project.join("inner")).unwrap();
+        std::fs::create_dir_all(temp.path().join("module/helper")).unwrap();
+        std::fs::create_dir_all(temp.path().join("private/nested")).unwrap();
+        std::fs::create_dir(temp.path().join("private/bad")).unwrap();
+        std::os::unix::fs::symlink("../private/nested", project.join("jump")).unwrap();
+        std::fs::write(project.join("inner/main.crn"), "local").unwrap();
+        std::fs::write(temp.path().join("private/bad/main.crn"), "remote").unwrap();
+        std::fs::write(project.join("file"), "not a directory").unwrap();
+        let base = ResolvedPath::new(&project).unwrap();
+
+        for (source, expected) in [
+            ("./outer/../inner/./main.crn", "inner/main.crn"),
+            ("../module/./helper", "../module/helper"),
+            ("./jump/../bad/./main.crn", "jump/../bad/main.crn"),
+            ("missing/../inner/main.crn", "missing/../inner/main.crn"),
+            ("file/../inner/main.crn", "file/../inner/main.crn"),
+            ("./outer/..", "."),
+        ] {
+            assert_eq!(
+                DisplayPath::for_diagnostics_from(source, &base).to_string(),
+                expected,
+                "source={source}"
+            );
+            let absolute_expected = match expected {
+                "." => project.clone(),
+                "../module/helper" => temp.path().join("module/helper"),
+                _ => project.join(expected),
+            };
+            assert_eq!(
+                DisplayPath::for_diagnostics(project.join(source)).0,
+                absolute_expected
+            );
+        }
+        for source in ["./outer/../inner/./main.crn", "./jump/../bad/./main.crn"] {
+            let label = DisplayPath::for_diagnostics_from(source, &base);
+            assert_eq!(
+                base.join(source).unwrap().identity(),
+                base.join(&label.0).unwrap().identity()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostic_paths_inspect_the_pinned_tree_after_alias_retargeting() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original");
+        let replacement = temp.path().join("replacement");
+        let alias = temp.path().join("alias");
+        std::fs::create_dir_all(original.join("outer")).unwrap();
+        std::fs::create_dir_all(temp.path().join("private/nested")).unwrap();
+        std::os::unix::fs::symlink("../private/nested", original.join("jump")).unwrap();
+        std::fs::create_dir_all(replacement.join("jump")).unwrap();
+        std::os::unix::fs::symlink("../private/nested", replacement.join("outer")).unwrap();
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        let base = ResolvedPath::new(&alias).unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+
+        for (source, expected) in [
+            ("outer/../inner/main.crn", "inner/main.crn"),
+            ("jump/../bad/main.crn", "jump/../bad/main.crn"),
+        ] {
+            assert_eq!(
+                DisplayPath::for_diagnostics_from(source, &base).to_string(),
+                expected
+            );
+            assert_eq!(
+                DisplayPath::for_diagnostics_from(alias.join(source), &base).to_string(),
+                alias.join(expected).display().to_string()
+            );
+        }
+    }
+
     #[test]
     fn display_path_relative_labels_accept_an_optional_leading_dot() {
         for (base, path, expected) in [
@@ -1171,6 +1321,25 @@ mod tests {
         assert_eq!(path.read().unwrap(), b"new");
         assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn resolved_path_rejects_missing_ancestor_before_parent_component() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("production")).unwrap();
+        for suffix in ["missing/../production", "missing/nested/../../production"] {
+            let path = temp.path().join(suffix);
+            assert_eq!(
+                std::fs::canonicalize(&path).unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+            assert_eq!(
+                ResolvedPath::new(&path).unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+        }
+        // Missing leaves remain valid destinations, including below existing parents.
+        ResolvedPath::new(temp.path().join("production/../new/state.json")).unwrap();
     }
 
     #[test]

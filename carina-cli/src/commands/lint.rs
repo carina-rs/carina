@@ -463,7 +463,7 @@ fn lint_result(
                     warnings.push(LintWarning {
                         file,
                         line: 1,
-                        message: format!("{}: {duplicate}", module.diagnostic_path().display()),
+                        message: format!("{}: {duplicate}", module.diagnostic_label()),
                     });
                 }
             }

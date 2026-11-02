@@ -49,6 +49,26 @@ impl ProviderTypeCheckSite {
     }
 }
 
+#[cfg(all(test, unix))]
+#[test]
+fn deferred_type_diagnostics_preserve_symlink_parent_source_spelling() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("private/nested")).unwrap();
+    std::fs::create_dir(temp.path().join("private/bad")).unwrap();
+    std::os::unix::fs::symlink("private/nested", temp.path().join("jump")).unwrap();
+    let source = temp.path().join("jump/../bad/main.crn");
+    std::fs::write(&source, "arguments { value: MissingType }\n").unwrap();
+    let span = SourceSpan::dummy();
+    assert_eq!(
+        ProviderTypeCheckSite::new(&source, span, "annotation").source,
+        source
+    );
+    assert_eq!(
+        ProviderTypeCheckSite::at_line(&source, 1, 1, "annotation").source,
+        source
+    );
+}
+
 /// The evidence belongs exclusively to one run, never to a cloneable catalog.
 #[derive(Debug)]
 struct DeferredProviderTypeChecks<'s> {

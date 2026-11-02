@@ -1336,12 +1336,11 @@ mod verified_revision_artifact {
         cached: &CachedRevisionArtifact,
         lock_entry: &crate::provider_resolver::LockEntry<R>,
         name: &str,
-        project_dir: &ResolvedPath,
+        install_lock: &ProviderInstallLock,
     ) -> Result<VerifiedRevisionArtifact, VerifiedArtifactError> {
-        let artifact = VerifiedArtifact::from_existing(lock_entry, name, project_dir)?;
-        if artifact
-            .path()
-            .resolve(project_dir)
+        let artifact = VerifiedArtifact::from_existing(lock_entry, name, install_lock)?;
+        if install_lock
+            .project_artifact(artifact.path())
             .map_err(|error| VerifiedArtifactError::Other(error.to_string()))?
             .identity()
             != cached.path().identity()
@@ -1366,8 +1365,8 @@ mod verified_revision_artifact {
         lock_entry: &crate::provider_resolver::LockEntry<R>,
         name: &str,
     ) -> Result<VerifiedRevisionArtifact, VerifiedArtifactError> {
-        let target = destination
-            .resolve(install_lock.project_dir())
+        let target = install_lock
+            .project_artifact(destination)
             .map_err(|error| VerifiedArtifactError::Other(error.to_string()))?;
         revision_artifact_cache::publish(&target, cached.artifact_id(), || {
             crate::install_lock::install_project_artifact_from_global_cache(
@@ -1422,8 +1421,8 @@ mod verified_revision_artifact {
         name: &str,
         unchanged_revision: bool,
     ) -> Result<PublishedRevisionArtifact, String> {
-        let target = destination
-            .resolve(install_lock.project_dir())
+        let target = install_lock
+            .project_artifact(destination)
             .map_err(|error| error.to_string())?;
         revision_artifact_cache::publish(&target, selected.artifact_id(), || {
             let staged = stage_selected_artifact(install_lock, destination, selected)?;
@@ -1680,23 +1679,27 @@ where
     let wasm_path = WasmArtifactPath::new(cache_path_revision(base_dir, source, &sha), name)?;
     if mode != LockMode::Upgrade
         && let Some((lock_entry, pin)) = artifact_pin.pinned(user_dirs)
-        && let Some(cached) = wasm_path
-            .resolve(base_dir)
+        && let Some(cached) = install_lock
+            .project_artifact(&wasm_path)
             .ok()
             .and_then(|path| revision_artifact_cache::read(&path, pin.artifact_id))
     {
         let pin = pin.clone();
-        let verified =
-            match verified_revision_artifact::from_existing(&cached, lock_entry, name, base_dir) {
-                Ok(verified) => verified,
-                Err(VerifiedArtifactError::ChecksumMismatch(mismatch)) => {
-                    let removal = wasm_path
-                        .resolve(base_dir)
-                        .and_then(|path| revision_artifact_cache::remove(&path));
-                    return Err((*mismatch).after_cache_removal(wasm_path.as_path(), removal));
-                }
-                Err(VerifiedArtifactError::Other(message)) => return Err(message),
-            };
+        let verified = match verified_revision_artifact::from_existing(
+            &cached,
+            lock_entry,
+            name,
+            install_lock,
+        ) {
+            Ok(verified) => verified,
+            Err(VerifiedArtifactError::ChecksumMismatch(mismatch)) => {
+                let removal = install_lock
+                    .project_artifact(&wasm_path)
+                    .and_then(|path| revision_artifact_cache::remove(&path));
+                return Err((*mismatch).after_cache_removal(wasm_path.as_path(), removal));
+            }
+            Err(VerifiedArtifactError::Other(message)) => return Err(message),
+        };
         if mode != LockMode::Locked {
             lock_file.upsert(revision_lock_entry(
                 &verified,
@@ -1816,8 +1819,8 @@ where
     // Save to global cache
     if let Some(global_wasm) = global_cache_path_revision(user_dirs, source, &sha) {
         install_global_revision_artifact(
-            &installed_path
-                .resolve(base_dir)
+            &install_lock
+                .project_artifact(&installed_path)
                 .map_err(|error| error.to_string())?,
             &global_wasm,
             verified.artifact_id(),
@@ -2027,7 +2030,10 @@ mod tests {
         let nested = VerifiedArtifact::from_existing(
             &lock_entry,
             "aws",
-            &carina_core::paths::ResolvedPath::new(&project_dir).unwrap(),
+            &ProviderInstallLock::acquire(
+                &carina_core::paths::ResolvedPath::new(&project_dir).unwrap(),
+            )
+            .unwrap(),
         )
         .unwrap_err()
         .to_string();

@@ -1229,6 +1229,53 @@ let disabled = chooser { flag = false }
 
 #[cfg(unix)]
 #[test]
+fn cached_module_registers_nested_imports_for_each_symlink_spelling() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(temp.path().join("outer/inner/leaf")).unwrap();
+    std::os::unix::fs::symlink("outer", temp.path().join("outer-alias")).unwrap();
+    fs::write(
+        temp.path().join("outer/main.crn"),
+        "arguments { label: String }\nlet inner = use { source = \"./inner\" }\nlet child = inner { label = label }\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("outer/inner/main.crn"),
+        "arguments { label: String }\nlet leaf = use { source = \"./leaf\" }\nlet child = leaf { label = label }\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("outer/inner/leaf/main.crn"),
+        "arguments { label: String }\nlet item = mock.test.Thing { value = label }\n",
+    )
+    .unwrap();
+    let source = r#"
+let outer = use { source = "./outer" }
+let alias = use { source = "./outer-alias" }
+let first = outer { label = "first" }
+let second = alias { label = "second" }
+"#;
+    let parsed = crate::parser::parse_file(
+        source,
+        &temp.path().join("main.crn"),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let expanded =
+        resolve_modules(parsed, temp.path()).expect("both spellings expand nested imports");
+    assert_eq!(expanded.resources.len(), 2);
+    for label in ["first", "second"] {
+        let resource = expanded.resources.iter().find(|resource| {
+            resource.get_attr("value")
+                == Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                    label.into(),
+                )))
+        });
+        assert!(resource.is_some(), "missing nested resource for {label}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn module_parse_error_preserves_symlink_followed_by_parent_components() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");

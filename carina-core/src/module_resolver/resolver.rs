@@ -1045,9 +1045,13 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             return Err(ModuleError::CircularImport(path.to_string()));
         }
 
-        // Check cache
-        if let Some(module) = self.module_cache.get(&canonical) {
-            return Ok(module.clone());
+        // Parsed templates share canonical identities, but nested import
+        // locations belong to each spelling and its pinned directory.
+        if let Some(mut module) = self.module_cache.get(&canonical).cloned() {
+            self.resolving.insert(canonical.clone());
+            let result = self.resolve_nested_modules(&mut module, &full_path);
+            self.resolving.remove(&canonical);
+            return result.map(|()| module);
         }
 
         // Mark as resolving

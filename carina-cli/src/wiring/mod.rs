@@ -4468,7 +4468,7 @@ pub(crate) fn validate_module_attribute_refs_after_expansion_failure(
         for finding in validation::resolve_file_type_exprs(&mut parsed, config) {
             errors.push(AppError::Validation(format!(
                 "{}: {finding}",
-                module.diagnostic_path().display()
+                module.diagnostic_label()
             )));
         }
         let signatures = carina_core::module_resolver::ResolvedModuleSignatures::default();
@@ -4481,7 +4481,7 @@ pub(crate) fn validate_module_attribute_refs_after_expansion_failure(
         ) {
             errors.extend(prefixed_validation_messages(
                 &joined,
-                module.diagnostic_path().display(),
+                module.diagnostic_label(),
             ));
         }
     }
@@ -4500,7 +4500,7 @@ pub(crate) fn validate_module_internal_ref_types(
     let mut errors = Vec::new();
     for module in module_walk.iter() {
         let mut parsed = module.loaded().parsed.clone();
-        let prefix = module.diagnostic_path().display();
+        let prefix = module.diagnostic_label();
         // Module expansion retains the established diagnostic for malformed
         // declarations. This pass only needs successful resolution so valid
         // dotted argument types can act as sources before expansion.
@@ -4556,7 +4556,7 @@ pub(crate) fn validate_no_provider_in_modules(module_walk: &ModuleWalk) -> Vec<A
         if let Err(message) = validation::validate_no_provider_in_module(&module.loaded().parsed) {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
-                module.diagnostic_path().display()
+                module.diagnostic_label()
             )));
         }
     }
@@ -4576,7 +4576,7 @@ pub(crate) fn validate_no_state_blocks_in_modules(module_walk: &ModuleWalk) -> V
         {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
-                module.diagnostic_path().display()
+                module.diagnostic_label()
             )));
         }
     }
@@ -4593,7 +4593,7 @@ pub(crate) fn validate_no_backend_in_modules(module_walk: &ModuleWalk) -> Vec<Ap
         if let Err(message) = validation::validate_no_backend_in_module(&module.loaded().parsed) {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
-                module.diagnostic_path().display()
+                module.diagnostic_label()
             )));
         }
     }
@@ -4612,7 +4612,7 @@ pub(crate) fn validate_no_upstream_states_in_modules(module_walk: &ModuleWalk) -
         {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
-                module.diagnostic_path().display()
+                module.diagnostic_label()
             )));
         }
     }
@@ -4629,7 +4629,7 @@ pub(crate) fn validate_no_exports_in_modules(module_walk: &ModuleWalk) -> Vec<Ap
         if let Err(message) = validation::validate_no_exports_in_module(&module.loaded().parsed) {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
-                module.diagnostic_path().display()
+                module.diagnostic_label()
             )));
         }
     }

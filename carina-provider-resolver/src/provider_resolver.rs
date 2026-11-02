@@ -7959,8 +7959,8 @@ fn obtain_registry_artifact<'lock, H: RegistryHttp>(
     let project_dir = install_lock.project_dir();
     let path = WasmArtifactPath::new(cache_path_wasm(project_dir, source, version), provider_name)
         .map_err(RegistryArtifactError::Invalid)?;
-    let io_path = path
-        .resolve(project_dir)
+    let io_path = install_lock
+        .project_artifact(&path)
         .map_err(|error| RegistryArtifactError::Invalid(error.to_string()))?;
     let (state, digest) = if io_path.exists()
         && (!ProviderTrust::remote_source_is_allowlisted(source)
@@ -8712,14 +8712,14 @@ where
         cache_path_github_release(project_dir, &source_key, version),
         name,
     )?;
-    if wasm_path
-        .resolve(project_dir)
+    if install_lock
+        .project_artifact(&wasm_path)
         .map_err(|error| error.to_string())?
         .exists()
         && let Some((lock_entry, pin)) = artifact_pin.pinned(user_dirs)
     {
         let pin = pin.clone();
-        let verified = match VerifiedArtifact::from_existing(lock_entry, name, project_dir) {
+        let verified = match VerifiedArtifact::from_existing(lock_entry, name, install_lock) {
             Ok(verified) => verified,
             Err(VerifiedArtifactError::ChecksumMismatch(mismatch)) => {
                 let removal = install_lock.remove_project_artifact(&wasm_path);
@@ -8816,8 +8816,8 @@ where
     // Save to global cache
     if let Some(global_wasm) = global_cache_path_github_release(user_dirs, &source_key, version) {
         let _ = install_global_artifact_atomically(
-            &installed_path
-                .resolve(project_dir)
+            &install_lock
+                .project_artifact(&installed_path)
                 .map_err(|error| error.to_string())?,
             &global_wasm,
         );
@@ -19166,7 +19166,10 @@ transparency_log_present = true
             lock.find_by_source_key_and_version(&source_key(source), "1.0.0")
                 .unwrap(),
             "aws",
-            &carina_core::paths::ResolvedPath::new(&project_dir).unwrap(),
+            &ProviderInstallLock::acquire(
+                &carina_core::paths::ResolvedPath::new(&project_dir).unwrap(),
+            )
+            .unwrap(),
         )
         .unwrap_err()
         .to_string();

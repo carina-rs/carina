@@ -3,7 +3,7 @@ use carina_core::paths::{CanonicalPath, ResolvedPath};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 
 use crate::{MockObservations, MockStates};
@@ -43,13 +43,32 @@ impl MockScope {
                 "mock state path must be absolute",
             ));
         }
-        path.file_name().ok_or_else(|| {
+        let file_name = path.file_name().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "mock state path has no file name",
             )
         })?;
-        let path = ResolvedPath::new(path)?;
+        // Mock stores can be configured before their directories exist. Pin
+        // each component, but cancel a missing planned directory locally;
+        // ResolvedPath itself must still reject traversing a missing ancestor.
+        let mut parent = ResolvedPath::new(path.ancestors().last().unwrap())?;
+        for component in path.parent().unwrap().components() {
+            match component {
+                Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+                Component::ParentDir => {
+                    parent = match parent.join("..") {
+                        Ok(parent) => parent,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            parent.parent().ok_or(error)?
+                        }
+                        Err(error) => return Err(error),
+                    };
+                }
+                Component::Normal(name) => parent = parent.join(name)?,
+            }
+        }
+        let path = parent.join(file_name)?;
         let identity = path.identity();
         let mut scopes = FILE_SCOPES
             .lock()
@@ -259,6 +278,24 @@ mod tests {
         let scope = MockScope::file(dir.path().join("state.json")).unwrap();
         let alias = MockScope::file(link.join("state.json")).unwrap();
         assert!(Arc::ptr_eq(&scope.0, &alias.0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_scope_cancels_missing_directories_after_resolving_symlink_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let private = dir.path().join("private");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir_all(private.join("nested")).unwrap();
+        std::os::unix::fs::symlink(private.join("nested"), project.join("jump")).unwrap();
+        let scope = MockScope::file(private.join("state.json")).unwrap();
+        let alias = MockScope::file(project.join("jump/../missing/../state.json")).unwrap();
+        assert!(Arc::ptr_eq(&scope.0, &alias.0));
+        assert!(!private.join("missing").exists());
+        alias.lock().unwrap().save(&MockStates::new()).unwrap();
+        assert!(private.join("state.json").is_file());
+        assert!(!project.join("state.json").exists());
     }
 
     #[test]

@@ -1881,6 +1881,91 @@ fn binding_use_finding_display_is_context_only_and_error_is_its_source() {
     );
 }
 
+#[cfg(unix)]
+fn symlink_parent_source(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    let private = temp.path().join("private");
+    std::fs::create_dir_all(project.join("bad")).unwrap();
+    std::fs::create_dir_all(private.join("nested")).unwrap();
+    std::fs::create_dir(private.join("bad")).unwrap();
+    std::fs::write(project.join("bad/main.crn"), "wrong file").unwrap();
+    std::fs::write(private.join("bad/main.crn"), contents).unwrap();
+    std::os::unix::fs::symlink(private.join("nested"), project.join("jump")).unwrap();
+    let source = project.join("jump/../bad/main.crn");
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), contents);
+    (temp, source)
+}
+
+#[cfg(unix)]
+#[test]
+fn binding_diagnostics_preserve_symlink_parent_source_spelling() {
+    let (_temp, path) = symlink_parent_source(
+        "arguments { value: Int }\nlet item = mock.test.resource { name = value }\n",
+    );
+    let provider = LoadedProviderContext::empty_for_test();
+    let parsed =
+        crate::parser::parse_file(&std::fs::read_to_string(&path).unwrap(), &path, &provider)
+            .unwrap();
+    let schemas = function_ref_schema();
+    let signatures = crate::module_resolver::ResolvedModuleSignatures::new();
+    let report = check_bare_binding_uses(
+        &parsed,
+        &ValidationTypeContext::new(&parsed, &schemas, &provider, &signatures),
+    );
+    assert_eq!(report.findings().len(), 1, "{report:?}");
+    let finding = &report.findings()[0];
+    assert_eq!(finding.use_site.source_file.path(), path);
+    assert_eq!(finding.to_string(), format!("{} at line 2", path.display()));
+    assert_eq!(
+        report.to_string(),
+        format!("{}: {} at line 2", path.display(), finding.error)
+    );
+    let nested = ModuleCallFindingMessage::NestedResourceBindingUse(Box::new(finding.clone()));
+    assert_eq!(nested.to_string(), report.to_string());
+}
+
+#[cfg(unix)]
+#[test]
+fn module_call_diagnostics_preserve_symlink_parent_source_spelling() {
+    let (_temp, path) = symlink_parent_source(
+        "let child = use { source = './child' }\nchild { surprise = true }\n",
+    );
+    let provider = LoadedProviderContext::empty_for_test();
+    let parsed =
+        crate::parser::parse_file(&std::fs::read_to_string(&path).unwrap(), &path, &provider)
+            .unwrap();
+    let signatures = HashMap::from([(
+        "child".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: Vec::new(),
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+    let findings = module_call_findings_for_test(&parsed, &signatures, &provider);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].anchor().source_file.path(), path);
+    assert_eq!(
+        findings[0].to_string(),
+        format!("{} at line 2", path.display())
+    );
+    assert_eq!(module_use_anchor(&parsed.uses[0]).source_file.path(), path);
+    let diagnostic = TypeResolutionDiagnostic::description(
+        "module declaration".to_string(),
+        crate::static_type::StaticTypeResolutionError::UnknownCustomType {
+            name: "Missing".to_string(),
+        }
+        .into(),
+        Some(TypeResolutionSource::new(
+            SourceFileId::new(path.clone()),
+            SourceSpan::dummy(),
+        )),
+    );
+    let finding = ModuleCallFinding::try_from_type_resolution(diagnostic).unwrap();
+    assert_eq!(finding.anchor().source_file.path(), path);
+}
+
 #[test]
 fn parser_side_deferred_resource_keeps_bare_binding_sink_type() {
     let parsed = crate::parser::parse(
