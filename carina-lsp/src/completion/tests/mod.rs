@@ -279,11 +279,11 @@ pub(super) fn test_provider_with_enum_and_regions() -> CompletionProvider {
     let region_completions: Vec<CompletionValue> = vec![
         CompletionValue {
             value: "aws.Region.ap_northeast_1".to_string(),
-            description: "Asia Pacific (Tokyo)".to_string(),
+            description: "Asia Pacific (Tokyo)".into(),
         },
         CompletionValue {
             value: "aws.Region.us_east_1".to_string(),
-            description: "US East (N. Virginia)".to_string(),
+            description: "US East (N. Virginia)".into(),
         },
     ];
 

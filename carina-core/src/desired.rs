@@ -1096,7 +1096,14 @@ mod tests {
                 .downcast_ref::<NormalizationError>()
                 .expect("cause must retain the normalization error type");
             assert!(error.source().is_none(), "provider errors remain terminal");
-            assert_eq!(error.detail().resource_id.as_deref(), Some(&resource.id));
+            assert_eq!(
+                error
+                    .detail()
+                    .resource_id
+                    .as_deref()
+                    .map(|id| id.as_resource_id()),
+                Some(&resource.id)
+            );
             assert_eq!(source.attribute, "value");
             if invalid_scalar {
                 assert!(

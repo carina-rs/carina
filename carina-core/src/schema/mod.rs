@@ -198,6 +198,7 @@ pub use compiled_pattern::{
     Compiled, CompiledPattern, Draft, PatternCompileError, PatternCompileErrorSource, PatternForm,
 };
 
+use crate::provider_text::ProviderText;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -446,7 +447,11 @@ pub fn legacy_validator<F>(f: F) -> CustomValidator
 where
     F: Fn(&Value) -> Result<(), String> + Send + Sync + 'static,
 {
-    Arc::new(move |v| f(v).map_err(|message| TypeError::ValidationFailed { message }))
+    Arc::new(move |v| {
+        f(v).map_err(|message| TypeError::ValidationFailed {
+            message: message.into(),
+        })
+    })
 }
 
 /// External validator resolved from the exact declared refined type.
@@ -998,7 +1003,7 @@ pub struct PatternStructField<R: PatternForm = Draft> {
     /// Whether user input for this field is optional, required, or forbidden.
     declared_input_mode: InputMode,
     /// Description of this field
-    pub(crate) description: Option<String>,
+    pub(crate) description: Option<ProviderText>,
     /// Provider-side property name (e.g., "IpProtocol")
     pub(crate) provider_name: Option<String>,
     /// Alternative block name for repeated block syntax (e.g., "transition" for "transitions")
@@ -1210,7 +1215,7 @@ macro_rules! impl_user_input_struct_field_builder {
             }
 
             pub fn with_description(mut self, description: impl Into<String>) -> Self {
-                self.field.description = Some(description.into());
+                self.field.description = Some(ProviderText::new(description));
                 self
             }
 
@@ -1281,7 +1286,7 @@ impl<R: PatternForm> CreateOnlyOptionalStructFieldBuilder<R> {
 
 impl<R: PatternForm> ProviderPopulatedStructFieldBuilder<R> {
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
-        self.field.description = Some(description.into());
+        self.field.description = Some(ProviderText::new(description));
         self
     }
 
@@ -2151,7 +2156,9 @@ impl RefResolutionFailure<'_> {
                 self.name
             ),
         };
-        TypeError::ValidationFailed { message }
+        TypeError::ValidationFailed {
+            message: message.into(),
+        }
     }
 }
 
@@ -4156,7 +4163,7 @@ impl PatternAttributeType<Compiled> {
             }
             (AttrTypeKind::Float { .. }, ConcreteValueRef::Float(f)) => {
                 Err(TypeError::ValidationFailed {
-                    message: format!("non-finite float value: {f}"),
+                    message: format!("non-finite float value: {f}").into(),
                 })
             }
             (AttrTypeKind::Float { binding, range }, ConcreteValueRef::Int(i)) => {
@@ -4236,7 +4243,8 @@ impl PatternAttributeType<Compiled> {
                 expected,
                 extra_message: validation_result
                     .and_then(Result::err)
-                    .map(validation_error_message),
+                    .map(validation_error_message)
+                    .map(ProviderText::new),
             });
         }
 
@@ -4291,7 +4299,8 @@ impl PatternAttributeType<Compiled> {
                             message: format!(
                                 "Invalid {name} {}: {message}",
                                 user_form.render_enum_value(InvalidEnumValueKind::Identifier)
-                            ),
+                            )
+                            .into(),
                         }
                     })?;
                 }
@@ -4883,7 +4892,7 @@ pub fn enum_identity(name: &str, namespace: Option<&str>) -> TypeIdentity {
 
 fn validation_error_message(err: TypeError) -> String {
     match err {
-        TypeError::ValidationFailed { message } => message,
+        TypeError::ValidationFailed { message } => message.to_string(),
         other => other.to_string(),
     }
 }
@@ -4900,7 +4909,7 @@ fn validate_string_refinement(
     {
         return Err(TypeError::PatternMismatch {
             value: s.into(),
-            pattern: pattern.to_string(),
+            pattern: pattern.to_string().into(),
             attribute: None,
             type_name,
         });
@@ -4930,7 +4939,7 @@ fn validate_int_range(
         && (min.is_some_and(|min| value < min) || max.is_some_and(|max| value > max))
     {
         return Err(TypeError::ValidationFailed {
-            message: format!("value {value} is outside allowed range {min:?}..={max:?}"),
+            message: format!("value {value} is outside allowed range {min:?}..={max:?}").into(),
         });
     }
     Ok(())
@@ -4944,7 +4953,7 @@ fn validate_float_range(
         && (min.is_some_and(|min| value < min) || max.is_some_and(|max| value > max))
     {
         return Err(TypeError::ValidationFailed {
-            message: format!("value {value} is outside allowed range {min:?}..={max:?}"),
+            message: format!("value {value} is outside allowed range {min:?}..={max:?}").into(),
         });
     }
     Ok(())
@@ -7183,7 +7192,7 @@ pub enum TypeError {
     )]
     PatternMismatch {
         value: DiagnosticValue,
-        pattern: String,
+        pattern: ProviderText,
         attribute: Option<String>,
         type_name: Option<String>,
     },
@@ -7244,11 +7253,11 @@ pub enum TypeError {
         /// path, where the validator does not enumerate variants. When
         /// `expected` is non-empty, this field is silently ignored by
         /// the renderer; callers should not set both at once.
-        extra_message: Option<String>,
+        extra_message: Option<ProviderText>,
     },
 
     #[error("Validation failed: {message}")]
-    ValidationFailed { message: String },
+    ValidationFailed { message: ProviderText },
 
     #[error("{error}")]
     CustomTypeValidation {
@@ -7258,7 +7267,7 @@ pub enum TypeError {
 
     #[error("Resource validation failed: {message}")]
     ResourceValidationFailed {
-        message: String,
+        message: ProviderText,
         /// Optional attribute name for precise diagnostic positioning.
         attribute: Option<String>,
     },
@@ -7500,10 +7509,10 @@ impl TypeError {
                 attribute,
                 type_name,
                 expected,
-                extra_message: extra_message.map(|_| MASKED_MESSAGE.to_string()),
+                extra_message: extra_message.map(|_| MASKED_MESSAGE.into()),
             },
             TypeError::ValidationFailed { .. } => TypeError::ValidationFailed {
-                message: MASKED_MESSAGE.to_string(),
+                message: MASKED_MESSAGE.into(),
             },
             TypeError::CustomTypeValidation { error, attribute } => {
                 TypeError::CustomTypeValidation {
@@ -7513,7 +7522,7 @@ impl TypeError {
             }
             TypeError::ResourceValidationFailed { attribute, .. } => {
                 TypeError::ResourceValidationFailed {
-                    message: MASKED_MESSAGE.to_string(),
+                    message: MASKED_MESSAGE.into(),
                     attribute,
                 }
             }
@@ -7825,7 +7834,7 @@ pub struct CompletionValue {
     /// The value to insert (e.g., "aws.vpc.InstanceTenancy.default")
     pub value: String,
     /// Description shown in completion popup
-    pub description: String,
+    pub description: ProviderText,
 }
 
 /// Canonical name of a field in a struct-valued schema node.
@@ -7884,7 +7893,7 @@ impl CompletionValue {
     pub fn new(value: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
             value: value.into(),
-            description: description.into(),
+            description: ProviderText::new(description),
         }
     }
 }
@@ -7966,7 +7975,7 @@ pub struct PatternAttributeSchema<R: PatternForm = Draft> {
     /// Whether user input for this attribute is optional, required, or forbidden.
     pub(crate) input_mode: InputMode,
     pub(crate) default: Option<Value>,
-    pub(crate) description: Option<String>,
+    pub(crate) description: Option<ProviderText>,
     /// Completion values for this attribute (used by LSP)
     pub(crate) completions: Option<Vec<CompletionValue>>,
     /// Provider-side property name (e.g., "VpcId" for AWS Cloud Control)
@@ -8216,7 +8225,7 @@ macro_rules! impl_user_input_attribute_builder {
             }
 
             pub fn with_description(mut self, description: impl Into<String>) -> Self {
-                self.attribute.description = Some(description.into());
+                self.attribute.description = Some(ProviderText::new(description));
                 self
             }
 
@@ -8322,7 +8331,7 @@ impl<R: PatternForm> CreateOnlyOptionalAttributeSchemaBuilder<R> {
 
 impl<R: PatternForm> ProviderPopulatedAttributeSchemaBuilder<R> {
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
-        self.attribute.description = Some(description.into());
+        self.attribute.description = Some(ProviderText::new(description));
         self
     }
 
@@ -8477,7 +8486,7 @@ pub struct PatternResourceSchema<R: PatternForm = Draft> {
     pub(crate) resource_type: String,
     pub(crate) attributes: BTreeMap<String, PatternAttributeSchema<R>>,
     duplicate_attributes: Vec<String>,
-    pub(crate) description: Option<String>,
+    pub(crate) description: Option<ProviderText>,
     /// Cross-attribute validation, including its fingerprintable source.
     pub(crate) validation: ResourceValidation,
     /// Whether this is a managed resource or a data source.
@@ -8560,8 +8569,8 @@ impl ResourceValidation {
 /// `field_groups[0]` or `defs.Tag.key` as a resource attribute.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SchemaValidationIssueLocation {
-    Attribute(String),
-    Definition(String),
+    Attribute(ProviderText),
+    Definition(ProviderText),
     FieldGroup(usize),
     UniqueName,
     DefaultPreventDestroy,
@@ -8570,8 +8579,8 @@ pub enum SchemaValidationIssueLocation {
 impl SchemaValidationIssueLocation {
     fn with_suffix(&self, suffix: impl fmt::Display) -> Self {
         match self {
-            Self::Attribute(path) => Self::Attribute(format!("{path}{suffix}")),
-            Self::Definition(path) => Self::Definition(format!("{path}{suffix}")),
+            Self::Attribute(path) => Self::Attribute(format!("{path}{suffix}").into()),
+            Self::Definition(path) => Self::Definition(format!("{path}{suffix}").into()),
             Self::FieldGroup(_) | Self::UniqueName | Self::DefaultPreventDestroy => {
                 unreachable!("schema-level issue locations cannot have type-path descendants")
             }
@@ -8605,8 +8614,8 @@ impl fmt::Display for SchemaValidationIssueLocation {
 struct SchemaDefinitionIssue {
     pattern_error: Option<PatternCompileError>,
     location: SchemaValidationIssueLocation,
-    path: String,
-    message: String,
+    path: ProviderText,
+    message: ProviderText,
 }
 
 impl fmt::Display for SchemaDefinitionIssue {
@@ -8628,7 +8637,7 @@ fn fmt_schema_issues(issues: &[SchemaDefinitionIssue], f: &mut fmt::Formatter<'_
 /// Error returned when a resource-schema draft fails whole-schema validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceSchemaValidationError {
-    resource_type: String,
+    resource_type: ProviderText,
     issues: Vec<SchemaDefinitionIssue>,
 }
 
@@ -9536,7 +9545,7 @@ fn config_definition_issues(
     let mut visited_definitions = HashSet::new();
     let mut identified_kinds = HashMap::new();
     for (name, attr_type) in attribute_types {
-        let location = SchemaValidationIssueLocation::Attribute(name.clone());
+        let location = SchemaValidationIssueLocation::Attribute(name.clone().into());
         validate_type_definition(
             attr_type,
             &defs,
@@ -9570,7 +9579,7 @@ impl ValidatedConfigSchema {
         let attribute_types = compile_schema::compile_all(attribute_types, |(name, attr_type)| {
             attr_type
                 .compile_patterns(
-                    SchemaValidationIssueLocation::Attribute(name.clone()),
+                    SchemaValidationIssueLocation::Attribute(name.clone().into()),
                     &mut issues,
                 )
                 .map(|attr_type| (name, attr_type))
@@ -10086,9 +10095,9 @@ fn push_schema_issue(
 ) {
     issues.push(SchemaDefinitionIssue {
         pattern_error: None,
-        path: location.to_string(),
+        path: location.to_string().into(),
         location: location.clone(),
-        message: message.into(),
+        message: ProviderText::new(message),
     });
 }
 
@@ -10889,7 +10898,7 @@ fn validate_tags_key_value(attributes: &HashMap<String, Value>) -> Result<(), Ve
             }
             if has_key && has_value {
                 return Err(vec![TypeError::ResourceValidationFailed {
-                    message: "tags map contains both 'key' and 'value' as keys, which looks like a Key/Value pair list. Use flat map syntax instead: tags = { Name = '...' }".to_string(),
+                    message: "tags map contains both 'key' and 'value' as keys, which looks like a Key/Value pair list. Use flat map syntax instead: tags = { Name = '...' }".into(),
                     attribute: Some("tags".to_string()),
                 }]);
             }
@@ -11598,7 +11607,7 @@ impl<R: PatternForm> PatternResourceSchema<R> {
     }
 
     pub fn with_description(mut self, desc: impl Into<String>) -> Self {
-        self.description = Some(desc.into());
+        self.description = Some(ProviderText::new(desc));
         self
     }
 
@@ -14206,7 +14215,7 @@ impl PatternResourceSchema<Draft> {
         }
 
         for name in &self.duplicate_attributes {
-            let location = SchemaValidationIssueLocation::Attribute(name.clone());
+            let location = SchemaValidationIssueLocation::Attribute(name.clone().into());
             push_schema_issue(
                 issues,
                 &location,
@@ -14215,7 +14224,7 @@ impl PatternResourceSchema<Draft> {
         }
 
         for (name, attribute) in &self.attributes {
-            let location = SchemaValidationIssueLocation::Attribute(name.clone());
+            let location = SchemaValidationIssueLocation::Attribute(name.clone().into());
             validate_attribute_mode(attribute, &location, issues);
             if attribute.identity_mode.is_identity()
                 && identity_leaf_is_scalar_or_enum(
@@ -14270,7 +14279,7 @@ impl PatternResourceSchema<Draft> {
         for (name, definition) in &self.defs {
             validate_identified_scalar_kind_consistency(
                 definition,
-                SchemaValidationIssueLocation::Definition(name.clone()),
+                SchemaValidationIssueLocation::Definition(name.clone().into()),
                 &mut identified_kinds,
                 issues,
             );
@@ -14280,7 +14289,7 @@ impl PatternResourceSchema<Draft> {
             validate_type_definition(
                 definition,
                 &self.defs,
-                SchemaValidationIssueLocation::Definition(name.clone()),
+                SchemaValidationIssueLocation::Definition(name.clone().into()),
                 None,
                 &mut visited_definitions,
                 issues,
@@ -14314,8 +14323,7 @@ impl PatternResourceSchema<Draft> {
         }
 
         if let Some(conflict) = self.first_write_only_conflict() {
-            let location =
-                SchemaValidationIssueLocation::Attribute(conflict.attribute().to_string());
+            let location = SchemaValidationIssueLocation::Attribute(conflict.attribute().into());
             push_schema_issue(issues, &location, conflict.message());
         }
 
@@ -14323,7 +14331,7 @@ impl PatternResourceSchema<Draft> {
             type_create_only_analysis(&attribute.attr_type, &self.defs, &mut Vec::new())
                 .union_conflict
         }) {
-            let location = SchemaValidationIssueLocation::Attribute(name.clone());
+            let location = SchemaValidationIssueLocation::Attribute(name.clone().into());
             push_schema_issue(
                 issues,
                 &location,
@@ -14362,7 +14370,7 @@ fn finish_resource_schema_validation(
             })
         }
         _ => Err(ResourceSchemaValidationError {
-            resource_type,
+            resource_type: resource_type.into(),
             issues,
         }),
     }

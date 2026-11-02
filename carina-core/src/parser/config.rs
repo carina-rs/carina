@@ -367,7 +367,7 @@ pub enum CustomTypeValidationError {
     Rejected {
         owner: String,
         identity: TypeIdentity,
-        message: String,
+        message: crate::provider_text::ProviderText,
     },
     ProviderRejected {
         owner: String,
@@ -586,7 +586,7 @@ impl CustomTypeValidationError {
             } => Self::Rejected {
                 owner,
                 identity,
-                message: MASKED_MESSAGE.to_string(),
+                message: MASKED_MESSAGE.into(),
             },
             Self::ProviderRejected {
                 owner,
@@ -631,7 +631,7 @@ pub(crate) fn fixture_custom_type_rejection(
     CustomTypeValidationError::Rejected {
         owner: owner.to_string(),
         identity: target.identity().clone(),
-        message: message.into(),
+        message: crate::provider_text::ProviderText::new(message),
     }
 }
 

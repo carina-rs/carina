@@ -22,6 +22,7 @@
 //! let _ = config_schema_to_protocol(&draft);
 //! ```
 
+use crate::provider_text::ProviderText;
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
@@ -67,7 +68,7 @@ fn protocol_to_field_group(group: &protocol::FieldGroup) -> Result<FieldGroup, S
         protocol::FieldGroupKind::AtMostOne => FieldGroupKind::AtMostOne,
     };
     FieldGroup::new(kind, group.fields.clone()).map_err(|error| SchemaDecodeError::InvalidSchema {
-        detail: "field group is invalid".to_string(),
+        detail: "field group is invalid".into(),
         resource_type: None,
         attribute_path: Vec::new(),
         schema_issue_location: None,
@@ -78,10 +79,55 @@ fn protocol_to_field_group(group: &protocol::FieldGroup) -> Result<FieldGroup, S
 /// A key or index locating a nested value in a provider input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WirePathSegment {
-    Key(String),
+    Key(WirePathKey),
     Index(usize),
     /// The failing value is inside an opaque secret; its inner path is hidden.
     Secret,
+}
+
+/// A value's map key retained for secret-path traversal, with a separate safe
+/// diagnostic spelling. Sanitizing diagnostic text must not change data lookup.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WirePathKey {
+    key: String,
+    diagnostic: ProviderText,
+}
+
+impl fmt::Debug for WirePathKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.diagnostic.as_str(), f)
+    }
+}
+
+impl WirePathKey {
+    pub fn as_str(&self) -> &str {
+        self.diagnostic.as_str()
+    }
+
+    pub(crate) fn lookup_key(&self) -> &str {
+        &self.key
+    }
+}
+
+impl From<String> for WirePathKey {
+    fn from(key: String) -> Self {
+        Self {
+            diagnostic: ProviderText::new(&key),
+            key,
+        }
+    }
+}
+
+impl From<&str> for WirePathKey {
+    fn from(key: &str) -> Self {
+        key.to_string().into()
+    }
+}
+
+impl fmt::Display for WirePathKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.diagnostic.fmt(f)
+    }
 }
 
 /// A core value or type cannot be represented by the provider protocol.
@@ -125,7 +171,7 @@ pub enum ProtocolConvertError {
         base_kind: &'static str,
     },
     Context {
-        context: String,
+        context: ProviderText,
         source: Box<ProtocolConvertError>,
     },
     ValuePath {
@@ -290,7 +336,7 @@ impl ProtocolConvertError {
 
     fn context(self, context: impl Into<String>) -> Self {
         Self::Context {
-            context: context.into(),
+            context: ProviderText::new(context),
             source: Box::new(self),
         }
     }
@@ -300,9 +346,9 @@ impl ProtocolConvertError {
 #[derive(Debug)]
 pub enum SchemaDecodeError {
     InvalidSchema {
-        detail: String,
-        resource_type: Option<String>,
-        attribute_path: Vec<String>,
+        detail: ProviderText,
+        resource_type: Option<ProviderText>,
+        attribute_path: Vec<ProviderText>,
         schema_issue_location: Option<Box<SchemaValidationIssueLocation>>,
         source: Option<Box<dyn Error + Send + Sync>>,
     },
@@ -315,7 +361,7 @@ pub enum SchemaDecodeError {
 impl SchemaDecodeError {
     fn new(detail: impl Into<String>) -> Self {
         Self::InvalidSchema {
-            detail: detail.into(),
+            detail: ProviderText::new(detail),
             resource_type: None,
             attribute_path: Vec::new(),
             schema_issue_location: None,
@@ -325,7 +371,7 @@ impl SchemaDecodeError {
 
     fn from_default(error: ProtocolConvertError) -> Self {
         Self::InvalidSchema {
-            detail: "schema default value conversion error".to_string(),
+            detail: "schema default value conversion error".into(),
             resource_type: None,
             attribute_path: Vec::new(),
             schema_issue_location: None,
@@ -335,7 +381,7 @@ impl SchemaDecodeError {
 
     fn config_schema_validation(error: ConfigSchemaValidationError) -> Self {
         Self::InvalidSchema {
-            detail: "provider config schema is invalid".to_string(),
+            detail: "provider config schema is invalid".into(),
             resource_type: None,
             attribute_path: Vec::new(),
             schema_issue_location: None,
@@ -352,8 +398,8 @@ impl SchemaDecodeError {
             .next()
             .map(|(location, _message)| location.clone());
         Self::InvalidSchema {
-            detail: "resource schema is invalid".to_string(),
-            resource_type: Some(resource_type.to_string()),
+            detail: "resource schema is invalid".into(),
+            resource_type: Some(resource_type.into()),
             attribute_path: Vec::new(),
             schema_issue_location: schema_issue_location.map(Box::new),
             source: Some(Box::new(error)),
@@ -400,7 +446,7 @@ impl SchemaDecodeError {
 
     fn empty_custom_enum_namespace(name: &str) -> Self {
         Self::InvalidSchema {
-            detail: "custom enum namespace is invalid".to_string(),
+            detail: "custom enum namespace is invalid".into(),
             resource_type: None,
             attribute_path: Vec::new(),
             schema_issue_location: None,
@@ -418,7 +464,7 @@ impl SchemaDecodeError {
 
     fn protocol(error: ProtocolConvertError, detail: &'static str) -> Self {
         Self::InvalidSchema {
-            detail: detail.to_string(),
+            detail: detail.into(),
             resource_type: None,
             attribute_path: Vec::new(),
             schema_issue_location: None,
@@ -451,7 +497,7 @@ impl SchemaDecodeError {
                 schema_issue_location: _schema_issue_location,
                 source: _source,
             } => {
-                attribute_path.insert(0, name.to_string());
+                attribute_path.insert(0, name.into());
             }
             Self::DuplicateReferenceForm { identity: _ } | Self::InvalidProviderSchema(_) => {}
         }
@@ -467,12 +513,13 @@ impl SchemaDecodeError {
                 schema_issue_location,
                 source: _source,
             } => {
-                let path = std::iter::once(name.to_string())
+                let path = std::iter::once(ProviderText::new(name))
                     .chain(attribute_path.drain(..))
                     .collect::<Vec<_>>()
                     .join(".");
-                *schema_issue_location =
-                    Some(Box::new(SchemaValidationIssueLocation::Definition(path)));
+                *schema_issue_location = Some(Box::new(SchemaValidationIssueLocation::Definition(
+                    path.into(),
+                )));
             }
             Self::DuplicateReferenceForm { identity: _ } | Self::InvalidProviderSchema(_) => {}
         }
@@ -487,7 +534,7 @@ impl SchemaDecodeError {
                 attribute_path: _attribute_path,
                 schema_issue_location: _schema_issue_location,
                 source: _source,
-            } => *current = Some(resource_type.to_string()),
+            } => *current = Some(resource_type.into()),
             Self::DuplicateReferenceForm { identity: _ } | Self::InvalidProviderSchema(_) => {}
         }
         self
@@ -1894,7 +1941,9 @@ pub fn try_core_to_protocol_value(value: &Value) -> Result<protocol::Value, Prot
                 .map(|(key, value)| {
                     try_core_to_protocol_value(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
+                        .map_err(|error| {
+                            error.at_value_path(WirePathSegment::Key(key.clone().into()))
+                        })
                 })
                 .collect::<Result<_, _>>()?,
         )),
@@ -1974,7 +2023,9 @@ pub fn protocol_to_core_value(value: &protocol::Value) -> Result<Value, Protocol
                 .map(|(key, value)| {
                     protocol_to_core_value(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
+                        .map_err(|error| {
+                            error.at_value_path(WirePathSegment::Key(key.clone().into()))
+                        })
                 })
                 .collect::<Result<IndexMap<_, _>, _>>()?,
         ))),
@@ -2023,7 +2074,9 @@ pub fn protocol_schema_default_to_core(
                 .map(|(key, value)| {
                     protocol_schema_default_to_core(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
+                        .map_err(|error| {
+                            error.at_value_path(WirePathSegment::Key(key.clone().into()))
+                        })
                 })
                 .collect::<Result<IndexMap<_, _>, _>>()?,
         ))),
@@ -2039,7 +2092,7 @@ pub fn try_core_to_protocol_value_map(
         .map(|(key, value)| {
             try_core_to_protocol_value(value)
                 .map(|converted| (key.clone(), converted))
-                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone().into())))
         })
         .collect()
 }
@@ -2053,7 +2106,7 @@ pub fn protocol_to_core_value_map(
         .map(|(key, value)| {
             protocol_to_core_value(value)
                 .map(|converted| (key.clone(), converted))
-                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone().into())))
         })
         .collect()
 }
@@ -2111,7 +2164,9 @@ pub fn try_core_to_protocol_persisted_value(
                 .map(|(key, value)| {
                     try_core_to_protocol_persisted_value(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
+                        .map_err(|error| {
+                            error.at_value_path(WirePathSegment::Key(key.clone().into()))
+                        })
                 })
                 .collect::<Result<_, _>>()?,
         )),
@@ -2165,7 +2220,9 @@ pub fn protocol_to_core_persisted_value(
                 .map(|(key, value)| {
                     protocol_to_core_persisted_value(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
+                        .map_err(|error| {
+                            error.at_value_path(WirePathSegment::Key(key.clone().into()))
+                        })
                 })
                 .collect::<Result<IndexMap<_, _>, _>>()?,
         ))),
@@ -2181,7 +2238,7 @@ pub fn try_core_to_protocol_persisted_value_map(
         .map(|(key, value)| {
             try_core_to_protocol_persisted_value(value)
                 .map(|converted| (key.clone(), converted))
-                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone().into())))
         })
         .collect()
 }
@@ -2195,7 +2252,7 @@ pub fn protocol_to_core_persisted_value_map(
         .map(|(key, value)| {
             protocol_to_core_persisted_value(value)
                 .map(|converted| (key.clone(), converted))
-                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone().into())))
         })
         .collect()
 }
@@ -2608,8 +2665,11 @@ pub fn try_update_outcome_to_protocol(
             Ok(protocol::UpdateOutcome::PartialSuccess {
                 state: try_applied_update_state_to_protocol(state, state_after_patch)?,
                 diagnostic: protocol::PartialReadDiagnostic {
-                    reason: reason.clone(),
-                    missing_attributes: missing_attributes.clone(),
+                    reason: reason.to_string(),
+                    missing_attributes: missing_attributes
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
                 },
             })
         }
@@ -2769,7 +2829,7 @@ mod tests {
             let (location, source) = source.pattern_errors().next().unwrap();
             assert_eq!(
                 location,
-                &SchemaValidationIssueLocation::Attribute("value".to_string())
+                &SchemaValidationIssueLocation::Attribute("value".into())
             );
             assert_eq!(source.pattern, "(?=x)");
         }
@@ -2864,7 +2924,7 @@ mod tests {
         assert!(
             matches!(error, SchemaDecodeError::InvalidSchema {
             schema_issue_location: Some(ref location), ref attribute_path, ..
-        } if **location == SchemaValidationIssueLocation::Definition("Bad".to_string()) && attribute_path.is_empty()),
+        } if **location == SchemaValidationIssueLocation::Definition("Bad".into()) && attribute_path.is_empty()),
             "{error}"
         );
         assert!(error.to_string().contains("defs.Bad"), "{error}");

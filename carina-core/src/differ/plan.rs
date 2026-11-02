@@ -1467,7 +1467,7 @@ fn create_plan_parts(
                     diagnostic_id,
                     PlanErrorKind::WaitPredicateInvalid {
                         wait_binding: wait_binding.to_string(),
-                        reason: error.to_string(),
+                        reason: error.to_string().into(),
                     },
                 ));
                 continue;

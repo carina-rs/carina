@@ -31,6 +31,7 @@ use carina_provider_protocol::types::{
 use crate::binding_index::SecretPreservingAttributes;
 use crate::effect::PlanOp;
 use crate::parser::{ProviderConfig, StateBlockAddress};
+use crate::provider_text::{ProviderDiagnostic, ProviderText};
 pub use crate::resource::ProviderDirectiveSchema;
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, PartialReadMarker, PendingReRead,
@@ -78,22 +79,23 @@ pub(crate) fn fixture_applied_identifier(identifier: impl Into<String>) -> Appli
 ///
 /// ```compile_fail,E0451
 /// use carina_core::provider::ErrorDetail;
+/// use carina_core::provider_text::ProviderDiagnostic;
 ///
 /// let _ = ErrorDetail {
-///     message: String::from("x"),
-///     cause: Some(Box::new(std::io::Error::other("x"))),
+///     message: "x".into(),
+///     cause: Some(ProviderDiagnostic::new(std::io::Error::other("x"))),
 ///     ..ErrorDetail::default()
 /// };
 /// ```
 #[derive(Debug, Default)]
 pub struct ErrorDetail {
     /// Human-readable message.
-    message: String,
+    message: ProviderText,
     /// Resource the error pertains to, if known.
-    pub resource_id: Option<Box<ResourceId>>,
+    pub resource_id: Option<Box<ProviderErrorResourceId>>,
     /// Underlying terminal cause. Flattened to a string when the error crosses
     /// the WIT boundary.
-    cause: Option<Box<dyn std::error::Error + Send + Sync>>,
+    cause: Option<ProviderDiagnostic>,
     /// Host-side policy marker. This is deliberately not transported over the
     /// provider protocol because guests cannot originate host lifecycle state.
     host_cause: Option<HostErrorCause>,
@@ -102,14 +104,14 @@ pub struct ErrorDetail {
     /// where the name is known but no specific resource is in scope.
     /// Display ignores this field; CLI renderers can read it to label
     /// structured output.
-    pub provider_name: Option<String>,
+    pub provider_name: Option<ProviderText>,
     /// Service-qualified cloud-API operation that failed, e.g.
     /// `"iam.ListRoles"`, `"s3.HeadBucket"`. Populating this field —
     /// or any of the sibling `status` / `code` / `request_id`
     /// fields — flips `Display` into the multi-line, labeled render
     /// shape introduced in carina#3242; see
     /// [`ErrorDetail::has_structured_cloud_fields`] for the exact gate.
-    pub operation: Option<String>,
+    pub operation: Option<ProviderText>,
     /// HTTP status code from the cloud-API response, when the error
     /// came from an HTTP-based service call.
     pub status: Option<u16>,
@@ -118,12 +120,62 @@ pub struct ErrorDetail {
     /// share a status (HTTP 403 covers `AccessDenied`,
     /// `InvalidAccessKeyId`, `SignatureDoesNotMatch`, etc.), so both
     /// belong in the rendered output.
-    pub code: Option<String>,
+    pub code: Option<ProviderText>,
     /// Correlation id from the cloud-API response (AWS
     /// `x-amzn-RequestId`, GCP `X-Goog-Request-Id`, Azure
     /// `x-ms-request-id`, …). Operators paste this into support
     /// tickets so the provider can look up server-side logs.
-    pub request_id: Option<String>,
+    pub request_id: Option<ProviderText>,
+}
+
+/// A diagnostic resource id whose components have passed through [`ProviderText`].
+/// It cannot be mutated or used to change a resource's plan/state identity.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ProviderErrorResourceId(ResourceId);
+
+impl ProviderErrorResourceId {
+    /// Borrow the sanitized diagnostic id, preserving resource-id comparisons.
+    pub fn as_resource_id(&self) -> &ResourceId {
+        &self.0
+    }
+}
+
+impl From<ResourceId> for ProviderErrorResourceId {
+    fn from(id: ResourceId) -> Self {
+        let ResourceId {
+            provider,
+            resource_type,
+            identity,
+            provider_instance,
+        } = id;
+        let identity = match identity {
+            crate::resource::ResourceIdentityState::Pending(pending) => {
+                crate::resource::ResourceIdentityState::Pending(pending)
+            }
+            crate::resource::ResourceIdentityState::Resolved(identity) => {
+                crate::resource::ResourceIdentityState::Resolved(
+                    ProviderText::new(identity.as_str())
+                        .to_string()
+                        .try_into()
+                        .expect("sanitizing a non-empty identity cannot empty it"),
+                )
+            }
+        };
+        Self(ResourceId {
+            provider: ProviderText::new(provider).to_string(),
+            resource_type: ProviderText::new(resource_type).to_string(),
+            identity,
+            provider_instance: provider_instance.map(|name| ProviderText::new(name).to_string()),
+        })
+    }
+}
+
+impl std::ops::Deref for ProviderErrorResourceId {
+    type Target = ResourceId;
+
+    fn deref(&self) -> &ResourceId {
+        &self.0
+    }
 }
 
 /// Host-only classification for errors produced by provider lifecycle policy.
@@ -245,30 +297,10 @@ impl std::fmt::Display for ProviderError {
             return render_structured_cloud_fields(f, detail);
         }
 
-        // In-repo typed causes are terminal diagnostics. External errors may
-        // still carry actionable detail in their source chain, so expand that
-        // chain at this single ProviderError rendering seam.
-        if let Some(cause) = detail.cause() {
-            write!(f, ": {}", ProviderCauseChain(cause))?;
-        }
-        Ok(())
-    }
-}
-
-/// Complete rendering of one typed provider cause.
-///
-/// Errors defined in this workspace follow the terminal rule and therefore
-/// have no source. External errors such as SDK transport/service errors can
-/// keep detail in their source chain; render every such level exactly once.
-struct ProviderCauseChain<'a>(&'a (dyn std::error::Error + Send + Sync + 'static));
-
-impl std::fmt::Display for ProviderCauseChain<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)?;
-        let mut source = self.0.source();
-        while let Some(error) = source {
-            write!(f, ": {error}")?;
-            source = error.source();
+        // Construction captures and sanitizes the complete typed cause chain.
+        // The original typed cause remains available for inspection.
+        if let Some(cause) = &detail.cause {
+            write!(f, ": {cause}")?;
         }
         Ok(())
     }
@@ -306,8 +338,8 @@ fn render_structured_cloud_fields(
     if let Some(ref id) = detail.request_id {
         write!(f, "\n  request_id: {id}")?;
     }
-    if let Some(cause) = detail.cause() {
-        write!(f, "\n  cause: {}", ProviderCauseChain(cause))?;
+    if let Some(cause) = &detail.cause {
+        write!(f, "\n  cause: {cause}")?;
     }
     Ok(())
 }
@@ -447,7 +479,7 @@ impl ProviderError {
             message,
             resource_id,
             cause,
-            host_cause: _,
+            host_cause: _host_cause,
             provider_name,
             operation,
             status,
@@ -463,18 +495,16 @@ impl ProviderError {
         };
         WireProviderError {
             kind,
-            message: message.clone(),
+            message: message.to_string(),
             resource_id: resource_id
                 .as_deref()
-                .map(crate::protocol_convert::resource_id_to_protocol),
-            cause: cause
-                .as_deref()
-                .map(|cause| ProviderCauseChain(cause).to_string()),
-            provider_name: provider_name.clone(),
-            operation: operation.clone(),
+                .map(|id| crate::protocol_convert::resource_id_to_protocol(id)),
+            cause: cause.as_ref().map(ToString::to_string),
+            provider_name: provider_name.as_ref().map(ToString::to_string),
+            operation: operation.as_ref().map(ToString::to_string),
             status: *status,
-            code: code.clone(),
-            request_id: request_id.clone(),
+            code: code.as_ref().map(ToString::to_string),
+            request_id: request_id.as_ref().map(ToString::to_string),
         }
     }
 
@@ -482,7 +512,7 @@ impl ProviderError {
     ///
     /// This is the only sanctioned entry point for a wire record containing
     /// both a runtime-built message and flattened cause string. It preserves
-    /// that untrusted data for diagnostics; it does not provide the static
+    /// sanitized text for diagnostics; it does not provide the static
     /// context guarantees of the typed `*_caused_by` constructors.
     pub fn from_wire(error: WireProviderError) -> Self {
         let WireProviderError {
@@ -496,22 +526,20 @@ impl ProviderError {
             code,
             request_id,
         } = error;
-        let resource_id =
-            resource_id.map(|id| Box::new(crate::protocol_convert::protocol_to_resource_id(&id)));
+        let resource_id = resource_id
+            .map(|id| Box::new(crate::protocol_convert::protocol_to_resource_id(&id).into()));
         let detail = Box::new(ErrorDetail {
-            message,
+            message: message.into(),
             resource_id,
-            cause: cause.map(|cause| {
-                Box::new(FlattenedWireCause(cause)) as Box<dyn std::error::Error + Send + Sync>
-            }),
+            cause: cause.map(|cause| ProviderDiagnostic::new(FlattenedWireCause(cause.into()))),
             // Host lifecycle markers are intentionally not part of the wire
             // record and untrusted guest errors cannot acquire one on decode.
             host_cause: None,
-            provider_name,
-            operation,
+            provider_name: provider_name.map(ProviderText::new),
+            operation: operation.map(ProviderText::new),
             status,
-            code,
-            request_id,
+            code: code.map(ProviderText::new),
+            request_id: request_id.map(ProviderText::new),
         });
         match kind {
             WireProviderErrorKind::InvalidInput => ProviderError::InvalidInput(detail),
@@ -524,7 +552,7 @@ impl ProviderError {
 
     /// Attach a resource id to the inner detail.
     pub fn for_resource(mut self, id: ResourceId) -> Self {
-        self.detail_mut().resource_id = Some(Box::new(id));
+        self.detail_mut().resource_id = Some(Box::new(id.into()));
         self
     }
 
@@ -533,7 +561,7 @@ impl ProviderError {
     /// `create_provider` / provider init failures). Used by the CLI
     /// renderer to label structured account-guard output.
     pub fn for_provider(mut self, provider_name: impl Into<String>) -> Self {
-        self.detail_mut().provider_name = Some(provider_name.into());
+        self.detail_mut().provider_name = Some(ProviderText::new(provider_name));
         self
     }
 
@@ -543,7 +571,7 @@ impl ProviderError {
     /// [`Self::with_request_id`] — flips `Display` into the multi-line
     /// labeled render shape introduced in carina#3242.
     pub fn with_operation(mut self, operation: impl Into<String>) -> Self {
-        self.detail_mut().operation = Some(operation.into());
+        self.detail_mut().operation = Some(ProviderText::new(operation));
         self
     }
 
@@ -556,14 +584,14 @@ impl ProviderError {
     /// Attach the application-level error code from the cloud API
     /// (e.g. `"AccessDenied"`, `"NoSuchBucket"`).
     pub fn with_code(mut self, code: impl Into<String>) -> Self {
-        self.detail_mut().code = Some(code.into());
+        self.detail_mut().code = Some(ProviderText::new(code));
         self
     }
 
     /// Attach the correlation id from the cloud-API response so the
     /// operator can paste it into support tickets.
     pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
-        self.detail_mut().request_id = Some(request_id.into());
+        self.detail_mut().request_id = Some(ProviderText::new(request_id));
         self
     }
 
@@ -576,7 +604,7 @@ impl ProviderError {
     /// Replace only diagnostic text while preserving the error variant,
     /// structured metadata, typed cause, and host lifecycle classification.
     pub(crate) fn with_redacted_message(mut self, message: impl Into<String>) -> Self {
-        self.detail_mut().message = message.into();
+        self.detail_mut().message = ProviderText::new(message);
         self
     }
 }
@@ -584,7 +612,7 @@ impl ProviderError {
 impl ErrorDetail {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
-            message: message.into(),
+            message: ProviderText::new(message),
             ..Self::default()
         }
     }
@@ -594,8 +622,8 @@ impl ErrorDetail {
         cause: impl std::error::Error + Send + Sync + 'static,
     ) -> Self {
         Self {
-            message: context.to_string(),
-            cause: Some(Box::new(cause)),
+            message: context.into(),
+            cause: Some(ProviderDiagnostic::new(cause)),
             ..Self::default()
         }
     }
@@ -608,7 +636,7 @@ impl ErrorDetail {
 
     /// Typed source error, when this detail was built by a cause-bearing path.
     pub fn cause(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
-        self.cause.as_deref()
+        self.cause.as_ref().map(ProviderDiagnostic::error)
     }
 
     /// Host-side lifecycle classification, when the host attached one.
@@ -638,7 +666,7 @@ impl ErrorDetail {
 
 /// Synthetic typed source for a flattened cause received over WIT.
 #[derive(Debug)]
-struct FlattenedWireCause(String);
+struct FlattenedWireCause(ProviderText);
 
 impl std::fmt::Display for FlattenedWireCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2178,8 +2206,8 @@ pub enum UpdateOutcomeKind {
 /// Diagnostic details for a partial post-mutation read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PartialReadDiagnostic {
-    pub(crate) reason: String,
-    pub(crate) missing_attributes: Vec<String>,
+    pub(crate) reason: ProviderText,
+    pub(crate) missing_attributes: Vec<ProviderText>,
 }
 
 /// Validated UTC RFC3339 timestamp used only to describe when a persisted
@@ -2796,17 +2824,17 @@ impl ObservedCreate {
         (self.id, self.identifier, self.observation, self.sent)
     }
 
-    pub(crate) fn post_error_note(&self) -> String {
+    pub(crate) fn post_error_note(&self) -> ProviderText {
         match &self.observation {
             CreateObservation::Observed(_state) => {
-                "resource created; recorded in state, the next apply completes it".to_string()
+                "resource created; recorded in state, the next apply completes it".into()
             }
             CreateObservation::Unobserved(reason) => {
                 let reason = reason.to_string().replace('\n', "\n  ");
                 format!(
                     "{} reported identifier '{}' but the resource could not be observed; recorded in state so the next plan re-checks it\n  reason: {reason}",
                     self.id.provider, self.identifier,
-                )
+                ).into()
             }
         }
     }
@@ -4872,8 +4900,11 @@ impl PartialReadDiagnostic {
             None
         } else {
             Some(Self {
-                reason,
-                missing_attributes,
+                reason: reason.into(),
+                missing_attributes: missing_attributes
+                    .into_iter()
+                    .map(ProviderText::new)
+                    .collect(),
             })
         }
     }
@@ -4882,7 +4913,7 @@ impl PartialReadDiagnostic {
         &self.reason
     }
 
-    pub fn missing_attributes(&self) -> &[String] {
+    pub fn missing_attributes(&self) -> &[ProviderText] {
         &self.missing_attributes
     }
 
@@ -4920,7 +4951,10 @@ impl PartialReadDiagnostic {
     pub fn into_state_for_writeback(self, mut state: State) -> State {
         state.partial_read = PartialReadMarker::new(
             PendingReRead::incomplete(self.reason),
-            self.missing_attributes.into_iter().collect(),
+            self.missing_attributes
+                .into_iter()
+                .map(|name| name.to_string())
+                .collect(),
         );
         state
     }
@@ -6475,7 +6509,7 @@ impl CustomTypeCanonicalizationError {
             | Self::MissingScalarKind { .. }
             | Self::NonFiniteFloat { .. }
             | Self::EnumIdentityMismatch { .. }) => crate::schema::TypeError::ValidationFailed {
-                message: error.to_string(),
+                message: error.to_string().into(),
             },
         }
     }
@@ -7173,7 +7207,7 @@ fn local_custom_validator(
 
 fn custom_validator_bridge_message(error: crate::schema::TypeError) -> String {
     match error {
-        crate::schema::TypeError::ValidationFailed { message } => message,
+        crate::schema::TypeError::ValidationFailed { message } => message.to_string(),
         error => error.to_string(),
     }
 }
@@ -7802,7 +7836,7 @@ fn validate_custom_type_annotation(
                     return Err(CustomTypeValidationError::Rejected {
                         owner: owner.clone(),
                         identity: identity.clone(),
-                        message: "identified declaration has no scalar bridge kind".to_string(),
+                        message: "identified declaration has no scalar bridge kind".into(),
                     });
                 };
                 if let Some((previous_kind, previous)) = &bridge {
@@ -7812,7 +7846,7 @@ fn validate_custom_type_annotation(
                             identity: identity.clone(),
                             message:
                                 "same-identity annotation declarations canonicalize inconsistently"
-                                    .to_string(),
+                                    .into(),
                         });
                     }
                 } else {
@@ -8905,6 +8939,22 @@ mod tests {
     }
 
     #[test]
+    fn provider_text_post_create_note_sanitizes_provider_identifier() {
+        let raw = format!("\x1b]52;c;ZXZpbA==\x07\x1b[2J{}", "x".repeat(20 * 1024));
+        let created = ObservedCreate::from_create_observation(
+            ResourceId::with_provider_identity("test", "widget", "example", None),
+            AppliedIdentifier::new(&raw).unwrap(),
+            CreateObservation::Unobserved(UnobservedReason::NotFound),
+            SentRecord::Request(Sent::AllRequestAttributes),
+        );
+        let note = created.post_error_note();
+        assert!(!note.contains(['\x1b', '\x07']));
+        assert!(note.contains("\\u{1b}"));
+        assert!(note.len() <= crate::provider_text::MAX_PROVIDER_TEXT_BYTES);
+        assert_eq!(created.identifier().as_str(), raw);
+    }
+
+    #[test]
     fn created_failure_post_error_note_indents_multiline_reason() {
         let id = ResourceId::with_provider_identity("test", "widget", "example", None);
         let created = ObservedCreate::from_create_observation(
@@ -9967,7 +10017,7 @@ mod tests {
                 .expect("fixture identifier is non-empty")
         };
         let expected = PendingReRead::new(ReReadReason::Incomplete {
-            detail: "provider returned a partial read".to_string(),
+            detail: "provider returned a partial read".into(),
         });
 
         let created = CreateOutcome::partial_success(

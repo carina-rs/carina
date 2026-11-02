@@ -142,7 +142,7 @@ pub enum PlanErrorKind {
     },
     WaitPredicateInvalid {
         wait_binding: String,
-        reason: String,
+        reason: crate::provider_text::ProviderText,
     },
     /// A schema value constraint failed after one or more authored
     /// references became known.
@@ -152,7 +152,7 @@ pub enum PlanErrorKind {
         /// Authored reference paths that supplied the newly known values.
         origins: Vec<String>,
         /// Schema or provider-validator diagnostic.
-        message: String,
+        message: crate::provider_text::ProviderText,
     },
     /// An update would have to resend an ignored write-only value that the
     /// provider cannot return on read.
@@ -2037,7 +2037,7 @@ mod tests {
         assert_eq!(
             render_plan_error_kind(PlanErrorKind::WaitPredicateInvalid {
                 wait_binding: "cert_issued".to_string(),
-                reason: "invalid predicate attribute path: empty attribute path".to_string(),
+                reason: "invalid predicate attribute path: empty attribute path".into(),
             }),
             "wait `cert_issued`: invalid predicate attribute path: empty attribute path"
         );

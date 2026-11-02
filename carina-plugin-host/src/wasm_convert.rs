@@ -15,6 +15,7 @@ use carina_core::provider::{
 };
 #[cfg(test)]
 use carina_core::provider::{PatchOp as CorePatchOp, ProviderDirectiveSchema};
+use carina_core::provider_text::ProviderText;
 use carina_core::resource::{
     ConcreteValue, DeferredValue, RedactedSecretHash, ResourceId as CoreResourceId,
     ResourceIdentityState, State as CoreState, Value as CoreValue,
@@ -92,7 +93,7 @@ impl std::error::Error for SchemaDecodeError {
 #[derive(Debug)]
 pub struct WasmValueDecodeError {
     wit_variant: WitValueVariant,
-    attribute_path: Vec<String>,
+    attribute_path: Vec<ProviderText>,
     kind: WasmValueDecodeErrorKind,
 }
 
@@ -140,7 +141,7 @@ impl WasmValueDecodeError {
     }
 
     fn prepend_attribute(mut self, name: &str) -> Self {
-        self.attribute_path.insert(0, name.to_string());
+        self.attribute_path.insert(0, name.into());
         self
     }
 }
@@ -1899,6 +1900,37 @@ mod reference_tests {
     use carina_core::references::{ReferenceError, ReferenceOutcome};
 
     #[test]
+    fn provider_text_reference_error_decode_sanitizes_every_outcome() {
+        let guest_error = || {
+            wit::ProviderError::NotFound(wit::ErrorDetail {
+                message: "\x1b]52;c;ZXZpbA==\x07\x1b[2J".into(),
+                resource_id: None,
+                cause: None,
+                provider_name: None,
+                operation: None,
+                status: None,
+                code: None,
+                request_id: None,
+            })
+        };
+        let results = decode_reference_results(vec![
+            Ok(wit::ReferenceOutcome::NotFound(guest_error())),
+            Err(wit::ReferenceError::AccessDenied(guest_error())),
+            Err(wit::ReferenceError::Transient(guest_error())),
+            Err(wit::ReferenceError::InvalidReference(guest_error())),
+        ]);
+        for result in results {
+            let rendered = match result {
+                Ok(ReferenceOutcome::NotFound(error)) => error.to_string(),
+                Err(error) => std::error::Error::source(&error).unwrap().to_string(),
+                Ok(ReferenceOutcome::Resolved(_value)) => panic!("expected an error"),
+            };
+            assert!(!rendered.contains(['\x1b', '\x07']));
+            assert!(rendered.contains("\\u{1b}]52;c;ZXZpbA==\\u{7}\\u{1b}[2J"));
+        }
+    }
+
+    #[test]
     fn reference_decode_preserves_positional_results_for_core_validation() {
         for actual in [0, 1, 3] {
             let mut results = Vec::with_capacity(actual);
@@ -1939,7 +1971,7 @@ mod reference_tests {
 pub fn decode_provider_initialization_error(error: proto::ProviderError) -> CoreProviderError {
     let mut error = CoreProviderError::from_wire(error);
     if error.detail().operation.is_none() {
-        error.detail_mut().operation = Some("initialize".to_string());
+        error.detail_mut().operation = Some("initialize".into());
     }
     error
 }
@@ -2033,9 +2065,16 @@ pub(crate) fn core_type_identity_to_wit(
 }
 
 /// Deserialize JSON to (name, display_name, version) tuple from ProviderInfo.
-pub fn json_to_provider_info(json: &str) -> Result<(String, String, String), serde_json::Error> {
-    let info = serde_json::from_str::<proto::ProviderInfo>(json)?;
-    Ok((info.name, info.display_name, info.version))
+pub fn json_to_provider_info(
+    json: &str,
+) -> Result<(String, ProviderText, ProviderText), serde_json::Error> {
+    let proto::ProviderInfo {
+        name,
+        display_name,
+        capabilities: _capabilities,
+        version,
+    } = serde_json::from_str(json)?;
+    Ok((name, display_name.into(), version.into()))
 }
 
 /// Reject a provider whose protocol is outside this host's supported range.
@@ -2044,9 +2083,9 @@ pub fn json_to_provider_info(json: &str) -> Result<(String, String, String), ser
 /// the author sets. A provider predating the envelope omits the field ->
 /// deserializes to 0 -> below any host minimum (the carina#3364 class).
 /// carina#3365.
-pub fn check_protocol_version(info_json: &str) -> Result<(), String> {
-    let envelope: proto::ProviderInfoEnvelope =
-        serde_json::from_str(info_json).map_err(|e| format!("invalid provider info: {e}"))?;
+pub fn check_protocol_version(info_json: &str) -> Result<(), ProviderText> {
+    let envelope: proto::ProviderInfoEnvelope = serde_json::from_str(info_json)
+        .map_err(|e| ProviderText::new(format!("invalid provider info: {e}")))?;
     let host = carina_provider_protocol::PROTOCOL_VERSION;
     let min = carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION;
     if envelope.protocol_version < min {
@@ -2054,14 +2093,15 @@ pub fn check_protocol_version(info_json: &str) -> Result<(), String> {
             "provider '{}' was built against protocol version {} but this host \
              requires at least version {}; rebuild the provider against the current carina protocol",
             envelope.info.name, envelope.protocol_version, min
-        ));
+        ).into());
     }
     if envelope.protocol_version > host {
         return Err(format!(
             "provider '{}' was built against protocol version {} but this host \
              supports up to version {}; upgrade carina to load this provider",
             envelope.info.name, envelope.protocol_version, host
-        ));
+        )
+        .into());
     }
     Ok(())
 }
@@ -2076,7 +2116,7 @@ pub fn check_protocol_version(info_json: &str) -> Result<(), String> {
 /// dynamic component API; it never constructs runtime bindings or calls
 /// `initialize`. Keep this compatibility window explicit rather than
 /// weakening the ordinary provider runtime gate above.
-pub fn check_schema_only_protocol_version(info_json: &str) -> Result<(), String> {
+pub fn check_schema_only_protocol_version(info_json: &str) -> Result<(), ProviderText> {
     const LEGACY_SCHEMA_PROTOCOL_VERSION: u32 = 12;
 
     if schema_only_protocol_version(info_json)? == LEGACY_SCHEMA_PROTOCOL_VERSION {
@@ -2086,9 +2126,9 @@ pub fn check_schema_only_protocol_version(info_json: &str) -> Result<(), String>
 }
 
 /// Read the protocol stamp after the schema-only compatibility gate admits it.
-pub(crate) fn schema_only_protocol_version(info_json: &str) -> Result<u32, String> {
-    let envelope: proto::ProviderInfoEnvelope =
-        serde_json::from_str(info_json).map_err(|e| format!("invalid provider info: {e}"))?;
+pub(crate) fn schema_only_protocol_version(info_json: &str) -> Result<u32, ProviderText> {
+    let envelope: proto::ProviderInfoEnvelope = serde_json::from_str(info_json)
+        .map_err(|e| ProviderText::new(format!("invalid provider info: {e}")))?;
     Ok(envelope.protocol_version)
 }
 
@@ -4836,6 +4876,63 @@ mod tests {
         assert_eq!(back.id, resource.id);
         // Compare resolved attributes
         assert_eq!(back.resolved_attributes(), resource.resolved_attributes());
+    }
+
+    #[test]
+    fn provider_error_wit_decode_sanitizes_all_guest_diagnostics() {
+        let attack = "\x1b]52;c;ZXZpbA==\x07 \x1b[2J\r\u{9b}";
+        let error = wit::ProviderError::ApiError(wit::ErrorDetail {
+            message: attack.into(),
+            resource_id: Some(wit::ResourceId {
+                provider: attack.into(),
+                resource_type: attack.into(),
+                identity: attack.into(),
+            }),
+            cause: Some(attack.into()),
+            provider_name: Some(attack.into()),
+            operation: Some(attack.into()),
+            status: Some(403),
+            code: Some(attack.into()),
+            request_id: Some(attack.into()),
+        });
+        let decoded = wit_to_core_provider_error(error);
+        let rendered = decoded.to_string();
+        assert!(!rendered.contains(['\x1b', '\x07', '\r', '\u{9b}']));
+        assert!(rendered.contains("\\u{1b}]52;c;ZXZpbA==\\u{7}"));
+        assert!(rendered.contains("\\u{1b}[2J\\u{d}\\u{9b}"));
+        assert!(
+            !decoded
+                .detail()
+                .provider_name
+                .as_deref()
+                .unwrap()
+                .contains('\x1b')
+        );
+        assert!(
+            !decoded
+                .detail()
+                .resource_id
+                .as_ref()
+                .unwrap()
+                .provider
+                .contains('\x1b')
+        );
+    }
+
+    #[test]
+    fn provider_text_metadata_decode_sanitizes_display_fields_and_version_errors() {
+        let raw = format!("\x1b]52;c;ZXZpbA==\x07\x1b[2J{}", "x".repeat(20 * 1024));
+        let json = serde_json::json!({
+            "name": raw, "display_name": raw, "version": raw, "protocol_version": 0
+        })
+        .to_string();
+        let (_name, display_name, version) = json_to_provider_info(&json).unwrap();
+        let version_error = check_protocol_version(&json).unwrap_err();
+        for text in [display_name, version, version_error] {
+            assert!(!text.contains(['\x1b', '\x07']));
+            assert!(text.contains("\\u{1b}"));
+            assert!(text.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
+        }
     }
 
     #[test]

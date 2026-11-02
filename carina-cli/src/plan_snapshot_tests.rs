@@ -282,7 +282,7 @@ fn snapshot_iam_preflight_warning_appears_after_plan_summary() {
                             .to_string(),
                         op: carina_core::effect::PlanOp::Create,
                     },
-                    missing_actions: vec!["ec2:DescribeInternetGateways".to_string()],
+                    missing_actions: vec!["ec2:DescribeInternetGateways".into()],
                 }],
             },
         ),

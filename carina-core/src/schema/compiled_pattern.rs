@@ -2,6 +2,7 @@
 
 use std::{fmt, ops::Deref};
 
+use crate::provider_text::ProviderText;
 use regex_syntax::ast::{self, Ast};
 
 mod sealed {
@@ -68,7 +69,10 @@ impl CompiledPattern {
                 regex,
             })
             .map_err(|error| PatternCompileError {
-                pattern: source.to_string(),
+                diagnostic: ProviderText::new(format!(
+                    "invalid string pattern {source:?}: {error}"
+                )),
+                pattern: source.into(),
                 reason: error,
             })
     }
@@ -91,11 +95,12 @@ impl Deref for CompiledPattern {
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
-#[error("invalid string pattern {pattern:?}: {reason}")]
+#[error("{diagnostic}")]
 pub struct PatternCompileError {
-    pub pattern: String,
+    pub pattern: ProviderText,
     /// Typed parser, dialect or regex compiler diagnostic rendered by this error.
     pub reason: PatternCompileErrorSource,
+    diagnostic: ProviderText,
 }
 
 impl Eq for PatternCompileError {}
@@ -379,6 +384,16 @@ mod tests {
         assert_eq!(&*pattern, source);
         assert_eq!(pattern, pattern.clone());
         assert!(pattern.is_match("12a"));
+    }
+
+    #[test]
+    fn provider_text_pattern_error_diagnostic_is_sanitized_and_bounded() {
+        let raw = format!("\x1b[2J{}[", "x".repeat(20 * 1024));
+        let error = CompiledPattern::try_new(&raw).unwrap_err();
+        assert!(!error.to_string().contains('\x1b'));
+        assert!(error.to_string().contains("truncated,"));
+        assert!(error.to_string().len() <= crate::provider_text::MAX_PROVIDER_TEXT_BYTES);
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]

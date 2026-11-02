@@ -91,7 +91,7 @@ impl ProviderWireError {
             use std::fmt::Write;
             match segment {
                 WirePathSegment::Key(key) => {
-                    append_key(&mut path, key);
+                    append_key(&mut path, key.as_str());
                 }
                 WirePathSegment::Index(index) => {
                     let _ = write!(path, "[{index}]");
@@ -315,7 +315,7 @@ fn hide_secret_path(value: &Value, error: ProtocolConvertError) -> ProtocolConve
                 segment: Key(key),
                 error,
             },
-        ) => hide_secret_path(&values[&key], *error).at_value_path(Key(key)),
+        ) => hide_secret_path(&values[key.lookup_key()], *error).at_value_path(Key(key)),
         (_, error) => error,
     }
 }
@@ -444,6 +444,31 @@ mod tests {
             ProtocolConvertError::NonFiniteFloat
         ));
         assert!(error.error.value_path().is_empty());
+    }
+
+    #[test]
+    fn provider_text_wire_path_preserves_map_lookup_and_hides_secret_paths() {
+        let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "\x1b[2J".into(),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::Map(IndexMap::from([(
+                    "private.key".into(),
+                    Value::Concrete(ConcreteValue::Float(f64::NAN)),
+                )])),
+            )))),
+        )])));
+        let error = WireReady::try_new(
+            IndexMap::from([("attr".into(), value)]),
+            ProviderWireTarget::Configuration {
+                provider: "test".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.attribute_path().contains("(secret)"));
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains('\x1b'));
+            assert!(!rendered.contains("private.key"));
+        }
     }
 
     #[test]

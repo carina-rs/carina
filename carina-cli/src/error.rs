@@ -545,6 +545,7 @@ impl std::error::Error for StateBucketCreateError {
 #[derive(Debug)]
 pub struct StateBucketSeedError {
     identifier: String,
+    identifier_label: carina_core::provider_text::ProviderText,
     resource_address: String,
     source: BackendError,
 }
@@ -552,6 +553,7 @@ pub struct StateBucketSeedError {
 impl StateBucketSeedError {
     pub fn new(identifier: String, resource_address: String, source: BackendError) -> Self {
         Self {
+            identifier_label: carina_core::provider_text::ProviderText::new(&identifier),
             identifier,
             resource_address,
             source,
@@ -572,7 +574,7 @@ impl std::fmt::Display for StateBucketSeedError {
         write!(
             f,
             "State bucket '{}' was created but could not be recorded in state, so it exists outside state. Add the following import block to the configuration and re-run apply to record it:",
-            self.identifier
+            self.identifier_label
         )
     }
 }
@@ -1128,7 +1130,7 @@ pub enum AppError {
     )]
     SourceProviderKindMismatch {
         configured: String,
-        loaded: String,
+        loaded: carina_core::provider_text::ProviderText,
         provider_source: String,
     },
 
@@ -1513,6 +1515,26 @@ impl From<carina_core::value::SerializationError> for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_text_state_bucket_seed_error_preserves_identifier_data_and_source() {
+        let raw = format!("\x1b[2J\x07{}", "x".repeat(20 * 1024));
+        let error = StateBucketSeedError::new(
+            raw.clone(),
+            "test.bucket 'state'".into(),
+            BackendError::Configuration("write failed".into()),
+        );
+        assert_eq!(error.identifier(), raw);
+        assert!(!error.to_string().contains(['\x1b', '\x07']));
+        assert!(
+            error.identifier_label.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES
+        );
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .is::<BackendError>()
+        );
+    }
 
     #[tokio::test]
     async fn wire_preparation_errors_render_the_typed_reason_once_at_cli_boundaries() {

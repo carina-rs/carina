@@ -5452,7 +5452,8 @@ impl CanonicalizationErrorPolicy for RejectEnumResolutionErrors {
             crate::schema::TypeError::ValidationFailed {
                 message: format!(
                     "canonical map key `{canonical_key}` conflicts with an earlier map key"
-                ),
+                )
+                .into(),
             },
         ))
     }
@@ -6136,7 +6137,8 @@ fn canonicalize_without_fit<
                     message: format!(
                         "unresolved enum identifier `{}` did not match any Union member",
                         occurrence.raw
-                    ),
+                    )
+                    .into(),
                 },
                 occurrence,
             );
@@ -6581,7 +6583,7 @@ fn unresolved_enum_identifier_type_error(
     raw: &crate::resource::RawEnumIdentifier,
 ) -> crate::schema::TypeError {
     crate::schema::TypeError::ValidationFailed {
-        message: format!("unresolved enum identifier `{raw}` survived canonicalization"),
+        message: format!("unresolved enum identifier `{raw}` survived canonicalization").into(),
     }
 }
 
@@ -7742,13 +7744,13 @@ mod tests {
         let cases = [
             (
                 ReReadReason::Incomplete {
-                    detail: "response omitted attributes".to_string(),
+                    detail: "response omitted attributes".into(),
                 },
                 "(unknown until next refresh: read after apply was incomplete — response omitted attributes)",
             ),
             (
                 ReReadReason::ReadFailed {
-                    detail: "AccessDenied".to_string(),
+                    detail: "AccessDenied".into(),
                 },
                 "(unknown until next refresh: read after apply failed — AccessDenied)",
             ),
@@ -7783,7 +7785,7 @@ mod tests {
                 "{}",
                 ApplyTimeUnknown::<crate::resource::AbsoluteBindingAddress>::PendingReRead(
                     PendingReRead::new(ReReadReason::ReadFailed {
-                        detail: "AccessDenied".to_string(),
+                        detail: "AccessDenied".into(),
                     }),
                 )
             ),

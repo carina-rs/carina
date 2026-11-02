@@ -2384,7 +2384,7 @@ fn tied_union_error_with_attributes(first: &'static str, second: &'static str) -
             carina_core::schema::validator(move |_| {
                 Err(TypeError::PatternMismatch {
                     value: "invalid".into(),
-                    pattern: pattern.to_string(),
+                    pattern: pattern.into(),
                     attribute: Some(attribute.to_string()),
                     type_name: None,
                 })
@@ -2412,7 +2412,7 @@ fn tied_union_error_with_one_unattributed_failure() -> TypeError {
         carina_core::schema::validator(|_| {
             Err(TypeError::PatternMismatch {
                 value: "invalid".into(),
-                pattern: "^first$".to_string(),
+                pattern: "^first$".into(),
                 attribute: Some("target".to_string()),
                 type_name: None,
             })
@@ -2425,7 +2425,7 @@ fn tied_union_error_with_one_unattributed_failure() -> TypeError {
         None,
         carina_core::schema::validator(|_| {
             Err(TypeError::ValidationFailed {
-                message: "second failure".to_string(),
+                message: "second failure".into(),
             })
         }),
         None,

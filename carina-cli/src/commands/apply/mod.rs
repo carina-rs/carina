@@ -298,7 +298,7 @@ async fn create_checked_bootstrap_resource(
                 if let Some(diagnostic) = diagnostic {
                     eprintln!(
                         "{}",
-                        format_partial_state_bucket_create_warning(color_mode, &identifier, &diagnostic)
+                        format_partial_state_bucket_create_warning(color_mode, &carina_core::provider_text::ProviderText::new(&identifier), &diagnostic)
                     );
                 }
                 Ok(())
@@ -401,7 +401,7 @@ async fn seed_protected_bootstrap_resource(
 
 fn format_partial_state_bucket_create_warning(
     color_mode: crate::output_style::ColorMode,
-    identifier: &str,
+    identifier: &carina_core::provider_text::ProviderText,
     diagnostic: &carina_core::provider::PartialReadDiagnostic,
 ) -> String {
     let [reason, missing, state_recorded] = partial_read_detail_lines(diagnostic);

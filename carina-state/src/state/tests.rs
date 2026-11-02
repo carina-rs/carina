@@ -907,7 +907,7 @@ fn v18_migrates_partial_read_detail_to_incomplete_reread_reason() {
     assert_eq!(
         marker.pending(),
         &PendingReRead::new(ReReadReason::Incomplete {
-            detail: "legacy partial read".to_string(),
+            detail: "legacy partial read".into(),
         })
     );
     assert_eq!(
@@ -8025,7 +8025,7 @@ fn unobserved_read_failed_observation_records_identifier_and_provider_error_deta
     assert_eq!(
         row.partial_read().map(PartialReadMarker::pending),
         Some(&PendingReRead::new(ReReadReason::ReadFailed {
-            detail: read_error_display,
+            detail: read_error_display.into(),
         }))
     );
 }

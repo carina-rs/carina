@@ -903,7 +903,11 @@ fn native_question_mark_errors_keep_the_original_provider_instance() {
         let id = resource.id.clone();
         let error = normalize(&mut resource, stage).unwrap_err();
         assert_eq!(
-            error.detail().resource_id.as_deref(),
+            error
+                .detail()
+                .resource_id
+                .as_deref()
+                .map(|id| id.as_resource_id()),
             Some(&id),
             "stage={stage}"
         );

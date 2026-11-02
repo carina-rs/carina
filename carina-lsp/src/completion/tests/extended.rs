@@ -53,7 +53,7 @@ fn availability_zone_completions_use_dynamic_prefix() {
     // it easy enough to wire region data inline.
     let region_completions: Vec<CompletionValue> = vec![CompletionValue {
         value: "awscc.Region.ap_northeast_1".to_string(),
-        description: "Asia Pacific (Tokyo)".to_string(),
+        description: "Asia Pacific (Tokyo)".into(),
     }];
     let provider = CompletionProvider::new(
         Arc::new(SchemaRegistry::new()),

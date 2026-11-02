@@ -20,7 +20,7 @@ pub(crate) enum IamPreflightResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IamPreflightSkipped {
-    pub reason: String,
+    pub reason: carina_core::provider_text::ProviderText,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +40,7 @@ pub(crate) enum IamCheckMethod {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MissingEffectActions {
     pub effect: EffectAddress,
-    pub missing_actions: Vec<String>,
+    pub missing_actions: Vec<carina_core::provider_text::ProviderText>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,7 +210,7 @@ pub(crate) async fn run_iam_preflight(
             return Ok(IamPreflightResult::Skipped(IamPreflightSkipped {
                 reason: format!(
                     "Warning: IAM preflight check skipped because AWS caller identity could not be resolved ({e})."
-                ),
+                ).into(),
             }));
         }
     };
@@ -242,7 +242,7 @@ pub(crate) async fn run_iam_preflight(
                              Add the grant to enable --check-iam.",
                             actor_arn.as_str(),
                             actor_arn.as_str(),
-                        ),
+                        ).into(),
                     }));
                 }
             }
@@ -251,7 +251,7 @@ pub(crate) async fn run_iam_preflight(
             return Ok(IamPreflightResult::Skipped(IamPreflightSkipped {
                 reason: format!(
                     "Warning: IAM preflight check skipped because IAM policy simulation failed ({e})."
-                ),
+                ).into(),
             }));
         }
     };
@@ -681,7 +681,7 @@ fn group_missing_by_effect(
         .into_iter()
         .map(|(effect, actions)| MissingEffectActions {
             effect,
-            missing_actions: actions.into_iter().collect(),
+            missing_actions: actions.into_iter().map(Into::into).collect(),
         })
         .collect()
 }
@@ -767,6 +767,23 @@ fn plan_op_rank(op: PlanOp) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_text_permission_report_keeps_action_data_and_sanitizes_display() {
+        let raw = format!("\x1b[2J\x07{}", "x".repeat(20 * 1024));
+        let required = vec![RequiredAction {
+            effect: EffectAddress {
+                resource: "test.example".into(),
+                op: PlanOp::Create,
+            },
+            action: raw.clone(),
+        }];
+        let report = group_missing_by_effect(&required, &BTreeSet::from([raw.clone()]));
+        let displayed = report[0].missing_actions.join(", ");
+        assert!(!displayed.contains(['\x1b', '\x07']));
+        assert!(displayed.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
+        assert_eq!(required[0].action, raw);
+    }
     use aws_sdk_iam::error::ErrorMetadata;
     use carina_core::parser::{DeferredForExpression, ForBinding};
     use carina_core::provider::{
@@ -1077,8 +1094,8 @@ mod tests {
                     op: PlanOp::Create,
                 },
                 missing_actions: vec![
-                    "iam:CreateServiceLinkedRole".to_string(),
-                    "ec2:DescribeInternetGateways".to_string(),
+                    "iam:CreateServiceLinkedRole".into(),
+                    "ec2:DescribeInternetGateways".into(),
                 ],
             }],
         });

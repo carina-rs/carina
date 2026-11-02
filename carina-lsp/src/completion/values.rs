@@ -747,7 +747,7 @@ impl CompletionProvider {
                 completions.extend(schema_completions.iter().map(|c| CompletionItem {
                     label: c.value.clone(),
                     kind: Some(CompletionItemKind::ENUM_MEMBER),
-                    detail: Some(c.description.clone()),
+                    detail: Some(c.description.to_string()),
                     insert_text: Some(c.value.clone()),
                     ..Default::default()
                 }));
@@ -2072,7 +2072,7 @@ impl CompletionProvider {
             .map(|c| CompletionItem {
                 label: c.value.clone(),
                 kind: Some(CompletionItemKind::ENUM_MEMBER),
-                detail: Some(c.description.clone()),
+                detail: Some(c.description.to_string()),
                 insert_text: Some(c.value.clone()),
                 ..Default::default()
             })
