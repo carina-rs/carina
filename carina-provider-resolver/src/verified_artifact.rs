@@ -2,7 +2,6 @@ use carina_core::paths::{DisplayPath, ResolvedPath};
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::path::Path;
 use std::sync::Arc;
 
 use carina_core::UserDirs;
@@ -922,7 +921,11 @@ impl ChecksumMismatch {
         )
     }
 
-    pub(crate) fn after_cache_removal(self, cached_path: &Path, removal: io::Result<()>) -> String {
+    pub(crate) fn after_cache_removal(
+        self,
+        cached_path: &DisplayPath,
+        removal: io::Result<()>,
+    ) -> String {
         let summary = self.summary();
         let command = ProjectCommand::for_display_path("init", &self.project_dir);
         match removal {
@@ -931,7 +934,7 @@ impl ChecksumMismatch {
             ),
             Err(error) => format!(
                 "{summary} Failed to remove the mismatched cached copy at {}: {error}. Remove it manually, then re-run `{command}` to download it again.",
-                cached_path.display(),
+                cached_path,
             ),
         }
     }
@@ -1216,8 +1219,8 @@ pub(crate) fn publish_cached<R>(
     if staged.destination() != &path {
         return Err(VerifiedArtifactError::Other(format!(
             "Staged provider artifact {} does not match lock-selected path {}",
-            staged.destination().as_path().display(),
-            path.as_path().display()
+            staged.destination().display(),
+            path.display()
         )));
     }
     let verified = VerifiedArtifact::verify_bytes_at(
@@ -1234,11 +1237,11 @@ pub(crate) fn publish_cached<R>(
         provider_name,
         &project_dir,
     )?;
-    let published_path = verified.path.as_path().to_path_buf();
+    let published_path = verified.path.display().clone();
     staged.publish().map_err(|error| {
         VerifiedArtifactError::Other(format!(
             "Failed to publish provider artifact {}: {error}",
-            published_path.display()
+            published_path
         ))
     })?;
     Ok(verified)
@@ -1270,11 +1273,11 @@ fn publish_download_verified<R, P>(
                     VerifiedArtifactError::Other(format!("Failed to hash WASM binary: {error}"))
                 })?;
             let path = staged.destination().clone();
-            let published_path = path.as_path().to_path_buf();
+            let published_path = path.display().clone();
             staged.publish().map_err(|error| {
                 VerifiedArtifactError::Other(format!(
                     "Failed to publish provider artifact {}: {error}",
-                    published_path.display()
+                    published_path
                 ))
             })?;
             Ok(DownloadedArtifact::FirstUse {
@@ -1461,7 +1464,7 @@ fn lock_artifact_selection_with<'lock, R>(
         }
     };
 
-    let published_path = WasmArtifactPath::new(path, provider_name)?;
+    let published_path = path;
     let path = resolve_artifact(&published_path).map_err(|error| error.to_string())?;
     Ok(LockArtifactSelection {
         path,
@@ -1476,7 +1479,7 @@ fn lock_artifact_selection_with<'lock, R>(
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
 
@@ -1676,15 +1679,11 @@ mod tests {
         let locked_bytes = b"repository-installed bytes";
         let downloaded_bytes = b"changed origin bytes";
         let expected_sha256 = format!("{:x}", Sha256::digest(locked_bytes));
-        let destination = WasmArtifactPath::new(
-            cache_path_github_release(
-                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-                &source,
-                &version,
-            ),
-            "aws",
-        )
-        .unwrap();
+        let destination = cache_path_github_release(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source,
+            &version,
+        );
         std::fs::create_dir_all(destination.as_path().parent().unwrap()).unwrap();
         std::fs::write(destination.as_path(), locked_bytes).unwrap();
         let install_lock = crate::ProviderInstallLock::acquire(
@@ -1811,10 +1810,10 @@ mod tests {
             actual_sha256: "actual".into(),
             project_dir: DisplayPath::new("infra/foo").unwrap(),
         };
-        let cached_path = Path::new("infra/foo/.carina/providers/aws.wasm");
+        let cached_path = DisplayPath::new("infra/foo/.carina/providers/aws.wasm").unwrap();
 
         let message = mismatch.after_cache_removal(
-            cached_path,
+            &cached_path,
             Err(io::Error::other("simulated removal failure")),
         );
 

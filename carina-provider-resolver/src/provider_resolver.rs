@@ -19,7 +19,7 @@ use time::format_description::well_known::Rfc3339;
 use carina_core::UserDirs;
 use carina_core::hint::ProjectCommand;
 use carina_core::parser::ProviderConfig;
-use carina_core::paths::ResolvedPath;
+use carina_core::paths::{DisplayPath, PersistedPath, ResolvedPath};
 use carina_core::provider_source::{
     FileSource, GithubSource, ProviderSource, RegistrySource, RemoteSource, RemoteSourceKey,
 };
@@ -4902,7 +4902,12 @@ impl<'borrow, 'lock> PersistentLockFile<'borrow, 'lock> {
 /// A resolved provider artifact path that is guaranteed to have a `.wasm`
 /// extension.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WasmArtifactPath(PathBuf);
+pub struct WasmArtifactPath {
+    // Byte-preserving bridge for locator APIs that still take `&Path`.
+    path: PathBuf,
+    io_locator: PersistedPath,
+    display: DisplayPath,
+}
 
 impl WasmArtifactPath {
     pub(crate) fn new(path: PathBuf, provider_name: &str) -> Result<Self, String> {
@@ -4910,7 +4915,13 @@ impl WasmArtifactPath {
             .extension()
             .is_some_and(|extension| extension == "wasm")
         {
-            Ok(Self(path))
+            let display = DisplayPath::new(&path).map_err(|error| error.to_string())?;
+            let io_locator = PersistedPath::new(&path).map_err(|error| error.to_string())?;
+            Ok(Self {
+                path,
+                io_locator,
+                display,
+            })
         } else {
             Err(format!(
                 "Provider '{provider_name}': native binaries are no longer supported. Use a .wasm component instead."
@@ -4919,12 +4930,52 @@ impl WasmArtifactPath {
     }
 
     pub fn as_path(&self) -> &Path {
-        &self.0
+        &self.path
+    }
+
+    pub fn display(&self) -> &DisplayPath {
+        &self.display
+    }
+
+    pub(crate) fn io_locator(&self) -> &PersistedPath {
+        &self.io_locator
+    }
+
+    /// Build the IO locator and diagnostic spelling together from the same child.
+    pub(crate) fn in_project_cache(base_dir: &ResolvedPath, child: &Path) -> Self {
+        let io_locator = base_dir
+            .persisted_path()
+            .join(child)
+            .expect("an absolute cache locator has a nonempty path");
+        Self {
+            path: io_locator.to_path_buf(),
+            io_locator,
+            display: base_dir.display().join(child),
+        }
     }
 
     /// Pin this complete locator without treating it as a project child.
     pub(crate) fn resolve(&self, project: &ResolvedPath) -> io::Result<ResolvedPath> {
-        project.join_display(&carina_core::paths::DisplayPath::new(&self.0)?)
+        let locator = self.io_locator.to_path_buf();
+        let base = project.persisted_path().to_path_buf();
+        match locator.strip_prefix(&base) {
+            Ok(child) => project.join(child),
+            Err(_) => self.io_locator.resolve(),
+        }
+    }
+}
+
+impl AsRef<Path> for WasmArtifactPath {
+    fn as_ref(&self) -> &Path {
+        self.as_path()
+    }
+}
+
+impl std::ops::Deref for WasmArtifactPath {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        self.as_path()
     }
 }
 
@@ -5017,7 +5068,7 @@ impl InstalledProvider {
         let bytes = ProviderArtifactBytes::read(io_path).map_err(|error| {
             format!(
                 "Failed to read provider artifact {}: {error}",
-                path.as_path().display()
+                path.display()
             )
         })?;
         let source_display = carina_core::paths::DisplayPath::new(source.path())
@@ -5121,7 +5172,7 @@ impl InstalledProvider {
         ProviderArtifactLoadError {
             error: ProviderArtifactLoadFailure::Loader(Box::new(error)),
             provider_name: self.provider_name.clone(),
-            artifact_path: self.path().as_path().to_path_buf(),
+            artifact_path: self.path().display().clone(),
             provenance: Box::new(self.provenance()),
         }
     }
@@ -5133,7 +5184,7 @@ impl InstalledProvider {
         ProviderArtifactLoadError {
             error: ProviderArtifactLoadFailure::Identity(Box::new(error)),
             provider_name: self.provider_name.clone(),
-            artifact_path: self.path().as_path().to_path_buf(),
+            artifact_path: self.path().display().clone(),
             provenance: Box::new(self.provenance()),
         }
     }
@@ -5356,7 +5407,7 @@ impl fmt::Display for ProviderArtifactProvenance {
 pub struct ProviderArtifactLoadError<E> {
     error: ProviderArtifactLoadFailure<E>,
     provider_name: String,
-    artifact_path: PathBuf,
+    artifact_path: DisplayPath,
     provenance: Box<ProviderArtifactProvenance>,
 }
 
@@ -5409,10 +5460,7 @@ impl<E: fmt::Display> fmt::Display for ProviderArtifactLoadError<E> {
         write!(
             f,
             "{}\nProvider: {}\nArtifact: {}\n{}",
-            error,
-            self.provider_name,
-            self.artifact_path.display(),
-            self.provenance
+            error, self.provider_name, self.artifact_path, self.provenance
         )
     }
 }
@@ -7688,7 +7736,6 @@ fn convert_obtainable_legacy_signer_pin<H: RegistryHttp>(
             install_lock: lock_file.install_lock(),
             source: source_key,
             version: &locked_version,
-            provider_name: &locked_name,
             download_url: &download_url,
             expected_shasum: &locked_sha256,
             context: &artifact_context,
@@ -7727,11 +7774,11 @@ fn convert_obtainable_legacy_signer_pin<H: RegistryHttp>(
         }
     };
     debug_assert_eq!(acceptance.transition, SignerTransition::LegacyConverted);
-    let artifact_path = artifact.path().as_path().to_path_buf();
+    let artifact_path = artifact.path().display().clone();
     artifact.publish().map_err(|error| {
         format!(
             "legacy-pinned version {source_key}@{locked_version}: Failed to publish provider artifact {}: {error}",
-            artifact_path.display()
+            artifact_path
         )
     })?;
     lock_file.record_signer_acceptance(source_key, acceptance)?;
@@ -7765,22 +7812,20 @@ pub fn cache_path_wasm(
     base_dir: &ResolvedPath,
     source: &RemoteSourceKey,
     version: &str,
-) -> PathBuf {
-    base_dir
-        .persisted_path()
-        .to_path_buf()
-        .join(".carina")
+) -> WasmArtifactPath {
+    let child = Path::new(".carina")
         .join("providers")
         .join(source.as_str())
         .join(version)
-        .join(format!("{}.wasm", source.artifact_name()))
+        .join(format!("{}.wasm", source.artifact_name()));
+    WasmArtifactPath::in_project_cache(base_dir, &child)
 }
 
 pub(crate) fn cache_path_github_release(
     base_dir: &ResolvedPath,
     source: &RemoteSourceKey,
     version: &Version,
-) -> PathBuf {
+) -> WasmArtifactPath {
     cache_path_wasm(base_dir, source, &version.to_string())
 }
 
@@ -7922,7 +7967,6 @@ struct RegistryArtifactRequest<'lock, 'request> {
     install_lock: &'lock ProviderInstallLock,
     source: &'request RemoteSourceKey,
     version: &'request str,
-    provider_name: &'request str,
     download_url: &'request RegistryResourceUrl,
     expected_shasum: &'request str,
     context: &'request str,
@@ -7937,14 +7981,12 @@ fn obtain_registry_artifact<'lock, H: RegistryHttp>(
         install_lock,
         source,
         version,
-        provider_name,
         download_url,
         expected_shasum,
         context,
     } = request;
     let project_dir = install_lock.project_dir();
-    let path = WasmArtifactPath::new(cache_path_wasm(project_dir, source, version), provider_name)
-        .map_err(RegistryArtifactError::Invalid)?;
+    let path = cache_path_wasm(project_dir, source, version);
     let io_path = install_lock
         .project_artifact(&path)
         .map_err(|error| RegistryArtifactError::Invalid(error.to_string()))?;
@@ -7968,7 +8010,7 @@ fn obtain_registry_artifact<'lock, H: RegistryHttp>(
         let mut staged = StagedArtifact::for_project(install_lock, &path).map_err(|error| {
             RegistryArtifactError::Invalid(format!(
                 "Failed to stage provider artifact {}: {error}",
-                path.as_path().display()
+                path.display()
             ))
         })?;
         if let Err(error) = http.download_into(download_url, &mut staged) {
@@ -8425,7 +8467,6 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
             install_lock,
             source: source_key,
             version: version_string,
-            provider_name: name,
             download_url: &download_url,
             expected_shasum: &download.shasum,
             context: &provider_context,
@@ -8485,11 +8526,11 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
         }
     };
 
-    let artifact_path = artifact.path().as_path().to_path_buf();
+    let artifact_path = artifact.path().display().clone();
     let artifact = artifact.publish().map_err(|error| {
         format!(
             "Failed to publish provider artifact {}: {error}",
-            artifact_path.display()
+            artifact_path
         )
     })?;
 
@@ -8682,10 +8723,7 @@ where
     // matching lock pin and a user-owned trust record, project and global cache
     // entries are skipped and the artifact is downloaded from its origin.
     // This deliberately preserves issue #2032 only for user-verified cache hits.
-    let wasm_path = WasmArtifactPath::new(
-        cache_path_github_release(project_dir, &source_key, version),
-        name,
-    )?;
+    let wasm_path = cache_path_github_release(project_dir, &source_key, version);
     if install_lock
         .project_artifact(&wasm_path)
         .map_err(|error| error.to_string())?
@@ -8697,7 +8735,7 @@ where
             Ok(verified) => verified,
             Err(VerifiedArtifactError::ChecksumMismatch(mismatch)) => {
                 let removal = install_lock.remove_project_artifact(&wasm_path);
-                return Err((*mismatch).after_cache_removal(wasm_path.as_path(), removal));
+                return Err((*mismatch).after_cache_removal(wasm_path.display(), removal));
             }
             Err(VerifiedArtifactError::Other(message)) => return Err(message),
         };
@@ -8721,7 +8759,7 @@ where
             Ok(verified) => verified,
             Err(VerifiedArtifactError::ChecksumMismatch(mismatch)) => {
                 let removal = fs::remove_file(global_wasm.as_path());
-                return Err((*mismatch).after_cache_removal(global_wasm.as_path(), removal));
+                return Err((*mismatch).after_cache_removal(global_wasm.display(), removal));
             }
             Err(VerifiedArtifactError::Other(message)) => return Err(message),
         };
@@ -8737,7 +8775,7 @@ where
     let mut staged = StagedArtifact::for_project(install_lock, &wasm_path).map_err(|error| {
         format!(
             "Failed to stage provider artifact {}: {error}",
-            wasm_path.as_path().display()
+            wasm_path.display()
         )
     })?;
     eprintln!(
@@ -9004,16 +9042,13 @@ fn resolve_file_provider(
 fn file_provider_cache_path(
     base_dir: &ResolvedPath,
     src_path: &WasmArtifactPath,
-    provider_name: &str,
+    _provider_name: &str,
 ) -> Result<WasmArtifactPath, String> {
     let file_name = src_path
         .as_path()
         .file_stem()
         .unwrap_or_else(|| std::ffi::OsStr::new("provider"));
-    let dest = base_dir
-        .persisted_path()
-        .to_path_buf()
-        .join(".carina")
+    let dest = Path::new(".carina")
         .join("providers")
         .join("file")
         .join(file_name)
@@ -9023,7 +9058,7 @@ fn file_provider_cache_path(
                 .file_name()
                 .unwrap_or_else(|| std::ffi::OsStr::new("provider.wasm")),
         );
-    WasmArtifactPath::new(dest, provider_name)
+    Ok(WasmArtifactPath::in_project_cache(base_dir, &dest))
 }
 
 /// Resolve a `file://` provider at its source path without copying it.
@@ -9339,10 +9374,8 @@ pub fn find_installed_provider<P: PlaceholderKind, B: BindingAddress>(
         ProviderSource::File(file_source) => {
             let src = WasmArtifactPath::new(PathBuf::from(file_source.path()), &config.name)?;
             let dest = file_provider_cache_path(base_dir, &src, &config.name)?;
-            let dest_label = carina_core::paths::DisplayPath::new(dest.as_path())
-                .map_err(|error| FindInstalledProviderError::Other(error.to_string()))?;
-            if io_base
-                .join_display(&dest_label)
+            if dest
+                .resolve(&io_base)
                 .map_err(|error| FindInstalledProviderError::Other(error.to_string()))?
                 .exists()
             {
@@ -13464,7 +13497,8 @@ sha256 = "malformed"
                     &carina_core::paths::ResolvedPath::new(base).unwrap(),
                     &source_key(source),
                     "0.1.0"
-                ),
+                )
+                .as_path(),
                 PathBuf::from(expected)
             );
         }
@@ -19756,7 +19790,7 @@ future_protection_field = "retain-me"
             parse_registry_resource_url("https://downloads.example.test/aws.wasm", "test URL")
                 .unwrap();
         let http = PartialFailingRegistryHttp {
-            final_path: final_path.clone(),
+            final_path: final_path.as_path().to_path_buf(),
         };
 
         let error = obtain_registry_artifact(
@@ -19765,7 +19799,6 @@ future_protection_field = "retain-me"
                 install_lock: &guard,
                 source: &source,
                 version: "1.0.0",
-                provider_name: "aws",
                 download_url: &download_url,
                 expected_shasum: &sha256_bytes(b"complete bytes"),
                 context: "test registry artifact",
@@ -19803,7 +19836,6 @@ future_protection_field = "retain-me"
                 install_lock: &guard,
                 source: &source,
                 version: "1.0.0",
-                provider_name: "aws",
                 download_url: &download_url,
                 expected_shasum: &sha256_bytes(b"expected bytes"),
                 context: "test registry artifact",
@@ -21784,7 +21816,7 @@ future_protection_field = "retain-me"
         let http = AssertArtifactUnpublishedOnBundleFetch {
             inner: signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200)
                 .json(SIGNED_FIXTURE_DOWNLOAD_URL, &download_response),
-            final_path: artifact_path.clone(),
+            final_path: artifact_path.as_path().to_path_buf(),
         };
 
         let error = resolve_provider_with_http(
@@ -23767,6 +23799,7 @@ transparency_log_present = false
                     &source_key("carina-rs/aws"),
                     "0.5.0"
                 )
+                .as_path()
             );
             assert_eq!(lock_file.provider.len(), 1);
             assert_eq!(lock_file.provider[0].source, "carina-rs/aws");
@@ -25051,7 +25084,10 @@ future_protection_field = "retain-me"
         )
         .expect("a rerun must download the lock-matching origin artifact");
 
-        assert_eq!(rerun.get("awscc").unwrap().as_path(), project_wasm);
+        assert_eq!(
+            rerun.get("awscc").unwrap().as_path(),
+            project_wasm.as_path()
+        );
         assert_eq!(fs::read(&project_wasm).unwrap(), expected_bytes);
         assert_eq!(fs::read(global_wasm.as_path()).unwrap(), expected_bytes);
         assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
@@ -25362,7 +25398,7 @@ future_protection_field = "retain-me"
         )
         .expect("a rerun must download the lock-matching origin artifact");
 
-        assert_eq!(resolved.as_path(), project_wasm);
+        assert_eq!(resolved.as_path(), project_wasm.as_path());
         assert_eq!(fs::read(resolved.as_path()).unwrap(), locked_bytes);
         assert_eq!(github_http.requests()[0].url(), asset_url);
     }
@@ -25420,7 +25456,10 @@ future_protection_field = "retain-me"
             version,
         );
 
-        assert_eq!(resolved.get("awscc").unwrap().as_path(), project_wasm);
+        assert_eq!(
+            resolved.get("awscc").unwrap().as_path(),
+            project_wasm.as_path()
+        );
         assert_eq!(fs::read(&project_wasm).unwrap(), cached_bytes);
         assert_eq!(github_http.requested_urls(), [release_url, asset_url]);
         assert!(
@@ -25504,7 +25543,7 @@ future_protection_field = "retain-me"
         )
         .unwrap();
 
-        assert_eq!(resolved.as_path(), project_wasm);
+        assert_eq!(resolved.as_path(), project_wasm.as_path());
         assert_eq!(fs::read(&project_wasm).unwrap(), origin_bytes);
         assert_eq!(
             lock.find_by_source(source).unwrap().sha256,
@@ -25817,6 +25856,127 @@ future_protection_field = "retain-me"
     }
 
     #[test]
+    fn cached_provider_load_errors_preserve_project_spelling() {
+        let cwd = std::env::current_dir().unwrap();
+        let temp = tempfile::tempdir_in(&cwd).unwrap();
+        let directory = temp.path().join("infra");
+        fs::create_dir(&directory).unwrap();
+        let relative = Path::new(temp.path().file_name().unwrap()).join("infra");
+        let source = "github.com/example/provider-widget";
+        let version = "1.0.0";
+        let sha = commit_sha("abc123def456789012345678901234567890abcd");
+        let bytes = b"malformed wasm component";
+        let source_path = temp.path().join("local.wasm");
+        fs::write(&source_path, bytes).unwrap();
+
+        for spelling in [
+            relative.clone(),
+            Path::new(".").join(&relative),
+            relative.join("..").join("infra"),
+            directory.clone(),
+        ] {
+            let project = ResolvedPath::new(&spelling).unwrap();
+            for cache_kind in ["version", "revision", "file"] {
+                let (config, artifact, suffix, kind) = match cache_kind {
+                    "version" => (
+                        provider_config(source, None),
+                        cache_path_wasm(&project, &source_key(source), version),
+                        ".carina/providers/github.com/example/provider-widget/1.0.0/provider-widget.wasm",
+                        LockEntryKind::GithubRelease {
+                            version: Version::parse(version).unwrap(),
+                            tag: ReleaseTag::from_lock(format!("v{version}")),
+                            asset_id: release_asset_id(42),
+                            constraint: None,
+                        },
+                    ),
+                    "revision" => (
+                        provider_config(source, Some("main")),
+                        crate::revision_resolver::cache_path_revision(
+                            &project,
+                            &github_source(source),
+                            &sha,
+                        ),
+                        ".carina/providers/github.com/example/provider-widget/rev-abc123def456/provider-widget.wasm",
+                        LockEntryKind::Revision {
+                            revision: "main".into(),
+                            resolved_sha: sha.clone(),
+                            artifact_id: ArtifactId::from_lock(42),
+                        },
+                    ),
+                    "file" => {
+                        let config =
+                            provider_config(&format!("file://{}", source_path.display()), None);
+                        let artifact = file_provider_cache_path(
+                            &project,
+                            &WasmArtifactPath::new(source_path.clone(), "awscc").unwrap(),
+                            "awscc",
+                        )
+                        .unwrap();
+                        (
+                            config,
+                            artifact,
+                            ".carina/providers/file/local/local.wasm",
+                            LockEntryKind::File,
+                        )
+                    }
+                    _ => unreachable!(),
+                };
+                fs::create_dir_all(artifact.as_path().parent().unwrap()).unwrap();
+                fs::write(artifact.as_path(), bytes).unwrap();
+                let mut lock = LockFile::default();
+                lock.upsert(LockEntry {
+                    name: config.name.clone(),
+                    source: config.source.as_ref().unwrap().to_string(),
+                    kind,
+                    sha256: sha256_bytes(bytes),
+                    registry: None,
+                });
+                lock.save(&provider_lock_path(&directory)).unwrap();
+
+                let installed = find_installed_provider(&project, &config).unwrap();
+                assert_eq!(installed.artifact_bytes().as_bytes(), bytes);
+                assert_eq!(installed.path().as_path(), artifact.as_path());
+                assert_eq!(
+                    artifact.io_locator(),
+                    &project.persisted_path().join(suffix).unwrap()
+                );
+                assert_eq!(
+                    artifact.display().to_string(),
+                    spelling.join(suffix).display().to_string()
+                );
+                assert_eq!(artifact.resolve(&project).unwrap().read().unwrap(), bytes);
+                let error = installed.with_load_error(io::Error::other("malformed wasm component"));
+                assert_eq!(
+                    error.loader_error().unwrap().to_string(),
+                    "malformed wasm component"
+                );
+                assert_eq!(
+                    error
+                        .to_string()
+                        .lines()
+                        .find(|line| line.starts_with("Artifact: ")),
+                    Some(format!("Artifact: {}", spelling.join(suffix).display()).as_str()),
+                    "{cache_kind} cache must retain the user's project spelling"
+                );
+                let error: ProviderArtifactLoadError<io::Error> = installed.with_identity_error(
+                    ProviderLoadIdentityError::ConfiguredNameMismatch {
+                        configured_name: config.name.clone(),
+                        expected: "aws",
+                    },
+                );
+                assert_eq!(
+                    error
+                        .to_string()
+                        .lines()
+                        .find(|line| line.starts_with("Artifact: ")),
+                    Some(format!("Artifact: {}", spelling.join(suffix).display()).as_str()),
+                    "identity errors must retain the {cache_kind} cache spelling"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn installed_provider_and_fingerprint_accept_a_relative_project_locator() {
         let cwd = std::env::current_dir().unwrap();
         let temp = tempfile::tempdir_in(&cwd).unwrap();
@@ -25848,7 +26008,7 @@ future_protection_field = "retain-me"
 
         let installed = find_installed_provider(&project, &config)
             .expect("a complete cache locator must not be joined to infra again");
-        assert_eq!(installed.path().as_path(), artifact);
+        assert_eq!(installed.path().as_path(), artifact.as_path());
         let fingerprint = provider_artifact_fingerprint(&project, &config).unwrap();
         assert!(
             fingerprint.artifact.is_some(),
@@ -25891,7 +26051,7 @@ future_protection_field = "retain-me"
         )
         .expect("the lock-matching provider should be loadable");
 
-        assert_eq!(installed.path().as_path(), wasm_path);
+        assert_eq!(installed.path().as_path(), wasm_path.as_path());
         assert_eq!(
             installed.provenance(),
             ProviderArtifactProvenance::LockFile {
@@ -26163,11 +26323,7 @@ future_protection_field = "retain-me"
                         sha256: sha256_bytes(bytes),
                         registry: None,
                     });
-                    WasmArtifactPath::new(
-                        cache_path_wasm(&root, &remote_source.source_key(), version),
-                        &config.name,
-                    )
-                    .unwrap()
+                    cache_path_wasm(&root, &remote_source.source_key(), version)
                 } else {
                     let source = WasmArtifactPath::new(source_file.clone(), &config.name).unwrap();
                     file_provider_cache_path(&root, &source, &config.name).unwrap()
@@ -26263,7 +26419,7 @@ future_protection_field = "retain-me"
         let cache = cache_path_wasm(&project, &source, "1.0.0");
 
         assert_eq!(
-            cache,
+            cache.as_path(),
             project_dir.join(
                 ".carina/providers/github.com/example/provider-widget/1.0.0/provider-widget.wasm"
             )
@@ -26274,7 +26430,7 @@ future_protection_field = "retain-me"
             &commit_sha("abc123def456789012345678901234567890abcd"),
         );
         assert_eq!(
-            revision,
+            revision.as_path(),
             project_dir.join(".carina/providers/github.com/example/provider-widget/rev-abc123def456/provider-widget.wasm")
         );
     }
@@ -27196,7 +27352,7 @@ sha256 = "{}"
         )
         .expect("an unrelated legacy source must not block this installed provider");
 
-        assert_eq!(installed.path().as_path(), installed_path);
+        assert_eq!(installed.path().as_path(), installed_path.as_path());
     }
 
     #[test]
@@ -27443,7 +27599,7 @@ sha256 = "{}"
             .unwrap()
             .path()
             .as_path(),
-            wasm_path
+            wasm_path.as_path()
         );
     }
 
@@ -27474,7 +27630,7 @@ sha256 = "{}"
             &provider_config(source, Some(revision)),
         )
         .expect("revision provider should resolve");
-        assert_eq!(installed.path().as_path(), wasm_path);
+        assert_eq!(installed.path().as_path(), wasm_path.as_path());
         let error = installed.with_load_error(io::Error::other(
             "Failed to instantiate WASM component (HTTP)",
         ));

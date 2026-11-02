@@ -138,7 +138,7 @@ fn build_factories(
                 log::info!(
                     "LSP: loaded provider '{}' from {}",
                     config.name,
-                    installed.path().as_path().display()
+                    installed.path().display()
                 );
                 factories.push(Box::new(factory));
             }
@@ -427,7 +427,7 @@ mod tests {
         )
         .expect("registry source should resolve through the shared provider source type");
 
-        assert_eq!(installed.path().as_path(), wasm);
+        assert_eq!(installed.path().as_path(), wasm.as_path());
     }
 
     #[tokio::test(flavor = "multi_thread")]

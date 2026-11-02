@@ -1099,7 +1099,7 @@ fn stage_selected_artifact<'lock>(
     let mut staged = StagedArtifact::for_project(install_lock, destination).map_err(|error| {
         format!(
             "Failed to stage provider artifact {}: {error}",
-            destination.as_path().display()
+            destination.display()
         )
     })?;
     staged
@@ -1114,16 +1114,14 @@ pub fn cache_path_revision(
     base_dir: &ResolvedPath,
     source: &GithubSource,
     sha: &CommitSha,
-) -> PathBuf {
+) -> WasmArtifactPath {
     let sha_prefix = sha.short();
-    base_dir
-        .persisted_path()
-        .to_path_buf()
-        .join(".carina")
+    let child = Path::new(".carina")
         .join("providers")
         .join(source.to_string())
         .join(format!("rev-{sha_prefix}"))
-        .join(format!("{}.wasm", source.repo()))
+        .join(format!("{}.wasm", source.repo()));
+    WasmArtifactPath::in_project_cache(base_dir, &child)
 }
 
 pub(crate) fn global_cache_path_revision(
@@ -1350,7 +1348,7 @@ mod verified_revision_artifact {
             return Err(VerifiedArtifactError::Other(format!(
                 "Cached revision artifact path {} does not match lock-selected path {}",
                 cached.path().display(),
-                artifact.path().as_path().display(),
+                artifact.path().display(),
             )));
         }
         Ok(VerifiedRevisionArtifact::from_cached(
@@ -1384,7 +1382,7 @@ mod verified_revision_artifact {
         })
         .map_err(|error| match error {
             revision_artifact_cache::PublishError::Metadata(error) => VerifiedArtifactError::Other(
-                revision_cache_metadata_error(destination.as_path(), error),
+                revision_cache_metadata_error(destination.display(), error),
             ),
             revision_artifact_cache::PublishError::Artifact(error) => error,
         })
@@ -1439,7 +1437,7 @@ mod verified_revision_artifact {
         })
         .map_err(|error| match error {
             revision_artifact_cache::PublishError::Metadata(error) => {
-                revision_cache_metadata_error(destination.as_path(), error)
+                revision_cache_metadata_error(destination.display(), error)
             }
             revision_artifact_cache::PublishError::Artifact(error) => error,
         })
@@ -1504,10 +1502,13 @@ fn revision_lock_entry(
     }
 }
 
-fn revision_cache_metadata_error(wasm_path: &Path, error: io::Error) -> String {
+fn revision_cache_metadata_error(
+    wasm_path: &carina_core::paths::DisplayPath,
+    error: io::Error,
+) -> String {
     format!(
         "Failed to write revision cache metadata {}: {error}",
-        wasm_path.display()
+        wasm_path
     )
 }
 
@@ -1522,18 +1523,18 @@ fn install_global_revision_artifact(
     })
     .map_err(|error| match error {
         revision_artifact_cache::PublishError::Metadata(error) => {
-            revision_cache_metadata_error(destination.as_path(), error)
+            revision_cache_metadata_error(destination.display(), error)
         }
         revision_artifact_cache::PublishError::Artifact(error) => {
             let cleanup = revision_artifact_cache::remove(&target);
             match cleanup {
                 Ok(()) => format!(
                     "Failed to install global revision cache artifact {}: {error}. The incomplete cache entry was removed.",
-                    destination.as_path().display()
+                    destination.display()
                 ),
                 Err(cleanup_error) => format!(
                     "Failed to install global revision cache artifact {}: {error}. Failed to remove the incomplete cache entry: {cleanup_error}.",
-                    destination.as_path().display()
+                    destination.display()
                 ),
             }
         }
@@ -1678,7 +1679,7 @@ where
     // As in version mode, machine-local artifacts are never first-use trust
     // anchors. A project or global cache entry without this exact revision pin
     // is skipped in favor of a fresh origin download.
-    let wasm_path = WasmArtifactPath::new(cache_path_revision(base_dir, source, &sha), name)?;
+    let wasm_path = cache_path_revision(base_dir, source, &sha);
     if mode != LockMode::Upgrade
         && let Some((lock_entry, pin)) = artifact_pin.pinned(user_dirs)
         && let Some(cached) = install_lock
@@ -1698,7 +1699,7 @@ where
                 let removal = install_lock
                     .project_artifact(&wasm_path)
                     .and_then(|path| revision_artifact_cache::remove(&path));
-                return Err((*mismatch).after_cache_removal(wasm_path.as_path(), removal));
+                return Err((*mismatch).after_cache_removal(wasm_path.display(), removal));
             }
             Err(VerifiedArtifactError::Other(message)) => return Err(message),
         };
@@ -1731,7 +1732,7 @@ where
             Err(VerifiedArtifactError::ChecksumMismatch(mismatch)) => {
                 let removal = ResolvedPath::new(global_wasm.as_path())
                     .and_then(|path| revision_artifact_cache::remove(&path));
-                return Err((*mismatch).after_cache_removal(global_wasm.as_path(), removal));
+                return Err((*mismatch).after_cache_removal(global_wasm.display(), removal));
             }
             Err(VerifiedArtifactError::Other(message)) => return Err(message),
         };
@@ -1994,7 +1995,7 @@ mod tests {
             &sha,
         );
         assert_eq!(
-            path,
+            path.as_path(),
             PathBuf::from(
                 "/tmp/project/.carina/providers/github.com/carina-rs/carina-provider-awscc/rev-abc123def456/carina-provider-awscc.wasm"
             )
@@ -2124,15 +2125,11 @@ mod tests {
     fn fresh_revision_download_mismatch_is_rejected_before_publish() {
         let project = tempfile::tempdir().unwrap();
         let source = test_source();
-        let destination = WasmArtifactPath::new(
-            cache_path_revision(
-                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-                &source,
-                &test_sha(),
-            ),
-            "aws",
-        )
-        .unwrap();
+        let destination = cache_path_revision(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source,
+            &test_sha(),
+        );
         let install_lock = ProviderInstallLock::acquire(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         )
@@ -2964,15 +2961,11 @@ mod tests {
             sha256: sha256_bytes(wasm),
             registry: None,
         };
-        let destination = WasmArtifactPath::new(
-            cache_path_revision(
-                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-                &source,
-                &sha,
-            ),
-            "aws",
-        )
-        .unwrap();
+        let destination = cache_path_revision(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source,
+            &sha,
+        );
         let install_lock = ProviderInstallLock::acquire(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         )
@@ -4201,15 +4194,11 @@ sha256 = "{}"
 
             let project = tempfile::tempdir().unwrap();
             let source = test_source();
-            let destination = WasmArtifactPath::new(
-                cache_path_revision(
-                    &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-                    &source,
-                    &test_sha(),
-                ),
-                "aws",
-            )
-            .unwrap();
+            let destination = cache_path_revision(
+                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+                &source,
+                &test_sha(),
+            );
             let install_lock = ProviderInstallLock::acquire(
                 &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             )
@@ -4614,15 +4603,11 @@ sha256 = "{}"
         )
         .unwrap();
         let project = tempfile::tempdir().unwrap();
-        let destination = WasmArtifactPath::new(
-            cache_path_revision(
-                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-                &source,
-                &test_sha(),
-            ),
-            "aws",
-        )
-        .unwrap();
+        let destination = cache_path_revision(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source,
+            &test_sha(),
+        );
         let install_lock = ProviderInstallLock::acquire(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         )
@@ -4948,15 +4933,11 @@ sha256 = "{}"
         .unwrap();
         let project = tempfile::tempdir().unwrap();
         let source = test_source();
-        let destination = WasmArtifactPath::new(
-            cache_path_revision(
-                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-                &source,
-                &test_sha(),
-            ),
-            "aws",
-        )
-        .unwrap();
+        let destination = cache_path_revision(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source,
+            &test_sha(),
+        );
         let install_lock = ProviderInstallLock::acquire(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         )
@@ -5025,15 +5006,11 @@ sha256 = "{}"
 
         let project = tempfile::tempdir().unwrap();
         let source = test_source();
-        let destination = WasmArtifactPath::new(
-            cache_path_revision(
-                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-                &source,
-                &test_sha(),
-            ),
-            "aws",
-        )
-        .unwrap();
+        let destination = cache_path_revision(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source,
+            &test_sha(),
+        );
         let install_lock = ProviderInstallLock::acquire(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         )
@@ -5080,15 +5057,11 @@ sha256 = "{}"
             |_| Ok(artifact_zip(&[("provider.wasm", b"changed provider")])),
         )
         .unwrap();
-        let destination = WasmArtifactPath::new(
-            cache_path_revision(
-                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-                &source,
-                &test_sha(),
-            ),
-            "aws",
-        )
-        .unwrap();
+        let destination = cache_path_revision(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source,
+            &test_sha(),
+        );
         let install_lock = ProviderInstallLock::acquire(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         )

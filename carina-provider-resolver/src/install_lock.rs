@@ -230,9 +230,8 @@ impl ProviderInstallLock {
 
     /// Artifact IO is available only through the guard that owns its directory pin.
     pub(crate) fn project_artifact(&self, artifact: &WasmArtifactPath) -> io::Result<ResolvedPath> {
-        validate_project_target(self, artifact.as_path())?;
-        self.carina_dir
-            .join_display(&DisplayPath::new(artifact.as_path())?)
+        validate_project_target(self, artifact)?;
+        artifact.resolve(&self.carina_dir)
     }
 }
 
@@ -246,11 +245,15 @@ pub(crate) struct StagedArtifact<'a> {
     destination: WasmArtifactPath,
 }
 
-pub(crate) struct GlobalArtifactPath(PathBuf);
+pub(crate) struct GlobalArtifactPath(WasmArtifactPath);
 
 impl GlobalArtifactPath {
     pub(crate) fn as_path(&self) -> &Path {
-        &self.0
+        self.0.as_path()
+    }
+
+    pub(crate) fn display(&self) -> &DisplayPath {
+        self.0.display()
     }
 }
 
@@ -266,9 +269,9 @@ pub(crate) fn global_cache_artifact_path(
     }) {
         return None;
     }
-    Some(GlobalArtifactPath(
-        user_dirs.plugin_cache_dir().join(relative),
-    ))
+    WasmArtifactPath::new(user_dirs.plugin_cache_dir().join(relative), "global cache")
+        .ok()
+        .map(GlobalArtifactPath)
 }
 
 impl<'a> StagedArtifact<'a> {
@@ -364,13 +367,14 @@ pub(crate) fn install_global_artifact_atomically(
 
 fn validate_project_target(
     install_lock: &ProviderInstallLock,
-    destination: &Path,
+    destination: &WasmArtifactPath,
 ) -> io::Result<()> {
     let cache = install_lock.carina_dir.persisted_path().join("providers")?;
-    let label = DisplayPath::new(destination)?;
-    if cache.contains(&carina_core::paths::PersistedPath::new(destination)?) {
+    if cache.contains(destination.io_locator()) {
         Ok(())
     } else {
+        let label = destination.display();
+        let cache = install_lock.carina_dir.display().join("providers");
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("project provider artifact {label} is outside {cache}"),
@@ -759,6 +763,7 @@ mod tests {
             .path()
             .join(".carina/providers/source/../../outside.wasm");
 
+        let destination = WasmArtifactPath::new(destination, "aws").unwrap();
         let error = validate_project_target(&guard, &destination)
             .expect_err("parent components must not escape the provider cache");
 
