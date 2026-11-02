@@ -280,6 +280,8 @@ removed {
 
 This removes the resource from Carina's state but leaves the actual cloud resource untouched. This is useful when transferring ownership of a resource to another tool or project.
 
+`carina destroy` and `carina state refresh` treat the resource the same way: they drop it from state without reading it from the provider or deleting it in the cloud.
+
 ## Referencing upstream state
 
 To read outputs from another Carina project's state, use `upstream_state`. The upstream project publishes values with an `exports` block:
