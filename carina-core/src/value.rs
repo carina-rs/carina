@@ -2912,29 +2912,32 @@ impl<'a> SecretRedactionMapGuide<'a> {
 }
 
 impl<'a> SecretRedactionGuide<'a> {
-    fn secret_value<'b>(&'b self, source: &'b Value) -> Option<&'b Value> {
-        let plaintext = match source {
-            Value::Deferred(DeferredValue::Secret(inner)) => inner.as_ref(),
-            _ => source,
-        };
+    fn protects_whole_value(self, source_is_secret: bool) -> bool {
         match self {
-            Self::Evaluated(Value::Deferred(DeferredValue::Secret(inner))) => Some(inner),
-            Self::SecretShape(Value::Deferred(DeferredValue::Secret(_))) => Some(plaintext),
-            Self::RedactedShape(Value::Deferred(DeferredValue::Placeholder(
+            Self::Evaluated(Value::Deferred(DeferredValue::Secret(_)))
+            | Self::SecretShape(Value::Deferred(DeferredValue::Secret(_)))
+            | Self::RedactedShape(Value::Deferred(DeferredValue::Placeholder(
                 SnapshotLeaf::RedactedSecret { .. },
-            ))) => Some(plaintext),
+            ))) => true,
             Self::RedactedDesired(Value::Deferred(DeferredValue::Placeholder(
                 SnapshotLeaf::RedactedSecret { .. },
-            ))) => match source {
-                Value::Deferred(DeferredValue::Secret(_)) => Some(plaintext),
-                _ => None,
-            },
-            Self::Persisted(value) if value.is_redacted_secret() => Some(plaintext),
-            Self::PersistedDesired(value) if value.is_redacted_secret() => match source {
-                Value::Deferred(DeferredValue::Secret(_)) => Some(plaintext),
-                _ => None,
-            },
-            _ => None,
+            ))) => source_is_secret,
+            Self::Persisted(value) => value.is_redacted_secret(),
+            Self::PersistedDesired(value) => value.is_redacted_secret() && source_is_secret,
+            _ => false,
+        }
+    }
+
+    fn secret_value<'b>(&'b self, source: &'b Value) -> Option<&'b Value> {
+        if !self.protects_whole_value(matches!(source, Value::Deferred(DeferredValue::Secret(_)))) {
+            return None;
+        }
+        match self {
+            Self::Evaluated(Value::Deferred(DeferredValue::Secret(inner))) => Some(inner),
+            _ => Some(match source {
+                Value::Deferred(DeferredValue::Secret(inner)) => inner.as_ref(),
+                _ => source,
+            }),
         }
     }
 
@@ -3077,6 +3080,16 @@ fn redact_snapshot_with_guide(
     if source.secret_hash().is_some() {
         return Ok(source.clone());
     }
+    if guide.protects_whole_value(matches!(source, Value::Deferred(DeferredValue::Secret(_)))) {
+        // Sensitivity covers the complete value, including plaintext siblings
+        // of existing hashes. Only an evaluated guide can supply missing material.
+        if let SecretRedactionGuide::Evaluated(Value::Deferred(DeferredValue::Secret(inner))) =
+            guide
+        {
+            return redact_with_guide(inner, guide);
+        }
+        return redact_with_guide(&source.to_value_at("state")?, guide);
+    }
     match source {
         Value::Concrete(ConcreteValue::Map(values)) => {
             let map_guide = guide.as_map();
@@ -3090,22 +3103,9 @@ fn redact_snapshot_with_guide(
                     Ok((key.clone(), value))
                 })
                 .collect::<Result<IndexMap<_, _>, SerializationError>>()?;
-            // A whole-container secret shape takes precedence over its children.
-            if !source.contains_secret_hash() {
-                let value = source.to_value_at("state")?;
-                if guide.secret_value(&value).is_some() {
-                    return redact_with_guide(&value, guide);
-                }
-            }
             Ok(Value::Concrete(ConcreteValue::Map(values)))
         }
         Value::Concrete(ConcreteValue::List(values)) => {
-            if !source.contains_secret_hash() {
-                let value = source.to_value_at("state")?;
-                if guide.secret_value(&value).is_some() {
-                    return redact_with_guide(&value, guide);
-                }
-            }
             let values = values
                 .iter()
                 .enumerate()
@@ -5212,12 +5212,12 @@ pub(crate) enum DesiredValueSource {
 /// must decide whether to remove its key. Desired-value canonicalization never
 /// produces `Absent`; authored empty objects remain available to providers.
 #[derive(Debug, Clone, PartialEq)]
-pub enum CanonicalState<H: PlaceholderKind = crate::resource::NoPlaceholder> {
+pub enum CanonicalState<H: ValueKind = crate::resource::NoPlaceholder> {
     Present(Value<H>),
     Absent,
 }
 
-impl<H: PlaceholderKind> CanonicalState<H> {
+impl<H: ValueKind> CanonicalState<H> {
     pub fn into_present(self) -> Option<Value<H>> {
         match self {
             Self::Present(value) => Some(value),
@@ -5281,10 +5281,90 @@ impl<'a> CanonicalizationPurpose<'a> {
     }
 }
 
+trait CanonicalizationLeaf: ValueKind + Sized {
+    fn fit<'a, B: BindingAddress>(
+        attr: &'a AttributeType,
+        value: &Value<Self, B>,
+        defs: &'a BTreeMap<String, AttributeType>,
+        ancestry: crate::schema::FieldAncestry,
+        purpose: CanonicalizationPurpose<'_>,
+        visited_refs: &mut Vec<&'a str>,
+    ) -> Option<crate::schema::Fit<'a>>;
+
+    fn closest_member<'a, B: BindingAddress>(
+        attr: &'a AttributeType,
+        value: crate::resource::ConcreteValueRef<'_, Self, B>,
+        defs: &'a BTreeMap<String, AttributeType>,
+        ancestry: crate::schema::FieldAncestry,
+        visited_refs: &mut Vec<&'a str>,
+    ) -> Option<&'a AttributeType>;
+}
+
+impl<P: PlaceholderKind> CanonicalizationLeaf for P {
+    fn fit<'a, B: BindingAddress>(
+        attr: &'a AttributeType,
+        value: &Value<Self, B>,
+        defs: &'a BTreeMap<String, AttributeType>,
+        ancestry: crate::schema::FieldAncestry,
+        purpose: CanonicalizationPurpose<'_>,
+        visited_refs: &mut Vec<&'a str>,
+    ) -> Option<crate::schema::Fit<'a>> {
+        crate::schema::fit_value_to_resolved_type_on_path(
+            attr,
+            value,
+            defs,
+            ancestry,
+            purpose,
+            visited_refs,
+        )
+    }
+
+    fn closest_member<'a, B: BindingAddress>(
+        attr: &'a AttributeType,
+        value: crate::resource::ConcreteValueRef<'_, Self, B>,
+        defs: &'a BTreeMap<String, AttributeType>,
+        ancestry: crate::schema::FieldAncestry,
+        visited_refs: &mut Vec<&'a str>,
+    ) -> Option<&'a AttributeType> {
+        crate::schema::closest_union_member_for_value_on_path(
+            attr,
+            value,
+            defs,
+            ancestry,
+            visited_refs,
+        )
+    }
+}
+
+impl CanonicalizationLeaf for SnapshotLeaf {
+    fn fit<'a, B: BindingAddress>(
+        attr: &'a AttributeType,
+        value: &Value<Self, B>,
+        defs: &'a BTreeMap<String, AttributeType>,
+        ancestry: crate::schema::FieldAncestry,
+        _purpose: CanonicalizationPurpose<'_>,
+        visited_refs: &mut Vec<&'a str>,
+    ) -> Option<crate::schema::Fit<'a>> {
+        crate::schema::inspect_snapshot_state_structure(attr, value, defs, ancestry, visited_refs)
+    }
+
+    fn closest_member<'a, B: BindingAddress>(
+        _attr: &'a AttributeType,
+        _value: crate::resource::ConcreteValueRef<'_, Self, B>,
+        _defs: &'a BTreeMap<String, AttributeType>,
+        _ancestry: crate::schema::FieldAncestry,
+        _visited_refs: &mut Vec<&'a str>,
+    ) -> Option<&'a AttributeType> {
+        // Lenient state canonicalization never selects a rejected union arm
+        // using provider-output diagnostics.
+        None
+    }
+}
+
 trait CanonicalizationErrorPolicy: Copy {
     type Error;
 
-    fn canonicalization_failed<H: PlaceholderKind, B: BindingAddress>(
+    fn canonicalization_failed<H: ValueKind, B: BindingAddress>(
         self,
         original: Value<H, B>,
         source: crate::schema::TypeError,
@@ -5309,7 +5389,7 @@ struct RejectEnumResolutionErrors;
 impl CanonicalizationErrorPolicy for RejectEnumResolutionErrors {
     type Error = crate::schema::TypeError;
 
-    fn canonicalization_failed<H: PlaceholderKind, B: BindingAddress>(
+    fn canonicalization_failed<H: ValueKind, B: BindingAddress>(
         self,
         _original: Value<H, B>,
         source: crate::schema::TypeError,
@@ -5367,7 +5447,7 @@ struct PreserveEnumResolutionErrors;
 impl CanonicalizationErrorPolicy for PreserveEnumResolutionErrors {
     type Error = Infallible;
 
-    fn canonicalization_failed<H: PlaceholderKind, B: BindingAddress>(
+    fn canonicalization_failed<H: ValueKind, B: BindingAddress>(
         self,
         original: Value<H, B>,
         _source: crate::schema::TypeError,
@@ -5572,7 +5652,7 @@ pub(crate) fn canonicalize_wait_rhs_with_type<P: PlaceholderKind, B: BindingAddr
 }
 
 fn canonicalize_with_type_for_purpose<
-    H: PlaceholderKind,
+    H: CanonicalizationLeaf,
     B: BindingAddress,
     P: CanonicalizationErrorPolicy,
 >(
@@ -5596,7 +5676,7 @@ fn canonicalize_with_type_for_purpose<
     )
 }
 
-fn canonicalize_state_entry_with_type<H: PlaceholderKind, P: CanonicalizationErrorPolicy>(
+fn canonicalize_state_entry_with_type<H: CanonicalizationLeaf, P: CanonicalizationErrorPolicy>(
     value: Value<H>,
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
@@ -5625,7 +5705,7 @@ fn canonicalize_state_entry_with_type<H: PlaceholderKind, P: CanonicalizationErr
 
 fn canonicalize_resolved_value_for_purpose<
     'a,
-    H: PlaceholderKind,
+    H: CanonicalizationLeaf,
     B: BindingAddress,
     P: CanonicalizationErrorPolicy,
 >(
@@ -5638,14 +5718,7 @@ fn canonicalize_resolved_value_for_purpose<
     visited_refs: &mut Vec<&'a str>,
 ) -> Result<Value<H, B>, P::Error> {
     let resolved_attr = resolved_type.as_attr();
-    if let Some(fit) = crate::schema::fit_value_to_resolved_type_on_path(
-        resolved_attr,
-        &value,
-        defs,
-        ancestry,
-        purpose,
-        visited_refs,
-    ) {
+    if let Some(fit) = H::fit(resolved_attr, &value, defs, ancestry, purpose, visited_refs) {
         canonicalize_with_fit(value, &fit, defs, purpose, error_policy)
     } else {
         canonicalize_without_fit(
@@ -5662,7 +5735,7 @@ fn canonicalize_resolved_value_for_purpose<
 
 /// Encode a successful fit through the same canonicalization used by values.
 /// Address-bearing or unresolved values cannot form an ordinary JSON key.
-pub(crate) fn canonical_json_with_fit<H: PlaceholderKind, B: BindingAddress>(
+pub(crate) fn canonical_json_with_fit<H: ValueKind, B: BindingAddress>(
     value: Value<H, B>,
     fit: &crate::schema::Fit<'_>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
@@ -5679,7 +5752,7 @@ pub(crate) fn canonical_json_with_fit<H: PlaceholderKind, B: BindingAddress>(
 /// Consume a successful fit witness without re-validating any selected Union
 /// member or re-resolving any enum. The value and witness have identical tree
 /// shapes by construction.
-fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: CanonicalizationErrorPolicy>(
+fn canonicalize_with_fit<H: ValueKind, B: BindingAddress, P: CanonicalizationErrorPolicy>(
     value: Value<H, B>,
     fit: &crate::schema::Fit<'_>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
@@ -5837,11 +5910,7 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
     }
 }
 
-fn collect_canonicalized_map<
-    H: PlaceholderKind,
-    B: BindingAddress,
-    P: CanonicalizationErrorPolicy,
->(
+fn collect_canonicalized_map<H: ValueKind, B: BindingAddress, P: CanonicalizationErrorPolicy>(
     entries: Vec<(String, String, Value<H, B>)>,
     error_policy: P,
 ) -> Result<IndexMap<String, Value<H, B>>, P::Error> {
@@ -5864,7 +5933,7 @@ fn collect_canonicalized_map<
         .collect())
 }
 
-fn canonical_map_key_text<H: PlaceholderKind, B: BindingAddress>(
+fn canonical_map_key_text<H: ValueKind, B: BindingAddress>(
     value: Value<H, B>,
 ) -> Result<String, crate::schema::TypeError> {
     match value {
@@ -5951,7 +6020,7 @@ fn type_contains_enum(
     walk(attr_type, defs, &mut std::collections::HashSet::new())
 }
 
-fn finish_no_fit<H: PlaceholderKind, B: BindingAddress, P: CanonicalizationErrorPolicy>(
+fn finish_no_fit<H: ValueKind, B: BindingAddress, P: CanonicalizationErrorPolicy>(
     value: Value<H, B>,
     expected: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
@@ -5977,7 +6046,7 @@ fn finish_no_fit<H: PlaceholderKind, B: BindingAddress, P: CanonicalizationError
 /// persisted state retains its established forward-compatible lenience.
 fn canonicalize_without_fit<
     'a,
-    H: PlaceholderKind,
+    H: CanonicalizationLeaf,
     B: BindingAddress,
     P: CanonicalizationErrorPolicy,
 >(
@@ -6013,13 +6082,8 @@ fn canonicalize_without_fit<
     if matches!(shape, crate::schema::Shape::Union) {
         if purpose.rejects_unrecognized_enum_text()
             && let Some(concrete) = value.as_concrete()
-            && let Some(member) = crate::schema::closest_union_member_for_value_on_path(
-                unwrapped,
-                concrete,
-                defs,
-                ancestry,
-                visited_refs,
-            )
+            && let Some(member) =
+                H::closest_member(unwrapped, concrete, defs, ancestry, visited_refs)
         {
             let canonical = canonicalize_without_fit(
                 value,
@@ -6327,13 +6391,13 @@ struct EnumIdentifierOccurrence<'a> {
     inside_secret: bool,
 }
 
-fn first_enum_identifier<H: PlaceholderKind, B: BindingAddress>(
+fn first_enum_identifier<H: ValueKind, B: BindingAddress>(
     value: &Value<H, B>,
 ) -> Option<EnumIdentifierOccurrence<'_>> {
     first_enum_identifier_inner(value, false)
 }
 
-fn first_enum_identifier_inner<H: PlaceholderKind, B: BindingAddress>(
+fn first_enum_identifier_inner<H: ValueKind, B: BindingAddress>(
     value: &Value<H, B>,
     inside_secret: bool,
 ) -> Option<EnumIdentifierOccurrence<'_>> {
@@ -6387,9 +6451,7 @@ fn first_enum_identifier_inner<H: PlaceholderKind, B: BindingAddress>(
 
 /// Body of state and desired canonicalization for the
 /// `string_or_list_of_strings` case.
-fn canonicalize_to_string_list<H: PlaceholderKind, B: BindingAddress>(
-    value: Value<H, B>,
-) -> Value<H, B> {
+fn canonicalize_to_string_list<H: ValueKind, B: BindingAddress>(value: Value<H, B>) -> Value<H, B> {
     match value {
         Value::Concrete(ConcreteValue::StringList(items)) => {
             Value::Concrete(ConcreteValue::StringList(items))
@@ -6875,6 +6937,239 @@ mod tests {
 
     type LoopValue = crate::resource::Value<LoopSlot>;
     type LoopDeferredValue = crate::resource::DeferredValue<LoopSlot>;
+
+    #[test]
+    fn saved_plan_whole_container_secret_rejects_hashes_without_plaintext() {
+        use crate::effect::Effect;
+        use crate::resource::{ExpandedResource as Resource, ResolvedResource, SnapshotState};
+
+        let token = Value::Concrete(ConcreteValue::String("old-private-token".into()));
+        let hash = redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(Box::new(
+            token.clone(),
+        ))))
+        .unwrap();
+        let sibling = Value::Concrete(ConcreteValue::String(
+            "whole-container-plaintext-must-not-leak".into(),
+        ));
+        for (plain, observed) in [
+            (
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    ("token".into(), token.clone()),
+                    ("sibling".into(), sibling.clone()),
+                ]))),
+                SnapshotValue::Concrete(crate::resource::ConcreteValue::Map(IndexMap::from([
+                    ("token".into(), hash.clone()),
+                    ("sibling".into(), sibling.to_snapshot()),
+                ]))),
+            ),
+            (
+                Value::Concrete(ConcreteValue::List(vec![token.clone(), sibling.clone()])),
+                SnapshotValue::Concrete(crate::resource::ConcreteValue::List(vec![
+                    hash.clone(),
+                    sibling.to_snapshot(),
+                ])),
+            ),
+        ] {
+            let secret = Value::Deferred(DeferredValue::Secret(Box::new(plain.clone())));
+            let guide = redact_secrets_in_value(&secret).unwrap();
+            let resource =
+                Resource::new("mock.Secret", "example").with_attribute("settings", secret.clone());
+            let id = resource.id.clone();
+            let historical =
+                SnapshotState::existing(id.clone(), HashMap::from([("settings".into(), guide)]));
+            let current = SnapshotState::existing(
+                id.clone(),
+                HashMap::from([("settings".into(), observed.clone())]),
+            );
+            let mut plan = crate::plan::Plan::new();
+            plan.add(Effect::Update {
+                from: Box::new(current),
+                identifier: crate::effect::fixture_applied_identifier("example-id"),
+                to: ResolvedResource::new(resource.with_dependency_phase(())),
+                changed_attributes: vec!["settings".into()],
+            });
+            let historical = HashMap::from([(id, historical)]);
+            let saved = redact_secrets_in_plan_with_desired_and_historical::<()>(
+                &plan,
+                &HashMap::new(),
+                &historical,
+            );
+            let serialized = match &saved {
+                Ok(saved) => serde_json::to_string(saved).unwrap(),
+                Err(SerializationError::UnavailableSecret(_)) => String::new(),
+                Err(error) => panic!("unexpected plan redaction error: {error}"),
+            };
+            assert!(
+                !serialized.contains("whole-container-plaintext-must-not-leak"),
+                "{serialized}"
+            );
+            assert!(matches!(
+                saved,
+                Err(SerializationError::UnavailableSecret(_))
+            ));
+            assert!(matches!(
+                redact_plaintext_using_secret_shape(&observed, &secret),
+                Err(SerializationError::UnavailableSecret(_))
+            ));
+            let mut available_plan = plan.clone();
+            let Effect::Update { from, .. } = &mut available_plan.effects_mut()[0] else {
+                panic!("update fixture");
+            };
+            from.attributes
+                .insert("settings".into(), plain.to_snapshot());
+            let protected_plan = redact_secrets_in_plan_with_desired_and_historical::<()>(
+                &available_plan,
+                &HashMap::new(),
+                &historical,
+            )
+            .unwrap();
+            let serialized = serde_json::to_string(&protected_plan).unwrap();
+            assert!(!serialized.contains("whole-container-plaintext-must-not-leak"));
+            assert!(!serialized.contains("old-private-token"));
+            let Effect::Update { from, .. } = &protected_plan.effects()[0] else {
+                panic!("redacted update");
+            };
+            assert!(from.attributes["settings"].secret_hash().is_some());
+            let protected = redact_plaintext_using_secret_shape(&plain, &secret).unwrap();
+            assert!(
+                !serde_json::to_string(&protected)
+                    .unwrap()
+                    .contains("whole-container-plaintext-must-not-leak")
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_secret_collections_keep_empty_struct_entries_without_diff() {
+        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+        let entry_type = AttributeType::struct_(
+            "Entry",
+            vec![StructField::optional("token", AttributeType::string()).build()],
+        );
+        let schema = ResourceSchema::new("mock.Collections")
+            .attribute(
+                AttributeSchema::optional("items", AttributeType::list(entry_type.clone()))
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("by_name", AttributeType::map(entry_type))
+                    .create_only()
+                    .build(),
+            )
+            .validate()
+            .unwrap();
+        let empty = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+        let entry = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "token".into(),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("private".into()),
+            )))),
+        )])));
+        let desired = crate::resource::ExpandedResource::new("mock.Collections", "example")
+            .with_attribute(
+                "items",
+                Value::Concrete(ConcreteValue::List(vec![empty.clone(), entry.clone()])),
+            )
+            .with_attribute(
+                "by_name",
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    ("empty".into(), empty),
+                    ("secret".into(), entry),
+                ]))),
+            );
+        let mut attributes = desired
+            .attributes
+            .iter()
+            .map(|(key, value)| (key.clone(), redact_secrets_in_value(value).unwrap()))
+            .collect::<HashMap<_, _>>();
+        let before = attributes.clone();
+        canonicalize_snapshot_attribute_map_with_schema(&mut attributes, schema.as_schema());
+        assert_eq!(
+            attributes, before,
+            "collection membership must survive state canonicalization"
+        );
+        let current = crate::resource::SnapshotState::existing(desired.id.clone(), attributes);
+        assert!(matches!(
+            crate::differ::diff_test(
+                &desired,
+                &current,
+                None,
+                None,
+                Some(schema.as_schema()),
+                &crate::differ::exact_comparison_schema_for_tests()
+            ),
+            crate::differ::Diff::NoChange(_)
+        ));
+    }
+
+    #[test]
+    fn snapshot_enum_map_keys_with_secret_values_normalize_without_diff() {
+        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+        let schema = ResourceSchema::new("mock.Aliases")
+            .attribute(
+                AttributeSchema::optional(
+                    "tokens",
+                    AttributeType::map_with_key(status_enum_type(), AttributeType::string()),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("private".into()),
+        ))));
+        let desired = crate::resource::ExpandedResource::new("mock.Aliases", "example")
+            .with_attribute(
+                "tokens",
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "enabled".into(),
+                    secret.clone(),
+                )]))),
+            );
+        let mut attributes = HashMap::from([(
+            "tokens".into(),
+            redact_secrets_in_value(&desired.attributes["tokens"]).unwrap(),
+        )]);
+        canonicalize_snapshot_attribute_map_with_schema(&mut attributes, schema.as_schema());
+        let SnapshotValue::Concrete(crate::resource::ConcreteValue::Map(tokens)) =
+            &attributes["tokens"]
+        else {
+            panic!("map attribute");
+        };
+        assert_eq!(
+            tokens.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["Enabled"]
+        );
+        let current = crate::resource::SnapshotState::existing(desired.id.clone(), attributes);
+        assert!(matches!(
+            crate::differ::diff_test(
+                &desired,
+                &current,
+                None,
+                None,
+                Some(schema.as_schema()),
+                &crate::differ::exact_comparison_schema_for_tests()
+            ),
+            crate::differ::Diff::NoChange(_)
+        ));
+        let collision = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("RSA-2048".into(), secret.clone()),
+            ("RSA_2048".into(), secret),
+        ])));
+        let snapshot = redact_secrets_in_value(&collision).unwrap();
+        let canonical = canonicalize_snapshot_with_type(
+            snapshot.clone(),
+            &separator_folding_map_key_type(),
+            crate::schema::empty_defs_for_schema_walks(),
+            crate::schema::FieldAncestry::WRITABLE,
+        )
+        .unwrap();
+        assert_eq!(
+            canonical, snapshot,
+            "colliding state keys must both be preserved"
+        );
+    }
 
     #[test]
     fn loop_slot_secret_material_matches_main_persisted_serde() {
@@ -8716,7 +9011,11 @@ mod tests {
     }
 
     fn status_enum() -> AttributeType {
-        AttributeType::enum_(
+        status_enum_type()
+    }
+
+    fn status_enum_type<R: crate::schema::PatternForm>() -> crate::schema::PatternAttributeType<R> {
+        crate::schema::PatternAttributeType::enum_(
             crate::schema::TypeIdentity::new(Some("test"), ["widget"], "Status"),
             Some(vec!["Enabled".to_string(), "Disabled".to_string()]),
             vec![
@@ -14550,8 +14849,8 @@ mod tests {
 }
 
 /// Canonicalize historical structure while preserving hash leaves as evidence.
-/// Ordinary subtrees cross the same checked conversion used by state selection;
-/// a hash never enters schema fitting or value evaluation.
+/// State-only structural inspection never converts a historical hash to an
+/// evaluable value. Hashes remain opaque leaves in the shared state traversal.
 pub(crate) fn canonicalize_snapshot_attribute_map_with_schema<Attributes>(
     attributes: &mut Attributes,
     schema: &crate::schema::CompiledResourceSchema,
@@ -14583,95 +14882,14 @@ pub(crate) fn canonicalize_snapshot_with_type(
     defs: &std::collections::BTreeMap<String, AttributeType>,
     ancestry: crate::schema::FieldAncestry,
 ) -> Option<SnapshotValue> {
-    if value.secret_hash().is_some() {
-        return Some(value);
-    }
-    if let Ok(live) = value.to_value_at("state") {
-        return canonicalize_state_with_type_and_ancestry(live, ty, defs, ancestry)
-            .into_present()
-            .map(|value| value.to_snapshot());
-    }
-    let resolved = ty.resolve_refs_with_defs(defs);
-    let Ok(shape) = resolved.as_attr().shape_ref_free() else {
-        return Some(value);
-    };
-    match (value, shape) {
-        (Value::Concrete(ConcreteValue::Map(values)), crate::schema::Shape::Struct { .. }) => {
-            let fields = crate::schema::struct_fields_with_defs(ty, defs).unwrap_or(&[]);
-            let values = values
-                .into_iter()
-                .filter_map(|(key, value)| {
-                    let value = match crate::schema::struct_field_for_key(fields, &key, ancestry) {
-                        Some(field) => canonicalize_snapshot_with_type(
-                            value,
-                            &field.field_type,
-                            defs,
-                            ancestry.descend(field),
-                        ),
-                        None => Some(value),
-                    };
-                    value.map(|value| (key, value))
-                })
-                .collect();
-            Some(Value::Concrete(ConcreteValue::Map(values)))
-        }
-        (
-            Value::Concrete(ConcreteValue::Map(values)),
-            crate::schema::Shape::Map {
-                value: value_type, ..
-            },
-        ) => Some(Value::Concrete(ConcreteValue::Map(
-            values
-                .into_iter()
-                .filter_map(|(key, value)| {
-                    canonicalize_snapshot_with_type(value, value_type, defs, ancestry)
-                        .map(|value| (key, value))
-                })
-                .collect(),
-        ))),
-        (
-            Value::Concrete(ConcreteValue::List(values)),
-            crate::schema::Shape::List { element_type, .. },
-        ) => Some(Value::Concrete(ConcreteValue::List(
-            values
-                .into_iter()
-                .filter_map(|value| {
-                    canonicalize_snapshot_with_type(value, element_type, defs, ancestry)
-                })
-                .collect(),
-        ))),
-        (value, crate::schema::Shape::Union) => {
-            let members = crate::schema::union_members_with_defs(ty, defs);
-            let mut matching = members
-                .as_ref()
-                .into_iter()
-                .flat_map(|members| members.iter().flatten())
-                .filter(|member| {
-                    let ty = member.as_attr();
-                    let resolved = ty.resolve_refs_with_defs(defs);
-                    matches!(
-                        (&value, resolved.as_attr().shape_ref_free()),
-                        (
-                            Value::Concrete(ConcreteValue::Map(_)),
-                            Ok(crate::schema::Shape::Map { .. }
-                                | crate::schema::Shape::Struct { .. })
-                        ) | (
-                            Value::Concrete(ConcreteValue::List(_)),
-                            Ok(crate::schema::Shape::List { .. })
-                        )
-                    )
-                });
-            match (matching.next(), matching.next()) {
-                (Some(member), None) => {
-                    canonicalize_snapshot_with_type(value, member.as_attr(), defs, ancestry)
-                }
-                // A historical digest cannot choose between otherwise matching
-                // union members. Preserve an ambiguous shape for comparison.
-                _ => Some(value),
-            }
-        }
-        (value, _) => Some(value),
-    }
+    unwrap_infallible(canonicalize_state_entry_with_type(
+        value,
+        ty,
+        defs,
+        ancestry,
+        PreserveEnumResolutionErrors,
+    ))
+    .into_present()
 }
 
 pub(crate) fn redact_state_snapshot_value(

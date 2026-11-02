@@ -1389,11 +1389,7 @@ impl ProjectionDesiredValue<'_> {
                     .get(key)
                     .map_or(Self::Absent, |value| Self::Present(value, child_path))
             }
-            Self::Present(value, _)
-                if !value
-                    .to_value_at("desired")
-                    .is_ok_and(|value| value.is_fully_resolved()) =>
-            {
+            Self::Present(value, _) if crate::resource::contains_comparison_expression(value) => {
                 Self::Conservative
             }
             Self::Present(_, _) | Self::Absent => Self::Absent,
@@ -1738,11 +1734,9 @@ fn project_value_inner<R: ReferenceEquality>(
                 ProjectionDesiredValue::Present(
                     Value::Concrete(ConcreteValue::List(desired_items)),
                     desired_path,
-                ) if desired_items.iter().all(|value| {
-                    value
-                        .to_value_at("desired")
-                        .is_ok_and(|value| value.is_fully_resolved())
-                }) =>
+                ) if desired_items
+                    .iter()
+                    .all(|value| !crate::resource::contains_comparison_expression(value)) =>
                 {
                     // Pair in the normal desired -> current direction so each
                     // desired element claims at most one current element. A
@@ -1788,9 +1782,7 @@ fn project_value_inner<R: ReferenceEquality>(
                     desired_by_current
                 }
                 ProjectionDesiredValue::Present(value, _)
-                    if !value
-                        .to_value_at("desired")
-                        .is_ok_and(|value| value.is_fully_resolved()) =>
+                    if crate::resource::contains_comparison_expression(value) =>
                 {
                     vec![ProjectionDesiredValue::Conservative; items.len()]
                 }
@@ -3793,6 +3785,90 @@ mod tests {
                 item("first", false),
                 item("second", false),
             ]))
+        );
+    }
+
+    #[test]
+    fn saved_plan_projection_keeps_hash_evidence_and_propagates_verification_errors() {
+        let live: Value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("private".into()),
+        ))));
+        let hash = crate::value::redact_secrets_in_value(&live).unwrap();
+        let authored = SnapshotValue::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "key".into(),
+                SnapshotValue::Concrete(ConcreteValue::String("authored".into())),
+            ),
+            ("value".into(), hash.clone()),
+        ])));
+        let default = SnapshotValue::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "key".into(),
+                SnapshotValue::Concrete(ConcreteValue::String("default".into())),
+            ),
+            (
+                "value".into(),
+                SnapshotValue::Concrete(ConcreteValue::String("provider".into())),
+            ),
+        ])));
+        let observed =
+            SnapshotValue::Concrete(ConcreteValue::List(vec![default.clone(), authored.clone()]));
+        let stored = SnapshotValue::Concrete(ConcreteValue::List(vec![authored.clone(), default]));
+        let desired = SnapshotValue::Concrete(ConcreteValue::List(vec![authored.clone()]));
+        let canonicalize = |value: SnapshotValue| {
+            CanonicalComparisonAttributes::from_unschematized(
+                crate::resource::UnschematizedComparisonAttributes::new(HashMap::from([(
+                    "items".into(),
+                    value,
+                )])),
+            )
+        };
+        let current = canonicalize(observed);
+        let stored = canonicalize(stored);
+        let desired = canonicalize(desired);
+        let explicit = ExplicitFields::Struct {
+            children: HashMap::from([(
+                "items".into(),
+                ExplicitFields::ListElements {
+                    elements: vec![authored_keyed_value(), ExplicitFields::Unrecorded],
+                },
+            )]),
+        };
+        let masked = crate::resource::ResolvedIgnoreChanges::default().mask_comparison_attributes(
+            &desired,
+            &current,
+            Some(&stored),
+            None,
+        );
+        let schema = crate::differ::exact_comparison_schema_for_tests();
+        let projected = schema
+            .with_observation(|comparison| {
+                ExplicitProjection::for_desired(&masked, &explicit, None, comparison)
+                    .current()
+                    .into_attributes()
+            })
+            .unwrap();
+        assert_eq!(
+            projected.get("items"),
+            Some(&SnapshotValue::Concrete(ConcreteValue::List(vec![
+                authored
+            ])))
+        );
+        let unavailable =
+            SnapshotValue::Deferred(DeferredValue::Secret(Box::new(SnapshotValue::Concrete(
+                ConcreteValue::Map(IndexMap::from([("opaque".into(), hash.clone())])),
+            ))));
+        let result = schema.with_observation(|comparison| {
+            crate::differ::type_aware_equal(
+                &unavailable,
+                &hash,
+                None,
+                empty_defs_for_schema_walks(),
+                comparison,
+            )
+        });
+        assert!(
+            matches!(result, Err(crate::differ::ComparisonError::Secret(crate::value::SerializationError::UnavailableSecret(error))) if error.path() == "comparison.secret.opaque")
         );
     }
 

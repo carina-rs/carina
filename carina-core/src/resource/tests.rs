@@ -4471,3 +4471,19 @@ fn provider_normalization_boundary_strips_then_restores_host_dependencies() {
         Some(&Value::Concrete(ConcreteValue::Bool(true)))
     );
 }
+
+#[test]
+fn exact_pairing_preserves_hash_container_evidence() {
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String("private".into()),
+    ))));
+    let hash = crate::value::redact_secrets_in_value(&secret).unwrap();
+    let item = SnapshotValue::Concrete(super::ConcreteValue::Map(IndexMap::from([(
+        "token".into(),
+        hash,
+    )])));
+    let (pairs, matched) =
+        super::match_equal_concrete_items(std::slice::from_ref(&item), std::slice::from_ref(&item));
+    assert_eq!(pairs, vec![Some(0)]);
+    assert_eq!(matched, vec![true]);
+}

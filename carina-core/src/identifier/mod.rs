@@ -2910,7 +2910,7 @@ struct StateRowIdentityValues {
 #[derive(Clone)]
 enum StateIdentityValue {
     Absent,
-    Comparable(ResolvedCreateOnlyValue),
+    Comparable(ResolvedCreateOnlyValue<crate::resource::SnapshotLeaf>),
     Uncomparable,
 }
 
@@ -2918,10 +2918,7 @@ impl StateIdentityValue {
     fn at_path(root: Option<&crate::resource::SnapshotValue>, path: &IdentityPath) -> Self {
         match value_at_identity_path(root, path) {
             Ok(None) => Self::Absent,
-            Ok(Some(value)) => value
-                .to_value_at(path.to_string())
-                .ok()
-                .and_then(ResolvedCreateOnlyValue::from_value)
+            Ok(Some(value)) => ResolvedCreateOnlyValue::from_value(value.clone())
                 .map(Self::Comparable)
                 .unwrap_or(Self::Uncomparable),
             Err(()) => Self::Uncomparable,

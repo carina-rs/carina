@@ -21,6 +21,47 @@ impl<'a> SavedValueViews<'a> {
     }
 }
 
+/// Whether historical comparison data still contains a computation.
+/// A hash is opaque evidence rather than an expression or an evaluable value.
+pub(crate) fn contains_comparison_expression(value: &Value) -> bool {
+    match value {
+        Value::Concrete(ConcreteValue::List(values)) => {
+            values.iter().any(contains_comparison_expression)
+        }
+        Value::Concrete(ConcreteValue::Map(values)) => {
+            values.values().any(contains_comparison_expression)
+        }
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        ) => false,
+        Value::Deferred(DeferredValue::Secret(inner)) => contains_comparison_expression(inner),
+        Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { .. })) => false,
+        Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::Expression(never))) => {
+            match *never {}
+        }
+        Value::Deferred(
+            DeferredValue::ModuleIf(_)
+            | DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::Coalesce { .. }
+            | DeferredValue::IntegerArithmetic(_)
+            | DeferredValue::Interpolation(_)
+            | DeferredValue::FunctionCall { .. }
+            | DeferredValue::Unavailable { .. }
+            | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::Access(_)
+            | DeferredValue::Unknown(_),
+        ) => true,
+    }
+}
+
 /// Borrow either concrete list representation at the comparison seam.
 /// Conversion is local to comparison and never rewrites a payload or state.
 /// Pair identical concrete items before probing other unordered candidates.
@@ -41,11 +82,7 @@ pub(crate) fn match_equal_concrete_items<A: Borrow<Value>, B: Borrow<Value>>(
     }
     for (i, item) in a.iter().enumerate() {
         let item = item.borrow();
-        if !matches!(item, Value::Concrete(_))
-            || !item
-                .to_value_at("comparison")
-                .is_ok_and(|value| value.is_fully_resolved())
-        {
+        if !matches!(item, Value::Concrete(_)) || contains_comparison_expression(item) {
             continue;
         }
         if let Some(j) = buckets.get(&item.canonical_hash()).and_then(|bucket| {

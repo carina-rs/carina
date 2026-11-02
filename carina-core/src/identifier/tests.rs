@@ -9991,3 +9991,37 @@ fn legacy_loop_detector_skips_ambiguous_owner_without_one_exact_input_match() {
         );
     }
 }
+
+#[test]
+fn historical_identity_inspection_preserves_hashes_and_propagates_selection_errors() {
+    let hash = redacted_identity_value();
+    let snapshot = crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::Map(
+        IndexMap::from([("token".into(), hash)]),
+    ));
+    let path = IdentityPath::attribute("name");
+    let selected = StateIdentityValue::at_path(Some(&snapshot), &path);
+    let StateIdentityValue::Comparable(value) = selected else {
+        panic!("a historical container must retain its hash evidence");
+    };
+    assert_eq!(
+        serde_json::to_value(&value.value).unwrap(),
+        serde_json::to_value(&snapshot).unwrap()
+    );
+    let registry = scalar_identity_registry();
+    let desired = Resource::pending_with_provider("mock", "test.resource", None).with_attribute(
+        "name",
+        Value::root_resource_ref("history", "settings", vec![]),
+    );
+    let schema = registry.get_for(&desired).unwrap();
+    let result = DesiredIdentityValues::from_resource(&desired, schema.schema(), &|_| {
+        vec![AnonymousIdBindingStateInfo {
+            name: "history".into(),
+            attribute_values: HashMap::from([("settings".into(), snapshot.clone())]),
+        }]
+    });
+    let error = match result {
+        Ok(_) => panic!("a selected historical secret needs a typed unavailable error"),
+        Err(error) => error,
+    };
+    assert_eq!(error.path(), "history.settings.token");
+}

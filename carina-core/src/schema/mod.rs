@@ -3142,7 +3142,7 @@ impl fmt::Display for FieldPath {
 /// an unresolved Ref stays on the ordinary validation-error path rather
 /// than panicking here. Shared by the ancestry-aware fit and diagnostic
 /// walkers so map-key validation cannot drift (carina#3347).
-pub(crate) fn lift_map_key<P: PlaceholderKind, B: BindingAddress>(
+pub(crate) fn lift_map_key<P: crate::resource::ValueKind, B: BindingAddress>(
     key_type: &PatternAttributeType<Compiled>,
     key: &str,
     defs: &BTreeMap<String, PatternAttributeType<Compiled>>,
@@ -3180,7 +3180,7 @@ pub(crate) fn empty_defs_for_schema_walks<R: PatternForm>()
 /// The decision is made only from the value and its fully Ref-resolved type: an
 /// empty map means absence for a struct that declares at least one field.
 /// Zero-field structs remain real marker values.
-pub(crate) fn reads_as_absent<H: PlaceholderKind, B: BindingAddress>(
+pub(crate) fn reads_as_absent<H: crate::resource::ValueKind, B: BindingAddress>(
     value: &Value<H, B>,
     resolved_type: ResolvedAttrType<'_, Compiled>,
 ) -> bool {
@@ -4106,6 +4106,14 @@ impl PatternAttributeType<Compiled> {
     /// The pre-Phase-2 `Value::Concrete(ConcreteValue::String(_)) | Value::Deferred(DeferredValue::ResourceRef{ .. }) |
     /// Value::Deferred(DeferredValue::Interpolation(_))` arm is now structurally unrepresentable.
     fn validate_primitive<P: PlaceholderKind, B: BindingAddress>(
+        &self,
+        value: ConcreteValueRef<'_, P, B>,
+    ) -> Result<(), TypeError> {
+        self.inspect_primitive(value)
+    }
+
+    /// Inspect an available scalar; opaque state leaves never reach this path.
+    fn inspect_primitive<P: crate::resource::ValueKind, B: BindingAddress>(
         &self,
         value: ConcreteValueRef<'_, P, B>,
     ) -> Result<(), TypeError> {
@@ -5069,7 +5077,7 @@ fn canonical_enum_key_from_fit(fit: &Fit<'_>) -> Option<String> {
 struct KnownListElement(serde_json::Value);
 
 impl KnownListElement {
-    fn from_fit<P: PlaceholderKind, B: BindingAddress>(
+    fn from_fit<P: crate::resource::ValueKind, B: BindingAddress>(
         value: &Value<P, B>,
         fit: &Fit<'_>,
         defs: &BTreeMap<String, CompiledAttributeType>,
@@ -5100,7 +5108,7 @@ impl ListConstraints {
         mut fit_item: impl FnMut(&Value<P, B>) -> Option<Fit<'schema>>,
     ) -> impl Iterator<Item = Result<(usize, Option<Fit<'schema>>), ListConstraintError>>
     where
-        P: PlaceholderKind,
+        P: crate::resource::ValueKind,
         B: BindingAddress,
         I: ExactSizeIterator,
         I::Item: std::borrow::Borrow<Value<P, B>>,
@@ -5213,15 +5221,57 @@ fn fit_value_to_type_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
     purpose: CanonicalizationPurpose<'_>,
     visited_refs: &mut Vec<&'a str>,
 ) -> Option<Fit<'a>> {
+    inspect_structure_with_defs_on_path(attr, value, defs, ancestry, purpose, visited_refs)
+}
+
+fn inspect_structure_with_defs_on_path<'a, P: crate::resource::ValueKind, B: BindingAddress>(
+    attr: &'a PatternAttributeType<Compiled>,
+    value: &Value<P, B>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
+    ancestry: FieldAncestry,
+    purpose: CanonicalizationPurpose<'_>,
+    visited_refs: &mut Vec<&'a str>,
+) -> Option<Fit<'a>> {
     let resolution = resolve_refs_on_path(attr, defs, visited_refs).ok()?;
     let resolved = resolution.attr;
     let fit =
-        fit_value_to_resolved_type_on_path(resolved, value, defs, ancestry, purpose, visited_refs);
+        inspect_value_structure_on_path(resolved, value, defs, ancestry, purpose, visited_refs);
     visited_refs.truncate(resolution.restore_len);
     fit
 }
 
 pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
+    attr: &'a PatternAttributeType<Compiled>,
+    value: &Value<P, B>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
+    ancestry: FieldAncestry,
+    purpose: CanonicalizationPurpose<'_>,
+    visited_refs: &mut Vec<&'a str>,
+) -> Option<Fit<'a>> {
+    inspect_value_structure_on_path(attr, value, defs, ancestry, purpose, visited_refs)
+}
+
+/// Inspect persisted structure while retaining hashes as opaque state leaves.
+/// Its witness describes historical state only; evaluable validation and
+/// expression type selection retain their PlaceholderKind entry points.
+pub(crate) fn inspect_snapshot_state_structure<'a, B: BindingAddress>(
+    attr: &'a PatternAttributeType<Compiled>,
+    value: &crate::resource::SnapshotValue<crate::resource::NoPlaceholder, B>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
+    ancestry: FieldAncestry,
+    visited_refs: &mut Vec<&'a str>,
+) -> Option<Fit<'a>> {
+    inspect_value_structure_on_path(
+        attr,
+        value,
+        defs,
+        ancestry,
+        CanonicalizationPurpose::State,
+        visited_refs,
+    )
+}
+
+fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: BindingAddress>(
     attr: &'a PatternAttributeType<Compiled>,
     value: &Value<P, B>,
     defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
@@ -5249,7 +5299,7 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
         | AT::Ref(_) => {}
     }
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        let inner = fit_value_to_resolved_type_on_path(
+        let inner = inspect_value_structure_on_path(
             attr,
             inner,
             defs,
@@ -5266,10 +5316,22 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
     }
 
     if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
-        let value_fit =
-            fit_value_to_type_on_path(attr, value, defs, ancestry, purpose, &mut Vec::new())?;
-        let default_fit =
-            fit_value_to_type_on_path(attr, default, defs, ancestry, purpose, &mut Vec::new())?;
+        let value_fit = inspect_structure_with_defs_on_path(
+            attr,
+            value,
+            defs,
+            ancestry,
+            purpose,
+            &mut Vec::new(),
+        )?;
+        let default_fit = inspect_structure_with_defs_on_path(
+            attr,
+            default,
+            defs,
+            ancestry,
+            purpose,
+            &mut Vec::new(),
+        )?;
         let mut exactness = value_fit.exactness;
         exactness.combine(default_fit.exactness);
         return Some(Fit::with_kind(
@@ -5292,7 +5354,7 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
                 FitKind::Deferred,
             )),
             AT::Union(members) => {
-                let selected = fit_union_members_on_path(
+                let selected = inspect_union_structure_on_path(
                     members.as_raw_slice(),
                     value,
                     defs,
@@ -5391,7 +5453,7 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
             let mut exactness = FitExactness::EXACT;
             let mut item_fits = Vec::with_capacity(items.len());
             for result in constraints.check(items.iter(), defs, ancestry, purpose, |item| {
-                fit_value_to_type_on_path(
+                inspect_structure_with_defs_on_path(
                     element_type,
                     item,
                     defs,
@@ -5422,7 +5484,7 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
                 .map(|item| Value::Concrete(ConcreteValue::String(item.clone())));
             for result in
                 constraints.check(values, defs, ancestry, purpose, |item: &Value<P, B>| {
-                    fit_value_to_type_on_path(
+                    inspect_structure_with_defs_on_path(
                         element_type,
                         item,
                         defs,
@@ -5454,7 +5516,7 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
             let mut entry_fits = Vec::with_capacity(map.len());
             for (map_key, map_value) in map {
                 let lifted_key: Value<P, B> = lift_map_key(key, map_key, defs);
-                let key_fit = fit_value_to_type_on_path(
+                let key_fit = inspect_structure_with_defs_on_path(
                     key,
                     &lifted_key,
                     defs,
@@ -5464,7 +5526,7 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
                 )?;
                 exactness.combine(key_fit.exactness);
                 let canonical_key = canonical_enum_key_from_fit(&key_fit);
-                let value_fit = fit_value_to_type_on_path(
+                let value_fit = inspect_structure_with_defs_on_path(
                     value_type,
                     map_value,
                     defs,
@@ -5512,7 +5574,7 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
                 {
                     return None;
                 }
-                let child = fit_value_to_type_on_path(
+                let child = inspect_structure_with_defs_on_path(
                     &field.field_type,
                     field_value,
                     defs,
@@ -5526,7 +5588,7 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
             Some(Fit::with_kind(exactness, attr, FitKind::Struct(field_fits)))
         }
         (AT::Union(members), _) => {
-            let selected = fit_union_members_on_path(
+            let selected = inspect_union_structure_on_path(
                 members.as_raw_slice(),
                 value,
                 defs,
@@ -5556,7 +5618,7 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
             | AT::Duration,
             _,
         ) => {
-            attr.validate_primitive(concrete).ok()?;
+            attr.inspect_primitive(concrete).ok()?;
             let exactness = if matches!(
                 (&attr.kind, concrete),
                 (AT::Float { .. }, ConcreteValueRef::Int(_))
@@ -5571,7 +5633,7 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
     }
 }
 
-fn fit_union_members_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
+fn inspect_union_structure_on_path<'a, P: crate::resource::ValueKind, B: BindingAddress>(
     members: &'a [PatternAttributeType<Compiled>],
     value: &Value<P, B>,
     defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
@@ -5581,9 +5643,14 @@ fn fit_union_members_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
 ) -> Option<UnionFit<'a>> {
     let mut best: Option<UnionFit<'a>> = None;
     for member in members {
-        let Some(fit) =
-            fit_value_to_type_on_path(member, value, defs, ancestry, purpose, visited_refs)
-        else {
+        let Some(fit) = inspect_structure_with_defs_on_path(
+            member,
+            value,
+            defs,
+            ancestry,
+            purpose,
+            visited_refs,
+        ) else {
             continue;
         };
         if best.as_ref().is_none_or(|current| fit > current.fit) {
@@ -6014,7 +6081,7 @@ pub(crate) fn select_union_member_on_path<'a, P: PlaceholderKind, B: BindingAddr
     ancestry: FieldAncestry,
     visited_refs: &mut Vec<&'a str>,
 ) -> Result<&'a PatternAttributeType<Compiled>, TypeError> {
-    if let Some(selected) = fit_union_members_on_path(
+    if let Some(selected) = inspect_union_structure_on_path(
         members,
         original,
         defs,
@@ -6093,7 +6160,7 @@ pub(crate) fn struct_field_for_key<'a>(
         .find(|field| field.name == key || ancestry.block_name(field) == Some(key))
 }
 
-fn struct_field_is_present<P: PlaceholderKind, B: BindingAddress>(
+fn struct_field_is_present<P: crate::resource::ValueKind, B: BindingAddress>(
     fields: &[CompiledStructField],
     map: &IndexMap<String, Value<P, B>>,
     expected: &CompiledStructField,
@@ -6105,7 +6172,7 @@ fn struct_field_is_present<P: PlaceholderKind, B: BindingAddress>(
     })
 }
 
-fn violated_struct_field_groups<'a, P: PlaceholderKind, B: BindingAddress>(
+fn violated_struct_field_groups<'a, P: crate::resource::ValueKind, B: BindingAddress>(
     fields: &'a [CompiledStructField],
     field_groups: &'a [FieldGroup],
     map: &'a IndexMap<String, Value<P, B>>,
@@ -7731,7 +7798,7 @@ impl TypeError {
     }
 }
 
-impl<P: PlaceholderKind, B: BindingAddress> Value<P, B> {
+impl<P: crate::resource::ValueKind, B: BindingAddress> Value<P, B> {
     pub fn type_name(&self) -> String {
         match self {
             Value::Deferred(DeferredValue::ModuleIf(_)) => "ModuleIf".to_string(),
@@ -7771,7 +7838,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Value<P, B> {
     }
 }
 
-impl<P: PlaceholderKind, B: BindingAddress> ConcreteValueRef<'_, P, B> {
+impl<P: crate::resource::ValueKind, B: BindingAddress> ConcreteValueRef<'_, P, B> {
     /// Concrete-axis name used in type-mismatch diagnostics. Mirrors
     /// the labels [`Value::type_name`] produces for the same axis.
     fn type_name(&self) -> &'static str {
