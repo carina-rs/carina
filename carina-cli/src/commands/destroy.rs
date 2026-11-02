@@ -748,8 +748,31 @@ async fn run_destroy_locked_owned(
         mid_run_writer.write_schema_migration(state_file.as_mut().expect("validated migration retains state")).await?;
     }
 
-    // Collect resources that exist and will be destroyed
-    // Skip the state bucket if it matches the backend bucket
+    // Backend protection covers persisted rows regardless of current-instance
+    // refresh eligibility: removed-claimed rows can still have deposed generations.
+    let mut protected_row_keys: HashSet<StateRowKey> = HashSet::new();
+    if let (Some(state), Some(backend_rt), Some(bucket_name)) = (
+        state_file.as_ref(),
+        backend.resource_type(),
+        protected_bucket.as_deref(),
+    ) {
+        for row in state.resources() {
+            if row.resource_type == backend_rt
+                && let Some(Value::Concrete(ConcreteValue::String(name))) = row
+                    .persisted_attributes()
+                    .and_then(|attributes| attributes.get("bucket"))
+                && name.expose_plaintext() == bucket_name
+            {
+                protected_row_keys.insert(state_row_key_from_parts(
+                    &row.provider,
+                    &row.resource_type,
+                    row.identity.as_str(),
+                ));
+            }
+        }
+    }
+
+    // Collect resources that exist and will be destroyed.
     let mut protected_resources: Vec<&Resource> = Vec::new();
     let mut prevent_destroy_resources: Vec<(&Resource, PreventDestroySource)> = Vec::new();
     let mut resources_to_destroy: Vec<&Resource> = all_resources
@@ -782,12 +805,21 @@ async fn run_destroy_locked_owned(
                 }
             }
 
-            // Check if this is the protected state bucket
-            if let Some(backend_rt) = backend.resource_type()
-                && r.id.resource_type == backend_rt
-                && let Some(ref bucket_name) = protected_bucket
-                && let Some(Value::Concrete(ConcreteValue::String(name))) = r.get_attr("bucket")
-                && name.expose_plaintext() == bucket_name.as_str()
+            // Protect the persisted backend bucket even if its configured name changed.
+            let configured_backend_bucket = backend.resource_type()
+                == Some(r.id.resource_type.as_str())
+                && protected_bucket.as_deref().is_some_and(|bucket_name| {
+                    matches!(r.get_attr("bucket"), Some(Value::Concrete(ConcreteValue::String(name)))
+                        if name.expose_plaintext() == bucket_name)
+                });
+            if configured_backend_bucket
+                || r.id.identity_str().is_some_and(|identity| {
+                    protected_row_keys.contains(&state_row_key_from_parts(
+                        &r.id.provider,
+                        &r.id.resource_type,
+                        identity,
+                    ))
+                })
             {
                 protected_resources.push(r);
                 return false;
@@ -815,11 +847,12 @@ async fn run_destroy_locked_owned(
     // bucket itself. `prevent_destroy` is intentionally not included here: it
     // guards the current instance, while a deposed generation already came from
     // a replacement path that approved deleting the old instance.
-    let protected_row_keys: HashSet<StateRowKey> = protected_resources
-        .iter()
-        .filter_map(|resource| ResolvedResourceId::try_new(resource.id.clone()))
-        .map(|id| state_row_key_from_id(&id))
-        .collect();
+    protected_row_keys.extend(
+        protected_resources
+            .iter()
+            .filter_map(|resource| ResolvedResourceId::try_new(resource.id.clone()))
+            .map(|id| state_row_key_from_id(&id)),
+    );
     let resolved_resources_to_destroy = resources_to_destroy
         .iter()
         .map(|resource| destroy_graph.resolve_resource((*resource).clone(), ctx.schemas()))
@@ -2950,6 +2983,161 @@ mod tests {
             "nat_gw must be destroyed before igw; order: {:?}",
             order.iter().map(|idx| &names[*idx]).collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn removed_backend_bucket_with_deposed_generation_is_protected_in_both_refresh_modes() {
+        use carina_provider_mock::{MockBehavior, MockObservations, MockScope};
+        use carina_state::{BackendResult, DeposedInstance, DeposedKey, LoadedState, RawState};
+
+        // Exercise S3 bucket protection while keeping state I/O local.
+        struct StateBucketBackend(Box<dyn StateBackend>);
+
+        #[async_trait::async_trait]
+        impl StateBackend for StateBucketBackend {
+            async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
+                self.0.read_state().await
+            }
+
+            async fn read_state_bytes(&self) -> BackendResult<Option<RawState>> {
+                self.0.read_state_bytes().await
+            }
+
+            async fn write_state(&self, state: &StateFile) -> BackendResult<()> {
+                self.0.write_state(state).await
+            }
+
+            async fn acquire_lock(&self, operation: &str) -> BackendResult<LockInfo> {
+                self.0.acquire_lock(operation).await
+            }
+
+            async fn release_lock(&self, lock: &LockInfo) -> BackendResult<()> {
+                self.0.release_lock(lock).await
+            }
+
+            async fn renew_lock(&self, lock: &LockInfo) -> BackendResult<LockInfo> {
+                self.0.renew_lock(lock).await
+            }
+
+            async fn write_state_locked(
+                &self,
+                state: &StateFile,
+                lock: &LockInfo,
+            ) -> BackendResult<()> {
+                self.0.write_state_locked(state, lock).await
+            }
+
+            async fn force_unlock(&self, lock_id: &str) -> BackendResult<()> {
+                self.0.force_unlock(lock_id).await
+            }
+
+            async fn bucket_exists(&self) -> BackendResult<bool> {
+                self.0.bucket_exists().await
+            }
+
+            async fn create_bucket(&self) -> BackendResult<()> {
+                self.0.create_bucket().await
+            }
+
+            fn resource_type(&self) -> Option<&str> {
+                Some("s3.Bucket")
+            }
+        }
+
+        for refresh in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let delete_log = dir.path().join("deletes.log");
+            let runtime = crate::test_support::TestCommandRuntime::with_mock(
+                MockBehavior {
+                    observations: MockObservations {
+                        delete_log: Some(delete_log.clone()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                MockScope::memory(),
+            );
+            let config_path = dir.path();
+            std::fs::write(
+                config_path.join("main.crn"),
+                "provider mock {}\nremoved { from = mock.s3.Bucket 'state' }\n",
+            )
+            .unwrap();
+            let parsed = load_configuration_with_config(
+                config_path,
+                &ProviderContext::default(),
+                &carina_core::schema::SchemaRegistry::new(),
+            )
+            .unwrap()
+            .parsed
+            .into_parsed();
+            let backend: Arc<dyn StateBackend> = Arc::new(StateBucketBackend(
+                crate::commands::local_backend_for_test(dir.path().join("state.json")),
+            ));
+            let mut row = carina_state::ResourceState::try_applied(
+                "s3.Bucket",
+                "state",
+                "mock",
+                "backend-state-bucket",
+            )
+            .unwrap();
+            row.set_persisted_attribute("bucket", serde_json::json!("backend-state-bucket"));
+            row.deposed.push(DeposedInstance::from_persisted_json(
+                DeposedKey::new_unique(),
+                "old-state-bucket".to_owned(),
+                None,
+                HashMap::new(),
+                Default::default(),
+            ));
+            let mut state = StateFile::new();
+            state.upsert_resource(row).unwrap();
+            backend.write_state(&state).await.unwrap();
+            let lock = backend.acquire_lock("destroy").await.unwrap();
+
+            run_destroy_locked(
+                &runtime,
+                crate::output_style::ColorMode::Plain,
+                parsed,
+                true,
+                Arc::clone(&backend),
+                Some("backend-state-bucket".to_owned()),
+                StateLock::held(lock),
+                refresh,
+                false,
+                config_path,
+                &ProviderContext::default(),
+                NonZeroUsize::new(1).unwrap(),
+                ShutdownToken::running(),
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                !delete_log.exists(),
+                "removed backend bucket generations must never be deleted (refresh={refresh})"
+            );
+            let state = backend.read_state().await.unwrap().unwrap().into_state();
+            let row = state
+                .find_resource("mock", "s3.Bucket", "state")
+                .expect("row with protected deposed generation must be retained");
+            assert!(
+                !row.has_current_instance(),
+                "the removed claim must forget the current instance (refresh={refresh})"
+            );
+            assert_eq!(
+                row.deposed.len(),
+                1,
+                "the protected deposed generation must be retained (refresh={refresh})"
+            );
+            assert_eq!(
+                row.deposed[0].identifier, "old-state-bucket",
+                "the protected deposed generation must be unchanged (refresh={refresh})"
+            );
+            assert!(
+                !dir.path().join("state.lock").exists(),
+                "destroy must release the lock (refresh={refresh})"
+            );
+        }
     }
 
     #[tokio::test]
