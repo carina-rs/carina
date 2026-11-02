@@ -113,7 +113,7 @@ pub(crate) fn apply<S, D>(
 mod tests {
     use super::*;
     use carina_core::resource::{ConcreteValue, DeferredValue, Value};
-    use carina_plugin_sdk::{DesiredInputs, DesiredValue};
+    use carina_plugin_sdk::{DesiredValue, NativeDesiredNormalization};
 
     fn string(value: &str) -> Value {
         Value::Concrete(ConcreteValue::String(value.into()))
@@ -166,15 +166,11 @@ mod tests {
                 .1 = wit::DesiredValue::StrVal("wasm".into());
             apply(std::slice::from_mut(resource), batch, returned).unwrap();
             assert_eq!(resource.attributes["known"], string("wasm"));
+            let mut native = NativeDesiredNormalization::from_core(resource).unwrap();
             assert!(matches!(
-                DesiredInputs::from_core(resource)
-                    .unwrap()
-                    .attribute("secret"),
+                native.inputs().attribute("secret"),
                 Some(DesiredValue::Deferred(_)),
             ));
-
-            let mut native =
-                carina_plugin_sdk::NativeDesiredNormalization::from_core(resource).unwrap();
             {
                 let mut view = native.view();
                 let Some(carina_plugin_sdk::DesiredValueMut::Known(value)) =
@@ -224,7 +220,9 @@ mod tests {
         let text = format!("{wire:?}");
         assert!(!text.contains("private-top") && !text.contains("private-nested"));
         assert!(text.contains("$$carina_deferred"));
-        let inputs = DesiredInputs::from_core(&resources[0]).unwrap();
+        let mut native = resources[0].clone();
+        let normalization = NativeDesiredNormalization::from_core(&mut native).unwrap();
+        let inputs = normalization.inputs();
         assert!(matches!(
             inputs.attribute("top"),
             Some(DesiredValue::Deferred(_))

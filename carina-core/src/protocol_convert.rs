@@ -75,6 +75,15 @@ fn protocol_to_field_group(group: &protocol::FieldGroup) -> Result<FieldGroup, S
     })
 }
 
+/// A key or index locating a nested value in a provider input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WirePathSegment {
+    Key(String),
+    Index(usize),
+    /// The failing value is inside an opaque secret; its inner path is hidden.
+    Secret,
+}
+
 /// A core value or type cannot be represented by the provider protocol.
 #[derive(Debug)]
 pub enum ProtocolConvertError {
@@ -118,6 +127,10 @@ pub enum ProtocolConvertError {
     Context {
         context: String,
         source: Box<ProtocolConvertError>,
+    },
+    ValuePath {
+        segment: WirePathSegment,
+        error: Box<ProtocolConvertError>,
     },
 }
 
@@ -186,6 +199,11 @@ impl fmt::Display for ProtocolConvertError {
                 context,
                 source: _source,
             } => formatter.write_str(context),
+            Self::ValuePath { segment, .. } => match segment {
+                WirePathSegment::Key(key) => write!(formatter, "map key `{key}`"),
+                WirePathSegment::Index(index) => write!(formatter, "list index {index}"),
+                WirePathSegment::Secret => formatter.write_str("secret value"),
+            },
         }
     }
 }
@@ -197,6 +215,7 @@ impl Error for ProtocolConvertError {
                 context: _context,
                 source,
             } => Some(source.as_ref()),
+            Self::ValuePath { error, .. } => Some(error.as_ref()),
             Self::NonFiniteFloat => None,
             Self::DurationOutOfRange => None,
             Self::InvalidRedactedSecretDigest => None,
@@ -231,6 +250,44 @@ impl Error for ProtocolConvertError {
 }
 
 impl ProtocolConvertError {
+    /// Structured container path, in outermost-to-innermost order.
+    pub fn value_path(&self) -> Vec<WirePathSegment> {
+        match self {
+            Self::ValuePath { segment, error } => {
+                let mut path = vec![segment.clone()];
+                path.extend(error.value_path());
+                path
+            }
+            Self::Context { source, .. } => source.value_path(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The typed conversion reason beneath contextual wrappers.
+    #[cfg(test)]
+    pub fn leaf_error(&self) -> &Self {
+        match self {
+            Self::ValuePath { error, .. } => error.leaf_error(),
+            Self::Context { source, .. } => source.leaf_error(),
+            error => error,
+        }
+    }
+
+    pub(crate) fn into_leaf_error(self) -> Self {
+        match self {
+            Self::ValuePath { error, .. } => error.into_leaf_error(),
+            Self::Context { source, .. } => source.into_leaf_error(),
+            error => error,
+        }
+    }
+
+    pub(crate) fn at_value_path(self, segment: WirePathSegment) -> Self {
+        Self::ValuePath {
+            segment,
+            error: Box::new(self),
+        }
+    }
+
     fn context(self, context: impl Into<String>) -> Self {
         Self::Context {
             context: context.into(),
@@ -1821,7 +1878,7 @@ pub fn try_core_to_protocol_value(value: &Value) -> Result<protocol::Value, Prot
                 .enumerate()
                 .map(|(index, value)| {
                     try_core_to_protocol_value(value)
-                        .map_err(|error| error.context(format!("list index {index}")))
+                        .map_err(|error| error.at_value_path(WirePathSegment::Index(index)))
                 })
                 .collect::<Result<_, _>>()?,
         )),
@@ -1837,7 +1894,7 @@ pub fn try_core_to_protocol_value(value: &Value) -> Result<protocol::Value, Prot
                 .map(|(key, value)| {
                     try_core_to_protocol_value(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.context(format!("map key `{key}`")))
+                        .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
                 })
                 .collect::<Result<_, _>>()?,
         )),
@@ -1907,7 +1964,7 @@ pub fn protocol_to_core_value(value: &protocol::Value) -> Result<Value, Protocol
                 .enumerate()
                 .map(|(index, value)| {
                     protocol_to_core_value(value)
-                        .map_err(|error| error.context(format!("list index {index}")))
+                        .map_err(|error| error.at_value_path(WirePathSegment::Index(index)))
                 })
                 .collect::<Result<_, _>>()?,
         ))),
@@ -1917,7 +1974,7 @@ pub fn protocol_to_core_value(value: &protocol::Value) -> Result<Value, Protocol
                 .map(|(key, value)| {
                     protocol_to_core_value(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.context(format!("map key `{key}`")))
+                        .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
                 })
                 .collect::<Result<IndexMap<_, _>, _>>()?,
         ))),
@@ -1956,7 +2013,7 @@ pub fn protocol_schema_default_to_core(
                 .enumerate()
                 .map(|(index, value)| {
                     protocol_schema_default_to_core(value)
-                        .map_err(|error| error.context(format!("list index {index}")))
+                        .map_err(|error| error.at_value_path(WirePathSegment::Index(index)))
                 })
                 .collect::<Result<_, _>>()?,
         ))),
@@ -1966,7 +2023,7 @@ pub fn protocol_schema_default_to_core(
                 .map(|(key, value)| {
                     protocol_schema_default_to_core(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.context(format!("map key `{key}`")))
+                        .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
                 })
                 .collect::<Result<IndexMap<_, _>, _>>()?,
         ))),
@@ -1982,7 +2039,7 @@ pub fn try_core_to_protocol_value_map(
         .map(|(key, value)| {
             try_core_to_protocol_value(value)
                 .map(|converted| (key.clone(), converted))
-                .map_err(|error| error.context(format!("map key `{key}`")))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
         })
         .collect()
 }
@@ -1996,7 +2053,7 @@ pub fn protocol_to_core_value_map(
         .map(|(key, value)| {
             protocol_to_core_value(value)
                 .map(|converted| (key.clone(), converted))
-                .map_err(|error| error.context(format!("map key `{key}`")))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
         })
         .collect()
 }
@@ -2036,7 +2093,7 @@ pub fn try_core_to_protocol_persisted_value(
                 .enumerate()
                 .map(|(index, value)| {
                     try_core_to_protocol_persisted_value(value)
-                        .map_err(|error| error.context(format!("list index {index}")))
+                        .map_err(|error| error.at_value_path(WirePathSegment::Index(index)))
                 })
                 .collect::<Result<_, _>>()?,
         )),
@@ -2054,7 +2111,7 @@ pub fn try_core_to_protocol_persisted_value(
                 .map(|(key, value)| {
                     try_core_to_protocol_persisted_value(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.context(format!("map key `{key}`")))
+                        .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
                 })
                 .collect::<Result<_, _>>()?,
         )),
@@ -2098,7 +2155,7 @@ pub fn protocol_to_core_persisted_value(
                 .enumerate()
                 .map(|(index, value)| {
                     protocol_to_core_persisted_value(value)
-                        .map_err(|error| error.context(format!("list index {index}")))
+                        .map_err(|error| error.at_value_path(WirePathSegment::Index(index)))
                 })
                 .collect::<Result<_, _>>()?,
         ))),
@@ -2108,7 +2165,7 @@ pub fn protocol_to_core_persisted_value(
                 .map(|(key, value)| {
                     protocol_to_core_persisted_value(value)
                         .map(|converted| (key.clone(), converted))
-                        .map_err(|error| error.context(format!("map key `{key}`")))
+                        .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
                 })
                 .collect::<Result<IndexMap<_, _>, _>>()?,
         ))),
@@ -2124,7 +2181,7 @@ pub fn try_core_to_protocol_persisted_value_map(
         .map(|(key, value)| {
             try_core_to_protocol_persisted_value(value)
                 .map(|converted| (key.clone(), converted))
-                .map_err(|error| error.context(format!("map key `{key}`")))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
         })
         .collect()
 }
@@ -2138,7 +2195,7 @@ pub fn protocol_to_core_persisted_value_map(
         .map(|(key, value)| {
             protocol_to_core_persisted_value(value)
                 .map(|converted| (key.clone(), converted))
-                .map_err(|error| error.context(format!("map key `{key}`")))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone())))
         })
         .collect()
 }
@@ -3415,6 +3472,94 @@ mod tests {
                 ["a_first", "z_last"],
                 "iteration {iteration}"
             );
+        }
+    }
+
+    fn assert_complete_value_path(error: ProtocolConvertError) {
+        assert_eq!(
+            error.value_path(),
+            vec![
+                WirePathSegment::Key("root".into()),
+                WirePathSegment::Index(0),
+                WirePathSegment::Key("leaf".into()),
+            ]
+        );
+        assert!(matches!(
+            error.leaf_error(),
+            ProtocolConvertError::NonFiniteFloat
+        ));
+        let mut messages = Vec::new();
+        let mut current: Option<&dyn std::error::Error> = Some(&error);
+        while let Some(error) = current {
+            messages.push(error.to_string());
+            current = error.source();
+        }
+        assert_eq!(
+            messages,
+            [
+                "map key `root`",
+                "list index 0",
+                "map key `leaf`",
+                "non-finite float cannot cross the provider protocol",
+            ]
+        );
+    }
+
+    #[test]
+    fn ordinary_value_converters_keep_complete_structured_paths() {
+        let core = HashMap::from([(
+            "root".into(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(IndexMap::from([(
+                    "leaf".into(),
+                    Value::Concrete(ConcreteValue::Float(f64::NAN)),
+                )])),
+            )])),
+        )]);
+        let wire = BTreeMap::from([(
+            "root".into(),
+            protocol::Value::List(vec![protocol::Value::Map(BTreeMap::from([(
+                "leaf".into(),
+                protocol::Value::Float(f64::NAN),
+            )]))]),
+        )]);
+        for error in [
+            try_core_to_protocol_value_map(&core).unwrap_err(),
+            protocol_to_core_value_map(&wire).unwrap_err(),
+            protocol_to_core_value(&protocol::Value::Map(wire.clone())).unwrap_err(),
+            protocol_schema_default_to_core(&protocol::Value::Map(wire)).unwrap_err(),
+        ] {
+            assert_complete_value_path(error);
+        }
+    }
+
+    #[test]
+    fn persisted_value_converters_keep_complete_structured_paths() {
+        let core = HashMap::from([(
+            "root".into(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(IndexMap::from([(
+                    "leaf".into(),
+                    Value::Concrete(ConcreteValue::Float(f64::NAN)),
+                )])),
+            )])),
+        )]);
+        let wire = BTreeMap::from([(
+            "root".into(),
+            protocol::PersistedValue::List(vec![protocol::PersistedValue::Map(BTreeMap::from([
+                ("leaf".into(), protocol::PersistedValue::Float(f64::NAN)),
+            ]))]),
+        )]);
+        for error in [
+            try_core_to_protocol_persisted_value_map(&core).unwrap_err(),
+            try_core_to_protocol_persisted_value(&Value::Concrete(ConcreteValue::Map(
+                core.into_iter().collect(),
+            )))
+            .unwrap_err(),
+            protocol_to_core_persisted_value_map(&wire).unwrap_err(),
+            protocol_to_core_persisted_value(&protocol::PersistedValue::Map(wire)).unwrap_err(),
+        ] {
+            assert_complete_value_path(error);
         }
     }
 

@@ -1,16 +1,18 @@
 //! One structural desired-value view for native and WASM normalizers.
 
+use indexmap::IndexMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use carina_core::desired::NormalizationBatch;
 use carina_core::protocol_convert::{ProtocolConvertError, protocol_to_resource_id};
 use carina_core::provider::{
-    ProviderError as NativeProviderError, ProviderResult as NativeProviderResult,
+    ProviderError as NativeProviderError, ProviderReady, ProviderResult as NativeProviderResult,
+    ResourceWirePayload,
 };
 use carina_core::resource::{
-    AbsoluteBindingAddress, NoPlaceholder, Resource, ResourceId, UnexpandedDependencyFields,
-    ValueString,
+    AbsoluteBindingAddress, ConcreteValue, DeferredValue, NoPlaceholder, Resource, ResourceId,
+    UnexpandedDependencyFields, Value, ValueString,
 };
 use carina_provider_protocol::normalization::{
     NormalizationErrorKind as Kind, NormalizationPathSegment as Segment, NormalizationResource,
@@ -208,14 +210,40 @@ enum InputsTree<'a> {
     Owned(DesiredMap),
 }
 impl DesiredInputs<'_> {
-    pub fn from_core<S, D>(
-        resource: &Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>,
-    ) -> NativeProviderResult<Self> {
-        let (_, inner) = decode_native(resource)?;
-        Ok(Self {
-            id: std::borrow::Cow::Owned(inner.id),
-            tree: InputsTree::Owned(inner.attributes),
-        })
+    /// Project a resource that already passed the complete provider wire gate.
+    ///
+    /// Normalizers obtain their view from their normalization owner instead.
+    /// Raw resources cannot bypass provider preparation:
+    ///
+    /// ```compile_fail
+    /// use carina_plugin_sdk::{DesiredInputs, core::resource::Resource};
+    /// fn bypass(raw: &Resource) { let _ = DesiredInputs::from_provider_ready(raw); }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use carina_plugin_sdk::{DesiredInputs, core::resource::Resource};
+    /// fn bypass(raw: &Resource) { let _ = DesiredInputs::from_core(raw); }
+    /// ```
+    ///
+    /// Update requests expose desired values only through their checked patch:
+    ///
+    /// ```compile_fail,E0599
+    /// use carina_plugin_sdk::{DesiredInputs, core::provider::UpdateRequest};
+    /// fn bypass(request: &UpdateRequest) { let _ = DesiredInputs::from_update(request); }
+    /// ```
+    pub fn from_provider_ready<T: ResourceWirePayload>(resource: &ProviderReady<T>) -> Self {
+        let owner = Arc::new(());
+        let entries = resource
+            .wire_attributes()
+            .iter()
+            .map(|(name, value)| (name.clone(), checked_value(value.value())))
+            .collect();
+        let mut attributes = DesiredMap { entries };
+        retain_native_map_metadata(&mut attributes, resource.as_inner().attributes(), &owner);
+        Self {
+            id: std::borrow::Cow::Owned(resource.as_inner().resource_id().clone()),
+            tree: InputsTree::Owned(attributes),
+        }
     }
     pub fn id(&self) -> &ResourceId {
         &self.id
@@ -228,6 +256,35 @@ impl DesiredInputs<'_> {
             InputsTree::Borrowed(tree) => tree.get(name),
             InputsTree::Owned(tree) => tree.get(name),
         }
+    }
+}
+
+// Consume the checked representation without projecting core values again.
+// Original diagnostic provenance is applied by the shared walker below.
+fn checked_value(value: &crate::types::Value) -> DesiredValue {
+    use crate::types::Value as WireValue;
+    match value {
+        WireValue::Bool(value) => DesiredValue::Known(DesiredScalar::Bool(*value)),
+        WireValue::Int(value) => DesiredValue::Known(DesiredScalar::Int(*value)),
+        WireValue::Float(value) => DesiredValue::Known(DesiredScalar::Float(*value)),
+        WireValue::String(value) => {
+            DesiredValue::Known(DesiredScalar::String(value.clone().into()))
+        }
+        WireValue::StringList(values) => DesiredValue::List(DesiredList {
+            values: values
+                .iter()
+                .map(|value| DesiredValue::Known(DesiredScalar::String(value.clone().into())))
+                .collect(),
+        }),
+        WireValue::List(values) => DesiredValue::List(DesiredList {
+            values: values.iter().map(checked_value).collect(),
+        }),
+        WireValue::Map(values) => DesiredValue::Map(DesiredMap {
+            entries: values
+                .iter()
+                .map(|(name, value)| (name.clone(), checked_value(value)))
+                .collect(),
+        }),
     }
 }
 
@@ -556,6 +613,13 @@ impl<'a, S, D> NativeDesiredNormalization<'a, S, D> {
     pub fn view(&mut self) -> DesiredView<'_> {
         self.inner.view()
     }
+    /// Query the staged normalization input, including its opaque leaves.
+    pub fn inputs(&self) -> DesiredInputs<'_> {
+        DesiredInputs {
+            id: std::borrow::Cow::Borrowed(&self.inner.id),
+            tree: InputsTree::Borrowed(&self.inner.attributes),
+        }
+    }
     pub fn finish(self) -> NativeProviderResult<()> {
         let id = self.target.id.clone();
         let into_error = |error| NativeProviderError::from(error).for_resource(id.clone());
@@ -577,7 +641,93 @@ fn decode_native<S, D>(
     let mut inner =
         DesiredNormalization::decode(batch.resources()[0].clone()).map_err(into_error)?;
     inner.id = resource.id.clone();
+    retain_native_map_metadata(&mut inner.attributes, &resource.attributes, &inner.owner);
     Ok((batch, inner))
+}
+
+// The one core provenance walker serves both native normalization inputs and
+// provider-ready inputs. Containers retain protocol order; opaque normalization
+// handles keep their identity, and late secret annotations become opaque too.
+fn retain_native_map_metadata(
+    tree: &mut DesiredMap,
+    originals: &IndexMap<String, Value>,
+    owner: &Arc<()>,
+) {
+    for (name, original) in originals {
+        let value = tree
+            .entries
+            .get_mut(name)
+            .expect("projected original attribute");
+        retain_native_value_metadata(value, original, owner);
+    }
+}
+
+fn retain_native_value_metadata(tree: &mut DesiredValue, original: &Value, owner: &Arc<()>) {
+    match original {
+        Value::Concrete(ConcreteValue::String(original)) => {
+            let DesiredValue::Known(DesiredScalar::String(value)) = tree else {
+                unreachable!("projected string provenance")
+            };
+            *value = original.clone();
+        }
+        Value::Concrete(ConcreteValue::StringList(originals)) => {
+            let DesiredValue::List(list) = tree else {
+                unreachable!("projected string-list provenance")
+            };
+            for (value, original) in list.values.iter_mut().zip(originals) {
+                let DesiredValue::Known(DesiredScalar::String(value)) = value else {
+                    unreachable!("projected string-list element provenance")
+                };
+                *value = original.clone();
+            }
+        }
+        Value::Concrete(ConcreteValue::List(originals)) => {
+            let DesiredValue::List(list) = tree else {
+                unreachable!("projected list provenance")
+            };
+            for (value, original) in list.values.iter_mut().zip(originals) {
+                retain_native_value_metadata(value, original, owner);
+            }
+        }
+        Value::Concrete(ConcreteValue::Map(originals)) => {
+            let DesiredValue::Map(map) = tree else {
+                unreachable!("projected map provenance")
+            };
+            retain_native_map_metadata(map, originals, owner);
+        }
+        Value::Deferred(DeferredValue::Secret(_)) => match tree {
+            DesiredValue::Deferred(_) => {}
+            DesiredValue::Known(_) | DesiredValue::List(_) | DesiredValue::Map(_) => {
+                *tree = DesiredValue::Deferred(DeferredLeaf {
+                    slot: 0,
+                    owner: Arc::clone(owner),
+                });
+            }
+        },
+        Value::Concrete(
+            ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_),
+        )
+        | Value::Deferred(
+            DeferredValue::ModuleIf(_)
+            | DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::Coalesce { .. }
+            | DeferredValue::IntegerArithmetic(_)
+            | DeferredValue::Interpolation(_)
+            | DeferredValue::FunctionCall { .. }
+            | DeferredValue::Unavailable { .. }
+            | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::Access(_)
+            | DeferredValue::RedactedSecret { .. }
+            | DeferredValue::Unknown(_),
+        ) => {}
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+    }
 }
 
 #[cfg(test)]

@@ -60,6 +60,251 @@ fn mock_identifier() -> AppliedIdentifier {
     AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty")
 }
 
+struct WireConfigFactory;
+
+impl ProviderFactory for WireConfigFactory {
+    fn name(&self) -> &str {
+        "mock"
+    }
+    fn display_name(&self) -> &str {
+        "native wire fixture"
+    }
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        carina_core::schema::ValidatedConfigSchema::validate(Default::default()).unwrap()
+    }
+    fn validate_config(
+        &self,
+        _: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> carina_core::provider::ProviderResult<()> {
+        Ok(())
+    }
+    fn create_provider(
+        &self,
+        _: Option<&str>,
+        _: &ProviderReadyConfig,
+        _: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<
+        '_,
+        carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
+    > {
+        panic!("invalid config must not initialize")
+    }
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        Vec::new()
+    }
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wire_boundary_factory_config_has_native_and_wasm_parity() {
+    let wasm = wasm_path().expect("carina#4212 requires the mock WASM fixture");
+    let (factory, _cache) = load_factory(&wasm).await;
+    let attributes = indexmap::IndexMap::from([(
+        "extra".into(),
+        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+            "unrelated".into(),
+            Value::Concrete(ConcreteValue::Float(f64::NAN)),
+        )]))),
+    )]);
+    let config = resolved_provider_config("mock", attributes);
+    let mut errors = Vec::new();
+    for factory in [&factory as &dyn ProviderFactory, &WireConfigFactory] {
+        errors.push(
+            carina_core::executor::prepare_provider_ready_config(factory, &config)
+                .expect_err("both factories must fail before semantic validation"),
+        );
+    }
+    assert_eq!(errors[0].to_string(), errors[1].to_string());
+    assert!(errors[0].to_string().contains("extra.unrelated"));
+    for error in &errors {
+        let carina_core::executor::ProviderConfigPreparationError::Wire(error) = error else {
+            panic!("expected a shared wire error: {error}")
+        };
+        assert_eq!(
+            error.target(),
+            &carina_core::provider::ProviderWireTarget::Configuration {
+                provider: "mock".into()
+            }
+        );
+        assert_eq!(error.attribute(), "extra");
+        assert_eq!(
+            error.path(),
+            &[carina_core::protocol_convert::WirePathSegment::Key(
+                "unrelated".into()
+            )]
+        );
+        assert!(matches!(
+            error.conversion_error(),
+            carina_core::protocol_convert::ProtocolConvertError::NonFiniteFloat
+        ));
+        assert!(std::error::Error::source(error).is_none());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wire_boundary_default_tag_fails_before_native_and_guest_crud() {
+    carina_core::validation::deferred_types::with_session_for_test_async(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        async |type_checks| {
+            use carina_core::executor::{
+                ModuleConstraintGate, ProviderPreparationContext, prepare_create_request,
+            };
+            use carina_core::schema::{
+                PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, SchemaRegistry,
+            };
+
+            let wasm = wasm_path().expect(
+                "carina#4212 requires the mock WASM fixture; build it before running this binary",
+            );
+            let (factory, _cache) = load_factory(&wasm).await;
+            let ready = ready_config(&factory, &indexmap::IndexMap::new());
+            let provider = factory
+                .create_initialized_provider(None, &ready)
+                .await
+                .unwrap();
+            let normalizer = factory.create_normalizer(None, &ready).await.unwrap();
+            let mut schemas = SchemaRegistry::new();
+            schemas.insert(
+                "mock",
+                PatternResourceSchema::new("sqs.Queue")
+                    .attribute(
+                        PatternAttributeSchema::optional(
+                            "tags",
+                            PatternAttributeType::map(PatternAttributeType::string()),
+                        )
+                        .build(),
+                    )
+                    .validate()
+                    .unwrap(),
+            );
+            let mut configs = [carina_core::parser::ExpandedProviderConfig {
+                name: "mock".into(),
+                attributes: Default::default(),
+                default_tags: indexmap::IndexMap::from([(
+                    "unrelated".into(),
+                    Value::Concrete(ConcreteValue::Duration(Duration::from_secs(u64::MAX))),
+                )]),
+                source: None,
+                version: None,
+                revision: None,
+                unresolved_attributes: Default::default(),
+                binding: None,
+            }];
+            let bindings = carina_core::binding_index::ResolvedBindings::default();
+            let gate = ModuleConstraintGate::from_live_compositions(&[]);
+            let resource = Resource::with_provider("mock", "sqs.Queue", "queue", None);
+            let mut errors = Vec::new();
+            let crud_calls = AtomicUsize::new(0);
+            for normalizer in [
+                normalizer.as_ref(),
+                &carina_core::provider::NoopNormalizer
+                    as &dyn carina_core::provider::ProviderNormalizer,
+            ] {
+                let context = ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &configs,
+                    normalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                let prepared = prepare_create_request(resource.clone(), &context).await;
+                match prepared {
+                    Err(error) => errors.push(error),
+                    Ok(request) => {
+                        crud_calls.fetch_add(1, Ordering::SeqCst);
+                        let outcome = provider
+                            .provider()
+                            .create_for_test(&resource.id, request)
+                            .await;
+                        panic!("wire gate allowed guest CRUD: {outcome:?}");
+                    }
+                }
+            }
+            assert_eq!(crud_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(errors[0].to_string(), errors[1].to_string());
+            for error in &errors {
+                let carina_core::executor::ProviderPreparationError::Wire(error) = error else {
+                    panic!("expected a shared wire error: {error}")
+                };
+                assert_eq!(
+                    error.target(),
+                    &carina_core::provider::ProviderWireTarget::Resource(resource.id.clone())
+                );
+                assert_eq!(error.attribute(), "tags");
+                assert_eq!(
+                    error.path(),
+                    &[carina_core::protocol_convert::WirePathSegment::Key(
+                        "unrelated".into()
+                    )]
+                );
+                assert!(matches!(
+                    error.conversion_error(),
+                    carina_core::protocol_convert::ProtocolConvertError::DurationOutOfRange
+                ));
+                assert!(std::error::Error::source(error).is_none());
+            }
+            let rendered = errors[0].to_string();
+            assert!(rendered.contains("tags.unrelated"), "{rendered}");
+            assert!(
+                rendered.contains("duration in seconds does not fit"),
+                "{rendered}"
+            );
+            assert_eq!(
+                rendered.matches("duration in seconds does not fit").count(),
+                1
+            );
+            configs[0].default_tags.insert(
+                "unrelated".into(),
+                Value::Concrete(ConcreteValue::Duration(Duration::from_secs(
+                    i64::MAX as u64,
+                ))),
+            );
+            let context = ProviderPreparationContext::new(
+                &bindings,
+                &gate,
+                &configs,
+                normalizer.as_ref(),
+                &[],
+                &schemas,
+                type_checks,
+            );
+            let request = prepare_create_request(resource.clone(), &context)
+                .await
+                .unwrap();
+            let inputs = carina_plugin_sdk::DesiredInputs::from_provider_ready(request.resource());
+            assert!(matches!(
+                inputs.attribute("tags"),
+                Some(carina_plugin_sdk::DesiredValue::Map(_))
+            ));
+            crud_calls.fetch_add(1, Ordering::SeqCst);
+            let outcome = provider
+                .provider()
+                .create_for_test(&resource.id, request)
+                .await
+                .unwrap();
+            let state = create_state_for_writeback(outcome);
+            let Value::Concrete(ConcreteValue::Map(tags)) = &state.attributes["tags"] else {
+                panic!()
+            };
+            assert_eq!(
+                tags["unrelated"],
+                Value::Concrete(ConcreteValue::Int(i64::MAX))
+            );
+            assert_eq!(crud_calls.load(Ordering::SeqCst), 1);
+        },
+    )
+    .await
+}
+
 fn assert_minted_mock_identifier(identifier: &str) {
     assert!(
         identifier.starts_with("mock-v1:"),

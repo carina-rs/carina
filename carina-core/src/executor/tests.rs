@@ -7064,6 +7064,99 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
 }
 
 #[tokio::test]
+async fn wire_boundary_executor_never_dispatches_non_wire_desired_values() {
+    for operation in ["create", "resume_create", "update", "read"] {
+        let provider = MockProvider::new();
+        let resource = Resource::with_provider("test", "test", "wire-boundary", None);
+        let id = resource.id.clone();
+        let invalid = Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+            u64::MAX,
+        )));
+        let configs = [provider_config_with_default_tags(indexmap::IndexMap::from(
+            [("unrelated".into(), invalid.clone())],
+        ))];
+        let mut plan = Plan::new();
+        let mut managed_current = HashMap::new();
+        let mut data_source_values = ExecutableDataSourceValues::empty();
+        match operation {
+            "create" => {
+                plan.add(create_effect(resource));
+                provider.push_create(Ok(ok_state(&id)));
+            }
+            "resume_create" => {
+                let pending = persisted_unissued_create_for_executor(&id);
+                plan.add(Effect::ResumeCreate {
+                    resource: resolved(resource),
+                    started_at: pending.started_at().clone(),
+                });
+                managed_current.insert(id.clone(), Current::CreateInFlight(pending));
+                provider.push_resume(ResumeFixture::Resumed);
+            }
+            "update" => {
+                plan.add(Effect::Update {
+                    from: Box::new(ok_state(&id)),
+                    identifier: crate::effect::fixture_applied_identifier("id-123"),
+                    to: resolved(resource),
+                    changed_attributes: vec!["name".into()],
+                });
+                provider.push_update(Ok(ok_state(&id)));
+            }
+            "read" => {
+                let mut data = DataSource::with_provider("test", "test", "wire-boundary", None);
+                data.attributes.insert("unread".into(), invalid);
+                data_source_values =
+                    executable_deferred_data_source_values(std::slice::from_ref(&data));
+                plan.add(Effect::Read {
+                    resource: resolved_data_source(data),
+                });
+                provider.push_read(Ok(ok_state(&id)));
+            }
+            _ => unreachable!(),
+        }
+        let input = ExecutionInput {
+            provider_context: crate::parser::ProviderContext::clone(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+            ),
+            plan: &plan,
+            provider_check_inputs: ProviderCheckInputs::Authored,
+            compositions: &[],
+            bindings: ResolvedBindings::default(),
+            managed_current,
+            data_source_values,
+            normalizer: &NoopNormalizer,
+            provider_configs: &configs,
+            factories: &[],
+            schemas: &DEFAULT_TAG_SCHEMAS,
+            parallelism: crate::executor::TEST_UNCAPPED,
+            precompleted_success_count: 0,
+            checkpoint_sink: ExecutionCheckpointSink::noop(),
+        };
+        let result = completed_result(
+            execute_plan(
+                &provider,
+                input,
+                &MockObserver::new(),
+                uncancelled_shutdown(),
+            )
+            .await,
+        );
+        assert!(
+            provider.calls().is_empty(),
+            "{operation}: {:?}",
+            provider.calls()
+        );
+        assert_eq!(result.failure_count(), 1, "{operation}");
+        assert!(
+            result.failures()[0]
+                .to_string()
+                .contains("duration in seconds does not fit"),
+            "{operation}: {:?}",
+            result.failures()
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
     let provider = MockProvider::new();
     let mut to_resource = Resource::with_provider("test", "a", "a", None);
