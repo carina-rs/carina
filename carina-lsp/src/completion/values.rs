@@ -8,6 +8,7 @@ use tower_lsp::lsp_types::{
 
 use carina_core::builtins;
 use carina_core::parser::{TypeExpr, snake_to_pascal};
+use carina_core::provider_text::ProviderText;
 use carina_core::resource::EnumValueResolver;
 use carina_core::schema::{
     CompiledAttributeType as AttributeType, EffectiveType, SchemaRegistry, Shape, TypeIdentity,
@@ -260,6 +261,25 @@ pub(super) enum InScopeBindingMode<'a> {
     /// surfaced here because compatibility with the surrounding
     /// attribute is part of the popup's job.
     ValuePosition { current_binding: Option<&'a str> },
+}
+
+/// Project display fields after completion matching and deduplication. Preserve
+/// the original label's insertion, filtering and ordering defaults explicitly
+/// whenever sanitization changes it.
+pub(super) fn format_completion_display(mut item: CompletionItem) -> CompletionItem {
+    let label = ProviderText::new(&item.label).to_string();
+    if label != item.label {
+        let raw_label = std::mem::replace(&mut item.label, label);
+        item.filter_text.get_or_insert_with(|| raw_label.clone());
+        item.sort_text.get_or_insert_with(|| raw_label.clone());
+        if item.insert_text.is_none() && item.text_edit.is_none() {
+            item.insert_text = Some(raw_label);
+        }
+    }
+    item.detail = item
+        .detail
+        .map(|detail| ProviderText::new(detail).to_string());
+    item
 }
 
 fn type_completion_item(label: String, detail: String, range: Range) -> CompletionItem {

@@ -1414,7 +1414,9 @@ pub fn format_value_user_facing<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
 ) -> String {
     match value {
-        Value::Concrete(ConcreteValue::String(value)) => value.expose_plaintext().to_string(),
+        Value::Concrete(ConcreteValue::String(value)) => {
+            crate::provider_text::ProviderText::new(value.expose_plaintext()).to_string()
+        }
         _ => format_value(value),
     }
 }
@@ -8285,6 +8287,21 @@ mod tests {
                 crate::parser::display_string_literal(text)
             );
         }
+    }
+
+    #[test]
+    fn provider_text_user_facing_string_escapes_and_caps_without_changing_data() {
+        let raw = format!("\x1b]52;c;ZXZpbA==\x07\x1b[2J{}", "x".repeat(20 * 1024));
+        let value = Value::Concrete(ConcreteValue::String(raw.clone().into()));
+        let rendered = format_value_user_facing(&value);
+        assert!(!rendered.contains(['\x1b', '\x07']));
+        assert!(rendered.contains("\\u{1b}]52;c;ZXZpbA==\\u{7}\\u{1b}[2J"));
+        assert!(rendered.contains("truncated,"));
+        assert!(rendered.len() <= crate::provider_text::MAX_PROVIDER_TEXT_BYTES);
+        let Value::Concrete(ConcreteValue::String(value)) = value else {
+            unreachable!()
+        };
+        assert_eq!(value.expose_plaintext(), raw);
     }
 
     #[test]

@@ -5,6 +5,97 @@ use carina_core::schema::{
 use tower_lsp::lsp_types::{InsertTextFormat, TextEdit};
 
 #[test]
+fn provider_text_completion_display_preserves_raw_insertion_and_filtering() {
+    use carina_core::schema::TypeIdentity;
+    let attack = "\x1b]52;c;ZXZpbA==\x07\x1b[2J";
+    let values = vec![
+        attack.to_string(),
+        format!("{attack}{}", "x".repeat(20 * 1024)),
+    ];
+    let identity = TypeIdentity::new(
+        Some("test"),
+        [format!("Widget{attack}")],
+        format!("Mode{attack}"),
+    );
+    let enum_values = values
+        .iter()
+        .map(|value| format!("{identity}.{value}"))
+        .collect::<Vec<_>>();
+    let schema = PatternResourceSchema::new("Widget")
+        .attribute(
+            PatternAttributeSchema::optional("status", PatternAttributeType::string())
+                .with_completions(
+                    values
+                        .iter()
+                        .map(|value| CompletionValue::new(value, attack))
+                        .collect(),
+                )
+                .build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional(
+                "mode",
+                PatternAttributeType::enum_(
+                    identity.clone(),
+                    Some(values.clone()),
+                    vec![],
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional(
+                "open",
+                PatternAttributeType::enum_(identity.clone(), None, vec![], None, None),
+            )
+            .build(),
+        );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema.validate().unwrap());
+    let provider = CompletionProvider::new(Arc::new(schemas), vec!["test".into()], vec![], vec![]);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider test {}\n").unwrap();
+    for (attribute, expected_values) in [
+        ("status", values),
+        ("mode", enum_values),
+        ("open", vec![format!("{identity}.")]),
+    ] {
+        let prefix = format!("  {attribute} = ");
+        let text = format!("test.Widget {{\n{prefix}\n}}\n");
+        let path = directory.path().join("main.crn");
+        std::fs::write(&path, &text).unwrap();
+        let document = Document::new_with_path(
+            text,
+            path,
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        let items = provider.complete_for_test(
+            &document,
+            Position::new(1, prefix.len() as u32),
+            Some(directory.path()),
+        );
+        for expected in expected_values {
+            let item = items
+                .iter()
+                .find(|item| item.insert_text.as_deref() == Some(expected.as_str()))
+                .expect("original completion value must remain insertable");
+            assert!(!item.label.contains(['\x1b', '\x07']));
+            assert!(item.label.contains("\\u{1b}"));
+            assert!(item.label.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
+            if let Some(detail) = &item.detail {
+                assert!(!detail.contains(['\x1b', '\x07']));
+                assert!(detail.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
+            }
+            assert_eq!(item.filter_text.as_deref(), Some(expected.as_str()));
+        }
+    }
+}
+
+#[test]
 fn module_parameter_completion_uses_environment_snapshot() {
     let directory = tempfile::tempdir().unwrap();
     let module = directory.path().join("module");

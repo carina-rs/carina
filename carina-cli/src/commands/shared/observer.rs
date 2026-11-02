@@ -618,6 +618,25 @@ mod tests {
     }
 
     #[test]
+    fn provider_text_wait_observer_escapes_provider_attribute_values() {
+        let raw = "\x1b]52;c;ZXZpbA==\x07\x1b[2J";
+        let target = ResourceId::with_identity("aws.acm.Certificate", "demo");
+        let attrs = HashMap::from([(
+            "status".into(),
+            Value::Concrete(ConcreteValue::String(raw.into())),
+        )]);
+        for predicate in [
+            equals_predicate(AttrPath::single("status"), "issued"),
+            equals_predicate(AttrPath::single("missing"), "issued"),
+        ] {
+            let observation = wait_observation(&target, &predicate, &attrs);
+            let line = format_wait_polling_line(&observation, Duration::from_secs(5));
+            assert!(!line.contains(['\x1b', '\x07']));
+            assert!(line.contains("status=\\u{1b}]52;c;ZXZpbA==\\u{7}\\u{1b}[2J"));
+        }
+    }
+
+    #[test]
     fn wait_polling_resets_plain_generic_heartbeat_schedule() {
         let color_mode = crate::output_style::ColorMode::Plain;
         let output = SharedWriter::default();

@@ -6947,22 +6947,19 @@ impl DiagnosticValue {
     }
 
     fn render_string_literal(&self) -> String {
-        match self {
-            Self::Plain(value) => display_string_literal(value),
-            Self::Masked => SECRET_VALUE_MASK.to_string(),
-            Self::TypeOnlyString => "string".to_string(),
-        }
+        self.render_enum_value(InvalidEnumValueKind::String)
     }
 
     fn render_enum_value(&self, value_kind: InvalidEnumValueKind) -> String {
-        match self {
+        let text = match self {
             Self::Plain(value) => match value_kind {
                 InvalidEnumValueKind::String => display_string_literal(value),
                 InvalidEnumValueKind::Identifier => value.clone(),
             },
             Self::Masked => SECRET_VALUE_MASK.to_string(),
             Self::TypeOnlyString => "string".to_string(),
-        }
+        };
+        ProviderText::new(text).to_string()
     }
 }
 

@@ -12,6 +12,42 @@ fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
 }
 
 #[test]
+fn provider_text_diagnostic_values_escape_and_cap_duplicate_list_elements() {
+    let raw = format!("\x1b]52;c;ZXZpbA==\x07\x1b[2J{}", "x".repeat(20 * 1024));
+    let value = DiagnosticValue::Plain(raw.clone());
+    for kind in [
+        InvalidEnumValueKind::Identifier,
+        InvalidEnumValueKind::String,
+    ] {
+        let rendered = value.render_enum_value(kind);
+        assert!(!rendered.contains(['\x1b', '\x07']));
+        assert!(rendered.contains("\\u{1b}]52;c;ZXZpbA==\\u{7}\\u{1b}[2J"));
+        assert!(rendered.contains("truncated,"));
+        assert!(rendered.len() <= crate::provider_text::MAX_PROVIDER_TEXT_BYTES);
+    }
+    let error = TypeError::DuplicateListElement {
+        value,
+        index: 1,
+        first_index: 0,
+        attribute: Some("modes".into()),
+    };
+    let rendered = error.to_string();
+    assert!(!rendered.contains(['\x1b', '\x07']));
+    assert!(rendered.contains("\\u{1b}]52;c;ZXZpbA==\\u{7}\\u{1b}[2J"));
+    assert!(rendered.contains("truncated,"));
+    let TypeError::DuplicateListElement {
+        value,
+        index: _,
+        first_index: _,
+        attribute: _,
+    } = error
+    else {
+        unreachable!()
+    };
+    assert_eq!(value.as_plain(), Some(raw.as_str()));
+}
+
+#[test]
 fn provider_text_schema_location_suffix_preserves_raw_lookup_path() {
     let raw = "name\x1b[2J";
     let location = SchemaValidationIssueLocation::Attribute(raw.into()).with_suffix(".child");

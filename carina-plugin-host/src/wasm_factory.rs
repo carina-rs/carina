@@ -7528,22 +7528,27 @@ pub struct WasmProviderNormalizer {
 
 #[derive(Debug)]
 struct WasmNormalizerResultKeysError {
-    missing: ProviderText,
-    unexpected: ProviderText,
-    duplicates: ProviderText,
+    missing: BTreeSet<String>,
+    unexpected: BTreeSet<String>,
+    duplicates: BTreeSet<String>,
 }
 
 impl fmt::Display for WasmNormalizerResultKeysError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("returned a mismatched state key set")?;
-        if !self.missing.is_empty() {
-            write!(f, "; missing: {}", self.missing)?;
-        }
-        if !self.unexpected.is_empty() {
-            write!(f, "; unexpected: {}", self.unexpected)?;
-        }
-        if !self.duplicates.is_empty() {
-            write!(f, "; duplicate: {}", self.duplicates)?;
+        for (label, keys) in [
+            ("missing", &self.missing),
+            ("unexpected", &self.unexpected),
+            ("duplicate", &self.duplicates),
+        ] {
+            if !keys.is_empty() {
+                let names = keys
+                    .iter()
+                    .map(|key| if key.is_empty() { "\"\"" } else { key.as_str() })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "; {label}: {}", ProviderText::new(names))?;
+            }
         }
         Ok(())
     }
@@ -7604,26 +7609,21 @@ fn validate_wit_state_result_keys(
     let missing = expected_keys
         .difference(&returned_keys)
         .cloned()
-        .collect::<Vec<_>>()
-        .join(", ")
-        .into();
+        .collect::<BTreeSet<_>>();
     let unexpected = returned_keys
         .difference(&expected_keys)
         .cloned()
-        .collect::<Vec<_>>()
-        .join(", ")
-        .into();
-    let error = WasmNormalizerResultKeysError {
-        missing,
-        unexpected,
-        duplicates: duplicates.into_iter().collect::<Vec<_>>().join(", ").into(),
-    };
-    if !error.missing.is_empty() || !error.unexpected.is_empty() || !error.duplicates.is_empty() {
+        .collect::<BTreeSet<_>>();
+    if !missing.is_empty() || !unexpected.is_empty() || !duplicates.is_empty() {
         return Err(ProviderError::internal_caused_by(
             "WASM provider returned invalid state keys",
             WasmOperationError {
                 operation,
-                source: error,
+                source: WasmNormalizerResultKeysError {
+                    missing,
+                    unexpected,
+                    duplicates,
+                },
             },
         ));
     }
@@ -7636,9 +7636,9 @@ fn validate_wit_state_result_keys(
                 WasmOperationError {
                     operation,
                     source: WasmNormalizerResultKeysError {
-                        missing: key.as_str().into(),
-                        unexpected: ProviderText::default(),
-                        duplicates: ProviderText::default(),
+                        missing: BTreeSet::from([key.clone()]),
+                        unexpected: BTreeSet::new(),
+                        duplicates: BTreeSet::new(),
                     },
                 },
             ));
@@ -10181,6 +10181,45 @@ mod tests {
                 .unwrap_err();
         assert!(!error.to_string().contains(['\x1b', '\x07']));
         assert!(error.to_string().contains("\\u{1b}[2J\\u{7}"));
+    }
+
+    #[test]
+    fn normalizer_result_rejects_empty_unexpected_key() {
+        let id = Resource::<ModuleSource>::with_provider("mock", "test.resource", "only", None).id;
+        let expected = HashMap::from([("expected".to_string(), id)]);
+        let state = wit_types::PersistedState {
+            identifier: None,
+            attributes: Vec::new(),
+            exists: true,
+        };
+        let error = validate_wit_state_result_keys(
+            "normalize_state",
+            &expected,
+            vec![("expected".into(), state.clone()), (String::new(), state)],
+        )
+        .expect_err("an unexpected empty key must not disappear during validation");
+        assert!(error.to_string().contains("unexpected: \"\""));
+    }
+
+    #[test]
+    fn normalizer_result_rejects_duplicate_keys_including_empty() {
+        for key in ["expected", ""] {
+            let id =
+                Resource::<ModuleSource>::with_provider("mock", "test.resource", "only", None).id;
+            let expected = HashMap::from([(key.to_string(), id)]);
+            let state = wit_types::PersistedState {
+                identifier: None,
+                attributes: Vec::new(),
+                exists: true,
+            };
+            let error = validate_wit_state_result_keys(
+                "normalize_state",
+                &expected,
+                vec![(key.into(), state.clone()), (key.into(), state)],
+            )
+            .expect_err("duplicate keys must be rejected before formatting");
+            assert!(error.to_string().contains("duplicate:"));
+        }
     }
 
     #[test]
