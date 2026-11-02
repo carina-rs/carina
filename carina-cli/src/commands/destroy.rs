@@ -748,8 +748,8 @@ async fn run_destroy_locked_owned(
         mid_run_writer.write_schema_migration(state_file.as_mut().expect("validated migration retains state")).await?;
     }
 
-    // Backend protection covers persisted rows regardless of current-instance
-    // refresh eligibility: removed-claimed rows can still have deposed generations.
+    // Backend protection covers every persisted generation, including rows
+    // whose removed current instance no longer has any attributes.
     let mut protected_row_keys: HashSet<StateRowKey> = HashSet::new();
     if let (Some(state), Some(backend_rt), Some(bucket_name)) = (
         state_file.as_ref(),
@@ -758,10 +758,22 @@ async fn run_destroy_locked_owned(
     ) {
         for row in state.resources() {
             if row.resource_type == backend_rt
-                && let Some(Value::Concrete(ConcreteValue::String(name))) = row
+                && (row
                     .persisted_attributes()
-                    .and_then(|attributes| attributes.get("bucket"))
-                && name.expose_plaintext() == bucket_name
+                    .into_iter()
+                    .chain(
+                        row.deposed
+                            .iter()
+                            .map(|generation| generation.persisted_attributes()),
+                    )
+                    .any(|attributes| {
+                        matches!(attributes.get("bucket"), Some(Value::Concrete(ConcreteValue::String(name)))
+                            if name.expose_plaintext() == bucket_name)
+                    })
+                    || row
+                        .deposed
+                        .iter()
+                        .any(|generation| generation.identifier == bucket_name))
             {
                 protected_row_keys.insert(state_row_key_from_parts(
                     &row.provider,
@@ -3044,99 +3056,120 @@ mod tests {
             }
         }
 
-        for refresh in [true, false] {
-            let dir = tempfile::tempdir().unwrap();
-            let delete_log = dir.path().join("deletes.log");
-            let runtime = crate::test_support::TestCommandRuntime::with_mock(
-                MockBehavior {
-                    observations: MockObservations {
-                        delete_log: Some(delete_log.clone()),
+        for (deposed_identifier, deposed_bucket) in [
+            ("backend-state-bucket", None),
+            ("aliased-state-bucket", Some("backend-state-bucket")),
+            ("backend-state-bucket", Some("backend-state-bucket")),
+        ] {
+            for refresh in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                let delete_log = dir.path().join("deletes.log");
+                let runtime = crate::test_support::TestCommandRuntime::with_mock(
+                    MockBehavior {
+                        observations: MockObservations {
+                            delete_log: Some(delete_log.clone()),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    ..Default::default()
-                },
-                MockScope::memory(),
-            );
-            let config_path = dir.path();
-            std::fs::write(
-                config_path.join("main.crn"),
-                "provider mock {}\nremoved { from = mock.s3.Bucket 'state' }\n",
-            )
-            .unwrap();
-            let parsed = load_configuration_with_config(
-                config_path,
-                &ProviderContext::default(),
-                &carina_core::schema::SchemaRegistry::new(),
-            )
-            .unwrap()
-            .parsed
-            .into_parsed();
-            let backend: Arc<dyn StateBackend> = Arc::new(StateBucketBackend(
-                crate::commands::local_backend_for_test(dir.path().join("state.json")),
-            ));
-            let mut row = carina_state::ResourceState::try_applied(
-                "s3.Bucket",
-                "state",
-                "mock",
-                "backend-state-bucket",
-            )
-            .unwrap();
-            row.set_persisted_attribute("bucket", serde_json::json!("backend-state-bucket"));
-            row.deposed.push(DeposedInstance::from_persisted_json(
-                DeposedKey::new_unique(),
-                "old-state-bucket".to_owned(),
-                None,
-                HashMap::new(),
-                Default::default(),
-            ));
-            let mut state = StateFile::new();
-            state.upsert_resource(row).unwrap();
-            backend.write_state(&state).await.unwrap();
-            let lock = backend.acquire_lock("destroy").await.unwrap();
+                    MockScope::memory(),
+                );
+                let config_path = dir.path();
+                std::fs::write(
+                    config_path.join("main.crn"),
+                    concat!(
+                        "provider mock {}\n",
+                        "let alias = provider mock {}\n",
+                        "removed { from = mock.s3.Bucket 'state' }\n",
+                    ),
+                )
+                .unwrap();
+                let backend: Arc<dyn StateBackend> = Arc::new(StateBucketBackend(
+                    crate::commands::local_backend_for_test(dir.path().join("state.json")),
+                ));
+                let mut row = carina_state::ResourceState::try_applied(
+                    "s3.Bucket",
+                    "state",
+                    "mock",
+                    "backend-state-bucket",
+                )
+                .unwrap();
+                row.set_persisted_attribute("bucket", serde_json::json!("backend-state-bucket"));
+                row.deposed.push(DeposedInstance::from_persisted_json(
+                    DeposedKey::new_unique(),
+                    "old-state-bucket".to_owned(),
+                    None,
+                    HashMap::new(),
+                    Default::default(),
+                ));
+                row.deposed.push(DeposedInstance::from_persisted_json(
+                    DeposedKey::new_unique(),
+                    deposed_identifier.to_owned(),
+                    Some("alias".to_owned()),
+                    deposed_bucket
+                        .map(|bucket| {
+                            HashMap::from([("bucket".to_owned(), serde_json::json!(bucket))])
+                        })
+                        .unwrap_or_default(),
+                    Default::default(),
+                ));
+                let expected_deposed = serde_json::to_value(&row.deposed).unwrap();
+                let mut state = StateFile::new();
+                state.upsert_resource(row).unwrap();
+                backend.write_state(&state).await.unwrap();
 
-            run_destroy_locked(
-                &runtime,
-                crate::output_style::ColorMode::Plain,
-                parsed,
-                true,
-                Arc::clone(&backend),
-                Some("backend-state-bucket".to_owned()),
-                StateLock::held(lock),
-                refresh,
-                false,
-                config_path,
-                &ProviderContext::default(),
-                NonZeroUsize::new(1).unwrap(),
-                ShutdownToken::running(),
-            )
-            .await
-            .unwrap();
+                for run in 1..=2 {
+                    let parsed = load_configuration_with_config(
+                        config_path,
+                        &ProviderContext::default(),
+                        &carina_core::schema::SchemaRegistry::new(),
+                    )
+                    .unwrap()
+                    .parsed
+                    .into_parsed();
+                    let lock = backend.acquire_lock("destroy").await.unwrap();
 
-            assert!(
-                !delete_log.exists(),
-                "removed backend bucket generations must never be deleted (refresh={refresh})"
-            );
-            let state = backend.read_state().await.unwrap().unwrap().into_state();
-            let row = state
-                .find_resource("mock", "s3.Bucket", "state")
-                .expect("row with protected deposed generation must be retained");
-            assert!(
-                !row.has_current_instance(),
-                "the removed claim must forget the current instance (refresh={refresh})"
-            );
-            assert_eq!(
-                row.deposed.len(),
-                1,
-                "the protected deposed generation must be retained (refresh={refresh})"
-            );
-            assert_eq!(
-                row.deposed[0].identifier, "old-state-bucket",
-                "the protected deposed generation must be unchanged (refresh={refresh})"
-            );
-            assert!(
-                !dir.path().join("state.lock").exists(),
-                "destroy must release the lock (refresh={refresh})"
-            );
+                    run_destroy_locked(
+                        &runtime,
+                        crate::output_style::ColorMode::Plain,
+                        parsed,
+                        true,
+                        Arc::clone(&backend),
+                        Some("backend-state-bucket".to_owned()),
+                        StateLock::held(lock),
+                        refresh,
+                        false,
+                        config_path,
+                        &ProviderContext::default(),
+                        NonZeroUsize::new(1).unwrap(),
+                        ShutdownToken::running(),
+                    )
+                    .await
+                    .unwrap();
+
+                    assert!(
+                        !delete_log.exists(),
+                        "removed backend bucket generations must never be deleted (refresh={refresh}, run={run}, identifier={deposed_identifier}, bucket={deposed_bucket:?})"
+                    );
+                    let state = backend.read_state().await.unwrap().unwrap().into_state();
+                    let row = state
+                        .find_resource("mock", "s3.Bucket", "state")
+                        .expect("row with protected deposed generation must be retained");
+                    assert!(
+                        !row.has_current_instance(),
+                        "the removed claim must forget the current instance (refresh={refresh}, run={run})"
+                    );
+                    assert_eq!(
+                        serde_json::to_value(&row.deposed).unwrap(),
+                        expected_deposed,
+                        "all protected deposed generations must be retained unchanged (refresh={refresh}, run={run})"
+                    );
+                    assert!(
+                        !dir.path().join("state.lock").exists(),
+                        "destroy must release the lock (refresh={refresh}, run={run})"
+                    );
+                }
+            }
         }
     }
 
