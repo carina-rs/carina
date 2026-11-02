@@ -264,6 +264,7 @@ impl ProtocolConvertError {
     }
 
     /// The typed conversion reason beneath contextual wrappers.
+    #[cfg(test)]
     pub fn leaf_error(&self) -> &Self {
         match self {
             Self::ValuePath { error, .. } => error.leaf_error(),
@@ -765,6 +766,9 @@ pub fn attribute_type_to_protocol(
     attribute_type: &AttributeType,
 ) -> Result<protocol::AttributeType, ProtocolConvertError> {
     match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => Err(ProtocolConvertError::NonWireAttributeType {
+            kind: "UnloadedSchemaType",
+        }),
         RawShape::Reference {
             identity,
             pattern,
@@ -2267,8 +2271,13 @@ fn protocol_to_directives(directives: &protocol::Directives) -> ProviderDirectiv
 }
 
 /// Encode a managed resource for the ordinary provider boundary.
-pub fn try_resource_to_protocol<S>(
-    resource: &Resource<S>,
+pub fn try_resource_to_protocol<S, D>(
+    resource: &Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     directives: &ProviderDirectives,
 ) -> Result<protocol::Resource, ProtocolConvertError> {
     let Resource {
@@ -2280,7 +2289,7 @@ pub fn try_resource_to_protocol<S>(
         resolved_ignore_changes: _resolved_ignore_changes,
         prefixes: _prefixes,
         binding: _binding,
-        dependency_bindings: _dependency_bindings,
+        dependencies: _dependencies,
         module_source: _module_source,
         default_tag_keys: _default_tag_keys,
         loop_provenance: _loop_provenance,
@@ -2302,8 +2311,13 @@ pub fn try_resource_to_protocol<S>(
 }
 
 /// Encode a data source using the protocol's shared Resource record.
-pub fn try_data_source_to_protocol(
-    data_source: &DataSource,
+pub fn try_data_source_to_protocol<S, D>(
+    data_source: &DataSource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     provider_directives: &ProviderDirectives,
 ) -> Result<protocol::Resource, ProtocolConvertError> {
     let DataSource {
@@ -2311,7 +2325,7 @@ pub fn try_data_source_to_protocol(
         attributes,
         directives: _authored_directives,
         binding: _binding,
-        dependency_bindings: _dependency_bindings,
+        dependencies: _dependencies,
         module_source: _module_source,
         quoted_string_attrs: _quoted_string_attrs,
     } = data_source;
@@ -3574,6 +3588,8 @@ mod tests {
             name: "fixture".to_string(),
             params: Vec::new(),
             return_type: None,
+            return_type_span: None,
+            annotation_source_file: None,
             local_lets: Vec::new(),
             body: crate::parser::UserFunctionBody {
                 value: Value::Concrete(ConcreteValue::Int(1)),
@@ -4412,6 +4428,9 @@ mod tests {
             let decoded_wire: protocol::AttributeType = serde_json::from_str(&json).unwrap();
             let decoded = protocol_to_attribute_type(&decoded_wire).unwrap();
             let (decoded_identity, has_callback) = match decoded.raw_shape() {
+                RawShape::UnloadedSchemaType(_) => {
+                    panic!("builtin wire type must have a loaded declaration")
+                }
                 RawShape::Reference {
                     identity,
                     pattern: _pattern,

@@ -12,6 +12,11 @@ use crate::provider_resolver::{
 };
 use crate::verified_artifact::{VerifiedArtifact, VerifiedArtifactError, publish_cached};
 
+#[cfg(test)]
+thread_local! {
+    static BLOCKING_ACQUIRE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 const PROVIDER_INSTALL_LOCK_FILE_NAME: &str = "provider-install.lock";
 
 /// Exclusive ownership of provider installation and lock-file mutation for one project.
@@ -157,6 +162,12 @@ impl ProviderInstallLock {
                     "Waiting for provider install lock at {} (held by another carina process)...",
                     guard_path.display()
                 );
+                #[cfg(test)]
+                BLOCKING_ACQUIRE_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() {
+                        hook();
+                    }
+                });
                 guard_file.lock()?;
             }
             Err(TryLockError::Error(error)) => return Err(error),
@@ -624,7 +635,6 @@ mod tests {
     use std::fs;
     use std::io;
     use std::sync::mpsc;
-    use std::time::Duration;
 
     use super::{
         ArtifactTarget, ProviderInstallLock, install_artifact_atomically_with,
@@ -637,26 +647,56 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let first = ProviderInstallLock::acquire(project.path()).unwrap();
         let project_dir = project.path().to_path_buf();
-        let (started_tx, started_rx) = mpsc::channel();
         let (acquired_tx, acquired_rx) = mpsc::channel();
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+
+        let competing_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                project
+                    .path()
+                    .join(".carina")
+                    .join(super::PROVIDER_INSTALL_LOCK_FILE_NAME),
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                competing_file.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ),
+            "the first acquisition must hold the OS lock"
+        );
 
         let waiter = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
+            super::BLOCKING_ACQUIRE_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || blocked_tx.send(()).unwrap()));
+            });
             let second = ProviderInstallLock::acquire(&project_dir).unwrap();
             acquired_tx.send(()).unwrap();
             drop(second);
         });
 
-        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // wall-clock-ok: original five-second hang guard for the OS-lock waiter thread.
+        blocked_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            matches!(acquired_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "the waiter must not acquire while the first guard is held"
+        );
+        // wall-clock-ok: original 250ms negative window after the waiter enters the blocking path; scheduler slowness can only extend the absence of an acquisition.
         assert!(
             acquired_rx
-                .recv_timeout(Duration::from_millis(250))
+                .recv_timeout(std::time::Duration::from_millis(250))
                 .is_err(),
-            "a second acquisition must remain blocked while the first guard is alive"
+            "the second acquisition must remain blocked while the first guard is held"
         );
-
         drop(first);
-        acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // wall-clock-ok: original five-second hang guard for acquisition after releasing the OS lock.
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         waiter.join().unwrap();
     }
 

@@ -37,8 +37,9 @@ let subnet = awscc.ec2.Subnet {
 }
 
 attributes {
-  vpc_id   : awscc.ec2.Vpc = vpc.vpc_id
-  subnet_id: awscc.ec2.Subnet = subnet.subnet_id
+  vpc      = vpc
+  vpc_id   : aws.ec2.Vpc.Id = vpc.vpc_id
+  subnet_id: aws.ec2.Subnet.Id = subnet.subnet_id
 }
 ```
 
@@ -53,7 +54,14 @@ arguments {
 }
 ```
 
-Supported types include `String`, `Bool`, `Int`, `Float`, `list(String)`, `map(String)`, built-in types such as `Ipv4Cidr`, types registered by providers such as `aws.AvailabilityZone.ZoneName` or `aws.ec2.Vpc.Id`, and resource type references like `awscc.ec2.Vpc`. Arguments are type-checked against the attributes they flow into: passing a `String` argument to a `cidr_block` attribute is an error, because the attribute expects an `Ipv4Cidr`.
+Supported types include `String`, `Bool`, `Int`, `Float`, `list(String)`,
+`map(String)`, built-in types such as `Ipv4Cidr`, types registered by
+providers such as `aws.AvailabilityZone.ZoneName` or `aws.ec2.Vpc.Id`, and
+resource handle types like `awscc.ec2.Vpc`. A resource handle type accepts
+only a matching bare resource or module output handle; a string or typed ID is
+still a value and does not satisfy it. Arguments are also type-checked against
+the attributes they flow into: passing a `String` argument to a `cidr_block`
+attribute is an error, because the attribute expects an `Ipv4Cidr`.
 
 ### Attributes block
 
@@ -61,12 +69,16 @@ The `attributes` block declares the outputs the module exposes to callers:
 
 ```crn
 attributes {
-  vpc_id   : awscc.ec2.Vpc = vpc.vpc_id
-  subnet_id: awscc.ec2.Subnet = subnet.subnet_id
+  vpc      = vpc
+  vpc_id   : aws.ec2.Vpc.Id = vpc.vpc_id
+  subnet_id: aws.ec2.Subnet.Id = subnet.subnet_id
 }
 ```
 
-Each attribute has a name, an optional type annotation, and a value expression.
+Each attribute has a name, an optional type annotation, and a required
+right-hand side. That right-hand side may be an ordinary value or a local or
+received resource handle. Carina infers unannotated handle outputs as their
+known resource type.
 
 ## Loading and calling a module
 
@@ -105,12 +117,41 @@ let net = network {
 
 # Use module output to create another resource
 awscc.ec2.RouteTable {
-  vpc_id = net.vpc_id
+  vpc_id = net.vpc.vpc_id
   tags   = { Name = 'my-route-table' }
 }
 ```
 
-The `net.vpc_id` reference accesses the `vpc_id` attribute declared in the module's `attributes` block.
+The `net.vpc` output preserves the underlying VPC handle.
+`net.vpc.vpc_id` selects an ordinary value from that resource, while
+`net.vpc_id` accesses the separately published identity value.
+
+### Passing resource handles between modules
+
+A consumer can declare a resource-typed argument and use it for ordering:
+
+```crn
+# modules/consumer/arguments.crn
+arguments {
+  validation_record: aws.route53.RecordSet
+}
+
+# modules/consumer/main.crn
+aws.acm.CertificateValidation {
+  # ...
+
+  directives {
+    depends_on = [validation_record]
+  }
+}
+```
+
+If a producer declares
+`attributes { validation_record = validation_record }`, the root can pass
+`producer.validation_record` directly to this argument. The handle remains
+typed and resolves to the producer's concrete instance-qualified resource;
+it is not converted to a string or provider value. Select an attribute such
+as `producer.validation_record.name` when a value is needed.
 
 ## Splitting a module across multiple files
 
@@ -159,8 +200,9 @@ let rt = awscc.ec2.RouteTable {
 }
 
 attributes {
-  vpc_id        : awscc.ec2.Vpc = net.vpc_id
-  route_table_id: awscc.ec2.RouteTable = rt.route_table_id
+  vpc           = net.vpc
+  vpc_id        : aws.ec2.Vpc.Id = net.vpc.vpc_id
+  route_table_id: aws.ec2.RouteTable.Id = rt.route_table_id
 }
 ```
 

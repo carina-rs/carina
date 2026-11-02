@@ -14,7 +14,7 @@ use super::ast::{
 use super::error::{ParseError, ParseWarning};
 use super::{ParserProviderConfig as ProviderConfig, ParserWaitBinding as WaitBinding};
 use super::{ProviderContext, Rule};
-use crate::eval_value::{EvalValue, StructuralHandle, StructuralHandleKind};
+use crate::eval_value::{EvalValue, UnexpandedStructuralHandle, UnexpandedStructuralHandleKind};
 use crate::resource::{
     DiagnosticSourceSpan, ModuleSource, ParserPlaceholder, RelativeBindingName,
     Resource as GenericResource, ResourceId, Value as GenericValue,
@@ -54,7 +54,7 @@ pub(super) enum ParseBinding {
         scope: BindingScopeId,
     },
     Structural {
-        handle: StructuralHandle,
+        handle: UnexpandedStructuralHandle,
         scope: BindingScopeId,
     },
 }
@@ -66,7 +66,7 @@ pub(super) enum ParseBindingRef<'a> {
         declaration: crate::schema::BindingKind,
         declared_type: Option<&'a Arc<TypeExpr>>,
     },
-    Structural(&'a StructuralHandle),
+    Structural(&'a UnexpandedStructuralHandle),
     Unbound,
 }
 
@@ -95,6 +95,8 @@ pub(crate) struct ParseContext<'cfg, Source = AuthoredDiagnosticSource> {
     pub(super) evaluating_functions: Vec<String>,
     /// Parser configuration (decryptor, custom validators)
     pub(super) config: &'cfg ProviderContext,
+    pub(super) session:
+        Option<&'cfg dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     /// Binding names from structurally-required expressions (if/for/read)
     pub(super) structural_bindings: HashSet<String>,
     /// Upstream state bindings (binding_name -> UpstreamState)
@@ -175,11 +177,13 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
     }
 
     pub(super) fn isolated(&self) -> Self {
-        Self::with_source(
+        let mut context = Self::with_source(
             self.config,
             self.binding_scope_source_file.clone(),
             self.diagnostic_source.clone(),
-        )
+        );
+        context.session = self.session;
+        context
     }
 
     pub(super) fn set_preprocessed_file(&mut self, file: &super::PreprocessedFile) {
@@ -235,12 +239,31 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
 }
 
 impl<'cfg> ParseContext<'cfg, EvaluationOnly> {
+    pub(super) fn for_evaluation_in_session(
+        session: &'cfg dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Self {
+        let mut context = Self::for_evaluation(session.catalog());
+        context.session = Some(session);
+        context
+    }
+
     pub(super) fn for_evaluation(config: &'cfg ProviderContext) -> Self {
         Self::with_source(config, std::path::PathBuf::new(), EvaluationOnly)
     }
 }
 
 impl<'cfg, Source: Clone> ParseContext<'cfg, Source> {
+    pub(super) fn typecheck_provider_context(
+        &self,
+    ) -> crate::validation::typecheck::TypecheckProviderContext<'cfg> {
+        match self.session {
+            Some(session) => {
+                crate::validation::typecheck::TypecheckProviderContext::for_session(session)
+            }
+            None => crate::validation::typecheck::TypecheckProviderContext::for_parser(self.config),
+        }
+    }
+
     fn with_source(
         config: &'cfg ProviderContext,
         source_file: std::path::PathBuf,
@@ -255,6 +278,7 @@ impl<'cfg, Source: Clone> ParseContext<'cfg, Source> {
             seeded_user_functions: HashSet::new(),
             evaluating_functions: Vec::new(),
             config,
+            session: None,
             structural_bindings: HashSet::new(),
             upstream_states: HashMap::new(),
             wait_bindings: HashMap::new(),
@@ -437,7 +461,11 @@ impl<'cfg, Source: Clone> ParseContext<'cfg, Source> {
         );
     }
 
-    pub(super) fn set_structural_binding(&mut self, name: String, handle: StructuralHandle) {
+    pub(super) fn set_structural_binding(
+        &mut self,
+        name: String,
+        handle: UnexpandedStructuralHandle,
+    ) {
         self.bindings.insert(
             name,
             ParseBinding::Structural {
@@ -447,7 +475,11 @@ impl<'cfg, Source: Clone> ParseContext<'cfg, Source> {
         );
     }
 
-    pub(super) fn set_structural_alias(&mut self, name: String, handle: StructuralHandle) {
+    pub(super) fn set_structural_alias(
+        &mut self,
+        name: String,
+        handle: UnexpandedStructuralHandle,
+    ) {
         self.bindings.insert(
             name.clone(),
             ParseBinding::Structural {
@@ -518,8 +550,8 @@ impl<'cfg, Source: Clone> ParseContext<'cfg, Source> {
         ) {
             self.set_structural_binding(
                 name.clone(),
-                StructuralHandle::new(
-                    StructuralHandleKind::Resource(super::ast::ResourceTypePath::new(
+                UnexpandedStructuralHandle::new(
+                    UnexpandedStructuralHandleKind::Resource(super::ast::ResourceTypePath::new(
                         resource.id.provider.clone(),
                         resource.id.resource_type.clone(),
                     )),
@@ -747,16 +779,18 @@ impl<'a> ExpressionMode<'a> {
             ),
             ParseBindingRef::Structural(handle) => {
                 let resource_type = match handle.kind() {
-                    StructuralHandleKind::Resource(resource_type) => Some(resource_type.clone()),
-                    StructuralHandleKind::For
-                    | StructuralHandleKind::If
-                    | StructuralHandleKind::Use
-                    | StructuralHandleKind::Module
-                    | StructuralHandleKind::Wait
-                    | StructuralHandleKind::UpstreamState
-                    | StructuralHandleKind::Provider
-                    | StructuralHandleKind::ModuleParameter
-                    | StructuralHandleKind::FunctionParameter => None,
+                    UnexpandedStructuralHandleKind::Resource(resource_type) => {
+                        Some(resource_type.clone())
+                    }
+                    UnexpandedStructuralHandleKind::For
+                    | UnexpandedStructuralHandleKind::If
+                    | UnexpandedStructuralHandleKind::Use
+                    | UnexpandedStructuralHandleKind::Module
+                    | UnexpandedStructuralHandleKind::Wait
+                    | UnexpandedStructuralHandleKind::UpstreamState
+                    | UnexpandedStructuralHandleKind::Provider
+                    | UnexpandedStructuralHandleKind::ModuleParameter
+                    | UnexpandedStructuralHandleKind::FunctionParameter => None,
                 };
                 (
                     BareBindingKind::Structural {

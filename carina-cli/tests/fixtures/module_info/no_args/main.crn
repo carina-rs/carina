@@ -1,5 +1,5 @@
 attributes {
-  bucket_arn: awscc.s3.Bucket = my_bucket.arn
+  bucket_arn = my_bucket.arn
 }
 
 let my_bucket = awscc.s3.Bucket {

@@ -24,13 +24,11 @@ use crate::provider::{
     CreateRequest, ProviderDirectives, ProviderFactory, ProviderNormalizer, ProviderWireError,
     ProviderWireTarget, ResourceWirePayload, UpdateRequest, WireAttributes, WireReady,
 };
-#[cfg(test)]
-use crate::resource::NoPlaceholder;
 use crate::resource::{
-    BindingAddress, ConcreteValue, DataSource, DeferredValue, LiveComposition, ParserPlaceholder,
-    PlaceholderKind, ProviderDataSource, ProviderModuleSource, ProviderResource,
-    RelativeBindingName, ResolvedDataSource, ResolvedResource, Resource, ResourceId,
-    SavedComposition, Value,
+    AbsoluteBindingAddress, BindingAddress, ConcreteValue, DataSource, DeferredValue,
+    LiveComposition, NoPlaceholder, ParserPlaceholder, PlaceholderKind, ProviderDataSource,
+    ProviderModuleSource, ProviderResource, RelativeBindingName, ResolvedDataSource,
+    ResolvedResource, Resource, ResourceId, SavedComposition, Value,
 };
 use crate::schema::{
     CompiledResourceSchema as ResourceSchema, SchemaKind, SchemaRegistry, TypeError,
@@ -74,6 +72,30 @@ pub struct ProviderReady<T: ResourceWirePayload> {
 }
 
 impl<T: ResourceWirePayload> ProviderReady<T> {
+    fn settled(
+        pending: crate::validation::deferred_types::PendingProviderTypeChecks<
+            '_,
+            (T, ProviderDirectives),
+        >,
+    ) -> Result<Self, ProviderPreparationError> {
+        let mut diagnostics = Vec::new();
+        let (value, directives) = pending.publish(&mut diagnostics)?;
+        if !diagnostics.is_empty() {
+            let messages = diagnostics.into_iter().map(|diagnostic| match diagnostic {
+                crate::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning)
+                | crate::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(warning) => warning.message,
+            }).collect::<Vec<_>>();
+            return Err(ProviderPreparationError::Provider(
+                crate::provider::ProviderError::invalid_input(messages.join("\n")),
+            ));
+        }
+        let target = ProviderWireTarget::Resource(value.resource_id().clone());
+        Ok(Self {
+            value: WireReady::try_new(value, target)?,
+            directives,
+        })
+    }
+
     /// Borrow the checked payload.
     pub fn as_inner(&self) -> &T {
         self.value.as_inner()
@@ -200,6 +222,7 @@ pub struct ProviderPreparationContext<'a> {
     normalizer: &'a dyn ProviderNormalizer,
     custom_type_resolver:
         crate::provider::FactoryCustomTypeResolver<&'a [Box<dyn ProviderFactory>]>,
+    type_checks: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: &'a SchemaRegistry,
 }
 
@@ -214,6 +237,7 @@ impl<'a> ProviderPreparationContext<'a> {
         normalizer: &'a dyn ProviderNormalizer,
         factories: &'a [Box<dyn ProviderFactory>],
         schemas: &'a SchemaRegistry,
+        type_checks: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Self {
         let custom_type_resolver = crate::provider::FactoryCustomTypeResolver::new(factories);
         Self {
@@ -223,7 +247,14 @@ impl<'a> ProviderPreparationContext<'a> {
             normalizer,
             custom_type_resolver,
             schemas,
+            type_checks,
         }
+    }
+
+    pub(super) fn type_checks(
+        &self,
+    ) -> &dyn crate::validation::deferred_types::ProviderTypeCheckContext {
+        self.type_checks
     }
 
     pub(super) fn bindings(&self) -> &ResolvedBindings {
@@ -242,10 +273,15 @@ impl<'a> ProviderPreparationContext<'a> {
 /// Whether a provider-bound value is still in its authored form or came from
 /// the plan after normalization. The latter always carries the authored
 /// snapshot; omitting it is not representable at the preparation seam.
-pub(super) enum CheckInput<T> {
+pub(super) enum CheckInput<T, A = T> {
     Authored(T),
-    PlanNormalized { resolved: T, authored: T },
+    PlanNormalized { resolved: T, authored: A },
 }
+
+pub(super) type ResourceCheckInput<S> =
+    CheckInput<Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()>>;
+pub(super) type DataSourceCheckInput<S> =
+    CheckInput<DataSource<S, NoPlaceholder, AbsoluteBindingAddress, ()>>;
 
 /// A resolved provider payload paired with the only valid schema-check scope.
 ///
@@ -349,13 +385,14 @@ impl ModuleConstraintGate {
         &self,
         bindings: &ResolvedBindings,
         terminal: bool,
+        session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<ModuleConstraintFailure> {
         match &self.compositions {
             ModuleConstraintCompositions::Live(compositions) => {
-                evaluate_live_pending_constraints(compositions, bindings, terminal)
+                evaluate_live_pending_constraints(compositions, bindings, terminal, session)
             }
             ModuleConstraintCompositions::Saved(compositions) => {
-                evaluate_saved_pending_constraints(compositions, bindings, terminal)
+                evaluate_saved_pending_constraints(compositions, bindings, terminal, session)
             }
         }
     }
@@ -371,8 +408,12 @@ impl ModuleConstraintGate {
     /// One ceiling remains: a cross-argument `require` over X and Y can still
     /// be pending when a consumer of X runs if Y is unknown. It is evaluated
     /// when Y becomes known at a later gate, or rejected by the terminal sweep.
-    pub fn check(&self, bindings: &ResolvedBindings) -> Result<(), ModuleConstraintGateError> {
-        let failures = self.evaluate(bindings, false);
+    pub fn check(
+        &self,
+        bindings: &ResolvedBindings,
+        session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Result<(), ModuleConstraintGateError> {
+        let failures = self.evaluate(bindings, false, session);
         if failures.is_empty() {
             return Ok(());
         }
@@ -408,8 +449,9 @@ impl ModuleConstraintGate {
         &self,
         bindings: &ResolvedBindings,
         report_unresolved: bool,
+        session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<(), ModuleConstraintGateError> {
-        let failures = self.evaluate(bindings, report_unresolved);
+        let failures = self.evaluate(bindings, report_unresolved, session);
         self.report_new(failures)
     }
 
@@ -453,6 +495,8 @@ pub enum ProviderPreparationError {
     /// The complete provider input has no wire representation.
     #[error("{0}")]
     Wire(ProviderWireError),
+    #[error(transparent)]
+    TypeSettlement(#[from] crate::validation::deferred_types::ProviderTypeCheckFailure),
     /// An unresolved deferred value survived apply-time reference resolution.
     #[error(transparent)]
     Serialization(#[from] SerializationError),
@@ -773,8 +817,13 @@ impl std::error::Error for ProviderValueConstraintErrors {}
 /// secrets for the provider, validates every newly known schema value
 /// (including provider custom types), re-runs the complete desired-side
 /// normalization pipeline, and finally proves no provider-ineligible deferred value remains.
-pub async fn prepare_provider_ready_resource(
-    resource: Resource,
+pub async fn prepare_provider_ready_resource<S: Clone, D: Clone + Default>(
+    resource: Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
     prepare_provider_ready_resource_with_value_check(
@@ -792,8 +841,13 @@ pub async fn prepare_provider_ready_resource(
 /// effect. This prevents provider normalization performed during planning
 /// from being mistaken for user input while still rerunning cross-attribute
 /// validators when at least one input became known now.
-pub(super) async fn prepare_provider_ready_resource_after_resolution<S: Clone>(
-    input: ResolvedCheckInput<Resource<S>>,
+pub(super) async fn prepare_provider_ready_resource_after_resolution<
+    S: Clone,
+    D: Clone + Default,
+>(
+    input: ResolvedCheckInput<
+        Resource<S, crate::resource::NoPlaceholder, crate::resource::AbsoluteBindingAddress, D>,
+    >,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
     prepare_provider_ready_resource_with_value_check(input, context).await
@@ -807,8 +861,10 @@ enum ResourceValueCheck {
     },
 }
 
-async fn prepare_provider_ready_resource_with_value_check<S: Clone>(
-    input: ResolvedCheckInput<Resource<S>>,
+async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + Default>(
+    input: ResolvedCheckInput<
+        Resource<S, crate::resource::NoPlaceholder, crate::resource::AbsoluteBindingAddress, D>,
+    >,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
     let ResolvedCheckInput {
@@ -816,7 +872,9 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone>(
         check: value_check,
     } = input;
     let resource = &mut value;
-    context.module_gate.check(context.bindings)?;
+    context
+        .module_gate
+        .check(context.bindings, context.type_checks)?;
     if let Some(schema) = context.schemas.get_for(resource) {
         match value_check {
             ResourceValueCheck::All => validate_known_provider_values(
@@ -857,11 +915,7 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone>(
         SchemaKind::Resource,
         &resource.as_resource().directives,
     );
-    let target = ProviderWireTarget::Resource(resource.as_resource().id.clone());
-    Ok(ProviderReady {
-        value: WireReady::try_new(resource, target)?,
-        directives,
-    })
+    ProviderReady::settled(context.type_checks.pending((resource, directives)))
 }
 
 /// Validate and prepare a data source for provider dispatch.
@@ -886,8 +940,10 @@ pub fn prepare_provider_ready_data_source(
 /// authored inputs and derived which attributes became known during apply.
 /// Plan-normalized literal attributes are deliberately outside that check
 /// scope because they already passed the plan-time authored-value gate.
-pub(super) fn prepare_provider_ready_data_source_after_resolution<S>(
-    input: ResolvedCheckInput<DataSource<S>>,
+pub(super) fn prepare_provider_ready_data_source_after_resolution<S, D>(
+    input: ResolvedCheckInput<
+        DataSource<S, crate::resource::NoPlaceholder, crate::resource::AbsoluteBindingAddress, D>,
+    >,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyDataSource, ProviderPreparationError> {
     let ResolvedCheckInput {
@@ -895,7 +951,9 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S>(
         check: value_check,
     } = input;
     let resource = &mut value;
-    context.module_gate.check(context.bindings)?;
+    context
+        .module_gate
+        .check(context.bindings, context.type_checks)?;
     if let Some(schema) = context.schemas.get_for_data_source(resource) {
         match value_check {
             ResourceValueCheck::All => validate_known_provider_values(
@@ -933,11 +991,7 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S>(
         SchemaKind::DataSource,
         &value.as_inner().directives,
     );
-    let target = ProviderWireTarget::Resource(value.as_inner().id.clone());
-    Ok(ProviderReady {
-        value: WireReady::try_new(value, target)?,
-        directives,
-    })
+    ProviderReady::settled(context.type_checks.pending((value, directives)))
 }
 
 /// Prepare a checked create request through the provider-boundary gate.
@@ -950,9 +1004,14 @@ pub async fn prepare_create_request(
 }
 
 /// Look up the schema required to construct an update request.
-pub(super) fn managed_update_schema<'a, S>(
+pub(super) fn managed_update_schema<'a, S, D>(
     schemas: &'a SchemaRegistry,
-    resource: &Resource<S>,
+    resource: &Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
 ) -> Result<&'a ResourceSchema, ProviderPreparationError> {
     schemas
         .get_for(resource)
@@ -1084,21 +1143,28 @@ mod provider_config_tests {
                 .validate()
                 .expect("valid test schema"),
         );
-        let context = ProviderPreparationContext::new(
-            &bindings,
-            &module_gate,
-            &[],
-            &crate::provider::NoopNormalizer,
-            &[],
-            &schemas,
-        );
+        crate::validation::deferred_types::with_session_for_test_async(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            async |type_checks| {
+                let context = ProviderPreparationContext::new(
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &crate::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
 
-        let request = prepare_create_request(resource, &context)
-            .await
-            .expect("provider preparation must use schema resolution");
+                let request = prepare_create_request(resource, &context)
+                    .await
+                    .expect("provider preparation must use schema resolution");
 
-        assert_eq!(request.resource().ignore_changes().iter().len(), 1);
-        assert!(request.directives().prevent_destroy());
+                assert_eq!(request.resource().ignore_changes().iter().len(), 1);
+                assert!(request.directives().prevent_destroy());
+            },
+        )
+        .await
     }
 
     #[tokio::test]
@@ -1115,20 +1181,27 @@ mod provider_config_tests {
                 .validate()
                 .expect("valid test schema"),
         );
-        let context = ProviderPreparationContext::new(
-            &bindings,
-            &module_gate,
-            &[],
-            &crate::provider::NoopNormalizer,
-            &[],
-            &schemas,
-        );
+        crate::validation::deferred_types::with_session_for_test_async(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            async |type_checks| {
+                let context = ProviderPreparationContext::new(
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &crate::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
 
-        let request = prepare_update_request(resource, from, &[], &context)
-            .await
-            .expect("provider preparation must resolve directives against the schema");
+                let request = prepare_update_request(resource, from, &[], &context)
+                    .await
+                    .expect("provider preparation must resolve directives against the schema");
 
-        assert!(request.directives().prevent_destroy());
+                assert!(request.directives().prevent_destroy());
+            },
+        )
+        .await
     }
 
     #[tokio::test]
@@ -1139,29 +1212,36 @@ mod provider_config_tests {
         let bindings = ResolvedBindings::default();
         let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = SchemaRegistry::new();
-        let context = ProviderPreparationContext::new(
-            &bindings,
-            &module_gate,
-            &[],
-            &crate::provider::NoopNormalizer,
-            &[],
-            &schemas,
-        );
+        crate::validation::deferred_types::with_session_for_test_async(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            async |type_checks| {
+                let context = ProviderPreparationContext::new(
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &crate::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
 
-        let error = prepare_update_request(resource, from, &[], &context)
-            .await
-            .expect_err("updates without a managed schema must fail preparation");
+                let error = prepare_update_request(resource, from, &[], &context)
+                    .await
+                    .expect_err("updates without a managed schema must fail preparation");
 
-        assert!(matches!(
-            &error,
-            ProviderPreparationError::MissingManagedSchema { resource } if resource == &id
-        ));
-        let rendered = error.to_string();
-        assert!(rendered.contains(&id.to_string()), "{rendered}");
-        assert!(
-            rendered.contains("no managed schema is registered"),
-            "{rendered}"
-        );
+                assert!(matches!(
+                    &error,
+                    ProviderPreparationError::MissingManagedSchema { resource } if resource == &id
+                ));
+                let rendered = error.to_string();
+                assert!(rendered.contains(&id.to_string()), "{rendered}");
+                assert!(
+                    rendered.contains("no managed schema is registered"),
+                    "{rendered}"
+                );
+            },
+        )
+        .await
     }
 
     struct EnumConfigFactory;
@@ -1559,6 +1639,7 @@ mod provider_config_tests {
                 SchemaTypeOwner::Provider("awscc".to_string()),
             ])
             .expect("two owners are non-empty"),
+            crate::schema::RefinedScalarKind::String,
         );
         let value = Value::Concrete(ConcreteValue::String("arn:accepted".into()));
 
@@ -1618,6 +1699,7 @@ mod provider_config_tests {
                 SchemaTypeOwner::Provider("one".to_string()),
             ])
             .expect("two owners are non-empty"),
+            crate::schema::RefinedScalarKind::String,
         );
         let value = Value::Concrete(ConcreteValue::enum_identifier("shared.Mode.COMMON"));
 
@@ -1669,7 +1751,11 @@ mod provider_config_tests {
                 seen_values: None,
             })]);
         let validator = test_custom_type_validator(factories);
-        let owned = OwnedTypeIdentity::provider("owner", identity);
+        let owned = OwnedTypeIdentity::provider(
+            "owner",
+            identity,
+            crate::schema::RefinedScalarKind::String,
+        );
         let value = Value::Concrete(ConcreteValue::enum_identifier("shared.Mode.COMMON"));
 
         validator(CustomTypeValidationTarget::Annotation(&owned), &value)

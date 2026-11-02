@@ -11,6 +11,18 @@ use carina_state::BackendError;
 
 use crate::commands::shared::state_writeback::PersistedDirectiveChange;
 
+/// Filesystem failures when a command resolves its invocation inputs.
+#[derive(Debug, thiserror::Error)]
+pub enum CommandInputError {
+    #[error("Failed to resolve the command startup directory: {error}")]
+    StartupDirectory { error: std::io::Error },
+    #[error("Invalid mock state storage path {}: {error}", path.display())]
+    MockStorage {
+        path: PathBuf,
+        error: std::io::Error,
+    },
+}
+
 /// Final endpoint/kind summary retaining typed causes for programmatic use.
 /// Full cause chains have already been streamed through the failure sink.
 #[derive(Debug, Clone)]
@@ -692,6 +704,30 @@ impl std::error::Error for CorruptPlanFileError {
     }
 }
 
+/// Semantic evidence failure with file and recovery context. Boxing this
+/// wrapper keeps AppError compact while retaining the original typed cause.
+#[derive(Debug)]
+pub struct SavedPlanProviderEvidenceError {
+    path: PathBuf,
+    replan_command: Option<String>,
+    source: crate::commands::plan::ProviderEvidenceError,
+}
+
+impl std::fmt::Display for SavedPlanProviderEvidenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Invalid saved plan '{}': {source}. {}",
+            self.path.display(),
+            plan_file_recreation_guidance(self.replan_command.as_deref()),
+            source = self.source,
+        )
+    }
+}
+
+// Terminal CLI diagnostic: Display already includes the typed cause once.
+impl std::error::Error for SavedPlanProviderEvidenceError {}
+
 /// Render a provider initialization error as user-facing text.
 ///
 /// Detects the carina-provider-aws / carina-provider-awscc account
@@ -906,6 +942,12 @@ impl std::error::Error for AwsCredentialStartupError {}
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    #[error(transparent)]
+    CommandInput(#[from] std::sync::Arc<CommandInputError>),
+
+    #[error(transparent)]
+    ExportBoundary(#[from] carina_core::validation::ExportBoundaryError),
+
     /// Provider installation, egress consent, or initialization failed.
     #[error(transparent)]
     Init(Box<crate::commands::init::InitError>),
@@ -948,6 +990,11 @@ pub enum AppError {
     /// Identity assignment was incomplete at a resolved-only pipeline boundary.
     #[error(transparent)]
     PendingResourceIdentity(#[from] carina_core::resource::PendingResourceIdentityError),
+
+    /// A post-expansion handle or dependency operand could not be mapped to
+    /// one complete scheduler address.
+    #[error(transparent)]
+    ExpandedGraphResolution(Box<carina_core::resolved_graph::ExpandedGraphResolutionError>),
 
     /// A resource's authored lifecycle paths could not cross the
     /// schema-resolved planning boundary.
@@ -1054,9 +1101,9 @@ pub enum AppError {
     #[error(transparent)]
     DestroyDependencyAnalysis(#[from] DestroyDependencyAnalysisError),
 
-    /// Distinct desired resources resolved to the same execution identity.
+    /// Authored resource origins could not be indexed by resolved identity.
     #[error(transparent)]
-    DuplicateResolvedResourceId(#[from] crate::wiring::DuplicateResolvedResourceIdError),
+    ResolvedResourceOriginIndex(#[from] crate::wiring::ResolvedResourceOriginIndexError),
 
     /// A provider-boundary check failed for a resource before dispatch.
     #[error(transparent)]
@@ -1265,6 +1312,10 @@ pub enum AppError {
     #[error(transparent)]
     CorruptPlanFile(Box<CorruptPlanFileError>),
 
+    /// A decoded saved plan carries inconsistent semantic provider evidence.
+    #[error(transparent)]
+    SavedPlanProviderEvidence(Box<SavedPlanProviderEvidenceError>),
+
     /// A saved plan was computed against different provider schemas.
     #[error("{0}")]
     SavedPlanSchemaMismatch(SavedPlanSchemaMismatchError),
@@ -1302,6 +1353,18 @@ impl From<crate::commands::init::InitError> for AppError {
 }
 
 impl AppError {
+    pub(crate) fn invalid_saved_plan_provider_evidence(
+        path: PathBuf,
+        replan_command: Option<String>,
+        source: crate::commands::plan::ProviderEvidenceError,
+    ) -> Self {
+        Self::SavedPlanProviderEvidence(Box::new(SavedPlanProviderEvidenceError {
+            path,
+            replan_command,
+            source,
+        }))
+    }
+
     pub(crate) fn corrupt_plan_file(
         path: PathBuf,
         replan_command: Option<String>,
@@ -1423,6 +1486,12 @@ impl From<carina_core::resource::LeftoverPlaceholders> for AppError {
     }
 }
 
+impl From<carina_core::resolved_graph::ExpandedGraphResolutionError> for AppError {
+    fn from(error: carina_core::resolved_graph::ExpandedGraphResolutionError) -> Self {
+        Self::ExpandedGraphResolution(Box::new(error))
+    }
+}
+
 impl From<String> for AppError {
     fn from(s: String) -> Self {
         AppError::Config(s)
@@ -1447,80 +1516,83 @@ mod tests {
 
     #[tokio::test]
     async fn wire_preparation_errors_render_the_typed_reason_once_at_cli_boundaries() {
-        use carina_core::executor::{
-            ModuleConstraintGate, ProviderPreparationContext, ProviderPreparationError,
-            prepare_create_request,
-        };
-        use carina_core::resource::{ConcreteValue, Resource, Value};
-        for state_bucket in [false, true] {
-            let resource = Resource::with_provider("mock", "sqs.Queue", "queue", None)
-                .with_attribute(
-                    "tags",
-                    Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
-                        "unrelated".into(),
-                        Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
-                            u64::MAX,
-                        ))),
-                    )]))),
-                );
-            let id = resource.id.clone();
-            let bindings = carina_core::binding_index::ResolvedBindings::default();
-            let gate = ModuleConstraintGate::from_live_compositions(&[]);
-            let schemas = carina_core::schema::SchemaRegistry::new();
-            let context = ProviderPreparationContext::new(
-                &bindings,
-                &gate,
-                &[],
-                &carina_core::provider::NoopNormalizer,
-                &[],
-                &schemas,
-            );
-            let error = prepare_create_request(resource, &context)
-                .await
-                .unwrap_err();
-            let error = if state_bucket {
-                AppError::from_state_bucket_preparation(error)
-            } else {
-                AppError::from_resource_preparation(id.clone(), error)
-            };
-            let typed = match &error {
-                AppError::ProviderPreparation(error) => error.preparation_error(),
-                AppError::StateBucketPreparation(error) => error.preparation_error(),
-                _ => panic!("expected a typed preparation diagnostic"),
-            };
-            let ProviderPreparationError::Wire(wire) = typed else {
-                panic!("expected a wire diagnostic")
-            };
-            assert!(matches!(
-                wire.conversion_error(),
-                carina_core::protocol_convert::ProtocolConvertError::DurationOutOfRange
-            ));
-            let rendered = format_error_with_source_chain(&error);
-            assert!(rendered.contains(&id.to_string()), "{rendered}");
-            let resource_label = format!("{}.{}", id.resource_type, id.identity_display());
-            assert_eq!(rendered.matches(&resource_label).count(), 1, "{rendered}");
-            assert!(rendered.contains("tags.unrelated"), "{rendered}");
-            assert_eq!(
-                rendered.matches("duration in seconds does not fit").count(),
-                1,
-                "{rendered}"
-            );
-            assert!(!rendered.contains(&u64::MAX.to_string()), "{rendered}");
-            assert!(std::error::Error::source(&error).is_none());
-        }
+        carina_core::validation::deferred_types::with_session_for_test_async(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            async |type_checks| {
+                use carina_core::executor::{
+                    ModuleConstraintGate, ProviderPreparationContext, ProviderPreparationError,
+                    prepare_create_request,
+                };
+                use carina_core::resource::{ConcreteValue, Resource, Value};
+                for state_bucket in [false, true] {
+                    let resource = Resource::with_provider("mock", "sqs.Queue", "queue", None)
+                        .with_attribute(
+                            "tags",
+                            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                                "unrelated".into(),
+                                Value::Concrete(ConcreteValue::Duration(
+                                    std::time::Duration::from_secs(u64::MAX),
+                                )),
+                            )]))),
+                        );
+                    let id = resource.id.clone();
+                    let bindings = carina_core::binding_index::ResolvedBindings::default();
+                    let gate = ModuleConstraintGate::from_live_compositions(&[]);
+                    let schemas = carina_core::schema::SchemaRegistry::new();
+                    let context = ProviderPreparationContext::new(
+                        &bindings,
+                        &gate,
+                        &[],
+                        &carina_core::provider::NoopNormalizer,
+                        &[],
+                        &schemas,
+                        type_checks,
+                    );
+                    let error = prepare_create_request(resource, &context)
+                        .await
+                        .unwrap_err();
+                    let error = if state_bucket {
+                        AppError::from_state_bucket_preparation(error)
+                    } else {
+                        AppError::from_resource_preparation(id.clone(), error)
+                    };
+                    let typed = match &error {
+                        AppError::ProviderPreparation(error) => error.preparation_error(),
+                        AppError::StateBucketPreparation(error) => error.preparation_error(),
+                        _ => panic!("expected a typed preparation diagnostic"),
+                    };
+                    let ProviderPreparationError::Wire(wire) = typed else {
+                        panic!("expected a wire diagnostic")
+                    };
+                    assert!(matches!(
+                        wire.conversion_error(),
+                        carina_core::protocol_convert::ProtocolConvertError::DurationOutOfRange
+                    ));
+                    let rendered = format_error_with_source_chain(&error);
+                    assert!(rendered.contains(&id.to_string()), "{rendered}");
+                    let resource_label = format!("{}.{}", id.resource_type, id.identity_display());
+                    assert_eq!(rendered.matches(&resource_label).count(), 1, "{rendered}");
+                    assert!(rendered.contains("tags.unrelated"), "{rendered}");
+                    assert_eq!(
+                        rendered.matches("duration in seconds does not fit").count(),
+                        1,
+                        "{rendered}"
+                    );
+                    assert!(!rendered.contains(&u64::MAX.to_string()), "{rendered}");
+                    assert!(std::error::Error::source(&error).is_none());
+                }
+            },
+        )
+        .await
     }
 
     fn dependency_analysis_failure() -> carina_core::effect::deps::DependencyAnalysisFailure {
-        use std::collections::{HashMap, HashSet};
-
-        use carina_core::effect::deps::{
-            ScheduleInputs, UnresolvedResource, build_effect_dependency_analysis,
-        };
+        use carina_core::effect::deps::{ScheduleInputs, build_effect_dependency_analysis};
         use carina_core::effect::{Effect, EffectGeneration};
         use carina_core::resource::ResolvedResourceId;
 
         let id = ResourceId::with_provider_identity("mock", "test.Widget", "example", None);
-        let effect = Effect::Delete {
+        let effect: Effect = Effect::Delete {
             id: ResolvedResourceId::try_new(id).expect("fixture identity is resolved"),
             identifier: carina_core::provider::AppliedIdentifier::new("provider-id")
                 .expect("fixture provider identifier is non-empty"),
@@ -1529,17 +1601,20 @@ mod tests {
             binding: Some(carina_core::resource::absolute_binding_address_for_test(
                 "example",
             )),
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::from(["missing-consumer".into()]),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: std::iter::once(
+                carina_core::resource::ResolvedResourceId::with_provider_identity(
+                    "mock",
+                    "test.Resource",
+                    "missing-consumer",
+                    None,
+                ),
+            )
+            .collect(),
         };
-        build_effect_dependency_analysis(
-            &[effect],
-            &HashMap::<ResourceId, UnresolvedResource>::new(),
-            &[],
-            ScheduleInputs::Apply,
-        )
-        .expect_err("missing required target must fail dependency analysis")
+        build_effect_dependency_analysis(&[effect], std::iter::empty(), ScheduleInputs::Apply)
+            .expect_err("missing required target must fail dependency analysis")
     }
 
     #[test]
@@ -1908,6 +1983,37 @@ mod tests {
 
         assert_eq!(app_err.to_string().matches("denied").count(), 1);
         assert!(std::error::Error::source(&app_err).is_none());
+    }
+
+    #[test]
+    fn saved_plan_provider_evidence_retains_its_typed_source() {
+        use crate::commands::plan::ProviderEvidenceError;
+
+        let error = AppError::invalid_saved_plan_provider_evidence(
+            PathBuf::from("reviewed-plan.json"),
+            Some("carina plan --out reviewed-plan.json .".to_string()),
+            ProviderEvidenceError::MissingProviderArtifact {
+                provider: "mock".to_string(),
+            },
+        );
+        let AppError::SavedPlanProviderEvidence(context) = &error else {
+            panic!("semantic provider evidence must retain its typed wrapper");
+        };
+        let source = &context.source;
+        assert!(
+            matches!(source, ProviderEvidenceError::MissingProviderArtifact { provider } if provider == "mock")
+        );
+        let rendered = format_error_with_source_chain(&error);
+        assert!(rendered.contains("Invalid saved plan 'reviewed-plan.json'"));
+        assert_eq!(
+            rendered
+                .matches("invalid saved-plan provider evidence")
+                .count(),
+            1
+        );
+        assert!(std::error::Error::source(&error).is_none());
+        assert!(rendered.contains("carina plan --out"));
+        assert!(!rendered.contains("Failed to parse"));
     }
 
     #[test]

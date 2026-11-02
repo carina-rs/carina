@@ -1192,9 +1192,14 @@ fn default_tag_annotation(default_tag_keys: &DefaultTagKeys, key: &str) -> Optio
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_update_rows<S, R: ReferenceEquality>(
+fn build_update_rows<S, D, R: ReferenceEquality>(
     historical: &HistoricalUpdateAttributes,
-    to: &crate::resource::Resource<S>,
+    to: &crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     changed_attributes: &[String],
     schema: Option<&ResourceSchema>,
     detail: DetailLevel,
@@ -1531,8 +1536,13 @@ fn project_from_attrs<R: ReferenceEquality>(
     }
 }
 
-fn build_attribute_diff_rows<S, R: ReferenceEquality>(
-    to: &crate::resource::Resource<S>,
+fn build_attribute_diff_rows<S, D, R: ReferenceEquality>(
+    to: &crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     to_attributes: &CanonicalComparisonAttributes,
     ctx: AttributeDiffContext<'_, R>,
 ) -> AttributeDiffRows {
@@ -1796,9 +1806,14 @@ fn build_attribute_diff_rows<S, R: ReferenceEquality>(
 /// effect. This helper owns the delete-index lookup so every renderer consumes
 /// the same masked historical view rather than reconstructing that lookup.
 #[allow(clippy::too_many_arguments)]
-pub fn build_replace_detail_rows_from_display<S>(
+pub fn build_replace_detail_rows_from_display<S, D>(
     plan: &Plan<S>,
-    to: &crate::resource::Resource<S>,
+    to: &crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     replacement: ReplaceDisplayInfo<'_>,
     historical_display: &HistoricalDisplayAttributes,
     registry: Option<&SchemaRegistry>,
@@ -1883,11 +1898,16 @@ pub fn build_replace_detail_rows_from_display<S>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_replace_rows_from_attributes<S, R: ReferenceEquality>(
+fn build_replace_rows_from_attributes<S, D, R: ReferenceEquality>(
     previous_attributes: &HashMap<String, Value>,
     stored_attributes: Option<&HashMap<String, Value>>,
     nested_write_only: &NestedWriteOnlyRecord,
-    to: &crate::resource::Resource<S>,
+    to: &crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     comparison_attributes: &CanonicalComparisonAttributes,
     changed_create_only: &[String],
     temporary_name: Option<&crate::effect::TemporaryName>,
@@ -3015,6 +3035,7 @@ fn string_list_inner_type<'a>(
             return None;
         }
         let result = match resolved.shape_ref_free().ok()? {
+            crate::schema::Shape::UnloadedSchemaType(_) => None,
             crate::schema::Shape::List {
                 element_type: inner,
                 ..
@@ -3055,12 +3076,16 @@ mod tests {
         ExpandedConcreteValue as ConcreteValue, ExpandedResource as Resource,
         ExpandedValue as Value, ResolvedResource, ResourceId, State,
     };
-    use std::collections::HashSet;
 
     #[allow(clippy::too_many_arguments)]
-    fn build_replace_detail_rows_from_display<S>(
+    fn build_replace_detail_rows_from_display<S, D>(
         plan: &Plan<S>,
-        to: &crate::resource::Resource<S>,
+        to: &crate::resource::Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
         replacement: ReplaceDisplayInfo<'_>,
         historical_display: &HistoricalDisplayAttributes,
         registry: Option<&SchemaRegistry>,
@@ -3141,7 +3166,7 @@ mod tests {
     }
 
     fn resolved(resource: Resource) -> ResolvedResource {
-        ResolvedResource::new(resource)
+        ResolvedResource::new(resource.with_dependency_phase(()))
     }
 
     fn rendered_key(key: &str) -> RenderedKey {
@@ -3411,9 +3436,9 @@ mod tests {
             generation: EffectGeneration::Current,
             directives: Default::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
         plan.replace_display_mut().push(ReplaceDisplayMetadata {
             create_idx: 0,
@@ -3472,7 +3497,7 @@ mod tests {
         let desired = Resource::new("test.Widget", "example")
             .with_attribute("password", secret("new-secret"));
         let id = desired.id.clone();
-        let to = ResolvedResource::resolve_with_schemas(desired.clone(), &registry)
+        let to = ResolvedResource::resolve_raw_fixture(desired.clone(), &registry)
             .expect("desired fixture resolves with its schema");
         let from = State::existing(
             id.clone(),
@@ -3743,7 +3768,7 @@ mod tests {
             crate::resource::ParsedIgnorePathSegment::Attribute("config".to_string()),
             crate::resource::ParsedIgnorePathSegment::Attribute("label".to_string()),
         ])];
-        let to = ResolvedResource::resolve_with_schemas(to, &registry)
+        let to = ResolvedResource::resolve_raw_fixture(to, &registry)
             .expect("ignore_changes path must resolve");
         let effect = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("widget-id"),
@@ -4316,9 +4341,9 @@ mod tests {
             generation: EffectGeneration::Current,
             directives: Default::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
         plan.replace_display_mut().push(ReplaceDisplayMetadata {
             create_idx: 0,
@@ -4532,9 +4557,9 @@ mod tests {
             generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: std::collections::HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         };
         let mut delete_attrs: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
         delete_attrs.insert(
@@ -4560,9 +4585,9 @@ mod tests {
             generation: EffectGeneration::Current,
             directives: Default::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         };
 
         let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
@@ -4634,9 +4659,9 @@ mod tests {
             generation: EffectGeneration::Current,
             directives: Default::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
         plan.replace_display_mut().push(ReplaceDisplayMetadata {
             create_idx: 0,
@@ -4689,9 +4714,9 @@ mod tests {
             generation: EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique()),
             directives: Default::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
         plan.replace_display_mut().push(ReplaceDisplayMetadata {
             create_idx: 0,
@@ -5289,9 +5314,9 @@ mod tests {
             generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: std::collections::HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         };
         let mut tags = IndexMap::new();
         tags.insert(
@@ -5337,9 +5362,9 @@ mod tests {
             generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: std::collections::HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         };
         let mut entry = IndexMap::new();
         entry.insert(

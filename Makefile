@@ -58,6 +58,8 @@ plan-replace-with-non-forcing-diffs:
 	$(PLAN_FIXTURE) replace_with_non_forcing_diffs
 plan-delete:
 	$(PLAN_FIXTURE) delete_orphan
+plan-legacy-orphan-unknown-destroy-ordering:
+	$(PLAN_FIXTURE) legacy_orphan_unknown_destroy_ordering
 plan-deposed-delete:
 	$(PLAN_FIXTURE) deposed_delete
 plan-deposed-delete-update-dependency:
@@ -435,7 +437,7 @@ plan-multi-instance-create:
 	$(PLAN_FIXTURE) multi_instance_create
 plan-multi-instance-module:
 	$(PLAN_FIXTURE) multi_instance_module
-.PHONY: plan-image plan-all-create plan-no-changes plan-state-only-directive-change plan-empty-explicit-children-no-changes plan-no-changes-enum plan-dynamic-enum-az-no-diff plan-route53-hosted-zone-name-strip-suffix-no-diff plan-mixed plan-image-module-cascade plan-image-reference-layout plan-image-anonymous plan-delete plan-deposed-delete plan-deposed-delete-update-dependency plan-delete-list-of-maps plan-compact plan-import-deferred-interpolation \
+.PHONY: plan-image plan-all-create plan-no-changes plan-state-only-directive-change plan-empty-explicit-children-no-changes plan-no-changes-enum plan-dynamic-enum-az-no-diff plan-route53-hosted-zone-name-strip-suffix-no-diff plan-mixed plan-image-module-cascade plan-image-reference-layout plan-image-anonymous plan-delete plan-legacy-orphan-unknown-destroy-ordering plan-deposed-delete plan-deposed-delete-update-dependency plan-delete-list-of-maps plan-compact plan-import-deferred-interpolation \
         plan-map-diff plan-replace-create-only plan-anonymous-create-only-rekey \
         plan-anonymous-old-identity-name-override plan-anonymous-old-identity-update \
         plan-anonymous-loop-insert-before plan-anonymous-loop-reorder \

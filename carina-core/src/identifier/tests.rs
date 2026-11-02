@@ -135,11 +135,17 @@ fn parse_loop_fixture(source: &str, file: &str) -> Vec<Resource> {
         &crate::parser::ProviderContext::default(),
     )
     .expect("valid loop fixture");
-    crate::module_resolver::resolve_modules_providerless(
-        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        Path::new("."),
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            crate::module_resolver::resolve_modules_providerless(
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                Path::new("."),
+                session,
+            )
+            .expect("loop fixture crosses the module-resolution seam")
+        },
     )
-    .expect("loop fixture crosses the module-resolution seam")
     .into_expanded(&crate::schema::SchemaRegistry::new())
     .expect("loop fixture contains no parser placeholders")
     .resources
@@ -1669,11 +1675,17 @@ fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
         &crate::parser::ProviderContext::default(),
     )
     .expect("the parser must preserve the authored use for typed validation");
-    let parsed = crate::module_resolver::resolve_modules_providerless(
-        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
-    )
-    .expect("the fixture crosses module resolution before readiness validation");
+    let parsed = crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            crate::module_resolver::resolve_modules_providerless(
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                std::path::Path::new("."),
+                session,
+            )
+            .expect("the fixture crosses module resolution before readiness validation")
+        },
+    );
     let error = crate::validation::resolve_bare_binding_uses(
         parsed,
         &SchemaRegistry::new(),
@@ -1687,6 +1699,46 @@ fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
             .to_string()
             .contains("'vpc' is a resource, not a value"),
         "unexpected error: {error}",
+    );
+}
+
+#[test]
+fn module_handle_dependency_does_not_change_anonymous_identity_hash() {
+    let schema = PatternResourceSchema::new("test.resource").attribute(
+        PatternAttributeSchema::optional("name", PatternAttributeType::string())
+            .create_only()
+            .build(),
+    );
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
+
+    let resource = || {
+        let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+        resource.set_attr("name".to_string(), concrete_string("anonymous-dependent"));
+        resource
+    };
+    let mut without_dependency = vec![resource()];
+    let mut with_dependency = vec![resource()];
+    with_dependency[0].dependencies.depends_on = crate::parser::UnexpandedDependencies::new(vec![
+        crate::parser::UnexpandedDependencyOperand::AttributeSelection {
+            binding: absolute_binding("producer"),
+            attribute: "validation_record".to_string(),
+        },
+    ]);
+
+    compute_anonymous_identifiers_for_test(&mut without_dependency, &[], &registry, &|_| {
+        Vec::new()
+    })
+    .expect("identity without a handle dependency");
+    compute_anonymous_identifiers_for_test(&mut with_dependency, &[], &registry, &|_| Vec::new())
+        .expect("identity with a module handle dependency");
+
+    assert_eq!(
+        with_dependency[0].id, without_dependency[0].id,
+        "dependency capabilities are graph metadata, never identity-hash input",
     );
 }
 
@@ -9088,7 +9140,7 @@ fn nested_loop_rewrite_uses_current_module_prefix_and_is_a_valid_move_target() {
     )
     .expect("rendered move target must parse");
     assert!(
-        check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &[] as &[Resource],)
+        check_legacy_loop_move_targets::<ModuleSource, _>(&parsed.state_blocks, &[] as &[Resource],)
             .is_empty(),
         "the suggested current-prefix target must not be classified as legacy",
     );
@@ -9112,10 +9164,15 @@ fn loop_conflict_suggestion_reserves_sibling_file_value_bindings() {
         &crate::parser::ProviderContext::default(),
     )
     .expect("directory parses");
-    let mut parsed = crate::module_resolver::resolve_modules_providerless(parsed, fixture.path())
-        .expect("directory fixture crosses the module-resolution seam")
-        .into_expanded(&crate::schema::SchemaRegistry::new())
-        .expect("directory fixture contains no parser placeholders");
+    let mut parsed = crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            crate::module_resolver::resolve_modules_providerless(parsed, fixture.path(), session)
+                .expect("directory fixture crosses the module-resolution seam")
+        },
+    )
+    .into_expanded(&crate::schema::SchemaRegistry::new())
+    .expect("directory fixture contains no parser placeholders");
     let registry = loop_identity_registry(false);
 
     let error =
@@ -9502,7 +9559,7 @@ import {
     );
 
     let errors =
-        check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &parsed.resources);
+        check_legacy_loop_move_targets::<ModuleSource, _>(&parsed.state_blocks, &parsed.resources);
 
     assert!(
         errors.is_empty(),
@@ -9544,7 +9601,7 @@ fn moved_to_rejects_an_orphaned_legacy_segment_below_a_regular_prefix() {
     .expect("moved block parses");
 
     let errors =
-        check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &[] as &[Resource]);
+        check_legacy_loop_move_targets::<ModuleSource, _>(&parsed.state_blocks, &[] as &[Resource]);
 
     assert_eq!(errors.len(), 1);
     assert!(errors[0].to_string().contains("net._for0[0]"));

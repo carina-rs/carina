@@ -1,10 +1,11 @@
-use std::io::{ErrorKind, IsTerminal};
+mod process_inputs;
+use std::io::ErrorKind;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
+use carina_cli::output_style::Colorize;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{CompleteEnv, Shell, generate};
-use colored::Colorize;
 
 use carina_cli::commands;
 use carina_cli::commands::apply::{run_apply, run_apply_from_plan};
@@ -19,7 +20,7 @@ use carina_cli::commands::skills;
 use carina_cli::commands::state::{StateCommands, run_force_unlock, run_state_command};
 use carina_cli::commands::validate::run_validate;
 use carina_cli::error;
-use carina_cli::plan_image::{ImageTheme, PlanImageTarget, resolve_plan_image_options};
+use carina_cli::plan_image::{ImageTheme, PlanImageTarget};
 use carina_cli::{DEFAULT_PARALLELISM, DetailLevel};
 
 /// Version string assembled at build time by `build.rs`. Formatted as
@@ -346,7 +347,7 @@ fn create_provider_context() -> carina_core::parser::ProviderContext {
         tokio::sync::OnceCell::const_new();
 
     carina_core::parser::ProviderContext {
-        decryptor: Some(Box::new(|ciphertext, key| {
+        decryptor: Some(std::sync::Arc::new(|ciphertext, key| {
             let ciphertext = ciphertext.to_string();
             let key = key.map(|k| k.to_string());
             tokio::task::block_in_place(|| {
@@ -382,32 +383,20 @@ async fn main() {
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
-    // Restore the terminal cursor on the panic path the command-wide
-    // `CursorGuard`'s `Drop` cannot reach (#3153, #3158).
-    carina_cli::cursor::install_panic_restore_hook();
-
     let cli = Cli::parse();
-    let trusted_local_env = std::env::var_os("CARINA_TRUST_LOCAL_PROVIDER");
-    carina_cli::wiring::set_trusted_local_grant_inputs(
-        cli.trust_local_provider.clone(),
-        trusted_local_env,
-    )
-    .expect("trusted local provider grant inputs are installed once at process startup");
+    let inputs = process_inputs::ProcessInputs::capture(cli.trust_local_provider.clone());
+    let color_mode = inputs.color_mode;
+    let cursor = inputs.cursor.clone();
+    install_panic_restore_hook(&cursor);
     let plan_images = match &cli.command {
         Commands::Plan {
             image,
             image_inline,
             image_theme,
             ..
-        } => match resolve_plan_image_options(
-            image.as_ref(),
-            *image_inline,
-            *image_theme,
-            |name| std::env::var(name).ok(),
-            std::io::stdout().is_terminal(),
-        ) {
+        } => match inputs.plan_image_options(image.as_ref(), *image_inline, *image_theme) {
             Ok(images) => images,
-            Err(error) => handle_app_error(error.into()),
+            Err(error) => handle_app_error(color_mode, &cursor, error.into()),
         },
         _ => Default::default(),
     };
@@ -420,9 +409,9 @@ async fn main() {
     // after `Cli::parse()` because that exits the process itself on
     // --help/--version/parse error, so those paths must not hide; and
     // before dispatch so all user-visible output runs cursor-hidden.
-    let _cursor_guard = carina_cli::cursor::CursorGuard::progress();
+    let _cursor_guard = carina_cli::cursor::CursorGuard::progress(&cursor);
 
-    let completion = carina_cli::signal::run_with_shutdown(|shutdown| async move {
+    let completion = carina_cli::signal::run_with_shutdown(&cursor, |shutdown| async move {
         // Handle Plan separately since it returns Result<bool, String>
         if let Commands::Plan {
             path,
@@ -439,12 +428,15 @@ async fn main() {
             strict_iam,
         } = cli.command
         {
-            let user_dirs = match resolve_user_dirs() {
-                Ok(user_dirs) => user_dirs,
-                Err(error) => return CommandCompletion::Error(error),
+            let runtime = match resolve_user_dirs()
+                .map_err(Box::new)
+                .and_then(|dirs| inputs.runtime(dirs))
+            {
+                Ok(runtime) => runtime,
+                Err(error) => return CommandCompletion::Error(*error),
             };
             match run_plan(
-                &user_dirs,
+                &runtime,
                 &path,
                 out.as_deref(),
                 plan_images.file(),
@@ -474,8 +466,10 @@ async fn main() {
         let result: Result<(), error::AppError> = async {
             match cli.command {
                 Commands::Validate { path, json } => {
-                    let user_dirs = resolve_user_dirs()?;
-                    run_validate(&user_dirs, &path, json, &provider_context)
+                    let runtime = inputs
+                        .runtime(resolve_user_dirs()?)
+                        .map_err(|error| *error)?;
+                    run_validate(&runtime, &path, json, &provider_context)
                 }
                 Commands::Plan { .. } => unreachable!(),
                 Commands::Apply {
@@ -485,11 +479,13 @@ async fn main() {
                     parallelism,
                     accept_legacy_name_overrides,
                 } => {
-                    let user_dirs = resolve_user_dirs()?;
+                    let runtime = inputs
+                        .runtime(resolve_user_dirs()?)
+                        .map_err(|error| *error)?;
                     match classify_apply_input(&path) {
                         Ok(ApplyInput::SavedPlan(plan_path)) => {
                             run_apply_from_plan(
-                                &user_dirs,
+                                &runtime,
                                 plan_path,
                                 auto_approve,
                                 lock,
@@ -501,7 +497,7 @@ async fn main() {
                             .await
                         }
                         Ok(ApplyInput::Project(project_path)) => run_apply(
-                            &user_dirs,
+                            &runtime,
                             project_path,
                             auto_approve,
                             lock,
@@ -523,9 +519,11 @@ async fn main() {
                     force,
                     parallelism,
                 } => {
-                    let user_dirs = resolve_user_dirs()?;
+                    let runtime = inputs
+                        .runtime(resolve_user_dirs()?)
+                        .map_err(|error| *error)?;
                     run_destroy(
-                        &user_dirs,
+                        &runtime,
                         &path,
                         auto_approve,
                         lock,
@@ -553,6 +551,7 @@ async fn main() {
                     };
                     let path = PathBuf::from(".");
                     commands::export::run_export(
+                        color_mode,
                         &path,
                         state_url.as_deref(),
                         name,
@@ -568,23 +567,22 @@ async fn main() {
                     diff,
                     recursive,
                 } => {
-                    let user_dirs = resolve_user_dirs()?;
-                    run_fmt(
-                        &user_dirs,
-                        &path,
-                        FmtMode::from_flags(check, diff),
-                        recursive,
-                    )
+                    let runtime = inputs
+                        .runtime(resolve_user_dirs()?)
+                        .map_err(|error| *error)?;
+                    run_fmt(&runtime, &path, FmtMode::from_flags(check, diff), recursive)
                 }
                 Commands::Module { command } => run_module_command(command, &provider_context),
                 Commands::ForceUnlock { lock_id, path } => {
-                    run_force_unlock(&lock_id, &path, &provider_context).await
+                    run_force_unlock(color_mode, &lock_id, &path, &provider_context).await
                 }
                 Commands::State { command } => {
-                    let user_dirs = resolve_user_dirs()?;
+                    let runtime = inputs
+                        .runtime(resolve_user_dirs()?)
+                        .map_err(|error| *error)?;
                     let project_dir = command.project_dir().map(Path::to_path_buf);
                     let result =
-                        run_state_command(&user_dirs, command, &provider_context, shutdown.clone())
+                        run_state_command(&runtime, command, &provider_context, shutdown.clone())
                             .await;
                     match project_dir {
                         Some(project_dir) => {
@@ -602,23 +600,19 @@ async fn main() {
                     migrate_state,
                     force,
                 } => {
-                    let user_dirs = resolve_user_dirs()?;
-                    commands::init::run_init(
-                        &user_dirs,
-                        &path,
-                        upgrade,
-                        locked,
-                        migrate_state,
-                        force,
-                        &accept_egress,
-                    )
-                    .await
-                    .map_err(error::AppError::from)
-                    .map_err(|error| error.with_project_dir(&path))
+                    let runtime = inputs
+                        .init_runtime(resolve_user_dirs()?, &path, &accept_egress)
+                        .map_err(|error| *error)?;
+                    commands::init::run_init(&runtime, &path, upgrade, locked, migrate_state, force)
+                        .await
+                        .map_err(error::AppError::from)
+                        .map_err(|error| error.with_project_dir(&path))
                 }
                 Commands::Lint { path } => {
-                    let user_dirs = resolve_user_dirs()?;
-                    run_lint(&user_dirs, &path, &provider_context)
+                    let runtime = inputs
+                        .runtime(resolve_user_dirs()?)
+                        .map_err(|error| *error)?;
+                    run_lint(&runtime, &path, &provider_context)
                 }
                 Commands::Completions { shell } => {
                     generate(shell, &mut Cli::command(), "carina", &mut std::io::stdout());
@@ -689,11 +683,25 @@ async fn main() {
         CommandCompletion::Success => {}
         CommandCompletion::Exit(code) => {
             // process::exit skips Drop — restore the cursor first (#3158).
-            carina_cli::cursor::restore_cursor();
+            cursor.restore();
             std::process::exit(code);
         }
-        CommandCompletion::Error(error) => handle_app_error(error),
+        CommandCompletion::Error(error) => handle_app_error(color_mode, &cursor, error),
     }
+}
+
+/// The executable alone installs a process-wide panic hook. Unit tests invoke
+/// CursorState's restoration callback directly; actual hooks run in children.
+fn install_panic_restore_hook(cursor: &carina_cli::cursor::CursorState) {
+    if carina_cli::cursor::progress_mode() != carina_cli::cursor::ProgressMode::Tty {
+        return;
+    }
+    let cursor = cursor.clone();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        cursor.restore();
+        previous(info);
+    }));
 }
 
 /// A completed command's requested process outcome.
@@ -716,7 +724,10 @@ struct AppErrorRendering {
 
 /// Pure rendering of `AppError`. Split out from `handle_app_error` so
 /// the formatting can be tested without invoking `process::exit`.
-fn render_app_error(e: &error::AppError) -> AppErrorRendering {
+fn render_app_error(
+    color_mode: carina_cli::output_style::ColorMode,
+    e: &error::AppError,
+) -> AppErrorRendering {
     match e {
         error::AppError::Interrupted => AppErrorRendering {
             stderr: String::new(),
@@ -737,18 +748,21 @@ fn render_app_error(e: &error::AppError) -> AppErrorRendering {
                         }
                     });
             AppErrorRendering {
-                stderr: format_error_lines(&body),
+                stderr: format_error_lines(color_mode, &body),
                 exit_code: 1,
             }
         }
         error::AppError::PartialSuccess(message) => AppErrorRendering {
-            stderr: format_error_lines(message),
+            stderr: format_error_lines(color_mode, message),
             exit_code: 2,
         },
         error::AppError::StateBucketSeed(seed_error) => {
             let stderr = format!(
                 "{}\nimport {{\n  to = {}\n  id = {}\n}}\n",
-                format_error_lines(&error::format_error_with_source_chain(seed_error.as_ref())),
+                format_error_lines(
+                    color_mode,
+                    &error::format_error_with_source_chain(seed_error.as_ref())
+                ),
                 seed_error.resource_address(),
                 carina_core::parser::display_string_literal(seed_error.identifier()),
             );
@@ -758,7 +772,7 @@ fn render_app_error(e: &error::AppError) -> AppErrorRendering {
             }
         }
         _ => AppErrorRendering {
-            stderr: format_error_lines(&error::format_error_with_source_chain(e)),
+            stderr: format_error_lines(color_mode, &error::format_error_with_source_chain(e)),
             exit_code: 1,
         },
     }
@@ -768,20 +782,24 @@ fn render_app_error(e: &error::AppError) -> AppErrorRendering {
 /// the structured account-guard rendering when the message shape
 /// matches; everything else falls through to the generic `Error: ...`
 /// formatter (#2407).
-fn handle_app_error(e: error::AppError) -> ! {
+fn handle_app_error(
+    color_mode: carina_cli::output_style::ColorMode,
+    cursor: &carina_cli::cursor::CursorState,
+    e: error::AppError,
+) -> ! {
     // `process::exit` runs no destructors, so the command-wide CursorGuard
     // would never restore the cursor on the error path — restore it here
     // first (#3158). Claim-once, so this is harmless if a guard also ran.
-    carina_cli::cursor::restore_cursor();
-    let rendering = render_app_error(&e);
+    cursor.restore();
+    let rendering = render_app_error(color_mode, &e);
     if !rendering.stderr.is_empty() {
         eprint!("{}", rendering.stderr);
     }
     std::process::exit(rendering.exit_code);
 }
 
-fn format_error_lines(msg: &str) -> String {
-    let prefix = "Error:".red().bold().to_string();
+fn format_error_lines(color_mode: carina_cli::output_style::ColorMode, msg: &str) -> String {
+    let prefix = "Error:".red(color_mode).bold(color_mode).to_string();
     msg.lines()
         .map(|line| format!("{} {}\n", prefix, line))
         .collect()
@@ -832,22 +850,25 @@ mod error_format_tests {
 
     #[test]
     fn single_line_error_has_prefix() {
-        colored::control::set_override(false);
-        let result = format_error_lines("something went wrong");
+        let color_mode = carina_cli::output_style::ColorMode::Plain;
+
+        let result = format_error_lines(color_mode, "something went wrong");
         assert_eq!(result, "Error: something went wrong\n");
     }
 
     #[test]
     fn multi_line_error_each_line_has_prefix() {
-        colored::control::set_override(false);
-        let result = format_error_lines("first error\nsecond error");
+        let color_mode = carina_cli::output_style::ColorMode::Plain;
+
+        let result = format_error_lines(color_mode, "first error\nsecond error");
         assert_eq!(result, "Error: first error\nError: second error\n");
     }
 
     #[test]
     fn binding_use_error_renders_context_and_typed_source_once() {
-        colored::control::set_override(false);
-        let rendered = render_app_error(&binding_use_app_error());
+        let color_mode = carina_cli::output_style::ColorMode::Plain;
+
+        let rendered = render_app_error(color_mode, &binding_use_app_error());
 
         assert!(
             rendered.stderr.contains("Error: test.crn at line 2\n"),
@@ -880,14 +901,15 @@ mod error_format_tests {
 
     #[test]
     fn state_bucket_seed_error_renders_source_and_pasteable_import_block() {
-        colored::control::set_override(false);
+        let color_mode = carina_cli::output_style::ColorMode::Plain;
+
         let error = error::AppError::StateBucketSeed(Box::new(error::StateBucketSeedError::new(
             "state'bucket".to_string(),
             "aws.s3.Bucket 'state_bucket'".to_string(),
             carina_state::BackendError::Configuration("seed write failed".to_string()),
         )));
 
-        let rendered = render_app_error(&error);
+        let rendered = render_app_error(color_mode, &error);
 
         assert_eq!(rendered.exit_code, 1);
         let lead_in =
@@ -957,7 +979,8 @@ mod error_format_tests {
 
     #[test]
     fn provider_account_guard_renders_structured_block() {
-        colored::control::set_override(false);
+        let color_mode = carina_cli::output_style::ColorMode::Plain;
+
         let pe = carina_core::provider::ProviderError::invalid_input(
             "AWS account ID '019115212452' \
              is not in the provider's allowed_account_ids [\"151116838382\"]. \
@@ -965,7 +988,7 @@ mod error_format_tests {
              Check the AWS credentials in your environment.",
         );
         let app_err: error::AppError = pe.into();
-        let r = render_app_error(&app_err);
+        let r = render_app_error(color_mode, &app_err);
         assert_eq!(r.exit_code, 1);
         assert!(
             r.stderr.contains("AWS account mismatch"),
@@ -1008,7 +1031,8 @@ mod error_format_tests {
 
     #[test]
     fn decoded_provider_initialization_account_guard_renders_structured_block() {
-        colored::control::set_override(false);
+        let color_mode = carina_cli::output_style::ColorMode::Plain;
+
         const AWS_MESSAGE: &str = "AWS account ID 019115212452 is not in allowed_account_ids \
             [\"151116838382\"]; refusing to operate against this account";
         const AWSCC_MESSAGE: &str = "AWS account ID '019115212452' is not in the provider's \
@@ -1023,7 +1047,7 @@ mod error_format_tests {
                     .for_provider(provider_name);
             assert_eq!(pe.detail().operation.as_deref(), Some("initialize"));
             let app_err: error::AppError = pe.into();
-            let rendered = render_app_error(&app_err);
+            let rendered = render_app_error(color_mode, &app_err);
 
             assert!(
                 rendered.stderr.contains("AWS account mismatch"),
@@ -1043,15 +1067,16 @@ mod error_format_tests {
 
     #[test]
     fn provider_non_account_guard_falls_back_to_plain_error() {
+        let color_mode = carina_cli::output_style::ColorMode::Plain;
         // Generic provider init failures (invalid region, missing
         // credentials chain, etc.) must still be surfaced — just not
         // through the structured account-guard renderer.
-        colored::control::set_override(false);
+
         let pe = carina_core::provider::ProviderError::invalid_input(
             "failed to load AWS credentials from the environment",
         );
         let app_err: error::AppError = pe.into();
-        let r = render_app_error(&app_err);
+        let r = render_app_error(color_mode, &app_err);
         assert_eq!(r.exit_code, 1);
         assert!(
             r.stderr.starts_with("Error: "),
@@ -1077,13 +1102,14 @@ mod error_format_tests {
 
     #[test]
     fn decoded_provider_initialization_fallback_names_provider_and_phase() {
-        colored::control::set_override(false);
+        let color_mode = carina_cli::output_style::ColorMode::Plain;
+
         let pe = carina_plugin_host::wasm_factory::decode_initialize_string_error_for_test(
             "failed to load AWS credentials from the environment",
         )
         .for_provider("awscc");
 
-        let rendered = render_app_error(&error::AppError::Provider(pe));
+        let rendered = render_app_error(color_mode, &error::AppError::Provider(pe));
 
         assert_eq!(
             rendered.stderr,
@@ -1095,13 +1121,14 @@ mod error_format_tests {
 
     #[test]
     fn non_initialization_provider_error_does_not_add_provider_header() {
-        colored::control::set_override(false);
+        let color_mode = carina_cli::output_style::ColorMode::Plain;
+
         let pe = carina_core::provider::ProviderError::invalid_input(
             "failed to encode default tag for provider 'aws'",
         )
         .for_provider("aws");
 
-        let rendered = render_app_error(&error::AppError::Provider(pe));
+        let rendered = render_app_error(color_mode, &error::AppError::Provider(pe));
 
         assert_eq!(
             rendered.stderr,
@@ -1111,11 +1138,12 @@ mod error_format_tests {
 
     #[test]
     fn provider_account_guard_uses_attached_provider_name() {
+        let color_mode = carina_cli::output_style::ColorMode::Plain;
         // When the wiring layer has attached a provider name via
         // ProviderError::for_provider, the structured renderer uses
         // it instead of the "aws" default. Catches awscc-vs-aws
         // mislabeling.
-        colored::control::set_override(false);
+
         let pe = carina_core::provider::ProviderError::invalid_input(
             "AWS account ID '019115212452' \
              is not in the provider's allowed_account_ids [\"151116838382\"]. \
@@ -1123,7 +1151,7 @@ mod error_format_tests {
         )
         .for_provider("awscc");
         let app_err: error::AppError = pe.into();
-        let r = render_app_error(&app_err);
+        let r = render_app_error(color_mode, &app_err);
         assert!(
             r.stderr.contains("Provider:    awscc"),
             "provider label not picked up from ProviderError: {}",
@@ -1133,7 +1161,8 @@ mod error_format_tests {
 
     #[test]
     fn interrupted_error_renders_quietly_with_sigint_exit_code() {
-        let r = render_app_error(&error::AppError::Interrupted);
+        let color_mode = carina_cli::output_style::ColorMode::Plain;
+        let r = render_app_error(color_mode, &error::AppError::Interrupted);
         assert_eq!(r.exit_code, 130);
         assert!(r.stderr.is_empty(), "interrupted stderr: {}", r.stderr);
     }
@@ -1260,9 +1289,14 @@ mod error_format_tests {
         else {
             panic!("expected plan command");
         };
-        let error =
-            resolve_plan_image_options(image.as_ref(), image_inline, image_theme, |_| None, false)
-                .unwrap_err();
+        let error = carina_cli::plan_image::resolve_plan_image_options(
+            image.as_ref(),
+            image_inline,
+            image_theme,
+            |_| None,
+            false,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             error,
@@ -1501,5 +1535,70 @@ mod error_format_tests {
             ])
             .is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod cursor_abort_tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn installed_panic_hook_restores_cursor_before_child_abort() {
+        const CHILD: &str = "CARINA_CURSOR_ABORT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // This branch only runs in the explicitly spawned child process.
+            let limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe {
+                libc::setrlimit(libc::RLIMIT_CORE, &limit);
+            }
+            let cursor = carina_cli::cursor::CursorState::new();
+            let _guard = carina_cli::cursor::CursorGuard::progress(&cursor);
+            std::panic::set_hook(Box::new(|_| std::process::abort()));
+            install_panic_restore_hook(&cursor);
+            panic!("exercise restoration before abort without unwinding");
+        }
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = portable_pty::CommandBuilder::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "cursor_abort_tests::installed_panic_hook_restores_cursor_before_child_abort",
+            "--nocapture",
+        ]);
+        command.env(CHILD, "1");
+        let mut child = pair.slave.spawn_command(command).unwrap();
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let reading = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            // Unix PTYs can finish with EIO after delivering the final bytes.
+            let _ = reader.read_to_end(&mut output);
+            sent.send(output).unwrap();
+        });
+        // wall-clock-ok: original 10s hang guard for a real PTY child to abort and close its output.
+        let output = received
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap_or_else(|error| {
+                let _ = child.kill();
+                panic!("cursor abort child did not finish: {error}");
+            });
+        let status = child.wait().unwrap();
+        reading.join().unwrap();
+        assert!(!status.success());
+        let output = String::from_utf8_lossy(&output);
+        assert_eq!(output.matches("\x1b[?25l").count(), 1, "{output:?}");
+        assert_eq!(output.matches("\x1b[?25h").count(), 1, "{output:?}");
+        assert!(output.find("\x1b[?25l") < output.find("\x1b[?25h"));
     }
 }

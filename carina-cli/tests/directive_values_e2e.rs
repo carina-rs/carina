@@ -243,7 +243,7 @@ fn saved_defaulted_loop_opt_out_is_rejected_after_iterable_materializes() {
     let saved: serde_json::Value =
         serde_json::from_slice(&fs::read(scenario.0.path().join("deferred.plan")).unwrap())
             .unwrap();
-    assert_eq!(saved["version"], 38);
+    assert_eq!(saved["version"], 39);
     assert!(
         saved["plan"]["effects"]
             .as_array()

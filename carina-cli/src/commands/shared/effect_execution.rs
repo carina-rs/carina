@@ -1,5 +1,6 @@
 //! Helpers for executing import and state-only effects with user feedback.
 
+use crate::output_style::Colorize;
 use carina_core::effect::{Effect, resolve_import_identifier};
 use carina_core::executor::{
     EffectFailureKind, ExecutionCheckpointSink, ExecutionObserver, ExecutionResult,
@@ -8,7 +9,6 @@ use carina_core::executor::{
 use carina_core::plan::Plan;
 use carina_core::provider::{AppliedIdentifier, Provider, ReadRequest};
 use carina_core::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
-use colored::Colorize;
 
 /// Owns all result mutation for one import iteration and publishes at most one
 /// checkpoint when the iteration leaves scope, including through `continue`.
@@ -75,6 +75,7 @@ fn record_import_failure<S: Clone>(
 /// to fetch the current state and stores the result in applied_states
 /// so that finalize_apply can persist it.
 pub(crate) async fn execute_import_effects<S: Clone>(
+    color_mode: crate::output_style::ColorMode,
     plan: &Plan<S>,
     provider: &dyn Provider,
     result: &mut ExecutionResult<S>,
@@ -159,7 +160,7 @@ pub(crate) async fn execute_import_effects<S: Clone>(
             };
             println!(
                 "  {} Importing {} (id: {})...",
-                "<-".cyan(),
+                "<-".cyan(color_mode),
                 id,
                 identifier_display
             );
@@ -172,7 +173,7 @@ pub(crate) async fn execute_import_effects<S: Clone>(
                 Ok(outcome) => {
                     let state = outcome.into_state();
                     if state.exists {
-                        println!("  {} Imported {}", "✓".green(), id);
+                        println!("  {} Imported {}", "✓".green(color_mode), id);
                         iteration.mutate(|result| {
                             result.applied_states.insert(
                                 id.clone().into_inner(),
@@ -218,12 +219,22 @@ pub(crate) async fn execute_import_effects<S: Clone>(
 /// token here is now a neutral `~` and the operation name
 /// (`removed-from-state`) carries the meaning, so a state-only
 /// success line can never be misread as a failure.
-fn format_state_only_effect_line<S>(effect: &Effect<S>) -> Option<String> {
+fn format_state_only_effect_line<S>(
+    color_mode: crate::output_style::ColorMode,
+    effect: &Effect<S>,
+) -> Option<String> {
     match effect {
-        Effect::Remove { id } => Some(format!("  {} removed-from-state {}", "~".yellow(), id)),
-        Effect::Move { from, to, .. } => {
-            Some(format!("  {} Moving {} -> {}", "->".yellow(), from, to))
-        }
+        Effect::Remove { id } => Some(format!(
+            "  {} removed-from-state {}",
+            "~".yellow(color_mode),
+            id
+        )),
+        Effect::Move { from, to, .. } => Some(format!(
+            "  {} Moving {} -> {}",
+            "->".yellow(color_mode),
+            from,
+            to
+        )),
         Effect::ReleaseListKeys {
             id,
             attribute,
@@ -231,7 +242,7 @@ fn format_state_only_effect_line<S>(effect: &Effect<S>) -> Option<String> {
             ..
         } => Some(format!(
             "  {} Released {} key{} from authored state for {}.{}",
-            "!".yellow(),
+            "!".yellow(color_mode),
             keys.len(),
             if keys.len() == 1 { "" } else { "s" },
             id,
@@ -254,10 +265,13 @@ fn format_state_only_effect_line<S>(effect: &Effect<S>) -> Option<String> {
 ///
 /// State writeback applies these effects to every checkpoint and to the final
 /// state; this function only emits their user-facing output.
-pub(crate) fn execute_state_only_effects<S>(plan: &Plan<S>) -> usize {
+pub(crate) fn execute_state_only_effects<S>(
+    color_mode: crate::output_style::ColorMode,
+    plan: &Plan<S>,
+) -> usize {
     let mut completed = 0;
     for effect in plan.effects() {
-        if let Some(line) = format_state_only_effect_line(effect) {
+        if let Some(line) = format_state_only_effect_line(color_mode, effect) {
             println!("{}", line);
             completed += 1;
         }
@@ -431,6 +445,7 @@ mod tests {
     /// gates that path.
     #[tokio::test]
     async fn execute_import_effects_rejects_deferred_identifier_without_calling_provider() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let id = ResourceId::with_identity("aws.route53.RecordSet", "r");
         let deferred = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
@@ -452,6 +467,7 @@ mod tests {
         let recorder = ReadRecorder::new();
         let mut result = empty_result();
         execute_import_effects(
+            color_mode,
             &plan,
             &recorder,
             &mut result,
@@ -485,6 +501,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_failures_report_real_plan_position_and_total() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         struct ProgressRecorder(Mutex<Vec<(usize, usize)>>);
         impl ExecutionObserver for ProgressRecorder {
             fn on_event(&self, event: &carina_core::executor::ExecutionEvent<'_>) {
@@ -512,6 +529,7 @@ mod tests {
         // These effects completed in the executor before the import phase.
         result.success_count = 2;
         execute_import_effects(
+            color_mode,
             &plan,
             &ReadRecorder::new(),
             &mut result,
@@ -527,6 +545,7 @@ mod tests {
     /// A concrete-string identifier still flows through to the provider unchanged.
     #[tokio::test]
     async fn execute_import_effects_passes_concrete_identifier_through() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let id = ResourceId::with_identity("aws.s3.Bucket", "b");
         let mut plan = Plan::new();
         plan.add(Effect::Import {
@@ -537,6 +556,7 @@ mod tests {
         let recorder = ReadRecorder::new();
         let mut result = empty_result();
         execute_import_effects(
+            color_mode,
             &plan,
             &recorder,
             &mut result,
@@ -559,15 +579,17 @@ mod tests {
     /// the rendered line contains no `x` / `✗` glyph at all.
     #[test]
     fn remove_effect_line_has_no_failure_shaped_glyph() {
-        colored::control::set_override(true);
+        let color_mode = crate::output_style::ColorMode::Ansi;
+
         let id =
             ResourceId::with_identity("aws.route53.RecordSet", "aws_route53_record_set_7059de08");
-        let line =
-            format_state_only_effect_line(&Effect::<carina_core::resource::ModuleSource>::Remove {
+        let line = format_state_only_effect_line(
+            color_mode,
+            &Effect::<carina_core::resource::ModuleSource>::Remove {
                 id: carina_core::resource::ResolvedResourceId::new(id.clone()),
-            })
-            .expect("Remove must render a line");
-        colored::control::unset_override();
+            },
+        )
+        .expect("Remove must render a line");
 
         // No literal `x` or `✗` anywhere — the leading token and the
         // word `removed-from-state` are both x-free.
@@ -598,17 +620,19 @@ mod tests {
     /// does not change it by accident.
     #[test]
     fn move_effect_line_format_is_unchanged() {
-        colored::control::set_override(false);
+        let color_mode = crate::output_style::ColorMode::Plain;
+
         let from = ResourceId::with_identity("aws.s3.Bucket", "old");
         let to = ResourceId::with_identity("aws.s3.Bucket", "new");
-        let line =
-            format_state_only_effect_line(&Effect::<carina_core::resource::ModuleSource>::Move {
+        let line = format_state_only_effect_line(
+            color_mode,
+            &Effect::<carina_core::resource::ModuleSource>::Move {
                 from: carina_core::resource::ResolvedResourceId::new(from.clone()),
                 to: carina_core::resource::ResolvedResourceId::new(to.clone()),
                 origin: None,
-            })
-            .expect("Move must render a line");
-        colored::control::unset_override();
+            },
+        )
+        .expect("Move must render a line");
 
         assert_eq!(line, format!("  -> Moving {} -> {}", from, to));
     }

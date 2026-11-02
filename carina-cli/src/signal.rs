@@ -21,11 +21,11 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use crate::error::AppError;
 
-struct ProcessExit;
+struct ProcessExit(crate::cursor::CursorState);
 
 impl ExitProcess for ProcessExit {
     fn exit(&self, code: i32) {
-        crate::cursor::restore_cursor();
+        self.0.restore();
         std::process::exit(code);
     }
 }
@@ -75,13 +75,13 @@ impl ShutdownEvents for SignalEvents {
 }
 
 /// Run a command under unified SIGINT/SIGTERM supervision.
-pub async fn run_with_shutdown<F, Fut, T>(command: F) -> T
+pub async fn run_with_shutdown<F, Fut, T>(cursor: &crate::cursor::CursorState, command: F) -> T
 where
     F: FnOnce(ShutdownToken) -> Fut,
     Fut: Future<Output = T>,
 {
     let events = SignalEvents::unix().expect("install unix signal handlers");
-    match supervise_shutdown_events(command, events, ProcessExit).await {
+    match supervise_shutdown_events(command, events, ProcessExit(cursor.clone())).await {
         Supervised::Completed(output) => output,
         Supervised::ExitRequested(_) => {
             unreachable!("ProcessExit must not return after std::process::exit")
@@ -207,7 +207,7 @@ mod tests {
         assert_eq!(*exit_calls.lock().unwrap(), vec![130]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn second_signal_during_cleanup_does_not_exit_before_state_flush_and_lock_release() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let state_flushed = Arc::new(AtomicBool::new(false));
@@ -430,6 +430,7 @@ mod tests {
             exit,
         ));
 
+        // wall-clock-ok: all callers pause Tokio time; this helper bounds supervisor liveness on that clock.
         let outcome = tokio::time::timeout(CLEANUP_DEADLINE + Duration::from_secs(1), supervisor)
             .await
             .expect("a closed signal stream must retain a cleanup deadline")

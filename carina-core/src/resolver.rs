@@ -34,6 +34,7 @@ use crate::resource::{
 pub fn resolve_refs_with_state(
     resources: &mut [Resource],
     managed_current: &HashMap<ResourceId, PlanInputCurrent>,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<(), String> {
     let bindings = crate::binding_index::ResolvedBindings::pre_apply_live(
         crate::binding_index::LivePreApplyInputs {
@@ -45,7 +46,7 @@ pub fn resolve_refs_with_state(
             wait_aliases: &[],
         },
     );
-    resolve_refs_with_state_and_remote(resources, &bindings)
+    resolve_refs_with_state_and_remote(resources, &bindings, config)
 }
 
 /// Resolve all `ResourceRef` values in `resources` against a
@@ -64,8 +65,14 @@ pub fn resolve_refs_with_state(
 pub fn resolve_refs_with_state_and_remote(
     resources: &mut [Resource],
     bindings: &ResolvedBindings,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<(), String> {
-    resolve_refs_inner(resources, bindings, &std::collections::HashSet::new())
+    resolve_refs_inner(
+        resources,
+        bindings,
+        &std::collections::HashSet::new(),
+        config,
+    )
 }
 
 /// Plan-only counterpart of [`resolve_refs_with_state_and_remote`].
@@ -78,14 +85,16 @@ pub fn resolve_refs_for_plan(
     resources: &mut [Resource],
     bindings: &ResolvedBindings,
     unresolved_upstream_bindings: &std::collections::HashSet<&str>,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<(), String> {
-    resolve_refs_inner(resources, bindings, unresolved_upstream_bindings)
+    resolve_refs_inner(resources, bindings, unresolved_upstream_bindings, config)
 }
 
 fn resolve_refs_inner(
     resources: &mut [Resource],
     bindings: &ResolvedBindings,
     unresolved_upstream_bindings: &std::collections::HashSet<&str>,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<(), String> {
     // Save dependency bindings before resolution destroys ResourceRef values.
     // This metadata is used by plan tree building to recover parent-child
@@ -104,7 +113,7 @@ fn resolve_refs_inner(
             AbsoluteBindingAddress,
         >::Resource(resource));
         if !deps.is_empty() {
-            resource.dependency_bindings = deps.into_iter().collect();
+            resource.dependencies.value_bindings = deps.into_iter().collect();
         }
     }
 
@@ -116,7 +125,7 @@ fn resolve_refs_inner(
     for resource in resources.iter_mut() {
         let mut resolved_attrs: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
         for (key, value) in &resource.attributes {
-            let resolved = resolve_ref_value(value, bindings)?;
+            let resolved = resolve_ref_value(value, bindings, config)?;
             let final_value = if mark_unresolved_upstream {
                 stamp_unresolved_upstream(resolved, unresolved_upstream_bindings)
                     .map_err(|error| error.to_string())?
@@ -150,8 +159,9 @@ fn resolve_refs_inner(
 pub fn resolve_managed_refs_with_state_and_remote(
     managed: &mut [Resource],
     bindings: &ResolvedBindings,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<(), String> {
-    resolve_refs_inner(managed, bindings, &std::collections::HashSet::new())
+    resolve_refs_inner(managed, bindings, &std::collections::HashSet::new(), config)
 }
 
 /// Resolve `ResourceRef` values in a slice of [`DataSource`]s against
@@ -166,8 +176,14 @@ pub fn resolve_managed_refs_with_state_and_remote(
 pub fn resolve_data_source_refs(
     data_sources: &mut [DataSource],
     bindings: &ResolvedBindings,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<(), String> {
-    resolve_data_source_refs_inner(data_sources, bindings, &std::collections::HashSet::new())
+    resolve_data_source_refs_inner(
+        data_sources,
+        bindings,
+        &std::collections::HashSet::new(),
+        config,
+    )
 }
 
 /// Plan-only counterpart of [`resolve_data_source_refs`]. Mirrors
@@ -178,14 +194,16 @@ pub fn resolve_data_source_refs_for_plan(
     data_sources: &mut [DataSource],
     bindings: &ResolvedBindings,
     unresolved_upstream_bindings: &std::collections::HashSet<&str>,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<(), String> {
-    resolve_data_source_refs_inner(data_sources, bindings, unresolved_upstream_bindings)
+    resolve_data_source_refs_inner(data_sources, bindings, unresolved_upstream_bindings, config)
 }
 
 fn resolve_data_source_refs_inner(
     data_sources: &mut [DataSource],
     bindings: &ResolvedBindings,
     unresolved_upstream_bindings: &std::collections::HashSet<&str>,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<(), String> {
     for data_source in data_sources.iter_mut() {
         let deps =
@@ -202,14 +220,14 @@ fn resolve_data_source_refs_inner(
                 AbsoluteBindingAddress,
             >::DataSource(data_source));
         if !deps.is_empty() {
-            data_source.dependency_bindings = deps.into_iter().collect();
+            data_source.dependencies.value_bindings = deps.into_iter().collect();
         }
     }
     let mark_unresolved_upstream = !unresolved_upstream_bindings.is_empty();
     for data_source in data_sources.iter_mut() {
         let mut resolved_attrs: IndexMap<String, Value> = IndexMap::new();
         for (key, value) in &data_source.attributes {
-            let resolved = resolve_ref_value(value, bindings)?;
+            let resolved = resolve_ref_value(value, bindings, config)?;
             let final_value = if mark_unresolved_upstream {
                 stamp_unresolved_upstream(resolved, unresolved_upstream_bindings)
                     .map_err(|error| error.to_string())?
@@ -240,9 +258,11 @@ fn resolve_data_source_refs_inner(
 pub fn resolve_live_composition_refs_post_apply(
     compositions: &mut [LiveComposition],
     bindings: &ResolvedBindings,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<(), String> {
     for v in compositions.iter_mut() {
-        v.signature.attributes = resolve_composition_attributes(&v.signature.attributes, bindings)?;
+        v.signature.attributes =
+            resolve_composition_attributes(&v.signature.attributes, bindings, config)?;
     }
     Ok(())
 }
@@ -250,22 +270,23 @@ pub fn resolve_live_composition_refs_post_apply(
 pub fn resolve_saved_composition_refs_post_apply(
     compositions: &mut [crate::resource::SavedComposition],
     bindings: &ResolvedBindings,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<(), String> {
     for composition in compositions {
         composition.signature.attributes =
-            resolve_composition_attributes(&composition.signature.attributes, bindings)?;
+            resolve_composition_attributes(&composition.signature.attributes, bindings, config)?;
     }
     Ok(())
 }
 
-trait RuntimeCompositionAttribute: Sized {
-    fn runtime_value(&self) -> Value;
+trait RuntimeCompositionAttribute: Sized + Clone {
+    fn runtime_value(&self) -> Option<Value>;
     fn with_runtime_value(&self, value: Value) -> Self;
 }
 
 impl RuntimeCompositionAttribute for crate::resource::LiveCompositionAttribute {
-    fn runtime_value(&self) -> Value {
-        self.to_value()
+    fn runtime_value(&self) -> Option<Value> {
+        self.value()
     }
 
     fn with_runtime_value(&self, value: Value) -> Self {
@@ -274,8 +295,8 @@ impl RuntimeCompositionAttribute for crate::resource::LiveCompositionAttribute {
 }
 
 impl RuntimeCompositionAttribute for crate::resource::SavedCompositionAttribute {
-    fn runtime_value(&self) -> Value {
-        self.to_value()
+    fn runtime_value(&self) -> Option<Value> {
+        Some(self.to_value())
     }
 
     fn with_runtime_value(&self, value: Value) -> Self {
@@ -286,6 +307,7 @@ impl RuntimeCompositionAttribute for crate::resource::SavedCompositionAttribute 
 fn resolve_composition_attributes<A: RuntimeCompositionAttribute>(
     attributes: &IndexMap<String, A>,
     bindings: &ResolvedBindings,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<IndexMap<String, A>, String> {
     attributes
         .iter()
@@ -294,7 +316,10 @@ fn resolve_composition_attributes<A: RuntimeCompositionAttribute>(
             // reclassify it in the same lifecycle. A forwarded reference that
             // resolves to a literal becomes derived; one that remains a
             // reference stays forwarded.
-            let resolved = resolve_ref_value(&attribute.runtime_value(), bindings)?;
+            let Some(value) = attribute.runtime_value() else {
+                return Ok((key.clone(), attribute.clone()));
+            };
+            let resolved = resolve_ref_value(&value, bindings, config)?;
             Ok((key.clone(), attribute.with_runtime_value(resolved)))
         })
         .collect()
@@ -458,8 +483,9 @@ pub fn resolve_value_for_plan(
     value: &Value,
     bindings: &ResolvedBindings,
     unresolved_upstream_bindings: &std::collections::HashSet<&str>,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Value {
-    let resolved = resolve_ref_value(value, bindings).unwrap_or_else(|_| value.clone());
+    let resolved = resolve_ref_value(value, bindings, config).unwrap_or_else(|_| value.clone());
     if unresolved_upstream_bindings.is_empty() {
         resolved
     } else {
@@ -475,8 +501,24 @@ pub fn resolve_value_for_plan(
 pub fn resolve_ref_value<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &ResolvedBindings<P, B>,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<Value<P, B>, String> {
-    resolve_ref_value_inner(value, bindings, None)
+    resolve_ref_value_inner(value, bindings, RuntimeContext::Session(config))
+}
+
+/// Project binding data without evaluating user functions. Their annotated
+/// call nodes remain values that must be checked by a runtime session.
+pub(crate) fn project_ref_value_status<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+    bindings: &ResolvedBindings<P, B>,
+) -> Result<ValueResolution<P, B>, String> {
+    resolve_ref_value_status_inner(value, bindings, RuntimeContext::Projection, false)
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeContext<'a> {
+    Session(&'a dyn crate::validation::deferred_types::ProviderTypeCheckContext),
+    Projection,
 }
 
 /// Three-state result used by null/missing coalescing. A missing value is not
@@ -495,8 +537,9 @@ pub enum ValueResolution<
 pub fn resolve_ref_value_status<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &ResolvedBindings<P, B>,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<ValueResolution<P, B>, String> {
-    resolve_ref_value_status_inner(value, bindings, None, false)
+    resolve_ref_value_status_inner(value, bindings, RuntimeContext::Session(config), false)
 }
 
 /// Resolve a value using binding data and a provider-aware builtin context.
@@ -507,9 +550,9 @@ pub fn resolve_ref_value_status<P: PlaceholderKind, B: BindingAddress>(
 pub fn resolve_ref_value_with_config<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &ResolvedBindings<P, B>,
-    config: &crate::parser::ProviderContext,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<Value<P, B>, String> {
-    resolve_ref_value_inner(value, bindings, Some(config))
+    resolve_ref_value_inner(value, bindings, RuntimeContext::Session(config))
 }
 
 /// Select the miss policy for a path-shaped reference. A missing source is not
@@ -538,7 +581,7 @@ fn missing_access(error: &ValueAccessError) -> bool {
 fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &ResolvedBindings<P, B>,
-    config: Option<&crate::parser::ProviderContext>,
+    config: RuntimeContext<'_>,
     allow_absent_default: bool,
 ) -> Result<ValueResolution<P, B>, String> {
     match value {
@@ -696,7 +739,7 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
 fn resolve_required_value_status<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &ResolvedBindings<P, B>,
-    config: Option<&crate::parser::ProviderContext>,
+    config: RuntimeContext<'_>,
 ) -> Result<ValueResolution<P, B>, String> {
     let resolved = resolve_ref_value_inner(value, bindings, config)?;
     if resolved.is_fully_resolved() {
@@ -726,11 +769,28 @@ fn user_function_runtime_error(
     }
 }
 
+fn function_annotation_site<B: BindingAddress>(
+    function: &crate::parser::UserFunction<B>,
+    span: Option<crate::parser::SourceSpan>,
+    context: String,
+) -> crate::validation::deferred_types::ProviderTypeCheckSite {
+    use crate::validation::deferred_types::ProviderTypeCheckSite;
+    let source = function
+        .annotation_source_file
+        .as_deref()
+        .or(function.body.source_file.as_deref())
+        .unwrap_or_else(|| std::path::Path::new("<config>"));
+    match span {
+        Some(span) => ProviderTypeCheckSite::new(source, span, context),
+        None => ProviderTypeCheckSite::at_line(source, function.body.source_line, 1, context),
+    }
+}
+
 fn evaluate_runtime_user_function<B: BindingAddress>(
     function: &crate::parser::UserFunction<B>,
     args: &[crate::resource::FunctionArgument<crate::resource::ParserPlaceholder, B>],
     bindings: &ResolvedBindings<crate::resource::ParserPlaceholder, B>,
-    config: Option<&crate::parser::ProviderContext>,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     call_line: usize,
 ) -> Result<Value<crate::resource::ParserPlaceholder, B>, crate::parser::ParseError> {
     let required = function
@@ -751,8 +811,7 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
         ));
     }
 
-    let default_config = crate::parser::ProviderContext::default();
-    let provider_config = config.unwrap_or(&default_config);
+    let provider_config = config;
     let mut substitutions = HashMap::new();
     for (index, parameter) in function.params.iter().enumerate() {
         let argument = match args.get(index) {
@@ -765,20 +824,24 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
             ),
         };
         let argument = argument
-            .try_map_value(|value| resolve_ref_value_inner(value, bindings, config))
+            .try_map_value(|value| {
+                resolve_ref_value_inner(value, bindings, RuntimeContext::Session(config))
+            })
             .map_err(|message| user_function_runtime_error(call_line, message))?;
         if let Some(expected) = &parameter.param_type {
-            let resolved_parameter =
-                crate::validation::resolve_parameter_type_for_check(expected, provider_config)
-                    .map_err(|message| {
-                        user_function_runtime_error(
-                            call_line,
-                            format!(
-                                "function '{}': parameter '{}': {message}",
-                                function.name, parameter.name
-                            ),
-                        )
-                    })?;
+            let resolved_parameter = crate::validation::resolve_parameter_type_for_check(
+                expected,
+                provider_config.catalog(),
+            )
+            .map_err(|message| {
+                user_function_runtime_error(
+                    call_line,
+                    format!(
+                        "function '{}': parameter '{}': {message}",
+                        function.name, parameter.name
+                    ),
+                )
+            })?;
             if let (Some(resolved_parameter), Some(handle)) =
                 (resolved_parameter.as_ref(), argument.handle())
             {
@@ -796,12 +859,22 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
             } else if argument.pending_parameter().is_none()
                 && let Some(value) = argument.value()
             {
-                crate::validation::typecheck::check_type_expr_value_providerless(
+                crate::validation::typecheck::TypecheckProviderContext::for_session(
+                    provider_config,
+                )
+                .check_at(
                     &resolved_parameter
                         .map_or_else(|| expected.clone(), |resolved| resolved.as_type_expr()),
                     value,
-                    provider_config,
                     crate::validation::typecheck::TypecheckInference::Unavailable,
+                    function_annotation_site(
+                        function,
+                        parameter.type_span,
+                        format!(
+                            "function '{}' parameter '{}'",
+                            function.name, parameter.name
+                        ),
+                    ),
                 )
                 .map_err(|error| {
                     user_function_runtime_error(
@@ -821,9 +894,10 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
         let substituted =
             crate::parser::substitute_fn_params(expression, &substitutions, *source_line)
                 .map_err(|error| locate_user_function_error(function, error))?;
-        let resolved = resolve_ref_value_inner(&substituted, bindings, config)
-            .map_err(|message| user_function_runtime_error(*source_line, message))
-            .map_err(|error| locate_user_function_error(function, error))?;
+        let resolved =
+            resolve_ref_value_inner(&substituted, bindings, RuntimeContext::Session(config))
+                .map_err(|message| user_function_runtime_error(*source_line, message))
+                .map_err(|error| locate_user_function_error(function, error))?;
         substitutions.insert(
             name.clone(),
             crate::resource::FunctionArgument::from_value(resolved),
@@ -836,23 +910,28 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
         function.body.source_line,
     )
     .map_err(|error| locate_user_function_error(function, error))?;
-    let result = resolve_ref_value_inner(&substituted, bindings, config)
+    let result = resolve_ref_value_inner(&substituted, bindings, RuntimeContext::Session(config))
         .map_err(|message| user_function_runtime_error(function.body.source_line, message))
         .map_err(|error| locate_user_function_error(function, error))?;
     if let Some(expected) = &function.return_type {
-        crate::validation::typecheck::check_type_expr_value_providerless(
-            expected,
-            &result,
-            provider_config,
-            crate::validation::typecheck::TypecheckInference::Unavailable,
-        )
-        .map_err(|error| {
-            user_function_runtime_error(
-                function.body.source_line,
-                format!("function '{}': return value: {error}", function.name),
+        crate::validation::typecheck::TypecheckProviderContext::for_session(provider_config)
+            .check_at(
+                expected,
+                &result,
+                crate::validation::typecheck::TypecheckInference::Unavailable,
+                function_annotation_site(
+                    function,
+                    function.return_type_span,
+                    format!("function '{}' return value", function.name),
+                ),
             )
-        })
-        .map_err(|error| locate_user_function_error(function, error))?;
+            .map_err(|error| {
+                user_function_runtime_error(
+                    function.body.source_line,
+                    format!("function '{}': return value: {error}", function.name),
+                )
+            })
+            .map_err(|error| locate_user_function_error(function, error))?;
     }
 
     Ok(result)
@@ -864,7 +943,7 @@ pub(crate) fn evaluate_module_resolved_user_function(
         crate::resource::ParserPlaceholder,
         AbsoluteBindingAddress,
     >],
-    config: &crate::parser::ProviderContext,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     call_line: usize,
 ) -> Result<
     Value<crate::resource::ParserPlaceholder, AbsoluteBindingAddress>,
@@ -874,7 +953,7 @@ pub(crate) fn evaluate_module_resolved_user_function(
         function,
         arguments,
         &ResolvedBindings::default(),
-        Some(config),
+        config,
         call_line,
     )
 }
@@ -904,7 +983,7 @@ enum FunctionArgumentResolution<P: PlaceholderKind, B: BindingAddress> {
 fn resolve_function_arguments<P: PlaceholderKind, B: BindingAddress>(
     args: &[crate::resource::FunctionArgument<P, B>],
     bindings: &ResolvedBindings<P, B>,
-    config: Option<&crate::parser::ProviderContext>,
+    config: RuntimeContext<'_>,
 ) -> Result<FunctionArgumentResolution<P, B>, String> {
     let args = args
         .iter()
@@ -925,7 +1004,7 @@ fn resolve_function_arguments<P: PlaceholderKind, B: BindingAddress>(
 fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &ResolvedBindings<P, B>,
-    config: Option<&crate::parser::ProviderContext>,
+    config: RuntimeContext<'_>,
 ) -> Result<Value<P, B>, String> {
     match value {
         Value::Deferred(DeferredValue::ModuleIf(_)) => {
@@ -1047,10 +1126,12 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                 .map(crate::parser::function_argument_as_eval)
                 .collect();
             let evaluated = match config {
-                Some(config) => {
-                    crate::builtins::evaluate_builtin_with_config(name, &eval_args, config)
-                }
-                None => crate::builtins::evaluate_builtin(name, &eval_args),
+                RuntimeContext::Session(session) => crate::builtins::evaluate_builtin_with_config(
+                    name,
+                    &eval_args,
+                    session.catalog(),
+                ),
+                RuntimeContext::Projection => crate::builtins::evaluate_builtin(name, &eval_args),
             };
             match evaluated {
                 Ok(result) => result
@@ -1071,6 +1152,10 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
             args,
             source_line,
         }) => {
+            let RuntimeContext::Session(session) = config else {
+                return Ok(value.clone());
+            };
+
             let resolved_args = match resolve_function_arguments(args, bindings, config)? {
                 FunctionArgumentResolution::FullyResolved(args) => args,
                 FunctionArgumentResolution::Deferred(args) => {
@@ -1083,8 +1168,6 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                 }
             };
 
-            let default_config = crate::parser::ProviderContext::default();
-            let config = config.unwrap_or(&default_config);
             let Some(parser_args) = parser_stage_function_arguments(&resolved_args) else {
                 return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
                     function: function.clone(),
@@ -1097,7 +1180,7 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                 function,
                 &parser_args,
                 &ResolvedBindings::default(),
-                Some(config),
+                session,
                 source_line.get().unwrap_or(function.body.source_line),
             )
             .map_err(|error| error.to_string())?;
@@ -1105,7 +1188,7 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                 .into_expanded()
                 .map(Value::into_placeholder_type)
                 .map_err(|error| error.to_string())?;
-            resolve_ref_value_inner(&evaluated, bindings, Some(config))
+            resolve_ref_value_inner(&evaluated, bindings, config)
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             let access_expression = crate::value::format_value(value);
@@ -1246,7 +1329,10 @@ mod tests {
         ]);
 
         assert_eq!(
-            resolve_ref_value(&expression, &bindings),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value(&expression, &bindings, session)
+            ),
             Ok(Value::Concrete(ConcreteValue::Int(2)))
         );
 
@@ -1255,7 +1341,10 @@ mod tests {
             vec![("seconds", Value::Concrete(ConcreteValue::Int(90)))],
         )]);
         assert!(matches!(
-            resolve_ref_value(&expression, &partial),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value(&expression, &partial, session)
+            ),
             Ok(Value::Deferred(DeferredValue::IntegerArithmetic(_)))
         ));
     }
@@ -1274,7 +1363,10 @@ mod tests {
             vec![("value", Value::Concrete(ConcreteValue::Int(0)))],
         )]);
         assert_eq!(
-            resolve_ref_value(&divide_by_deferred_zero, &zero),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value(&divide_by_deferred_zero, &zero, session)
+            ),
             Err("integer division by zero".to_string())
         );
 
@@ -1288,7 +1380,10 @@ mod tests {
             vec![("value", Value::Concrete(ConcreteValue::Int(i64::MIN)))],
         )]);
         assert_eq!(
-            resolve_ref_value(&overflow, &minimum),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value(&overflow, &minimum, session)
+            ),
             Err("integer arithmetic overflow".to_string())
         );
     }
@@ -1345,14 +1440,20 @@ mod tests {
             BindingValueSource::Upstream,
         );
         assert_eq!(
-            resolve_ref_value_status(&expression, &present),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value_status(&expression, &present, session)
+            ),
             Ok(ValueResolution::Present(accounts)),
         );
 
         let mut absent = ResolvedBindings::default();
         absent.set("up", HashMap::new(), BindingValueSource::Upstream);
         assert_eq!(
-            resolve_ref_value_status(&expression, &absent),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value_status(&expression, &absent, session)
+            ),
             Ok(ValueResolution::Present(default)),
         );
 
@@ -1364,7 +1465,10 @@ mod tests {
             BindingCompleteness::Incomplete,
         );
         assert_eq!(
-            resolve_ref_value_status(&expression, &unknown),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value_status(&expression, &unknown, session)
+            ),
             Ok(ValueResolution::Unknown(expression)),
         );
     }
@@ -1410,7 +1514,10 @@ mod tests {
             );
             for expression in [&left_grouped, &right_grouped] {
                 assert_eq!(
-                    resolve_ref_value_status(expression, &bindings),
+                    crate::validation::deferred_types::with_session_for_test(
+                        &crate::parser::LoadedProviderContext::empty_for_test(),
+                        |session| resolve_ref_value_status(expression, &bindings, session)
+                    ),
                     Ok(ValueResolution::Present(expected.clone())),
                 );
             }
@@ -1427,8 +1534,11 @@ mod tests {
             Value::Concrete(ConcreteValue::String("fallback".into())),
         );
 
-        let resolved = resolve_ref_value_status(&expression, &ResolvedBindings::default())
-            .expect("unknown coalesce must remain resolvable");
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value_status(&expression, &ResolvedBindings::default(), session),
+        )
+        .expect("unknown coalesce must remain resolvable");
         assert!(matches!(
             resolved,
             ValueResolution::Unknown(Value::Deferred(DeferredValue::Coalesce { .. }))
@@ -1455,7 +1565,14 @@ mod tests {
         );
 
         assert!(matches!(
-            resolve_ref_value_status(&expression, &ResolvedBindings::default()),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value_status(
+                    &expression,
+                    &ResolvedBindings::default(),
+                    session
+                )
+            ),
             Ok(ValueResolution::Unknown(Value::Deferred(
                 DeferredValue::Coalesce { .. }
             )))
@@ -1473,8 +1590,11 @@ mod tests {
             Value::Concrete(ConcreteValue::String("fallback".into())),
         );
 
-        let error = resolve_ref_value_status(&expression, &ResolvedBindings::default())
-            .expect_err("function errors must not select the coalesce default");
+        let error = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value_status(&expression, &ResolvedBindings::default(), session),
+        )
+        .expect_err("function errors must not select the coalesce default");
         assert!(error.contains("upper()"), "unexpected error: {error}");
     }
 
@@ -1501,7 +1621,10 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_ref_value_status(&expression, &bindings),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value_status(&expression, &bindings, session)
+            ),
             Err(format!(
                 "env(): environment variable '{missing}' is not set"
             )),
@@ -1577,7 +1700,10 @@ mod tests {
             Value::Concrete(ConcreteValue::String("fallback".into())),
         );
         assert_eq!(
-            resolve_ref_value_status(&changed, &bindings),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value_status(&changed, &bindings, session)
+            ),
             Ok(ValueResolution::Present(Value::Concrete(
                 ConcreteValue::String("new".into()),
             ))),
@@ -1586,12 +1712,16 @@ mod tests {
 
         let removed_default = Value::Concrete(ConcreteValue::String("removed-default".into()));
         assert_eq!(
-            resolve_ref_value_status(
-                &coalesce(
-                    Value::root_resource_ref("up", "removed", vec![]),
-                    removed_default.clone(),
-                ),
-                &bindings,
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value_status(
+                    &coalesce(
+                        Value::root_resource_ref("up", "removed", vec![]),
+                        removed_default.clone(),
+                    ),
+                    &bindings,
+                    session
+                )
             ),
             Ok(ValueResolution::Present(removed_default)),
             "an attribute removed by the update is definitively absent",
@@ -1602,7 +1732,10 @@ mod tests {
             Value::Concrete(ConcreteValue::List(Vec::new())),
         );
         assert_eq!(
-            resolve_ref_value_status(&provisional, &bindings),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value_status(&provisional, &bindings, session)
+            ),
             Ok(ValueResolution::Present(Value::Concrete(
                 ConcreteValue::List(vec![Value::Concrete(ConcreteValue::String(
                     "old-account".into(),
@@ -1616,18 +1749,25 @@ mod tests {
             Value::Concrete(ConcreteValue::String("fallback".into())),
         );
         assert_eq!(
-            resolve_ref_value_status(&missing_refreshable, &bindings),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value_status(&missing_refreshable, &bindings, session)
+            ),
             Ok(ValueResolution::Unknown(missing_refreshable)),
             "a missing provider-populated value may still appear during refresh",
         );
 
         assert_eq!(
-            resolve_ref_value_status(
-                &coalesce(
-                    Value::root_resource_ref("up", "stable", vec![]),
-                    Value::Concrete(ConcreteValue::String("fallback".into())),
-                ),
-                &bindings,
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value_status(
+                    &coalesce(
+                        Value::root_resource_ref("up", "stable", vec![]),
+                        Value::Concrete(ConcreteValue::String("fallback".into())),
+                    ),
+                    &bindings,
+                    session
+                )
             ),
             Ok(ValueResolution::Present(Value::Concrete(
                 ConcreteValue::String("same".into()),
@@ -1636,12 +1776,16 @@ mod tests {
         );
         let missing_default = Value::Concrete(ConcreteValue::String("fallback".into()));
         assert_eq!(
-            resolve_ref_value_status(
-                &coalesce(
-                    Value::root_resource_ref("up", "unrelated_optional", vec![]),
-                    missing_default.clone(),
-                ),
-                &bindings,
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value_status(
+                    &coalesce(
+                        Value::root_resource_ref("up", "unrelated_optional", vec![]),
+                        missing_default.clone(),
+                    ),
+                    &bindings,
+                    session
+                )
             ),
             Ok(ValueResolution::Present(missing_default)),
             "absence of an attribute the update cannot change remains definitive",
@@ -1691,14 +1835,17 @@ mod tests {
             &crate::schema::SchemaRegistry::new(),
             &resources,
         );
-        let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
-            managed: &resources,
-            compositions: &[],
-            managed_current: &current,
-            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
-            wait_aliases: &[],
-        });
+        let bindings =
+            ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs::<
+                crate::resource::UnexpandedDependencyFields,
+            > {
+                managed: &resources,
+                compositions: &[],
+                managed_current: &current,
+                data_source_values: &crate::data_source_value::DataSourceValues::empty(),
+                remote_bindings: &HashMap::new(),
+                wait_aliases: &[],
+            });
         let fallback = Value::Concrete(ConcreteValue::String("d".into()));
         let expression = coalesce(
             Value::root_resource_ref("producer", "comment", vec![]),
@@ -1706,7 +1853,10 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_ref_value_status(&expression, &bindings),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value_status(&expression, &bindings, session)
+            ),
             Ok(ValueResolution::Present(fallback)),
             "a successful refresh with no planned effect makes a missing output definitively absent",
         );
@@ -1733,7 +1883,10 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_ref_value_status(&expression, &bindings),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value_status(&expression, &bindings, session)
+            ),
             Ok(ValueResolution::Present(default)),
         );
     }
@@ -1764,8 +1917,11 @@ mod tests {
             Value::Concrete(ConcreteValue::String("fallback".into())),
         );
 
-        let error = resolve_ref_value_status(&expression, &bindings)
-            .expect_err("wrong-shaped access must remain an error");
+        let error = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value_status(&expression, &bindings, session),
+        )
+        .expect_err("wrong-shaped access must remain an error");
         assert!(
             error.contains("cannot apply access"),
             "unexpected error: {error}"
@@ -1816,8 +1972,11 @@ mod tests {
             BindingValueSource::Upstream,
         );
 
-        let error = resolve_ref_value_status(&expression, &bindings)
-            .expect_err("only an access chain rooted at a reference is optional");
+        let error = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value_status(&expression, &bindings, session),
+        )
+        .expect_err("only an access chain rooted at a reference is optional");
         assert!(error.contains("missing"), "unexpected error: {error}");
     }
 
@@ -1828,7 +1987,13 @@ mod tests {
             binding: absolute_binding("vpc"),
         });
 
-        assert_eq!(resolve_ref_value(&reference, &bindings), Ok(reference));
+        assert_eq!(
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value(&reference, &bindings, session)
+            ),
+            Ok(reference)
+        );
     }
 
     /// Test-only adapter that preserves the pre-#3248 four-arg
@@ -1854,7 +2019,10 @@ mod tests {
             remote_bindings,
             wait_aliases,
         });
-        resolve_refs_with_state_and_remote(resources, &bindings)
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_refs_with_state_and_remote(resources, &bindings, session),
+        )
     }
 
     /// Test-only adapter for the plan-path resolver (mirrors
@@ -1880,7 +2048,10 @@ mod tests {
         });
         let upstream_keys: std::collections::HashSet<&str> =
             remote_bindings.keys().map(String::as_str).collect();
-        resolve_refs_for_plan(resources, &bindings, &upstream_keys)
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_refs_for_plan(resources, &bindings, &upstream_keys, session),
+        )
     }
 
     #[test]
@@ -1903,7 +2074,11 @@ mod tests {
             vec![crate::resource::Subscript::Int { index: 0 }],
         );
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
-        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(
             resolved,
             Value::Concrete(ConcreteValue::String("alpha".into()))
@@ -1953,7 +2128,11 @@ mod tests {
             ],
         );
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
-        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(
             resolved,
             Value::Concrete(ConcreteValue::String("alpha".into()))
@@ -1989,7 +2168,11 @@ mod tests {
             }],
         );
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
-        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(resolved, Value::Concrete(ConcreteValue::String("1".into())));
     }
 
@@ -2027,7 +2210,11 @@ mod tests {
             }],
         );
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
-        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(
             resolved,
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
@@ -2061,7 +2248,11 @@ mod tests {
             vec![crate::resource::Subscript::Int { index: 1 }],
         );
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
-        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(
             resolved,
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
@@ -2097,7 +2288,11 @@ mod tests {
             vec!["db_pwd".to_string()],
         );
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
-        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(
             resolved,
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
@@ -2133,7 +2328,11 @@ mod tests {
             vec![crate::resource::Subscript::Str { key: "k".into() }],
         );
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
-        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(
             resolved,
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
@@ -2167,7 +2366,11 @@ mod tests {
             vec![crate::resource::Subscript::Int { index: 5 }],
         );
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
-        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(resolved, ref_value);
     }
 
@@ -2201,7 +2404,11 @@ mod tests {
             }],
         );
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
-        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(resolved, ref_value);
     }
 
@@ -2256,7 +2463,10 @@ mod tests {
             }],
         );
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
-        let result = resolve_ref_value(&ref_value, &bindings);
+        let result = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        );
         let err = result.expect_err("missing key in concrete upstream Secret(Map) must error");
         assert_eq!(
             err,
@@ -2310,8 +2520,11 @@ mod tests {
             Vec::new(),
         );
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
-        let err = resolve_ref_value(&ref_value, &bindings)
-            .expect_err("missing dot-form field in concrete upstream Secret(Map) must error");
+        let err = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        )
+        .expect_err("missing dot-form field in concrete upstream Secret(Map) must error");
         assert_eq!(
             err,
             "h.creds.missing: key not found; available keys: <redacted, 2 entries>"
@@ -2350,8 +2563,11 @@ mod tests {
             }],
         );
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
-        let err = resolve_ref_value(&ref_value, &bindings)
-            .expect_err("missing key in empty upstream Secret(Map) must error");
+        let err = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        )
+        .expect_err("missing key in empty upstream Secret(Map) must error");
         assert_eq!(
             err,
             "h.creds['missing']: key not found; available keys: <redacted, 0 entries>"
@@ -2389,7 +2605,11 @@ mod tests {
             vec![crate::resource::Subscript::Str { key: "k".into() }],
         );
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
-        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(
             resolved, ref_value,
             "Secret(ResourceRef) projection must keep the outer ref unchanged"
@@ -2416,7 +2636,11 @@ mod tests {
             vec![crate::resource::Subscript::Int { index: 5 }],
         );
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
-        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(resolved, ref_value);
     }
 
@@ -2432,7 +2656,11 @@ mod tests {
 
         let ref_value = Value::root_resource_ref("my_vpc".to_string(), "id".to_string(), vec![]);
 
-        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(
             resolved,
             Value::Concrete(ConcreteValue::String("vpc-123".into()))
@@ -2454,7 +2682,11 @@ mod tests {
             Value::root_resource_ref("my_sg".to_string(), "id".to_string(), vec![]),
         ]));
 
-        let resolved = resolve_ref_value(&list, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&list, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(
             resolved,
             Value::Concrete(ConcreteValue::List(vec![
@@ -2483,7 +2715,11 @@ mod tests {
             .collect(),
         ));
 
-        let resolved = resolve_ref_value(&map, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&map, &bindings, session),
+        )
+        .unwrap();
         if let Value::Concrete(ConcreteValue::Map(m)) = resolved {
             assert_eq!(
                 m.get("subnet_id"),
@@ -2501,7 +2737,11 @@ mod tests {
         let ref_value =
             Value::root_resource_ref("nonexistent".to_string(), "id".to_string(), vec![]);
 
-        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(resolved, ref_value);
     }
 
@@ -2524,7 +2764,11 @@ mod tests {
             )),
         ]));
 
-        let resolved = resolve_ref_value(&interp, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&interp, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(
             resolved,
             Value::Concrete(ConcreteValue::String("subnet-vpc-123".into()))
@@ -2544,7 +2788,11 @@ mod tests {
             )),
         ]));
 
-        let resolved = resolve_ref_value(&interp, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&interp, &bindings, session),
+        )
+        .unwrap();
         // Should remain as Interpolation since the ref couldn't be resolved
         assert!(matches!(
             resolved,
@@ -2563,7 +2811,11 @@ mod tests {
             InterpolationPart::Expr(Value::Concrete(ConcreteValue::Bool(true))),
         ]));
 
-        let resolved = resolve_ref_value(&interp, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&interp, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(
             resolved,
             Value::Concrete(ConcreteValue::String("port-8080-enabled-true".into()))
@@ -2605,19 +2857,25 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
-                dependency_bindings: std::collections::BTreeSet::new(),
+                dependency_bindings: Default::default(),
 
                 partial_read: None,
             },
         );
 
-        resolve_refs_with_state(
-            &mut resources,
-            &crate::resource::into_plan_input_current_map_from_states(
-                current_states.clone(),
-                &crate::schema::SchemaRegistry::new(),
-                &[],
-            ),
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                resolve_refs_with_state(
+                    &mut resources,
+                    &crate::resource::into_plan_input_current_map_from_states(
+                        current_states.clone(),
+                        &crate::schema::SchemaRegistry::new(),
+                        &[],
+                    ),
+                    session,
+                )
+            },
         )
         .unwrap();
 
@@ -2646,7 +2904,11 @@ mod tests {
             source_line: (0).into(),
         });
 
-        let resolved = resolve_ref_value(&func, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&func, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(
             resolved,
             Value::Concrete(ConcreteValue::String("a-b-c".into()))
@@ -2677,7 +2939,11 @@ mod tests {
             source_line: (0).into(),
         });
 
-        let resolved = resolve_ref_value(&func, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&func, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(
             resolved,
             Value::Concrete(ConcreteValue::String("prefix-vpc-123".into()))
@@ -2715,7 +2981,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            resolve_ref_value(&value, &bindings).unwrap(),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value(&value, &bindings, session)
+            )
+            .unwrap(),
             Value::Concrete(ConcreteValue::String("name".into()))
         );
     }
@@ -2749,8 +3019,11 @@ mod tests {
         )
         .unwrap();
 
-        let error = resolve_ref_value(&value, &bindings)
-            .expect_err("apply-time out-of-range access must be an error");
+        let error = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&value, &bindings, session),
+        )
+        .expect_err("apply-time out-of-range access must be an error");
         assert!(
             error.contains("index 5 out of range for list of length 3"),
             "unexpected error: {error}"
@@ -2786,8 +3059,11 @@ mod tests {
         )
         .unwrap();
 
-        let error = resolve_ref_value(&value, &bindings)
-            .expect_err("a computed list is final even when an input ref is local");
+        let error = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&value, &bindings, session),
+        )
+        .expect_err("a computed list is final even when an input ref is local");
         assert!(
             error.contains("index 5 out of range for list of length 3"),
             "unexpected error: {error}"
@@ -2828,11 +3104,17 @@ mod tests {
         assert_eq!(postfix_access, resource_path);
 
         assert_eq!(
-            resolve_ref_value(&resource_path, &bindings),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value(&resource_path, &bindings, session)
+            ),
             Ok(resource_path.clone())
         );
         assert_eq!(
-            resolve_ref_value(&postfix_access, &bindings),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value(&postfix_access, &bindings, session)
+            ),
             Ok(resource_path.clone())
         );
     }
@@ -2874,8 +3156,20 @@ mod tests {
 
         let expected =
             Err("res.tags['missing']: key not found; available keys: 'present'".to_string());
-        assert_eq!(resolve_ref_value(&resource_path, &bindings), expected);
-        assert_eq!(resolve_ref_value(&postfix_access, &bindings), expected);
+        assert_eq!(
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value(&resource_path, &bindings, session)
+            ),
+            expected
+        );
+        assert_eq!(
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value(&postfix_access, &bindings, session)
+            ),
+            expected
+        );
     }
 
     #[test]
@@ -2906,8 +3200,20 @@ mod tests {
         assert_eq!(postfix_access, resource_path);
 
         let expected = Ok(Value::Concrete(ConcreteValue::String("b".into())));
-        assert_eq!(resolve_ref_value(&resource_path, &bindings), expected);
-        assert_eq!(resolve_ref_value(&postfix_access, &bindings), expected);
+        assert_eq!(
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value(&resource_path, &bindings, session)
+            ),
+            expected
+        );
+        assert_eq!(
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| resolve_ref_value(&postfix_access, &bindings, session)
+            ),
+            expected
+        );
     }
 
     #[test]
@@ -2931,8 +3237,11 @@ mod tests {
             ),
         });
 
-        let error = resolve_ref_value(&value, &bindings)
-            .expect_err("a String cannot become indexable after apply");
+        let error = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&value, &bindings, session),
+        )
+        .expect_err("a String cannot become indexable after apply");
         assert!(
             error.contains("cannot apply access [0] to string"),
             "unexpected apply-time error: {error}",
@@ -2962,7 +3271,11 @@ mod tests {
             source_line: (0).into(),
         });
 
-        let resolved = resolve_ref_value(&func, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&func, &bindings, session),
+        )
+        .unwrap();
         assert!(matches!(
             resolved,
             Value::Deferred(DeferredValue::FunctionCall { .. })
@@ -2989,7 +3302,11 @@ mod tests {
             vec!["vpc_id".to_string()],
         );
 
-        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(
             resolved,
             Value::Concrete(ConcreteValue::String("vpc-123".into()))
@@ -3020,7 +3337,11 @@ mod tests {
             vec!["network".to_string(), "vpc_id".to_string()],
         );
 
-        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(
             resolved,
             Value::Concrete(ConcreteValue::String("vpc-456".into()))
@@ -3046,7 +3367,11 @@ mod tests {
             vec!["nonexistent".to_string()],
         );
 
-        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(resolved, ref_value);
     }
 
@@ -3067,7 +3392,10 @@ mod tests {
             source_line: (0).into(),
         });
 
-        let result = resolve_ref_value(&value, &bindings);
+        let result = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&value, &bindings, session),
+        );
         assert!(
             result.is_err(),
             "Expected error for env() with missing var, got: {:?}",
@@ -3094,7 +3422,10 @@ mod tests {
             source_line: (0).into(),
         });
 
-        let result = resolve_ref_value(&value, &bindings);
+        let result = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&value, &bindings, session),
+        );
         assert!(result.is_ok(), "Unresolved ref should not cause error");
         match result.unwrap() {
             Value::Deferred(DeferredValue::FunctionCall { name, .. }) => assert_eq!(name, "join"),
@@ -3125,13 +3456,19 @@ mod tests {
         )];
 
         let current_states: HashMap<ResourceId, State> = HashMap::new();
-        let result = resolve_refs_with_state(
-            &mut resources,
-            &crate::resource::into_plan_input_current_map_from_states(
-                current_states.clone(),
-                &crate::schema::SchemaRegistry::new(),
-                &[],
-            ),
+        let result = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                resolve_refs_with_state(
+                    &mut resources,
+                    &crate::resource::into_plan_input_current_map_from_states(
+                        current_states.clone(),
+                        &crate::schema::SchemaRegistry::new(),
+                        &[],
+                    ),
+                    session,
+                )
+            },
         );
         assert!(
             result.is_err(),
@@ -3785,7 +4122,8 @@ mod tests {
 
         assert!(
             resources[0]
-                .dependency_bindings
+                .dependencies
+                .value_bindings
                 .contains(&absolute_binding("network")),
             "dependency_bindings must record the upstream binding even after stamping"
         );
@@ -3853,7 +4191,11 @@ mod tests {
         });
         let path = crate::resource::AccessPath::root("cert_issued", "certificate_arn");
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
-        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(
             resolved,
             Value::Concrete(ConcreteValue::String(
@@ -3870,7 +4212,7 @@ mod tests {
     #[test]
     fn resolve_ref_value_wait_binding_absent_target_left_intact() {
         let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
-            managed: &[],
+            managed: &[] as &[Resource],
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
@@ -3882,10 +4224,92 @@ mod tests {
         });
         let path = crate::resource::AccessPath::root("cert_issued", "certificate_arn");
         let ref_value = Value::Deferred(DeferredValue::ResourceRef { path });
-        let resolved = resolve_ref_value(&ref_value, &bindings).unwrap();
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&ref_value, &bindings, session),
+        )
+        .unwrap();
         assert_eq!(
             resolved, ref_value,
             "no alias when target absent → ref stays intact (existing PlanError surfaces it)"
         );
+    }
+}
+
+#[cfg(test)]
+mod runtime_provider_type_tests {
+    use super::*;
+    use crate::parser::{OwnedTypeIdentity, ProviderContext, ProviderCustomTypes, parse_file};
+    use crate::schema::{RefinedScalarKind, TypeIdentity};
+    use crate::validation::deferred_types::ProviderTypeCheckDiagnostic;
+
+    #[test]
+    fn settlement_runtime_function_arguments_and_returns_use_catalog_authority() {
+        for source in [
+            "fn f(x: ready.ReadyId) { x }",
+            "fn f(x: String): ready.ReadyId { x }",
+        ] {
+            let mut parsed = parse_file(
+                source,
+                std::path::Path::new("/project/functions.crn"),
+                &ProviderContext::default(),
+            )
+            .unwrap();
+            let mut function = parsed.user_functions.remove("f").unwrap();
+            function.body.source_file = Some(std::path::PathBuf::from("/project/functions.crn"));
+            let arguments = [crate::resource::FunctionArgument::from_value(
+                crate::resource::AuthoredValue::Concrete(
+                    crate::resource::AuthoredConcreteValue::String("bad".into()),
+                ),
+            )];
+            let bindings = ResolvedBindings::for_authored_validation(&parsed);
+            let loaded = ProviderContext {
+                custom_types: ProviderCustomTypes::loaded(
+                    std::collections::HashSet::from([OwnedTypeIdentity::provider(
+                        "ready",
+                        TypeIdentity::new(Some("ready"), Vec::<String>::new(), "ReadyId"),
+                        RefinedScalarKind::String,
+                    )]),
+                    Box::new(|target, _| {
+                        Err(crate::parser::fixture_custom_type_rejection(
+                            target,
+                            "rejected by ready",
+                        ))
+                    }),
+                ),
+                ..Default::default()
+            };
+            let error =
+                crate::validation::deferred_types::with_session_for_test(&loaded, |session| {
+                    evaluate_runtime_user_function(&function, &arguments, &bindings, session, 8)
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("rejected by ready"), "{error}");
+            let partial = ProviderContext {
+                custom_types: loaded
+                    .custom_types
+                    .with_failed_providers(std::collections::BTreeSet::from(["broken".into()])),
+                ..Default::default()
+            };
+            let error =
+                crate::validation::deferred_types::with_session_for_test(&partial, |session| {
+                    evaluate_runtime_user_function(&function, &arguments, &bindings, session, 8)
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("rejected by ready"), "{error}");
+
+            let result = crate::validation::deferred_types::TypeCheckSession::run(
+                &ProviderContext::default(),
+                |unloaded| {
+                    evaluate_runtime_user_function(&function, &arguments, &bindings, unloaded, 8)
+                        .unwrap();
+                },
+            );
+            assert!(
+                matches!(result.diagnostics(), [ProviderTypeCheckDiagnostic::Deferred(warning)] if warning.file.as_deref() == Some("/project/functions.crn")),
+                "{:?}",
+                result.diagnostics()
+            );
+        }
     }
 }

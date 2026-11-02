@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
-use colored::{ColoredString, Colorize};
+use crate::output_style::{ColoredString, Colorize};
 
 use carina_core::detail_rows::{
     DetailRow, HistoricalDisplayAttributes, ListOfMapsDiffField, ListOfMapsDiffItem,
@@ -12,7 +12,9 @@ use carina_core::detail_rows::{
 #[cfg(test)]
 use carina_core::effect::DeletedInstanceKey;
 use carina_core::effect::Effect;
-use carina_core::plan::{DeferredSummaryAction, Plan, PlanSummaryPart, ReplaceDisplayInfo};
+use carina_core::plan::{
+    DeferredSummaryAction, DestroyOrdering, Plan, PlanSummaryPart, ReplaceDisplayInfo,
+};
 #[cfg(test)]
 use carina_core::plan_tree::shorten_attr_name;
 use carina_core::plan_tree::{
@@ -102,70 +104,73 @@ struct Sigil {
 }
 
 impl Sigil {
-    fn from_effect<S>(effect: &Effect<S>) -> Self {
+    fn from_effect<S>(color_mode: crate::output_style::ColorMode, effect: &Effect<S>) -> Self {
         let raw = effect.display_glyph();
         let rendered = match effect {
-            Effect::Create(_) | Effect::DeferredCreate(_) => raw.green().bold(),
-            Effect::ResumeCreate { .. } => raw.cyan().bold(),
-            Effect::Update { .. } => raw.yellow().bold(),
-            Effect::DeferredReplace(_) => raw.magenta().bold(),
-            Effect::Delete { .. } => raw.red().bold(),
-            Effect::Read { .. } | Effect::Import { .. } => raw.cyan().bold(),
+            Effect::Create(_) | Effect::DeferredCreate(_) => raw.green(color_mode).bold(color_mode),
+            Effect::ResumeCreate { .. } => raw.cyan(color_mode).bold(color_mode),
+            Effect::Update { .. } => raw.yellow(color_mode).bold(color_mode),
+            Effect::DeferredReplace(_) => raw.magenta(color_mode).bold(color_mode),
+            Effect::Delete { .. } => raw.red(color_mode).bold(color_mode),
+            Effect::Read { .. } | Effect::Import { .. } => raw.cyan(color_mode).bold(color_mode),
             // carina#3332: the previous `x` (red, bold) shape-collides
             // with the `✗` failure indicator used in apply output.
             // Use `~` (yellow, bold) — the same family as Move's `->`
             // and the trailing `(remove from state)` annotation
             // disambiguates from Update's `~` line.
-            Effect::Remove { .. } | Effect::Move { .. } => raw.yellow().bold(),
-            Effect::ReleaseListKeys { .. } => raw.yellow().bold(),
-            Effect::Wait { .. } => raw.magenta().bold(),
+            Effect::Remove { .. } | Effect::Move { .. } => raw.yellow(color_mode).bold(color_mode),
+            Effect::ReleaseListKeys { .. } => raw.yellow(color_mode).bold(color_mode),
+            Effect::Wait { .. } => raw.magenta(color_mode).bold(color_mode),
         };
         Self { raw, rendered }
     }
 
-    fn replacement(create_before_destroy: bool) -> Self {
+    fn replacement(
+        color_mode: crate::output_style::ColorMode,
+        create_before_destroy: bool,
+    ) -> Self {
         let raw = Effect::replace_display_glyph(create_before_destroy);
         Self {
             raw,
-            rendered: raw.magenta().bold(),
+            rendered: raw.magenta(color_mode).bold(color_mode),
         }
     }
 
-    fn module_header() -> Self {
+    fn module_header(color_mode: crate::output_style::ColorMode) -> Self {
         Self {
             raw: "▾",
-            rendered: "▾".cyan().bold(),
+            rendered: "▾".cyan(color_mode).bold(color_mode),
         }
     }
 
-    fn deferred_for_expression() -> Self {
+    fn deferred_for_expression(color_mode: crate::output_style::ColorMode) -> Self {
         Self {
             raw: "+",
-            rendered: "+".green().bold(),
+            rendered: "+".green(color_mode).bold(color_mode),
         }
     }
 
-    fn export_added() -> Self {
+    fn export_added(color_mode: crate::output_style::ColorMode) -> Self {
         // Export rows are intentionally quieter than operation rows, so omit bold.
         Self {
             raw: "+",
-            rendered: "+".green(),
+            rendered: "+".green(color_mode),
         }
     }
 
-    fn export_modified() -> Self {
+    fn export_modified(color_mode: crate::output_style::ColorMode) -> Self {
         // Export rows are intentionally quieter than operation rows, so omit bold.
         Self {
             raw: "~",
-            rendered: "~".yellow(),
+            rendered: "~".yellow(color_mode),
         }
     }
 
-    fn export_removed() -> Self {
+    fn export_removed(color_mode: crate::output_style::ColorMode) -> Self {
         // Export rows are intentionally quieter than operation rows, so omit bold.
         Self {
             raw: "-",
-            rendered: "-".red(),
+            rendered: "-".red(color_mode),
         }
     }
 }
@@ -201,7 +206,21 @@ fn module_child_prefix() -> String {
 }
 
 /// Check if a resource has a `let` binding (i.e., is not anonymous).
-fn has_binding<S>(resource: carina_core::parser::ResourceRef<'_, S>) -> bool {
+fn has_binding<S, R>(
+    resource: carina_core::parser::ResourceRef<
+        '_,
+        S,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::LoopSlot,
+        carina_core::parser::ResolvedDeferredForPhase<
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::LoopSlot,
+            carina_core::resource::AbsoluteBindingAddress,
+        >,
+        carina_core::resource::AbsoluteBindingAddress,
+        R,
+    >,
+) -> bool {
     resource.binding().is_some()
 }
 
@@ -211,8 +230,20 @@ fn has_binding<S>(resource: carina_core::parser::ResourceRef<'_, S>) -> bool {
 /// `name` is the display name of the resource (typically `id.name`).
 /// `parent_binding` is the binding name of the parent in the tree, used to skip
 /// redundant ResourceRef hints.
-fn format_compact_name<S>(
-    resource: carina_core::parser::ResourceRef<'_, S>,
+fn format_compact_name<S, R>(
+    resource: carina_core::parser::ResourceRef<
+        '_,
+        S,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::LoopSlot,
+        carina_core::parser::ResolvedDeferredForPhase<
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::LoopSlot,
+            carina_core::resource::AbsoluteBindingAddress,
+        >,
+        carina_core::resource::AbsoluteBindingAddress,
+        R,
+    >,
     name: &str,
     parent_binding: Option<&str>,
 ) -> String {
@@ -226,7 +257,10 @@ fn format_compact_name<S>(
 }
 
 /// Format a single export change entry (add/modify/remove) as a displayable line.
-fn format_export_change(change: &crate::commands::plan::ExportChange) -> String {
+fn format_export_change(
+    color_mode: crate::output_style::ColorMode,
+    change: &crate::commands::plan::ExportChange,
+) -> String {
     use crate::commands::plan::ExportChange;
     let mut out = String::new();
     match change {
@@ -242,10 +276,10 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
             writeln!(
                 out,
                 "{}{}{} = {}",
-                top_level_sigil_prefix(&Sigil::export_added()),
+                top_level_sigil_prefix(&Sigil::export_added(color_mode,)),
                 name,
-                type_str.dimmed(),
-                colored_value(&render_value(new_value))
+                type_str.dimmed(color_mode),
+                colored_value(color_mode, &render_value(new_value))
             )
             .unwrap();
         }
@@ -262,12 +296,12 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
             writeln!(
                 out,
                 "{}{}{} = {} {} {}",
-                top_level_sigil_prefix(&Sigil::export_modified()),
+                top_level_sigil_prefix(&Sigil::export_modified(color_mode,)),
                 name,
-                type_str.dimmed(),
-                colored_value(&render_export_json_value(old_json)),
-                "→".dimmed(),
-                colored_value(&render_value(new_value))
+                type_str.dimmed(color_mode),
+                colored_value(color_mode, &render_export_json_value(old_json)),
+                "→".dimmed(color_mode),
+                colored_value(color_mode, &render_value(new_value))
             )
             .unwrap();
         }
@@ -275,9 +309,9 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
             writeln!(
                 out,
                 "{}{} = {}",
-                top_level_sigil_prefix(&Sigil::export_removed()),
+                top_level_sigil_prefix(&Sigil::export_removed(color_mode,)),
                 name,
-                colored_value(&render_export_json_value(old_json))
+                colored_value(color_mode, &render_export_json_value(old_json))
             )
             .unwrap();
         }
@@ -286,10 +320,18 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
 }
 
 pub(crate) fn format_persisted_directive_changes(
+    color_mode: crate::output_style::ColorMode,
     changes: &[crate::commands::shared::state_writeback::PersistedDirectiveChange],
 ) -> String {
     let mut out = String::new();
-    writeln!(out, "{}", "State-only directive updates:".cyan().bold()).unwrap();
+    writeln!(
+        out,
+        "{}",
+        "State-only directive updates:"
+            .cyan(color_mode)
+            .bold(color_mode)
+    )
+    .unwrap();
     writeln!(out).unwrap();
     for (index, change) in changes.iter().enumerate() {
         if index > 0 {
@@ -298,8 +340,12 @@ pub(crate) fn format_persisted_directive_changes(
         writeln!(
             out,
             "  {} {}",
-            "~".yellow(),
-            change.resource_id.to_string().cyan().bold()
+            "~".yellow(color_mode),
+            change
+                .resource_id
+                .to_string()
+                .cyan(color_mode)
+                .bold(color_mode)
         )
         .unwrap();
         for field in &change.fields {
@@ -318,6 +364,7 @@ pub(crate) fn format_persisted_directive_changes(
 
 #[allow(clippy::too_many_arguments)]
 pub fn print_plan<S, D: HistoricalDisplaySource<S> + ?Sized>(
+    color_mode: crate::output_style::ColorMode,
     plan: &Plan<S>,
     summary: &PlanChangeSummary,
     detail: DetailLevel,
@@ -332,6 +379,7 @@ pub fn print_plan<S, D: HistoricalDisplaySource<S> + ?Sized>(
     print!(
         "{}",
         format_plan_with_delete_instances(
+            color_mode,
             plan,
             summary,
             detail,
@@ -350,6 +398,7 @@ pub fn print_plan<S, D: HistoricalDisplaySource<S> + ?Sized>(
 /// Render a successful planning outcome according to its typed row request.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn print_planned_plan(
+    color_mode: crate::output_style::ColorMode,
     planned: &crate::wiring::PlannedPlan,
     summary: &PlanChangeSummary,
     schemas: Option<&SchemaRegistry>,
@@ -360,6 +409,7 @@ pub(crate) fn print_planned_plan(
 ) -> ProviderResult<()> {
     match planned {
         crate::wiring::PlannedPlan::Rendered { display, .. } => print_prepared_plan(
+            color_mode,
             display,
             summary,
             schemas,
@@ -369,6 +419,7 @@ pub(crate) fn print_planned_plan(
             provider,
         ),
         crate::wiring::PlannedPlan::Unrendered { plan, .. } => print_plan(
+            color_mode,
             plan,
             summary,
             DetailLevel::None,
@@ -386,6 +437,7 @@ pub(crate) fn print_planned_plan(
 /// Print the exact plan that owns these prepared detail rows.
 #[allow(clippy::too_many_arguments)]
 pub fn print_prepared_plan(
+    color_mode: crate::output_style::ColorMode,
     display: &PreparedPlanDisplay,
     summary: &PlanChangeSummary,
     schemas: Option<&SchemaRegistry>,
@@ -397,6 +449,7 @@ pub fn print_prepared_plan(
     print!(
         "{}",
         format_prepared_plan(
+            color_mode,
             display,
             summary,
             schemas,
@@ -411,6 +464,7 @@ pub fn print_prepared_plan(
 
 #[allow(clippy::too_many_arguments)]
 pub fn format_prepared_plan(
+    color_mode: crate::output_style::ColorMode,
     display: &PreparedPlanDisplay,
     summary: &PlanChangeSummary,
     schemas: Option<&SchemaRegistry>,
@@ -425,6 +479,7 @@ pub fn format_prepared_plan(
         carina_core::detail_rows::DetailLevel::NamesOnly => DetailLevel::None,
     };
     format_plan_display(
+        color_mode,
         display.view(),
         summary,
         detail,
@@ -447,6 +502,7 @@ pub fn format_prepared_plan(
 /// fields the user never wrote do not inflate the plan output.
 #[allow(clippy::too_many_arguments)]
 pub fn format_plan_with_delete_instances<S, D: HistoricalDisplaySource<S> + ?Sized>(
+    color_mode: crate::output_style::ColorMode,
     plan: &Plan<S>,
     summary: &PlanChangeSummary,
     detail: DetailLevel,
@@ -460,6 +516,7 @@ pub fn format_plan_with_delete_instances<S, D: HistoricalDisplaySource<S> + ?Siz
 ) -> ProviderResult<String> {
     let historical = historical_display.historical_display(plan);
     format_plan_display(
+        color_mode,
         PlanDisplay::unprepared(plan, &historical, comparisons),
         summary,
         detail,
@@ -473,6 +530,7 @@ pub fn format_plan_with_delete_instances<S, D: HistoricalDisplaySource<S> + ?Siz
 
 #[allow(clippy::too_many_arguments)]
 fn format_plan_display<S>(
+    color_mode: crate::output_style::ColorMode,
     display: PlanDisplay<'_, S>,
     summary: &PlanChangeSummary,
     detail: DetailLevel,
@@ -482,13 +540,14 @@ fn format_plan_display<S>(
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
     provider: &ProviderRouter,
 ) -> ProviderResult<String> {
+    let plan = display.plan();
     let mut out = String::new();
 
     if !summary.has_changes() {
         writeln!(
             out,
             "{}",
-            "No changes. Infrastructure is up-to-date.".green()
+            "No changes. Infrastructure is up-to-date.".green(color_mode)
         )
         .unwrap();
         return Ok(out);
@@ -496,10 +555,16 @@ fn format_plan_display<S>(
 
     let export_changes = summary.export_changes();
     if summary.has_non_directive_changes() {
-        writeln!(out, "{}", "Execution Plan:".cyan().bold()).unwrap();
+        writeln!(
+            out,
+            "{}",
+            "Execution Plan:".cyan(color_mode).bold(color_mode)
+        )
+        .unwrap();
         writeln!(out).unwrap();
 
         out.push_str(&format_plan_tree(
+            color_mode,
             display,
             detail,
             schemas,
@@ -508,19 +573,20 @@ fn format_plan_display<S>(
             expansion_trace,
             provider,
         )?);
+        append_destroy_ordering_warnings(color_mode, &mut out, plan);
 
         // Show deferred for-expressions
         for deferred in summary.residual_deferred_for() {
-            out.push_str(&format_deferred_for_expression(deferred));
+            out.push_str(&format_deferred_for_expression(color_mode, deferred));
         }
 
         // Show export changes if any
         if !export_changes.is_empty() {
             writeln!(out).unwrap();
-            writeln!(out, "{}", "Exports:".cyan().bold()).unwrap();
+            writeln!(out, "{}", "Exports:".cyan(color_mode).bold(color_mode)).unwrap();
             writeln!(out).unwrap();
             for change in export_changes {
-                out.push_str(&format_export_change(change));
+                out.push_str(&format_export_change(color_mode, change));
             }
         }
     }
@@ -531,6 +597,7 @@ fn format_plan_display<S>(
             writeln!(out).unwrap();
         }
         out.push_str(&format_persisted_directive_changes(
+            color_mode,
             persisted_directive_changes,
         ));
     }
@@ -542,37 +609,42 @@ fn format_plan_display<S>(
             .iter()
             .copied()
             .map(|part| match part {
-                PlanSummaryPart::Read { count } => format!("{} to read", count.to_string().cyan()),
+                PlanSummaryPart::Read { count } => {
+                    format!("{} to read", count.to_string().cyan(color_mode))
+                }
                 PlanSummaryPart::Import { count } => {
-                    format!("{} to import", count.to_string().cyan())
+                    format!("{} to import", count.to_string().cyan(color_mode))
                 }
                 PlanSummaryPart::Create { count } => {
-                    let count = count.to_string().green();
+                    let count = count.to_string().green(color_mode);
                     format!("{} to add", count)
                 }
                 PlanSummaryPart::Update { count } => {
-                    format!("{} to change", count.to_string().yellow())
+                    format!("{} to change", count.to_string().yellow(color_mode))
                 }
                 PlanSummaryPart::Replace { count } => {
-                    format!("{} to replace", count.to_string().magenta())
+                    format!("{} to replace", count.to_string().magenta(color_mode))
                 }
                 PlanSummaryPart::Delete { count } => {
-                    format!("{} to destroy", count.to_string().red())
+                    format!("{} to destroy", count.to_string().red(color_mode))
                 }
                 PlanSummaryPart::Remove { count } => {
                     // carina#3332: state-only removal is not a destructive failure;
                     // color the count yellow to agree with the `~` Remove row in
                     // the tree above instead of red (which pairs with `✗`/Delete).
-                    format!("{} to remove from state", count.to_string().yellow())
+                    format!(
+                        "{} to remove from state",
+                        count.to_string().yellow(color_mode)
+                    )
                 }
                 PlanSummaryPart::Move { count } => {
-                    format!("{} to move", count.to_string().yellow())
+                    format!("{} to move", count.to_string().yellow(color_mode))
                 }
                 PlanSummaryPart::Release { count } => {
-                    format!("{} to release", count.to_string().yellow())
+                    format!("{} to release", count.to_string().yellow(color_mode))
                 }
                 PlanSummaryPart::Wait { count } => {
-                    format!("{} to wait", count.to_string().magenta())
+                    format!("{} to wait", count.to_string().magenta(color_mode))
                 }
             })
             .collect()
@@ -582,7 +654,7 @@ fn format_plan_display<S>(
     if !export_changes.is_empty() {
         parts.push(format!(
             "{} export change(s)",
-            export_changes.len().to_string().cyan()
+            export_changes.len().to_string().cyan(color_mode)
         ));
     }
     if !persisted_directive_changes.is_empty() {
@@ -590,20 +662,20 @@ fn format_plan_display<S>(
         let noun = if count == 1 { "change" } else { "changes" };
         parts.push(format!(
             "{} resource directive {}",
-            count.to_string().yellow(),
+            count.to_string().yellow(color_mode),
             noun
         ));
     }
     writeln!(out, "Plan: {}.", parts.join(", ")).unwrap();
     for entry in summary.deferred_effects() {
         let action = match entry.action {
-            DeferredSummaryAction::Add => "add".green(),
-            DeferredSummaryAction::Replace => "replace".magenta(),
+            DeferredSummaryAction::Add => "add".green(color_mode),
+            DeferredSummaryAction::Replace => "replace".magenta(color_mode),
         };
         writeln!(
             out,
             "       {} to {} after {} {}.",
-            "N".green(),
+            "N".green(color_mode),
             action,
             entry.upstream_binding,
             entry.verb
@@ -614,8 +686,8 @@ fn format_plan_display<S>(
         writeln!(
             out,
             "       {} to {} after {} resolves.",
-            "N".green(),
-            "add".green(),
+            "N".green(color_mode),
+            "add".green(color_mode),
             deferred_for_source(deferred)
         )
         .unwrap();
@@ -627,25 +699,33 @@ fn format_plan_display<S>(
 
 /// Format a single deferred for-expression for plan display.
 fn format_deferred_for_expression(
+    color_mode: crate::output_style::ColorMode,
     deferred: &carina_core::parser::ExpandedDeferredForExpression,
 ) -> String {
     let mut out = String::new();
     let upstream = deferred_for_source(deferred);
-    let sigil = Sigil::deferred_for_expression();
+    let sigil = Sigil::deferred_for_expression(color_mode);
     let line_prefix = top_level_sigil_prefix(&sigil);
     let attr_base = ATTR_BASE;
     writeln!(
         out,
         "{}{} {}",
         line_prefix,
-        deferred.resource_type().cyan().bold(),
-        format!("(N records after {upstream} resolves)").dimmed()
+        deferred.resource_type().cyan(color_mode).bold(color_mode),
+        format!("(N records after {upstream} resolves)").dimmed(color_mode)
     )
     .unwrap();
     for row in deferred_for_detail_rows(deferred, &upstream, "resolves") {
         match row {
             DetailRow::Text { text } => {
-                writeln!(out, "{}{}{}", LEFT_MARGIN, attr_base, text.dimmed()).unwrap();
+                writeln!(
+                    out,
+                    "{}{}{}",
+                    LEFT_MARGIN,
+                    attr_base,
+                    text.dimmed(color_mode)
+                )
+                .unwrap();
             }
             DetailRow::Attribute { key, value, .. } => {
                 writeln!(
@@ -653,7 +733,7 @@ fn format_deferred_for_expression(
                     "{}{}{}: {}",
                     LEFT_MARGIN,
                     attr_base,
-                    key.dimmed(),
+                    key.dimmed(color_mode),
                     value
                 )
                 .unwrap();
@@ -665,6 +745,7 @@ fn format_deferred_for_expression(
 }
 
 pub fn format_destroy_plan_with_delete_instances<D: HistoricalDisplaySource + ?Sized>(
+    color_mode: crate::output_style::ColorMode,
     plan: &Plan,
     detail: DetailLevel,
     historical_display: &D,
@@ -676,11 +757,12 @@ pub fn format_destroy_plan_with_delete_instances<D: HistoricalDisplaySource + ?S
         return Ok(out);
     }
 
-    writeln!(out, "{}", "Destroy Plan:".red().bold()).unwrap();
+    writeln!(out, "{}", "Destroy Plan:".red(color_mode).bold(color_mode)).unwrap();
     writeln!(out).unwrap();
 
     let historical_display = historical_display.historical_display(plan);
     out.push_str(&format_plan_tree(
+        color_mode,
         PlanDisplay::unprepared(
             plan,
             &historical_display,
@@ -693,8 +775,36 @@ pub fn format_destroy_plan_with_delete_instances<D: HistoricalDisplaySource + ?S
         None, // ExpansionTrace doesn't apply to destroy plans (no compositions in state)
         provider,
     )?);
+    append_destroy_ordering_warnings(color_mode, &mut out, plan);
 
     Ok(out)
+}
+
+fn append_destroy_ordering_warnings<S>(
+    color_mode: crate::output_style::ColorMode,
+    out: &mut String,
+    plan: &Plan<S>,
+) {
+    for notice in plan.destroy_ordering_notices() {
+        match notice.ordering() {
+            DestroyOrdering::Known => {}
+            DestroyOrdering::UnresolvedPersistedDependencies { dependencies } => {
+                for dependency in dependencies.iter() {
+                    writeln!(
+                        out,
+                        "{}",
+                        format!(
+                            "Warning: destroy ordering for {} is partially unknown: persisted dependency `{}` no longer resolves.",
+                            notice.id(),
+                            dependency,
+                        )
+                        .yellow(color_mode)
+                    )
+                    .unwrap();
+                }
+            }
+        }
+    }
 }
 
 /// Holds shared state and configuration for recursive tree rendering.
@@ -724,6 +834,7 @@ struct TreeRenderContext<'a, S> {
 impl<'a, S> TreeRenderContext<'a, S> {
     fn format_effect_tree(
         &mut self,
+        color_mode: crate::output_style::ColorMode,
         idx: usize,
         indent: usize,
         is_last: bool,
@@ -742,8 +853,8 @@ impl<'a, S> TreeRenderContext<'a, S> {
         let effect = &self.display.plan().effects()[idx];
         let replacement_info = self.replacement_create_info.get(&idx).copied();
         let sigil = replacement_info
-            .map(|metadata| Sigil::replacement(metadata.create_before_destroy))
-            .unwrap_or_else(|| Sigil::from_effect(effect));
+            .map(|metadata| Sigil::replacement(color_mode, metadata.create_before_destroy))
+            .unwrap_or_else(|| Sigil::from_effect(color_mode, effect));
         let line_prefix = tree_sigil_prefix(indent, is_last, prefix, &sigil);
         let base_indent = LEFT_MARGIN;
         let attr_base = ATTR_BASE;
@@ -771,7 +882,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
                         .map(|from| format!(" (moved from: {})", from.identity_display()));
                     if self.detail == DetailLevel::None {
                         let name_part = format_compact_name(
-                            carina_core::parser::ResourceRef::Resource(r),
+                            carina_core::parser::ResourceRef::Resource(r.as_inner()),
                             r.identity_str(),
                             parent_binding,
                         );
@@ -779,11 +890,11 @@ impl<'a, S> TreeRenderContext<'a, S> {
                             self.out,
                             "{}{} {} {}{}{}",
                             line_prefix,
-                            id.display_type().cyan().bold(),
-                            name_part.magenta().bold(),
-                            replace_note.magenta(),
-                            moved_note.as_deref().unwrap_or("").magenta(),
-                            origin_note.dimmed(),
+                            id.display_type().cyan(color_mode).bold(color_mode),
+                            name_part.magenta(color_mode).bold(color_mode),
+                            replace_note.magenta(color_mode),
+                            moved_note.as_deref().unwrap_or("").magenta(color_mode),
+                            origin_note.dimmed(color_mode),
                         )
                         .unwrap();
                     } else {
@@ -791,17 +902,17 @@ impl<'a, S> TreeRenderContext<'a, S> {
                             self.out,
                             "{}{} {} {}{}{}",
                             line_prefix,
-                            id.display_type().cyan().bold(),
-                            r.identity_str().magenta().bold(),
-                            replace_note.magenta(),
-                            moved_note.as_deref().unwrap_or("").magenta(),
-                            origin_note.dimmed(),
+                            id.display_type().cyan(color_mode).bold(color_mode),
+                            r.identity_str().magenta(color_mode).bold(color_mode),
+                            replace_note.magenta(color_mode),
+                            moved_note.as_deref().unwrap_or("").magenta(color_mode),
+                            origin_note.dimmed(color_mode),
                         )
                         .unwrap();
                     }
                 } else if self.detail == DetailLevel::None {
                     let name_part = format_compact_name(
-                        carina_core::parser::ResourceRef::Resource(r),
+                        carina_core::parser::ResourceRef::Resource(r.as_inner()),
                         r.identity_str(),
                         parent_binding,
                     );
@@ -809,9 +920,9 @@ impl<'a, S> TreeRenderContext<'a, S> {
                         self.out,
                         "{}{} {}{}",
                         line_prefix,
-                        r.id.display_type().cyan().bold(),
-                        name_part.white().bold(),
-                        origin_note.dimmed(),
+                        r.id.display_type().cyan(color_mode).bold(color_mode),
+                        name_part.white(color_mode).bold(color_mode),
+                        origin_note.dimmed(color_mode),
                     )
                     .unwrap();
                 } else {
@@ -819,9 +930,9 @@ impl<'a, S> TreeRenderContext<'a, S> {
                         self.out,
                         "{}{} {}{}",
                         line_prefix,
-                        r.id.display_type().cyan().bold(),
-                        r.identity_str().white().bold(),
-                        origin_note.dimmed(),
+                        r.id.display_type().cyan(color_mode).bold(color_mode),
+                        r.identity_str().white(color_mode).bold(color_mode),
+                        origin_note.dimmed(color_mode),
                     )
                     .unwrap();
                 }
@@ -835,10 +946,15 @@ impl<'a, S> TreeRenderContext<'a, S> {
                     self.out,
                     "{}{} {} {}{}",
                     line_prefix,
-                    "resume create".cyan().bold(),
-                    resource.id.human().to_string().cyan().bold(),
-                    since.dimmed(),
-                    origin_note.dimmed(),
+                    "resume create".cyan(color_mode).bold(color_mode),
+                    resource
+                        .id
+                        .human()
+                        .to_string()
+                        .cyan(color_mode)
+                        .bold(color_mode),
+                    since.dimmed(color_mode),
+                    origin_note.dimmed(color_mode),
                 )
                 .unwrap();
             }
@@ -850,7 +966,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
                     .map(|from| format!(" (moved from: {})", from.identity_display()));
                 if self.detail == DetailLevel::None {
                     let name_part = format_compact_name(
-                        carina_core::parser::ResourceRef::Resource(to),
+                        carina_core::parser::ResourceRef::Resource(to.as_inner()),
                         to.identity_str(),
                         parent_binding,
                     );
@@ -858,10 +974,10 @@ impl<'a, S> TreeRenderContext<'a, S> {
                         self.out,
                         "{}{} {}{}{}",
                         line_prefix,
-                        id.display_type().cyan().bold(),
-                        name_part.yellow().bold(),
-                        moved_note.as_deref().unwrap_or("").yellow(),
-                        origin_note.dimmed(),
+                        id.display_type().cyan(color_mode).bold(color_mode),
+                        name_part.yellow(color_mode).bold(color_mode),
+                        moved_note.as_deref().unwrap_or("").yellow(color_mode),
+                        origin_note.dimmed(color_mode),
                     )
                     .unwrap();
                 } else {
@@ -869,10 +985,10 @@ impl<'a, S> TreeRenderContext<'a, S> {
                         self.out,
                         "{}{} {}{}{}",
                         line_prefix,
-                        id.display_type().cyan().bold(),
-                        to.identity_str().yellow().bold(),
-                        moved_note.as_deref().unwrap_or("").yellow(),
-                        origin_note.dimmed(),
+                        id.display_type().cyan(color_mode).bold(color_mode),
+                        to.identity_str().yellow(color_mode).bold(color_mode),
+                        moved_note.as_deref().unwrap_or("").yellow(color_mode),
+                        origin_note.dimmed(color_mode),
                     )
                     .unwrap();
                 }
@@ -900,16 +1016,19 @@ impl<'a, S> TreeRenderContext<'a, S> {
                     self.out,
                     "{}{} {}{}",
                     line_prefix,
-                    id.display_type().cyan().bold(),
-                    display_name.red().bold().strikethrough(),
-                    deposed_note.yellow()
+                    id.display_type().cyan(color_mode).bold(color_mode),
+                    display_name
+                        .red(color_mode)
+                        .bold(color_mode)
+                        .strikethrough(color_mode),
+                    deposed_note.yellow(color_mode)
                 )
                 .unwrap();
             }
             Effect::Read { resource } => {
                 if self.detail == DetailLevel::None {
                     let name_part = format_compact_name(
-                        carina_core::parser::ResourceRef::DataSource(resource),
+                        carina_core::parser::ResourceRef::DataSource(resource.as_inner()),
                         resource.identity_str(),
                         parent_binding,
                     );
@@ -917,9 +1036,9 @@ impl<'a, S> TreeRenderContext<'a, S> {
                         self.out,
                         "{}{} {} {}",
                         line_prefix,
-                        resource.id.display_type().cyan().bold(),
-                        name_part.cyan().bold(),
-                        "(data source)".dimmed()
+                        resource.id.display_type().cyan(color_mode).bold(color_mode),
+                        name_part.cyan(color_mode).bold(color_mode),
+                        "(data source)".dimmed(color_mode)
                     )
                     .unwrap();
                 } else {
@@ -927,9 +1046,9 @@ impl<'a, S> TreeRenderContext<'a, S> {
                         self.out,
                         "{}{} {} {}",
                         line_prefix,
-                        resource.id.display_type().cyan().bold(),
-                        resource.identity_str().cyan().bold(),
-                        "(data source)".dimmed()
+                        resource.id.display_type().cyan(color_mode).bold(color_mode),
+                        resource.identity_str().cyan(color_mode).bold(color_mode),
+                        "(data source)".dimmed(color_mode)
                     )
                     .unwrap();
                 }
@@ -946,9 +1065,9 @@ impl<'a, S> TreeRenderContext<'a, S> {
                     self.out,
                     "{}{} {} {}",
                     line_prefix,
-                    id.display_type().cyan().bold(),
-                    id.identity_str().cyan().bold(),
-                    format!("(import: {})", identifier_str).dimmed()
+                    id.display_type().cyan(color_mode).bold(color_mode),
+                    id.identity_str().cyan(color_mode).bold(color_mode),
+                    format!("(import: {})", identifier_str).dimmed(color_mode)
                 )
                 .unwrap();
             }
@@ -957,14 +1076,14 @@ impl<'a, S> TreeRenderContext<'a, S> {
                     self.out,
                     "{}{} {} {}",
                     line_prefix,
-                    id.display_type().cyan().bold(),
+                    id.display_type().cyan(color_mode).bold(color_mode),
                     // carina#3332: name was previously `red().bold()`,
                     // which pairs with `✗`/Delete and re-introduces the
                     // "state-only success looks like failure" misread
                     // even after the leading `x` glyph fix. Yellow
                     // matches the `~` symbol family and Move's row.
-                    id.identity_str().yellow().bold(),
-                    "(remove from state)".dimmed()
+                    id.identity_str().yellow(color_mode).bold(color_mode),
+                    "(remove from state)".dimmed(color_mode)
                 )
                 .unwrap();
                 let abandoned: Vec<_> = self
@@ -1006,10 +1125,10 @@ impl<'a, S> TreeRenderContext<'a, S> {
                     self.out,
                     "{}{} {} {}{}",
                     line_prefix,
-                    to.display_type().cyan().bold(),
-                    to.identity_str().yellow().bold(),
-                    format!("(moved from: {})", from.identity_str()).dimmed(),
-                    origin_note.dimmed(),
+                    to.display_type().cyan(color_mode).bold(color_mode),
+                    to.identity_str().yellow(color_mode).bold(color_mode),
+                    format!("(moved from: {})", from.identity_str()).dimmed(color_mode),
+                    origin_note.dimmed(color_mode),
                 )
                 .unwrap();
             }
@@ -1018,24 +1137,22 @@ impl<'a, S> TreeRenderContext<'a, S> {
                     self.out,
                     "{}{} {} {}",
                     line_prefix,
-                    id.display_type().cyan().bold(),
-                    id.identity_str().yellow().bold(),
-                    "(release keyed list entries from state)".dimmed(),
+                    id.display_type().cyan(color_mode).bold(color_mode),
+                    id.identity_str().yellow(color_mode).bold(color_mode),
+                    "(release keyed list entries from state)".dimmed(color_mode),
                 )
                 .unwrap();
             }
             Effect::Wait {
-                identity,
-                until_surface,
-                ..
+                id, until_surface, ..
             } => {
-                let binding = identity.to_string();
+                let binding = id.identity_str();
                 writeln!(
                     self.out,
                     "{}{} {}",
                     line_prefix,
-                    binding.magenta().bold(),
-                    format!("(until {})", until_surface).dimmed()
+                    binding.magenta(color_mode).bold(color_mode),
+                    format!("(until {})", until_surface).dimmed(color_mode)
                 )
                 .unwrap();
             }
@@ -1043,12 +1160,12 @@ impl<'a, S> TreeRenderContext<'a, S> {
                 let template = &payload.template;
                 let verb = deferred_for_verb(self.display.plan(), template);
                 let display_name = deferred_for_display_name(template, verb);
-                let display_name = display_name.green().bold();
+                let display_name = display_name.green(color_mode).bold(color_mode);
                 writeln!(
                     self.out,
                     "{}{} {}",
                     line_prefix,
-                    template.resource_type().cyan().bold(),
+                    template.resource_type().cyan(color_mode).bold(color_mode),
                     display_name
                 )
                 .unwrap();
@@ -1064,19 +1181,21 @@ impl<'a, S> TreeRenderContext<'a, S> {
                 };
                 let upstream_binding = template.binding_description();
                 for row in deferred_for_detail_rows(template, &upstream_binding, verb) {
-                    render_detail_row(&mut self.out, &row, effect, &attr_prefix);
+                    render_detail_row(color_mode, &mut self.out, &row, effect, &attr_prefix);
                 }
                 has_displayed_attrs = true;
             }
             Effect::DeferredReplace(payload) => {
                 let template = payload.template.as_ref();
                 let verb = deferred_for_verb(self.display.plan(), template);
-                let display_name = deferred_for_display_name(template, verb).magenta().bold();
+                let display_name = deferred_for_display_name(template, verb)
+                    .magenta(color_mode)
+                    .bold(color_mode);
                 writeln!(
                     self.out,
                     "{}{} {}",
                     line_prefix,
-                    template.resource_type().cyan().bold(),
+                    template.resource_type().cyan(color_mode).bold(color_mode),
                     display_name
                 )
                 .unwrap();
@@ -1092,7 +1211,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
                 };
                 let upstream_binding = template.binding_description();
                 for row in deferred_for_detail_rows(template, &upstream_binding, verb) {
-                    render_detail_row(&mut self.out, &row, effect, &attr_prefix);
+                    render_detail_row(color_mode, &mut self.out, &row, effect, &attr_prefix);
                 }
                 has_displayed_attrs = true;
             }
@@ -1119,7 +1238,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
                 self.out,
                 "{}{}",
                 attr_prefix,
-                format!("# {} ignored attribute(s) differ", summary.count()).dimmed()
+                format!("# {} ignored attribute(s) differ", summary.count()).dimmed(color_mode)
             )
             .unwrap();
             has_displayed_attrs = true;
@@ -1151,7 +1270,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
             }
 
             for row in detail_rows.iter() {
-                render_detail_row(&mut self.out, row, effect, &attr_prefix);
+                render_detail_row(color_mode, &mut self.out, row, effect, &attr_prefix);
             }
         }
 
@@ -1175,6 +1294,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
         let child_render_items = self.child_render_items(&unprinted_children);
 
         has_displayed_attrs |= self.render_children(
+            color_mode,
             &child_render_items,
             ChildRenderOptions {
                 parent_indent: indent,
@@ -1191,6 +1311,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
 
     fn format_render_item(
         &mut self,
+        color_mode: crate::output_style::ColorMode,
         item: &ChildRenderItem,
         indent: usize,
         is_last: bool,
@@ -1199,7 +1320,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
     ) -> ProviderResult<bool> {
         match item {
             ChildRenderItem::Normal(idx) => {
-                self.format_effect_tree(*idx, indent, is_last, prefix, parent_binding)
+                self.format_effect_tree(color_mode, *idx, indent, is_last, prefix, parent_binding)
             }
         }
     }
@@ -1265,6 +1386,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
 
     fn render_children(
         &mut self,
+        color_mode: crate::output_style::ColorMode,
         items: &[ChildRenderItem],
         options: ChildRenderOptions<'_>,
     ) -> ProviderResult<bool> {
@@ -1293,6 +1415,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
         for (i, item) in rendering_items.iter().enumerate() {
             let child_is_last = i == rendering_items.len() - 1;
             let child_had_attrs = self.format_render_item(
+                color_mode,
                 item,
                 options.parent_indent + 1,
                 child_is_last,
@@ -1343,6 +1466,7 @@ fn child_prefix_for_parent(
 /// Replace, and Delete effects.
 #[allow(clippy::too_many_arguments)]
 fn format_plan_tree<'a, S>(
+    color_mode: crate::output_style::ColorMode,
     display: PlanDisplay<'a, S>,
     detail: DetailLevel,
     schemas: Option<&'a SchemaRegistry>,
@@ -1419,7 +1543,7 @@ fn format_plan_tree<'a, S>(
         let ungrouped_items = ctx.child_render_items(&composition_groups.ungrouped);
         for (i, item) in ungrouped_items.iter().enumerate() {
             let last = i == ungrouped_items.len() - 1 && composition_groups.grouped.is_empty();
-            ctx.format_render_item(item, 0, last, "", None)?;
+            ctx.format_render_item(color_mode, item, 0, last, "", None)?;
         }
         // Then: each composition group with its header. The header is a
         // virtual parent, and the leaves render through the same child path
@@ -1428,11 +1552,12 @@ fn format_plan_tree<'a, S>(
             writeln!(
                 ctx.out,
                 "{}",
-                format_composition_header(&group.binding, group.source_path.as_deref())
+                format_composition_header(color_mode, &group.binding, group.source_path.as_deref())
             )
             .unwrap();
             let leaf_items = ctx.child_render_items(&group.leaves);
             ctx.render_children(
+                color_mode,
                 &leaf_items,
                 ChildRenderOptions {
                     parent_indent: 0,
@@ -1449,7 +1574,7 @@ fn format_plan_tree<'a, S>(
         // pre-#3307 flat layout so existing snapshots remain valid.
         let root_items = ctx.child_render_items(&roots);
         for (i, item) in root_items.iter().enumerate() {
-            ctx.format_render_item(item, 0, i == root_items.len() - 1, "", None)?;
+            ctx.format_render_item(color_mode, item, 0, i == root_items.len() - 1, "", None)?;
         }
     }
 
@@ -1461,7 +1586,14 @@ fn format_plan_tree<'a, S>(
         .collect();
     let remaining_items = ctx.child_render_items(&remaining);
     for (i, item) in remaining_items.iter().enumerate() {
-        ctx.format_render_item(item, 0, i == remaining_items.len() - 1, "", None)?;
+        ctx.format_render_item(
+            color_mode,
+            item,
+            0,
+            i == remaining_items.len() - 1,
+            "",
+            None,
+        )?;
     }
 
     let effected_ids: HashSet<_> = plan.effects().iter().map(Effect::resource_id).collect();
@@ -1475,8 +1607,11 @@ fn format_plan_tree<'a, S>(
             ctx.out,
             "{}# {} {}",
             LEFT_MARGIN,
-            id.display_type().cyan().bold(),
-            id.identity_display().to_string().white().bold(),
+            id.display_type().cyan(color_mode).bold(color_mode),
+            id.identity_display()
+                .to_string()
+                .white(color_mode)
+                .bold(color_mode),
         )
         .unwrap();
         writeln!(
@@ -1484,7 +1619,7 @@ fn format_plan_tree<'a, S>(
             "{}{}{}",
             LEFT_MARGIN,
             ATTR_BASE,
-            format!("# {} ignored attribute(s) differ", summary.count()).dimmed(),
+            format!("# {} ignored attribute(s) differ", summary.count()).dimmed(color_mode),
         )
         .unwrap();
     }
@@ -1501,16 +1636,24 @@ fn format_plan_tree<'a, S>(
 /// wrote (`let r = infra { ... }`), so it is something they can
 /// trace back to their own `.crn` — unlike the previous internal
 /// `LiveComposition` label (carina#3322).
-fn format_composition_header(binding: &str, source_path: Option<&str>) -> String {
-    let sigil = Sigil::module_header();
+fn format_composition_header(
+    color_mode: crate::output_style::ColorMode,
+    binding: &str,
+    source_path: Option<&str>,
+) -> String {
+    let sigil = Sigil::module_header(color_mode);
     let prefix = top_level_sigil_prefix(&sigil);
     match source_path {
-        None => format!("{}module \"{}\"", prefix, binding.cyan().bold()),
+        None => format!(
+            "{}module \"{}\"",
+            prefix,
+            binding.cyan(color_mode).bold(color_mode)
+        ),
         Some(path) => format!(
             "{}module \"{}\" {}",
             prefix,
-            binding.cyan().bold(),
-            format!("({})", path).dimmed(),
+            binding.cyan(color_mode).bold(color_mode),
+            format!("({})", path).dimmed(color_mode),
         ),
     }
 }
@@ -1615,40 +1758,48 @@ enum AnsiValueStyle {
     Magenta,
 }
 
-fn style_value_span(kind: ValueSpanKind, text: &str, style: AnsiValueStyle) -> String {
+fn style_value_span(
+    color_mode: crate::output_style::ColorMode,
+    kind: ValueSpanKind,
+    text: &str,
+    style: AnsiValueStyle,
+) -> String {
     if kind == ValueSpanKind::Whitespace {
         return text.to_string();
     }
     match style {
         AnsiValueStyle::Semantic => match kind {
-            ValueSpanKind::StringLiteral => text.green().to_string(),
-            ValueSpanKind::Bool => text.yellow().to_string(),
-            ValueSpanKind::Number => text.white().to_string(),
-            ValueSpanKind::Enum => text.magenta().to_string(),
-            ValueSpanKind::Reference => text.cyan().to_string(),
+            ValueSpanKind::StringLiteral => text.green(color_mode).to_string(),
+            ValueSpanKind::Bool => text.yellow(color_mode).to_string(),
+            ValueSpanKind::Number => text.white(color_mode).to_string(),
+            ValueSpanKind::Enum => text.magenta(color_mode).to_string(),
+            ValueSpanKind::Reference => text.cyan(color_mode).to_string(),
             ValueSpanKind::Structure
             | ValueSpanKind::Key
             | ValueSpanKind::Other
             | ValueSpanKind::Whitespace => text.to_string(),
         },
         AnsiValueStyle::Dimmed => match kind {
-            ValueSpanKind::StringLiteral => text.green().dimmed().to_string(),
-            ValueSpanKind::Bool => text.yellow().dimmed().to_string(),
-            ValueSpanKind::Number => text.white().dimmed().to_string(),
-            ValueSpanKind::Enum => text.magenta().dimmed().to_string(),
-            ValueSpanKind::Reference => text.cyan().dimmed().to_string(),
+            ValueSpanKind::StringLiteral => text.green(color_mode).dimmed(color_mode).to_string(),
+            ValueSpanKind::Bool => text.yellow(color_mode).dimmed(color_mode).to_string(),
+            ValueSpanKind::Number => text.white(color_mode).dimmed(color_mode).to_string(),
+            ValueSpanKind::Enum => text.magenta(color_mode).dimmed(color_mode).to_string(),
+            ValueSpanKind::Reference => text.cyan(color_mode).dimmed(color_mode).to_string(),
             ValueSpanKind::Structure | ValueSpanKind::Key | ValueSpanKind::Other => {
-                text.dimmed().to_string()
+                text.dimmed(color_mode).to_string()
             }
             ValueSpanKind::Whitespace => text.to_string(),
         },
-        AnsiValueStyle::RedStrikethrough => text.red().strikethrough().to_string(),
-        AnsiValueStyle::Green => text.green().to_string(),
-        AnsiValueStyle::Magenta => text.magenta().to_string(),
+        AnsiValueStyle::RedStrikethrough => {
+            text.red(color_mode).strikethrough(color_mode).to_string()
+        }
+        AnsiValueStyle::Green => text.green(color_mode).to_string(),
+        AnsiValueStyle::Magenta => text.magenta(color_mode).to_string(),
     }
 }
 
 fn render_value_ansi(
+    color_mode: crate::output_style::ColorMode,
     rendered: &RenderedValue,
     style: AnsiValueStyle,
     continuation_prefix: Option<&str>,
@@ -1657,7 +1808,7 @@ fn render_value_ansi(
         return rendered
             .spans()
             .iter()
-            .map(|span| style_value_span(span.kind(), span.text(), style))
+            .map(|span| style_value_span(color_mode, span.kind(), span.text(), style))
             .collect();
     };
 
@@ -1696,27 +1847,44 @@ fn render_value_ansi(
             pending_indent.clear();
             continuation = false;
         }
-        out.push_str(&style_value_span(span.kind(), span.text(), style));
+        out.push_str(&style_value_span(
+            color_mode,
+            span.kind(),
+            span.text(),
+            style,
+        ));
     }
 
     out
 }
 
-pub(crate) fn colored_value(rendered: &RenderedValue) -> String {
-    render_value_ansi(rendered, AnsiValueStyle::Semantic, None)
+pub(crate) fn colored_value(
+    color_mode: crate::output_style::ColorMode,
+    rendered: &RenderedValue,
+) -> String {
+    render_value_ansi(color_mode, rendered, AnsiValueStyle::Semantic, None)
 }
 
-fn forcing_value(rendered: &RenderedValue) -> String {
-    render_value_ansi(rendered, AnsiValueStyle::Green, None)
+fn forcing_value(color_mode: crate::output_style::ColorMode, rendered: &RenderedValue) -> String {
+    render_value_ansi(color_mode, rendered, AnsiValueStyle::Green, None)
 }
 
 /// Apply type-based coloring to a value, with dimmed modifier for default values.
-fn colored_value_dimmed(rendered: &RenderedValue) -> String {
-    render_value_ansi(rendered, AnsiValueStyle::Dimmed, None)
+fn colored_value_dimmed(
+    color_mode: crate::output_style::ColorMode,
+    rendered: &RenderedValue,
+) -> String {
+    render_value_ansi(color_mode, rendered, AnsiValueStyle::Dimmed, None)
 }
 
 /// Render a single `DetailRow` into the output string with ANSI colors.
-fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, attr_prefix: &str) {
+fn render_detail_row<S>(
+    color_mode: crate::output_style::ColorMode,
+    out: &mut String,
+    row: &DetailRow,
+    effect: &Effect<S>,
+    attr_prefix: &str,
+) {
     match row {
         DetailRow::Text { text } => {
             writeln!(out, "{}{}", attr_prefix, text).unwrap();
@@ -1730,10 +1898,10 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 out,
                 "{}{} {}[{:?}]: left as {} (AWS does not revert omitted keys; write the default value to revert)",
                 attr_prefix,
-                "!".yellow().bold(),
+                "!".yellow(color_mode).bold(color_mode),
                 attribute,
                 key,
-                colored_value(retained_value),
+                colored_value(color_mode, retained_value),
             )
             .unwrap();
         }
@@ -1745,7 +1913,7 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
         } => {
             let cv = match effect {
                 Effect::Delete { .. } => {
-                    render_value_ansi(value, AnsiValueStyle::RedStrikethrough, None)
+                    render_value_ansi(color_mode, value, AnsiValueStyle::RedStrikethrough, None)
                 }
                 Effect::Read { .. }
                 | Effect::Create(_)
@@ -1757,9 +1925,9 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 | Effect::ReleaseListKeys { .. }
                 | Effect::Wait { .. }
                 | Effect::DeferredCreate(_)
-                | Effect::DeferredReplace(_) => colored_value(value),
+                | Effect::DeferredReplace(_) => colored_value(color_mode, value),
             };
-            let annotation_suffix = annotation_suffix(annotation.as_deref());
+            let annotation_suffix = annotation_suffix(color_mode, annotation.as_deref());
             writeln!(out, "{}{}: {}{}", attr_prefix, key, cv, annotation_suffix).unwrap();
         }
         DetailRow::PrettyAttribute { key, value } => {
@@ -1770,9 +1938,12 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 carina_core::value::PrettyLayout::for_attribute(attr_prefix.chars().count(), key);
             let pretty = value.render(layout);
             let cv = match effect {
-                Effect::Delete { .. } => {
-                    render_value_ansi(&pretty, AnsiValueStyle::RedStrikethrough, Some(attr_prefix))
-                }
+                Effect::Delete { .. } => render_value_ansi(
+                    color_mode,
+                    &pretty,
+                    AnsiValueStyle::RedStrikethrough,
+                    Some(attr_prefix),
+                ),
                 Effect::Read { .. }
                 | Effect::Create(_)
                 | Effect::ResumeCreate { .. }
@@ -1783,9 +1954,12 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 | Effect::ReleaseListKeys { .. }
                 | Effect::Wait { .. }
                 | Effect::DeferredCreate(_)
-                | Effect::DeferredReplace(_) => {
-                    render_value_ansi(&pretty, AnsiValueStyle::Semantic, Some(attr_prefix))
-                }
+                | Effect::DeferredReplace(_) => render_value_ansi(
+                    color_mode,
+                    &pretty,
+                    AnsiValueStyle::Semantic,
+                    Some(attr_prefix),
+                ),
             };
             writeln!(out, "{}{}: {}", attr_prefix, key, cv).unwrap();
         }
@@ -1809,6 +1983,7 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 let pretty = entry.value.render(layout);
                 let cv = match effect {
                     Effect::Delete { .. } => render_value_ansi(
+                        color_mode,
                         &pretty,
                         AnsiValueStyle::RedStrikethrough,
                         Some(attr_prefix),
@@ -1823,11 +1998,14 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                     | Effect::ReleaseListKeys { .. }
                     | Effect::Wait { .. }
                     | Effect::DeferredCreate(_)
-                    | Effect::DeferredReplace(_) => {
-                        render_value_ansi(&pretty, AnsiValueStyle::Semantic, Some(attr_prefix))
-                    }
+                    | Effect::DeferredReplace(_) => render_value_ansi(
+                        color_mode,
+                        &pretty,
+                        AnsiValueStyle::Semantic,
+                        Some(attr_prefix),
+                    ),
                 };
-                let annotation_suffix = annotation_suffix(entry.annotation.as_deref());
+                let annotation_suffix = annotation_suffix(color_mode, entry.annotation.as_deref());
                 writeln!(
                     out,
                     "{}  {}: {}{}",
@@ -1842,8 +2020,8 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 "{}{}: {} → {}",
                 attr_prefix,
                 key,
-                render_value_ansi(old, AnsiValueStyle::RedStrikethrough, None),
-                colored_value(new),
+                render_value_ansi(color_mode, old, AnsiValueStyle::RedStrikethrough, None),
+                colored_value(color_mode, new),
             )
             .unwrap();
         }
@@ -1853,15 +2031,15 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 "{}{}: {} → {} {}",
                 attr_prefix,
                 key,
-                render_value_ansi(old, AnsiValueStyle::RedStrikethrough, None),
-                forcing_value(new),
-                "(forces replacement)".magenta()
+                render_value_ansi(color_mode, old, AnsiValueStyle::RedStrikethrough, None),
+                forcing_value(color_mode, new),
+                "(forces replacement)".magenta(color_mode)
             )
             .unwrap();
         }
         DetailRow::MapDiff { key, entries } => {
             writeln!(out, "{}{}:", attr_prefix, key).unwrap();
-            render_map_diff_entries(out, entries.as_slice(), attr_prefix);
+            render_map_diff_entries(color_mode, out, entries.as_slice(), attr_prefix);
         }
         DetailRow::MapDiffForcesReplacement { key, entries } => {
             writeln!(
@@ -1869,10 +2047,10 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 "{}{}: {}",
                 attr_prefix,
                 key,
-                "(forces replacement)".magenta()
+                "(forces replacement)".magenta(color_mode)
             )
             .unwrap();
-            render_map_diff_entries(out, entries.as_slice(), attr_prefix);
+            render_map_diff_entries(color_mode, out, entries.as_slice(), attr_prefix);
         }
         DetailRow::StringListDiff {
             key,
@@ -1881,7 +2059,14 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
             removed,
         } => {
             writeln!(out, "{}{}:", attr_prefix, key).unwrap();
-            render_string_list_diff_entries(out, unchanged, added, removed, attr_prefix);
+            render_string_list_diff_entries(
+                color_mode,
+                out,
+                unchanged,
+                added,
+                removed,
+                attr_prefix,
+            );
         }
         DetailRow::StringListDiffForcesReplacement {
             key,
@@ -1894,14 +2079,22 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 "{}{}: {}",
                 attr_prefix,
                 key,
-                "(forces replacement)".magenta()
+                "(forces replacement)".magenta(color_mode)
             )
             .unwrap();
-            render_string_list_diff_entries(out, unchanged, added, removed, attr_prefix);
+            render_string_list_diff_entries(
+                color_mode,
+                out,
+                unchanged,
+                added,
+                removed,
+                attr_prefix,
+            );
         }
         DetailRow::ListOfMapsDiff { key, block } => {
             writeln!(out, "{}{}:", attr_prefix, key).unwrap();
             render_list_of_maps_diff(
+                color_mode,
                 out,
                 block.unchanged(),
                 block.modified(),
@@ -1916,10 +2109,11 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 "{}{}: {}",
                 attr_prefix,
                 key,
-                "(forces replacement)".magenta()
+                "(forces replacement)".magenta(color_mode)
             )
             .unwrap();
             render_list_of_maps_diff(
+                color_mode,
                 out,
                 block.unchanged(),
                 block.modified(),
@@ -1935,7 +2129,7 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 "{}{}: {}",
                 attr_prefix,
                 key,
-                "(forces replacement)".magenta()
+                "(forces replacement)".magenta(color_mode)
             )
             .unwrap();
         }
@@ -1945,8 +2139,8 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 "{}{}: {} → {}",
                 attr_prefix,
                 key,
-                render_value_ansi(old, AnsiValueStyle::RedStrikethrough, None),
-                "(removed)".red().strikethrough()
+                render_value_ansi(color_mode, old, AnsiValueStyle::RedStrikethrough, None),
+                "(removed)".red(color_mode).strikethrough(color_mode)
             )
             .unwrap();
         }
@@ -1955,9 +2149,9 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 out,
                 "{}{}: {}  {}",
                 attr_prefix,
-                key.dimmed(),
-                colored_value_dimmed(value),
-                "# default".dimmed()
+                key.dimmed(color_mode),
+                colored_value_dimmed(color_mode, value),
+                "# default".dimmed(color_mode)
             )
             .unwrap();
         }
@@ -1966,8 +2160,8 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 out,
                 "{}{}: {}",
                 attr_prefix,
-                key.dimmed(),
-                "(known after apply)".dimmed()
+                key.dimmed(color_mode),
+                "(known after apply)".dimmed(color_mode)
             )
             .unwrap();
         }
@@ -1976,7 +2170,7 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 out,
                 "{}{}",
                 attr_prefix,
-                hidden_unchanged_summary(*count, "attribute").dimmed()
+                hidden_unchanged_summary(*count, "attribute").dimmed(color_mode)
             )
             .unwrap();
         }
@@ -1986,9 +2180,9 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 "{}{}: {} → {} {}",
                 attr_prefix,
                 key,
-                render_value_ansi(old, AnsiValueStyle::RedStrikethrough, None),
-                "(removed)".red().strikethrough(),
-                "(forces replacement)".magenta()
+                render_value_ansi(color_mode, old, AnsiValueStyle::RedStrikethrough, None),
+                "(removed)".red(color_mode).strikethrough(color_mode),
+                "(forces replacement)".magenta(color_mode)
             )
             .unwrap();
         }
@@ -1998,9 +2192,9 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 "{}{}: {} → {} {}",
                 attr_prefix,
                 key,
-                render_value_ansi(old, AnsiValueStyle::RedStrikethrough, None),
-                render_value_ansi(new, AnsiValueStyle::Green, None),
-                "(forces replacement, known after apply)".magenta()
+                render_value_ansi(color_mode, old, AnsiValueStyle::RedStrikethrough, None),
+                render_value_ansi(color_mode, new, AnsiValueStyle::Green, None),
+                "(forces replacement, known after apply)".magenta(color_mode)
             )
             .unwrap();
         }
@@ -2015,9 +2209,9 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                     out,
                     "{}  {} via temporary name {}, will rename back to {} after old resource is deleted",
                     attr_prefix,
-                    "note:".magenta().bold(),
-                    render_value_ansi(temporary_value, AnsiValueStyle::Magenta, None),
-                    render_value_ansi(original_value, AnsiValueStyle::Green, None)
+                    "note:".magenta(color_mode).bold(color_mode),
+                    render_value_ansi(color_mode, temporary_value, AnsiValueStyle::Magenta, None),
+                    render_value_ansi(color_mode, original_value, AnsiValueStyle::Green, None)
                 )
                 .unwrap();
             } else {
@@ -2025,9 +2219,9 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                     out,
                     "{}  {} name will be {} (cannot rename create-only attribute \"{}\")",
                     attr_prefix,
-                    "note:".magenta().bold(),
-                    render_value_ansi(temporary_value, AnsiValueStyle::Magenta, None),
-                    attribute.magenta()
+                    "note:".magenta(color_mode).bold(color_mode),
+                    render_value_ansi(color_mode, temporary_value, AnsiValueStyle::Magenta, None),
+                    attribute.magenta(color_mode)
                 )
                 .unwrap();
             }
@@ -2036,7 +2230,12 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
 }
 
 /// Render map diff entries with ANSI colors.
-fn render_map_diff_entries(out: &mut String, entries: &[MapDiffEntryIR], attr_prefix: &str) {
+fn render_map_diff_entries(
+    color_mode: crate::output_style::ColorMode,
+    out: &mut String,
+    entries: &[MapDiffEntryIR],
+    attr_prefix: &str,
+) {
     for entry in entries {
         match entry {
             MapDiffEntryIR::Changed {
@@ -2045,15 +2244,15 @@ fn render_map_diff_entries(out: &mut String, entries: &[MapDiffEntryIR], attr_pr
                 new,
                 annotation,
             } => {
-                let annotation_suffix = annotation_suffix(annotation.as_deref());
+                let annotation_suffix = annotation_suffix(color_mode, annotation.as_deref());
                 writeln!(
                     out,
                     "{}  {} {}: {} → {}{}",
                     attr_prefix,
-                    "~".yellow(),
+                    "~".yellow(color_mode),
                     key,
-                    render_value_ansi(old, AnsiValueStyle::RedStrikethrough, None),
-                    colored_value(new),
+                    render_value_ansi(color_mode, old, AnsiValueStyle::RedStrikethrough, None),
+                    colored_value(color_mode, new),
                     annotation_suffix
                 )
                 .unwrap();
@@ -2063,14 +2262,14 @@ fn render_map_diff_entries(out: &mut String, entries: &[MapDiffEntryIR], attr_pr
                 value,
                 annotation,
             } => {
-                let annotation_suffix = annotation_suffix(annotation.as_deref());
+                let annotation_suffix = annotation_suffix(color_mode, annotation.as_deref());
                 writeln!(
                     out,
                     "{}  {} {}: {}{}",
                     attr_prefix,
-                    "+".green(),
+                    "+".green(color_mode),
                     key,
-                    colored_value(value),
+                    colored_value(color_mode, value),
                     annotation_suffix
                 )
                 .unwrap();
@@ -2080,21 +2279,22 @@ fn render_map_diff_entries(out: &mut String, entries: &[MapDiffEntryIR], attr_pr
                     out,
                     "{}  {} {}: {}",
                     attr_prefix,
-                    "-".red().strikethrough(),
+                    "-".red(color_mode).strikethrough(color_mode),
                     key,
-                    render_value_ansi(value, AnsiValueStyle::RedStrikethrough, None)
+                    render_value_ansi(color_mode, value, AnsiValueStyle::RedStrikethrough, None)
                 )
                 .unwrap();
             }
             MapDiffEntryIR::NestedMapDiff { key, entries } => {
                 writeln!(out, "{}    {}:", attr_prefix, key).unwrap();
                 let nested_prefix = format!("{}    ", attr_prefix);
-                render_map_diff_entries(out, entries.as_slice(), &nested_prefix);
+                render_map_diff_entries(color_mode, out, entries.as_slice(), &nested_prefix);
             }
             MapDiffEntryIR::NestedListOfMapsDiff { key, block } => {
                 writeln!(out, "{}    {}:", attr_prefix, key).unwrap();
                 let nested_prefix = format!("{}    ", attr_prefix);
                 render_list_of_maps_diff(
+                    color_mode,
                     out,
                     block.unchanged(),
                     block.modified(),
@@ -2112,15 +2312,25 @@ fn render_map_diff_entries(out: &mut String, entries: &[MapDiffEntryIR], attr_pr
                 // #3234: nested List<scalar> in a Map.
                 writeln!(out, "{}    {}:", attr_prefix, key).unwrap();
                 let nested_prefix = format!("{}    ", attr_prefix);
-                render_string_list_diff_entries(out, unchanged, added, removed, &nested_prefix);
+                render_string_list_diff_entries(
+                    color_mode,
+                    out,
+                    unchanged,
+                    added,
+                    removed,
+                    &nested_prefix,
+                );
             }
         }
     }
 }
 
-fn annotation_suffix(annotation: Option<&str>) -> String {
+fn annotation_suffix(
+    color_mode: crate::output_style::ColorMode,
+    annotation: Option<&str>,
+) -> String {
     annotation.map_or_else(String::new, |annotation| {
-        format!("  {}", annotation.dimmed())
+        format!("  {}", annotation.dimmed(color_mode))
     })
 }
 
@@ -2130,6 +2340,7 @@ fn annotation_suffix(annotation: Option<&str>) -> String {
 /// `render_list_of_maps_diff` and `# (n unchanged attributes hidden)`
 /// at the top level.
 fn render_string_list_diff_entries(
+    color_mode: crate::output_style::ColorMode,
     out: &mut String,
     unchanged: &[RenderedValue],
     added: &[RenderedValue],
@@ -2141,8 +2352,8 @@ fn render_string_list_diff_entries(
             out,
             "{}  {} {}",
             attr_prefix,
-            "-".red().strikethrough(),
-            render_value_ansi(s, AnsiValueStyle::RedStrikethrough, None)
+            "-".red(color_mode).strikethrough(color_mode),
+            render_value_ansi(color_mode, s, AnsiValueStyle::RedStrikethrough, None)
         )
         .unwrap();
     }
@@ -2151,8 +2362,8 @@ fn render_string_list_diff_entries(
             out,
             "{}  {} {}",
             attr_prefix,
-            "+".green(),
-            render_value_ansi(s, AnsiValueStyle::Green, None)
+            "+".green(color_mode),
+            render_value_ansi(color_mode, s, AnsiValueStyle::Green, None)
         )
         .unwrap();
     }
@@ -2161,7 +2372,7 @@ fn render_string_list_diff_entries(
             out,
             "{}  {}",
             attr_prefix,
-            hidden_unchanged_summary(unchanged.len(), "element").dimmed()
+            hidden_unchanged_summary(unchanged.len(), "element").dimmed(color_mode)
         )
         .unwrap();
     }
@@ -2169,6 +2380,7 @@ fn render_string_list_diff_entries(
 
 /// Render a list-of-maps diff with ANSI colors.
 fn render_list_of_maps_diff(
+    color_mode: crate::output_style::ColorMode,
     out: &mut String,
     unchanged: &[RenderedValue],
     modified: &[ListOfMapsDiffModified],
@@ -2192,7 +2404,13 @@ fn render_list_of_maps_diff(
             )
         });
         if has_block_field {
-            writeln!(out, "{}  {} {{", attr_prefix, "~".yellow().bold()).unwrap();
+            writeln!(
+                out,
+                "{}  {} {{",
+                attr_prefix,
+                "~".yellow(color_mode).bold(color_mode)
+            )
+            .unwrap();
             for field in item.fields.iter() {
                 match field {
                     ListOfMapsDiffField::Changed { key, old, new } => {
@@ -2200,17 +2418,22 @@ fn render_list_of_maps_diff(
                             out,
                             "{}    {} {}: {} → {}",
                             attr_prefix,
-                            "~".yellow(),
+                            "~".yellow(color_mode),
                             key,
-                            render_value_ansi(old, AnsiValueStyle::RedStrikethrough, None),
-                            render_value_ansi(new, AnsiValueStyle::Green, None)
+                            render_value_ansi(
+                                color_mode,
+                                old,
+                                AnsiValueStyle::RedStrikethrough,
+                                None
+                            ),
+                            render_value_ansi(color_mode, new, AnsiValueStyle::Green, None)
                         )
                         .unwrap();
                     }
                     ListOfMapsDiffField::NestedMapChanged { key, entries } => {
                         writeln!(out, "{}      {}:", attr_prefix, key).unwrap();
                         let nested_prefix = format!("{}      ", attr_prefix);
-                        render_map_diff_entries(out, entries, &nested_prefix);
+                        render_map_diff_entries(color_mode, out, entries, &nested_prefix);
                     }
                     ListOfMapsDiffField::StringListChanged {
                         key,
@@ -2221,6 +2444,7 @@ fn render_list_of_maps_diff(
                         writeln!(out, "{}      {}:", attr_prefix, key).unwrap();
                         let nested_prefix = format!("{}      ", attr_prefix);
                         render_string_list_diff_entries(
+                            color_mode,
                             out,
                             unchanged,
                             added,
@@ -2238,7 +2462,8 @@ fn render_list_of_maps_diff(
                     out,
                     "{}      {}",
                     attr_prefix,
-                    hidden_unchanged_summary(item.hidden_unchanged_count, "field").dimmed()
+                    hidden_unchanged_summary(item.hidden_unchanged_count, "field")
+                        .dimmed(color_mode)
                 )
                 .unwrap();
             }
@@ -2247,10 +2472,10 @@ fn render_list_of_maps_diff(
             // `item.fields` is `NonEmptyVec`, so the changed-field
             // string is statically non-empty — no need to guard the
             // separator (#2886).
-            let rendered_fields = render_modified_fields(item.fields.as_slice());
+            let rendered_fields = render_modified_fields(color_mode, item.fields.as_slice());
             let summary = if item.hidden_unchanged_count > 0 {
                 let s = hidden_unchanged_summary(item.hidden_unchanged_count, "field")
-                    .dimmed()
+                    .dimmed(color_mode)
                     .to_string();
                 format!("{}, {}", rendered_fields, s)
             } else {
@@ -2260,17 +2485,29 @@ fn render_list_of_maps_diff(
                 out,
                 "{}  {} {{{}}}",
                 attr_prefix,
-                "~".yellow().bold(),
+                "~".yellow(color_mode).bold(color_mode),
                 summary
             )
             .unwrap();
         }
     }
     for item in added {
-        render_added_removed_block(out, item, attr_prefix, ListOfMapsDiffItemKind::Added);
+        render_added_removed_block(
+            color_mode,
+            out,
+            item,
+            attr_prefix,
+            ListOfMapsDiffItemKind::Added,
+        );
     }
     for item in removed {
-        render_added_removed_block(out, item, attr_prefix, ListOfMapsDiffItemKind::Removed);
+        render_added_removed_block(
+            color_mode,
+            out,
+            item,
+            attr_prefix,
+            ListOfMapsDiffItemKind::Removed,
+        );
     }
 }
 
@@ -2285,14 +2522,19 @@ fn render_list_of_maps_diff(
 /// `format_value` and emitted it on one line (`+ {action: [...], ...}`),
 /// which produced unreadable ~500-column lines for IAM policy statements.
 fn render_added_removed_block(
+    color_mode: crate::output_style::ColorMode,
     out: &mut String,
     item: &ListOfMapsDiffItem,
     attr_prefix: &str,
     kind: ListOfMapsDiffItemKind,
 ) {
     let marker = match kind {
-        ListOfMapsDiffItemKind::Added => "+".green().bold().to_string(),
-        ListOfMapsDiffItemKind::Removed => "-".red().bold().strikethrough().to_string(),
+        ListOfMapsDiffItemKind::Added => "+".green(color_mode).bold(color_mode).to_string(),
+        ListOfMapsDiffItemKind::Removed => "-"
+            .red(color_mode)
+            .bold(color_mode)
+            .strikethrough(color_mode)
+            .to_string(),
     };
     writeln!(out, "{}  {} {{", attr_prefix, marker).unwrap();
     // Fields render at `attr_prefix.cols + 6`: 2 leading spaces, "+ {" is 3
@@ -2316,12 +2558,18 @@ fn render_added_removed_block(
         let layout = carina_core::value::PrettyLayout::for_map_key(field_indent_cols, key);
         let pretty = value.render(layout);
         let cv = match kind {
-            ListOfMapsDiffItemKind::Added => {
-                render_value_ansi(&pretty, AnsiValueStyle::Semantic, Some(attr_prefix))
-            }
-            ListOfMapsDiffItemKind::Removed => {
-                render_value_ansi(&pretty, AnsiValueStyle::RedStrikethrough, Some(attr_prefix))
-            }
+            ListOfMapsDiffItemKind::Added => render_value_ansi(
+                color_mode,
+                &pretty,
+                AnsiValueStyle::Semantic,
+                Some(attr_prefix),
+            ),
+            ListOfMapsDiffItemKind::Removed => render_value_ansi(
+                color_mode,
+                &pretty,
+                AnsiValueStyle::RedStrikethrough,
+                Some(attr_prefix),
+            ),
         };
         writeln!(out, "{}{}: {}", field_indent, key, cv).unwrap();
     }
@@ -2329,7 +2577,10 @@ fn render_added_removed_block(
 }
 
 /// Render modified fields from structured IR into colored output.
-fn render_modified_fields(fields: &[ListOfMapsDiffField]) -> String {
+fn render_modified_fields(
+    color_mode: crate::output_style::ColorMode,
+    fields: &[ListOfMapsDiffField],
+) -> String {
     let mut result_parts = Vec::new();
     for field in fields {
         match field {
@@ -2337,8 +2588,8 @@ fn render_modified_fields(fields: &[ListOfMapsDiffField]) -> String {
                 result_parts.push(format!(
                     "{}: {} → {}",
                     key,
-                    render_value_ansi(old, AnsiValueStyle::RedStrikethrough, None),
-                    render_value_ansi(new, AnsiValueStyle::Green, None)
+                    render_value_ansi(color_mode, old, AnsiValueStyle::RedStrikethrough, None),
+                    render_value_ansi(color_mode, new, AnsiValueStyle::Green, None)
                 ));
             }
             ListOfMapsDiffField::NestedMapChanged { key, .. } => {
@@ -2414,11 +2665,9 @@ pub fn format_effect<S>(effect: &Effect<S>) -> String {
             )
         }
         Effect::Wait {
-            identity,
-            until_surface,
-            ..
+            id, until_surface, ..
         } => {
-            let binding = identity.to_string();
+            let binding = id.identity_str().to_string();
             format!("Wait {} (until {})", binding, until_surface)
         }
         Effect::DeferredCreate(payload) => {

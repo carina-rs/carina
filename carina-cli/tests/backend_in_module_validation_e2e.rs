@@ -159,7 +159,7 @@ fn backend_in_imported_but_uncalled_nested_module_is_rejected() {
 
     assert!(
         diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains("../module/./helper:") && diagnostic.contains(RULE)
+            diagnostic.contains("../module/helper:") && diagnostic.contains(RULE)
         }),
         "an imported-but-uncalled backend must retain its recursive path: {diagnostics:#?}",
     );

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use colored::Colorize;
+use crate::output_style::Colorize;
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::parser::ProviderContext;
@@ -30,21 +30,16 @@ impl From<String> for InitError {
 }
 
 pub async fn run_init(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     path: &Path,
     upgrade: bool,
     locked: bool,
     migrate_state: bool,
     force: bool,
-    accept_egress: &[String],
 ) -> Result<(), InitError> {
-    let base_dir = get_base_dir(path);
-    let accepted_egress = carina_provider_resolver::AcceptedEgressSources::parse_os(
-        accept_egress,
-        std::env::var_os("CARINA_ACCEPT_EGRESS").as_deref(),
-        base_dir,
-    )?;
+    let color_mode = runtime.color_mode();
     run_init_with_provider_resolver(
+        color_mode,
         path,
         upgrade,
         locked,
@@ -52,11 +47,11 @@ pub async fn run_init(
         force,
         |install_lock, providers, mode| {
             carina_provider_resolver::resolve_all_with_egress(
-                user_dirs,
+                runtime.user_dirs(),
                 install_lock,
                 providers,
                 mode,
-                &accepted_egress,
+                runtime.accepted_egress(),
             )
             .map(|resolved| resolved.len())
         },
@@ -64,7 +59,9 @@ pub async fn run_init(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_init_with_provider_resolver(
+    color_mode: crate::output_style::ColorMode,
     path: &Path,
     upgrade: bool,
     locked: bool,
@@ -136,7 +133,7 @@ async fn run_init_with_provider_resolver(
                 action,
                 loaded.parsed.providers.len()
             )
-            .cyan()
+            .cyan(color_mode)
         );
 
         let install_lock = ProviderInstallLock::acquire(base_dir).map_err(|error| {
@@ -154,7 +151,7 @@ async fn run_init_with_provider_resolver(
                 "{} provider(s) installed in .carina/providers/",
                 resolved_count
             )
-            .green()
+            .green(color_mode)
         );
     }
 
@@ -175,7 +172,7 @@ async fn run_init_with_provider_resolver(
             if migrate_state {
                 println!(
                     "{}",
-                    "No state migration needed; backend lock initialized.".green()
+                    "No state migration needed; backend lock initialized.".green(color_mode)
                 );
             }
         }
@@ -185,7 +182,7 @@ async fn run_init_with_provider_resolver(
                 println!(
                     "{}",
                     "No state migration needed; backend lock already matches the configuration."
-                        .green()
+                        .green(color_mode)
                 );
             }
         }
@@ -193,11 +190,11 @@ async fn run_init_with_provider_resolver(
             if !migrate_state {
                 eprintln!(
                     "{}",
-                    drift_warning(drift.existing(), drift.configured(), path).yellow()
+                    drift_warning(drift.existing(), drift.configured(), path).yellow(color_mode)
                 );
                 migration_pending = true;
             } else {
-                match run_init_migrate_state(path, backend_config, force)
+                match run_init_migrate_state(color_mode, path, backend_config, force)
                     .await
                     .map_err(|e| e.to_string())?
                 {
@@ -208,7 +205,7 @@ async fn run_init_with_provider_resolver(
                     MigrationOutcome::Migrated { resources, source } => {
                         println!(
                             "{}",
-                            format!("State migrated ({resources} resource(s)).").green()
+                            format!("State migrated ({resources} resource(s)).").green(color_mode)
                         );
                         // `DeleteFailed` already produced a precise stderr
                         // warning inside the migration; only the deliberate
@@ -233,10 +230,10 @@ async fn run_init_with_provider_resolver(
                 "Backend migration pending. Provider plugins resolved; run `{}` to complete initialization.",
                 ProjectCommand::new("init --migrate-state", path)
             )
-            .yellow()
+            .yellow(color_mode)
         );
     } else {
-        println!("{}", "Initialized successfully.".green());
+        println!("{}", "Initialized successfully.".green(color_mode));
     }
 
     Ok(())
@@ -320,11 +317,13 @@ mod tests {
     }
 
     async fn run_init_with_fixture(
+        color_mode: crate::output_style::ColorMode,
         user_dirs: &UserDirs,
         project: &Path,
         http: &FixtureRegistryHttp,
     ) {
         run_init_with_provider_resolver(
+            color_mode,
             project,
             false,
             false,
@@ -346,12 +345,14 @@ mod tests {
     }
 
     async fn run_init_with_fixtures(
+        color_mode: crate::output_style::ColorMode,
         user_dirs: &UserDirs,
         project: &Path,
         registry_http: &FixtureRegistryHttp,
         github_http: &FixtureGithubHttp,
     ) {
         run_init_with_provider_resolver(
+            color_mode,
             project,
             false,
             false,
@@ -394,14 +395,15 @@ mod tests {
 
     #[test]
     fn init_with_up_to_date_github_lock_records_fresh_runner_trust_once() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(init_with_up_to_date_github_lock_case());
+            .block_on(init_with_up_to_date_github_lock_case(color_mode));
     }
 
-    async fn init_with_up_to_date_github_lock_case() {
+    async fn init_with_up_to_date_github_lock_case(color_mode: crate::output_style::ColorMode) {
         let project = tempfile::tempdir().unwrap();
         let user_root = tempfile::tempdir().unwrap();
         let user_dirs = UserDirs::under(user_root.path());
@@ -459,7 +461,14 @@ mod tests {
             )
             .bytes(&origin_url, bytes);
 
-        run_init_with_fixtures(&user_dirs, project.path(), &registry_http, &github_http).await;
+        run_init_with_fixtures(
+            color_mode,
+            &user_dirs,
+            project.path(),
+            &registry_http,
+            &github_http,
+        )
+        .await;
 
         assert_eq!(
             github_http
@@ -481,7 +490,14 @@ mod tests {
         assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
         assert_installed_provider_loads_as_aws(&user_dirs, project.path()).await;
 
-        run_init_with_fixtures(&user_dirs, project.path(), &registry_http, &github_http).await;
+        run_init_with_fixtures(
+            color_mode,
+            &user_dirs,
+            project.path(),
+            &registry_http,
+            &github_http,
+        )
+        .await;
 
         assert_eq!(
             github_http
@@ -504,14 +520,15 @@ mod tests {
 
     #[test]
     fn init_with_up_to_date_registry_lock_records_fresh_runner_trust_once() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(init_with_up_to_date_registry_lock_case());
+            .block_on(init_with_up_to_date_registry_lock_case(color_mode));
     }
 
-    async fn init_with_up_to_date_registry_lock_case() {
+    async fn init_with_up_to_date_registry_lock_case(color_mode: crate::output_style::ColorMode) {
         let project = tempfile::tempdir().unwrap();
         let first_user_root = tempfile::tempdir().unwrap();
         let fresh_user_root = tempfile::tempdir().unwrap();
@@ -530,7 +547,7 @@ mod tests {
         .unwrap();
         let http = official_signed_fixture_registry();
 
-        run_init_with_fixture(&first_user_dirs, project.path(), &http).await;
+        run_init_with_fixture(color_mode, &first_user_dirs, project.path(), &http).await;
 
         let lock_path = project.path().join("carina-providers.lock");
         let lock_before = fs::read(&lock_path).unwrap();
@@ -559,7 +576,7 @@ mod tests {
 
         assert!(!tree_contains_file(fresh_user_dirs.trust_record_dir()));
 
-        run_init_with_fixture(&fresh_user_dirs, project.path(), &http).await;
+        run_init_with_fixture(color_mode, &fresh_user_dirs, project.path(), &http).await;
 
         assert_eq!(
             request_count(&http, SIGNED_ARTIFACT_URL),
@@ -569,7 +586,7 @@ mod tests {
         assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
         assert_installed_provider_loads_as_aws(&fresh_user_dirs, project.path()).await;
 
-        run_init_with_fixture(&fresh_user_dirs, project.path(), &http).await;
+        run_init_with_fixture(color_mode, &fresh_user_dirs, project.path(), &http).await;
 
         assert_eq!(
             request_count(&http, SIGNED_ARTIFACT_URL),
@@ -578,7 +595,9 @@ mod tests {
         assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
     }
 
-    async fn assert_init_runs_real_verifier_inside_async_command() {
+    async fn assert_init_runs_real_verifier_inside_async_command(
+        color_mode: crate::output_style::ColorMode,
+    ) {
         let project = tempfile::tempdir().unwrap();
         let user_root = tempfile::tempdir().unwrap();
         let user_dirs = UserDirs::under(user_root.path());
@@ -594,6 +613,7 @@ mod tests {
         let http = signed_fixture_registry();
 
         run_init_with_provider_resolver(
+            color_mode,
             project.path(),
             false,
             false,
@@ -633,19 +653,25 @@ mod tests {
 
     #[test]
     fn init_real_verifier_is_safe_on_current_thread_runtime() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(assert_init_runs_real_verifier_inside_async_command());
+            .block_on(assert_init_runs_real_verifier_inside_async_command(
+                color_mode,
+            ));
     }
 
     #[test]
     fn init_real_verifier_is_safe_on_multi_thread_runtime() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(assert_init_runs_real_verifier_inside_async_command());
+            .block_on(assert_init_runs_real_verifier_inside_async_command(
+                color_mode,
+            ));
     }
 }

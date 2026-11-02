@@ -19,6 +19,7 @@ use crate::parser::{
     DeferredForExpression, DeferredIfCondition, DeferredValueIf, LoadedProviderContext,
     ModuleArgument, ModuleCall, ModuleResolvedParsedFile, ParsedDeferredForExpression,
     ParsedDeferredForPhase, ParsedFile, ProviderContext, ResourceTypePath, SourceSpan, TypeExpr,
+    UnexpandedDependencies, UnexpandedDependencyOperand,
 };
 use crate::resource::{
     AbsoluteBindingAddress, CanonicalEnumValue, LoopSlot, ModuleSource, ParserPlaceholder,
@@ -53,10 +54,18 @@ fn resolve_modules(
     parsed: ParsedFile,
     base_dir: &std::path::Path,
 ) -> Result<ModuleResolvedParsedFile, ModuleError> {
-    super::resolve_modules_providerless(
-        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        base_dir,
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            super::resolve_modules_providerless(
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                base_dir,
+                session,
+            )
+            .map_err(Box::new)
+        },
     )
+    .map_err(|error| *error)
 }
 
 fn resolve_modules_with_config(
@@ -65,12 +74,16 @@ fn resolve_modules_with_config(
     config: &ProviderContext,
     schemas: &crate::schema::SchemaRegistry,
 ) -> Result<ModuleResolvedParsedFile, ModuleError> {
-    super::resolve_modules_with_providerless_config(
-        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        base_dir,
-        config,
-        schemas,
-    )
+    crate::validation::deferred_types::with_session_for_test(config, |session| {
+        super::resolve_modules_with_providerless_config(
+            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+            base_dir,
+            session,
+            schemas,
+        )
+        .map_err(Box::new)
+    })
+    .map_err(|error| *error)
 }
 
 fn reconcile_anonymous_module_instances(
@@ -153,6 +166,25 @@ impl ModuleResolutionFixture {
             caller_file.parent().expect("caller file has a directory"),
         )
     }
+
+    fn resolve_upstream_caller(
+        &self,
+        caller_relative: impl AsRef<Path>,
+    ) -> Result<ModuleResolvedParsedFile, ModuleError> {
+        let caller_file = self.root.join(caller_relative);
+        let caller = fs::read_to_string(&caller_file).expect("read fixture caller");
+        let config = ProviderContext::default();
+        let parsed = crate::parser::parse_file(&caller, &caller_file, &config)
+            .expect("fixture caller parses");
+        crate::validation::deferred_types::with_session_for_test(&config, |session| {
+            resolve_upstream_modules_with_providerless_config(
+                parsed,
+                caller_file.parent().expect("caller file has a directory"),
+                session,
+                &crate::schema::SchemaRegistry::new(),
+            )
+        })
+    }
 }
 
 #[test]
@@ -214,8 +246,10 @@ fn module_directives_resolve_before_deferred_loop_is_saved() {
         .into_expanded(&crate::schema::SchemaRegistry::new())
         .unwrap();
     assert_eq!(expanded.deferred_for_expressions().len(), 1);
-    let deferred = &expanded.deferred_for_expressions()[0];
-    let saved = crate::parser::SavedDeferredForExpression::from(deferred.clone());
+    let deferred = expanded.deferred_for_expressions()[0].clone();
+    let graph = crate::resolved_graph::resolve_expanded_graph(expanded.into()).unwrap();
+    let (compiled, _dependencies) = graph.compile_deferred_for(deferred).unwrap();
+    let saved = crate::parser::SavedDeferredForExpression::from(compiled);
     let json = serde_json::to_value(&saved)
         .expect("resolved template directives keep the saved-plan format");
     assert_eq!(
@@ -227,14 +261,20 @@ fn module_directives_resolve_before_deferred_loop_is_saved() {
         })
     );
     let restored: crate::parser::SavedDeferredForExpression = serde_json::from_value(json).unwrap();
-    let children = crate::parser::expand_deferred_children(
-        &restored,
-        &crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(vec![
-            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
-                "child".into(),
-            )),
-        ])),
-        crate::resource::AccessMissPolicy::Error,
+    let children = crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            crate::parser::expand_deferred_children(
+                &restored,
+                &crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(vec![
+                    crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                        "child".into(),
+                    )),
+                ])),
+                crate::resource::AccessMissPolicy::Error,
+                session,
+            )
+        },
     )
     .unwrap();
     assert!(children[0].directives.explicitly_prevents_destroy());
@@ -273,12 +313,18 @@ fn module_loop_directives_are_strictly_resolved_for_each_child() {
         .unwrap();
     let deferred = &expanded.deferred_for_expressions()[0];
     for flag in [true, false] {
-        let children = crate::parser::expand_deferred_children(
-            deferred,
-            &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::Bool(flag),
-            )])),
-            crate::resource::AccessMissPolicy::Error,
+        let children = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                crate::parser::expand_deferred_children(
+                    deferred,
+                    &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                        ConcreteValue::Bool(flag),
+                    )])),
+                    crate::resource::AccessMissPolicy::Error,
+                    session,
+                )
+            },
         )
         .unwrap();
         let directives = crate::provider::ProviderDirectives::resolve(
@@ -308,10 +354,16 @@ fn module_loop_directives_are_strictly_resolved_for_each_child() {
             "unknown until apply",
         ),
     ] {
-        let error = crate::parser::expand_deferred_children(
-            deferred,
-            &Value::Concrete(ConcreteValue::List(vec![value])),
-            crate::resource::AccessMissPolicy::Error,
+        let error = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                crate::parser::expand_deferred_children(
+                    deferred,
+                    &Value::Concrete(ConcreteValue::List(vec![value])),
+                    crate::resource::AccessMissPolicy::Error,
+                    session,
+                )
+            },
         )
         .expect_err("unresolved child directives must never become defaults");
         let text = error.to_string();
@@ -425,7 +477,7 @@ let disabled = choice { flag = false }
                 composition.binding.as_ref().map(|binding| binding.as_str()) == Some(binding)
             })
             .and_then(|composition| composition.signature.attributes.get("value"))
-            .map(crate::resource::LiveCompositionAttribute::to_value)
+            .and_then(crate::resource::LiveCompositionAttribute::value)
             .unwrap_or_else(|| panic!("missing `{binding}.value`"))
     };
     assert_eq!(
@@ -472,7 +524,7 @@ let decremented = choice { flag = false  n = 10 }
                 composition.binding.as_ref().map(|binding| binding.as_str()) == Some(binding)
             })
             .and_then(|composition| composition.signature.attributes.get(attribute))
-            .map(crate::resource::LiveCompositionAttribute::to_value)
+            .and_then(crate::resource::LiveCompositionAttribute::value)
             .unwrap_or_else(|| panic!("missing `{binding}.{attribute}`"))
     };
 
@@ -737,7 +789,7 @@ let disabled = choice { flag = false }
                 composition.binding.as_ref().map(|binding| binding.as_str()) == Some(binding)
             })
             .and_then(|composition| composition.signature.attributes.get(name))
-            .map(crate::resource::LiveCompositionAttribute::to_value)
+            .and_then(crate::resource::LiveCompositionAttribute::value)
             .unwrap_or_else(|| panic!("missing `{binding}.{name}`"))
     };
     assert_eq!(
@@ -842,7 +894,7 @@ let disabled = outer { flag = false }
                 composition.binding.as_ref().map(|binding| binding.as_str()) == Some(binding)
             })
             .and_then(|composition| composition.signature.attributes.get("value"))
-            .map(crate::resource::LiveCompositionAttribute::to_value)
+            .and_then(crate::resource::LiveCompositionAttribute::value)
             .unwrap_or_else(|| panic!("missing `{binding}.value`"))
     };
     assert_eq!(
@@ -1005,12 +1057,17 @@ let forwarded = inner { flag = flag }
     let parsed = crate::parser::parse_file(outer_source, &outer_file, &ProviderContext::default())
         .expect("standalone outer module parses");
     let parsed = crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed);
-    let result = super::resolve_modules_with_providerless_diagnostics(
-        &parsed,
-        &outer_dir,
+    let result = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
-        &crate::schema::SchemaRegistry::new(),
-        &[],
+        |session| {
+            super::resolve_modules_with_providerless_diagnostics(
+                &parsed,
+                &outer_dir,
+                session,
+                &crate::schema::SchemaRegistry::new(),
+                &[],
+            )
+        },
     );
 
     let ModuleResolutionDiagnosticResult::Expanded { graph } = result else {
@@ -1161,13 +1218,15 @@ let enabled = chooser { flag = true caller = shared }
         .resource_types
         .insert(("mock".to_string(), "test.resource".to_string()));
     let parsed = crate::parser::parse_file(caller, &caller_file, &config).expect("caller parse");
-    let parsed = resolve_modules_with_config(
-        parsed,
-        &caller_dir,
-        &config,
-        &crate::schema::SchemaRegistry::new(),
-    )
-    .expect("conditional nested call expands in the chooser's module scope");
+    let parsed = crate::validation::deferred_types::with_session_for_test(&config, |session| {
+        resolve_modules_with_config(
+            parsed,
+            &caller_dir,
+            session.catalog(),
+            &crate::schema::SchemaRegistry::new(),
+        )
+        .expect("conditional nested call expands in the chooser's module scope")
+    });
 
     let nested = parsed
         .resources
@@ -1400,7 +1459,7 @@ let on = choice { flag = true }
             composition.binding.as_ref().map(|binding| binding.as_str()) == Some("off")
         })
         .and_then(|composition| composition.signature.attributes.get("n"))
-        .map(crate::resource::LiveCompositionAttribute::to_value)
+        .and_then(crate::resource::LiveCompositionAttribute::value)
         .expect("false instance output");
     assert_eq!(
         off_output,
@@ -1895,13 +1954,18 @@ fn resolver_error_from_parsed_call_retains_call_identity() {
         "fixture must pin the authored call range",
     );
 
-    let error = resolve_modules_with_config(
-        parsed,
-        base.path(),
+    let error = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
-        &crate::schema::SchemaRegistry::new(),
-    )
-    .expect_err("missing imported module must fail");
+        |session| {
+            resolve_modules_with_config(
+                parsed,
+                base.path(),
+                session.catalog(),
+                &crate::schema::SchemaRegistry::new(),
+            )
+            .expect_err("missing imported module must fail")
+        },
+    );
 
     let ModuleErrorCallSource::Owners(owners) = error.call_source() else {
         panic!("parsed call must own the resolver error: {error:?}");
@@ -1936,7 +2000,7 @@ fn create_test_module() -> ParsedFile {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: None,
-            dependency_bindings: BTreeSet::new(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -2171,7 +2235,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: None,
-            dependency_bindings: BTreeSet::new(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -2202,130 +2266,145 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
 
 #[test]
 fn test_expand_anonymous_resource_in_named_module_keeps_identity_absent() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert(
-            "policy_module".to_string(),
-            create_test_module_with_anonymous_resource(),
-        );
-        r
-    };
-    let call = ModuleCall::test(
-        "policy_module".to_string(),
-        Some("bootstrap".to_string()),
-        HashMap::new(),
-    );
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert(
+                    "policy_module".to_string(),
+                    create_test_module_with_anonymous_resource(),
+                );
+                r
+            };
+            let call = ModuleCall::test(
+                "policy_module".to_string(),
+                Some("bootstrap".to_string()),
+                HashMap::new(),
+            );
 
-    let expanded = resolver
-        .expand_module_call(&call, "bootstrap")
-        .unwrap()
-        .resources;
-    assert_eq!(expanded.len(), 1);
-    let policy = &expanded[0];
-    assert!(
-        matches!(
-            policy.id.identity_state(),
-            crate::resource::ResourceIdentityState::Pending(_)
-        ),
-        "anonymous resource inside a module instance must keep identity absent after expansion \
+            let expanded = resolver
+                .expand_module_call(&call, "bootstrap")
+                .unwrap()
+                .resources;
+            assert_eq!(expanded.len(), 1);
+            let policy = &expanded[0];
+            assert!(
+                matches!(
+                    policy.id.identity_state(),
+                    crate::resource::ResourceIdentityState::Pending(_)
+                ),
+                "anonymous resource inside a module instance must keep identity absent after expansion \
          (compute_anonymous_identifiers filters on absent identity and would skip an assigned value); \
          got {:?}",
-        policy.id.identity_state(),
-    );
-    let Some(crate::resource::ModuleSource::Module(source)) = &policy.module_source else {
-        panic!("expanded resource must retain its live module source")
-    };
-    assert_eq!(source.name(), "policy_module");
-    assert_eq!(source.instance(), "bootstrap");
-    assert_eq!(&source.module_call_path().immediate().id, call.id());
+                policy.id.identity_state(),
+            );
+            let Some(crate::resource::ModuleSource::Module(source)) = &policy.module_source else {
+                panic!("expanded resource must retain its live module source")
+            };
+            assert_eq!(source.name(), "policy_module");
+            assert_eq!(source.instance(), "bootstrap");
+            assert_eq!(&source.module_call_path().immediate().id, call.id());
+        },
+    )
 }
 
 #[test]
 fn anonymous_module_resource_instantiated_twice_has_distinct_pending_ids() {
-    let resolver = {
-        let mut resolver = ModuleResolver::new(".");
-        resolver.imported_modules.insert(
-            "policy_module".to_string(),
-            create_test_module_with_anonymous_resource(),
-        );
-        resolver
-    };
-    let call = ModuleCall::test("policy_module".to_string(), None, HashMap::new());
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut resolver = ModuleResolver::new(".", session);
+                resolver.imported_modules.insert(
+                    "policy_module".to_string(),
+                    create_test_module_with_anonymous_resource(),
+                );
+                resolver
+            };
+            let call = ModuleCall::test("policy_module".to_string(), None, HashMap::new());
 
-    let first = resolver
-        .expand_module_call(&call, "first")
-        .unwrap()
-        .resources
-        .into_iter()
-        .next()
-        .unwrap();
-    let second = resolver
-        .expand_module_call(&call, "second")
-        .unwrap()
-        .resources
-        .into_iter()
-        .next()
-        .unwrap();
+            let first = resolver
+                .expand_module_call(&call, "first")
+                .unwrap()
+                .resources
+                .into_iter()
+                .next()
+                .unwrap();
+            let second = resolver
+                .expand_module_call(&call, "second")
+                .unwrap()
+                .resources
+                .into_iter()
+                .next()
+                .unwrap();
 
-    assert_eq!(first.id.identity_str(), None);
-    assert_eq!(second.id.identity_str(), None);
-    assert_ne!(first.id, second.id);
+            assert_eq!(first.id.identity_str(), None);
+            assert_eq!(second.id.identity_str(), None);
+            assert_ne!(first.id, second.id);
 
-    let resources = vec![first.clone(), second.clone()];
-    let sorted = crate::deps::sort_resources_by_dependencies(&resources).unwrap();
-    assert_eq!(sorted.len(), 2);
-    assert_eq!(sorted[0].id, first.id);
-    assert_eq!(sorted[1].id, second.id);
+            let resources = vec![first.clone(), second.clone()];
+            let sorted = crate::deps::sort_resources_by_dependencies(&resources).unwrap();
+            assert_eq!(sorted.len(), 2);
+            assert_eq!(sorted[0].id, first.id);
+            assert_eq!(sorted[1].id, second.id);
+        },
+    )
 }
 
 #[test]
 fn test_expand_module_call() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules
-            .insert("test_module".to_string(), create_test_module());
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules
+                    .insert("test_module".to_string(), create_test_module());
+                r
+            };
 
-    let call = ModuleCall::test(
-        "test_module".to_string(),
-        Some("my_instance".to_string()),
-        {
-            let mut args = HashMap::new();
-            args.insert(
-                "vpc_id".to_string(),
-                Value::Concrete(ConcreteValue::String("vpc-456".into())),
+            let call = ModuleCall::test(
+                "test_module".to_string(),
+                Some("my_instance".to_string()),
+                {
+                    let mut args = HashMap::new();
+                    args.insert(
+                        "vpc_id".to_string(),
+                        Value::Concrete(ConcreteValue::String("vpc-456".into())),
+                    );
+                    module_arguments(args)
+                },
             );
-            module_arguments(args)
+
+            let expanded = resolver
+                .expand_module_call(&call, "my_instance")
+                .unwrap()
+                .resources;
+            assert_eq!(expanded.len(), 1);
+
+            let sg = &expanded[0];
+            assert_eq!(
+                sg.id.identity_str().expect("resolved identity"),
+                "my_instance.sg"
+            );
+            assert_eq!(
+                sg.get_attr("vpc_id"),
+                Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                    "vpc-456".into()
+                )))
+            );
+            let Some(crate::resource::ModuleSource::Module(source)) = &sg.module_source else {
+                panic!("expanded resource must retain its live module source")
+            };
+            assert_eq!(source.name(), "test_module");
+            assert_eq!(source.instance(), "my_instance");
+            assert_eq!(&source.module_call_path().immediate().id, call.id());
+            // Module info should NOT be in attributes
+            assert!(!sg.attributes.contains_key("_module"));
+            assert!(!sg.attributes.contains_key("_module_instance"));
         },
-    );
-
-    let expanded = resolver
-        .expand_module_call(&call, "my_instance")
-        .unwrap()
-        .resources;
-    assert_eq!(expanded.len(), 1);
-
-    let sg = &expanded[0];
-    assert_eq!(
-        sg.id.identity_str().expect("resolved identity"),
-        "my_instance.sg"
-    );
-    assert_eq!(
-        sg.get_attr("vpc_id"),
-        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
-            "vpc-456".into()
-        )))
-    );
-    let Some(crate::resource::ModuleSource::Module(source)) = &sg.module_source else {
-        panic!("expanded resource must retain its live module source")
-    };
-    assert_eq!(source.name(), "test_module");
-    assert_eq!(source.instance(), "my_instance");
-    assert_eq!(&source.module_call_path().immediate().id, call.id());
-    // Module info should NOT be in attributes
-    assert!(!sg.attributes.contains_key("_module"));
-    assert!(!sg.attributes.contains_key("_module_instance"));
+    )
 }
 
 /// Module whose resource targets a named provider instance via
@@ -2364,7 +2443,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("cert".into()),
-            dependency_bindings: BTreeSet::new(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -2395,42 +2474,47 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
 
 #[test]
 fn test_expand_module_call_preserves_provider_instance_on_id() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert(
-            "registry".to_string(),
-            create_module_with_named_provider_instance(),
-        );
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert(
+                    "registry".to_string(),
+                    create_module_with_named_provider_instance(),
+                );
+                r
+            };
 
-    let call = ModuleCall::test(
-        "registry".to_string(),
-        Some("acme".to_string()),
-        HashMap::new(),
-    );
+            let call = ModuleCall::test(
+                "registry".to_string(),
+                Some("acme".to_string()),
+                HashMap::new(),
+            );
 
-    let expanded = resolver
-        .expand_module_call(&call, "acme")
-        .unwrap()
-        .resources;
-    assert_eq!(expanded.len(), 1);
-    let cert = &expanded[0];
-    assert_eq!(
-        cert.id.provider_instance.as_deref(),
-        Some("us"),
-        "module expansion must preserve `id.provider_instance` so \
+            let expanded = resolver
+                .expand_module_call(&call, "acme")
+                .unwrap()
+                .resources;
+            assert_eq!(expanded.len(), 1);
+            let cert = &expanded[0];
+            assert_eq!(
+                cert.id.provider_instance.as_deref(),
+                Some("us"),
+                "module expansion must preserve `id.provider_instance` so \
          ProviderRouter dispatches `create` through the named \
          instance (carina#3038)"
-    );
-    // The directives copy stays correct (and is what state writeback
-    // already reads from) — assert it too so a regression that flips
-    // *both* sides at once is still caught.
-    assert_eq!(
-        cert.directives.provider_instance.as_deref(),
-        Some("us"),
-        "directives.provider_instance must survive module expansion"
-    );
+            );
+            // The directives copy stays correct (and is what state writeback
+            // already reads from) — assert it too so a regression that flips
+            // *both* sides at once is still caught.
+            assert_eq!(
+                cert.directives.provider_instance.as_deref(),
+                Some("us"),
+                "directives.provider_instance must survive module expansion"
+            );
+        },
+    )
 }
 
 #[test]
@@ -2469,7 +2553,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
         resolved_ignore_changes: Default::default(),
         prefixes: HashMap::new(),
         binding: Some(format!("{}.role", current_prefix).into()),
-        dependency_bindings: BTreeSet::new(),
+        dependencies: Default::default(),
         module_source: Some(crate::resource::ModuleSource::expanded_module(
             "thing",
             current_prefix.clone(),
@@ -2535,7 +2619,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 resolved_ignore_changes: Default::default(),
                 prefixes: HashMap::new(),
                 binding: Some("vpc".into()),
-                dependency_bindings: BTreeSet::new(),
+                dependencies: Default::default(),
                 module_source: None,
                 default_tag_keys: Default::default(),
                 loop_provenance: Default::default(),
@@ -2555,7 +2639,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 resolved_ignore_changes: Default::default(),
                 prefixes: HashMap::new(),
                 binding: Some("subnet".into()),
-                dependency_bindings: BTreeSet::new(),
+                dependencies: Default::default(),
                 module_source: None,
                 default_tag_keys: Default::default(),
                 loop_provenance: Default::default(),
@@ -2593,102 +2677,107 @@ fn create_module_with_intra_refs() -> ParsedFile {
 
 #[test]
 fn test_multiple_module_instances_no_collision() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules
-            .insert("net".to_string(), create_module_with_intra_refs());
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules
+                    .insert("net".to_string(), create_module_with_intra_refs());
+                r
+            };
 
-    let call_a = ModuleCall::test("net".to_string(), Some("prod".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "cidr".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-        );
-        module_arguments(args)
-    });
-    let call_b = ModuleCall::test("net".to_string(), Some("staging".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "cidr".to_string(),
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
-        );
-        module_arguments(args)
-    });
+            let call_a = ModuleCall::test("net".to_string(), Some("prod".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "cidr".to_string(),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+                );
+                module_arguments(args)
+            });
+            let call_b = ModuleCall::test("net".to_string(), Some("staging".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "cidr".to_string(),
+                    Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
+                );
+                module_arguments(args)
+            });
 
-    let expanded_a = resolver
-        .expand_module_call(&call_a, "prod")
-        .unwrap()
-        .resources;
-    let expanded_b = resolver
-        .expand_module_call(&call_b, "staging")
-        .unwrap()
-        .resources;
+            let expanded_a = resolver
+                .expand_module_call(&call_a, "prod")
+                .unwrap()
+                .resources;
+            let expanded_b = resolver
+                .expand_module_call(&call_b, "staging")
+                .unwrap()
+                .resources;
 
-    // binding must be prefixed so they don't collide (using dot notation)
-    assert_eq!(
-        expanded_a[0]
-            .binding
-            .as_ref()
-            .map(|binding| binding.as_str()),
-        Some("prod.vpc"),
-        "Instance A vpc binding should use dot path"
-    );
-    assert_eq!(
-        expanded_a[1]
-            .binding
-            .as_ref()
-            .map(|binding| binding.as_str()),
-        Some("prod.subnet"),
-        "Instance A subnet binding should use dot path"
-    );
-    assert_eq!(
-        expanded_b[0]
-            .binding
-            .as_ref()
-            .map(|binding| binding.as_str()),
-        Some("staging.vpc"),
-        "Instance B vpc binding should use dot path"
-    );
-    assert_eq!(
-        expanded_b[1]
-            .binding
-            .as_ref()
-            .map(|binding| binding.as_str()),
-        Some("staging.subnet"),
-        "Instance B subnet binding should use dot path"
-    );
+            // binding must be prefixed so they don't collide (using dot notation)
+            assert_eq!(
+                expanded_a[0]
+                    .binding
+                    .as_ref()
+                    .map(|binding| binding.as_str()),
+                Some("prod.vpc"),
+                "Instance A vpc binding should use dot path"
+            );
+            assert_eq!(
+                expanded_a[1]
+                    .binding
+                    .as_ref()
+                    .map(|binding| binding.as_str()),
+                Some("prod.subnet"),
+                "Instance A subnet binding should use dot path"
+            );
+            assert_eq!(
+                expanded_b[0]
+                    .binding
+                    .as_ref()
+                    .map(|binding| binding.as_str()),
+                Some("staging.vpc"),
+                "Instance B vpc binding should use dot path"
+            );
+            assert_eq!(
+                expanded_b[1]
+                    .binding
+                    .as_ref()
+                    .map(|binding| binding.as_str()),
+                Some("staging.subnet"),
+                "Instance B subnet binding should use dot path"
+            );
 
-    // Intra-module ResourceRef must point to the dot-path binding
-    assert_eq!(
-        expanded_a[1].get_attr("vpc_id"),
-        Some(&expanded_resource_ref(
-            "prod.vpc".to_string(),
-            "id".to_string(),
-            vec![]
-        )),
-        "Instance A subnet should reference prod.vpc, not bare vpc"
-    );
-    assert_eq!(
-        expanded_b[1].get_attr("vpc_id"),
-        Some(&expanded_resource_ref(
-            "staging.vpc".to_string(),
-            "id".to_string(),
-            vec![]
-        )),
-        "Instance B subnet should reference staging.vpc, not bare vpc"
-    );
+            // Intra-module ResourceRef must point to the dot-path binding
+            assert_eq!(
+                expanded_a[1].get_attr("vpc_id"),
+                Some(&expanded_resource_ref(
+                    "prod.vpc".to_string(),
+                    "id".to_string(),
+                    vec![]
+                )),
+                "Instance A subnet should reference prod.vpc, not bare vpc"
+            );
+            assert_eq!(
+                expanded_b[1].get_attr("vpc_id"),
+                Some(&expanded_resource_ref(
+                    "staging.vpc".to_string(),
+                    "id".to_string(),
+                    vec![]
+                )),
+                "Instance B subnet should reference staging.vpc, not bare vpc"
+            );
 
-    // Resource names should also be distinct (dot notation)
-    assert_eq!(
-        expanded_a[0].id.identity_str().expect("resolved identity"),
-        "prod.main_vpc"
-    );
-    assert_eq!(
-        expanded_b[0].id.identity_str().expect("resolved identity"),
-        "staging.main_vpc"
-    );
+            // Resource names should also be distinct (dot notation)
+            assert_eq!(
+                expanded_a[0].id.identity_str().expect("resolved identity"),
+                "prod.main_vpc"
+            );
+            assert_eq!(
+                expanded_b[0].id.identity_str().expect("resolved identity"),
+                "staging.main_vpc"
+            );
+        },
+    )
 }
 
 /// Module with an attributes block that exposes a security_group binding.
@@ -2713,7 +2802,7 @@ fn create_module_with_attributes() -> ParsedFile {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("sg".into()),
-            dependency_bindings: BTreeSet::new(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -2752,60 +2841,65 @@ fn create_module_with_attributes() -> ParsedFile {
 
 #[test]
 fn test_expand_module_call_creates_composition() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules
-            .insert("web_tier".to_string(), create_module_with_attributes());
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules
+                    .insert("web_tier".to_string(), create_module_with_attributes());
+                r
+            };
 
-    let call = ModuleCall::test(
-        "web_tier".to_string(),
-        Some("web".to_string()),
-        HashMap::new(),
-    );
+            let call = ModuleCall::test(
+                "web_tier".to_string(),
+                Some("web".to_string()),
+                HashMap::new(),
+            );
 
-    let expanded = resolver.expand_module_call(&call, "web").unwrap();
-    // carina#3181 PR C: `resources` is managed-only — 1 real resource.
-    assert_eq!(expanded.resources.len(), 1);
-    // The composition resource lives in the typed `compositions` slice.
-    assert_eq!(expanded.compositions.len(), 1);
-    let composition_res = &expanded.compositions[0];
+            let expanded = resolver.expand_module_call(&call, "web").unwrap();
+            // carina#3181 PR C: `resources` is managed-only — 1 real resource.
+            assert_eq!(expanded.resources.len(), 1);
+            // The composition resource lives in the typed `compositions` slice.
+            assert_eq!(expanded.compositions.len(), 1);
+            let composition_res = &expanded.compositions[0];
 
-    assert_eq!(
-        composition_res
-            .binding
-            .as_ref()
-            .map(|binding| binding.as_str()),
-        Some("web")
-    );
-    // Module info lives in the flattened module_name / instance fields.
-    assert_eq!(composition_res.module_name, "web_tier");
-    assert_eq!(composition_res.instance, "web");
-    assert_eq!(composition_res.call_path().calls().count(), 1);
-    assert_eq!(&composition_res.call_path().root().id, call.id());
-    assert_eq!(&composition_res.call_path().immediate().id, call.id());
-    assert!(!composition_res.signature.attributes.contains_key("_module"));
-    assert!(
-        !composition_res
-            .signature
-            .attributes
-            .contains_key("_module_instance")
-    );
-    // The security_group attribute should be a rewritten ResourceRef
-    // pointing to the dot-path binding (web.sg)
-    assert_eq!(
-        composition_res
-            .signature
-            .attributes
-            .get("security_group")
-            .map(|a| a.to_value()),
-        Some(expanded_resource_ref(
-            "web.sg".to_string(),
-            "id".to_string(),
-            vec![]
-        ))
-    );
+            assert_eq!(
+                composition_res
+                    .binding
+                    .as_ref()
+                    .map(|binding| binding.as_str()),
+                Some("web")
+            );
+            // Module info lives in the flattened module_name / instance fields.
+            assert_eq!(composition_res.module_name, "web_tier");
+            assert_eq!(composition_res.instance, "web");
+            assert_eq!(composition_res.call_path().calls().count(), 1);
+            assert_eq!(&composition_res.call_path().root().id, call.id());
+            assert_eq!(&composition_res.call_path().immediate().id, call.id());
+            assert!(!composition_res.signature.attributes.contains_key("_module"));
+            assert!(
+                !composition_res
+                    .signature
+                    .attributes
+                    .contains_key("_module_instance")
+            );
+            // The security_group attribute should be a rewritten ResourceRef
+            // pointing to the dot-path binding (web.sg)
+            assert_eq!(
+                composition_res
+                    .signature
+                    .attributes
+                    .get("security_group")
+                    .map(|a| a.value().expect("fixture output is a value")),
+                Some(expanded_resource_ref(
+                    "web.sg".to_string(),
+                    "id".to_string(),
+                    vec![]
+                ))
+            );
+        },
+    )
 }
 
 /// carina#3181 PR C: module-call expansion partitions the expanded
@@ -2814,38 +2908,43 @@ fn test_expand_module_call_creates_composition() {
 /// exactly one slice.
 #[test]
 fn test_expand_module_call_populates_compositions_slice() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules
-            .insert("web_tier".to_string(), create_module_with_attributes());
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules
+                    .insert("web_tier".to_string(), create_module_with_attributes());
+                r
+            };
 
-    let call = ModuleCall::test(
-        "web_tier".to_string(),
-        Some("web".to_string()),
-        HashMap::new(),
-    );
+            let call = ModuleCall::test(
+                "web_tier".to_string(),
+                Some("web".to_string()),
+                HashMap::new(),
+            );
 
-    let expanded = resolver.expand_module_call(&call, "web").unwrap();
+            let expanded = resolver.expand_module_call(&call, "web").unwrap();
 
-    // `resources` is managed-only — the synthetic composition is NOT here.
-    assert_eq!(expanded.resources.len(), 1);
+            // `resources` is managed-only — the synthetic composition is NOT here.
+            assert_eq!(expanded.resources.len(), 1);
 
-    // The composition resource lives only in the typed slice.
-    assert_eq!(expanded.compositions.len(), 1);
-    assert_eq!(
-        expanded.compositions[0]
-            .binding
-            .as_ref()
-            .map(|binding| binding.as_str()),
-        Some("web")
-    );
-    assert_eq!(expanded.compositions[0].module_name, "web_tier");
-    assert_eq!(expanded.compositions[0].instance, "web");
+            // The composition resource lives only in the typed slice.
+            assert_eq!(expanded.compositions.len(), 1);
+            assert_eq!(
+                expanded.compositions[0]
+                    .binding
+                    .as_ref()
+                    .map(|binding| binding.as_str()),
+                Some("web")
+            );
+            assert_eq!(expanded.compositions[0].module_name, "web_tier");
+            assert_eq!(expanded.compositions[0].instance, "web");
 
-    // This module declares no data sources.
-    assert!(expanded.data_sources.is_empty());
+            // This module declares no data sources.
+            assert!(expanded.data_sources.is_empty());
+        },
+    )
 }
 
 /// #3306 acceptance: a single-level module call records each leaf
@@ -2853,42 +2952,47 @@ fn test_expand_module_call_populates_compositions_slice() {
 /// `EphemeralId` as the only chain element.
 #[test]
 fn test_expand_module_call_populates_expansion_trace_single_level() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules
-            .insert("web_tier".to_string(), create_module_with_attributes());
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules
+                    .insert("web_tier".to_string(), create_module_with_attributes());
+                r
+            };
 
-    let call = ModuleCall::test(
-        "web_tier".to_string(),
-        Some("web".to_string()),
-        HashMap::new(),
-    );
+            let call = ModuleCall::test(
+                "web_tier".to_string(),
+                Some("web".to_string()),
+                HashMap::new(),
+            );
 
-    let expanded = resolver.expand_module_call(&call, "web").unwrap();
+            let expanded = resolver.expand_module_call(&call, "web").unwrap();
 
-    // One leaf produced (the security_group resource).
-    assert_eq!(expanded.resources.len(), 1);
-    let leaf = &expanded.resources[0];
+            // One leaf produced (the security_group resource).
+            assert_eq!(expanded.resources.len(), 1);
+            let leaf = &expanded.resources[0];
 
-    // The trace records the leaf against a one-element chain.
-    let chain = expanded
-        .expansion_trace
-        .call_sites_of(&leaf.persistent_id());
-    assert_eq!(
-        chain.len(),
-        1,
-        "single-level expansion must yield a one-element chain, got {chain:?}",
-    );
+            // The trace records the leaf against a one-element chain.
+            let chain = expanded
+                .expansion_trace
+                .call_sites_of(&leaf.persistent_id());
+            assert_eq!(
+                chain.len(),
+                1,
+                "single-level expansion must yield a one-element chain, got {chain:?}",
+            );
 
-    // The chain element points at this call site's instance prefix
-    // (`_virtual.<instance_prefix>`).
-    let expected_call_site =
-        crate::resource::EphemeralId::new(crate::resource::ResolvedResourceId::new(
-            crate::resource::ResourceId::with_identity("_virtual", "web"),
-        ));
-    assert_eq!(chain[0].id, expected_call_site);
+            // The chain element points at this call site's instance prefix
+            // (`_virtual.<instance_prefix>`).
+            let expected_call_site =
+                crate::resource::EphemeralId::new(crate::resource::ResolvedResourceId::new(
+                    crate::resource::ResourceId::with_identity("_virtual", "web"),
+                ));
+            assert_eq!(chain[0].id, expected_call_site);
+        },
+    )
 }
 
 /// carina#3322 acceptance: when `process_imports` recorded a
@@ -2899,35 +3003,40 @@ fn test_expand_module_call_populates_expansion_trace_single_level() {
 /// the group label silently falls back to the path-less form.
 #[test]
 fn test_expand_module_call_records_use_source_path_on_call_site() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules
-            .insert("web_tier".to_string(), create_module_with_attributes());
-        // Simulates what `process_imports` records for
-        // `use { source = "./modules/web_tier", alias = "web_tier" }`.
-        r.module_paths
-            .insert("web_tier".to_string(), "./modules/web_tier".to_string());
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules
+                    .insert("web_tier".to_string(), create_module_with_attributes());
+                // Simulates what `process_imports` records for
+                // `use { source = "./modules/web_tier", alias = "web_tier" }`.
+                r.module_paths
+                    .insert("web_tier".to_string(), "./modules/web_tier".to_string());
+                r
+            };
 
-    let call = ModuleCall::test(
-        "web_tier".to_string(),
-        Some("web".to_string()),
-        HashMap::new(),
-    );
+            let call = ModuleCall::test(
+                "web_tier".to_string(),
+                Some("web".to_string()),
+                HashMap::new(),
+            );
 
-    let expanded = resolver.expand_module_call(&call, "web").unwrap();
-    let leaf = &expanded.resources[0];
-    let chain = expanded
-        .expansion_trace
-        .call_sites_of(&leaf.persistent_id());
+            let expanded = resolver.expand_module_call(&call, "web").unwrap();
+            let leaf = &expanded.resources[0];
+            let chain = expanded
+                .expansion_trace
+                .call_sites_of(&leaf.persistent_id());
 
-    assert_eq!(
-        chain[0].source_path.as_deref(),
-        Some("./modules/web_tier"),
-        "the call site must carry the DSL `use` source path so the \
+            assert_eq!(
+                chain[0].source_path.as_deref(),
+                Some("./modules/web_tier"),
+                "the call site must carry the DSL `use` source path so the \
          renderer can emit `module \"<binding>\" (./modules/web_tier)`",
-    );
+            );
+        },
+    )
 }
 
 /// Absence-of-path fallback: when no `module_paths` entry exists for
@@ -2938,26 +3047,31 @@ fn test_expand_module_call_records_use_source_path_on_call_site() {
 /// string "None".
 #[test]
 fn test_expand_module_call_call_site_source_path_none_when_unmapped() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules
-            .insert("web_tier".to_string(), create_module_with_attributes());
-        // Deliberately no `module_paths` entry.
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules
+                    .insert("web_tier".to_string(), create_module_with_attributes());
+                // Deliberately no `module_paths` entry.
+                r
+            };
 
-    let call = ModuleCall::test(
-        "web_tier".to_string(),
-        Some("web".to_string()),
-        HashMap::new(),
-    );
+            let call = ModuleCall::test(
+                "web_tier".to_string(),
+                Some("web".to_string()),
+                HashMap::new(),
+            );
 
-    let expanded = resolver.expand_module_call(&call, "web").unwrap();
-    let leaf = &expanded.resources[0];
-    let chain = expanded
-        .expansion_trace
-        .call_sites_of(&leaf.persistent_id());
-    assert_eq!(chain[0].source_path, None);
+            let expanded = resolver.expand_module_call(&call, "web").unwrap();
+            let leaf = &expanded.resources[0];
+            let chain = expanded
+                .expansion_trace
+                .call_sites_of(&leaf.persistent_id());
+            assert_eq!(chain[0].source_path, None);
+        },
+    )
 }
 
 /// #3306 acceptance: when an outer expansion absorbs leaves from a
@@ -3077,98 +3191,108 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert("svc".to_string(), module);
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert("svc".to_string(), module);
+                r
+            };
 
-    let mut call_arguments: HashMap<String, Value<ParserPlaceholder>> = HashMap::new();
-    call_arguments.insert(
-        "region".to_string(),
-        Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
-    );
-    call_arguments.insert(
-        "instance_count".to_string(),
-        Value::Concrete(ConcreteValue::Int(3)),
-    );
+            let mut call_arguments: HashMap<String, Value<ParserPlaceholder>> = HashMap::new();
+            call_arguments.insert(
+                "region".to_string(),
+                Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
+            );
+            call_arguments.insert(
+                "instance_count".to_string(),
+                Value::Concrete(ConcreteValue::Int(3)),
+            );
 
-    let call = ModuleCall::test(
-        "svc".to_string(),
-        Some("api".to_string()),
-        module_arguments(call_arguments),
-    );
+            let call = ModuleCall::test(
+                "svc".to_string(),
+                Some("api".to_string()),
+                module_arguments(call_arguments),
+            );
 
-    let expanded = resolver.expand_module_call(&call, "api").unwrap();
-    assert_eq!(expanded.compositions.len(), 1);
-    let composition = &expanded.compositions[0];
+            let expanded = resolver.expand_module_call(&call, "api").unwrap();
+            assert_eq!(expanded.compositions.len(), 1);
+            let composition = &expanded.compositions[0];
 
-    // The composition's signature.arguments must contain BOTH values
-    // passed at the call site, keyed by argument name.
-    assert_eq!(
-        composition
-            .signature
-            .arguments
-            .get("region")
-            .map(|argument| argument.value()),
-        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
-            "ap-northeast-1".into()
-        ))),
-        "region argument must be recorded on the composition signature",
-    );
-    assert_eq!(
-        composition
-            .signature
-            .arguments
-            .get("instance_count")
-            .map(|argument| argument.value()),
-        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::Int(3))),
-        "instance_count argument must be recorded on the composition signature",
-    );
-    assert_eq!(
-        composition
-            .signature
-            .arguments
-            .get("region")
-            .and_then(|argument| argument.declared_type().known()),
-        Some(&TypeExpr::String),
-        "the declared sink type must travel with the argument value",
-    );
+            // The composition's signature.arguments must contain BOTH values
+            // passed at the call site, keyed by argument name.
+            assert_eq!(
+                composition
+                    .signature
+                    .arguments
+                    .get("region")
+                    .map(|argument| argument.value()),
+                Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                    "ap-northeast-1".into()
+                ))),
+                "region argument must be recorded on the composition signature",
+            );
+            assert_eq!(
+                composition
+                    .signature
+                    .arguments
+                    .get("instance_count")
+                    .map(|argument| argument.value()),
+                Some(&ExpandedValue::Concrete(ExpandedConcreteValue::Int(3))),
+                "instance_count argument must be recorded on the composition signature",
+            );
+            assert_eq!(
+                composition
+                    .signature
+                    .arguments
+                    .get("region")
+                    .and_then(|argument| argument.declared_type().known()),
+                Some(&TypeExpr::String),
+                "the declared sink type must travel with the argument value",
+            );
 
-    // Arguments are recorded in module.arguments declaration order so
-    // the trace is stable across runs.
-    let keys: Vec<&String> = composition.signature.arguments.keys().collect();
-    assert_eq!(keys, vec!["region", "instance_count"]);
+            // Arguments are recorded in module.arguments declaration order so
+            // the trace is stable across runs.
+            let keys: Vec<&String> = composition.signature.arguments.keys().collect();
+            assert_eq!(keys, vec!["region", "instance_count"]);
 
-    // The attribute half remains populated as before.
-    assert_eq!(
-        composition
-            .signature
-            .attributes
-            .get("endpoint")
-            .map(|a| a.to_value()),
-        Some(ExpandedValue::Concrete(ExpandedConcreteValue::String(
-            "fixed-endpoint".into()
-        ))),
-    );
+            // The attribute half remains populated as before.
+            assert_eq!(
+                composition
+                    .signature
+                    .attributes
+                    .get("endpoint")
+                    .map(|a| a.value().expect("fixture output is a value")),
+                Some(ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                    "fixed-endpoint".into()
+                ))),
+            );
+        },
+    )
 }
 
 #[test]
 fn test_expand_module_call_without_binding_still_records_boundary_composition() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules
-            .insert("web_tier".to_string(), create_module_with_attributes());
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules
+                    .insert("web_tier".to_string(), create_module_with_attributes());
+                r
+            };
 
-    // Module call without binding_name
-    let call = ModuleCall::test("web_tier".to_string(), None, HashMap::new());
+            // Module call without binding_name
+            let call = ModuleCall::test("web_tier".to_string(), None, HashMap::new());
 
-    let expanded = resolver.expand_module_call(&call, "web_tier").unwrap();
-    assert_eq!(expanded.compositions.len(), 1);
-    assert_eq!(expanded.compositions[0].binding, None);
-    assert_eq!(expanded.compositions[0].module_name, "web_tier");
+            let expanded = resolver.expand_module_call(&call, "web_tier").unwrap();
+            assert_eq!(expanded.compositions.len(), 1);
+            assert_eq!(expanded.compositions[0].binding, None);
+            assert_eq!(expanded.compositions[0].module_name, "web_tier");
+        },
+    )
 }
 
 /// Regression fixtures for #2197. Writes a minimal `modules/thing` module
@@ -3337,140 +3461,147 @@ thing { name = 'beta'  }
 
 #[test]
 fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
-    let mut origin = Resource::with_provider("mock", "test.resource", "origin", None);
-    origin.binding = Some("origin".into());
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            let mut origin = Resource::with_provider("mock", "test.resource", "origin", None);
+            origin.binding = Some("origin".into());
 
-    // Model the parsed `upper(origin)` call directly: ordinary parsing rejects
-    // a bare handle in strict mode, while the permissive directory pass keeps
-    // the failed call as Unavailable for diagnostics and identity material.
-    let handle = crate::eval_value::StructuralHandle::new(
-        crate::eval_value::StructuralHandleKind::Resource(crate::parser::ResourceTypePath::new(
-            "mock",
-            "test.resource",
-        )),
-        "origin",
-    );
-    let mut dependent = Resource::pending_with_provider("mock", "test.resource", None);
-    dependent.set_attr(
-        "replacement_key".to_string(),
-        Value::Deferred(DeferredValue::FunctionCall {
-            name: crate::builtins::BuiltinFunction::upper,
-            args: vec![crate::resource::FunctionArgument::from_handle(handle)],
-            source_line: (7).into(),
-        }),
-    );
-    let mut module = ParsedFile {
-        resources: vec![origin, dependent],
-        ..ParsedFile::default()
-    };
-    crate::parser::resolve_resource_refs_defer_unknown_functions(
-        &mut module,
-        &ProviderContext::default(),
-    )
-    .expect("permissive resolution must retain the failed built-in");
+            // Model the parsed `upper(origin)` call directly: ordinary parsing rejects
+            // a bare handle in strict mode, while the permissive directory pass keeps
+            // the failed call as Unavailable for diagnostics and identity material.
+            let handle = crate::eval_value::UnexpandedStructuralHandle::new(
+                crate::eval_value::UnexpandedStructuralHandleKind::Resource(
+                    crate::parser::ResourceTypePath::new("mock", "test.resource"),
+                ),
+                "origin",
+            );
+            let mut dependent = Resource::pending_with_provider("mock", "test.resource", None);
+            dependent.set_attr(
+                "replacement_key".to_string(),
+                Value::Deferred(DeferredValue::FunctionCall {
+                    name: crate::builtins::BuiltinFunction::upper,
+                    args: vec![crate::resource::FunctionArgument::from_handle(handle)],
+                    source_line: (7).into(),
+                }),
+            );
+            let mut module = ParsedFile {
+                resources: vec![origin, dependent],
+                ..ParsedFile::default()
+            };
+            crate::parser::resolve_resource_refs_defer_unknown_functions(
+                &mut module,
+                &ProviderContext::default(),
+            )
+            .expect("permissive resolution must retain the failed built-in");
 
-    let resolver = {
-        let mut resolver = ModuleResolver::new(".");
-        resolver.imported_modules.insert("m".to_string(), module);
-        resolver
-    };
-    let call = ModuleCall::test("m".to_string(), None, HashMap::new());
-    let mut resources = Vec::new();
-    for instance in ["first", "second"] {
-        resources.extend(
-            resolver
-                .expand_module_call(&call, instance)
-                .expect("expand module instance")
-                .resources,
-        );
-    }
-
-    let dependents = resources
-        .iter()
-        .filter(|resource| resource.get_attr("replacement_key").is_some())
-        .collect::<Vec<_>>();
-    assert_eq!(dependents.len(), 2, "expected one dependent per instance");
-
-    let argument_bindings = dependents
-        .iter()
-        .map(|resource| {
-            let Some(ExpandedValue::Deferred(ExpandedDeferredValue::Unavailable {
-                name: crate::builtins::BuiltinFunction::upper,
-                args,
-                ..
-            })) = resource.get_attr("replacement_key")
-            else {
-                panic!(
-                    "upper(handle) must remain an unavailable built-in: {:?}",
-                    resource.get_attr("replacement_key")
+            let resolver = {
+                let mut resolver = ModuleResolver::new(".", session);
+                resolver.imported_modules.insert("m".to_string(), module);
+                resolver
+            };
+            let call = ModuleCall::test("m".to_string(), None, HashMap::new());
+            let mut resources = Vec::new();
+            for instance in ["first", "second"] {
+                resources.extend(
+                    resolver
+                        .expand_module_call(&call, instance)
+                        .expect("expand module instance")
+                        .resources,
                 );
-            };
-            let [argument] = args.as_slice() else {
-                panic!("upper() must retain one argument: {args:?}");
-            };
-            let ExpandedValue::Deferred(ExpandedDeferredValue::BindingRef { binding }) =
-                argument.walker_value()
-            else {
-                panic!("upper() must retain its handle-shaped argument: {argument:?}");
-            };
-            binding.to_string()
-        })
-        .collect::<HashSet<_>>();
-    assert_eq!(
-        argument_bindings,
-        HashSet::from(["first.origin".to_string(), "second.origin".to_string()]),
-    );
-    let mut resources = resources
-        .into_iter()
-        .map(|resource| resource.into_expanded(&crate::schema::SchemaRegistry::new()))
-        .collect::<Result<Vec<_>, _>>()
-        .expect("expanded module resources contain no parser placeholders");
+            }
 
-    let mut registry = crate::schema::SchemaRegistry::new();
-    registry.insert(
-        "mock",
-        (PatternResourceSchema::new("test.resource").attribute(
-            PatternAttributeSchema::optional("replacement_key", PatternAttributeType::string())
-                .create_only()
-                .build(),
-        ))
-        .validate()
-        .expect("schema fixture must be valid"),
-    );
-    crate::identifier::compute_anonymous_identifiers_for_test(
-        &mut resources,
-        &[],
-        &registry,
-        &|_| Vec::new(),
-    )
-    .expect("compute anonymous identities");
+            let dependents = resources
+                .iter()
+                .filter(|resource| resource.get_attr("replacement_key").is_some())
+                .collect::<Vec<_>>();
+            assert_eq!(dependents.len(), 2, "expected one dependent per instance");
 
-    let identities = resources
-        .iter()
-        .filter(|resource| resource.get_attr("replacement_key").is_some())
-        .map(|resource| {
-            resource
-                .id
-                .identity_str()
-                .expect("computed identity")
-                .to_string()
-        })
-        .collect::<Vec<_>>();
-    assert_ne!(identities[0], identities[1]);
-    let hash_bases = identities
-        .iter()
-        .map(|identity| {
-            identity
-                .split_once('.')
-                .expect("module-prefixed identity")
-                .1
-                .to_string()
-        })
-        .collect::<HashSet<_>>();
-    assert_eq!(
-        hash_bases.len(),
-        2,
-        "instance-prefixed unavailable arguments must produce distinct identity hashes: {identities:?}",
+            let argument_bindings = dependents
+                .iter()
+                .map(|resource| {
+                    let Some(ExpandedValue::Deferred(ExpandedDeferredValue::Unavailable {
+                        name: crate::builtins::BuiltinFunction::upper,
+                        args,
+                        ..
+                    })) = resource.get_attr("replacement_key")
+                    else {
+                        panic!(
+                            "upper(handle) must remain an unavailable built-in: {:?}",
+                            resource.get_attr("replacement_key")
+                        );
+                    };
+                    let [argument] = args.as_slice() else {
+                        panic!("upper() must retain one argument: {args:?}");
+                    };
+                    let ExpandedValue::Deferred(ExpandedDeferredValue::BindingRef { binding }) =
+                        argument.walker_value()
+                    else {
+                        panic!("upper() must retain its handle-shaped argument: {argument:?}");
+                    };
+                    binding.to_string()
+                })
+                .collect::<HashSet<_>>();
+            assert_eq!(
+                argument_bindings,
+                HashSet::from(["first.origin".to_string(), "second.origin".to_string()]),
+            );
+            let mut resources = resources
+                .into_iter()
+                .map(|resource| resource.into_expanded(&crate::schema::SchemaRegistry::new()))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("expanded module resources contain no parser placeholders");
+
+            let mut registry = crate::schema::SchemaRegistry::new();
+            registry.insert(
+                "mock",
+                (PatternResourceSchema::new("test.resource").attribute(
+                    PatternAttributeSchema::optional(
+                        "replacement_key",
+                        PatternAttributeType::string(),
+                    )
+                    .create_only()
+                    .build(),
+                ))
+                .validate()
+                .expect("schema fixture must be valid"),
+            );
+            crate::identifier::compute_anonymous_identifiers_for_test(
+                &mut resources,
+                &[],
+                &registry,
+                &|_| Vec::new(),
+            )
+            .expect("compute anonymous identities");
+
+            let identities = resources
+                .iter()
+                .filter(|resource| resource.get_attr("replacement_key").is_some())
+                .map(|resource| {
+                    resource
+                        .id
+                        .identity_str()
+                        .expect("computed identity")
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            assert_ne!(identities[0], identities[1]);
+            let hash_bases = identities
+                .iter()
+                .map(|identity| {
+                    identity
+                        .split_once('.')
+                        .expect("module-prefixed identity")
+                        .1
+                        .to_string()
+                })
+                .collect::<HashSet<_>>();
+            assert_eq!(
+                hash_bases.len(),
+                2,
+                "instance-prefixed unavailable arguments must produce distinct identity hashes: {identities:?}",
+            );
+        },
     );
 }
 
@@ -3988,114 +4119,129 @@ thing { name = 'unchanged-but-different' }
 
 #[test]
 fn test_missing_required_argument() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules
-            .insert("test_module".to_string(), create_test_module());
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules
+                    .insert("test_module".to_string(), create_test_module());
+                r
+            };
 
-    let call = ModuleCall::test(
-        "test_module".to_string(),
-        Some("my_instance".to_string()),
-        HashMap::new(), // Missing vpc_id
-    );
+            let call = ModuleCall::test(
+                "test_module".to_string(),
+                Some("my_instance".to_string()),
+                HashMap::new(), // Missing vpc_id
+            );
 
-    let result = resolver.expand_module_call(&call, "my_instance");
-    assert!(matches!(
-        result.as_ref().map_err(|error| error.root_cause()),
-        Err(ModuleError::MissingArgument { .. })
-    ));
+            let result = resolver.expand_module_call(&call, "my_instance");
+            assert!(matches!(
+                result.as_ref().map_err(|error| error.root_cause()),
+                Err(ModuleError::MissingArgument { .. })
+            ));
+        },
+    )
 }
 
 #[test]
 fn test_expand_module_call_uses_dot_path_addressing() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules
-            .insert("test_module".to_string(), create_test_module());
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules
+                    .insert("test_module".to_string(), create_test_module());
+                r
+            };
 
-    let call = ModuleCall::test(
-        "test_module".to_string(),
-        Some("my_instance".to_string()),
-        {
-            let mut args = HashMap::new();
-            args.insert(
-                "vpc_id".to_string(),
-                Value::Concrete(ConcreteValue::String("vpc-456".into())),
+            let call = ModuleCall::test(
+                "test_module".to_string(),
+                Some("my_instance".to_string()),
+                {
+                    let mut args = HashMap::new();
+                    args.insert(
+                        "vpc_id".to_string(),
+                        Value::Concrete(ConcreteValue::String("vpc-456".into())),
+                    );
+                    module_arguments(args)
+                },
             );
-            module_arguments(args)
+
+            let expanded = resolver
+                .expand_module_call(&call, "my_instance")
+                .unwrap()
+                .resources;
+            assert_eq!(expanded.len(), 1);
+
+            let sg = &expanded[0];
+            // Resource name should use dot notation, not underscore
+            assert_eq!(
+                sg.id.identity_str().expect("resolved identity"),
+                "my_instance.sg"
+            );
         },
-    );
-
-    let expanded = resolver
-        .expand_module_call(&call, "my_instance")
-        .unwrap()
-        .resources;
-    assert_eq!(expanded.len(), 1);
-
-    let sg = &expanded[0];
-    // Resource name should use dot notation, not underscore
-    assert_eq!(
-        sg.id.identity_str().expect("resolved identity"),
-        "my_instance.sg"
-    );
+    )
 }
 
 #[test]
 fn test_module_dot_path_bindings_and_refs() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules
-            .insert("net".to_string(), create_module_with_intra_refs());
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules
+                    .insert("net".to_string(), create_module_with_intra_refs());
+                r
+            };
 
-    let call = ModuleCall::test("net".to_string(), Some("prod".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "cidr".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-        );
-        module_arguments(args)
-    });
+            let call = ModuleCall::test("net".to_string(), Some("prod".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "cidr".to_string(),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+                );
+                module_arguments(args)
+            });
 
-    let expanded = resolver
-        .expand_module_call(&call, "prod")
-        .unwrap()
-        .resources;
+            let expanded = resolver
+                .expand_module_call(&call, "prod")
+                .unwrap()
+                .resources;
 
-    // Resource names should use dot notation
-    assert_eq!(
-        expanded[0].id.identity_str().expect("resolved identity"),
-        "prod.main_vpc"
-    );
-    assert_eq!(
-        expanded[1].id.identity_str().expect("resolved identity"),
-        "prod.sub"
-    );
+            // Resource names should use dot notation
+            assert_eq!(
+                expanded[0].id.identity_str().expect("resolved identity"),
+                "prod.main_vpc"
+            );
+            assert_eq!(
+                expanded[1].id.identity_str().expect("resolved identity"),
+                "prod.sub"
+            );
 
-    // binding should use dot notation
-    assert_eq!(
-        expanded[0].binding.as_ref().map(|binding| binding.as_str()),
-        Some("prod.vpc")
-    );
-    assert_eq!(
-        expanded[1].binding.as_ref().map(|binding| binding.as_str()),
-        Some("prod.subnet")
-    );
+            // binding should use dot notation
+            assert_eq!(
+                expanded[0].binding.as_ref().map(|binding| binding.as_str()),
+                Some("prod.vpc")
+            );
+            assert_eq!(
+                expanded[1].binding.as_ref().map(|binding| binding.as_str()),
+                Some("prod.subnet")
+            );
 
-    // Intra-module ResourceRef should use dot notation
-    assert_eq!(
-        expanded[1].get_attr("vpc_id"),
-        Some(&expanded_resource_ref(
-            "prod.vpc".to_string(),
-            "id".to_string(),
-            vec![]
-        )),
-    );
+            // Intra-module ResourceRef should use dot notation
+            assert_eq!(
+                expanded[1].get_attr("vpc_id"),
+                Some(&expanded_resource_ref(
+                    "prod.vpc".to_string(),
+                    "id".to_string(),
+                    vec![]
+                )),
+            );
+        },
+    )
 }
 
 /// carina#3061: a `wait` block declared inside a module must survive
@@ -4128,7 +4274,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("distribution".into()),
-            dependency_bindings: BTreeSet::new(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -4144,108 +4290,124 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
                 rhs: Value::Concrete(ConcreteValue::String("available".into())),
             },
             timeout_secs: Some(300),
-            depends_on: vec!["subnet".into()],
+            depends_on: UnexpandedDependencies::new(vec![UnexpandedDependencyOperand::Handle(
+                crate::eval_value::UnexpandedResourceHandle::new(
+                    "subnet",
+                    ResourceTypePath::new("", "ec2.Subnet"),
+                ),
+            )]),
             line: 1,
         });
         m
     };
 
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert("net".to_string(), module);
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert("net".to_string(), module);
+                r
+            };
 
-    let call = ModuleCall::test("net".to_string(), Some("prod".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "cidr".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-        );
-        module_arguments(args)
-    });
+            let call = ModuleCall::test("net".to_string(), Some("prod".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "cidr".to_string(),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+                );
+                module_arguments(args)
+            });
 
-    let expanded = resolver.expand_module_call(&call, "prod").unwrap();
+            let expanded = resolver.expand_module_call(&call, "prod").unwrap();
 
-    // The wait binding survived expansion and every binding-name field
-    // is instance-prefixed.
-    assert_eq!(expanded.wait_bindings.len(), 1);
-    let wb = &expanded.wait_bindings[0];
-    assert_eq!(wb.binding.as_str(), "prod.cert_issued");
-    assert_eq!(wb.target.as_str(), "prod.vpc");
-    assert_eq!(wb.until_predicate.root.as_str(), "prod.vpc");
-    assert_eq!(wb.until_predicate.attribute_segments, ["state"]);
-    assert_eq!(
-        wb.depends_on
-            .iter()
-            .map(|binding| binding.as_str())
-            .collect::<Vec<_>>(),
-        vec!["prod.subnet"]
-    );
-    // RHS value and surface text are not binding names — unchanged.
-    assert_eq!(
-        wb.until_predicate.rhs,
-        crate::resource::ExpandedValue::Concrete(crate::resource::ExpandedConcreteValue::String(
-            "available".into()
-        ))
-    );
-    assert_eq!(wb.timeout_secs, Some(300));
+            // The wait binding survived expansion and every binding-name field
+            // is instance-prefixed.
+            assert_eq!(expanded.wait_bindings.len(), 1);
+            let wb = &expanded.wait_bindings[0];
+            assert_eq!(wb.binding.as_str(), "prod.cert_issued");
+            assert_eq!(wb.target.as_str(), "prod.vpc");
+            assert_eq!(wb.until_predicate.root.as_str(), "prod.vpc");
+            assert_eq!(wb.until_predicate.attribute_segments, ["state"]);
+            assert_eq!(
+                wb.depends_on
+                    .binding_references()
+                    .iter()
+                    .map(|binding| binding.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["prod.subnet"]
+            );
+            // RHS value and surface text are not binding names — unchanged.
+            assert_eq!(
+                wb.until_predicate.rhs,
+                crate::resource::ExpandedValue::Concrete(
+                    crate::resource::ExpandedConcreteValue::String("available".into())
+                )
+            );
+            assert_eq!(wb.timeout_secs, Some(300));
 
-    // The downstream resource's reference to the wait binding was
-    // rewritten to the prefixed name, so the dependency edge to the
-    // Effect::Wait can form at plan time.
-    let dist = expanded
-        .resources
-        .iter()
-        .find(|r| r.id.resource_type == "cloudfront.Distribution")
-        .expect("distribution resource present");
-    assert_eq!(
-        dist.get_attr("acm_certificate_arn"),
-        Some(&expanded_resource_ref(
-            "prod.cert_issued".to_string(),
-            "certificate_arn".to_string(),
-            vec![]
-        )),
-        "the module resource's `cert_issued` ref must be instance-prefixed"
-    );
+            // The downstream resource's reference to the wait binding was
+            // rewritten to the prefixed name, so the dependency edge to the
+            // Effect::Wait can form at plan time.
+            let dist = expanded
+                .resources
+                .iter()
+                .find(|r| r.id.resource_type == "cloudfront.Distribution")
+                .expect("distribution resource present");
+            assert_eq!(
+                dist.get_attr("acm_certificate_arn"),
+                Some(&expanded_resource_ref(
+                    "prod.cert_issued".to_string(),
+                    "certificate_arn".to_string(),
+                    vec![]
+                )),
+                "the module resource's `cert_issued` ref must be instance-prefixed"
+            );
+        },
+    )
 }
 
 #[test]
 fn test_module_composition_dot_path_refs() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules
-            .insert("web_tier".to_string(), create_module_with_attributes());
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules
+                    .insert("web_tier".to_string(), create_module_with_attributes());
+                r
+            };
 
-    let call = ModuleCall::test(
-        "web_tier".to_string(),
-        Some("web".to_string()),
-        HashMap::new(),
-    );
+            let call = ModuleCall::test(
+                "web_tier".to_string(),
+                Some("web".to_string()),
+                HashMap::new(),
+            );
 
-    let expanded = resolver.expand_module_call(&call, "web").unwrap();
+            let expanded = resolver.expand_module_call(&call, "web").unwrap();
 
-    // carina#3181 PR C: the composition resource lives in the typed slice.
-    let composition_res = expanded
-        .compositions
-        .first()
-        .expect("Virtual resource should exist");
+            // carina#3181 PR C: the composition resource lives in the typed slice.
+            let composition_res = expanded
+                .compositions
+                .first()
+                .expect("Virtual resource should exist");
 
-    // The security_group attribute should reference dot-notation binding
-    assert_eq!(
-        composition_res
-            .signature
-            .attributes
-            .get("security_group")
-            .map(|a| a.to_value()),
-        Some(expanded_resource_ref(
-            "web.sg".to_string(),
-            "id".to_string(),
-            vec![]
-        ))
-    );
+            // The security_group attribute should reference dot-notation binding
+            assert_eq!(
+                composition_res
+                    .signature
+                    .attributes
+                    .get("security_group")
+                    .map(|a| a.value().expect("fixture output is a value")),
+                Some(expanded_resource_ref(
+                    "web.sg".to_string(),
+                    "id".to_string(),
+                    vec![]
+                ))
+            );
+        },
+    )
 }
 
 #[test]
@@ -4281,40 +4443,45 @@ fn test_substitute_arguments_interpolation() {
 
 #[test]
 fn test_unknown_argument_rejected() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules
-            .insert("test_module".to_string(), create_test_module());
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules
+                    .insert("test_module".to_string(), create_test_module());
+                r
+            };
 
-    let call = ModuleCall::test(
-        "test_module".to_string(),
-        Some("my_instance".to_string()),
-        {
-            let mut args = HashMap::new();
-            args.insert(
-                "vpc_id".to_string(),
-                Value::Concrete(ConcreteValue::String("vpc-456".into())),
+            let call = ModuleCall::test(
+                "test_module".to_string(),
+                Some("my_instance".to_string()),
+                {
+                    let mut args = HashMap::new();
+                    args.insert(
+                        "vpc_id".to_string(),
+                        Value::Concrete(ConcreteValue::String("vpc-456".into())),
+                    );
+                    // Unknown argument: not declared in the module
+                    args.insert(
+                        "unknown_arg".to_string(),
+                        Value::Concrete(ConcreteValue::String("should-fail".into())),
+                    );
+                    module_arguments(args)
+                },
             );
-            // Unknown argument: not declared in the module
-            args.insert(
-                "unknown_arg".to_string(),
-                Value::Concrete(ConcreteValue::String("should-fail".into())),
+
+            let result = resolver.expand_module_call(&call, "my_instance");
+            assert!(
+                matches!(
+                    result.as_ref().map_err(|error| error.root_cause()),
+                    Err(ModuleError::UnknownArgument { .. })
+                ),
+                "Expected UnknownArgument error, got {:?}",
+                result
             );
-            module_arguments(args)
         },
-    );
-
-    let result = resolver.expand_module_call(&call, "my_instance");
-    assert!(
-        matches!(
-            result.as_ref().map_err(|error| error.root_cause()),
-            Err(ModuleError::UnknownArgument { .. })
-        ),
-        "Expected UnknownArgument error, got {:?}",
-        result
-    );
+    )
 }
 
 #[test]
@@ -4434,7 +4601,7 @@ fn create_module_with_interpolation() -> ParsedFile {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("vpc".into()),
-            dependency_bindings: BTreeSet::new(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -4480,59 +4647,64 @@ fn create_module_with_interpolation() -> ParsedFile {
 
 #[test]
 fn test_expand_module_call_with_interpolation() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules
-            .insert("vpc_mod".to_string(), create_module_with_interpolation());
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules
+                    .insert("vpc_mod".to_string(), create_module_with_interpolation());
+                r
+            };
 
-    let call = ModuleCall::test("vpc_mod".to_string(), Some("dev_vpc".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "cidr_block".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-        );
-        args.insert(
-            "env_name".to_string(),
-            Value::Concrete(ConcreteValue::String("dev".into())),
-        );
-        module_arguments(args)
-    });
+            let call = ModuleCall::test("vpc_mod".to_string(), Some("dev_vpc".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "cidr_block".to_string(),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+                );
+                args.insert(
+                    "env_name".to_string(),
+                    Value::Concrete(ConcreteValue::String("dev".into())),
+                );
+                module_arguments(args)
+            });
 
-    let expanded = resolver
-        .expand_module_call(&call, "dev_vpc")
-        .unwrap()
-        .resources;
-    assert_eq!(expanded.len(), 1);
+            let expanded = resolver
+                .expand_module_call(&call, "dev_vpc")
+                .unwrap()
+                .resources;
+            assert_eq!(expanded.len(), 1);
 
-    let vpc = &expanded[0];
+            let vpc = &expanded[0];
 
-    // Simple argument substitution should work
-    assert_eq!(
-        vpc.get_attr("cidr_block"),
-        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
-            "10.0.0.0/16".into()
-        )))
-    );
-    assert_eq!(
-        vpc.get_attr("env"),
-        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
-            "dev".into()
-        )))
-    );
+            // Simple argument substitution should work
+            assert_eq!(
+                vpc.get_attr("cidr_block"),
+                Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                    "10.0.0.0/16".into()
+                )))
+            );
+            assert_eq!(
+                vpc.get_attr("env"),
+                Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                    "dev".into()
+                )))
+            );
 
-    // Interpolation with argument substitutes and canonicalizes back to
-    // a flat `String` so downstream `Value::Concrete(ConcreteValue::String)` consumers (state
-    // diff, plan rendering) see the resolved value. Without the post-
-    // substitution canonicalize, this would stay as
-    // `Interpolation([Literal("test-"), Expr(String("dev"))])` (#2815, #2817).
-    assert_eq!(
-        vpc.get_attr("name"),
-        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
-            "test-dev".into()
-        ))),
-    );
+            // Interpolation with argument substitutes and canonicalizes back to
+            // a flat `String` so downstream `Value::Concrete(ConcreteValue::String)` consumers (state
+            // diff, plan rendering) see the resolved value. Without the post-
+            // substitution canonicalize, this would stay as
+            // `Interpolation([Literal("test-"), Expr(String("dev"))])` (#2815, #2817).
+            assert_eq!(
+                vpc.get_attr("name"),
+                Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                    "test-dev".into()
+                ))),
+            );
+        },
+    )
 }
 
 #[test]
@@ -4765,44 +4937,49 @@ fn test_nested_module_cycle_detection() {
 }
 
 fn expand_module_call_with_cidr_function_argument(cidr: Value) -> ExpandedValue {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules
-            .insert("vpc_mod".to_string(), create_module_with_interpolation());
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules
+                    .insert("vpc_mod".to_string(), create_module_with_interpolation());
+                r
+            };
 
-    // Pass a FunctionCall as an argument value
-    let call = ModuleCall::test("vpc_mod".to_string(), Some("dev_vpc".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "cidr_block".to_string(),
-            Value::Deferred(DeferredValue::FunctionCall {
-                name: crate::builtins::BuiltinFunction::cidr_subnet,
-                args: vec![
-                    cidr.into(),
-                    Value::Concrete(ConcreteValue::Int(8)).into(),
-                    Value::Concrete(ConcreteValue::Int(0)).into(),
-                ],
-                source_line: (0).into(),
-            }),
-        );
-        args.insert(
-            "env_name".to_string(),
-            Value::Concrete(ConcreteValue::String("dev".into())),
-        );
-        module_arguments(args)
-    });
+            // Pass a FunctionCall as an argument value
+            let call = ModuleCall::test("vpc_mod".to_string(), Some("dev_vpc".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "cidr_block".to_string(),
+                    Value::Deferred(DeferredValue::FunctionCall {
+                        name: crate::builtins::BuiltinFunction::cidr_subnet,
+                        args: vec![
+                            cidr.into(),
+                            Value::Concrete(ConcreteValue::Int(8)).into(),
+                            Value::Concrete(ConcreteValue::Int(0)).into(),
+                        ],
+                        source_line: (0).into(),
+                    }),
+                );
+                args.insert(
+                    "env_name".to_string(),
+                    Value::Concrete(ConcreteValue::String("dev".into())),
+                );
+                module_arguments(args)
+            });
 
-    let expanded = resolver
-        .expand_module_call(&call, "dev_vpc")
-        .unwrap()
-        .resources;
-    assert_eq!(expanded.len(), 1);
+            let expanded = resolver
+                .expand_module_call(&call, "dev_vpc")
+                .unwrap()
+                .resources;
+            assert_eq!(expanded.len(), 1);
 
-    let vpc = &expanded[0];
+            let vpc = &expanded[0];
 
-    vpc.get_attr("cidr_block").expect("expanded CIDR").clone()
+            vpc.get_attr("cidr_block").expect("expanded CIDR").clone()
+        },
+    )
 }
 
 #[test]
@@ -4846,25 +5023,30 @@ fn test_load_module_missing_path_cleans_resolving_set() {
     let tmp_dir = std::env::temp_dir().join("carina_test_missing_path_cleanup");
     let _ = fs::create_dir_all(&tmp_dir);
 
-    let mut resolver = ModuleResolver::new(&tmp_dir);
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let mut resolver = ModuleResolver::new(&tmp_dir, session);
 
-    let err = resolver
-        .load_module("nonexistent")
-        .expect_err("expected error");
-    assert!(
-        matches!(&err, ModuleError::Io(_)),
-        "expected Io error for a nonexistent path, got: {err:?}"
-    );
+            let err = resolver
+                .load_module("nonexistent")
+                .expect_err("expected error");
+            assert!(
+                matches!(&err, ModuleError::Io(_)),
+                "expected Io error for a nonexistent path, got: {err:?}"
+            );
 
-    let err = resolver
-        .load_module("nonexistent")
-        .expect_err("expected error");
-    assert!(
-        matches!(&err, ModuleError::Io(_)),
-        "expected Io error on second attempt, not CircularImport, got: {err:?}"
-    );
+            let err = resolver
+                .load_module("nonexistent")
+                .expect_err("expected error");
+            assert!(
+                matches!(&err, ModuleError::Io(_)),
+                "expected Io error on second attempt, not CircularImport, got: {err:?}"
+            );
 
-    let _ = fs::remove_dir_all(&tmp_dir);
+            let _ = fs::remove_dir_all(&tmp_dir);
+        },
+    )
 }
 
 #[test]
@@ -4879,32 +5061,37 @@ fn test_load_module_parse_error_cleans_resolving_set() {
     )
     .unwrap();
 
-    let mut resolver = ModuleResolver::new(&tmp_root);
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let mut resolver = ModuleResolver::new(&tmp_root, session);
 
-    // First attempt: parse error on a directory module with a bad .crn file.
-    let result = resolver.load_module("bad_module");
-    assert!(
-        result.is_err(),
-        "expected error but got: {:?}",
-        result.unwrap()
-    );
-    let err = result.unwrap_err();
-    assert!(
-        matches!(&err, ModuleError::ParseInFile { .. }),
-        "expected located Parse error on first attempt, got: {err:?}"
-    );
+            // First attempt: parse error on a directory module with a bad .crn file.
+            let result = resolver.load_module("bad_module");
+            assert!(
+                result.is_err(),
+                "expected error but got: {:?}",
+                result.unwrap()
+            );
+            let err = result.unwrap_err();
+            assert!(
+                matches!(&err, ModuleError::ParseInFile { .. }),
+                "expected located Parse error on first attempt, got: {err:?}"
+            );
 
-    // Second attempt: should still get parse error, not circular import
-    // (the resolving set must have been cleaned up).
-    let result = resolver.load_module("bad_module");
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert!(
-        matches!(&err, ModuleError::ParseInFile { .. }),
-        "expected located Parse error on second attempt, not CircularImport, got: {err:?}"
-    );
+            // Second attempt: should still get parse error, not circular import
+            // (the resolving set must have been cleaned up).
+            let result = resolver.load_module("bad_module");
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(
+                matches!(&err, ModuleError::ParseInFile { .. }),
+                "expected located Parse error on second attempt, not CircularImport, got: {err:?}"
+            );
 
-    let _ = fs::remove_dir_all(&tmp_root);
+            let _ = fs::remove_dir_all(&tmp_root);
+        },
+    )
 }
 
 #[test]
@@ -4946,20 +5133,25 @@ fn test_load_module_rejects_state_blocks() {
         .expect("module arguments");
         fs::write(module_dir.join("state.crn"), state_block).expect("module state block");
 
-        let mut resolver = ModuleResolver::new(tmp.path());
-        let err = resolver
-            .load_module("module")
-            .expect_err("state block inside a module must be rejected");
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                let mut resolver = ModuleResolver::new(tmp.path(), session);
+                let err = resolver
+                    .load_module("module")
+                    .expect_err("state block inside a module must be rejected");
 
-        assert!(
-            matches!(&err, ModuleError::StateBlockInModule),
-            "expected StateBlockInModule for {kind}, got {err:?}",
-        );
-        assert_eq!(
-            err.to_string(),
-            "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
-            "unexpected resolver error for {kind}",
-        );
+                assert!(
+                    matches!(&err, ModuleError::StateBlockInModule),
+                    "expected StateBlockInModule for {kind}, got {err:?}",
+                );
+                assert_eq!(
+                    err.to_string(),
+                    "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
+                    "unexpected resolver error for {kind}",
+                );
+            },
+        )
     }
 }
 
@@ -4979,21 +5171,26 @@ fn test_load_module_rejects_backend_and_cleans_resolving_set() {
     )
     .expect("module backend");
 
-    let mut resolver = ModuleResolver::new(tmp.path());
-    for attempt in 1..=2 {
-        let err = resolver
-            .load_module("module")
-            .expect_err("backend inside a module must be rejected");
-        assert!(
-            matches!(&err, ModuleError::BackendInModule),
-            "expected BackendInModule on attempt {attempt}, got {err:?}",
-        );
-        assert_eq!(
-            err.to_string(),
-            "backend blocks are not allowed inside modules. Define the backend at the root configuration level.",
-            "unexpected resolver error on attempt {attempt}",
-        );
-    }
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let mut resolver = ModuleResolver::new(tmp.path(), session);
+            for attempt in 1..=2 {
+                let err = resolver
+                    .load_module("module")
+                    .expect_err("backend inside a module must be rejected");
+                assert!(
+                    matches!(&err, ModuleError::BackendInModule),
+                    "expected BackendInModule on attempt {attempt}, got {err:?}",
+                );
+                assert_eq!(
+                    err.to_string(),
+                    "backend blocks are not allowed inside modules. Define the backend at the root configuration level.",
+                    "unexpected resolver error on attempt {attempt}",
+                );
+            }
+        },
+    )
 }
 
 #[test]
@@ -5012,21 +5209,26 @@ fn test_load_module_rejects_upstream_state_and_cleans_resolving_set() {
     )
     .expect("module upstream_state");
 
-    let mut resolver = ModuleResolver::new(tmp.path());
-    for attempt in 1..=2 {
-        let err = resolver
-            .load_module("module")
-            .expect_err("upstream_state inside a module must be rejected");
-        assert!(
-            matches!(&err, ModuleError::UpstreamStateInModule),
-            "expected UpstreamStateInModule on attempt {attempt}, got {err:?}",
-        );
-        assert_eq!(
-            err.to_string(),
-            "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
-            "unexpected resolver error on attempt {attempt}",
-        );
-    }
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let mut resolver = ModuleResolver::new(tmp.path(), session);
+            for attempt in 1..=2 {
+                let err = resolver
+                    .load_module("module")
+                    .expect_err("upstream_state inside a module must be rejected");
+                assert!(
+                    matches!(&err, ModuleError::UpstreamStateInModule),
+                    "expected UpstreamStateInModule on attempt {attempt}, got {err:?}",
+                );
+                assert_eq!(
+                    err.to_string(),
+                    "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
+                    "unexpected resolver error on attempt {attempt}",
+                );
+            }
+        },
+    )
 }
 
 #[test]
@@ -5045,21 +5247,26 @@ fn test_load_module_rejects_exports_and_cleans_resolving_set() {
     )
     .expect("module exports");
 
-    let mut resolver = ModuleResolver::new(tmp.path());
-    for attempt in 1..=2 {
-        let err = resolver
-            .load_module("module")
-            .expect_err("exports inside a module must be rejected");
-        assert!(
-            matches!(&err, ModuleError::ExportsInModule),
-            "expected ExportsInModule on attempt {attempt}, got {err:?}",
-        );
-        assert_eq!(
-            err.to_string(),
-            "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
-            "unexpected resolver error on attempt {attempt}",
-        );
-    }
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let mut resolver = ModuleResolver::new(tmp.path(), session);
+            for attempt in 1..=2 {
+                let err = resolver
+                    .load_module("module")
+                    .expect_err("exports inside a module must be rejected");
+                assert!(
+                    matches!(&err, ModuleError::ExportsInModule),
+                    "expected ExportsInModule on attempt {attempt}, got {err:?}",
+                );
+                assert_eq!(
+                    err.to_string(),
+                    "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
+                    "unexpected resolver error on attempt {attempt}",
+                );
+            }
+        },
+    )
 }
 
 #[test]
@@ -5072,16 +5279,21 @@ fn test_load_module_rejects_file_path() {
     fs::create_dir_all(&tmp_root).unwrap();
     fs::write(tmp_root.join("single.crn"), "arguments {\n  x: String\n}\n").unwrap();
 
-    let mut resolver = ModuleResolver::new(&tmp_root);
-    let err = resolver
-        .load_module("single.crn")
-        .expect_err("a single .crn file must not be loadable as a module");
-    assert!(
-        matches!(&err, ModuleError::NotADirectory { .. }),
-        "expected NotADirectory, got {err:?}"
-    );
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let mut resolver = ModuleResolver::new(&tmp_root, session);
+            let err = resolver
+                .load_module("single.crn")
+                .expect_err("a single .crn file must not be loadable as a module");
+            assert!(
+                matches!(&err, ModuleError::NotADirectory { .. }),
+                "expected NotADirectory, got {err:?}"
+            );
 
-    let _ = fs::remove_dir_all(&tmp_root);
+            let _ = fs::remove_dir_all(&tmp_root);
+        },
+    )
 }
 
 /// Helper to create a module with a validated port argument
@@ -5137,29 +5349,34 @@ fn create_module_with_port_validation() -> ParsedFile {
 
 #[test]
 fn test_argument_validation_passes_with_valid_value() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert(
-            "web_server".to_string(),
-            create_module_with_port_validation(),
-        );
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert(
+                    "web_server".to_string(),
+                    create_module_with_port_validation(),
+                );
+                r
+            };
 
-    let call = ModuleCall::test("web_server".to_string(), Some("web".to_string()), {
-        let mut args = HashMap::new();
-        args.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(443)));
-        module_arguments(args)
-    });
+            let call = ModuleCall::test("web_server".to_string(), Some("web".to_string()), {
+                let mut args = HashMap::new();
+                args.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(443)));
+                module_arguments(args)
+            });
 
-    let result = resolver.expand_module_call(&call, "web").unwrap();
-    assert!(
-        result.compositions[0]
-            .signature
-            .pending_constraints
-            .is_empty(),
-        "satisfied constraints must not be persisted"
-    );
+            let result = resolver.expand_module_call(&call, "web").unwrap();
+            assert!(
+                result.compositions[0]
+                    .signature
+                    .pending_constraints
+                    .is_empty(),
+                "satisfied constraints must not be persisted"
+            );
+        },
+    )
 }
 
 #[test]
@@ -5179,35 +5396,40 @@ fn test_argument_validation_with_resource_reference_is_pending() {
         },
         Some("port must not be empty".to_string()),
     )];
-    let resolver = {
-        let mut resolver = ModuleResolver::new(".");
-        resolver
-            .imported_modules
-            .insert("web_server".to_string(), module);
-        resolver
-    };
-    let call = ModuleCall::test(
-        "web_server".to_string(),
-        Some("web".to_string()),
-        module_arguments([(
-            "port".to_string(),
-            Value::resource_ref("producer", "port", Vec::new()),
-        )]),
-    );
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut resolver = ModuleResolver::new(".", session);
+                resolver
+                    .imported_modules
+                    .insert("web_server".to_string(), module);
+                resolver
+            };
+            let call = ModuleCall::test(
+                "web_server".to_string(),
+                Some("web".to_string()),
+                module_arguments([(
+                    "port".to_string(),
+                    Value::resource_ref("producer", "port", Vec::new()),
+                )]),
+            );
 
-    let expanded = resolver
-        .expand_module_call(&call, "web")
-        .expect("a reference-valued constraint must remain pending");
-    let constraints = &expanded.compositions[0].signature.pending_constraints;
-    assert_eq!(constraints.len(), 1);
-    assert_eq!(
-        constraints[0].id,
-        crate::resource::ModuleConstraintId::argument_validation("port", 0)
-    );
-    assert_eq!(
-        referenced_constraint_arguments(&constraints[0].expression),
-        ["port"]
-    );
+            let expanded = resolver
+                .expand_module_call(&call, "web")
+                .expect("a reference-valued constraint must remain pending");
+            let constraints = &expanded.compositions[0].signature.pending_constraints;
+            assert_eq!(constraints.len(), 1);
+            assert_eq!(
+                constraints[0].id,
+                crate::resource::ModuleConstraintId::argument_validation("port", 0)
+            );
+            assert_eq!(
+                referenced_constraint_arguments(&constraints[0].expression),
+                ["port"]
+            );
+        },
+    )
 }
 
 #[test]
@@ -5313,151 +5535,176 @@ let root = outer { outer_port = producer.port }
         deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
-    let resolver = {
-        let mut resolver = ModuleResolver::new(".");
-        resolver.imported_modules.insert("outer".to_string(), outer);
-        resolver
-    };
-    let expanded = resolver.expand_module_call(&call, "root").unwrap();
-    let nested = expanded
-        .compositions
-        .iter()
-        .find(|composition| composition.module_name == "inner")
-        .expect("nested composition");
-    assert_eq!(nested.instance, "root.inner");
-    assert_eq!(nested.call_path().calls().count(), 2);
-    assert_eq!(nested.call_path().root().module_name, "outer");
-    assert_eq!(nested.call_path().immediate().module_name, "inner");
-    assert_eq!(nested.call_path().immediate().instance, "root.inner");
-    assert_eq!(&nested.call_path().root().id, call.id());
-    assert_eq!(&nested.call_path().immediate().id, &inner_id);
-    assert_ne!(
-        nested.call_path().root().id,
-        nested.call_path().immediate().id,
-    );
-    assert_eq!(
-        nested
-            .signature
-            .arguments
-            .get("port")
-            .map(|argument| argument.value()),
-        Some(&expanded_resource_ref("producer", "port", Vec::new()))
-    );
-    let constraint = &nested.signature.pending_constraints[0];
-    assert_eq!(
-        constraint.id,
-        ModuleConstraintId::argument_validation("port", 0)
-    );
-    assert_eq!(
-        referenced_constraint_arguments(&constraint.expression),
-        ["port"]
-    );
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut resolver = ModuleResolver::new(".", session);
+                resolver.imported_modules.insert("outer".to_string(), outer);
+                resolver
+            };
+            let expanded = resolver.expand_module_call(&call, "root").unwrap();
+            let nested = expanded
+                .compositions
+                .iter()
+                .find(|composition| composition.module_name == "inner")
+                .expect("nested composition");
+            assert_eq!(nested.instance, "root.inner");
+            assert_eq!(nested.call_path().calls().count(), 2);
+            assert_eq!(nested.call_path().root().module_name, "outer");
+            assert_eq!(nested.call_path().immediate().module_name, "inner");
+            assert_eq!(nested.call_path().immediate().instance, "root.inner");
+            assert_eq!(&nested.call_path().root().id, call.id());
+            assert_eq!(&nested.call_path().immediate().id, &inner_id);
+            assert_ne!(
+                nested.call_path().root().id,
+                nested.call_path().immediate().id,
+            );
+            assert_eq!(
+                nested
+                    .signature
+                    .arguments
+                    .get("port")
+                    .map(|argument| argument.value()),
+                Some(&expanded_resource_ref("producer", "port", Vec::new()))
+            );
+            let constraint = &nested.signature.pending_constraints[0];
+            assert_eq!(
+                constraint.id,
+                ModuleConstraintId::argument_validation("port", 0)
+            );
+            assert_eq!(
+                referenced_constraint_arguments(&constraint.expression),
+                ["port"]
+            );
+        },
+    )
 }
 
 #[test]
 fn test_argument_validation_passes_with_default_value() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert(
-            "web_server".to_string(),
-            create_module_with_port_validation(),
-        );
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert(
+                    "web_server".to_string(),
+                    create_module_with_port_validation(),
+                );
+                r
+            };
 
-    let call = ModuleCall::test(
-        "web_server".to_string(),
-        Some("web".to_string()),
-        HashMap::new(), // Uses default 8080
-    );
+            let call = ModuleCall::test(
+                "web_server".to_string(),
+                Some("web".to_string()),
+                HashMap::new(), // Uses default 8080
+            );
 
-    let result = resolver.expand_module_call(&call, "web");
-    assert!(result.is_ok());
+            let result = resolver.expand_module_call(&call, "web");
+            assert!(result.is_ok());
+        },
+    )
 }
 
 #[test]
 fn test_argument_validation_fails_with_invalid_value() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert(
-            "web_server".to_string(),
-            create_module_with_port_validation(),
-        );
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert(
+                    "web_server".to_string(),
+                    create_module_with_port_validation(),
+                );
+                r
+            };
 
-    let call = ModuleCall::test("web_server".to_string(), Some("web".to_string()), {
-        let mut args = HashMap::new();
-        args.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(0)));
-        module_arguments(args)
-    });
+            let call = ModuleCall::test("web_server".to_string(), Some("web".to_string()), {
+                let mut args = HashMap::new();
+                args.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(0)));
+                module_arguments(args)
+            });
 
-    let result = resolver.expand_module_call(&call, "web");
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    let rendered = err.to_string();
-    assert!(rendered.contains("module 'web_server'"), "{rendered}");
-    assert!(rendered.contains("call 'web'"), "{rendered}");
-    assert!(rendered.contains("argument 'port'"), "{rendered}");
-    assert!(
-        rendered.contains("Port must be between 1 and 65535"),
-        "{rendered}"
-    );
-    assert!(rendered.contains("got 0"), "{rendered}");
-    match err.root_cause() {
-        ModuleError::Constraint(diagnostic) => {
-            assert_eq!(diagnostic.module, "web_server");
-            assert_eq!(diagnostic.arguments, ["port"]);
-            assert_eq!(diagnostic.message, "Port must be between 1 and 65535");
-            assert_eq!(diagnostic.actuals, [("port".to_string(), "0".to_string())]);
-        }
-        other => panic!("Expected module constraint failure, got {other:?}"),
-    }
+            let result = resolver.expand_module_call(&call, "web");
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            let rendered = err.to_string();
+            assert!(rendered.contains("module 'web_server'"), "{rendered}");
+            assert!(rendered.contains("call 'web'"), "{rendered}");
+            assert!(rendered.contains("argument 'port'"), "{rendered}");
+            assert!(
+                rendered.contains("Port must be between 1 and 65535"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("got 0"), "{rendered}");
+            match err.root_cause() {
+                ModuleError::Constraint(diagnostic) => {
+                    assert_eq!(diagnostic.module, "web_server");
+                    assert_eq!(diagnostic.arguments, ["port"]);
+                    assert_eq!(diagnostic.message, "Port must be between 1 and 65535");
+                    assert_eq!(diagnostic.actuals, [("port".to_string(), "0".to_string())]);
+                }
+                other => panic!("Expected module constraint failure, got {other:?}"),
+            }
+        },
+    )
 }
 
 #[test]
 fn test_argument_validation_fails_with_negative_value() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert(
-            "web_server".to_string(),
-            create_module_with_port_validation(),
-        );
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert(
+                    "web_server".to_string(),
+                    create_module_with_port_validation(),
+                );
+                r
+            };
 
-    let call = ModuleCall::test("web_server".to_string(), Some("web".to_string()), {
-        let mut args = HashMap::new();
-        args.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(-1)));
-        module_arguments(args)
-    });
+            let call = ModuleCall::test("web_server".to_string(), Some("web".to_string()), {
+                let mut args = HashMap::new();
+                args.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(-1)));
+                module_arguments(args)
+            });
 
-    let result = resolver.expand_module_call(&call, "web");
-    assert!(result.is_err());
+            let result = resolver.expand_module_call(&call, "web");
+            assert!(result.is_err());
+        },
+    )
 }
 
 #[test]
 fn test_argument_validation_fails_too_large() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert(
-            "web_server".to_string(),
-            create_module_with_port_validation(),
-        );
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert(
+                    "web_server".to_string(),
+                    create_module_with_port_validation(),
+                );
+                r
+            };
 
-    let call = ModuleCall::test("web_server".to_string(), Some("web".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "port".to_string(),
-            Value::Concrete(ConcreteValue::Int(70000)),
-        );
-        module_arguments(args)
-    });
+            let call = ModuleCall::test("web_server".to_string(), Some("web".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "port".to_string(),
+                    Value::Concrete(ConcreteValue::Int(70000)),
+                );
+                module_arguments(args)
+            });
 
-    let result = resolver.expand_module_call(&call, "web");
-    assert!(result.is_err());
+            let result = resolver.expand_module_call(&call, "web");
+            assert!(result.is_err());
+        },
+    )
 }
 
 #[test]
@@ -5503,27 +5750,32 @@ fn test_argument_validation_no_message_uses_default() {
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert("counter".to_string(), module);
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert("counter".to_string(), module);
+                r
+            };
 
-    let call = ModuleCall::test("counter".to_string(), Some("c".to_string()), {
-        let mut args = HashMap::new();
-        args.insert("count".to_string(), Value::Concrete(ConcreteValue::Int(0)));
-        module_arguments(args)
-    });
+            let call = ModuleCall::test("counter".to_string(), Some("c".to_string()), {
+                let mut args = HashMap::new();
+                args.insert("count".to_string(), Value::Concrete(ConcreteValue::Int(0)));
+                module_arguments(args)
+            });
 
-    let result = resolver.expand_module_call(&call, "c");
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    match err.root_cause() {
-        ModuleError::Constraint(diagnostic) => {
-            assert_eq!(diagnostic.message, "validation failed for argument 'count'");
-        }
-        other => panic!("Expected module constraint failure, got {other:?}"),
-    }
+            let result = resolver.expand_module_call(&call, "c");
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            match err.root_cause() {
+                ModuleError::Constraint(diagnostic) => {
+                    assert_eq!(diagnostic.message, "validation failed for argument 'count'");
+                }
+                other => panic!("Expected module constraint failure, got {other:?}"),
+            }
+        },
+    )
 }
 
 #[test]
@@ -5572,43 +5824,48 @@ fn test_argument_validation_len_with_list() {
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert("tagged".to_string(), module);
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert("tagged".to_string(), module);
+                r
+            };
 
-    // Valid: non-empty list
-    let call = ModuleCall::test("tagged".to_string(), Some("t".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "tags".to_string(),
-            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("env:prod".into()),
-            )])),
-        );
-        module_arguments(args)
-    });
-    assert!(resolver.expand_module_call(&call, "t").is_ok());
+            // Valid: non-empty list
+            let call = ModuleCall::test("tagged".to_string(), Some("t".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "tags".to_string(),
+                    Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                        ConcreteValue::String("env:prod".into()),
+                    )])),
+                );
+                module_arguments(args)
+            });
+            assert!(resolver.expand_module_call(&call, "t").is_ok());
 
-    // Invalid: empty list
-    let call = ModuleCall::test("tagged".to_string(), Some("t".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "tags".to_string(),
-            Value::Concrete(ConcreteValue::List(vec![])),
-        );
-        module_arguments(args)
-    });
-    let result = resolver.expand_module_call(&call, "t");
-    assert!(result.is_err());
-    let error = result.unwrap_err();
-    match error.root_cause() {
-        ModuleError::Constraint(diagnostic) => {
-            assert_eq!(diagnostic.message, "At least one tag is required");
-        }
-        other => panic!("Expected module constraint failure, got {other:?}"),
-    }
+            // Invalid: empty list
+            let call = ModuleCall::test("tagged".to_string(), Some("t".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "tags".to_string(),
+                    Value::Concrete(ConcreteValue::List(vec![])),
+                );
+                module_arguments(args)
+            });
+            let result = resolver.expand_module_call(&call, "t");
+            assert!(result.is_err());
+            let error = result.unwrap_err();
+            match error.root_cause() {
+                ModuleError::Constraint(diagnostic) => {
+                    assert_eq!(diagnostic.message, "At least one tag is required");
+                }
+                other => panic!("Expected module constraint failure, got {other:?}"),
+            }
+        },
+    )
 }
 
 #[test]
@@ -5671,28 +5928,33 @@ fn test_require_block_passes() {
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert("web".to_string(), module);
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert("web".to_string(), module);
+                r
+            };
 
-    // HTTPS enabled with cert_arn provided: should pass
-    let call = ModuleCall::test("web".to_string(), Some("w".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "enable_https".to_string(),
-            Value::Concrete(ConcreteValue::Bool(true)),
-        );
-        args.insert(
-            "cert_arn".to_string(),
-            Value::Concrete(ConcreteValue::String(
-                "arn:aws:acm:us-east-1:123:cert/abc".into(),
-            )),
-        );
-        module_arguments(args)
-    });
-    assert!(resolver.expand_module_call(&call, "w").is_ok());
+            // HTTPS enabled with cert_arn provided: should pass
+            let call = ModuleCall::test("web".to_string(), Some("w".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "enable_https".to_string(),
+                    Value::Concrete(ConcreteValue::Bool(true)),
+                );
+                args.insert(
+                    "cert_arn".to_string(),
+                    Value::Concrete(ConcreteValue::String(
+                        "arn:aws:acm:us-east-1:123:cert/abc".into(),
+                    )),
+                );
+                module_arguments(args)
+            });
+            assert!(resolver.expand_module_call(&call, "w").is_ok());
+        },
+    )
 }
 
 #[test]
@@ -5749,34 +6011,39 @@ fn test_require_block_fails_with_not_expr() {
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert("web".to_string(), module);
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert("web".to_string(), module);
+                r
+            };
 
-    // HTTPS enabled but has_cert is false: should fail
-    let call = ModuleCall::test("web".to_string(), Some("w".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "enable_https".to_string(),
-            Value::Concrete(ConcreteValue::Bool(true)),
-        );
-        args.insert(
-            "has_cert".to_string(),
-            Value::Concrete(ConcreteValue::Bool(false)),
-        );
-        module_arguments(args)
-    });
-    let result = resolver.expand_module_call(&call, "w");
-    assert!(result.is_err());
-    let error = result.unwrap_err();
-    match error.root_cause() {
-        ModuleError::Constraint(diagnostic) => {
-            assert_eq!(diagnostic.message, "cert is required when HTTPS is enabled");
-        }
-        other => panic!("Expected module constraint failure, got {other:?}"),
-    }
+            // HTTPS enabled but has_cert is false: should fail
+            let call = ModuleCall::test("web".to_string(), Some("w".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "enable_https".to_string(),
+                    Value::Concrete(ConcreteValue::Bool(true)),
+                );
+                args.insert(
+                    "has_cert".to_string(),
+                    Value::Concrete(ConcreteValue::Bool(false)),
+                );
+                module_arguments(args)
+            });
+            let result = resolver.expand_module_call(&call, "w");
+            assert!(result.is_err());
+            let error = result.unwrap_err();
+            match error.root_cause() {
+                ModuleError::Constraint(diagnostic) => {
+                    assert_eq!(diagnostic.message, "cert is required when HTTPS is enabled");
+                }
+                other => panic!("Expected module constraint failure, got {other:?}"),
+            }
+        },
+    )
 }
 
 #[test]
@@ -5826,46 +6093,51 @@ fn test_require_block_len_function() {
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert("alb".to_string(), module);
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert("alb".to_string(), module);
+                r
+            };
 
-    // Two subnets: should pass
-    let call = ModuleCall::test("alb".to_string(), Some("lb".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "subnet_ids".to_string(),
-            Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("subnet-a".into())),
-                Value::Concrete(ConcreteValue::String("subnet-b".into())),
-            ])),
-        );
-        module_arguments(args)
-    });
-    assert!(resolver.expand_module_call(&call, "lb").is_ok());
+            // Two subnets: should pass
+            let call = ModuleCall::test("alb".to_string(), Some("lb".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "subnet_ids".to_string(),
+                    Value::Concrete(ConcreteValue::List(vec![
+                        Value::Concrete(ConcreteValue::String("subnet-a".into())),
+                        Value::Concrete(ConcreteValue::String("subnet-b".into())),
+                    ])),
+                );
+                module_arguments(args)
+            });
+            assert!(resolver.expand_module_call(&call, "lb").is_ok());
 
-    // One subnet: should fail
-    let call = ModuleCall::test("alb".to_string(), Some("lb".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "subnet_ids".to_string(),
-            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("subnet-a".into()),
-            )])),
-        );
-        module_arguments(args)
-    });
-    let result = resolver.expand_module_call(&call, "lb");
-    assert!(result.is_err());
-    let error = result.unwrap_err();
-    match error.root_cause() {
-        ModuleError::Constraint(diagnostic) => {
-            assert_eq!(diagnostic.message, "ALB requires at least two subnets");
-        }
-        other => panic!("Expected module constraint failure, got {other:?}"),
-    }
+            // One subnet: should fail
+            let call = ModuleCall::test("alb".to_string(), Some("lb".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "subnet_ids".to_string(),
+                    Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                        ConcreteValue::String("subnet-a".into()),
+                    )])),
+                );
+                module_arguments(args)
+            });
+            let result = resolver.expand_module_call(&call, "lb");
+            assert!(result.is_err());
+            let error = result.unwrap_err();
+            match error.root_cause() {
+                ModuleError::Constraint(diagnostic) => {
+                    assert_eq!(diagnostic.message, "ALB requires at least two subnets");
+                }
+                other => panic!("Expected module constraint failure, got {other:?}"),
+            }
+        },
+    )
 }
 
 #[test]
@@ -5921,139 +6193,158 @@ fn test_require_block_multiple_constraints() {
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert("asg".to_string(), module);
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert("asg".to_string(), module);
+                r
+            };
 
-    // min_size < max_size: should pass
-    let call = ModuleCall::test("asg".to_string(), Some("a".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "min_size".to_string(),
-            Value::Concrete(ConcreteValue::Int(1)),
-        );
-        args.insert(
-            "max_size".to_string(),
-            Value::Concrete(ConcreteValue::Int(5)),
-        );
-        module_arguments(args)
-    });
-    assert!(resolver.expand_module_call(&call, "a").is_ok());
+            // min_size < max_size: should pass
+            let call = ModuleCall::test("asg".to_string(), Some("a".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "min_size".to_string(),
+                    Value::Concrete(ConcreteValue::Int(1)),
+                );
+                args.insert(
+                    "max_size".to_string(),
+                    Value::Concrete(ConcreteValue::Int(5)),
+                );
+                module_arguments(args)
+            });
+            assert!(resolver.expand_module_call(&call, "a").is_ok());
 
-    // min_size > max_size: should fail
-    let call = ModuleCall::test("asg".to_string(), Some("a".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "min_size".to_string(),
-            Value::Concrete(ConcreteValue::Int(10)),
-        );
-        args.insert(
-            "max_size".to_string(),
-            Value::Concrete(ConcreteValue::Int(5)),
-        );
-        module_arguments(args)
-    });
-    let result = resolver.expand_module_call(&call, "a");
-    assert!(result.is_err());
-    let error = result.unwrap_err();
-    let rendered = error.to_string();
-    assert!(rendered.contains("module 'asg'"), "{rendered}");
-    assert!(rendered.contains("call 'a'"), "{rendered}");
-    assert!(rendered.contains("max_size"), "{rendered}");
-    assert!(rendered.contains("min_size"), "{rendered}");
-    assert!(rendered.contains("max_size = 5"), "{rendered}");
-    assert!(rendered.contains("min_size = 10"), "{rendered}");
-    assert!(
-        rendered.contains("min_size must be <= max_size"),
-        "{rendered}"
-    );
-    match error.root_cause() {
-        ModuleError::Constraint(diagnostic) => {
-            assert_eq!(diagnostic.message, "min_size must be <= max_size");
-        }
-        other => panic!("Expected module constraint failure, got {other:?}"),
-    }
+            // min_size > max_size: should fail
+            let call = ModuleCall::test("asg".to_string(), Some("a".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "min_size".to_string(),
+                    Value::Concrete(ConcreteValue::Int(10)),
+                );
+                args.insert(
+                    "max_size".to_string(),
+                    Value::Concrete(ConcreteValue::Int(5)),
+                );
+                module_arguments(args)
+            });
+            let result = resolver.expand_module_call(&call, "a");
+            assert!(result.is_err());
+            let error = result.unwrap_err();
+            let rendered = error.to_string();
+            assert!(rendered.contains("module 'asg'"), "{rendered}");
+            assert!(rendered.contains("call 'a'"), "{rendered}");
+            assert!(rendered.contains("max_size"), "{rendered}");
+            assert!(rendered.contains("min_size"), "{rendered}");
+            assert!(rendered.contains("max_size = 5"), "{rendered}");
+            assert!(rendered.contains("min_size = 10"), "{rendered}");
+            assert!(
+                rendered.contains("min_size must be <= max_size"),
+                "{rendered}"
+            );
+            match error.root_cause() {
+                ModuleError::Constraint(diagnostic) => {
+                    assert_eq!(diagnostic.message, "min_size must be <= max_size");
+                }
+                other => panic!("Expected module constraint failure, got {other:?}"),
+            }
+        },
+    )
 }
 
 #[test]
 fn test_argument_type_mismatch_int_for_string() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules
-            .insert("test_module".to_string(), create_test_module());
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules
+                    .insert("test_module".to_string(), create_test_module());
+                r
+            };
 
-    let call = ModuleCall::test(
-        "test_module".to_string(),
-        Some("my_instance".to_string()),
-        {
-            let mut args = HashMap::new();
-            // vpc_id expects string, pass int
-            args.insert(
-                "vpc_id".to_string(),
-                Value::Concrete(ConcreteValue::Int(42)),
+            let call = ModuleCall::test(
+                "test_module".to_string(),
+                Some("my_instance".to_string()),
+                {
+                    let mut args = HashMap::new();
+                    // vpc_id expects string, pass int
+                    args.insert(
+                        "vpc_id".to_string(),
+                        Value::Concrete(ConcreteValue::Int(42)),
+                    );
+                    module_arguments(args)
+                },
             );
-            module_arguments(args)
-        },
-    );
 
-    let result = resolver.expand_module_call(&call, "my_instance");
-    assert!(
-        matches!(
-            result.as_ref().map_err(|error| error.root_cause()),
-            Err(ModuleError::InvalidArgumentType { .. })
-        ),
-        "Expected InvalidArgumentType error, got {:?}",
-        result
-    );
+            let result = resolver.expand_module_call(&call, "my_instance");
+            assert!(
+                matches!(
+                    result.as_ref().map_err(|error| error.root_cause()),
+                    Err(ModuleError::InvalidArgumentType { .. })
+                ),
+                "Expected InvalidArgumentType error, got {:?}",
+                result
+            );
+        },
+    )
 }
 
 #[test]
 fn test_argument_type_mismatch_string_for_bool() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules
-            .insert("test_module".to_string(), create_test_module());
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules
+                    .insert("test_module".to_string(), create_test_module());
+                r
+            };
 
-    let call = ModuleCall::test(
-        "test_module".to_string(),
-        Some("my_instance".to_string()),
-        {
-            let mut args = HashMap::new();
-            args.insert(
-                "vpc_id".to_string(),
-                Value::Concrete(ConcreteValue::String("vpc-123".into())),
+            let call = ModuleCall::test(
+                "test_module".to_string(),
+                Some("my_instance".to_string()),
+                {
+                    let mut args = HashMap::new();
+                    args.insert(
+                        "vpc_id".to_string(),
+                        Value::Concrete(ConcreteValue::String("vpc-123".into())),
+                    );
+                    // enable_flag expects bool, pass string
+                    args.insert(
+                        "enable_flag".to_string(),
+                        Value::Concrete(ConcreteValue::String("not-a-bool".into())),
+                    );
+                    module_arguments(args)
+                },
             );
-            // enable_flag expects bool, pass string
-            args.insert(
-                "enable_flag".to_string(),
-                Value::Concrete(ConcreteValue::String("not-a-bool".into())),
+
+            let result = resolver.expand_module_call(&call, "my_instance");
+            assert!(
+                matches!(
+                    result.as_ref().map_err(|error| error.root_cause()),
+                    Err(ModuleError::InvalidArgumentType { .. })
+                ),
+                "Expected InvalidArgumentType error, got {:?}",
+                result
             );
-            module_arguments(args)
         },
-    );
-
-    let result = resolver.expand_module_call(&call, "my_instance");
-    assert!(
-        matches!(
-            result.as_ref().map_err(|error| error.root_cause()),
-            Err(ModuleError::InvalidArgumentType { .. })
-        ),
-        "Expected InvalidArgumentType error, got {:?}",
-        result
-    );
+    )
 }
 
 #[test]
 fn test_argument_type_custom_validator() {
     // Create a loaded ProviderContext with a custom "arn" validator
     let identity = TypeIdentity::bare("Arn");
-    let owned = crate::parser::OwnedTypeIdentity::provider("test", identity.clone());
+    let owned = crate::parser::OwnedTypeIdentity::provider(
+        "test",
+        identity.clone(),
+        crate::schema::RefinedScalarKind::String,
+    );
     let validator_identity = identity.clone();
     let config = LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
@@ -6096,51 +6387,57 @@ fn test_argument_type_custom_validator() {
     }];
 
     let schemas = crate::schema::SchemaRegistry::new();
-    let resolver = {
-        let mut r = ModuleResolver::with_config_and_schemas(".", &config, &schemas);
-        r.imported_modules.insert("test_module".to_string(), module);
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(&config, |session| {
+        let resolver = {
+            let mut r = ModuleResolver::with_config_and_schemas(".", session, &schemas);
+            r.imported_modules.insert("test_module".to_string(), module);
+            r
+        };
 
-    // Valid ARN passes
-    let call = ModuleCall::test("test_module".to_string(), Some("a".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "policy_arn".to_string(),
-            Value::Concrete(ConcreteValue::String(
-                "arn:aws:iam::123456789012:policy/MyPolicy"
-                    .to_string()
-                    .into(),
-            )),
-        );
-        module_arguments(args)
-    });
-    assert!(resolver.expand_module_call(&call, "a").is_ok());
+        // Valid ARN passes
+        let call = ModuleCall::test("test_module".to_string(), Some("a".to_string()), {
+            let mut args = HashMap::new();
+            args.insert(
+                "policy_arn".to_string(),
+                Value::Concrete(ConcreteValue::String(
+                    "arn:aws:iam::123456789012:policy/MyPolicy"
+                        .to_string()
+                        .into(),
+                )),
+            );
+            module_arguments(args)
+        });
+        assert!(resolver.expand_module_call(&call, "a").is_ok());
 
-    // Invalid ARN fails
-    let call_bad = ModuleCall::test("test_module".to_string(), Some("b".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "policy_arn".to_string(),
-            Value::Concrete(ConcreteValue::String("not-an-arn".into())),
+        // Invalid ARN fails
+        let call_bad = ModuleCall::test("test_module".to_string(), Some("b".to_string()), {
+            let mut args = HashMap::new();
+            args.insert(
+                "policy_arn".to_string(),
+                Value::Concrete(ConcreteValue::String("not-an-arn".into())),
+            );
+            module_arguments(args)
+        });
+        let result = resolver.expand_module_call(&call_bad, "b");
+        assert!(
+            matches!(
+                result.as_ref().map_err(|error| error.root_cause()),
+                Err(ModuleError::InvalidArgumentType { .. })
+            ),
+            "Expected InvalidArgumentType error for invalid ARN, got {:?}",
+            result
         );
-        module_arguments(args)
-    });
-    let result = resolver.expand_module_call(&call_bad, "b");
-    assert!(
-        matches!(
-            result.as_ref().map_err(|error| error.root_cause()),
-            Err(ModuleError::InvalidArgumentType { .. })
-        ),
-        "Expected InvalidArgumentType error for invalid ARN, got {:?}",
-        result
-    );
+    })
 }
 
 #[test]
 fn test_argument_type_list_of_custom_type() {
     let identity = TypeIdentity::bare("Arn");
-    let owned = crate::parser::OwnedTypeIdentity::provider("test", identity.clone());
+    let owned = crate::parser::OwnedTypeIdentity::provider(
+        "test",
+        identity.clone(),
+        crate::schema::RefinedScalarKind::String,
+    );
     let validator_identity = identity.clone();
     let config = LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
@@ -6183,47 +6480,49 @@ fn test_argument_type_list_of_custom_type() {
     }];
 
     let schemas = crate::schema::SchemaRegistry::new();
-    let resolver = {
-        let mut r = ModuleResolver::with_config_and_schemas(".", &config, &schemas);
-        r.imported_modules.insert("test_module".to_string(), module);
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(&config, |session| {
+        let resolver = {
+            let mut r = ModuleResolver::with_config_and_schemas(".", session, &schemas);
+            r.imported_modules.insert("test_module".to_string(), module);
+            r
+        };
 
-    // Valid list of ARNs
-    let call = ModuleCall::test("test_module".to_string(), Some("a".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "policy_arns".to_string(),
-            Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("arn:aws:iam::123:policy/A".into())),
-                Value::Concrete(ConcreteValue::String("arn:aws:iam::123:policy/B".into())),
-            ])),
-        );
-        module_arguments(args)
-    });
-    assert!(resolver.expand_module_call(&call, "a").is_ok());
+        // Valid list of ARNs
+        let call = ModuleCall::test("test_module".to_string(), Some("a".to_string()), {
+            let mut args = HashMap::new();
+            args.insert(
+                "policy_arns".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![
+                    Value::Concrete(ConcreteValue::String("arn:aws:iam::123:policy/A".into())),
+                    Value::Concrete(ConcreteValue::String("arn:aws:iam::123:policy/B".into())),
+                ])),
+            );
+            module_arguments(args)
+        });
+        assert!(resolver.expand_module_call(&call, "a").is_ok());
 
-    // List with invalid ARN fails
-    let call_bad = ModuleCall::test("test_module".to_string(), Some("b".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "policy_arns".to_string(),
-            Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("arn:aws:iam::123:policy/A".into())),
-                Value::Concrete(ConcreteValue::String("not-an-arn".into())),
-            ])),
+        // List with invalid ARN fails
+        let call_bad = ModuleCall::test("test_module".to_string(), Some("b".to_string()), {
+            let mut args = HashMap::new();
+            args.insert(
+                "policy_arns".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![
+                    Value::Concrete(ConcreteValue::String("arn:aws:iam::123:policy/A".into())),
+                    Value::Concrete(ConcreteValue::String("not-an-arn".into())),
+                ])),
+            );
+            module_arguments(args)
+        });
+        let result = resolver.expand_module_call(&call_bad, "b");
+        assert!(
+            matches!(
+                result.as_ref().map_err(|error| error.root_cause()),
+                Err(ModuleError::InvalidArgumentType { .. })
+            ),
+            "Expected InvalidArgumentType for list with invalid ARN, got {:?}",
+            result
         );
-        module_arguments(args)
-    });
-    let result = resolver.expand_module_call(&call_bad, "b");
-    assert!(
-        matches!(
-            result.as_ref().map_err(|error| error.root_cause()),
-            Err(ModuleError::InvalidArgumentType { .. })
-        ),
-        "Expected InvalidArgumentType for list with invalid ARN, got {:?}",
-        result
-    );
+    })
 }
 
 #[test]
@@ -6604,13 +6903,15 @@ let child = selector { vpc = source }
         .resource_types
         .insert(("mock".to_string(), "test.Thing".to_string()));
     let parsed = crate::parser::parse(root_body, &context).unwrap();
-    let parsed = resolve_modules_with_config(
-        parsed,
-        &root_dir,
-        &context,
-        &crate::schema::SchemaRegistry::new(),
-    )
-    .expect("a Ref-typed function parameter must substitute a module handle");
+    let parsed = crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        resolve_modules_with_config(
+            parsed,
+            &root_dir,
+            session.catalog(),
+            &crate::schema::SchemaRegistry::new(),
+        )
+        .expect("a Ref-typed function parameter must substitute a module handle")
+    });
 
     let selected = parsed
         .resources
@@ -6660,13 +6961,15 @@ let child = imported { peer = source }
         .resource_types
         .insert(("mock".to_string(), "test.Thing".to_string()));
     let parsed = crate::parser::parse(root_body, &context).unwrap();
-    let parsed = resolve_modules_with_config(
-        parsed,
-        &root_dir,
-        &context,
-        &crate::schema::SchemaRegistry::new(),
-    )
-    .expect("a module handle in depends_on must expand to the caller binding");
+    let parsed = crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        resolve_modules_with_config(
+            parsed,
+            &root_dir,
+            session.catalog(),
+            &crate::schema::SchemaRegistry::new(),
+        )
+        .expect("a module handle in depends_on must expand to the caller binding")
+    });
 
     let consumer = parsed
         .resources
@@ -6677,8 +6980,9 @@ let child = imported { peer = source }
         .expect("expanded consumer");
     assert_eq!(
         consumer
-            .directives
+            .dependencies
             .depends_on
+            .binding_references()
             .iter()
             .map(|binding| binding.as_str())
             .collect::<Vec<_>>(),
@@ -6729,24 +7033,28 @@ let child = imported {
         .resource_types
         .insert(("mock".to_string(), "test.Thing".to_string()));
     let parsed = crate::parser::parse(root_body, &context).unwrap();
-    let error = resolve_modules_with_config(
-        parsed,
-        &root_dir,
-        &context,
-        &crate::schema::SchemaRegistry::new(),
-    )
-    .expect_err("a value cannot satisfy a module dependency handle");
+    let error = crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        resolve_modules_with_config(
+            parsed,
+            &root_dir,
+            session.catalog(),
+            &crate::schema::SchemaRegistry::new(),
+        )
+        .expect_err("a value cannot satisfy a module dependency handle")
+    });
 
     let message = error.to_string();
     assert!(message.contains("at line 5"), "unexpected error: {message}");
     assert!(
-        message.contains("depends_on parameter 'peer' received a value"),
+        message.contains(
+            "module argument 'peer': expected resource handle mock.test.Thing; got resource attribute value"
+        ),
         "unexpected error: {message}",
     );
 }
 
 #[test]
-fn module_value_argument_binding_collision_is_not_treated_as_a_handle() {
+fn module_value_argument_binding_collision_is_not_promoted_to_a_handle() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let module_dir = tmp.path().join("modules/consumer");
     fs::create_dir_all(&module_dir).unwrap();
@@ -6773,28 +7081,21 @@ let child = imported { peer = peer.identifier }
         .resource_types
         .insert(("mock".to_string(), "test.Thing".to_string()));
     let parsed = crate::parser::parse(root_body, &context).unwrap();
-    let parsed = resolve_modules_with_config(
+    let error = resolve_modules_with_config(
         parsed,
         &root_dir,
         &context,
         &crate::schema::SchemaRegistry::new(),
     )
-    .expect("the typed Value variant must survive a binding-name collision");
-
-    let consumer = parsed
-        .resources
-        .iter()
-        .find(|resource| {
-            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("child.consumer")
-        })
-        .expect("expanded consumer");
-    assert_eq!(
-        consumer.get_attr("parent"),
-        Some(&expanded_resource_ref(
-            "peer",
-            "identifier",
-            vec!["name".to_string()],
-        )),
+    .expect_err("an attribute value cannot satisfy a handle parameter");
+    let message = error.to_string();
+    assert!(
+        message.contains("peer") && message.contains("mock.test.Thing"),
+        "{message}"
+    );
+    assert!(
+        message.contains("resource reference") || message.contains("resource attribute value"),
+        "the argument must remain a value: {message}"
     );
 }
 
@@ -7479,8 +7780,10 @@ let instance = child { count = source.count + 1 }
     );
 
     let parsed = crate::parser::parse(root_source, &config).expect("root parse");
-    let parsed = resolve_modules_with_config(parsed, &root_dir, &config, &schemas)
-        .expect("typed arithmetic module argument must expand");
+    let parsed = crate::validation::deferred_types::with_session_for_test(&config, |session| {
+        resolve_modules_with_config(parsed, &root_dir, session.catalog(), &schemas)
+            .expect("typed arithmetic module argument must expand")
+    });
     let count = parsed
         .resources
         .iter()
@@ -7610,17 +7913,20 @@ outer {
         .insert(("mock".to_string(), "test.resource".to_string()));
     let content = fs::read_to_string(tmp.path().join("main.crn")).expect("root source");
     let parsed = crate::parser::parse(&content, &config).expect("root configuration must parse");
-    resolve_modules_with_config(
-        parsed,
-        tmp.path(),
-        &config,
-        &crate::schema::SchemaRegistry::new(),
-    )?;
+    crate::validation::deferred_types::with_session_for_test(&config, |session| {
+        resolve_modules_with_config(
+            parsed,
+            tmp.path(),
+            session.catalog(),
+            &crate::schema::SchemaRegistry::new(),
+        )
+        .map_err(Box::new)
+    })
+    .map_err(|error| *error)?;
     Ok(())
 }
 
-/// A declared resource reference is a typed handle for boundary checking even
-/// though its runtime transport remains the resource id string (#3803).
+/// A declared resource reference is a typed handle for boundary checking.
 #[test]
 fn ref_argument_forwarded_to_scalar_is_rejected_before_expansion() {
     let error = resolve_ref_forwarding_fixture("Int")
@@ -7635,11 +7941,13 @@ fn ref_argument_forwarded_to_scalar_is_rejected_before_expansion() {
 }
 
 #[test]
-fn ref_argument_forwarded_to_string_is_rejected_as_a_bare_handle() {
+fn ref_argument_forwarded_to_string_is_rejected_by_the_typed_boundary() {
     let error = resolve_ref_forwarding_fixture("String")
         .expect_err("a bare handle cannot cross into a String parameter");
     assert!(
-        error.to_string().contains("'a' is a resource, not a value"),
+        error
+            .to_string()
+            .contains("cannot assign mock.test.resource to 'x': expected String"),
         "{error}",
     );
 }
@@ -7677,13 +7985,15 @@ let instance = child { source = source }
         .resource_types
         .insert(("mock".to_string(), "test.resource".to_string()));
     let parsed = crate::parser::parse(root_source, &config).expect("root parse");
-    let parsed = resolve_modules_with_config(
-        parsed,
-        tmp.path(),
-        &config,
-        &crate::schema::SchemaRegistry::new(),
-    )
-    .expect("module expansion");
+    let parsed = crate::validation::deferred_types::with_session_for_test(&config, |session| {
+        resolve_modules_with_config(
+            parsed,
+            tmp.path(),
+            session.catalog(),
+            &crate::schema::SchemaRegistry::new(),
+        )
+        .expect("module expansion")
+    });
 
     let value = parsed
         .resources
@@ -7705,48 +8015,67 @@ let instance = child { source = source }
 
 #[test]
 fn ref_typed_module_argument_used_bare_is_rejected_in_module_context() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let module_dir = tmp.path().join("child");
-    fs::create_dir_all(&module_dir).expect("module directory");
-    fs::write(
-        module_dir.join("main.crn"),
-        r#"arguments {
-  source: mock.test.resource
-}
-let consumer = mock.test.consumer {
-  parent = source
-}
-"#,
-    )
-    .expect("module source");
-    let root_source = r#"let source = mock.test.resource { name = 'root' }
-let child = use { source = './child' }
-let instance = child { source = source }
-"#;
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let module_dir = tmp.path().join("child");
+            fs::create_dir_all(&module_dir).expect("module directory");
+            fs::write(
+                module_dir.join("main.crn"),
+                r#"arguments {
+          source: mock.test.resource
+        }
+        let consumer = mock.test.consumer {
+          parent = source
+        }
+        "#,
+            )
+            .expect("module source");
+            let root_source = r#"let source = mock.test.resource { name = 'root' }
+        let child = use { source = './child' }
+        let instance = child { source = source }
+        "#;
 
-    let mut config = ProviderContext::default();
-    config
-        .resource_types
-        .insert(("mock".to_string(), "test.resource".to_string()));
-    let parsed = crate::parser::parse(root_source, &config).expect("root parse");
-    let error = resolve_modules_with_config(
-        parsed,
-        tmp.path(),
-        &config,
-        &crate::schema::SchemaRegistry::new(),
-    )
-    .expect_err("bare module handle use must fail");
-    let message = error.to_string();
-    assert!(
-        message.contains("'source' is a resource handle, not a value")
-            && message.contains("line 5"),
-        "unexpected error: {message}",
+            let mut config = ProviderContext::default();
+            config
+                .resource_types
+                .insert(("mock".to_string(), "test.resource".to_string()));
+            let parsed = crate::parser::parse(root_source, &config).expect("root parse");
+            let parsed = resolve_modules_with_config(
+                parsed,
+                tmp.path(),
+                &config,
+                &crate::schema::SchemaRegistry::new(),
+            )
+            .expect("module expansion retains the typed pending use for validation");
+            let schemas = crate::schema::SchemaRegistry::new();
+            let signatures = crate::module_resolver::ResolvedModuleSignatures::new();
+            let context = crate::validation::ValidationTypeContext::in_session(
+                &parsed,
+                &schemas,
+                session,
+                &signatures,
+            );
+            let report = crate::validation::check_expanded_bare_binding_uses(&parsed, &context);
+            let finding = report
+                .findings()
+                .iter()
+                .find(|finding| {
+                    finding.use_site.name == "source"
+                        && matches!(finding.use_site.owner, BindingUseOwner::Resource(_))
+                })
+                .expect("bare handle use remains owned by the validation seam");
+            let message = finding.error.to_string();
+            assert!(
+                message.contains("'source' is a resource handle, not a value")
+                    && finding.use_site.span.start_line() == 5,
+                "unexpected finding: {finding:?}",
+            );
+        },
     );
 }
 
-/// Three-deep pass-through: outer → middle → inner all forwarding the
-/// same `list(String)` arg. Each enclosing scope contributes its own
-/// arg signature; the chain must hold across both module-call hops.
 #[test]
 fn test_list_passthrough_three_levels_deep() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -7877,63 +8206,73 @@ fn create_module_with_environment_union() -> ParsedFile {
 
 #[test]
 fn caller_side_typo_against_string_literal_union_is_rejected() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert(
-            "env_module".to_string(),
-            create_module_with_environment_union(),
-        );
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert(
+                    "env_module".to_string(),
+                    create_module_with_environment_union(),
+                );
+                r
+            };
 
-    let call = ModuleCall::test("env_module".to_string(), Some("my_env".to_string()), {
-        let mut args = HashMap::new();
-        // Typo: 'dpv' is outside the declared 'dev' | 'prod' union.
-        args.insert(
-            "environment".to_string(),
-            Value::Concrete(ConcreteValue::String("dpv".into())),
-        );
-        module_arguments(args)
-    });
+            let call = ModuleCall::test("env_module".to_string(), Some("my_env".to_string()), {
+                let mut args = HashMap::new();
+                // Typo: 'dpv' is outside the declared 'dev' | 'prod' union.
+                args.insert(
+                    "environment".to_string(),
+                    Value::Concrete(ConcreteValue::String("dpv".into())),
+                );
+                module_arguments(args)
+            });
 
-    let result = resolver.expand_module_call(&call, "my_env");
-    assert!(
-        matches!(
-            result.as_ref().map_err(|error| error.root_cause()),
-            Err(ModuleError::InvalidArgumentType { .. })
-        ),
-        "Caller passing 'dpv' to `'dev' | 'prod'` must be rejected — \
+            let result = resolver.expand_module_call(&call, "my_env");
+            assert!(
+                matches!(
+                    result.as_ref().map_err(|error| error.root_cause()),
+                    Err(ModuleError::InvalidArgumentType { .. })
+                ),
+                "Caller passing 'dpv' to `'dev' | 'prod'` must be rejected — \
          carina-rs/carina#2611. Got: {:?}",
-        result
-    );
+                result
+            );
+        },
+    )
 }
 
 #[test]
 fn caller_side_value_in_string_literal_union_is_accepted() {
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert(
-            "env_module".to_string(),
-            create_module_with_environment_union(),
-        );
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert(
+                    "env_module".to_string(),
+                    create_module_with_environment_union(),
+                );
+                r
+            };
 
-    let call = ModuleCall::test("env_module".to_string(), Some("my_env".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "environment".to_string(),
-            Value::Concrete(ConcreteValue::String("prod".into())),
-        );
-        module_arguments(args)
-    });
+            let call = ModuleCall::test("env_module".to_string(), Some("my_env".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "environment".to_string(),
+                    Value::Concrete(ConcreteValue::String("prod".into())),
+                );
+                module_arguments(args)
+            });
 
-    let result = resolver.expand_module_call(&call, "my_env");
-    assert!(
-        result.is_ok(),
-        "Caller passing 'prod' (in the declared union) must be accepted. Got: {:?}",
-        result
-    );
+            let result = resolver.expand_module_call(&call, "my_env");
+            assert!(
+                result.is_ok(),
+                "Caller passing 'prod' (in the declared union) must be accepted. Got: {:?}",
+                result
+            );
+        },
+    )
 }
 
 #[test]
@@ -7947,45 +8286,50 @@ arguments {
         &ProviderContext::default(),
     )
     .expect("module argument type should parse");
-    let mut resolver = ModuleResolver::new(".");
-    resolver
-        .imported_modules
-        .insert("env_module".to_string(), module);
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let mut resolver = ModuleResolver::new(".", session);
+            resolver
+                .imported_modules
+                .insert("env_module".to_string(), module);
 
-    let parse_value = |literal: &str| {
-        let source = format!("let value = {literal}\n");
-        crate::parser::parse(&source, &ProviderContext::default())
-            .expect("argument value should parse")
-            .variables
-            .get("value")
-            .expect("value binding should exist")
-            .clone()
-    };
-    let call = |value| {
-        ModuleCall::test(
-            "env_module".to_string(),
-            Some("instance".to_string()),
-            module_arguments([("environment".to_string(), value)]),
-        )
-    };
+            let parse_value = |literal: &str| {
+                let source = format!("let value = {literal}\n");
+                crate::parser::parse(&source, &ProviderContext::default())
+                    .expect("argument value should parse")
+                    .variables
+                    .get("value")
+                    .expect("value binding should exist")
+                    .clone()
+            };
+            let call = |value| {
+                ModuleCall::test(
+                    "env_module".to_string(),
+                    Some("instance".to_string()),
+                    module_arguments([("environment".to_string(), value)]),
+                )
+            };
 
-    for literal in [r"'it\'s'", r#""it's""#] {
-        let result = resolver.expand_module_call(&call(parse_value(literal)), "instance");
-        assert!(
-            result.is_ok(),
-            "{literal} should satisfy the decoded type: {result:?}"
-        );
-    }
+            for literal in [r"'it\'s'", r#""it's""#] {
+                let result = resolver.expand_module_call(&call(parse_value(literal)), "instance");
+                assert!(
+                    result.is_ok(),
+                    "{literal} should satisfy the decoded type: {result:?}"
+                );
+            }
 
-    let error = resolver
-        .expand_module_call(&call(parse_value("'x'")), "instance")
-        .expect_err("a value outside the literal union must be rejected");
-    assert!(
-        error
-            .to_string()
-            .contains(r#"expected "it's" | 'b', got string 'x'"#),
-        "the decoded apostrophe must use the shared renderer: {error}"
-    );
+            let error = resolver
+                .expand_module_call(&call(parse_value("'x'")), "instance")
+                .expect_err("a value outside the literal union must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains(r#"expected "it's" | 'b', got string 'x'"#),
+                "the decoded apostrophe must use the shared renderer: {error}"
+            );
+        },
+    )
 }
 
 /// Acceptance test for #2815 / #2817. An `arguments {}` block declared in
@@ -8133,7 +8477,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("cert".into()),
-            dependency_bindings: BTreeSet::new(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -8170,7 +8514,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
                     resolved_ignore_changes: Default::default(),
                     prefixes: HashMap::new(),
                     binding: None,
-                    dependency_bindings: BTreeSet::new(),
+                    dependencies: Default::default(),
                     module_source: None,
                     default_tag_keys: Default::default(),
                     loop_provenance: Default::default(),
@@ -8180,92 +8524,97 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
         m
     };
 
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert("registry".to_string(), module);
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert("registry".to_string(), module);
+                r
+            };
 
-    let call = ModuleCall::test("registry".to_string(), Some("r".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "cidr".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-        );
-        module_arguments(args)
-    });
+            let call = ModuleCall::test("registry".to_string(), Some("r".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "cidr".to_string(),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+                );
+                module_arguments(args)
+            });
 
-    let expanded = resolver.expand_module_call(&call, "r").unwrap();
+            let expanded = resolver.expand_module_call(&call, "r").unwrap();
 
-    // The structural invariant: the module-internal deferred-for
-    // reached the caller instead of vanishing at the expansion
-    // boundary.
-    assert_eq!(
-        expanded.parsed_deferred_for_expressions().len(),
-        1,
-        "module-internal deferred-for must survive expand_module_call (carina#3126)"
-    );
-    let d = &expanded.parsed_deferred_for_expressions()[0];
-    assert!(
-        d.root_bindings()
-            .iter()
-            .any(|binding| binding.as_str() == "r.cert")
-    );
-    // carina#3126 PR-B: binding-name fields are instance-prefixed so
-    // the loop-generated resources are isolated per module instance
-    // and the iterable resolves against the (now prefixed) module
-    // resource. Call instance is "r".
-    //
-    // `binding_name` is the generated-resource address prefix →
-    // prefixed unconditionally (mirrors `Resource.binding`).
-    assert_eq!(
-        d.target().bound_binding(),
-        Some("r._domain_validation_options"),
-        "PR-B must instance-prefix binding_name"
-    );
-    // `cert` is a module-internal `let cert` binding, so the typed module
-    // scope resolves it to `r.cert`. A module argument would instead be
-    // substituted with its caller-expanded absolute value.
-    assert_eq!(
-        d.root_bindings()
-            .iter()
-            .map(ToString::to_string)
-            .collect::<BTreeSet<_>>(),
-        std::collections::BTreeSet::from(["r.cert".to_string()]),
-        "PR-B must instance-prefix the intra-module iterable root"
-    );
-
-    // The part of the template treatment that SURVIVES materialization
-    // (`substitute_attrs` does not re-run ref-rewrite): the loop body's
-    // intra-module ref must be prefixed, and module_source stamped, so
-    // the generated RecordSet wires to the prefixed module certificate.
-    // Round-3 review found this load-bearing path had zero coverage.
-    let DeferredForBody::Resource(template_resource) = d.body() else {
-        panic!("deferred test body must remain a resource")
-    };
-    let validated_cert = template_resource
-        .attributes()
-        .get("validated_cert")
-        .expect("template attr preserved");
-    match validated_cert {
-        ExpandedValue::Deferred(ExpandedDeferredValue::ResourceRef { path }) => {
+            // The structural invariant: the module-internal deferred-for
+            // reached the caller instead of vanishing at the expansion
+            // boundary.
             assert_eq!(
-                path.binding(),
-                "r.cert",
-                "loop body's intra-module ref must be instance-prefixed"
+                expanded.parsed_deferred_for_expressions().len(),
+                1,
+                "module-internal deferred-for must survive expand_module_call (carina#3126)"
             );
-            assert_eq!(path.attribute(), "arn");
-        }
-        other => panic!("expected prefixed ResourceRef, got {other:?}"),
-    }
-    assert!(
-        matches!(
-            template_resource.module_source(),
-            Some(crate::resource::ModuleSource::Module(source)) if source.instance() == "r"
-        ),
-        "template_resource must carry the module instance source; got: {:?}",
-        template_resource.module_source()
-    );
+            let d = &expanded.parsed_deferred_for_expressions()[0];
+            assert!(
+                d.root_bindings()
+                    .iter()
+                    .any(|binding| binding.as_str() == "r.cert")
+            );
+            // carina#3126 PR-B: binding-name fields are instance-prefixed so
+            // the loop-generated resources are isolated per module instance
+            // and the iterable resolves against the (now prefixed) module
+            // resource. Call instance is "r".
+            //
+            // `binding_name` is the generated-resource address prefix →
+            // prefixed unconditionally (mirrors `Resource.binding`).
+            assert_eq!(
+                d.target().bound_binding(),
+                Some("r._domain_validation_options"),
+                "PR-B must instance-prefix binding_name"
+            );
+            // `cert` is a module-internal `let cert` binding, so the typed module
+            // scope resolves it to `r.cert`. A module argument would instead be
+            // substituted with its caller-expanded absolute value.
+            assert_eq!(
+                d.root_bindings()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<BTreeSet<_>>(),
+                std::collections::BTreeSet::from(["r.cert".to_string()]),
+                "PR-B must instance-prefix the intra-module iterable root"
+            );
+
+            // The part of the template treatment that SURVIVES materialization
+            // (`substitute_attrs` does not re-run ref-rewrite): the loop body's
+            // intra-module ref must be prefixed, and module_source stamped, so
+            // the generated RecordSet wires to the prefixed module certificate.
+            // Round-3 review found this load-bearing path had zero coverage.
+            let DeferredForBody::Resource(template_resource) = d.body() else {
+                panic!("deferred test body must remain a resource")
+            };
+            let validated_cert = template_resource
+                .attributes()
+                .get("validated_cert")
+                .expect("template attr preserved");
+            match validated_cert {
+                ExpandedValue::Deferred(ExpandedDeferredValue::ResourceRef { path }) => {
+                    assert_eq!(
+                        path.binding(),
+                        "r.cert",
+                        "loop body's intra-module ref must be instance-prefixed"
+                    );
+                    assert_eq!(path.attribute(), "arn");
+                }
+                other => panic!("expected prefixed ResourceRef, got {other:?}"),
+            }
+            assert!(
+                matches!(
+                    template_resource.module_source(),
+                    Some(crate::resource::ModuleSource::Module(source)) if source.instance() == "r"
+                ),
+                "template_resource must carry the module instance source; got: {:?}",
+                template_resource.module_source()
+            );
+        },
+    )
 }
 
 #[test]
@@ -8294,44 +8643,49 @@ fn module_deferred_template_instantiated_twice_has_distinct_materialized_ids() {
             Resource::pending_with_provider("awscc", "sso.Assignment", None),
         )));
 
-    let resolver = {
-        let mut resolver = ModuleResolver::new(".");
-        resolver
-            .imported_modules
-            .insert("assignments".to_string(), module);
-        resolver
-    };
-    let call = ModuleCall::test("assignments".to_string(), None, {
-        let mut arguments = HashMap::new();
-        arguments.insert(
-            "accounts".to_string(),
-            Value::resource_ref("accounts", "items", Vec::new()),
-        );
-        module_arguments(arguments)
-    });
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut resolver = ModuleResolver::new(".", session);
+                resolver
+                    .imported_modules
+                    .insert("assignments".to_string(), module);
+                resolver
+            };
+            let call = ModuleCall::test("assignments".to_string(), None, {
+                let mut arguments = HashMap::new();
+                arguments.insert(
+                    "accounts".to_string(),
+                    Value::resource_ref("accounts", "items", Vec::new()),
+                );
+                module_arguments(arguments)
+            });
 
-    let first_expanded = resolver.expand_module_call(&call, "first").unwrap();
-    let first = first_expanded
-        .into_parsed_deferred_for_expressions()
-        .into_iter()
-        .next()
-        .unwrap();
-    let DeferredForBody::Resource(first) = first.into_body() else {
-        panic!("deferred test body must remain a resource")
-    };
-    let second_expanded = resolver.expand_module_call(&call, "second").unwrap();
-    let second = second_expanded
-        .into_parsed_deferred_for_expressions()
-        .into_iter()
-        .next()
-        .unwrap();
-    let DeferredForBody::Resource(second) = second.into_body() else {
-        panic!("deferred test body must remain a resource")
-    };
+            let first_expanded = resolver.expand_module_call(&call, "first").unwrap();
+            let first = first_expanded
+                .into_parsed_deferred_for_expressions()
+                .into_iter()
+                .next()
+                .unwrap();
+            let DeferredForBody::Resource(first) = first.into_body() else {
+                panic!("deferred test body must remain a resource")
+            };
+            let second_expanded = resolver.expand_module_call(&call, "second").unwrap();
+            let second = second_expanded
+                .into_parsed_deferred_for_expressions()
+                .into_iter()
+                .next()
+                .unwrap();
+            let DeferredForBody::Resource(second) = second.into_body() else {
+                panic!("deferred test body must remain a resource")
+            };
 
-    assert_eq!(first.id().identity_str(), Some("first.assignments[?]"));
-    assert_eq!(second.id().identity_str(), Some("second.assignments[?]"));
-    assert_ne!(first.id(), second.id());
+            assert_eq!(first.id().identity_str(), Some("first.assignments[?]"));
+            assert_eq!(second.id().identity_str(), Some("second.assignments[?]"));
+            assert_ne!(first.id(), second.id());
+        },
+    )
 }
 
 /// carina#3126 PR-B negative case: a deferred iterable supplied through
@@ -8368,7 +8722,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
                     resolved_ignore_changes: Default::default(),
                     prefixes: HashMap::new(),
                     binding: None,
-                    dependency_bindings: BTreeSet::new(),
+                    dependencies: Default::default(),
                     module_source: None,
                     default_tag_keys: Default::default(),
                     loop_provenance: Default::default(),
@@ -8378,40 +8732,45 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
         m
     };
 
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert("net".to_string(), module);
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert("net".to_string(), module);
+                r
+            };
 
-    let call = ModuleCall::test("net".to_string(), Some("prod".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "cidr".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-        );
-        args.insert(
-            "accounts".to_string(),
-            Value::resource_ref("accounts", "list", Vec::new()),
-        );
-        module_arguments(args)
-    });
+            let call = ModuleCall::test("net".to_string(), Some("prod".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "cidr".to_string(),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+                );
+                args.insert(
+                    "accounts".to_string(),
+                    Value::resource_ref("accounts", "list", Vec::new()),
+                );
+                module_arguments(args)
+            });
 
-    let expanded = resolver.expand_module_call(&call, "prod").unwrap();
-    let d = &expanded.parsed_deferred_for_expressions()[0];
-    // `binding_name` is a synthesized address prefix → always prefixed.
-    assert_eq!(d.target().bound_binding(), Some("prod._list"));
-    // `accounts` is NOT module-internal → must stay UNPREFIXED
-    // (caller-collision guard). A regression to unconditional
-    // prefixing would make this `prod.accounts` and fail here.
-    assert_eq!(
-        d.root_bindings()
-            .iter()
-            .map(ToString::to_string)
-            .collect::<BTreeSet<_>>(),
-        std::collections::BTreeSet::from(["accounts".to_string()]),
-        "a caller-supplied iterable binding must not be prefixed"
-    );
+            let expanded = resolver.expand_module_call(&call, "prod").unwrap();
+            let d = &expanded.parsed_deferred_for_expressions()[0];
+            // `binding_name` is a synthesized address prefix → always prefixed.
+            assert_eq!(d.target().bound_binding(), Some("prod._list"));
+            // `accounts` is NOT module-internal → must stay UNPREFIXED
+            // (caller-collision guard). A regression to unconditional
+            // prefixing would make this `prod.accounts` and fail here.
+            assert_eq!(
+                d.root_bindings()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<BTreeSet<_>>(),
+                std::collections::BTreeSet::from(["accounts".to_string()]),
+                "a caller-supplied iterable binding must not be prefixed"
+            );
+        },
+    )
 }
 
 /// carina#3126 / PR-A end-to-end: `wait_bindings` AND
@@ -8595,13 +8954,18 @@ let resources = for item in itmes {
             if matches!(error.as_ref(), crate::parser::ParseError::UndefinedDeferredIterable { name, .. } if name == "itmes")
     ));
 
-    let error = super::resolve_modules_with_providerless_config(
-        loaded.parsed,
-        fixture.path(),
+    let error = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
-        &crate::schema::SchemaRegistry::new(),
-    )
-    .expect_err("finalization must reject an undefined managed-resource iterable");
+        |session| {
+            super::resolve_modules_with_providerless_config(
+                loaded.parsed,
+                fixture.path(),
+                session,
+                &crate::schema::SchemaRegistry::new(),
+            )
+            .expect_err("finalization must reject an undefined managed-resource iterable")
+        },
+    );
     let ModuleError::ParseInFile { path, error } = error.root_cause() else {
         panic!("expected a file-owned parse error, got {error:?}");
     };
@@ -8632,11 +8996,17 @@ let second = for item in secnd_items {
     )
     .expect("both undefined iterables remain deferred until finalization");
 
-    let error = super::resolve_modules_providerless(
-        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
-    )
-    .expect_err("finalization must reject both undefined iterables");
+    let error = crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            super::resolve_modules_providerless(
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                std::path::Path::new("."),
+                session,
+            )
+            .expect_err("finalization must reject both undefined iterables")
+        },
+    );
     let message = error.display_relative_to(std::path::Path::new("."));
 
     assert!(
@@ -8707,13 +9077,15 @@ let registry_publish = registry {
 
     let config = ProviderContext::default();
     let parsed = crate::parser::parse(root_body, &config).expect("root must parse");
-    let parsed = resolve_modules_with_config(
-        parsed,
-        &root_dir,
-        &config,
-        &crate::schema::SchemaRegistry::new(),
-    )
-    .expect("production module resolution must succeed");
+    let parsed = crate::validation::deferred_types::with_session_for_test(&config, |session| {
+        resolve_modules_with_config(
+            parsed,
+            &root_dir,
+            session.catalog(),
+            &crate::schema::SchemaRegistry::new(),
+        )
+        .expect("production module resolution must succeed")
+    });
 
     let consumer = parsed
         .resources
@@ -8725,19 +9097,21 @@ let registry_publish = registry {
         .expect("expanded module consumer must exist");
     assert!(
         consumer
-            .dependency_bindings
+            .dependencies
+            .value_bindings
             .iter()
             .any(|binding| binding.as_str() == "registry_publish.target"),
         "module resource dependency must be populated and prefixed: {:?}",
-        consumer.dependency_bindings,
+        consumer.dependencies.value_bindings,
     );
     assert!(
         consumer
-            .dependency_bindings
+            .dependencies
+            .value_bindings
             .iter()
             .all(|binding| binding.as_str() != "registry_publish.label"),
         "module arguments must not be mistaken for intra-module resources: {:?}",
-        consumer.dependency_bindings,
+        consumer.dependencies.value_bindings,
     );
     assert_eq!(
         consumer.attributes.get("description"),
@@ -8757,7 +9131,8 @@ let registry_publish = registry {
         .expect("expanded module data source must exist");
     assert_eq!(
         roles
-            .dependency_bindings
+            .dependencies
+            .value_bindings
             .iter()
             .map(ToString::to_string)
             .collect::<BTreeSet<_>>(),
@@ -8865,13 +9240,15 @@ let outer = outer_module {}
 
     let config = ProviderContext::default();
     let parsed = crate::parser::parse(root_body, &config).expect("root must parse");
-    let parsed = resolve_modules_with_config(
-        parsed,
-        &root_dir,
-        &config,
-        &crate::schema::SchemaRegistry::new(),
-    )
-    .expect("nested production module resolution must succeed");
+    let parsed = crate::validation::deferred_types::with_session_for_test(&config, |session| {
+        resolve_modules_with_config(
+            parsed,
+            &root_dir,
+            session.catalog(),
+            &crate::schema::SchemaRegistry::new(),
+        )
+        .expect("nested production module resolution must succeed")
+    });
 
     let target = parsed
         .resources
@@ -8895,7 +9272,8 @@ let outer = outer_module {}
         .expect("twice-expanded consumer must exist");
     assert_eq!(
         consumer
-            .dependency_bindings
+            .dependencies
+            .value_bindings
             .iter()
             .map(ToString::to_string)
             .collect::<BTreeSet<_>>(),
@@ -8912,7 +9290,8 @@ let outer = outer_module {}
         .expect("twice-expanded data source must exist");
     assert_eq!(
         roles
-            .dependency_bindings
+            .dependencies
+            .value_bindings
             .iter()
             .map(ToString::to_string)
             .collect::<BTreeSet<_>>(),
@@ -8936,7 +9315,7 @@ fn argument_type_list_accepts_resource_ref() {
     module.resources.clear();
     module.arguments = vec![ArgumentParameter {
         name: "role_arns".to_string(),
-        static_type: known(TypeExpr::List(Box::new(TypeExpr::Simple(
+        static_type: known(TypeExpr::List(Box::new(crate::parser::bare_type_for_test(
             "arn".to_string(),
         )))),
         default: None,
@@ -8944,27 +9323,32 @@ fn argument_type_list_accepts_resource_ref() {
         validations: Vec::new(),
     }];
 
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert("test_module".to_string(), module);
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert("test_module".to_string(), module);
+                r
+            };
 
-    let call = ModuleCall::test("test_module".to_string(), Some("a".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "role_arns".to_string(),
-            Value::resource_ref("admin_access_roles", "arns", Vec::new()),
-        );
-        module_arguments(args)
-    });
+            let call = ModuleCall::test("test_module".to_string(), Some("a".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "role_arns".to_string(),
+                    Value::resource_ref("admin_access_roles", "arns", Vec::new()),
+                );
+                module_arguments(args)
+            });
 
-    let result = resolver.expand_module_call(&call, "a");
-    assert!(
-        result.is_ok(),
-        "list(T) argument should accept ResourceRef (carina#3238); got {:?}",
-        result
-    );
+            let result = resolver.expand_module_call(&call, "a");
+            assert!(
+                result.is_ok(),
+                "list(T) argument should accept ResourceRef (carina#3238); got {:?}",
+                result
+            );
+        },
+    )
 }
 
 /// carina#3238 sibling case: `map(T)` arguments must also accept a
@@ -8983,27 +9367,32 @@ fn argument_type_map_accepts_resource_ref() {
         validations: Vec::new(),
     }];
 
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert("test_module".to_string(), module);
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert("test_module".to_string(), module);
+                r
+            };
 
-    let call = ModuleCall::test("test_module".to_string(), Some("a".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "tags".to_string(),
-            Value::resource_ref("some_resource", "tags", Vec::new()),
-        );
-        module_arguments(args)
-    });
+            let call = ModuleCall::test("test_module".to_string(), Some("a".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "tags".to_string(),
+                    Value::resource_ref("some_resource", "tags", Vec::new()),
+                );
+                module_arguments(args)
+            });
 
-    let result = resolver.expand_module_call(&call, "a");
-    assert!(
-        result.is_ok(),
-        "map(T) argument should accept ResourceRef (carina#3238); got {:?}",
-        result
-    );
+            let result = resolver.expand_module_call(&call, "a");
+            assert!(
+                result.is_ok(),
+                "map(T) argument should accept ResourceRef (carina#3238); got {:?}",
+                result
+            );
+        },
+    )
 }
 
 /// carina#3238 sibling case: `struct { ... }` arguments must also
@@ -9023,27 +9412,32 @@ fn argument_type_struct_accepts_resource_ref() {
         validations: Vec::new(),
     }];
 
-    let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert("test_module".to_string(), module);
-        r
-    };
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut r = ModuleResolver::new(".", session);
+                r.imported_modules.insert("test_module".to_string(), module);
+                r
+            };
 
-    let call = ModuleCall::test("test_module".to_string(), Some("a".to_string()), {
-        let mut args = HashMap::new();
-        args.insert(
-            "options".to_string(),
-            Value::resource_ref("some_resource", "options", Vec::new()),
-        );
-        module_arguments(args)
-    });
+            let call = ModuleCall::test("test_module".to_string(), Some("a".to_string()), {
+                let mut args = HashMap::new();
+                args.insert(
+                    "options".to_string(),
+                    Value::resource_ref("some_resource", "options", Vec::new()),
+                );
+                module_arguments(args)
+            });
 
-    let result = resolver.expand_module_call(&call, "a");
-    assert!(
-        result.is_ok(),
-        "struct argument should accept ResourceRef (carina#3238); got {:?}",
-        result
-    );
+            let result = resolver.expand_module_call(&call, "a");
+            assert!(
+                result.is_ok(),
+                "struct argument should accept ResourceRef (carina#3238); got {:?}",
+                result
+            );
+        },
+    )
 }
 
 #[test]
@@ -9058,27 +9452,32 @@ fn argument_type_int_accepts_resource_ref_for_later_ref_type_validation() {
         validations: Vec::new(),
     }];
 
-    let resolver = {
-        let mut resolver = ModuleResolver::new(".");
-        resolver
-            .imported_modules
-            .insert("test_module".to_string(), module);
-        resolver
-    };
-    let call = ModuleCall::test(
-        "test_module".to_string(),
-        Some("a".to_string()),
-        module_arguments([(
-            "count".to_string(),
-            Value::resource_ref("source", "count", Vec::new()),
-        )]),
-    );
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let resolver = {
+                let mut resolver = ModuleResolver::new(".", session);
+                resolver
+                    .imported_modules
+                    .insert("test_module".to_string(), module);
+                resolver
+            };
+            let call = ModuleCall::test(
+                "test_module".to_string(),
+                Some("a".to_string()),
+                module_arguments([(
+                    "count".to_string(),
+                    Value::resource_ref("source", "count", Vec::new()),
+                )]),
+            );
 
-    let result = resolver.expand_module_call(&call, "a");
-    assert!(
-        result.is_ok(),
-        "ResourceRef type is checked by the BindingIndex pass; expansion must defer it: {result:?}"
-    );
+            let result = resolver.expand_module_call(&call, "a");
+            assert!(
+                result.is_ok(),
+                "ResourceRef type is checked by the BindingIndex pass; expansion must defer it: {result:?}"
+            );
+        },
+    )
 }
 
 /// carina#3238 end-to-end: a multi-file directory fixture that mirrors
@@ -9165,7 +9564,9 @@ let rd = infra_deploy {
 fn argument_type_mismatch_error_shows_actual_value() {
     let msg = module_argument_type_error(
         "role_arns",
-        TypeExpr::List(Box::new(TypeExpr::Simple("arn".to_string()))),
+        TypeExpr::List(Box::new(crate::parser::bare_type_for_test(
+            "arn".to_string(),
+        ))),
         Value::Concrete(ConcreteValue::String("arn:aws:iam::123:role/A".into())),
     );
 
@@ -9198,25 +9599,27 @@ fn module_argument_type_error_with_config(
         validations: Vec::new(),
     }];
 
-    let resolver = {
-        let mut resolver = ModuleResolver::with_config(".", config);
-        resolver
-            .imported_modules
-            .insert("web_tier".to_string(), module);
-        resolver
-    };
+    crate::validation::deferred_types::with_session_for_test(config, |session| {
+        let resolver = {
+            let mut resolver = ModuleResolver::with_config(".", session);
+            resolver
+                .imported_modules
+                .insert("web_tier".to_string(), module);
+            resolver
+        };
 
-    let call = ModuleCall::test(
-        "web_tier".to_string(),
-        Some("web".to_string()),
-        module_arguments([(arg_name.to_string(), value)]),
-    );
+        let call = ModuleCall::test(
+            "web_tier".to_string(),
+            Some("web".to_string()),
+            module_arguments([(arg_name.to_string(), value)]),
+        );
 
-    let result = resolver.expand_module_call(&call, "web");
-    let Err(err) = result else {
-        panic!("expected InvalidArgumentType error, got Ok");
-    };
-    err.to_string()
+        let result = resolver.expand_module_call(&call, "web");
+        let Err(err) = result else {
+            panic!("expected InvalidArgumentType error, got Ok");
+        };
+        err.to_string()
+    })
 }
 
 fn environment_type() -> TypeExpr {
@@ -9275,7 +9678,7 @@ fn argument_type_mismatch_error_redacts_secret_value() {
 fn decrypted_module_argument_is_secret_by_value_type() {
     let plaintext = "hunter2SECRET";
     let config = ProviderContext {
-        decryptor: Some(Box::new(move |_, _| Ok(plaintext.to_string()))),
+        decryptor: Some(std::sync::Arc::new(move |_, _| Ok(plaintext.to_string()))),
         ..ProviderContext::default()
     };
     let value = crate::builtins::evaluate_builtin_with_config_to_value(
@@ -9365,23 +9768,28 @@ fn binding_ref_argument_defers_to_binding_index() {
         description: None,
         validations: Vec::new(),
     }];
-    let mut resolver = ModuleResolver::new(".");
-    resolver
-        .imported_modules
-        .insert("inner".to_string(), module);
-    let call = ModuleCall::test(
-        "inner".to_string(),
-        Some("inner_instance".to_string()),
-        module_arguments([(
-            "environment".to_string(),
-            Value::Deferred(DeferredValue::BindingRef {
-                binding: "outer_environment".into(),
-            }),
-        )]),
-    );
-    // Expansion only checks concrete value shapes. BindingIndex owns the
-    // declared source-to-sink relation for binding references.
-    assert!(resolver.expand_module_call(&call, "inner_instance").is_ok());
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            let mut resolver = ModuleResolver::new(".", session);
+            resolver
+                .imported_modules
+                .insert("inner".to_string(), module);
+            let call = ModuleCall::test(
+                "inner".to_string(),
+                Some("inner_instance".to_string()),
+                module_arguments([(
+                    "environment".to_string(),
+                    Value::Deferred(DeferredValue::BindingRef {
+                        binding: "outer_environment".into(),
+                    }),
+                )]),
+            );
+            // Expansion only checks concrete value shapes. BindingIndex owns the
+            // declared source-to-sink relation for binding references.
+            assert!(resolver.expand_module_call(&call, "inner_instance").is_ok());
+        },
+    )
 }
 
 #[test]
@@ -9501,8 +9909,11 @@ fn argument_type_mismatch_error_preserves_float_fraction() {
 fn argument_type_validation_error_shows_actual_string_literal() {
     let value = Value::Concrete(ConcreteValue::String("not-an-ipv4-cidr".into()));
 
-    let msg =
-        module_argument_type_error("network", TypeExpr::Simple("ipv4_cidr".to_string()), value);
+    let msg = module_argument_type_error(
+        "network",
+        crate::parser::bare_type_for_test("ipv4_cidr".to_string()),
+        value,
+    );
 
     assert!(
         msg.contains("got string 'not-an-ipv4-cidr'"),
@@ -9547,8 +9958,16 @@ fn resolved_module_signature_groups_all_owners_of_a_dotted_annotation() {
     let context = ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             HashSet::from([
-                crate::parser::OwnedTypeIdentity::provider("aws", identity.clone()),
-                crate::parser::OwnedTypeIdentity::provider("awscc", identity),
+                crate::parser::OwnedTypeIdentity::provider(
+                    "aws",
+                    identity.clone(),
+                    crate::schema::RefinedScalarKind::String,
+                ),
+                crate::parser::OwnedTypeIdentity::provider(
+                    "awscc",
+                    identity,
+                    crate::schema::RefinedScalarKind::String,
+                ),
             ]),
             Box::new(|target, _value| {
                 Err(
@@ -9609,5 +10028,887 @@ fn resolved_module_signature_preserves_unresolvable_attribute_type_for_best_effo
                     )
         ),
         "best-effort module signature must retain the typed unchecked reason: {static_type:?}",
+    );
+}
+
+fn handle_output_provider_context() -> ProviderContext {
+    let mut context = ProviderContext::default();
+    for resource_type in ["test.Record", "test.Consumer", "test.Target"] {
+        context
+            .resource_types
+            .insert(("mock".to_string(), resource_type.to_string()));
+    }
+    context
+}
+
+#[test]
+fn anonymous_module_handle_output_resolves_after_instance_reconciliation() {
+    let fixture = ModuleResolutionFixture::new();
+    fixture.write("producer/arguments.crn", "arguments { name: String }\n");
+    fixture.write(
+        "producer/resources.crn",
+        "let record = mock.test.Record { name = name }\n",
+    );
+    fixture.write("producer/attributes.crn", "attributes { r = record }\n");
+    fixture.write("providers.crn", "provider mock {}\n");
+    fixture.write("backend.crn", "backend local { path = './state.json' }\n");
+    fixture.write("exports.crn", "exports { message: String = message }\n");
+    let context = handle_output_provider_context();
+    let schemas = crate::schema::SchemaRegistry::new();
+    let resolve = |name: &str| {
+        let caller = fixture.write(
+            "main.crn",
+            &format!(
+                "let message = 'directory export'\nlet producer = use {{ source = './producer' }}\nproducer {{ name = '{name}' }}\n"
+            ),
+        );
+        let loaded = crate::config_loader::load_configuration_with_config(
+            caller.parent().unwrap(),
+            &context,
+            &schemas,
+        )
+        .expect("multi-file project directory loads");
+        assert_eq!(loaded.parsed.providers.len(), 1);
+        assert!(loaded.parsed.backend.is_some());
+        assert_eq!(loaded.parsed.export_params.len(), 1);
+        crate::validation::deferred_types::with_session_for_test(&context, |session| {
+            super::resolve_modules_with_providerless_config(
+                loaded.parsed,
+                &fixture.root,
+                session,
+                &schemas,
+            )
+            .map_err(Box::new)
+        })
+        .map_err(|error| *error)
+        .expect("anonymous module expands")
+    };
+    let previous = resolve("before-edit");
+    let mut edited = resolve("after-edit");
+    let prior_instance = &previous.compositions[0].instance;
+    let new_instance = &edited.compositions[0].instance;
+    assert!(edited.compositions[0].binding.is_none());
+    let (_, prior_hash) = parse_synthetic_instance_prefix(prior_instance).unwrap();
+    let (_, new_hash) = parse_synthetic_instance_prefix(new_instance).unwrap();
+    assert_ne!(prior_hash, new_hash, "argument edit must move the SimHash");
+    assert!(prior_hash.distance(new_hash) < crate::identifier::SIMHASH_HAMMING_THRESHOLD);
+    let prior_record = &previous.resources[0].id;
+    let prior_state = crate::resource::State::existing(
+        prior_record.clone(),
+        HashMap::from([(
+            "name".to_string(),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                "before-edit".into(),
+            )),
+        )]),
+    );
+    let state_lookup = |provider: &str, resource_type: &str| {
+        assert_eq!(provider, prior_state.id.provider);
+        assert_eq!(resource_type, prior_state.id.resource_type);
+        vec![prior_state.id.identity_str().unwrap().to_string()]
+    };
+    crate::module_resolver::reconcile_anonymous_module_instances(
+        &mut edited,
+        &state_lookup,
+        &crate::identifier::StateBlockClaims::empty(),
+    );
+    assert_eq!(edited.compositions[0].instance, *prior_instance);
+    assert_eq!(edited.resources[0].id, *prior_record);
+
+    let expanded = edited.into_expanded(&schemas).unwrap();
+    let graph = crate::resolved_graph::resolve_expanded_graph(expanded.into())
+        .expect("anonymous handle output must resolve through the remapped composition");
+    let composition = &graph.configuration().compositions[0];
+    assert_eq!(composition.instance, *prior_instance);
+    assert_eq!(
+        composition.signature.attributes["r"]
+            .handle()
+            .map(AsRef::as_ref),
+        Some(prior_record),
+        "the reconciled composition must expose its remapped resource handle",
+    );
+}
+
+#[test]
+fn unannotated_local_and_argument_handle_outputs_forward_across_modules() {
+    let tmp = tempfile::tempdir().expect("temporary handle-output fixture");
+    let producer = tmp.path().join("producer");
+    let relay = tmp.path().join("relay");
+    let root = tmp.path().join("root");
+    for directory in [&producer, &relay, &root] {
+        fs::create_dir_all(directory).expect("create fixture directory");
+    }
+
+    fs::write(
+        producer.join("resources.crn"),
+        "let record = mock.test.Record { name = 'record' }\n",
+    )
+    .expect("write producer resource");
+    fs::write(
+        producer.join("attributes.crn"),
+        "attributes {\n  r = record\n}\n",
+    )
+    .expect("write producer attributes");
+    fs::write(
+        relay.join("arguments.crn"),
+        "arguments {\n  x: mock.test.Record\n}\n",
+    )
+    .expect("write relay arguments");
+    fs::write(relay.join("attributes.crn"), "attributes {\n  r = x\n}\n")
+        .expect("write relay attributes");
+
+    let root_source = r#"
+let producer_module = use { source = "../producer" }
+let relay_module = use { source = "../relay" }
+let produced = producer_module {}
+let relayed = relay_module { x = produced.r }
+
+let consumer = mock.test.Consumer {
+  name = "consumer"
+  directives { depends_on = [relayed.r] }
+}
+"#;
+    fs::write(root.join("main.crn"), root_source).expect("write root source");
+
+    let context = handle_output_provider_context();
+    let parsed = crate::parser::parse(root_source, &context).expect("root parses");
+    let parsed = resolve_modules_with_config(
+        parsed,
+        &root,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("unannotated local and argument handles must forward transitively");
+    let parsed = parsed
+        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .expect("root fixture has no remaining parser placeholders");
+
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("consumer")
+        })
+        .expect("consumer resource")
+        .clone();
+    assert_eq!(
+        consumer.dependencies.depends_on.diagnostic_references(),
+        ["relayed.r"]
+    );
+
+    let expected = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("produced.record")
+        })
+        .and_then(|resource| crate::resource::ResolvedResourceId::try_new(resource.id.clone()))
+        .expect("producer record has a resolved instance-qualified identity");
+    let resources = parsed.resources.clone(); // allow: direct — fixture test inspection
+    let data_sources = parsed.data_sources.clone();
+    let index = crate::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = resources.clone();
+        configuration.data_sources = data_sources.clone();
+        configuration.into()
+    })
+    .expect("transitive handle outputs resolve at the expanded graph seam");
+    let expected_type = TypeExpr::Ref(ResourceTypePath::new("mock", "test.Record"));
+    for instance in ["produced", "relayed"] {
+        let output = index
+            .configuration()
+            .compositions
+            .iter()
+            .find(|composition| composition.instance == instance)
+            .and_then(|composition| composition.signature.attributes.get("r"))
+            .unwrap_or_else(|| panic!("{instance}.r output"));
+        assert_eq!(
+            output
+                .declared_type()
+                .and_then(crate::static_type::ConsumerStaticType::known),
+            Some(&expected_type),
+            "unannotated {instance}.r must infer a known resource-handle type",
+        );
+        assert_eq!(
+            output.handle(),
+            Some(&expected),
+            "transitive forwarding must preserve the producer's resolved id",
+        );
+    }
+    let consumer = index
+        .resolve_resource(consumer, &crate::schema::SchemaRegistry::new())
+        .expect("consumer dependency resolves through both module outputs");
+    assert_eq!(
+        consumer.explicit_dependencies().iter().collect::<Vec<_>>(),
+        [&expected],
+    );
+}
+
+#[test]
+fn directives_resolve_local_and_module_output_handles_through_one_typed_path() {
+    let tmp = tempfile::tempdir().expect("temporary mixed dependency fixture");
+    let producer = tmp.path().join("producer");
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&producer).expect("create producer module");
+    fs::create_dir_all(&root).expect("create root directory");
+    fs::write(
+        producer.join("resources.crn"),
+        "let record = mock.test.Record { name = 'module' }\n",
+    )
+    .expect("write module resource");
+    fs::write(
+        producer.join("attributes.crn"),
+        "attributes {\n  r = record\n}\n",
+    )
+    .expect("write module handle output");
+
+    let root_source = r#"let local = mock.test.Record { name = "local" }
+let producer_module = use { source = "../producer" }
+let child = producer_module {}
+let consumer = mock.test.Consumer {
+  name = "consumer"
+  directives { depends_on = [local, child.r] }
+}
+"#;
+    fs::write(root.join("main.crn"), root_source).expect("write root fixture");
+
+    let context = handle_output_provider_context();
+    let parsed = crate::parser::parse(root_source, &context).expect("root parses");
+    let parsed = resolve_modules_with_config(
+        parsed,
+        &root,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("mixed local/output handle dependencies expand");
+    let parsed = parsed
+        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .expect("root fixture has no remaining parser placeholders");
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("consumer")
+        })
+        .cloned()
+        .expect("consumer resource");
+    assert_eq!(
+        consumer.dependencies.depends_on.diagnostic_references(),
+        ["local", "child.r"],
+    );
+    let expected = parsed
+        .resources
+        .iter()
+        .filter(|resource| {
+            matches!(
+                resource.binding.as_ref().map(|binding| binding.as_str()),
+                Some("local" | "child.record")
+            )
+        })
+        .map(|resource| {
+            crate::resource::ResolvedResourceId::try_new(resource.id.clone())
+                .expect("dependency has a resolved id")
+        })
+        .collect::<crate::resource::ResolvedDependencies>();
+    assert_eq!(expected.len(), 2);
+
+    let resources = parsed.resources.clone(); // allow: direct — fixture test inspection
+    let data_sources = parsed.data_sources.clone();
+    let index = crate::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = resources.clone();
+        configuration.data_sources = data_sources.clone();
+        configuration.into()
+    })
+    .expect("expanded dependency graph resolves both operands");
+    let consumer = index
+        .resolve_resource(consumer, &crate::schema::SchemaRegistry::new())
+        .expect("consumer dependencies resolve");
+    assert_eq!(consumer.explicit_dependencies(), &expected);
+}
+
+#[test]
+fn module_wait_handle_argument_resolves_to_the_callers_resource() {
+    let tmp = tempfile::tempdir().expect("temporary wait-handle fixture");
+    let module = tmp.path().join("consumer");
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&module).expect("create consumer module");
+    fs::create_dir_all(&root).expect("create root directory");
+
+    fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  peer: mock.test.Record\n}\n",
+    )
+    .expect("write module arguments");
+    fs::write(
+        module.join("target.crn"),
+        r#"let target = mock.test.Target { name = "target" }
+"#,
+    )
+    .expect("write wait target");
+    fs::write(
+        module.join("wait.crn"),
+        r#"let ready = wait target {
+  until      = target.status == "ready"
+  depends_on = [peer]
+}
+"#,
+    )
+    .expect("write module wait");
+
+    let root_source = r#"
+let source = mock.test.Record { name = "source" }
+let consumer_module = use { source = "../consumer" }
+let child = consumer_module { peer = source }
+"#;
+    fs::write(root.join("main.crn"), root_source).expect("write root source");
+
+    let context = handle_output_provider_context();
+    let parsed = crate::parser::parse(root_source, &context).expect("root parses");
+    let parsed = resolve_modules_with_config(
+        parsed,
+        &root,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("module wait expands");
+    let parsed = parsed
+        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .expect("root fixture has no remaining parser placeholders");
+
+    let wait = parsed
+        .wait_bindings
+        .iter()
+        .find(|wait| wait.binding.as_str() == "child.ready")
+        .expect("expanded wait")
+        .clone();
+    assert_eq!(wait.depends_on.diagnostic_references(), ["source"]);
+    assert!(
+        wait.depends_on
+            .diagnostic_references()
+            .iter()
+            .all(|dependency| dependency != "child.peer"),
+        "a module parameter spelling is not a resource address: {wait:?}",
+    );
+
+    let expected = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("source")
+        })
+        .and_then(|resource| crate::resource::ResolvedResourceId::try_new(resource.id.clone()))
+        .expect("caller source has a resolved identity");
+    let resources = parsed.resources.clone(); // allow: direct — fixture test inspection
+    let data_sources = parsed.data_sources.clone();
+    let index = crate::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = resources.clone();
+        configuration.data_sources = data_sources.clone();
+        configuration.into()
+    })
+    .expect("expanded graph resolves the caller-supplied wait dependency");
+    let resolved_wait = index
+        .resolve_wait_binding(&wait)
+        .expect("module-internal wait resolves structurally");
+    assert_eq!(
+        resolved_wait
+            .explicit_dependencies
+            .iter()
+            .collect::<Vec<_>>(),
+        [&expected],
+        "the wait must depend on the caller resource, never child.peer",
+    );
+}
+
+#[test]
+fn module_wait_target_and_predicate_root_resolve_handle_argument_to_caller_resource() {
+    let tmp = tempfile::tempdir().expect("temporary wait-target handle fixture");
+    let module = tmp.path().join("consumer");
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&module).expect("create consumer module");
+    fs::create_dir_all(&root).expect("create root directory");
+
+    fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  peer: mock.test.Record\n}\n",
+    )
+    .expect("write module arguments");
+    fs::write(
+        module.join("wait.crn"),
+        r#"let ready = wait peer {
+  until = peer.name == "source"
+}
+"#,
+    )
+    .expect("write module wait");
+
+    let root_source = r#"
+let source = mock.test.Record { name = "source" }
+let consumer_module = use { source = "../consumer" }
+let child = consumer_module { peer = source }
+"#;
+    fs::write(root.join("main.crn"), root_source).expect("write root source");
+
+    let context = handle_output_provider_context();
+    let parsed = crate::parser::parse(root_source, &context).expect("root parses");
+    let parsed = resolve_modules_with_config(
+        parsed,
+        &root,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("module wait expands");
+    let parsed = parsed
+        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .expect("root fixture has no remaining parser placeholders");
+    let expected = parsed
+        .iter_all_resources()
+        .find(|resource| resource.binding() == Some("source"))
+        .and_then(|resource| crate::resource::ResolvedResourceId::try_new(resource.id().clone()))
+        .expect("caller source has a resolved identity");
+    let wait = parsed
+        .wait_bindings
+        .iter()
+        .find(|wait| wait.binding.as_str() == "child.ready")
+        .cloned()
+        .expect("expanded wait");
+    let index = crate::resolved_graph::resolve_expanded_graph(parsed.into())
+        .expect("expanded graph resolves the caller-supplied wait target");
+    let resolved = index
+        .resolve_wait_binding(&wait)
+        .expect("wait target and predicate root resolve through the module argument");
+
+    assert_eq!(resolved.target_id.id(), &expected);
+    assert_eq!(
+        resolved.until_predicate.root.as_str(),
+        "source",
+        "the predicate root must use the same caller resource as the wait target",
+    );
+}
+
+#[test]
+fn module_wait_on_value_argument_is_rejected() {
+    let tmp = tempfile::tempdir().expect("temporary wait-value fixture");
+    let module = tmp.path().join("consumer");
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&module).expect("create consumer module");
+    fs::create_dir_all(&root).expect("create root directory");
+
+    fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  peer: String\n}\n",
+    )
+    .expect("write module arguments");
+    fs::write(
+        module.join("wait.crn"),
+        r#"let ready = wait peer {
+  until = peer.name == "source"
+}
+"#,
+    )
+    .expect("write module wait");
+
+    let root_source = r#"
+let consumer_module = use { source = "../consumer" }
+let child = consumer_module { peer = "source" }
+"#;
+    fs::write(root.join("main.crn"), root_source).expect("write root source");
+
+    let context = handle_output_provider_context();
+    let parsed = crate::parser::parse(root_source, &context).expect("root parses");
+    let error = resolve_modules_with_config(
+        parsed,
+        &root,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect_err("a value argument cannot be used as a wait target");
+
+    assert!(
+        error
+            .to_string()
+            .contains("wait 'peer': expected resource handle"),
+        "unexpected diagnostic: {error}",
+    );
+}
+
+#[test]
+fn dotted_unresolved_module_argument_in_depends_on_resolves_to_caller_resource() {
+    let fixture = ModuleResolutionFixture::new();
+    fixture.write(
+        "consumer/main.crn",
+        r#"arguments { peer: mock.test.Thing }
+let consumer = mock.test.Consumer {
+  name = "consumer"
+  directives { depends_on = [peer] }
+}
+"#,
+    );
+    let caller = r#"let source = mock.test.Thing { name = "source" }
+let imported = use { source = "../consumer" }
+let child = imported { peer = source }
+"#;
+    fixture.write("root/main.crn", caller);
+
+    let parsed = fixture
+        .resolve_upstream_caller("root/main.crn")
+        .expect("providerless module resolution retains the provisional handle argument");
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("child.consumer")
+        })
+        .expect("expanded consumer");
+
+    assert_eq!(
+        consumer.dependencies.depends_on.diagnostic_references(),
+        ["source"],
+        "a DottedUnresolved argument must substitute the caller handle before prefixing",
+    );
+}
+
+#[test]
+fn module_wait_dependency_on_for_group_prefixes_and_resolves_every_member() {
+    let tmp = tempfile::tempdir().expect("temporary wait-for-group fixture");
+    let module = tmp.path().join("consumer");
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&module).expect("create consumer module");
+    fs::create_dir_all(&root).expect("create root directory");
+
+    fs::write(
+        module.join("resources.crn"),
+        r#"let target = mock.test.Target { name = "target" }
+let records = for record_name in ["one", "two"] {
+  mock.test.Record { name = record_name }
+}
+"#,
+    )
+    .expect("write module resources");
+    fs::write(
+        module.join("wait.crn"),
+        r#"let ready = wait target {
+  until      = target.status == "ready"
+  depends_on = [records]
+}
+"#,
+    )
+    .expect("write module wait");
+    fs::write(
+        module.join("attributes.crn"),
+        "attributes {\n  target_name: String = ready.name\n}\n",
+    )
+    .expect("write module output");
+    fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  marker: String = \"fixture\"\n}\n",
+    )
+    .expect("write module argument");
+
+    let root_source = r#"let consumer_module = use { source = "../consumer" }
+let child = consumer_module {}
+"#;
+    fs::write(root.join("main.crn"), root_source).expect("write root source");
+
+    let context = handle_output_provider_context();
+    let parsed = crate::parser::parse_file(root_source, &root.join("main.crn"), &context)
+        .expect("root parses with its source path");
+    let parsed = resolve_modules_with_config(
+        parsed,
+        &root,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("module with a wait over a for group expands");
+    let parsed = parsed
+        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .expect("root fixture has no remaining parser placeholders");
+
+    let wait = parsed
+        .wait_bindings
+        .iter()
+        .find(|wait| wait.binding.as_str() == "child.ready")
+        .expect("expanded wait")
+        .clone();
+    assert_eq!(wait.depends_on.diagnostic_references(), ["child.records"]);
+
+    let expected = parsed
+        .resources
+        .iter()
+        .filter(|resource| {
+            resource
+                .binding
+                .as_ref()
+                .map(|binding| binding.as_str())
+                .is_some_and(|binding| binding.starts_with("child.records["))
+        })
+        .filter_map(|resource| crate::resource::ResolvedResourceId::try_new(resource.id.clone()))
+        .collect::<crate::resource::ResolvedDependencies>();
+    assert_eq!(expected.len(), 2, "both loop members must be materialized");
+
+    let resources = parsed.resources.clone(); // allow: direct — fixture test inspection
+    let data_sources = parsed.data_sources.clone();
+    let index = crate::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = resources.clone();
+        configuration.data_sources = data_sources.clone();
+        configuration.into()
+    })
+    .expect("expanded graph registers the prefixed loop group");
+    let resolved_wait = index
+        .resolve_wait_binding(&wait)
+        .expect("wait dependency resolves to the complete managed group");
+    assert_eq!(resolved_wait.explicit_dependencies, expected);
+
+    let live_projection = index
+        .project_legacy_dependency("child.records", "legacy loop-group fixture")
+        .expect("the v20 collection spelling projects through the live graph")
+        .into_dependencies();
+    assert_eq!(live_projection.to_resolved_dependencies(), expected);
+}
+
+#[test]
+fn p3_unannotated_handle_output_orders_the_consumer_wait_after_the_producer() {
+    let tmp = tempfile::tempdir().expect("temporary P3 handle-output fixture");
+    let producer = tmp.path().join("producer");
+    let consumer = tmp.path().join("consumer");
+    let root = tmp.path().join("root");
+    for directory in [&producer, &consumer, &root] {
+        fs::create_dir_all(directory).expect("create fixture directory");
+    }
+
+    fs::write(
+        producer.join("record.crn"),
+        "let validation_record = mock.test.Record { name = 'validation-record' }\n",
+    )
+    .expect("write producer resource");
+    fs::write(
+        producer.join("attributes.crn"),
+        "attributes {\n  validation_record = validation_record\n}\n",
+    )
+    .expect("write unannotated producer output");
+    fs::write(
+        consumer.join("arguments.crn"),
+        "arguments {\n  validation_record: mock.test.Record\n}\n",
+    )
+    .expect("write consumer handle argument");
+    fs::write(
+        consumer.join("target.crn"),
+        "let target = mock.test.Target { name = 'target' }\n",
+    )
+    .expect("write consumer wait target");
+    fs::write(
+        consumer.join("wait.crn"),
+        r#"let ready = wait target {
+  until      = target.status == "ready"
+  depends_on = [validation_record]
+}
+"#,
+    )
+    .expect("write consumer wait");
+    fs::write(
+        consumer.join("attributes.crn"),
+        "attributes {\n  observed_name: String = ready.name\n}\n",
+    )
+    .expect("write consumer wait output");
+
+    let root_source = r#"
+let producer_module = use { source = "../producer" }
+let consumer_module = use { source = "../consumer" }
+let producer = producer_module {}
+let consumer = consumer_module {
+  validation_record = producer.validation_record
+}
+let reader = mock.test.Consumer { name = consumer.observed_name }
+"#;
+    fs::write(root.join("main.crn"), root_source).expect("write root source");
+
+    let context = handle_output_provider_context();
+    let parsed = crate::parser::parse(root_source, &context).expect("root parses");
+    let parsed = resolve_modules_with_config(
+        parsed,
+        &root,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("P3 modules expand");
+    let parsed = parsed
+        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .expect("root fixture has no remaining parser placeholders");
+
+    let expected = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str())
+                == Some("producer.validation_record")
+        })
+        .and_then(|resource| crate::resource::ResolvedResourceId::try_new(resource.id.clone()))
+        .expect("producer record has an instance-qualified resolved id");
+    let target = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("consumer.target")
+        })
+        .cloned()
+        .expect("consumer wait target");
+    let producer_resource = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str())
+                == Some("producer.validation_record")
+        })
+        .cloned()
+        .expect("producer resource");
+    let reader = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("reader")
+        })
+        .cloned()
+        .expect("wait output consumer");
+    let wait = parsed
+        .wait_bindings
+        .iter()
+        .find(|wait| wait.binding.as_str() == "consumer.ready")
+        .cloned()
+        .expect("expanded consumer wait");
+
+    let resources = parsed.resources.clone(); // allow: direct — fixture test inspection
+    let data_sources = parsed.data_sources.clone();
+    let index = crate::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = resources.clone();
+        configuration.data_sources = data_sources.clone();
+        configuration.into()
+    })
+    .expect("P3 graph addresses resolve");
+    let resolved_wait = index
+        .resolve_wait_binding(&wait)
+        .expect("consumer wait dependency resolves");
+    assert_eq!(
+        resolved_wait
+            .explicit_dependencies
+            .iter()
+            .collect::<Vec<_>>(),
+        [&expected],
+        "the wait must retain the producer instance's resource id",
+    );
+    assert!(
+        resolved_wait
+            .explicit_dependencies
+            .iter()
+            .all(|dependency| dependency.identity_str() != "consumer.validation_record"),
+        "the consumer parameter spelling must never become a graph address",
+    );
+    let resolved_reader = index
+        .resolve_resource(reader, &crate::schema::SchemaRegistry::new())
+        .expect("reader dependency resolves through the consumer composition");
+    assert_eq!(
+        resolved_reader
+            .value_dependencies()
+            .iter()
+            .collect::<Vec<_>>(),
+        [&resolved_wait.id],
+        "a concrete wait output must retain the wait scheduler edge",
+    );
+
+    let producer_effect = crate::effect::Effect::Create(
+        index
+            .resolve_resource(producer_resource, &crate::schema::SchemaRegistry::new())
+            .expect("resolve producer resource"),
+    );
+    let target_effect = crate::effect::Effect::Create(
+        index
+            .resolve_resource(target, &crate::schema::SchemaRegistry::new())
+            .expect("resolve consumer target"),
+    );
+    let wait_effect = crate::effect::Effect::Wait {
+        id: resolved_wait.id,
+        target_id: resolved_wait.target_id,
+        until: crate::wait::predicate::WaitPredicate::equals(
+            crate::wait::predicate::AttrPath::single("status"),
+            Value::Concrete(ConcreteValue::String("ready".to_string().into())),
+        )
+        .expect("valid wait predicate"),
+        until_surface: resolved_wait.until_raw,
+        timeout: std::time::Duration::from_secs(60),
+        interval: std::time::Duration::from_secs(5),
+        explicit_dependencies: resolved_wait.explicit_dependencies,
+    };
+
+    let mut plan = crate::plan::Plan::new();
+    plan.add(producer_effect.clone());
+    plan.add(target_effect.clone());
+    plan.add(wait_effect.clone());
+    let analysis = crate::effect::deps::build_effect_dependency_analysis(
+        plan.effects(),
+        std::iter::empty(),
+        crate::effect::deps::ScheduleInputs::Apply,
+    )
+    .expect("the complete P3 plan has a valid dependency graph");
+    assert!(
+        analysis
+            .deps_of(2)
+            .expect("wait dependency set")
+            .contains(&0),
+        "the wait effect must order after the producer effect",
+    );
+
+    let mut incomplete = crate::plan::Plan::new();
+    incomplete.add(target_effect);
+    incomplete.add(wait_effect);
+    let failure = crate::effect::deps::build_effect_dependency_analysis(
+        incomplete.effects(),
+        std::iter::empty(),
+        crate::effect::deps::ScheduleInputs::Apply,
+    )
+    .expect_err("a missing producer effect must not silently drop the wait edge");
+    assert_eq!(failure.unresolved().len(), 1);
+    assert_eq!(failure.unresolved()[0].id(), &expected);
+}
+
+#[test]
+fn ref_typed_module_argument_rejects_a_string_value() {
+    let tmp = tempfile::tempdir().expect("temporary Ref boundary fixture");
+    let module = tmp.path().join("consumer");
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&module).expect("create consumer module");
+    fs::create_dir_all(&root).expect("create root directory");
+    fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  record: mock.test.Record\n}\n",
+    )
+    .expect("write module arguments");
+    fs::write(
+        module.join("resource.crn"),
+        "let target = mock.test.Target { name = 'target' }\n",
+    )
+    .expect("write module resource");
+
+    let root_source = r#"
+let consumer_module = use { source = "../consumer" }
+let child = consumer_module { record = "record-id" }
+"#;
+    fs::write(root.join("main.crn"), root_source).expect("write root source");
+
+    let context = handle_output_provider_context();
+    let parsed = crate::parser::parse(root_source, &context).expect("root parses");
+    let error = resolve_modules_with_config(
+        parsed,
+        &root,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect_err("a String value must not satisfy a resource-handle parameter");
+    assert!(
+        error.to_string().contains(
+            "module argument 'record': expected resource handle mock.test.Record; got String"
+        ),
+        "unexpected diagnostic: {error}",
     );
 }

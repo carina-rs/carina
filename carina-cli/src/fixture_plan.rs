@@ -26,8 +26,10 @@ use carina_state::{PublishedExports, StateFile, check_and_migrate};
 
 use crate::commands::plan::compute_export_diffs;
 use crate::commands::shared::state_writeback::persisted_directive_changes;
+use crate::error::AppError;
 use crate::moved_hint::{MovedBlockHints, detect_moved_block_hints};
 use crate::plan_summary::PlanChangeSummary;
+use crate::runtime::CommandRuntime;
 use crate::wiring::{LoadedProviderFactory, ProviderLoad, ValidatedConfig};
 
 /// Fixture root path relative to the `carina-cli` crate manifest.
@@ -278,7 +280,10 @@ pub struct FixturePlan {
 }
 
 /// Build an explicitly scoped provider router for rendering a hand-built plan.
-pub fn provider_router_for_plan<S>(plan: &Plan<S>) -> ProviderRouter {
+pub fn provider_router_for_plan<S>(
+    runtime: &crate::runtime::CommandRuntime,
+    plan: &Plan<S>,
+) -> Result<ProviderRouter, AppError> {
     let instances = plan
         .effects()
         .iter()
@@ -288,21 +293,28 @@ pub fn provider_router_for_plan<S>(plan: &Plan<S>) -> ProviderRouter {
     for instance in instances {
         provider.add_provider_instance(
             instance,
-            InitializedProvider::unavailable(Box::new(carina_provider_mock::MockProvider::new())),
+            InitializedProvider::unavailable(Box::new(runtime.builtin_mock()?.create_provider())),
         );
     }
-    provider
+    Ok(provider)
 }
 
 /// Build a plan from a fixture directory name (e.g. "all_create"). Resolves
 /// the fixture under `CARGO_MANIFEST_DIR/tests/fixtures/plan_display/<name>`.
 #[cfg(test)]
-pub fn build_plan_from_fixture_name(fixture_dir: &str) -> FixturePlan {
-    build_plan_from_fixture_name_using(fixture_dir, LoadedProviderFactory::for_test)
+pub fn build_plan_from_fixture_name(
+    runtime: &CommandRuntime,
+    fixture_dir: &str,
+) -> Result<FixturePlan, AppError> {
+    build_plan_from_fixture_name_using(runtime, fixture_dir, LoadedProviderFactory::for_test)
 }
 
 /// Build a fixture plan with caller-supplied, identity-carrying factories.
-pub fn build_plan_from_fixture_name_using<F>(fixture_dir: &str, load_factories: F) -> FixturePlan
+pub fn build_plan_from_fixture_name_using<F>(
+    runtime: &CommandRuntime,
+    fixture_dir: &str,
+    load_factories: F,
+) -> Result<FixturePlan, AppError>
 where
     F: Fn(Vec<Box<dyn ProviderFactory>>) -> Vec<LoadedProviderFactory>,
 {
@@ -311,7 +323,7 @@ where
         "{}/{}/{}",
         manifest_dir, FIXTURE_SUBPATH, fixture_dir
     ));
-    build_plan_from_fixture_path_using(&fixture_path, load_factories)
+    build_plan_from_fixture_path_using(runtime, &fixture_path, load_factories)
 }
 
 /// Build the exact non-destroy display summary for a fixture, including its
@@ -340,15 +352,23 @@ pub fn build_fixture_plan_change_summary(fixture: &FixturePlan) -> PlanChangeSum
 /// validates with `skip_resource_validation=true` (no provider plugin load),
 /// and produces a provider-less fixture plan from the persisted state.
 #[cfg(test)]
-pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
-    build_plan_from_fixture_path_using(fixture_path, LoadedProviderFactory::for_test)
+pub fn build_plan_from_fixture_path(
+    runtime: &CommandRuntime,
+    fixture_path: &Path,
+) -> Result<FixturePlan, AppError> {
+    build_plan_from_fixture_path_using(runtime, fixture_path, LoadedProviderFactory::for_test)
 }
 
 /// Build a fixture plan with caller-supplied, identity-carrying factories.
-pub fn build_plan_from_fixture_path_using<F>(fixture_path: &Path, load_factories: F) -> FixturePlan
+pub fn build_plan_from_fixture_path_using<F>(
+    runtime: &CommandRuntime,
+    fixture_path: &Path,
+    load_factories: F,
+) -> Result<FixturePlan, AppError>
 where
     F: Fn(Vec<Box<dyn ProviderFactory>>) -> Vec<LoadedProviderFactory>,
 {
+    let builtin_mock = runtime.builtin_mock()?;
     let fixture_pathbuf = fixture_path.to_path_buf();
     let state_path = fixture_path.join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
 
@@ -362,6 +382,7 @@ where
     // catalog would assign anonymous identities earlier than the real plan
     // path and make the harness observe the wrong inputs.
     let validation_providers = ProviderLoad::for_fixture_with_additional_schemas(
+        runtime,
         load_factories(fixture_provider_config_factories()),
         &parsed.providers,
         fixture_validation_enum_schemas(&fixture_pathbuf),
@@ -393,6 +414,7 @@ where
     // planning; the test-only constructor marks that separately assembled
     // context as the fixture's validated execution wiring.
     let mut validated_config = ValidatedConfig::for_fixture_with_additional_schemas(
+        runtime,
         canonical_resources,
         load_factories(fixture_provider_factories(&fixture_pathbuf)),
         &provider_configs,
@@ -460,10 +482,15 @@ where
             .unwrap_or_default();
         remote_bindings.insert(us.binding.to_string(), bindings);
     }
-    let resolved_provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
-        parsed,
-        &remote_bindings,
+    let resolved_provider_configs = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
+        |session| {
+            carina_core::parser::resolve_provider_attributes_with_remote(
+                parsed,
+                &remote_bindings,
+                session,
+            )
+        },
     )
     .expect("fixture provider configs must resolve");
     let raw_provider_configs = resolved_provider_configs.as_provider_configs();
@@ -493,7 +520,7 @@ where
         provider_router.add_provider(
             factory.name().to_string(),
             carina_core::provider::InitializedProvider::unavailable(Box::new(
-                carina_provider_mock::MockProvider::new(),
+                builtin_mock.create_provider(),
             )),
         );
     }
@@ -520,7 +547,7 @@ where
     for route in fixture_routes {
         provider_router.add_provider_instance(
             route,
-            InitializedProvider::unavailable(Box::new(carina_provider_mock::MockProvider::new())),
+            InitializedProvider::unavailable(Box::new(builtin_mock.create_provider())),
         );
     }
     let expansion_prelude = expansion_prelude
@@ -594,7 +621,11 @@ where
         });
     let reconciled_expansion = expansion_prelude
         .bind_projected_phase1_state(managed_current, orphans, HashSet::new())
-        .reconcile_addresses(parsed, crate::wiring::DeferredForWarningPolicy::Print)
+        .reconcile_addresses(
+            runtime.color_mode(),
+            parsed,
+            crate::wiring::DeferredForWarningPolicy::Print,
+        )
         .expect("fixture move routes must match their loaded current states");
     let prepared_expansion = reconciled_expansion.seal(data_source_values);
     let mut validated_expansion = validated_config
@@ -648,7 +679,7 @@ where
         )
         .expect("fixture post-expansion plan construction must succeed")
     };
-    match post_expansion {
+    Ok(match post_expansion {
         crate::wiring::PostExpansionOutcome::Diagnostics(diagnostics) => {
             let (artifacts, plan) = diagnostics.into_parts();
             let crate::wiring::PostExpansionArtifacts {
@@ -661,7 +692,12 @@ where
                 moved_origins,
                 prev_explicit,
                 wait_aliases: _,
+                legacy_dependency_classification: _,
+                migrated_legacy_state,
             } = artifacts;
+            if let Some(migrated) = migrated_legacy_state {
+                state_file = Some(migrated);
+            }
             let moved_hints =
                 detect_moved_block_hints(&plan, &managed_current, &schemas, &provider_router)
                     .expect("fixture moved-hint comparisons must resolve");
@@ -681,12 +717,18 @@ where
                 moved_origins,
                 deferred_for_expressions: residual_deferred_for,
                 export_params,
-                resolved_export_params: carina_core::validation::check_export_values_pre_apply(
-                    &[],
-                    &carina_core::binding_index::ResolvedBindings::default(),
-                    validated_expansion.context().provider_context(),
-                )
-                .expect("empty exports are checked"),
+                resolved_export_params:
+                    carina_core::validation::deferred_types::with_session_for_test(
+                        validated_expansion.context().provider_context(),
+                        |session| {
+                            carina_core::validation::check_export_values_pre_apply(
+                                &[],
+                                &carina_core::binding_index::ResolvedBindings::default(),
+                                session,
+                            )
+                        },
+                    )
+                    .expect("empty exports are checked"),
                 prev_explicit,
                 expansion_trace,
             }
@@ -710,7 +752,12 @@ where
                 moved_origins,
                 prev_explicit,
                 wait_aliases: _,
+                legacy_dependency_classification: _,
+                migrated_legacy_state,
             } = artifacts;
+            if let Some(migrated) = migrated_legacy_state {
+                state_file = Some(migrated);
+            }
             let (plan, references) = match plan {
                 crate::wiring::PlannedPlan::Unrendered { plan, references } => {
                     (plan, FixtureReferences(references))
@@ -762,7 +809,7 @@ where
                 expansion_trace,
             }
         }
-    }
+    })
 }
 
 fn fixture_provider_factories(fixture_path: &Path) -> Vec<Box<dyn ProviderFactory>> {
@@ -1511,7 +1558,93 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fixture_plan_and_router_return_typed_mock_input_errors() {
+        use crate::cursor::CursorState;
+        use crate::error::CommandInputError;
+        use crate::output_style::ColorMode;
+        use crate::runtime::{BuiltinMockInputs, CommandInputs, InvocationHooks};
+        use crate::wiring::TrustedLocalGrantInputs;
+        use carina_provider_mock::{ConfiguredBuiltinMock, MockBehavior, MockScope};
+
+        let dirs = carina_core::TestUserDirs::new();
+        let runtime = CommandRuntime::new(
+            (*dirs).clone(),
+            CommandInputs {
+                builtin_mock: BuiltinMockInputs::deferred(|| {
+                    let path = PathBuf::from("/");
+                    let scope = MockScope::file(path.clone())
+                        .map_err(|error| CommandInputError::MockStorage { path, error })?;
+                    Ok(ConfiguredBuiltinMock::new(MockBehavior::default(), scope))
+                }),
+                trusted_local_grants: TrustedLocalGrantInputs::new(Vec::new(), None),
+                accepted_egress: Default::default(),
+                color_mode: ColorMode::Ansi,
+                cursor: CursorState::new(),
+                hooks: InvocationHooks::default(),
+            },
+        );
+        let mut plan: Plan = Plan::new();
+        plan.add(carina_core::effect::Effect::Create(ResolvedResource::new(
+            carina_core::resource::Resource::with_provider("mock", "test.resource", "item", None)
+                .into_value_snapshot(),
+        )));
+
+        let router_error = provider_router_for_plan(&runtime, &plan).err().unwrap();
+        let fixture_error = build_plan_from_fixture_name_using(
+            &runtime,
+            "all_create",
+            LoadedProviderFactory::for_test,
+        )
+        .err()
+        .unwrap();
+        for error in [router_error, fixture_error] {
+            let AppError::CommandInput(error) = error else {
+                panic!("expected a typed command input error, got {error:?}");
+            };
+            let CommandInputError::MockStorage {
+                path,
+                error: io_error,
+            } = error.as_ref()
+            else {
+                panic!("expected a typed mock storage error, got {error:?}");
+            };
+            assert_eq!(path, Path::new("/"));
+            assert_eq!(io_error.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(io_error.to_string(), "mock state path has no file name");
+        }
+    }
+
+    #[test]
+    fn fixture_plan_uses_callers_runtime() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("main.crn"),
+            "provider mock {}\nlet item = mock.test.resource { name = \"fixture\" }\n",
+        )
+        .expect("write fixture");
+        let maximum = temp.path().join("maximum");
+        let runtime = crate::test_support::TestCommandRuntime::with_mock(
+            carina_provider_mock::MockBehavior {
+                observations: carina_provider_mock::MockObservations {
+                    max_active: Some(maximum.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            carina_provider_mock::MockScope::memory(),
+        );
+
+        let fixture = build_plan_from_fixture_path(&runtime, temp.path())
+            .expect("fixture mock inputs must be valid");
+
+        assert_eq!(fixture.desired_resources.len(), 1);
+        assert_eq!(fs::read_to_string(maximum).unwrap(), "0");
+    }
+
+    #[test]
     fn providerless_fixture_plan_canonicalizes_block_names_in_both_snapshots() {
+        let runtime = crate::test_support::TestCommandRuntime::new();
+
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(
             temp.path().join("main.crn"),
@@ -1525,7 +1658,8 @@ let item = mock.test.resource {
         )
         .expect("write fixture");
 
-        let fixture = build_plan_from_fixture_path(temp.path());
+        let fixture = build_plan_from_fixture_path(&runtime, temp.path())
+            .expect("fixture mock inputs must be valid");
         let desired = fixture
             .desired_resources
             .iter()

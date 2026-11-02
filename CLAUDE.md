@@ -287,6 +287,18 @@ temporary home, so tests never write to the developer's real `~/.carina`
 (carina#4055). Plain `cargo test` skips that isolation; use it only for
 `--doc`.
 
+In-process mock tests pass a `MockBehavior` and explicit `MockScope` through
+`TestCommandRuntime`. Allocate a fresh scope for each fixture; aliases within
+one fixture share that scope. Set `CARINA_MOCK_*` only on child `Command`s in
+subprocess tests. The executable's `process_inputs` module captures those
+controls and passes owned inputs into the library.
+
+Run `scripts/test-in-process-isolation.sh` to check the CLI library, CLI binary
+unit tests, and mock library with eight libtest threads per process. It discovers
+executables through nextest and uses the same disposable HOME/TMPDIR setup as
+nextest; it does not use plain `cargo test`. CI runs it after nextest in the
+required `Test` job, reusing that job's WASM fixtures.
+
 ```bash
 # CLI commands — path defaults to cwd; if given, it must be a DIRECTORY, not a file
 cargo run -- plan

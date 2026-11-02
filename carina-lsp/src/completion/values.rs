@@ -10,7 +10,8 @@ use carina_core::builtins;
 use carina_core::parser::{TypeExpr, snake_to_pascal};
 use carina_core::resource::EnumValueResolver;
 use carina_core::schema::{
-    CompiledAttributeType as AttributeType, EffectiveType, Shape, TypeIdentity, TypeInSchema,
+    CompiledAttributeType as AttributeType, EffectiveType, SchemaRegistry, Shape, TypeIdentity,
+    TypeInSchema,
 };
 use carina_core::static_type::{
     ConsumerExportStaticType, ConsumerInferredUncheckedReason, InferenceError, NotInferableReason,
@@ -18,7 +19,7 @@ use carina_core::static_type::{
 };
 use carina_core::upstream_exports::{UpstreamExportEntry, UpstreamExportType};
 
-use super::{AttributeValueTarget, CompletionProvider, DslSource};
+use super::{AttributeValueTarget, CompletionProvider, DslSource, UpstreamDepth2Match};
 
 /// How far up the directory tree to walk when suggesting upstream_state sources.
 const UPSTREAM_SOURCE_MAX_UP: usize = 6;
@@ -65,11 +66,17 @@ impl StructuralTypeForCompletion<TypeExpr> {
         &self,
         target: &AttributeType,
         target_defs: &std::collections::BTreeMap<String, AttributeType>,
+        schemas: &SchemaRegistry,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> bool {
         match self {
-            Self::Known(type_expr) => {
-                type_expr_source_is_assignable_to(type_expr, target, target_defs)
-            }
+            Self::Known(type_expr) => type_expr_source_is_assignable_to(
+                type_expr,
+                target,
+                target_defs,
+                schemas,
+                provider_ctx,
+            ),
             Self::Unnameable(_type_expr) => true,
         }
     }
@@ -120,11 +127,17 @@ impl<'a> UpstreamCompletionStaticType<'a> {
         self,
         target: &AttributeType,
         target_defs: &std::collections::BTreeMap<String, AttributeType>,
+        schemas: &SchemaRegistry,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> bool {
         match self {
-            Self::Known(type_expr) => {
-                type_expr_source_is_assignable_to(type_expr, target, target_defs)
-            }
+            Self::Known(type_expr) => type_expr_source_is_assignable_to(
+                type_expr,
+                target,
+                target_defs,
+                schemas,
+                provider_ctx,
+            ),
             Self::DeclaredUnnameable(_reason) | Self::InferredUnnameable(_reason) => true,
             Self::NotInferable(_reason) => false,
             Self::InferenceFailed(_error) => false,
@@ -194,18 +207,34 @@ impl<'a> UpstreamCompletionStaticType<'a> {
     }
 }
 
-/// Treat non-liftable boundary declarations as unchecked; otherwise compare
-/// the declared source to the schema sink through the shared directional
-/// `AttributeType` relation.
+/// Resolve authored declarations with the available schema evidence, then
+/// exclude proven mismatches through the shared directional relation. Missing
+/// scalar evidence remains unchecked while nominal mismatches are decidable.
 fn type_expr_source_is_assignable_to(
     source: &TypeExpr,
     sink: &AttributeType,
     sink_defs: &std::collections::BTreeMap<String, AttributeType>,
+    schemas: &SchemaRegistry,
+    provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
 ) -> bool {
-    let Some(source) = carina_core::validation::lift_type_expr(source) else {
+    let Ok(source) = carina_core::parser::resolve_type_expr_from_schemas(
+        source,
+        schemas,
+        provider_ctx.catalog(),
+    ) else {
         return true;
     };
-    TypeInSchema::schemaless(&source).is_assignable_to(sink.in_schema(sink_defs))
+    let Some(source) = carina_core::validation::lift_type_expr(&source) else {
+        return true;
+    };
+    let assignment = TypeInSchema::schemaless(&source).assignment_to(sink.in_schema(sink_defs));
+    if provider_ctx.catalog().custom_types_loaded() {
+        // Completion has no diagnostic channel; missing loaded evidence must
+        // exclude the candidate rather than suggest an unproven assignment.
+        assignment.require_loaded().unwrap_or(false)
+    } else {
+        assignment.record_unchecked(provider_ctx)
+    }
 }
 
 /// Context when the user has typed `binding_name.` after `=`.
@@ -247,6 +276,97 @@ fn type_completion_item(label: String, detail: String, range: Range) -> Completi
 }
 
 impl CompletionProvider {
+    pub(super) fn module_handle_dot_completions(
+        &self,
+        text: &str,
+        position: Position,
+        base_path: Option<&Path>,
+    ) -> Option<Vec<CompletionItem>> {
+        let line = text.lines().nth(position.line as usize)?;
+        let prefix = line
+            .chars()
+            .take(position.character as usize)
+            .collect::<String>();
+        let token_start = prefix
+            .char_indices()
+            .rev()
+            .find_map(|(index, character)| {
+                (!character.is_alphanumeric() && character != '_' && character != '.')
+                    .then_some(index + character.len_utf8())
+            })
+            .unwrap_or(0);
+        let token = &prefix[token_start..];
+        let segments = token.split('.').collect::<Vec<_>>();
+        if segments.len() != 3
+            || segments[0].is_empty()
+            || segments[1].is_empty()
+            || !segments.iter().all(|segment| {
+                segment
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || character == '_')
+            })
+        {
+            return None;
+        }
+        let call_binding = segments[0];
+        let output_name = segments[1];
+
+        let mut merged = String::new();
+        let source = DslSource::resolve_directory(text, base_path, &mut merged);
+        let (_, rhs) = Self::extract_let_bindings(source)
+            .into_iter()
+            .find(|(binding, _)| binding == call_binding)?;
+        if self.extract_resource_type(&rhs).is_some() {
+            return None;
+        }
+        let call_expression = rhs
+            .split(|character: char| character.is_whitespace() || character == '{')
+            .find(|segment| !segment.is_empty())?;
+        let header = format!("let {call_binding} = {call_expression} {{");
+        let module_name = crate::enclosing_block::named_module_call_name(header.trim())?;
+        let parsed = self.load_called_module(module_name, text, base_path)?;
+        let output = parsed
+            .attribute_params
+            .iter()
+            .find(|attribute| attribute.name == output_name)?;
+        let resource_type = output
+            .value
+            .as_ref()
+            .and_then(carina_core::parser::BoundaryExpression::handle)
+            .map(|handle| handle.resource_type().to_string())
+            .or_else(|| match output.static_type.as_ref() {
+                Some(TypeExpr::Ref(path)) => Some(path.to_string()),
+                Some(TypeExpr::DottedUnresolved(path))
+                    if self.lookup_schema(&path.to_string()).is_some() =>
+                {
+                    Some(path.to_string())
+                }
+                Some(TypeExpr::DottedUnresolved(_)) => None,
+                Some(
+                    TypeExpr::String
+                    | TypeExpr::Bool
+                    | TypeExpr::Int
+                    | TypeExpr::Float
+                    | TypeExpr::Duration
+                    | TypeExpr::Simple(_)
+                    | TypeExpr::UnloadedSchemaType(_)
+                    | TypeExpr::List(_)
+                    | TypeExpr::Map(_)
+                    | TypeExpr::SchemaType { .. }
+                    | TypeExpr::Struct { .. }
+                    | TypeExpr::StringLiteral(_)
+                    | TypeExpr::Union(_),
+                )
+                | None => None,
+            })?;
+        let start_character = prefix[..token_start].chars().count() as u32;
+        Some(self.binding_attribute_completions(
+            &format!("{call_binding}.{output_name}"),
+            &resource_type,
+            Range::new(Position::new(position.line, start_character), position),
+        ))
+    }
+
     pub(super) fn attribute_completions_for_type(
         &self,
         resource_type: &str,
@@ -319,7 +439,7 @@ impl CompletionProvider {
         current_binding: Option<&str>,
         position: Position,
         base_path: Option<&Path>,
-        provider_ctx: &carina_core::parser::ProviderContext,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
 
@@ -446,12 +566,16 @@ impl CompletionProvider {
                     base_path,
                     &self.schemas,
                     &mut exports_cache,
+                    provider_ctx,
                 );
                 for (export_name, entry) in exports {
                     let completion_type = structural_type_for_completion(entry);
-                    if !completion_type
-                        .is_candidate_for_target(attr_schema.attr_type(), schema.as_schema().defs())
-                    {
+                    if !completion_type.is_candidate_for_target(
+                        attr_schema.attr_type(),
+                        schema.as_schema().defs(),
+                        &self.schemas,
+                        provider_ctx,
+                    ) {
                         continue;
                     }
                     let full_ref = format!("{}.{}", binding, export_name);
@@ -504,8 +628,15 @@ impl CompletionProvider {
                     .extract_argument_parameters(src)
                     .into_iter()
                     .filter_map(|(name, type_hint)| {
-                        carina_core::parser::parse_type_expr_str(&type_hint, provider_ctx)
-                            .map(|t| (name, t))
+                        carina_core::parser::parse_type_expr_str(&type_hint, provider_ctx.catalog())
+                            .and_then(|ty| {
+                                carina_core::validation::resolve_type_expr(
+                                    &ty,
+                                    provider_ctx.catalog(),
+                                )
+                                .ok()
+                            })
+                            .map(|ty| (name, ty))
                     })
                     .collect();
                 let structural_resources = EnumValueResolver::with_defs(attr_type, target_defs)
@@ -524,7 +655,13 @@ impl CompletionProvider {
                     else {
                         return true;
                     };
-                    type_expr_source_is_assignable_to(arg_type_expr, attr_type, target_defs)
+                    type_expr_source_is_assignable_to(
+                        arg_type_expr,
+                        attr_type,
+                        target_defs,
+                        &self.schemas,
+                        provider_ctx,
+                    )
                 }));
             }
         }
@@ -548,8 +685,14 @@ impl CompletionProvider {
                     base_path,
                     &self.schemas,
                     &mut exports_cache,
+                    provider_ctx,
                 )
-                && !element_type.is_candidate_for_target(attr_type, target_defs)
+                && !element_type.is_candidate_for_target(
+                    attr_type,
+                    target_defs,
+                    &self.schemas,
+                    provider_ctx,
+                )
             {
                 continue;
             }
@@ -739,6 +882,7 @@ impl CompletionProvider {
     /// has a structured identity.
     fn extract_custom_type_name(attr_type: &AttributeType) -> Option<&str> {
         match attr_type.shape_ref_free() {
+            Ok(Shape::UnloadedSchemaType(unloaded)) => Some(&unloaded.identity().kind),
             Ok(Shape::Reference {
                 identity: id,
                 pattern: _,
@@ -776,6 +920,7 @@ impl CompletionProvider {
             return Vec::new();
         };
         match shape {
+            Shape::UnloadedSchemaType(_) => Vec::new(),
             Shape::Bool => {
                 vec![
                     CompletionItem {
@@ -1016,6 +1161,7 @@ impl CompletionProvider {
                 return;
             }
             match value_type.shape() {
+                Shape::UnloadedSchemaType(_) => {}
                 Shape::List { .. } => {
                     if let Some(element) = value_type.list_element() {
                         push_nested_paths(element, prefix, depth + 1, labels);
@@ -1078,7 +1224,7 @@ impl CompletionProvider {
     /// not surfaced — omitting `directives.provider` routes there.
     pub(super) fn directives_provider_completions(
         &self,
-        provider_ctx: &carina_core::parser::ProviderContext,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
         base_path: Option<&std::path::Path>,
     ) -> Vec<CompletionItem> {
         let bindings = collect_named_provider_instance_bindings(provider_ctx, base_path);
@@ -1337,8 +1483,10 @@ impl CompletionProvider {
         source: &str,
         position: Position,
         base_path: Option<&Path>,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
-        let Some(keys) = resolve_upstream_export_keys(binding, source, base_path, &self.schemas)
+        let Some(keys) =
+            resolve_upstream_export_keys(binding, source, base_path, &self.schemas, provider_ctx)
         else {
             return Vec::new();
         };
@@ -1389,14 +1537,19 @@ impl CompletionProvider {
     /// depth and produce an empty list.
     pub(super) fn upstream_state_depth2_dot_completions(
         &self,
-        binding: &str,
-        key: &str,
-        partial: &str,
-        source: &str,
+        upstream: &UpstreamDepth2Match,
         position: Position,
         base_path: Option<&Path>,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
-        let Some(keys) = resolve_upstream_export_keys(binding, source, base_path, &self.schemas)
+        let UpstreamDepth2Match {
+            binding,
+            key,
+            partial,
+            source,
+        } = upstream;
+        let Some(keys) =
+            resolve_upstream_export_keys(binding, source, base_path, &self.schemas, provider_ctx)
         else {
             return Vec::new();
         };
@@ -1478,6 +1631,7 @@ impl CompletionProvider {
             | carina_core::parser::TypeExpr::Float
             | carina_core::parser::TypeExpr::Duration
             | carina_core::parser::TypeExpr::Simple(_)
+            | carina_core::parser::TypeExpr::UnloadedSchemaType(_)
             | carina_core::parser::TypeExpr::List(_)
             | carina_core::parser::TypeExpr::Ref(_)
             | carina_core::parser::TypeExpr::DottedUnresolved(_)
@@ -1608,16 +1762,18 @@ impl CompletionProvider {
     /// since an unknown type offers no basis for suggestion.
     pub(super) fn exports_value_completions(
         &self,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
         type_expr_text: &str,
         in_nested: bool,
         text: &str,
         base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
-        let Some(annotation) = parse_exports_type_text(type_expr_text) else {
+        let Some(annotation) = parse_exports_type_text(type_expr_text, provider_ctx) else {
             return Vec::new();
         };
         let effective = if in_nested {
             match annotation.shape_ref_free() {
+                Ok(Shape::UnloadedSchemaType(_)) => return Vec::new(),
                 Ok(
                     Shape::List {
                         element_type: inner,
@@ -1675,6 +1831,7 @@ impl CompletionProvider {
         attr_defs: &std::collections::BTreeMap<String, AttributeType>,
         text: &str,
         base_path: Option<&Path>,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
         let mut items = self.completions_for_type(attr_type, None);
         items.extend(Self::builtin_function_completions_for_type(attr_type));
@@ -1683,14 +1840,20 @@ impl CompletionProvider {
             text,
             base_path,
         ));
-        items.extend(
-            self.module_call_binding_ref_completions_for_type(
-                attr_type, attr_defs, text, base_path,
-            ),
-        );
-        items.extend(
-            self.upstream_state_ref_completions_for_type(attr_type, attr_defs, text, base_path),
-        );
+        items.extend(self.module_call_binding_ref_completions_for_type(
+            attr_type,
+            attr_defs,
+            text,
+            base_path,
+            provider_ctx,
+        ));
+        items.extend(self.upstream_state_ref_completions_for_type(
+            attr_type,
+            attr_defs,
+            text,
+            base_path,
+            provider_ctx,
+        ));
         items
     }
 
@@ -1708,6 +1871,7 @@ impl CompletionProvider {
         target_defs: &std::collections::BTreeMap<String, AttributeType>,
         text: &str,
         base_path: Option<&Path>,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
         let mut items: Vec<CompletionItem> = Vec::new();
         let mut src_buf = String::new();
@@ -1724,10 +1888,16 @@ impl CompletionProvider {
                 base_path,
                 &self.schemas,
                 &mut exports_cache,
+                provider_ctx,
             );
             for (export_name, entry) in exports {
                 let completion_type = structural_type_for_completion(entry);
-                if !completion_type.is_candidate_for_target(target, target_defs) {
+                if !completion_type.is_candidate_for_target(
+                    target,
+                    target_defs,
+                    &self.schemas,
+                    provider_ctx,
+                ) {
                     continue;
                 }
                 let full_ref = format!("{}.{}", binding, export_name);
@@ -1805,6 +1975,7 @@ impl CompletionProvider {
         target_defs: &std::collections::BTreeMap<String, AttributeType>,
         text: &str,
         base_path: Option<&Path>,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
         let mut items: Vec<CompletionItem> = Vec::new();
         let mut src_buf = String::new();
@@ -1832,7 +2003,13 @@ impl CompletionProvider {
                 let Some(export_ty) = export.static_type.as_ref() else {
                     continue;
                 };
-                if !type_expr_source_is_assignable_to(export_ty, target, target_defs) {
+                if !type_expr_source_is_assignable_to(
+                    export_ty,
+                    target,
+                    target_defs,
+                    &self.schemas,
+                    provider_ctx,
+                ) {
                     continue;
                 }
                 let full_ref = format!("{}.{}", binding_name, export.name);
@@ -2027,9 +2204,9 @@ impl CompletionProvider {
         // Custom types: built-in types + provider-extracted types (deduplicated).
         // Internal registry is snake_case; the LSP surface is PascalCase.
         let mut seen_custom = std::collections::HashSet::new();
-        let custom: Vec<CompletionItem> = carina_core::parser::BUILTIN_BARE_CUSTOM_TYPES
-            .iter()
-            .map(|s| s.to_string())
+        let custom: Vec<CompletionItem> = carina_core::parser::builtin_bare_custom_types()
+            .keys()
+            .cloned()
             .chain(self.custom_type_names.iter().cloned())
             .filter(|name| seen_custom.insert(name.clone()))
             .map(|snake| {
@@ -2197,6 +2374,7 @@ fn resolve_upstream_export_keys(
     source: &str,
     base_path: Option<&Path>,
     schemas: &carina_core::schema::SchemaRegistry,
+    provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Option<carina_core::upstream_exports::UpstreamExportEntries> {
     let base = base_path?;
     let upstream = carina_core::parser::UpstreamState {
@@ -2207,7 +2385,7 @@ fn resolve_upstream_export_keys(
         carina_core::upstream_exports::resolve_upstream_exports_providerless_with_schemas(
             base,
             &[upstream],
-            &Default::default(),
+            provider_ctx,
             Some(schemas),
         );
     exports.remove(binding)
@@ -2235,9 +2413,11 @@ fn resolve_upstream_exports_cached<'a>(
         String,
         carina_core::upstream_exports::UpstreamExportEntries,
     >,
+    provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
 ) -> &'a carina_core::upstream_exports::UpstreamExportEntries {
     cache.entry(binding.to_string()).or_insert_with(|| {
-        resolve_upstream_export_keys(binding, source, base_path, schemas).unwrap_or_default()
+        resolve_upstream_export_keys(binding, source, base_path, schemas, provider_ctx)
+            .unwrap_or_default()
     })
 }
 
@@ -2264,6 +2444,7 @@ fn infer_for_binding_type(
         String,
         carina_core::upstream_exports::UpstreamExportEntries,
     >,
+    provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Option<StructuralTypeForCompletion<carina_core::parser::TypeExpr>> {
     use super::top_level::ForBindingSlot;
     use carina_core::parser::TypeExpr;
@@ -2284,7 +2465,7 @@ fn infer_for_binding_type(
                 carina_core::upstream_exports::resolve_upstream_exports_providerless_with_schemas(
                     base,
                     &[upstream],
-                    &Default::default(),
+                    provider_ctx,
                     Some(schemas),
                 );
             // Move the entry out of `resolved` rather than cloning so we
@@ -2324,6 +2505,7 @@ fn infer_for_binding_type(
             | TypeExpr::Float
             | TypeExpr::Duration
             | TypeExpr::Simple(_)
+            | TypeExpr::UnloadedSchemaType(_)
             | TypeExpr::Ref(_)
             | TypeExpr::DottedUnresolved(_)
             | TypeExpr::SchemaType { .. }
@@ -2370,6 +2552,7 @@ fn return_type_fits(
         return false;
     };
     match shape {
+        Shape::UnloadedSchemaType(_) => false,
         Shape::Union => {
             let Ok(Some(members)) = attr_type.union_members_ref_free_with_budget(budget) else {
                 return false;
@@ -2403,72 +2586,16 @@ fn return_type_fits(
     }
 }
 
-/// Parse the raw text of an `exports` entry's type annotation into an
-/// `AttributeType` good enough to drive value-position completion
-/// filtering. Accepts the shapes the DSL grammar produces at this
-/// surface:
-///
-/// * primitive names (`string`, `int`, `float`, `bool`)
-/// * `list(T)` / `map(T)` with recursive inner parsing
-/// * a bare identifier interpreted as a custom semantic subtype — the
-///   name is PascalCase'd (`aws_account_id` → `AwsAccountId`) and
-///   stored as `Custom { semantic_name: Some(PascalCase), base: String }`
-///   so `is_assignable_to` matches schemas that declare the same
-///   semantic name.
-///
-/// Namespaced identifiers (`aws.vpc.VpcId`) are **not** parsed today —
-/// they fall into `None` and the caller silently drops to the empty
-/// completion set. Add a dotted-path branch when a real corpus shows
-/// users reaching for that shape in `exports` annotations.
-///
-/// Returns `None` for anything we don't understand; the caller falls
-/// back to the empty completion set rather than dumping everything.
-fn parse_exports_type_text(text: &str) -> Option<AttributeType> {
-    let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    if let Some(inner) = strip_generic("list", text) {
-        return parse_exports_type_text(inner).map(AttributeType::list);
-    }
-    if let Some(inner) = strip_generic("map", text) {
-        let inner_ty = parse_exports_type_text(inner)?;
-        return Some(AttributeType::map_with_key(
-            AttributeType::string(),
-            inner_ty,
-        ));
-    }
-    match text {
-        // Post-Phase C, primitive types are PascalCase. Accept only the new
-        // spellings at the surface.
-        "String" => Some(AttributeType::string()),
-        "Int" => Some(AttributeType::int()),
-        "Float" => Some(AttributeType::float()),
-        "Bool" => Some(AttributeType::bool()),
-        // Custom types also ship in PascalCase now (e.g. `AwsAccountId`,
-        // `Ipv4Cidr`). Carry the PascalCase form as a bare identity.
-        name if name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-            && name.chars().all(|c| c.is_ascii_alphanumeric()) =>
-        {
-            Some(AttributeType::refined_string(
-                Some(carina_core::schema::TypeIdentity::bare(name)),
-                None,
-                None,
-                None,
-            ))
-        }
-        _ => None,
-    }
-}
-
-/// `list(...)` / `map(...)` wrapper stripper. Returns the inner text
-/// between balanced parens, `None` for any other shape.
-fn strip_generic<'a>(prefix: &str, text: &'a str) -> Option<&'a str> {
-    let rest = text.strip_prefix(prefix)?;
-    let rest = rest.trim_start();
-    let rest = rest.strip_prefix('(')?;
-    let rest = rest.strip_suffix(')')?;
-    Some(rest)
+/// Resolve and lift an exports annotation using the provider catalog rather
+/// than guessing a scalar kind from the spelling of a custom name.
+fn parse_exports_type_text(
+    text: &str,
+    provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
+) -> Option<AttributeType> {
+    let parsed = carina_core::parser::parse_type_expr_str(text, provider_ctx.catalog())?;
+    let resolved =
+        carina_core::validation::resolve_type_expr(&parsed, provider_ctx.catalog()).ok()?;
+    carina_core::validation::lift_type_expr(&resolved)
 }
 
 /// Scan `ancestor` for directories that look like carina projects.
@@ -2567,7 +2694,7 @@ fn join_relative(up_depth: usize, parts: &[&str]) -> String {
 /// (input/output shape) or a root config — `load_module` returns
 /// `None` for root configs and would miss the bindings entirely.
 fn collect_named_provider_instance_bindings(
-    provider_ctx: &carina_core::parser::ProviderContext,
+    provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     base_path: Option<&Path>,
 ) -> Vec<String> {
     let Some(base) = base_path else {
@@ -2578,7 +2705,7 @@ fn collect_named_provider_instance_bindings(
     } else {
         base.to_path_buf()
     };
-    let parsed = match carina_core::config_loader::parse_directory(&dir, provider_ctx) {
+    let parsed = match carina_core::config_loader::parse_directory(&dir, provider_ctx.catalog()) {
         Ok(p) => p,
         Err(_) => return Vec::new(),
     };
@@ -2595,6 +2722,80 @@ fn collect_named_provider_instance_bindings(
 #[cfg(test)]
 mod return_type_fits_tests {
     use super::*;
+
+    #[test]
+    fn unloaded_module_export_candidates_use_nominal_identity() {
+        let context = carina_core::parser::ProviderContext::default();
+        let nominal = |name: &str| {
+            let parsed = carina_core::parser::parse_type_expr_str(name, &context).unwrap();
+            let resolved = carina_core::validation::resolve_type_expr(&parsed, &context).unwrap();
+            carina_core::validation::lift_type_expr(&resolved).unwrap()
+        };
+        // Module loading preserves authored Simple syntax until resolution.
+        let source = carina_core::parser::parse_type_expr_str("KmsKeyArn", &context).unwrap();
+        let defs = std::collections::BTreeMap::new();
+        let schemas = SchemaRegistry::new();
+        assert!(
+            carina_core::validation::deferred_types::with_session_for_test(
+                &carina_core::parser::ProviderContext::default(),
+                |session| type_expr_source_is_assignable_to(
+                    &source,
+                    &nominal("KmsKeyArn"),
+                    &defs,
+                    &schemas,
+                    session
+                )
+            )
+        );
+        assert!(
+            !carina_core::validation::deferred_types::with_session_for_test(
+                &carina_core::parser::ProviderContext::default(),
+                |session| type_expr_source_is_assignable_to(
+                    &source,
+                    &nominal("Arn"),
+                    &defs,
+                    &schemas,
+                    session
+                )
+            )
+        );
+        assert!(
+            carina_core::validation::deferred_types::with_session_for_test(
+                &carina_core::parser::ProviderContext::default(),
+                |session| type_expr_source_is_assignable_to(
+                    &source,
+                    &AttributeType::string(),
+                    &defs,
+                    &schemas,
+                    session
+                )
+            )
+        );
+        assert!(
+            !carina_core::validation::deferred_types::with_session_for_test(
+                &carina_core::parser::ProviderContext::default(),
+                |session| type_expr_source_is_assignable_to(
+                    &source,
+                    &nominal("PositiveInt"),
+                    &defs,
+                    &schemas,
+                    session
+                )
+            )
+        );
+        assert!(
+            !carina_core::validation::deferred_types::with_session_for_test(
+                &carina_core::parser::ProviderContext::default(),
+                |session| type_expr_source_is_assignable_to(
+                    &TypeExpr::String,
+                    &nominal("KmsKeyArn"),
+                    &defs,
+                    &schemas,
+                    session
+                )
+            )
+        );
+    }
 
     fn unnameable_reason() -> UnnameableInConsumer {
         let declared =

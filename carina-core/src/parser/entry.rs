@@ -29,7 +29,8 @@ use super::resolve::{
     finalize_provider_configs, resolve_provider_unresolved_attributes, resolve_resource_refs,
 };
 use crate::eval_value::{
-    EvalValue, EvalValueError, ParsedSinkValue, StructuralHandle, StructuralHandleMetadata,
+    EvalValue, EvalValueError, ParsedSinkValue, UnexpandedStructuralHandle,
+    UnexpandedStructuralHandleMetadata,
 };
 use crate::parser::{
     ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value,
@@ -50,12 +51,12 @@ pub(crate) struct BindingSeed<'a> {
 pub(crate) enum SeedKind<'a> {
     Value {
         value: &'a Value,
-        structural_handles: Option<&'a StructuralHandleMetadata>,
+        structural_handles: Option<&'a UnexpandedStructuralHandleMetadata>,
     },
-    ModuleParameter,
-    TypedStructural(&'a StructuralHandle),
+    ModuleParameter(&'a super::TypeExpr),
+    TypedStructural(&'a UnexpandedStructuralHandle),
     Provisional,
-    StructuralAlias(&'a StructuralHandle),
+    StructuralAlias(&'a UnexpandedStructuralHandle),
 }
 
 /// Source span of a top-level declaration keyword.
@@ -182,7 +183,7 @@ impl<'a> BindingSeed<'a> {
     pub(crate) fn value_with_structural_handles(
         name: &'a str,
         value: &'a Value,
-        structural_handles: &'a StructuralHandleMetadata,
+        structural_handles: &'a UnexpandedStructuralHandleMetadata,
     ) -> Self {
         Self {
             name,
@@ -193,7 +194,7 @@ impl<'a> BindingSeed<'a> {
         }
     }
 
-    pub(crate) fn typed_structural(name: &'a str, handle: &'a StructuralHandle) -> Self {
+    pub(crate) fn typed_structural(name: &'a str, handle: &'a UnexpandedStructuralHandle) -> Self {
         Self {
             name,
             kind: SeedKind::TypedStructural(handle),
@@ -207,14 +208,14 @@ impl<'a> BindingSeed<'a> {
         }
     }
 
-    pub(crate) fn module_parameter(name: &'a str) -> Self {
+    pub(crate) fn module_parameter(name: &'a str, declared_type: &'a super::TypeExpr) -> Self {
         Self {
             name,
-            kind: SeedKind::ModuleParameter,
+            kind: SeedKind::ModuleParameter(declared_type),
         }
     }
 
-    pub(crate) fn structural_alias(name: &'a str, handle: &'a StructuralHandle) -> Self {
+    pub(crate) fn structural_alias(name: &'a str, handle: &'a UnexpandedStructuralHandle) -> Self {
         Self {
             name,
             kind: SeedKind::StructuralAlias(handle),
@@ -261,6 +262,33 @@ pub fn parse_file(
     let parsed = parse_with_seeded_bindings_inner(input, config, &[], &user_functions, true, path)?;
     super::resolve::reject_cyclic_let_bindings(&parsed)?;
     Ok(parsed)
+}
+
+/// Read factory declarations without evaluating unrelated function/resource
+/// statements. Named provider instances do not request factory loading.
+pub fn parse_provider_factory_declarations(
+    input: &str,
+    source_file: &Path,
+) -> Result<Vec<super::ParserProviderConfig>, ParseError> {
+    let file = Arc::new(super::preprocess_file(input)?);
+    let pairs = file.parse()?;
+    let config = ProviderContext::default();
+    let ctx = ParseContext::new(&config, source_file, Arc::clone(&file));
+    let mut providers = Vec::new();
+    for pair in pairs.filter(|pair| pair.as_rule() == Rule::file) {
+        for statement in pair
+            .into_inner()
+            .filter(|pair| pair.as_rule() == Rule::statement)
+        {
+            if let Some(declaration) = statement
+                .into_inner()
+                .find(|pair| pair.as_rule() == Rule::provider_block)
+            {
+                providers.push(parse_provider_block(declaration, &ctx)?);
+            }
+        }
+    }
+    Ok(providers)
 }
 
 /// Collect top-level `let` names without evaluating their right-hand sides.
@@ -1317,7 +1345,12 @@ fn parse_with_seeded_bindings_inner(
             }
         }
     }
-    for check in ctx.pending_function_type_checks.borrow().iter().cloned() {
+    for mut check in ctx.pending_function_type_checks.borrow().iter().cloned() {
+        // Keep authored call ownership in buffer-only parses as well as
+        // directory parses, so replay records the same site in either view.
+        check
+            .source_file
+            .get_or_insert_with(|| source_file.to_path_buf());
         parser_binding_metadata.insert_pending_function_type_check(check);
     }
     for (name, span) in argument_type_sources {
@@ -1497,8 +1530,8 @@ fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[BindingSeed<'_>]) {
                     EvalValue::computed(value.clone(), structural_handles.cloned()),
                 );
             }
-            SeedKind::ModuleParameter => {
-                ctx.set_variable(
+            SeedKind::ModuleParameter(declared_type) => {
+                ctx.set_argument_variable(
                     seed.name().to_string(),
                     Value::Deferred(crate::resource::DeferredValue::Placeholder(
                         crate::resource::ParserPlaceholder::ModuleArgument {
@@ -1506,6 +1539,7 @@ fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[BindingSeed<'_>]) {
                             diagnostic: Default::default(),
                         },
                     )),
+                    Some(declared_type.clone()),
                 );
             }
             SeedKind::TypedStructural(handle) => {

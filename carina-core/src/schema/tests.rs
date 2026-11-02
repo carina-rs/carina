@@ -2006,7 +2006,8 @@ fn schema_admission_rejects_identity_below_provider_populated_ancestor() {
 #[test]
 fn builtin_validator_registry_reconstructs_core_refinements_by_identity() {
     let registry = builtin_validator_registry();
-    assert_eq!(registry.len(), 12);
+    assert_eq!(registry.len(), builtin_type_registry().len());
+    assert_eq!(registry.len(), 15);
 
     let positive_int =
         builtin_validator(RefinedScalarKind::Int, &TypeIdentity::bare("PositiveInt"))
@@ -2028,6 +2029,596 @@ fn builtin_validator_registry_reconstructs_core_refinements_by_identity() {
         )))
         .is_err()
     );
+}
+
+#[test]
+fn provider_schema_rejects_conflicting_builtin_bare_declarations() {
+    use super::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let identity = TypeIdentity::bare("Email");
+    let declarations = [
+        AttributeType::refined_int(Some(identity.clone()), None),
+        AttributeType::refined_string(Some(identity.clone()), None, None, None),
+        AttributeType::refined_string_with_validator(
+            identity.clone(),
+            None,
+            None,
+            legacy_validator(|_| Ok(())),
+            None,
+        ),
+        AttributeType::refined_string_with_validator(
+            identity.clone(),
+            Some("^internal$".to_string()),
+            None,
+            match types::email().raw_shape() {
+                RawShape::String {
+                    validate: Some(validate),
+                    ..
+                } => validate.clone(),
+                _ => unreachable!(),
+            },
+            None,
+        ),
+        AttributeType::enum_(
+            identity,
+            Some(vec!["internal".to_string()]),
+            vec![],
+            None,
+            None,
+        ),
+    ];
+    for declaration in declarations {
+        // Both resource and config declarations feed the admission boundary.
+        for in_config in [false, true] {
+            let (resources, config) = if in_config {
+                (
+                    vec![],
+                    ValidatedConfigSchema::validate(BTreeMap::from([(
+                        "email".to_string(),
+                        declaration.clone(),
+                    )]))
+                    .unwrap(),
+                )
+            } else {
+                (
+                    vec![
+                        ResourceSchema::new("test.Contact")
+                            .attribute(
+                                AttributeSchema::optional("email", declaration.clone()).build(),
+                            )
+                            .validate()
+                            .unwrap(),
+                    ],
+                    ValidatedConfigSchema::default(),
+                )
+            };
+            let error =
+                ValidatedProviderSchemaWitness::new(resources, config, ReferenceForms::new())
+                    .expect_err("a provider must not silently redefine a core built-in");
+            let message = error.to_string();
+            assert!(
+                message.contains("Email") && message.contains("built-in"),
+                "{message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn provider_schema_accepts_shared_builtin_constructor_declarations() {
+    use super::{AttributeSchema, ResourceSchema};
+
+    // Independent constructor calls, as used by aws and awscc, remain valid.
+    let mut schemas = SchemaRegistry::new();
+    for owner in ["aws", "awscc"] {
+        let resources = vec![
+            ResourceSchema::new("test.Contact")
+                .attribute(AttributeSchema::optional("email", types::email()).build())
+                .attribute(AttributeSchema::optional("count", types::positive_int()).build())
+                .validate()
+                .unwrap(),
+        ];
+        let config_types = builtin_type_registry()
+            .iter()
+            .map(|(identity, declaration)| {
+                let wire =
+                    crate::protocol_convert::attribute_type_to_protocol(declaration).unwrap();
+                let decoded = crate::protocol_convert::protocol_to_attribute_type(&wire).unwrap();
+                (identity.kind.clone(), decoded)
+            })
+            .collect();
+        let config = ValidatedConfigSchema::validate(config_types).unwrap();
+        let witness = ValidatedProviderSchemaWitness::new(resources, config, ReferenceForms::new())
+            .expect("providers may reuse the core built-in constructors");
+        schemas
+            .insert_provider_witness(owner, &witness)
+            .expect("shared core declarations and wire-decoded declarations remain loadable");
+    }
+    assert_eq!(schemas.len(), 2);
+}
+
+#[test]
+fn builtin_type_documentation_matches_registry() {
+    let docs = include_str!("../../../site/src/content/reference/dsl/types-and-values.md");
+    let section = docs
+        .split("### Built-in Types\n")
+        .nth(1)
+        .expect("the reference must list every built-in type")
+        .split("\n### ")
+        .next()
+        .unwrap();
+    let documented = section
+        .lines()
+        .filter_map(|line| {
+            let (name, rest) = line.strip_prefix("| `")?.split_once('`')?;
+            let base = rest.split('|').nth(1)?.trim();
+            Some((name.to_string(), base.to_string()))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let registered = builtin_type_registry()
+        .iter()
+        .map(|(identity, declaration)| {
+            let kind = identified_declaration_scalar_kind(declaration)
+                .expect("every core built-in must declare a scalar kind");
+            (identity.kind.clone(), kind.to_string())
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        documented, registered,
+        "keep the DSL reference in sync with core built-ins"
+    );
+}
+
+#[test]
+fn domain_and_https_validator_errors_include_escaped_offending_value() {
+    for (validate, invalid) in [
+        (
+            validate_domain_name as fn(&str) -> Result<(), String>,
+            "a\n.example",
+        ),
+        (validate_domain_name, "localhost"),
+        (validate_wildcard_domain_name, "*.a_underscore.example"),
+        (validate_https_url, "https://example.com/\n"),
+        (validate_https_url, "http://example.com"),
+        (validate_https_url, "https://user@example.com"),
+        (validate_https_url, "https://[invalid]"),
+        (validate_https_url, "https://example.com:0"),
+        (validate_https_url, "https://example.com/{proxy}"),
+    ] {
+        let error = validate(invalid).expect_err("invalid fixture");
+        assert!(
+            error.contains(&display_string_literal(invalid)),
+            "{invalid:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn domain_name_builtins_accept_dns_names() {
+    for type_name in ["DomainName", "WildcardDomainName"] {
+        let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare(type_name))
+            .expect("Domain name types must be registered built-ins");
+        for domain in [
+            "a.b",
+            "example.com",
+            "EXAMPLE.Com",
+            "a.b-c.example",
+            "123.456",
+            "1.2.3.4",
+            "192.0.2.1",
+            "example.123",
+            "example.0xFF",
+            "xn--bcher-kva.example",
+            "example.com.",
+            "EXAMPLE.Com.",
+        ] {
+            let result = validate(&Value::Concrete(ConcreteValue::String(domain.into())));
+            assert!(result.is_ok(), "{type_name}: {domain:?}: {result:?}");
+        }
+    }
+}
+
+#[test]
+fn domain_name_builtins_reject_invalid_dns_names() {
+    for (type_name, prefix) in [
+        ("DomainName", ""),
+        ("WildcardDomainName", ""),
+        ("WildcardDomainName", "*."),
+    ] {
+        let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare(type_name))
+            .expect("Domain name types must be registered built-ins");
+        for domain in [
+            "",
+            ".",
+            "..",
+            "localhost",
+            "localhost.",
+            ".example.com",
+            "example..com",
+            "example.com..",
+            "a..b",
+            "-example.com",
+            "example-.com",
+            "example.-com",
+            "example.com-",
+            "exa_mple.com",
+            "example.c_om",
+            " example.com",
+            "example.com ",
+            "exa mple.com",
+            "example.\tcom",
+            "example.com\n",
+            "example.com\r",
+            "example.com\0",
+            "example.\u{a0}com",
+            "b\u{fc}cher.example",
+            "https://example.com",
+            "example.com:443",
+            "example.com/path",
+        ] {
+            let domain = format!("{prefix}{domain}");
+            assert!(
+                validate(&Value::Concrete(ConcreteValue::String(
+                    domain.clone().into()
+                )))
+                .is_err(),
+                "{type_name} must reject {domain:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn domain_name_builtin_rejects_wildcards() {
+    let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare("DomainName"))
+        .expect("DomainName must be a registered built-in");
+    for domain in [
+        "*.example.com",
+        "*.example.com.",
+        "a.*.com",
+        "*foo.com",
+        "**.com",
+        "*",
+    ] {
+        assert!(
+            validate(&Value::Concrete(ConcreteValue::String(domain.into()))).is_err(),
+            "DomainName must reject {domain:?}"
+        );
+    }
+}
+
+#[test]
+fn wildcard_domain_name_builtin_accepts_only_entire_leftmost_wildcard() {
+    let validate = builtin_validator(
+        RefinedScalarKind::String,
+        &TypeIdentity::bare("WildcardDomainName"),
+    )
+    .expect("WildcardDomainName must be a registered built-in");
+    for (domain, valid) in [
+        ("*.example.com", true),
+        ("*.EXAMPLE.Com", true),
+        ("*.example.com.", true),
+        ("*.a.b-c.example", true),
+        ("*.xn--bcher-kva.example", true),
+        ("*.123.456", true),
+        ("*", false),
+        ("*.", false),
+        ("*.com", false),
+        ("*.com.", false),
+        ("a.*.com", false),
+        ("*foo.com", false),
+        ("**.com", false),
+        ("*.*.example.com", false),
+        ("example.com.*", false),
+        ("*.a.*.com", false),
+        ("*.foo*.com", false),
+        ("*..example.com", false),
+    ] {
+        let result = validate(&Value::Concrete(ConcreteValue::String(domain.into())));
+        assert_eq!(result.is_ok(), valid, "{domain:?}: {result:?}");
+    }
+}
+
+#[test]
+fn domain_name_builtins_enforce_label_and_name_length_boundaries() {
+    let max_name = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61)
+    );
+    assert_eq!(max_name.len(), 253);
+    let too_long = format!("{max_name}d");
+    assert_eq!(too_long.len(), 254);
+    for (type_name, prefix) in [
+        ("DomainName", ""),
+        ("WildcardDomainName", ""),
+        ("WildcardDomainName", "*."),
+    ] {
+        let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare(type_name))
+            .expect("Domain name types must be registered built-ins");
+        for (domain, valid) in [
+            (format!("{}.com", "a".repeat(63)), true),
+            (format!("a.{}", "b".repeat(63)), true),
+            (format!("a.{}.com", "b".repeat(63)), true),
+            (format!("{}.com", "a".repeat(64)), false),
+            (format!("a.{}", "b".repeat(64)), false),
+            (format!("a.{}.com", "b".repeat(64)), false),
+            (max_name[..251].to_string(), true),
+            (format!("{}.", &max_name[..251]), true),
+            (max_name[..252].to_string(), prefix.is_empty()),
+            (format!("{}.", &max_name[..252]), prefix.is_empty()),
+            (max_name.clone(), prefix.is_empty()),
+            (format!("{max_name}."), prefix.is_empty()),
+            (too_long.clone(), false),
+            (format!("{too_long}."), false),
+        ] {
+            let domain = format!("{prefix}{domain}");
+            let result = validate(&Value::Concrete(ConcreteValue::String(
+                domain.clone().into(),
+            )));
+            assert_eq!(result.is_ok(), valid, "{type_name}: {domain:?}: {result:?}");
+        }
+    }
+}
+
+#[test]
+fn domain_name_builtins_reject_non_string_values() {
+    for type_name in ["DomainName", "WildcardDomainName"] {
+        let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare(type_name))
+            .expect("Domain name types must be registered built-ins");
+        for value in [
+            Value::Concrete(ConcreteValue::Int(123)),
+            Value::Concrete(ConcreteValue::Float(1.2)),
+            Value::Concrete(ConcreteValue::Bool(true)),
+            Value::Concrete(ConcreteValue::List(vec![])),
+        ] {
+            assert!(
+                validate(&value).is_err(),
+                "{type_name} must reject {value:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn https_url_builtin_accepts_absolute_https_urls() {
+    let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare("HttpsUrl"))
+        .expect("HttpsUrl must be a registered built-in");
+    let mut urls = vec![
+        "https://example.com".to_string(),
+        "https://EXAMPLE.com/".to_string(),
+        "https://localhost".to_string(),
+        "https://localhost.".to_string(),
+        "https://example.com.".to_string(),
+        "https://EXAMPLE.com.:443/path?q=1#fragment".to_string(),
+        "https://a.b-c.example".to_string(),
+        "https://xn--bcher-kva.example".to_string(),
+        "https://192.0.2.1:443/oidc".to_string(),
+        "https://[2001:db8::1]:8443/.well-known/jwks.json".to_string(),
+        "https://[::1]".to_string(),
+        "https://[::ffff:192.0.2.1]/".to_string(),
+        "https://example.com:1".to_string(),
+        "https://example.com:65535".to_string(),
+        "https://example.com:0443".to_string(),
+        "https://example.com?query=value".to_string(),
+        "https://example.com#fragment".to_string(),
+        "https://example.com?#".to_string(),
+        "https://example.com:8443/a%20b?q=x%2Fy#section-1".to_string(),
+        "https://example.com/a:b@c!$&'()*+,;=~_-./?q=@x/y?z#f/g?h".to_string(),
+        "https://example.com/%E6%97%A5%E6%9C%AC?q=%00#%7F".to_string(),
+        "https://example.com/path:65536".to_string(),
+    ];
+    urls.push(format!("https://{}.example", "a".repeat(63)));
+    // Length limits belong to attributes, not this provider-neutral type.
+    urls.push(format!(
+        "https://{}/{}?q=yes#fragment",
+        vec!["a".repeat(63); 5].join("."),
+        "p".repeat(4096)
+    ));
+    for url in urls {
+        let result = validate(&Value::Concrete(ConcreteValue::String(url.clone().into())));
+        assert!(result.is_ok(), "{url:?} should be accepted: {result:?}");
+    }
+}
+
+#[test]
+fn https_url_builtin_rejects_invalid_urls() {
+    let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare("HttpsUrl"))
+        .expect("HttpsUrl must be a registered built-in");
+    let mut urls = vec![
+        "",
+        "http://example.com",
+        "ftp://example.com",
+        "HTTPS://example.com",
+        "Https://example.com",
+        "https:example.com",
+        "https:/example.com",
+        "//example.com",
+        "example.com",
+        "https://",
+        "https:///path",
+        "https://?query",
+        "https://#fragment",
+        "https://:443",
+        "https://user@example.com",
+        "https://user:password@example.com",
+        "https://@example.com",
+        "https://example.com@evil.example",
+        "https://.example.com",
+        "https://example.com..",
+        "https://.",
+        "https://..",
+        "https://example..com",
+        "https://-example.com",
+        "https://example-.com",
+        "https://exa_mple.com",
+        "https://*.example.com",
+        "https://b\u{fc}cher.example",
+        "https://%65xample.com",
+        "https://256.0.0.1",
+        "https://192.0.2.01",
+        "https://127.1",
+        "https://[::1",
+        "https://[]",
+        "https://[127.0.0.1]",
+        "https://[not-ipv6]",
+        "https://[2001:db8::1::2]",
+        "https://[fe80::1%25eth0]",
+        "https://::1",
+        "https://[::1]suffix",
+        "https://[::1]]",
+        "https://[::1]:",
+        "https://[::1]:0",
+        "https://[::1]:65536",
+        "https://example.com:",
+        "https://example.com:0",
+        "https://example.com:65536",
+        "https://example.com:9999999999999999999999",
+        "https://example.com:+443",
+        "https://example.com:-1",
+        "https://example.com:abc",
+        "https://example.com:443:444",
+        "https://example.com:/path",
+        "https://example.com:?q",
+        "https://example.com\\@evil.example",
+        "https://example.com/path\\tail",
+        "https://example.com/%",
+        "https://example.com/%2",
+        "https://example.com/%GG",
+        "https://example.com?q=%zz",
+        "https://example.com#%x1",
+        "https://example.com#one#two",
+        "https://example.com/<tag>",
+        "https://example.com/\"quote",
+        "https://example.com/{proxy}",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    urls.push(format!("https://{}.example", "a".repeat(64)));
+    for url in urls {
+        assert!(
+            validate(&Value::Concrete(ConcreteValue::String(url.clone().into()))).is_err(),
+            "{url:?} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn https_url_builtin_requires_canonical_ipv4_when_host_ends_in_a_number() {
+    let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare("HttpsUrl"))
+        .expect("HttpsUrl must be a registered built-in");
+    for (host, valid) in [
+        ("123", false),
+        ("4294967295", false),
+        ("0x7f.1", false),
+        ("0x7f000001", false),
+        ("0X7F000001", false),
+        ("0x", false),
+        ("0X", false),
+        ("example.123", false),
+        ("example.09", false),
+        ("example.0x", false),
+        ("example.0X", false),
+        ("example.0xFF", false),
+        ("example.0Xff", false),
+        ("1.2.3.0x4", false),
+        ("01.2.3.4", false),
+        ("1.2.3.256", false),
+        ("1.2.3.4", true),
+        ("0.0.0.0", true),
+        ("255.255.255.255", true),
+        ("example.123a", true),
+        ("example.0xg", true),
+        ("123.example", true),
+    ] {
+        for suffix in ["", ".", ":443/path?q=1#fragment", ".:443/path?q=1#fragment"] {
+            let url = format!("https://{host}{suffix}");
+            let result = validate(&Value::Concrete(ConcreteValue::String(url.clone().into())));
+            assert_eq!(result.is_ok(), valid, "{url:?}: {result:?}");
+        }
+    }
+}
+
+#[test]
+fn https_url_builtin_rejects_whitespace_and_controls_in_every_component() {
+    let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare("HttpsUrl"))
+        .expect("HttpsUrl must be a registered built-in");
+    let characters = (0u8..=32).map(char::from).chain([
+        '\u{7f}', '\u{85}', '\u{9f}', '\u{a0}', '\u{2003}', '\u{2028}',
+    ]);
+    for character in characters {
+        for (prefix, suffix) in [
+            ("", "https://example.com"),
+            ("https://exa", "mple.com"),
+            ("https://example.com:44", "3"),
+            ("https://example.com/p", "ath"),
+            ("https://example.com?q=v", "alue"),
+            ("https://example.com#frag", "ment"),
+        ] {
+            let url = format!("{prefix}{character}{suffix}");
+            assert!(
+                validate(&Value::Concrete(ConcreteValue::String(url.clone().into()))).is_err(),
+                "{url:?} should be rejected"
+            );
+        }
+    }
+}
+
+#[test]
+fn https_url_builtin_rejects_non_string_values() {
+    let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare("HttpsUrl"))
+        .expect("HttpsUrl must be a registered built-in");
+    for value in [
+        Value::Concrete(ConcreteValue::Int(443)),
+        Value::Concrete(ConcreteValue::Float(443.0)),
+        Value::Concrete(ConcreteValue::Bool(true)),
+        Value::Concrete(ConcreteValue::List(vec![])),
+    ] {
+        assert!(validate(&value).is_err(), "{value:?} should be rejected");
+    }
+}
+
+#[test]
+fn https_url_builtin_constructor_and_json_roundtrip_preserve_validation() {
+    let url_type = admit_builtin_type(types::https_url());
+    let AttrTypeKind::String {
+        binding,
+        pattern,
+        length,
+        ..
+    } = url_type.kind()
+    else {
+        panic!("HttpsUrl must refine String");
+    };
+    assert_eq!(binding.identity(), Some(&TypeIdentity::bare("HttpsUrl")));
+    assert!(pattern.is_none() && length.is_none());
+
+    let wire = crate::protocol_convert::attribute_type_to_protocol(&url_type).unwrap();
+    let json = serde_json::to_string(&wire).unwrap();
+    let wire = serde_json::from_str(&json).unwrap();
+    let decoded =
+        admit_builtin_type(crate::protocol_convert::protocol_to_attribute_type(&wire).unwrap());
+    for ty in [url_type, decoded] {
+        assert!(
+            ty.validate(&Value::Concrete(ConcreteValue::String(
+                "https://example.com:8443/keys?q=1#key".into()
+            )))
+            .is_ok()
+        );
+        assert!(
+            ty.validate(&Value::Concrete(ConcreteValue::String(
+                "http://example.com".into()
+            )))
+            .is_err()
+        );
+        assert!(
+            ty.validate(&Value::Concrete(ConcreteValue::Int(443)))
+                .is_err()
+        );
+    }
 }
 
 #[test]
@@ -8494,13 +9085,17 @@ fn lifted_type_expr_finite_universe_is_reflexive() {
         ("Int", TypeExpr::Int),
         ("Float", TypeExpr::Float),
         ("Bool", TypeExpr::Bool),
-        ("Simple(ipv4_cidr)", TypeExpr::Simple("ipv4_cidr".into())),
+        (
+            "Simple(ipv4_cidr)",
+            crate::parser::bare_type_for_test("ipv4_cidr".into()),
+        ),
         (
             "SchemaType(aws.ec2.Vpc.Id)",
             TypeExpr::SchemaType {
                 owned: crate::parser::OwnedTypeIdentity::provider(
                     "aws",
                     TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id"),
+                    crate::schema::RefinedScalarKind::String,
                 ),
             },
         ),
@@ -8536,10 +9131,6 @@ fn lifted_type_expr_finite_universe_is_reflexive() {
             "Ref(aws.ec2.Vpc)",
             TypeExpr::Ref(ResourceTypePath::new("aws", "ec2.Vpc")),
         ),
-        (
-            "DottedUnresolved(aws.ec2.Vpc)",
-            TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "ec2.Vpc")),
-        ),
     ];
 
     for (name, type_expr) in liftable {
@@ -8550,10 +9141,19 @@ fn lifted_type_expr_finite_universe_is_reflexive() {
             "lifted TypeExpr must be assignable to itself; offending pair: lift({name}) -> lift({name})",
         );
     }
+
+    assert!(
+        crate::validation::lift_type_expr(&TypeExpr::DottedUnresolved(ResourceTypePath::new(
+            "aws", "ec2.Vpc"
+        ),))
+        .is_none(),
+        "an unresolved dotted provider type must not be guessed to be a resource handle",
+    );
 }
 
 fn contains_unrefined_primitive(attr: &AttributeType) -> bool {
     match &attr.kind {
+        AttrTypeKind::UnloadedSchemaType(_) => false,
         AttrTypeKind::String {
             binding: RefinementBinding::MetadataOnly(None),
             pattern: None,

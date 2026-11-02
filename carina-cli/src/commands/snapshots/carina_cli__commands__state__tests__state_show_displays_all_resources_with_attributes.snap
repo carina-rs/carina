@@ -8,6 +8,7 @@ expression: output
   vpc_id = 'vpc-0123456789abcdef0'
 
 # awscc.ec2.Subnet (subnet)
+  dependencies not yet migrated (legacy: vpc)
   availability_zone = 'ap-northeast-1a'
   cidr_block = '10.0.1.0/24'
   subnet_id = 'subnet-0123456789abcdef0'
@@ -15,5 +16,6 @@ expression: output
   vpc_id = 'vpc-0123456789abcdef0'
 
 # awscc.ec2.RouteTable (main-rt)
+  dependencies not yet migrated (legacy: vpc)
   route_table_id = 'rtb-0123456789abcdef0'
   vpc_id = 'vpc-0123456789abcdef0'

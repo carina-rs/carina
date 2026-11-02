@@ -899,6 +899,7 @@ impl ModuleSignature {
             | TypeExpr::Float
             | TypeExpr::Duration
             | TypeExpr::Simple(_)
+            | TypeExpr::UnloadedSchemaType(_)
             | TypeExpr::Ref(_)
             | TypeExpr::DottedUnresolved(_)
             | TypeExpr::SchemaType { .. }
@@ -917,6 +918,7 @@ impl ModuleSignature {
             | TypeExpr::List(_)
             | TypeExpr::Map(_)
             | TypeExpr::Simple(_)
+            | TypeExpr::UnloadedSchemaType(_)
             | TypeExpr::SchemaType { .. }
             | TypeExpr::Struct { .. }
             | TypeExpr::StringLiteral(_)
@@ -1011,12 +1013,21 @@ impl ModuleSignature {
             .attribute_params
             .iter()
             .map(|attr_param| {
-                let source_binding = attr_param.value.as_ref().and_then(|v| match v {
-                    Value::Deferred(DeferredValue::ResourceRef { path }) => {
-                        Some(path.binding().to_string())
-                    }
-                    _ => None,
-                });
+                let source_binding =
+                    attr_param
+                        .value
+                        .as_ref()
+                        .and_then(|expression| match expression {
+                            crate::parser::BoundaryExpression::Value(Value::Deferred(
+                                DeferredValue::ResourceRef { path },
+                            )) => Some(path.binding().to_string()),
+                            crate::parser::BoundaryExpression::Handle(handle) => {
+                                Some(handle.canonical_binding_name().to_string())
+                            }
+                            crate::parser::BoundaryExpression::Value(
+                                Value::Concrete(_) | Value::Deferred(_),
+                            ) => None,
+                        });
 
                 TypedAttributeParam {
                     name: attr_param.name.clone(),
@@ -1405,6 +1416,7 @@ impl ModuleSignature {
             | TypeExpr::Float
             | TypeExpr::Duration
             | TypeExpr::Simple(_)
+            | TypeExpr::UnloadedSchemaType(_)
             | TypeExpr::SchemaType { .. }
             | TypeExpr::StringLiteral(_)
             | TypeExpr::Union(_) => format!("{}{}{}", c.green, type_expr, c.reset),

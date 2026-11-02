@@ -340,12 +340,19 @@ impl RootDirectoryParse<crate::parser::InferredExportParam> {
     /// Resolve root-owned type declarations while preserving this witness.
     pub fn resolve_type_exprs_report(
         &mut self,
-        config: &ProviderContext,
+        config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> crate::validation::FileTypeResolutionReport {
         crate::validation::resolve_file_type_exprs_report(&mut self.parsed, config, None)
     }
 
     /// Resolve root-relative resource references while preserving this witness.
+    pub fn resolve_resource_refs_in_session(
+        &mut self,
+        session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Result<(), parser::ParseError> {
+        parser::resolve_resource_refs_in_session(&mut self.parsed, session)
+    }
+
     pub fn resolve_resource_refs_with_config(
         &mut self,
         config: &ProviderContext,
@@ -527,7 +534,7 @@ fn collect_file_declarations(
         .filter(|name| !argument_names.contains(name) && !function_names.contains(name))
         .collect();
     for name in local_variable_names {
-        if parsed.variables.contains_key(name)
+        if parsed.variables.contains_key(name.as_str())
             && !binding_names.contains(name.as_str())
             && !argument_names.contains(name.as_str())
         {
@@ -1081,7 +1088,7 @@ pub(crate) fn merge_parsed_file<E, B: BindingAddress>(
 #[derive(Clone, PartialEq)]
 struct DirectorySeedState {
     variables: IndexMap<String, parser::ParsedValue>,
-    metadata: crate::parser::ParserBindingMetadata,
+    metadata: crate::parser::ParserSeedMetadata,
 }
 
 #[derive(Debug)]
@@ -1178,7 +1185,12 @@ pub(crate) fn parse_directory_files_located_from_root(
     provisional_seeds.extend(
         directory_module_parameters
             .iter()
-            .map(|name| parser::BindingSeed::module_parameter(name)),
+            // The syntax-classification pass does not know an argument's
+            // declared type when parsing a sibling file. Preserve the bare
+            // name as a provisional reference here; the fixed-point union
+            // replaces it with either a typed structural handle (`Ref`) or a
+            // value-shaped module-argument placeholder before the final pass.
+            .map(|name| parser::BindingSeed::provisional(name)),
     );
 
     // Pass 1.a: classify declarations with the complete syntactic scope.
@@ -1201,15 +1213,16 @@ pub(crate) fn parse_directory_files_located_from_root(
         merge_parsed_file(&mut pass1_union, parsed);
     }
     let structural = pass1_union.structural_binding_names();
-    let module_parameters: HashSet<&str> = pass1_union
+    let module_parameters: HashMap<&str, &parser::TypeExpr> = pass1_union
         .arguments
         .iter()
-        .map(|argument| argument.name.as_str())
+        .map(|argument| (argument.name.as_str(), &argument.static_type))
         .collect();
     parser::reject_cyclic_let_bindings_in_variables(&pass1_union.variables, &structural)
         .map_err(LocatedParseError::directory_wide)?;
-    let mut seed_metadata = pass1_union.parser_binding_metadata.clone();
-    seed_metadata.clear_pending_function_type_checks();
+    let seed_metadata = pass1_union.parser_binding_metadata.binding_seed_snapshot();
+    let mut stable_structural_metadata = seed_metadata.clone();
+    stable_structural_metadata.retain(|name| !pass1_union.variables.contains_key(name.as_str()));
     let mut bindings_current = DirectorySeedState {
         variables: pass1_union.variables.clone(),
         metadata: seed_metadata,
@@ -1224,13 +1237,21 @@ pub(crate) fn parse_directory_files_located_from_root(
             &bindings_current.variables,
             &bindings_current.metadata,
         );
-        let bindings_next = parse_local_variable_union(
+        let mut bindings_next = parse_local_variable_union(
             files,
             config,
             &seeds,
             &pass_1a_local_variables,
             &directory_functions,
         )?;
+        // The fixed point recomputes value-shaped `let` bindings only.
+        // Resource handles, Ref-typed module arguments, and structural aliases
+        // are declarations rather than values, so carry their exact metadata
+        // across every iteration instead of degrading them to provisional or
+        // unknown seeds after the first pass.
+        let mut still_structural = stable_structural_metadata.clone();
+        still_structural.retain(|name| !bindings_next.variables.contains_key(name.as_str()));
+        bindings_next.metadata.extend(still_structural);
         parser::reject_cyclic_let_bindings_in_variables(&bindings_next.variables, &structural)
             .map_err(LocatedParseError::directory_wide)?;
 
@@ -1421,7 +1442,7 @@ fn parse_local_variable_union(
     user_functions: &HashMap<String, parser::UserFunction>,
 ) -> Result<DirectorySeedState, LocatedParseError> {
     let mut variables = IndexMap::new();
-    let mut metadata = crate::parser::ParserBindingMetadata::default();
+    let mut metadata = crate::parser::ParserSeedMetadata::default();
     for ((path, content), local_variables) in files.iter().zip(local_variables_by_file.iter()) {
         let mut parsed = parser::parse_with_directory_context(
             content,
@@ -1438,11 +1459,8 @@ fn parse_local_variable_union(
         parsed
             .parser_binding_metadata
             .retain(|name| local_variables.contains(name.as_str()));
-        parsed
-            .parser_binding_metadata
-            .clear_pending_function_type_checks();
         variables.extend(parsed.variables);
-        metadata.extend(parsed.parser_binding_metadata);
+        metadata.extend(parsed.parser_binding_metadata.binding_seed_snapshot());
     }
     Ok(DirectorySeedState {
         variables,
@@ -1526,6 +1544,33 @@ mod tests {
     use crate::parser::ModuleCall;
     use crate::resource::{DeferredValue, Value};
     use std::fs;
+
+    #[test]
+    fn directory_load_preserves_resource_handle_export_type_for_boundary_validation() {
+        let directory = tempfile::tempdir().expect("temporary export fixture");
+        fs::write(
+            directory.path().join("main.crn"),
+            "let instance = mock.compute.Instance { name = \"instance\" }\nexports {\n  inferred = instance\n}\n",
+        )
+        .expect("write fixture");
+
+        let loaded = load_configuration_with_config(
+            directory.path(),
+            &ProviderContext::default(),
+            &SchemaRegistry::new(),
+        )
+        .expect("load handle export fixture");
+        assert!(
+            matches!(
+                loaded.parsed.export_params[0].static_type,
+                crate::static_type::ExportStaticType::Inferred(
+                    crate::static_type::StaticType::Known(crate::parser::TypeExpr::Ref(_))
+                )
+            ),
+            "directory inference lost the handle export: {:?}",
+            loaded.parsed.export_params[0].static_type,
+        );
+    }
 
     /// Helper to create a temporary directory for tests
     fn create_temp_dir(name: &str) -> PathBuf {
@@ -2245,13 +2290,18 @@ for account_id in orgs.accounts {
         .unwrap();
 
         let config = load_configuration(&dir).expect("directory fixture loads");
-        let mut parsed = crate::module_resolver::resolve_modules_with_providerless_config(
-            config.parsed,
-            &dir,
+        let mut parsed = crate::validation::deferred_types::with_session_for_test(
             &ProviderContext::default(),
-            &SchemaRegistry::new(),
-        )
-        .expect("directory fixture crosses the module-resolution seam");
+            |session| {
+                crate::module_resolver::resolve_modules_with_providerless_config(
+                    config.parsed,
+                    &dir,
+                    session,
+                    &SchemaRegistry::new(),
+                )
+                .expect("directory fixture crosses the module-resolution seam")
+            },
+        );
         assert_eq!(parsed.deferred_for_expressions().len(), 1);
         let deferred_line = parsed.deferred_for_expressions()[0].line();
         parsed.warnings.push(crate::parser::ParseWarning {
@@ -2281,9 +2331,11 @@ for account_id in orgs.accounts {
         let mut parsed = parsed
             .into_expanded(&crate::schema::SchemaRegistry::new())
             .expect("directory fixture must contain no parser placeholders");
-        parsed
-            .expand_deferred_for_expressions(&bindings)
-            .expect("resolved upstream iterable expands");
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| parsed.expand_deferred_for_expressions(&bindings, session),
+        )
+        .expect("resolved upstream iterable expands");
 
         assert!(parsed.deferred_for_expressions().is_empty());
         assert!(
@@ -2410,12 +2462,19 @@ let orgs = upstream_state {
         let parsed = load_configuration(fixture.path())
             .expect("the parser-side deferred body must survive directory loading")
             .parsed;
-        crate::module_resolver::resolve_modules_with_providerless_config(
-            parsed,
-            fixture.path(),
+        crate::validation::deferred_types::with_session_for_test(
             &ProviderContext::default(),
-            &SchemaRegistry::new(),
+            |session| {
+                crate::module_resolver::resolve_modules_with_providerless_config(
+                    parsed,
+                    fixture.path(),
+                    session,
+                    &SchemaRegistry::new(),
+                )
+                .map_err(Box::new)
+            },
         )
+        .map_err(|error| *error)
     }
 
     #[test]
@@ -3121,7 +3180,7 @@ awscc.ec2.SecurityGroup {
                     rhs: Value::Concrete(crate::resource::ConcreteValue::String("ready".into())),
                 },
                 timeout_secs: None,
-                depends_on: Vec::new(),
+                depends_on: Default::default(),
                 line: 1,
             }],
             ..ParsedFile::default()

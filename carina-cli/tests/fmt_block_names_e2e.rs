@@ -241,6 +241,7 @@ impl FormattingClient {
         }))
         .await;
 
+        // wall-clock-ok: hang guard for messages from a real LSP process; formatting is asserted separately.
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let message = self.read_non_request().await;
@@ -271,6 +272,7 @@ impl FormattingClient {
             }
         }))
         .await;
+        // wall-clock-ok: hang guard for messages from a real LSP process; formatting is asserted separately.
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let message = self.read_non_request().await;

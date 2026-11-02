@@ -1,6 +1,6 @@
 //! CLI-level regression coverage for destroy ordering through wait bindings.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -37,6 +37,33 @@ impl Scenario {
 
     fn write_config(&self) {
         self.write_config_with_cert_name("cert");
+    }
+
+    fn write_distribution_config(&self) {
+        fs::write(
+            self.project.join("main.crn"),
+            format!(
+                r#"backend local {{ path = "{}" }}
+provider mock {{}}
+
+let cert = mock.test.resource {{
+  name = "cert"
+  comment = "ready"
+}}
+
+let cert_issued = wait cert {{
+  until = cert.comment == "ready"
+}}
+
+let distribution = mock.test.resource {{
+  name = "distribution"
+  comment = cert_issued.comment
+}}
+"#,
+                self.state_path.display()
+            ),
+        )
+        .unwrap();
     }
 
     fn write_single_resource_config(&self) {
@@ -114,8 +141,20 @@ let lst = mock.test.resource {{
             .with_attribute("id", serde_json::json!("lst-id"))
             .with_attribute("upstream", serde_json::json!("cert-id"));
         lst.binding = Some(absolute_binding("lst"));
-        lst.dependency_bindings
-            .insert(absolute_binding("cert_issued"));
+        lst.dependency_bindings =
+            carina_core::resource::PersistedDestroyDependencies::decode_persisted(
+                [
+                    carina_core::resource::ResolvedResourceId::with_provider_identity(
+                        "mock",
+                        "test.resource",
+                        "cert",
+                        None,
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap();
         state
             .upsert_resource(lst)
             .expect("test state setup must be valid");
@@ -168,7 +207,7 @@ let lst = mock.test.resource {{
                 ("id".to_string(), serde_json::json!("main-old")),
                 ("status".to_string(), serde_json::json!("STALE")),
             ]),
-            BTreeSet::new(),
+            Default::default(),
         ));
         state
             .upsert_resource(main)
@@ -209,6 +248,35 @@ let lst = mock.test.resource {{
             .env("CARINA_MOCK_STATE_FILE", &self.mock_state_path)
             .env("CARINA_MOCK_DELETE_LOG", &self.delete_log_path)
             .env("CARINA_MOCK_DELETE_DELAY_MS_FOR", "test.resource.lst")
+            .env("CARINA_MOCK_DELETE_DELAY_MS", DELETE_DELAY_MS)
+            .output()
+            .expect("failed to execute carina destroy")
+    }
+
+    fn apply(&self) -> Output {
+        carina(&self.project)
+            .args(["apply", "--auto-approve", ".", "--lock=false"])
+            .env("CARINA_MOCK_STATE_FILE", &self.mock_state_path)
+            .output()
+            .expect("failed to execute carina apply")
+    }
+
+    fn destroy_distribution(&self) -> Output {
+        carina(&self.project)
+            .args([
+                "destroy",
+                "--auto-approve",
+                ".",
+                "--lock=false",
+                "--parallelism",
+                "8",
+            ])
+            .env("CARINA_MOCK_STATE_FILE", &self.mock_state_path)
+            .env("CARINA_MOCK_DELETE_LOG", &self.delete_log_path)
+            .env(
+                "CARINA_MOCK_DELETE_DELAY_MS_FOR",
+                "test.resource.distribution",
+            )
             .env("CARINA_MOCK_DELETE_DELAY_MS", DELETE_DELAY_MS)
             .output()
             .expect("failed to execute carina destroy")
@@ -342,6 +410,55 @@ fn destroy_wait_ordering_deletes_dependent_before_wait_target() {
     assert!(
         lst_pos < cert_pos,
         "destroy must delete lst before cert when lst depends on wait binding cert_issued; delete log: {delete_log:?}"
+    );
+}
+
+#[test]
+fn apply_persists_wait_dependency_as_managed_target_and_destroy_uses_it() {
+    let scenario = Scenario::new();
+    scenario.write_distribution_config();
+    scenario.init();
+
+    let apply = scenario.apply();
+    assert_success("carina apply", &apply);
+
+    let raw_state = fs::read_to_string(&scenario.state_path).expect("read state after apply");
+    let state: serde_json::Value =
+        serde_json::from_str(&raw_state).expect("state after apply is valid JSON");
+    let distribution = state["resources"]
+        .as_array()
+        .expect("state resources are an array")
+        .iter()
+        .find(|row| row["identity"] == "distribution")
+        .expect("distribution row is persisted");
+    assert_eq!(
+        distribution["dependency_bindings"],
+        serde_json::json!([{
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "cert"
+        }]),
+        "the wait must be flattened to its managed certificate row"
+    );
+    assert!(
+        !raw_state.contains("__wait"),
+        "synthetic wait IDs must never enter persisted state: {raw_state}"
+    );
+
+    let destroy = scenario.destroy_distribution();
+    assert_success("carina destroy", &destroy);
+    let delete_log = scenario.delete_log();
+    let distribution_pos = delete_log
+        .iter()
+        .position(|entry| entry == "test.resource.distribution")
+        .expect("delete log should contain distribution");
+    let cert_pos = delete_log
+        .iter()
+        .position(|entry| entry == "test.resource.cert")
+        .expect("delete log should contain cert");
+    assert!(
+        distribution_pos < cert_pos,
+        "destroy must delete distribution before its projected certificate dependency: {delete_log:?}"
     );
 }
 

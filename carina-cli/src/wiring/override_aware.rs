@@ -1,5 +1,6 @@
 //! Canonical resource pairs and resolved resources with permanent name overrides applied.
 
+use carina_core::resource::{PendingResourceIdentityError, ResolvedResourceId};
 use std::collections::{HashMap, HashSet};
 
 use carina_core::binding_index::{LivePreApplyInputs, ManagedBindingStability, ResolvedBindings};
@@ -325,6 +326,7 @@ impl<E> CanonicalResourcePair<E> {
     pub fn expand_deferred_for_expressions<F>(
         &mut self,
         bindings: &carina_core::binding_index::IterableBindings<'_>,
+        type_checks: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
         classify: F,
     ) -> Result<
         (
@@ -348,7 +350,8 @@ impl<E> CanonicalResourcePair<E> {
                     .any(|deferred| deferred.location().matches_deferred_warning(warning))
         });
         self.parsed.replace_deferred_for_expressions(selected);
-        self.parsed.expand_deferred_for_expressions(bindings)?;
+        self.parsed
+            .expand_deferred_for_expressions(bindings, type_checks)?;
         let residual = self.parsed.deferred_for_expressions().clone();
         self.parsed
             .deferred_for_expressions_mut()
@@ -387,9 +390,11 @@ impl<E> CanonicalResourcePair<E> {
 
 /// Two paired resources resolved to the same identity before execution.
 #[derive(Debug, thiserror::Error)]
-#[error("override-aware resources contain duplicate resolved id {id}")]
-pub struct DuplicateResolvedResourceIdError {
-    id: ResourceId,
+pub enum ResolvedResourceOriginIndexError {
+    #[error(transparent)]
+    PendingIdentity(#[from] PendingResourceIdentityError),
+    #[error("override-aware resources contain duplicate resolved id {id}")]
+    Duplicate { id: ResolvedResourceId },
 }
 
 /// Reference-resolution mode for an evaluated/authored resource pair.
@@ -453,10 +458,13 @@ impl OverrideAwareResources {
         inputs: LivePreApplyInputs<'_>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
         mode: OverrideAwareBuildMode<'_>,
+        session: &super::ValidationProviderCatalog,
     ) -> Result<(Self, Self), String> {
         let (evaluated, unresolved) = resources.resources_for_build()?;
-        let evaluated = Self::build_inner(evaluated, state, &inputs, managed_stability, mode)?;
-        let unresolved = Self::build_inner(unresolved, state, &inputs, managed_stability, mode)?;
+        let evaluated =
+            Self::build_inner(evaluated, state, &inputs, managed_stability, mode, session)?;
+        let unresolved =
+            Self::build_inner(unresolved, state, &inputs, managed_stability, mode, session)?;
         Ok((evaluated, unresolved))
     }
 
@@ -468,7 +476,19 @@ impl OverrideAwareResources {
         mode: OverrideAwareBuildMode<'_>,
     ) -> Result<(Self, Self), String> {
         let state = ProjectedStateRead::for_test_unmoved(None);
-        Self::build_pair_with_stability(resources, &state, inputs, managed_stability, mode)
+        carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                Self::build_pair_with_stability(
+                    resources,
+                    &state,
+                    inputs,
+                    managed_stability,
+                    mode,
+                    session,
+                )
+            },
+        )
     }
 
     fn build_inner(
@@ -477,6 +497,7 @@ impl OverrideAwareResources {
         inputs: &LivePreApplyInputs<'_>,
         managed_stability: &HashMap<ResourceId, ManagedBindingStability>,
         mode: OverrideAwareBuildMode<'_>,
+        session: &super::ValidationProviderCatalog,
     ) -> Result<Self, String> {
         let mut resources = unresolved.clone();
         let mut bindings = ResolvedBindings::pre_apply_live_with_stability(
@@ -490,7 +511,7 @@ impl OverrideAwareResources {
             },
             managed_stability,
         );
-        resolve_resources(&mut resources, &bindings, &mode)?;
+        resolve_resources(&mut resources, &bindings, &mode, session)?;
 
         let snapshot = resources.clone();
         let mut unresolved_resources = unresolved;
@@ -536,7 +557,7 @@ impl OverrideAwareResources {
             },
             managed_stability,
         );
-        resolve_resources(&mut resources, &bindings, &mode)?;
+        resolve_resources(&mut resources, &bindings, &mode, session)?;
 
         Ok(Self {
             resources,
@@ -577,7 +598,8 @@ impl OverrideAwareResources {
 
     pub fn unresolved_by_resolved_id(
         &self,
-    ) -> Result<HashMap<ResourceId, UnresolvedResource>, DuplicateResolvedResourceIdError> {
+    ) -> Result<HashMap<ResolvedResourceId, UnresolvedResource>, ResolvedResourceOriginIndexError>
+    {
         unresolved_map_from_paired(self.resources(), self.paired_unresolved_resources())
     }
 
@@ -632,7 +654,8 @@ impl OverrideAwareResources {
     pub fn unresolved_by_resolved_id_with_binding_sources(
         &self,
         binding_sources: &OverrideAwareResources,
-    ) -> Result<HashMap<ResourceId, UnresolvedResource>, DuplicateResolvedResourceIdError> {
+    ) -> Result<HashMap<ResolvedResourceId, UnresolvedResource>, ResolvedResourceOriginIndexError>
+    {
         let paired_unresolved =
             self.paired_unresolved_resources_with_binding_sources(binding_sources);
         unresolved_map_from_paired(self.resources(), paired_unresolved)
@@ -729,7 +752,7 @@ fn can_pair_by_binding(resource: &Resource, source: &Resource) -> bool {
 fn unresolved_map_from_paired(
     resources: &[Resource],
     paired_unresolved: Vec<Resource>,
-) -> Result<HashMap<ResourceId, UnresolvedResource>, DuplicateResolvedResourceIdError> {
+) -> Result<HashMap<ResolvedResourceId, UnresolvedResource>, ResolvedResourceOriginIndexError> {
     assert_eq!(
         resources.len(),
         paired_unresolved.len(),
@@ -737,10 +760,11 @@ fn unresolved_map_from_paired(
     );
     let mut by_id = HashMap::with_capacity(paired_unresolved.len());
     for (resource, unresolved) in resources.iter().zip(paired_unresolved) {
-        let id = resource.id.clone();
+        let id = ResolvedResourceId::try_new(resource.id.clone())
+            .ok_or_else(|| PendingResourceIdentityError::new(resource.id.clone()))?;
         let previous = by_id.insert(id.clone(), UnresolvedResource::from_pre_resolve(unresolved));
         if previous.is_some() {
-            return Err(DuplicateResolvedResourceIdError { id });
+            return Err(ResolvedResourceOriginIndexError::Duplicate { id });
         }
     }
     Ok(by_id)
@@ -750,10 +774,11 @@ fn resolve_resources(
     resources: &mut [Resource],
     bindings: &ResolvedBindings,
     mode: &OverrideAwareBuildMode<'_>,
+    session: &super::ValidationProviderCatalog,
 ) -> Result<(), String> {
     match mode {
         OverrideAwareBuildMode::Apply => {
-            carina_core::resolver::resolve_refs_with_state_and_remote(resources, bindings)
+            carina_core::resolver::resolve_refs_with_state_and_remote(resources, bindings, session)
         }
         OverrideAwareBuildMode::Plan {
             unresolved_upstream_bindings,
@@ -761,6 +786,7 @@ fn resolve_resources(
             resources,
             bindings,
             unresolved_upstream_bindings,
+            session,
         ),
     }
 }
@@ -847,19 +873,25 @@ mod tests {
         parsed.resources = resources.clone();
         let canonical = CanonicalResourcePair::new(parsed, resources);
         let state = ProjectedStateRead::for_test_name_overrides(overrides);
-        OverrideAwareResources::build_pair_with_stability(
-            &canonical,
-            &state,
-            LivePreApplyInputs {
-                managed: &[],
-                compositions: &compositions,
-                managed_current: &managed_current,
-                data_source_values: &data_source_values,
-                remote_bindings: &remote_bindings,
-                wait_aliases: &wait_aliases,
+        carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                OverrideAwareResources::build_pair_with_stability(
+                    &canonical,
+                    &state,
+                    LivePreApplyInputs {
+                        managed: &[],
+                        compositions: &compositions,
+                        managed_current: &managed_current,
+                        data_source_values: &data_source_values,
+                        remote_bindings: &remote_bindings,
+                        wait_aliases: &wait_aliases,
+                    },
+                    &HashMap::new(),
+                    OverrideAwareBuildMode::Apply,
+                    session,
+                )
             },
-            &HashMap::new(),
-            OverrideAwareBuildMode::Apply,
         )
         .map(|(evaluated, _)| evaluated)
         .expect("override-aware resources should build")

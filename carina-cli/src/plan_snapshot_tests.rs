@@ -31,6 +31,7 @@ use crate::plan_summary::PlanChangeSummary;
 
 #[allow(clippy::too_many_arguments)]
 fn format_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
+    color_mode: crate::output_style::ColorMode,
     plan: &Plan,
     detail: DetailLevel,
     historical_display: &D,
@@ -45,8 +46,10 @@ fn format_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
         deferred_for_expressions.iter().cloned(),
     );
     let summary = PlanChangeSummary::new(plan, export_changes, &deferred_for_expressions, &[]);
-    let provider = provider_router_for_plan(plan);
+    let provider = provider_router_for_plan(&crate::test_support::TestCommandRuntime::new(), plan)
+        .expect("fixture mock inputs must be valid");
     format_plan_with_delete_instances(
+        color_mode,
         plan,
         &summary,
         detail,
@@ -64,21 +67,33 @@ fn format_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
 }
 
 fn format_destroy_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
+    color_mode: crate::output_style::ColorMode,
     plan: &Plan,
     detail: DetailLevel,
     historical_display: &D,
 ) -> String {
-    let provider = provider_router_for_plan(plan);
-    format_destroy_plan_with_delete_instances(plan, detail, historical_display, &provider)
-        .expect("snapshot destroy plan must have an initialized provider route")
+    let provider = provider_router_for_plan(&crate::test_support::TestCommandRuntime::new(), plan)
+        .expect("fixture mock inputs must be valid");
+    format_destroy_plan_with_delete_instances(
+        color_mode,
+        plan,
+        detail,
+        historical_display,
+        &provider,
+    )
+    .expect("snapshot destroy plan must have an initialized provider route")
 }
 
 fn resolved(resource: Resource) -> ResolvedResource {
-    ResolvedResource::new(resource)
+    ResolvedResource::collect_resolved([resource])
+        .expect("fixture identity resolves")
+        .remove(0)
 }
 
 fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
-    ResolvedDataSource::new(resource)
+    ResolvedDataSource::collect_resolved([resource])
+        .expect("fixture identity resolves")
+        .remove(0)
 }
 
 /// Strip ANSI escape codes from a string for snapshot readability.
@@ -109,18 +124,22 @@ fn nested_write_only_listener_block<'a>(output: &'a str, name: &str) -> &'a str 
 
 /// Build a plan from a .crn fixture and optional state file, mimicking `--refresh=false`.
 fn build_plan_from_fixture(
+    color_mode: crate::output_style::ColorMode,
     fixture_dir: &str,
 ) -> (
     carina_core::plan::Plan,
     SchemaRegistry,
     HashMap<ResourceId, ResourceId>,
 ) {
-    let fp = build_plan_from_fixture_name(fixture_dir);
+    let runtime = crate::test_support::TestCommandRuntime::new().with_color_mode(color_mode);
+    let fp = build_plan_from_fixture_name(&runtime, fixture_dir)
+        .expect("fixture mock inputs must be valid");
     (fp.plan, fp.schemas, fp.moved_origins)
 }
 
 #[allow(clippy::type_complexity)]
 fn build_plan_and_states_from_fixture(
+    color_mode: crate::output_style::ColorMode,
     fixture_dir: &str,
 ) -> (
     carina_core::plan::Plan,
@@ -128,7 +147,9 @@ fn build_plan_and_states_from_fixture(
     SchemaRegistry,
     HashMap<ResourceId, ResourceId>,
 ) {
-    let fp = build_plan_from_fixture_name(fixture_dir);
+    let runtime = crate::test_support::TestCommandRuntime::new().with_color_mode(color_mode);
+    let fp = build_plan_from_fixture_name(&runtime, fixture_dir)
+        .expect("fixture mock inputs must be valid");
     (fp.plan, fp.managed_current, fp.schemas, fp.moved_origins)
 }
 
@@ -144,8 +165,10 @@ fn delete_attributes_for_plan(
 /// reference; the snapshot pins how the plan tree renders that edge.
 #[test]
 fn snapshot_depends_on() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("depends_on");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "depends_on");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -161,7 +184,10 @@ fn snapshot_depends_on() {
 
 #[test]
 fn snapshot_ignore_changes_readable_drift() {
-    let fp = build_plan_from_fixture_name("ignore_changes_readable");
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let fp = build_plan_from_fixture_name(&runtime, "ignore_changes_readable")
+        .expect("fixture mock inputs must be valid");
     assert_eq!(fp.plan.ignored_change_summaries().len(), 2);
     assert!(
         fp.plan
@@ -171,6 +197,7 @@ fn snapshot_ignore_changes_readable_drift() {
     );
 
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -187,8 +214,10 @@ fn snapshot_ignore_changes_readable_drift() {
 
 #[test]
 fn snapshot_postfix_access() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("postfix_access");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "postfix_access");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -227,8 +256,10 @@ fn snapshot_deferred_integer_arithmetic_is_structural() {
 
 #[test]
 fn snapshot_iam_preflight_warning_appears_after_plan_summary() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("depends_on");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "depends_on");
     let mut output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::None,
         &HashMap::new(),
@@ -285,8 +316,10 @@ fn snapshot_iam_preflight_warning_appears_after_plan_summary() {
 ///   `plan_tree::build_dependency_graph`.
 #[test]
 fn snapshot_wait_cert() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("wait_cert");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "wait_cert");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -302,8 +335,10 @@ fn snapshot_wait_cert() {
 
 #[test]
 fn snapshot_all_create() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("all_create");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "all_create");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -319,7 +354,10 @@ fn snapshot_all_create() {
 
 #[test]
 fn snapshot_resolved_value_constraint_multifile() {
-    let fp = build_plan_from_fixture_name("resolved_value_constraint_multifile");
+    let runtime = crate::test_support::TestCommandRuntime::new();
+
+    let fp = build_plan_from_fixture_name(&runtime, "resolved_value_constraint_multifile")
+        .expect("fixture mock inputs must be valid");
     assert!(
         !fp.plan.errors().is_empty(),
         "the fixture planner must run the resolved-value constraint gate"
@@ -370,7 +408,8 @@ fn snapshot_module_constraint_plan_error() {
 
 #[test]
 fn non_module_anonymous_dependency_uses_schema_derived_identity() {
-    let (plan, _schemas, _moved) = build_plan_from_fixture("all_create");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, _schemas, _moved) = build_plan_from_fixture(color_mode, "all_create");
     let route_table = plan
         .effects()
         .iter()
@@ -398,8 +437,10 @@ fn non_module_anonymous_dependency_uses_schema_derived_identity() {
 /// silent about the instance — that surface is owned by a later phase).
 #[test]
 fn snapshot_multi_instance_create() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("multi_instance_create");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "multi_instance_create");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -421,7 +462,8 @@ fn snapshot_multi_instance_create() {
 /// `ProviderRouter::get_provider_or_error` keys on at apply time.
 #[test]
 fn multi_instance_create_propagates_provider_instance() {
-    let (plan, _schemas, _moved) = build_plan_from_fixture("multi_instance_create");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, _schemas, _moved) = build_plan_from_fixture(color_mode, "multi_instance_create");
 
     let mut by_name: HashMap<String, Option<String>> = HashMap::new();
     for effect in plan.effects() {
@@ -457,7 +499,8 @@ fn multi_instance_create_propagates_provider_instance() {
 /// covers the module-expanded shape specifically.
 #[test]
 fn module_routed_instance_propagates_provider_instance() {
-    let (plan, _schemas, _moved) = build_plan_from_fixture("multi_instance_module");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, _schemas, _moved) = build_plan_from_fixture(color_mode, "multi_instance_module");
 
     let routed: Vec<(String, Option<String>)> = plan
         .effects()
@@ -496,8 +539,10 @@ fn module_routed_instance_propagates_provider_instance() {
 /// the anonymous resource is *not* rendered as `bootstrap.`.
 #[test]
 fn snapshot_module_anonymous_resource() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("module_anonymous_resource");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "module_anonymous_resource");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -513,8 +558,10 @@ fn snapshot_module_anonymous_resource() {
 
 #[test]
 fn snapshot_policy_pretty() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("policy_pretty");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "policy_pretty");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -530,8 +577,10 @@ fn snapshot_policy_pretty() {
 
 #[test]
 fn snapshot_policy_pretty_nested() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("policy_pretty_nested");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "policy_pretty_nested");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -556,8 +605,10 @@ fn snapshot_policy_pretty_nested() {
 /// path.
 #[test]
 fn snapshot_list_struct_child_gutter() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("list_struct_child_gutter");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "list_struct_child_gutter");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -573,14 +624,17 @@ fn snapshot_list_struct_child_gutter() {
 
 #[test]
 fn snapshot_policy_pretty_dynamic_key_list() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     // #2528 acceptance: an IAM trust-policy `condition.<op>.<context-key>:
     // [list]` shape — a multi-element list-of-strings nested under a
     // dynamic-key Map — must break across lines all the way down, the
     // same way `statement[].action` does. Pre-fix the deepest list
     // collapsed to one line because the inline-vs-vertical decision did
     // not bubble down to nested Map values.
-    let (plan, schemas, _moved) = build_plan_from_fixture("policy_pretty_dynamic_key_list");
+    let (plan, schemas, _moved) =
+        build_plan_from_fixture(color_mode, "policy_pretty_dynamic_key_list");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -596,8 +650,10 @@ fn snapshot_policy_pretty_dynamic_key_list() {
 
 #[test]
 fn snapshot_pretty_long_string_list() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("pretty_long_string_list");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "pretty_long_string_list");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -613,8 +669,10 @@ fn snapshot_pretty_long_string_list() {
 
 #[test]
 fn snapshot_pretty_short_string_list() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("pretty_short_string_list");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "pretty_short_string_list");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -630,8 +688,10 @@ fn snapshot_pretty_short_string_list() {
 
 #[test]
 fn snapshot_no_changes() {
-    let (plan, _schemas, _moved) = build_plan_from_fixture("no_changes");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, _schemas, _moved) = build_plan_from_fixture(color_mode, "no_changes");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -647,17 +707,22 @@ fn snapshot_no_changes() {
 
 #[test]
 fn snapshot_state_only_directive_change() {
-    let fp = build_plan_from_fixture_name("state_only_directive_change");
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let fp = build_plan_from_fixture_name(&runtime, "state_only_directive_change")
+        .expect("fixture mock inputs must be valid");
     assert!(
         fp.plan.effects().is_empty(),
         "the fixture must contain no provider-visible effects"
     );
     let summary = build_fixture_plan_change_summary(&fp);
-    let provider = provider_router_for_plan(&fp.plan);
+    let provider =
+        provider_router_for_plan(&runtime, &fp.plan).expect("fixture mock inputs must be valid");
     let historical_display =
         carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&fp.plan);
     let output = strip_ansi(
         &format_plan_with_delete_instances(
+            color_mode,
             &fp.plan,
             &summary,
             DetailLevel::Full,
@@ -687,8 +752,12 @@ fn snapshot_state_only_directive_change() {
 /// `No changes. Infrastructure is up-to-date.`
 #[test]
 fn snapshot_empty_explicit_children_no_changes() {
-    let fp = build_plan_from_fixture_name("empty_explicit_children_no_changes");
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let fp = build_plan_from_fixture_name(&runtime, "empty_explicit_children_no_changes")
+        .expect("fixture mock inputs must be valid");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -710,8 +779,10 @@ fn snapshot_empty_explicit_children_no_changes() {
 
 #[test]
 fn snapshot_mixed_operations() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("mixed_operations");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "mixed_operations");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -727,8 +798,10 @@ fn snapshot_mixed_operations() {
 
 #[test]
 fn snapshot_replace_create_only() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("replace_create_only");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "replace_create_only");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -744,7 +817,9 @@ fn snapshot_replace_create_only() {
 
 #[test]
 fn snapshot_anonymous_create_only_rekey() {
-    let (plan, schemas, moved_origins) = build_plan_from_fixture("anonymous_create_only_rekey");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, moved_origins) =
+        build_plan_from_fixture(color_mode, "anonymous_create_only_rekey");
     assert_eq!(
         plan.summary().replace,
         1,
@@ -759,6 +834,7 @@ fn snapshot_anonymous_create_only_rekey() {
     assert_eq!(moved_origins.len(), 1);
 
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -775,7 +851,10 @@ fn snapshot_anonymous_create_only_rekey() {
 
 #[test]
 fn anonymous_old_identity_name_override_is_a_pure_move() {
-    let fixture = build_plan_from_fixture_name("anonymous_old_identity_name_override");
+    let runtime = crate::test_support::TestCommandRuntime::new();
+
+    let fixture = build_plan_from_fixture_name(&runtime, "anonymous_old_identity_name_override")
+        .expect("fixture mock inputs must be valid");
     let summary = fixture.plan.summary();
 
     assert_eq!(summary.create, 0);
@@ -789,11 +868,14 @@ fn anonymous_old_identity_name_override_is_a_pure_move() {
 
 #[test]
 fn snapshot_anonymous_old_identity_update() {
-    let (plan, schemas, moved_origins) = build_plan_from_fixture("anonymous_old_identity_update");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, moved_origins) =
+        build_plan_from_fixture(color_mode, "anonymous_old_identity_update");
     assert_eq!(plan.summary().update, 1);
     assert_eq!(plan.summary().moved, 1);
 
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -811,12 +893,15 @@ fn snapshot_anonymous_old_identity_update() {
 }
 
 fn assert_anonymous_loop_fixture(
+    color_mode: crate::output_style::ColorMode,
     fixture_name: &str,
     expected_create: usize,
     expected_delete: usize,
     expected_moved: usize,
 ) -> String {
-    let fixture = build_plan_from_fixture_name(fixture_name);
+    let runtime = crate::test_support::TestCommandRuntime::new().with_color_mode(color_mode);
+    let fixture = build_plan_from_fixture_name(&runtime, fixture_name)
+        .expect("fixture mock inputs must be valid");
     let summary = fixture.plan.summary();
 
     assert_eq!(
@@ -840,6 +925,7 @@ fn assert_anonymous_loop_fixture(
     );
 
     strip_ansi(&format_plan(
+        color_mode,
         &fixture.plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -854,13 +940,15 @@ fn assert_anonymous_loop_fixture(
 
 #[test]
 fn snapshot_anonymous_loop_insert_before() {
-    let output = assert_anonymous_loop_fixture("anonymous_loop_insert_before", 1, 0, 2);
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let output = assert_anonymous_loop_fixture(color_mode, "anonymous_loop_insert_before", 1, 0, 2);
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_anonymous_loop_origin_labels() {
-    let output = assert_anonymous_loop_fixture("anonymous_loop_insert_before", 1, 0, 2);
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let output = assert_anonymous_loop_fixture(color_mode, "anonymous_loop_insert_before", 1, 0, 2);
     let origin_lines = output
         .lines()
         .filter(|line| line.contains("(for ["))
@@ -876,62 +964,76 @@ fn snapshot_anonymous_loop_origin_labels() {
 
 #[test]
 fn snapshot_anonymous_loop_reorder() {
-    let output = assert_anonymous_loop_fixture("anonymous_loop_reorder", 0, 0, 3);
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let output = assert_anonymous_loop_fixture(color_mode, "anonymous_loop_reorder", 0, 0, 3);
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_anonymous_loop_delete_earlier() {
-    let output = assert_anonymous_loop_fixture("anonymous_loop_delete_earlier", 0, 2, 1);
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let output =
+        assert_anonymous_loop_fixture(color_mode, "anonymous_loop_delete_earlier", 0, 2, 1);
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_anonymous_loop_sibling_files() {
-    let output = assert_anonymous_loop_fixture("anonymous_loop_sibling_files", 1, 0, 1);
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let output = assert_anonymous_loop_fixture(color_mode, "anonymous_loop_sibling_files", 1, 0, 1);
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_anonymous_loop_same_tail() {
-    let output = assert_anonymous_loop_fixture("anonymous_loop_same_tail", 1, 0, 1);
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let output = assert_anonymous_loop_fixture(color_mode, "anonymous_loop_same_tail", 1, 0, 1);
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_anonymous_if_legacy() {
-    let output = assert_anonymous_loop_fixture("anonymous_if_legacy", 0, 0, 1);
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let output = assert_anonymous_loop_fixture(color_mode, "anonymous_if_legacy", 0, 0, 1);
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_anonymous_loop_deferred_map() {
-    let output = assert_anonymous_loop_fixture("anonymous_loop_deferred_map", 0, 0, 1);
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let output = assert_anonymous_loop_fixture(color_mode, "anonymous_loop_deferred_map", 0, 0, 1);
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_anonymous_loop_module_call() {
-    let output = assert_anonymous_loop_fixture("anonymous_loop_module_call", 0, 0, 1);
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let output = assert_anonymous_loop_fixture(color_mode, "anonymous_loop_module_call", 0, 0, 1);
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_anonymous_loop_claimed_legacy() {
-    let output = assert_anonymous_loop_fixture("anonymous_loop_claimed_legacy", 1, 0, 1);
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let output =
+        assert_anonymous_loop_fixture(color_mode, "anonymous_loop_claimed_legacy", 1, 0, 1);
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_anonymous_loop_new_id_exists() {
-    let output = assert_anonymous_loop_fixture("anonymous_loop_new_id_exists", 0, 1, 0);
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let output = assert_anonymous_loop_fixture(color_mode, "anonymous_loop_new_id_exists", 0, 1, 0);
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_replace_with_non_forcing_diffs() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("replace_with_non_forcing_diffs");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) =
+        build_plan_from_fixture(color_mode, "replace_with_non_forcing_diffs");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -947,10 +1049,35 @@ fn snapshot_replace_with_non_forcing_diffs() {
 
 #[test]
 fn snapshot_delete_orphan() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let (plan, current_states, schemas, _moved) =
-        build_plan_and_states_from_fixture("delete_orphan");
+        build_plan_and_states_from_fixture(color_mode, "delete_orphan");
     let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
     let output = strip_ansi(&format_plan(
+        color_mode,
+        &plan,
+        DetailLevel::Full,
+        &delete_attributes,
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_legacy_orphan_unknown_destroy_ordering() {
+    let color_mode = crate::output_style::ColorMode::Plain;
+    // Legacy dependency warnings are emitted to stderr during state migration,
+    // before the plan renderer consumes the migrated, typed dependencies.
+    let (plan, current_states, schemas, _moved) =
+        build_plan_and_states_from_fixture(color_mode, "legacy_orphan_unknown_destroy_ordering");
+    let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
+    let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &delete_attributes,
@@ -966,13 +1093,17 @@ fn snapshot_delete_orphan() {
 
 #[test]
 fn snapshot_deposed_delete() {
-    let fp = build_plan_from_fixture_name("deposed_delete");
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let fp = build_plan_from_fixture_name(&runtime, "deposed_delete")
+        .expect("fixture mock inputs must be valid");
     let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(
         &fp.plan,
         &fp.managed_current,
         fp.state_file.as_ref(),
     );
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &delete_attributes,
@@ -988,7 +1119,10 @@ fn snapshot_deposed_delete() {
 
 #[test]
 fn fixture_removed_block_suppresses_prior_missing_identifier_error() {
-    let fp = build_plan_from_fixture_name("removed_missing_identifier");
+    let runtime = crate::test_support::TestCommandRuntime::new();
+
+    let fp = build_plan_from_fixture_name(&runtime, "removed_missing_identifier")
+        .expect("fixture mock inputs must be valid");
 
     assert!(
         fp.plan.errors().is_empty(),
@@ -1005,13 +1139,17 @@ fn fixture_removed_block_suppresses_prior_missing_identifier_error() {
 
 #[test]
 fn snapshot_deposed_delete_update_dependency() {
-    let fp = build_plan_from_fixture_name("deposed_delete_update_dependency");
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let fp = build_plan_from_fixture_name(&runtime, "deposed_delete_update_dependency")
+        .expect("fixture mock inputs must be valid");
     let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(
         &fp.plan,
         &fp.managed_current,
         fp.state_file.as_ref(),
     );
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &delete_attributes,
@@ -1037,10 +1175,12 @@ fn snapshot_deposed_delete_update_dependency() {
 /// `build_detail_rows` / `build_delete_rows`.
 #[test]
 fn snapshot_delete_orphan_list_of_maps() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let (plan, current_states, schemas, _moved) =
-        build_plan_and_states_from_fixture("delete_orphan_list_of_maps");
+        build_plan_and_states_from_fixture(color_mode, "delete_orphan_list_of_maps");
     let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &delete_attributes,
@@ -1056,8 +1196,10 @@ fn snapshot_delete_orphan_list_of_maps() {
 
 #[test]
 fn snapshot_compact() {
-    let (plan, _schemas, _moved) = build_plan_from_fixture("compact");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, _schemas, _moved) = build_plan_from_fixture(color_mode, "compact");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::None,
         &HashMap::new(),
@@ -1073,8 +1215,10 @@ fn snapshot_compact() {
 
 #[test]
 fn snapshot_map_key_diff() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("map_key_diff");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "map_key_diff");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -1093,8 +1237,10 @@ fn snapshot_map_key_diff() {
 /// lines, not as a single inline `tags: (none) → {...}` line.
 #[test]
 fn snapshot_map_added_from_none() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("map_added_from_none");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "map_added_from_none");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -1115,8 +1261,10 @@ fn snapshot_map_added_from_none() {
 /// for the removal direction.
 #[test]
 fn snapshot_map_attribute_removed() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("map_attribute_removed");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "map_attribute_removed");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -1132,8 +1280,10 @@ fn snapshot_map_attribute_removed() {
 
 #[test]
 fn snapshot_enum_display() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("enum_display");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "enum_display");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -1149,8 +1299,10 @@ fn snapshot_enum_display() {
 
 #[test]
 fn snapshot_string_dot_suffix() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("string_dot_suffix");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "string_dot_suffix");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -1171,8 +1323,10 @@ fn snapshot_string_dot_suffix() {
 
 #[test]
 fn snapshot_no_changes_enum() {
-    let (plan, _schemas, _moved) = build_plan_from_fixture("no_changes_enum");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, _schemas, _moved) = build_plan_from_fixture(color_mode, "no_changes_enum");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -1188,11 +1342,13 @@ fn snapshot_no_changes_enum() {
 
 #[test]
 fn dynamic_enum_az_state_api_spelling_has_no_diff_in_cli_plan_path() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("dynamic_enum_az_no_diff");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "dynamic_enum_az_no_diff");
     assert!(
         plan.effects().is_empty(),
         "API-spelled saved state must compare equal to DSL-spelled desired state through the CLI plan path:\n{}",
         strip_ansi(&format_plan(
+            color_mode,
             &plan,
             DetailLevel::Full,
             &HashMap::new(),
@@ -1208,12 +1364,14 @@ fn dynamic_enum_az_state_api_spelling_has_no_diff_in_cli_plan_path() {
 
 #[test]
 fn route53_hosted_zone_name_strip_suffix_no_diff() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let (plan, schemas, _moved) =
-        build_plan_from_fixture("route53_hosted_zone_name_strip_suffix_no_diff");
+        build_plan_from_fixture(color_mode, "route53_hosted_zone_name_strip_suffix_no_diff");
     assert!(
         plan.effects().is_empty(),
         "Route53 HostedZone state names with a trailing dot must compare equal to DSL names without one:\n{}",
         strip_ansi(&format_plan(
+            color_mode,
             &plan,
             DetailLevel::Full,
             &HashMap::new(),
@@ -1229,10 +1387,12 @@ fn route53_hosted_zone_name_strip_suffix_no_diff() {
 
 #[test]
 fn snapshot_destroy_full() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let (plan, current_states, _schemas, _moved) =
-        build_plan_and_states_from_fixture("destroy_full");
+        build_plan_and_states_from_fixture(color_mode, "destroy_full");
     let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
     let output = strip_ansi(&format_destroy_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &delete_attributes,
@@ -1248,10 +1408,12 @@ fn snapshot_destroy_full() {
 /// (cf. #3115).
 #[test]
 fn snapshot_destroy_list_struct_child_gutter() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let (plan, current_states, _schemas, _moved) =
-        build_plan_and_states_from_fixture("destroy_list_struct_child_gutter");
+        build_plan_and_states_from_fixture(color_mode, "destroy_list_struct_child_gutter");
     let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
     let output = strip_ansi(&format_destroy_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &delete_attributes,
@@ -1261,10 +1423,12 @@ fn snapshot_destroy_list_struct_child_gutter() {
 
 #[test]
 fn snapshot_destroy_orphans() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let (plan, current_states, _schemas, _moved) =
-        build_plan_and_states_from_fixture("destroy_orphans");
+        build_plan_and_states_from_fixture(color_mode, "destroy_orphans");
     let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
     let output = strip_ansi(&format_destroy_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &delete_attributes,
@@ -1274,8 +1438,10 @@ fn snapshot_destroy_orphans() {
 
 #[test]
 fn snapshot_default_values() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("default_values");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "default_values");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -1291,8 +1457,10 @@ fn snapshot_default_values() {
 
 #[test]
 fn snapshot_read_only_attrs() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("read_only_attrs");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "read_only_attrs");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -1308,8 +1476,10 @@ fn snapshot_read_only_attrs() {
 
 #[test]
 fn snapshot_explicit() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("explicit");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "explicit");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Explicit,
         &HashMap::new(),
@@ -1325,8 +1495,10 @@ fn snapshot_explicit() {
 
 #[test]
 fn snapshot_default_tags() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("default_tags");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "default_tags");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -1342,8 +1514,11 @@ fn snapshot_default_tags() {
 
 #[test]
 fn snapshot_default_tags_update_replace() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("default_tags_update_replace");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) =
+        build_plan_from_fixture(color_mode, "default_tags_update_replace");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -1359,8 +1534,10 @@ fn snapshot_default_tags_update_replace() {
 
 #[test]
 fn snapshot_state_blocks() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("state_blocks");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "state_blocks");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -1376,10 +1553,12 @@ fn snapshot_state_blocks() {
 
 #[test]
 fn snapshot_secret_values() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let (plan, current_states, schemas, _moved) =
-        build_plan_and_states_from_fixture("secret_values");
+        build_plan_and_states_from_fixture(color_mode, "secret_values");
     let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &delete_attributes,
@@ -1395,13 +1574,17 @@ fn snapshot_secret_values() {
 
 #[test]
 fn snapshot_nested_write_only() {
-    let fixture = build_plan_from_fixture_name("nested_write_only");
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let fixture = build_plan_from_fixture_name(&runtime, "nested_write_only")
+        .expect("fixture mock inputs must be valid");
     let historical = crate::commands::plan::collect_historical_display_attributes(
         &fixture.plan,
         &fixture.managed_current,
         fixture.state_file.as_ref(),
     );
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fixture.plan,
         DetailLevel::Full,
         &historical,
@@ -1456,8 +1639,10 @@ fn snapshot_nested_write_only() {
 
 #[test]
 fn snapshot_moved_with_changes() {
-    let (plan, schemas, moved_origins) = build_plan_from_fixture("moved_with_changes");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, moved_origins) = build_plan_from_fixture(color_mode, "moved_with_changes");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -1478,7 +1663,8 @@ fn snapshot_moved_with_changes() {
 /// Plan should detect the removal via prev_desired_keys under the new name.
 #[test]
 fn snapshot_moved_prev_keys() {
-    let (plan, schemas, moved_origins) = build_plan_from_fixture("moved_prev_keys");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, moved_origins) = build_plan_from_fixture(color_mode, "moved_prev_keys");
     // The plan must contain an Update effect to remove the "tags" attribute.
     let has_update = plan
         .effects()
@@ -1489,6 +1675,7 @@ fn snapshot_moved_prev_keys() {
         "Plan should detect tag removal via prev_desired_keys transfer, but no Update effect found"
     );
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -1509,7 +1696,8 @@ fn snapshot_moved_prev_keys() {
 /// The Move line must be visible in the plan tree.
 #[test]
 fn snapshot_moved_pure() {
-    let (plan, schemas, moved_origins) = build_plan_from_fixture("moved_pure");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, moved_origins) = build_plan_from_fixture(color_mode, "moved_pure");
     // Pure move should NOT have an Update effect
     let has_update = plan
         .effects()
@@ -1526,6 +1714,7 @@ fn snapshot_moved_pure() {
         .any(|e| matches!(e, carina_core::effect::Effect::Move { .. }));
     assert!(has_move, "Pure move fixture should produce a Move effect");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -1539,8 +1728,14 @@ fn snapshot_moved_pure() {
     insta::assert_snapshot!(output);
 }
 
-fn assert_pure_move_snapshot(fixture: &str, expected_loop_identity: &str) -> FixturePlan {
-    let fp = build_plan_from_fixture_name(fixture);
+fn assert_pure_move_snapshot(
+    color_mode: crate::output_style::ColorMode,
+    fixture: &str,
+    expected_loop_identity: &str,
+) -> FixturePlan {
+    let runtime = crate::test_support::TestCommandRuntime::new().with_color_mode(color_mode);
+    let fp =
+        build_plan_from_fixture_name(&runtime, fixture).expect("fixture mock inputs must be valid");
     let summary = fp.plan.summary();
     assert_eq!(summary.create, 0, "{fixture} unexpectedly creates");
     assert_eq!(summary.delete, 0, "{fixture} unexpectedly deletes");
@@ -1557,6 +1752,7 @@ fn assert_pure_move_snapshot(fixture: &str, expected_loop_identity: &str) -> Fix
         "{fixture} must materialize {expected_loop_identity} in desired resources"
     );
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -1571,13 +1767,17 @@ fn assert_pure_move_snapshot(fixture: &str, expected_loop_identity: &str) -> Fix
     fp
 }
 
-fn moved_hint_snapshot_output(fp: &FixturePlan) -> String {
+fn moved_hint_snapshot_output(
+    color_mode: crate::output_style::ColorMode,
+    fp: &FixturePlan,
+) -> String {
     let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(
         &fp.plan,
         &fp.managed_current,
         fp.state_file.as_ref(),
     );
     let plan_output = format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &delete_attributes,
@@ -1592,11 +1792,14 @@ fn moved_hint_snapshot_output(fp: &FixturePlan) -> String {
 }
 
 fn assert_suggested_move_snapshot(
+    color_mode: crate::output_style::ColorMode,
     fixture: &str,
     expected_from: &str,
     expected_to: &str,
 ) -> FixturePlan {
-    let fp = build_plan_from_fixture_name(fixture);
+    let runtime = crate::test_support::TestCommandRuntime::new().with_color_mode(color_mode);
+    let fp =
+        build_plan_from_fixture_name(&runtime, fixture).expect("fixture mock inputs must be valid");
     assert!(
         fp.desired_resources
             .iter()
@@ -1618,7 +1821,7 @@ fn assert_suggested_move_snapshot(
 
     insta::assert_snapshot!(
         format!("snapshot_{fixture}"),
-        moved_hint_snapshot_output(&fp)
+        moved_hint_snapshot_output(color_mode, &fp)
     );
     fp
 }
@@ -1666,28 +1869,37 @@ fn assert_suggestion_round_trips(hint: &MovedBlockHint, expected_from: &str, exp
 /// state-only move when the user supplies the exact expanded address.
 #[test]
 fn snapshot_moved_let_to_for_bound() {
-    assert_pure_move_snapshot("moved_let_to_for_bound", "vpcs[0]");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    assert_pure_move_snapshot(color_mode, "moved_let_to_for_bound", "vpcs[0]");
 }
 
 /// An explicit move can target an unbound loop element by its stable anonymous
 /// address and remains a state-only move.
 #[test]
 fn snapshot_moved_let_to_for_unbound() {
-    assert_pure_move_snapshot("moved_let_to_for_unbound", "awscc_ec2_vpc_0bc2a2bb");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    assert_pure_move_snapshot(
+        color_mode,
+        "moved_let_to_for_unbound",
+        "awscc_ec2_vpc_0bc2a2bb",
+    );
 }
 
 /// Map iteration uses the canonical dot-form element address when the key is
 /// a valid identifier.
 #[test]
 fn snapshot_moved_let_to_for_map() {
-    assert_pure_move_snapshot("moved_let_to_for_map", "vpcs.a");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    assert_pure_move_snapshot(color_mode, "moved_let_to_for_map", "vpcs.a");
 }
 
 /// An unbound loop expanded from a resource reference accepts the same stable
 /// anonymous move target as a literal-backed loop.
 #[test]
 fn snapshot_moved_let_to_for_unbound_reference() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     assert_pure_move_snapshot(
+        color_mode,
         "moved_let_to_for_unbound_reference",
         "awscc_ec2_vpc_0bc2a2bb",
     );
@@ -1697,14 +1909,21 @@ fn snapshot_moved_let_to_for_unbound_reference() {
 /// explicit move and remains a pure state operation.
 #[test]
 fn snapshot_moved_let_to_for_read_loop() {
-    assert_pure_move_snapshot("moved_let_to_for_read_loop", "validation_records[0]");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    assert_pure_move_snapshot(
+        color_mode,
+        "moved_let_to_for_read_loop",
+        "validation_records[0]",
+    );
 }
 
 /// The production certificate-validation rewrite also works inside a module
 /// instance, preserving the module prefix on both moved addresses.
 #[test]
 fn snapshot_moved_let_to_for_read_loop_module() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     assert_pure_move_snapshot(
+        color_mode,
         "moved_let_to_for_read_loop_module",
         "r.validation_records[0]",
     );
@@ -1715,19 +1934,23 @@ fn snapshot_moved_let_to_for_read_loop_module() {
 /// those effects.
 #[test]
 fn snapshot_moved_hint_let_to_for() {
-    assert_suggested_move_snapshot("moved_hint_let_to_for", "old_vpc", "vpcs[0]");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    assert_suggested_move_snapshot(color_mode, "moved_hint_let_to_for", "old_vpc", "vpcs[0]");
 }
 
 /// Multiple matching destroys and creates form one connected component. The
 /// warning must list the whole component and must not invent a pairing.
 #[test]
 fn snapshot_moved_hint_ambiguous() {
-    let fp = build_plan_from_fixture_name("moved_hint_ambiguous");
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let fp = build_plan_from_fixture_name(&runtime, "moved_hint_ambiguous")
+        .expect("fixture mock inputs must be valid");
     let summary = fp.plan.summary();
     assert_eq!(summary.create, 2);
     assert_eq!(summary.delete, 2);
     assert_eq!(summary.moved, 0);
-    let output = moved_hint_snapshot_output(&fp);
+    let output = moved_hint_snapshot_output(color_mode, &fp);
     insta::assert_snapshot!(output);
     assert!(matches!(
         fp.moved_hints.as_slice(),
@@ -1743,7 +1966,9 @@ fn snapshot_moved_hint_ambiguous() {
 /// its loop child, replace the old record, and suggest the exact state move.
 #[test]
 fn snapshot_moved_hint_read_loop() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     assert_suggested_move_snapshot(
+        color_mode,
         "moved_hint_read_loop",
         "validation_record",
         "validation_records[0]",
@@ -1754,7 +1979,9 @@ fn snapshot_moved_hint_read_loop() {
 /// in both the diagnostic and the parseable moved block it renders.
 #[test]
 fn snapshot_moved_hint_read_loop_module() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let fp = assert_suggested_move_snapshot(
+        color_mode,
         "moved_hint_read_loop_module",
         "r.validation_record",
         "r.validation_records[0]",
@@ -1770,7 +1997,9 @@ fn snapshot_moved_hint_read_loop_module() {
 /// name if the moved block did not claim it first.
 #[test]
 fn snapshot_moved_claims_precede_heuristics() {
-    let (plan, schemas, moved_origins) = build_plan_from_fixture("moved_claims_precede_heuristics");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, moved_origins) =
+        build_plan_from_fixture(color_mode, "moved_claims_precede_heuristics");
     assert_eq!(plan.summary().create, 0);
     assert_eq!(plan.summary().delete, 0);
     assert_eq!(plan.summary().moved, 1);
@@ -1781,6 +2010,7 @@ fn snapshot_moved_claims_precede_heuristics() {
         "claims-precedence fixture should produce a Move effect"
     );
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -1804,8 +2034,10 @@ fn snapshot_moved_claims_precede_heuristics() {
 /// surface here instead of going unnoticed.
 #[test]
 fn snapshot_moved_with_changes_compact() {
-    let (plan, schemas, moved_origins) = build_plan_from_fixture("moved_with_changes");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, moved_origins) = build_plan_from_fixture(color_mode, "moved_with_changes");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::None,
         &HashMap::new(),
@@ -1886,8 +2118,8 @@ fn no_unused_let_bindings_in_fixtures() {
 /// any .crn file", so such layouts are exercised too.
 #[test]
 fn unused_let_check_covers_fixtures_without_main_crn() {
-    let tmp_root = std::env::temp_dir().join("carina_test_unused_let_sibling_only");
-    let _ = std::fs::remove_dir_all(&tmp_root);
+    let tmp = tempfile::tempdir().expect("snapshot fixture tempdir");
+    let tmp_root = tmp.path();
     let fixture_dir = tmp_root.join("sibling_only");
     std::fs::create_dir_all(&fixture_dir).unwrap();
 
@@ -1899,7 +2131,7 @@ fn unused_let_check_covers_fixtures_without_main_crn() {
     )
     .unwrap();
 
-    let failures = collect_unused_let_bindings_in_fixtures(&tmp_root);
+    let failures = collect_unused_let_bindings_in_fixtures(tmp_root);
     assert_eq!(
         failures.len(),
         1,
@@ -1907,14 +2139,14 @@ fn unused_let_check_covers_fixtures_without_main_crn() {
     );
     assert_eq!(failures[0].0, "sibling_only");
     assert_eq!(failures[0].1, vec!["orphan".to_string()]);
-
-    let _ = std::fs::remove_dir_all(&tmp_root);
 }
 
 #[test]
 fn plan_snapshot_upstream_state() {
-    let (plan, schemas, moved_origins) = build_plan_from_fixture("upstream_state");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, moved_origins) = build_plan_from_fixture(color_mode, "upstream_state");
     let output = format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -1934,8 +2166,11 @@ fn plan_snapshot_upstream_state() {
 /// looks like a string literal. See issue #2366.
 #[test]
 fn plan_snapshot_upstream_state_unresolved() {
-    let (plan, schemas, moved_origins) = build_plan_from_fixture("upstream_state_unresolved");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, moved_origins) =
+        build_plan_from_fixture(color_mode, "upstream_state_unresolved");
     let output = format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -1969,8 +2204,11 @@ fn plan_snapshot_upstream_state_unresolved() {
 /// string to AWS as-is.
 #[test]
 fn plan_snapshot_import_deferred_interpolation() {
-    let (plan, schemas, moved_origins) = build_plan_from_fixture("import_deferred_interpolation");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, moved_origins) =
+        build_plan_from_fixture(color_mode, "import_deferred_interpolation");
     let output = format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2007,8 +2245,11 @@ fn plan_snapshot_import_deferred_interpolation() {
 /// issue #2366.
 #[test]
 fn plan_snapshot_upstream_state_empty_exports() {
-    let (plan, schemas, moved_origins) = build_plan_from_fixture("upstream_state_empty_exports");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, moved_origins) =
+        build_plan_from_fixture(color_mode, "upstream_state_empty_exports");
     let output = format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2034,8 +2275,11 @@ fn plan_snapshot_upstream_state_empty_exports() {
 /// from the upstream's exports map.
 #[test]
 fn plan_snapshot_upstream_state_map_subscript() {
-    let (plan, schemas, moved_origins) = build_plan_from_fixture("upstream_state_map_subscript");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, moved_origins) =
+        build_plan_from_fixture(color_mode, "upstream_state_map_subscript");
     let output = format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2082,8 +2326,11 @@ fn plan_snapshot_upstream_state_map_subscript() {
 /// must now resolve to the upstream's concrete map value.
 #[test]
 fn plan_snapshot_upstream_state_map_dot_notation() {
-    let (plan, schemas, moved_origins) = build_plan_from_fixture("upstream_state_map_dot_notation");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, moved_origins) =
+        build_plan_from_fixture(color_mode, "upstream_state_map_dot_notation");
     let output = format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2124,11 +2371,12 @@ fn plan_snapshot_upstream_state_map_dot_notation() {
 
 #[test]
 fn plan_snapshot_exports() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use crate::commands::plan::ExportChange;
     use carina_core::parser::TypeExpr;
     use carina_core::resource::Value;
 
-    let (plan, schemas, moved_origins) = build_plan_from_fixture("exports");
+    let (plan, schemas, moved_origins) = build_plan_from_fixture(color_mode, "exports");
     let export_changes = vec![
         ExportChange::Added {
             name: "vpc_id".to_string(),
@@ -2144,6 +2392,7 @@ fn plan_snapshot_exports() {
         },
     ];
     let output = format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2166,9 +2415,12 @@ fn plan_snapshot_exports() {
 /// Exports section disappear from the snapshot.
 #[test]
 fn plan_snapshot_exports_multifile() {
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
     use crate::commands::plan::compute_export_diffs;
 
-    let fp = build_plan_from_fixture_name("exports_multifile");
+    let fp = build_plan_from_fixture_name(&runtime, "exports_multifile")
+        .expect("fixture mock inputs must be valid");
 
     // Assert the multi-file load actually picked up exports.crn before
     // rendering, so the snapshot claim is backed by parsed state.
@@ -2181,6 +2433,7 @@ fn plan_snapshot_exports_multifile() {
 
     let export_changes = compute_export_diffs(&fp.resolved_export_params, &HashMap::new());
     let output = format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2196,12 +2449,16 @@ fn plan_snapshot_exports_multifile() {
 
 #[test]
 fn plan_snapshot_exports_multifile_let_literal() {
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
     use crate::commands::plan::compute_export_diffs;
 
-    let fp = build_plan_from_fixture_name("exports_multifile_let_literal");
+    let fp = build_plan_from_fixture_name(&runtime, "exports_multifile_let_literal")
+        .expect("fixture mock inputs must be valid");
 
     let export_changes = compute_export_diffs(&fp.resolved_export_params, &HashMap::new());
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2239,12 +2496,16 @@ fn plan_snapshot_exports_multifile_let_literal() {
 
 #[test]
 fn plan_snapshot_exports_multifile_let_chain() {
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
     use crate::commands::plan::compute_export_diffs;
 
-    let fp = build_plan_from_fixture_name("exports_multifile_let_chain");
+    let fp = build_plan_from_fixture_name(&runtime, "exports_multifile_let_chain")
+        .expect("fixture mock inputs must be valid");
 
     let export_changes = compute_export_diffs(&fp.resolved_export_params, &HashMap::new());
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2272,12 +2533,16 @@ fn plan_snapshot_exports_multifile_let_chain() {
 
 #[test]
 fn plan_snapshot_exports_multifile_let_chain_5hop() {
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
     use crate::commands::plan::compute_export_diffs;
 
-    let fp = build_plan_from_fixture_name("exports_multifile_let_chain_5hop");
+    let fp = build_plan_from_fixture_name(&runtime, "exports_multifile_let_chain_5hop")
+        .expect("fixture mock inputs must be valid");
 
     let export_changes = compute_export_diffs(&fp.resolved_export_params, &HashMap::new());
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2305,12 +2570,16 @@ fn plan_snapshot_exports_multifile_let_chain_5hop() {
 
 #[test]
 fn plan_exports_multifile_resource_attribute_ref_resolves() {
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
     use crate::commands::plan::compute_export_diffs;
 
-    let fp = build_plan_from_fixture_name("exports_multifile_resource_attribute_ref");
+    let fp = build_plan_from_fixture_name(&runtime, "exports_multifile_resource_attribute_ref")
+        .expect("fixture mock inputs must be valid");
 
     let export_changes = compute_export_diffs(&fp.resolved_export_params, &HashMap::new());
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2331,12 +2600,16 @@ fn plan_exports_multifile_resource_attribute_ref_resolves() {
 
 #[test]
 fn plan_exports_multifile_module_output_resolves() {
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
     use crate::commands::plan::compute_export_diffs;
 
-    let fp = build_plan_from_fixture_name("exports_multifile_module_output");
+    let fp = build_plan_from_fixture_name(&runtime, "exports_multifile_module_output")
+        .expect("fixture mock inputs must be valid");
 
     let export_changes = compute_export_diffs(&fp.resolved_export_params, &HashMap::new());
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2357,7 +2630,7 @@ fn plan_exports_multifile_module_output_resolves() {
 
 #[test]
 fn plan_snapshot_exports_multifile_string_let_attr_access_rejected() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let fixture_path = PathBuf::from(format!(
         "{}/tests/fixtures/plan_display/exports_multifile_string_let_attr_access_rejected",
         env!("CARGO_MANIFEST_DIR")
@@ -2398,11 +2671,12 @@ fn plan_snapshot_exports_multifile_string_let_attr_access_rejected() {
 
 #[test]
 fn plan_snapshot_export_changes_mixed() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use crate::commands::plan::ExportChange;
     use carina_core::parser::TypeExpr;
     use carina_core::resource::{ConcreteValue, Value};
 
-    let (plan, schemas, moved_origins) = build_plan_from_fixture("no_changes");
+    let (plan, schemas, moved_origins) = build_plan_from_fixture(color_mode, "no_changes");
     let export_changes = vec![
         ExportChange::Added {
             name: "new_export".to_string(),
@@ -2421,6 +2695,7 @@ fn plan_snapshot_export_changes_mixed() {
         },
     ];
     let output = format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2436,8 +2711,10 @@ fn plan_snapshot_export_changes_mixed() {
 
 #[test]
 fn snapshot_nested_map_diff() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("nested_map_diff");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "nested_map_diff");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2458,8 +2735,10 @@ fn snapshot_nested_map_diff() {
 // blew past 500 columns for IAM policy statements.
 #[test]
 fn snapshot_list_diff_added_struct() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("list_diff_added_struct");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "list_diff_added_struct");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2487,8 +2766,11 @@ fn snapshot_list_diff_added_struct() {
 /// spaces, so the diff block floated outside the tree under a gutter.
 #[test]
 fn snapshot_list_diff_added_struct_child_gutter() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("list_diff_added_struct_child_gutter");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) =
+        build_plan_from_fixture(color_mode, "list_diff_added_struct_child_gutter");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2511,8 +2793,11 @@ fn snapshot_list_diff_added_struct_child_gutter() {
 // `action: [...]` list that produced a wide one-line dump.
 #[test]
 fn snapshot_list_diff_modified_with_unchanged() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("list_diff_modified_with_unchanged");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) =
+        build_plan_from_fixture(color_mode, "list_diff_modified_with_unchanged");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2542,8 +2827,11 @@ fn snapshot_list_diff_modified_with_unchanged() {
 /// the higher-score peers first.
 #[test]
 fn snapshot_list_diff_best_first_mid_insert() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("list_diff_best_first_mid_insert");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) =
+        build_plan_from_fixture(color_mode, "list_diff_best_first_mid_insert");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2575,8 +2863,10 @@ fn snapshot_list_diff_best_first_mid_insert() {
 /// [a, b, ..., c, d]` overflow line.
 #[test]
 fn snapshot_list_diff_string_list_grew() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("list_diff_string_list_grew");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "list_diff_string_list_grew");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2603,8 +2893,10 @@ fn snapshot_list_diff_string_list_grew() {
 /// which collapsed long IAM principal lists onto one unscannable line.
 #[test]
 fn snapshot_map_field_string_list_grew() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("map_field_string_list_grew");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "map_field_string_list_grew");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2632,9 +2924,11 @@ fn snapshot_map_field_string_list_grew() {
 // `NestedMapChanged` arm.
 #[test]
 fn snapshot_list_diff_modified_with_unchanged_nested() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let (plan, schemas, _moved) =
-        build_plan_from_fixture("list_diff_modified_with_unchanged_nested");
+        build_plan_from_fixture(color_mode, "list_diff_modified_with_unchanged_nested");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2665,8 +2959,11 @@ fn snapshot_list_diff_modified_with_unchanged_nested() {
 // includes the absorbed attribute).
 #[test]
 fn snapshot_list_diff_paired_all_unchanged_dropped() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("list_diff_paired_all_unchanged_dropped");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) =
+        build_plan_from_fixture(color_mode, "list_diff_paired_all_unchanged_dropped");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2688,8 +2985,11 @@ fn snapshot_list_diff_paired_all_unchanged_dropped() {
 // unchanged-attributes count.
 #[test]
 fn snapshot_nested_list_of_maps_all_dropped() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("nested_list_of_maps_all_dropped");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) =
+        build_plan_from_fixture(color_mode, "nested_list_of_maps_all_dropped");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2706,8 +3006,10 @@ fn snapshot_nested_list_of_maps_all_dropped() {
 // Mirror of the added-struct test for the removed path.
 #[test]
 fn snapshot_list_diff_removed_struct() {
-    let (plan, schemas, _moved) = build_plan_from_fixture("list_diff_removed_struct");
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "list_diff_removed_struct");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2728,13 +3030,17 @@ fn snapshot_list_diff_removed_struct() {
 
 #[test]
 fn snapshot_deferred_for() {
-    let fp = build_plan_from_fixture_name("deferred_for");
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let fp = build_plan_from_fixture_name(&runtime, "deferred_for")
+        .expect("fixture mock inputs must be valid");
     assert!(
         !fp.deferred_for_expressions.is_empty(),
         "expected at least one deferred for-expression"
     );
 
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2750,13 +3056,17 @@ fn snapshot_deferred_for() {
 
 #[test]
 fn snapshot_deferred_for_create_solo() {
-    let fp = build_plan_from_fixture_name("deferred_for_create_solo");
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let fp = build_plan_from_fixture_name(&runtime, "deferred_for_create_solo")
+        .expect("fixture mock inputs must be valid");
     let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(
         &fp.plan,
         &fp.managed_current,
         fp.state_file.as_ref(),
     );
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &delete_attributes,
@@ -2772,8 +3082,12 @@ fn snapshot_deferred_for_create_solo() {
 
 #[test]
 fn snapshot_deferred_for_anonymous() {
-    let fp = build_plan_from_fixture_name("deferred_for_anonymous");
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let fp = build_plan_from_fixture_name(&runtime, "deferred_for_anonymous")
+        .expect("fixture mock inputs must be valid");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2789,13 +3103,17 @@ fn snapshot_deferred_for_anonymous() {
 
 #[test]
 fn snapshot_deferred_for_with_paired_destroy() {
-    let fp = build_plan_from_fixture_name("deferred_for_with_paired_destroy");
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let fp = build_plan_from_fixture_name(&runtime, "deferred_for_with_paired_destroy")
+        .expect("fixture mock inputs must be valid");
     let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(
         &fp.plan,
         &fp.managed_current,
         fp.state_file.as_ref(),
     );
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &delete_attributes,
@@ -2811,18 +3129,38 @@ fn snapshot_deferred_for_with_paired_destroy() {
 
 #[test]
 fn snapshot_deferred_for_with_dependent_wait() {
-    let mut fp = build_plan_from_fixture_name("deferred_for_with_dependent_wait");
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let mut fp = build_plan_from_fixture_name(&runtime, "deferred_for_with_dependent_wait")
+        .expect("fixture mock inputs must be valid");
     let mut plan = Plan::new();
     for effect in fp.plan.effects() {
         let effect = match effect.clone() {
             Effect::Create(resource)
                 if resource.id.resource_type == "acm.CertificateValidation" =>
             {
-                let mut resource = resource.into_inner();
-                resource.directives.depends_on.push(
-                    carina_core::resource::absolute_binding_address_for_test("validation_records"),
-                );
-                Effect::Create(resolved(resource))
+                let deferred_id = fp
+                    .plan
+                    .effects()
+                    .iter()
+                    .find_map(|effect| match effect {
+                        Effect::DeferredReplace(payload) => Some(payload.id()),
+                        _ => None,
+                    })
+                    .expect("fixture deferred producer");
+                let mut explicit = resource.explicit_dependencies().clone();
+                explicit.insert(deferred_id.clone());
+                Effect::Create(
+                    ResolvedResource::from_resolved_parts(
+                        resource.as_inner().clone(),
+                        resource.value_dependencies().clone(),
+                        explicit,
+                    )
+                    .with_saved_destroy_dependencies(
+                        resource.persisted_value_destroy_dependencies().clone(),
+                        resource.persisted_explicit_destroy_dependencies().clone(),
+                    ),
+                )
             }
             effect => effect,
         };
@@ -2835,6 +3173,7 @@ fn snapshot_deferred_for_with_dependent_wait() {
         fp.state_file.as_ref(),
     );
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &delete_attributes,
@@ -2850,13 +3189,17 @@ fn snapshot_deferred_for_with_dependent_wait() {
 
 #[test]
 fn snapshot_deferred_for_with_unrelated_delete() {
-    let fp = build_plan_from_fixture_name("deferred_for_with_unrelated_delete");
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let fp = build_plan_from_fixture_name(&runtime, "deferred_for_with_unrelated_delete")
+        .expect("fixture mock inputs must be valid");
     let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(
         &fp.plan,
         &fp.managed_current,
         fp.state_file.as_ref(),
     );
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &delete_attributes,
@@ -2872,12 +3215,14 @@ fn snapshot_deferred_for_with_unrelated_delete() {
 
 #[test]
 fn snapshot_provider_prefix() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     // Regression guard for #2426 / #2431: anonymous resource identifiers
     // gain a `<provider>_` prefix so plan output and state files
     // self-describe their provider. The header line for the lone Vpc
     // resource must read `+ awscc.ec2.Vpc awscc_ec2_vpc_<8hex>`.
-    let (plan, schemas, _moved) = build_plan_from_fixture("provider_prefix");
+    let (plan, schemas, _moved) = build_plan_from_fixture(color_mode, "provider_prefix");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2900,8 +3245,12 @@ fn snapshot_provider_prefix() {
 /// in the rendered plan.
 #[test]
 fn snapshot_server_default_struct_leaf() {
-    let fp = build_plan_from_fixture_name("server_default_struct_leaf");
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let fp = build_plan_from_fixture_name(&runtime, "server_default_struct_leaf")
+        .expect("fixture mock inputs must be valid");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -2929,13 +3278,17 @@ fn snapshot_server_default_struct_leaf() {
 /// `ExplicitFields::ListElements::Unrecorded` must not appear as removals.
 #[test]
 fn snapshot_server_added_list_elements_changed() {
-    let fp = build_plan_from_fixture_name("server_added_list_elements_changed");
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let fp = build_plan_from_fixture_name(&runtime, "server_added_list_elements_changed")
+        .expect("fixture mock inputs must be valid");
     let historical = crate::commands::plan::collect_historical_display_attributes(
         &fp.plan,
         &fp.managed_current,
         fp.state_file.as_ref(),
     );
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &historical,
@@ -2962,13 +3315,17 @@ fn snapshot_server_added_list_elements_changed() {
 /// its authoring record instead of promising a provider-side deletion.
 #[test]
 fn snapshot_keyed_partial_update_release() {
-    let fp = build_plan_from_fixture_name("keyed_partial_update_release");
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let fp = build_plan_from_fixture_name(&runtime, "keyed_partial_update_release")
+        .expect("fixture mock inputs must be valid");
     let historical = crate::commands::plan::collect_historical_display_attributes(
         &fp.plan,
         &fp.managed_current,
         fp.state_file.as_ref(),
     );
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::Full,
         &historical,
@@ -3006,6 +3363,7 @@ fn snapshot_keyed_partial_update_release() {
 /// `Composition "<binding>"` term in carina#3322.
 #[test]
 fn snapshot_composition_folding() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use carina_core::effect::Effect;
     use carina_core::plan::Plan;
     use carina_core::resource::{
@@ -3043,6 +3401,7 @@ fn snapshot_composition_folding() {
 
     let schemas = SchemaRegistry::new();
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::None,
         &HashMap::new(),
@@ -3086,6 +3445,7 @@ fn snapshot_composition_folding() {
 /// their natural width.
 #[test]
 fn snapshot_top_level_sigil_alignment() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use carina_core::effect::Effect;
     use carina_core::parser::{DeferredForExpression, ForBinding};
     use carina_core::plan::Plan;
@@ -3146,6 +3506,7 @@ fn snapshot_top_level_sigil_alignment() {
 
     let schemas = SchemaRegistry::new();
     let output = strip_ansi(&format_plan(
+        color_mode,
         &plan,
         DetailLevel::None,
         &HashMap::new(),
@@ -3198,8 +3559,12 @@ fn snapshot_top_level_sigil_alignment() {
 /// bare string.
 #[test]
 fn snapshot_module_header_renders_use_source_path_for_real_fixture() {
-    let fp = build_plan_from_fixture_name("module_anonymous_resource");
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let fp = build_plan_from_fixture_name(&runtime, "module_anonymous_resource")
+        .expect("fixture mock inputs must be valid");
     let output = strip_ansi(&format_plan(
+        color_mode,
         &fp.plan,
         DetailLevel::None,
         &HashMap::new(),
@@ -3233,13 +3598,17 @@ fn round2_saved_plan_matches_existing_nested_and_tags_snapshots() {
         "list_diff_paired_all_unchanged_dropped",
         "nested_list_of_maps_all_dropped",
     ] {
-        let fp = build_plan_from_fixture_name(fixture);
+        let runtime = crate::test_support::TestCommandRuntime::new();
+        let fp = build_plan_from_fixture_name(&runtime, fixture)
+            .expect("fixture mock inputs must be valid");
         let wire = serde_json::to_vec(&carina_core::plan::SavedPlan::from(fp.plan)).unwrap();
         let saved: carina_core::plan::UnresolvedSavedPlan = serde_json::from_slice(&wire).unwrap();
         let plan = saved.resolve_with_schemas(&fp.schemas).unwrap();
-        let provider = provider_router_for_plan(&plan);
+        let provider =
+            provider_router_for_plan(&runtime, &plan).expect("fixture mock inputs must be valid");
         let summary = PlanChangeSummary::new(&plan, &[], &fp.deferred_for_expressions, &[]);
         let output = format_plan_with_delete_instances(
+            runtime.color_mode(),
             &plan,
             &summary,
             DetailLevel::Full,

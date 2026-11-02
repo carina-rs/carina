@@ -53,12 +53,18 @@ impl<R> StaticType<R, ConsumerResolvedType> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum StaticTypeResolutionError {
     #[error("unknown custom type '{name}'")]
     UnknownCustomType { name: String },
     #[error("unknown custom type '{name}'; suggestion: use '{suggestion}'")]
     UnknownCustomTypeWithSuggestion { name: String, suggestion: String },
+    #[error("custom type '{name}' has conflicting scalar kinds: {first_kind} and {second_kind}")]
+    ConflictingScalarKinds {
+        name: String,
+        first_kind: crate::schema::RefinedScalarKind,
+        second_kind: crate::schema::RefinedScalarKind,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -120,6 +126,15 @@ pub enum NotInferableReason {
     NonInferableBinding { binding: String },
     #[error("schema is unavailable for binding `{binding}`")]
     SchemaUnavailable { binding: String },
+    /// The parser slot has not yet been substituted and no declaration in the
+    /// current inference scope establishes its type. This is unavailable
+    /// authority, not evidence of an invalid type or invalid postfix access.
+    #[error("type authority is unavailable for parser placeholder `{placeholder}`")]
+    PlaceholderTypeUnavailable { placeholder: String },
+    #[error("provider schema is unavailable for type `{identity}`")]
+    CustomTypeSchemaUnavailable {
+        identity: crate::schema::TypeIdentity,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

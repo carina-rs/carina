@@ -58,50 +58,78 @@ fn tags(value: Value) -> Value {
 
 #[tokio::test]
 async fn wire_error_renders_a_top_level_attribute_once() {
-    let resource = Resource::with_provider("test", "sqs.Queue", "queue", None)
-        .with_attribute("unread", duration(u64::MAX));
-    let bindings = ResolvedBindings::default();
-    let gate = ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = SchemaRegistry::new();
-    let context =
-        ProviderPreparationContext::new(&bindings, &gate, &[], &NoopNormalizer, &[], &schemas);
-    let error = prepare_create_request(resource, &context)
-        .await
-        .unwrap_err();
-    assert_eq!(error.to_string().matches("`unread`").count(), 1);
+    crate::validation::deferred_types::with_session_for_test_async(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        async |type_checks| {
+            let resource = Resource::with_provider("test", "sqs.Queue", "queue", None)
+                .with_attribute("unread", duration(u64::MAX));
+            let bindings = ResolvedBindings::default();
+            let gate = ModuleConstraintGate::from_live_compositions(&[]);
+            let schemas = SchemaRegistry::new();
+            let context = ProviderPreparationContext::new(
+                &bindings,
+                &gate,
+                &[],
+                &NoopNormalizer,
+                &[],
+                &schemas,
+                type_checks,
+            );
+            let error = prepare_create_request(resource, &context)
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string().matches("`unread`").count(), 1);
+        },
+    )
+    .await
 }
 
 #[tokio::test]
 async fn wire_error_paths_quote_non_identifier_map_keys() {
-    for (key, expected) in [
-        ("a.b", r#"tags["a.b"]"#),
-        ("a\"b", r#"tags["a\"b"]"#),
-        ("", r#"tags[""]"#),
-        ("0", r#"tags["0"]"#),
-        ("with space", r#"tags["with space"]"#),
-        ("ordinary_key", "tags.ordinary_key"),
-    ] {
-        let resource = Resource::with_provider("test", "sqs.Queue", "queue", None).with_attribute(
-            "tags",
-            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
-                key.into(),
-                duration(u64::MAX),
-            )]))),
-        );
-        let bindings = ResolvedBindings::default();
-        let gate = ModuleConstraintGate::from_live_compositions(&[]);
-        let schemas = SchemaRegistry::new();
-        let context =
-            ProviderPreparationContext::new(&bindings, &gate, &[], &NoopNormalizer, &[], &schemas);
-        let ProviderPreparationError::Wire(error) = prepare_create_request(resource, &context)
-            .await
-            .unwrap_err()
-        else {
-            panic!("expected wire error")
-        };
-        assert_eq!(error.attribute_path(), expected);
-        assert!(error.to_string().contains(expected));
-    }
+    crate::validation::deferred_types::with_session_for_test_async(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        async |type_checks| {
+            for (key, expected) in [
+                ("a.b", r#"tags["a.b"]"#),
+                ("a\"b", r#"tags["a\"b"]"#),
+                ("", r#"tags[""]"#),
+                ("0", r#"tags["0"]"#),
+                ("with space", r#"tags["with space"]"#),
+                ("ordinary_key", "tags.ordinary_key"),
+            ] {
+                let resource = Resource::with_provider("test", "sqs.Queue", "queue", None)
+                    .with_attribute(
+                        "tags",
+                        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                            key.into(),
+                            duration(u64::MAX),
+                        )]))),
+                    );
+                let bindings = ResolvedBindings::default();
+                let gate = ModuleConstraintGate::from_live_compositions(&[]);
+                let schemas = SchemaRegistry::new();
+                let context = ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                let ProviderPreparationError::Wire(error) =
+                    prepare_create_request(resource, &context)
+                        .await
+                        .unwrap_err()
+                else {
+                    panic!("expected wire error")
+                };
+                assert_eq!(error.attribute_path(), expected);
+                assert!(error.to_string().contains(expected));
+            }
+        },
+    )
+    .await
 }
 
 fn config(default_tag: Value) -> ExpandedProviderConfig {
@@ -140,149 +168,210 @@ fn schemas() -> SchemaRegistry {
 
 #[tokio::test]
 async fn default_tag_duration_boundary_is_signed_i64_seconds() {
-    use carina_provider_protocol::types::Value as Wire;
-    let max = u64::try_from(i64::MAX).unwrap();
-    for seconds in [max, max + 1] {
-        let resource = Resource::with_provider("test", "sqs.Queue", "queue", None);
-        let bindings = ResolvedBindings::default();
-        let gate = ModuleConstraintGate::from_live_compositions(&[]);
-        let schemas = schemas();
-        let configs = [config(duration(seconds))];
-        let context = ProviderPreparationContext::new(
-            &bindings,
-            &gate,
-            &configs,
-            &NoopNormalizer,
-            &[],
-            &schemas,
-        );
-        let result = prepare_create_request(resource, &context).await;
-        if seconds == max {
-            let request = result.unwrap();
-            assert_eq!(
-                request
-                    .resource()
-                    .wire_attributes()
-                    .get("tags")
-                    .unwrap()
-                    .value(),
-                &Wire::Map(BTreeMap::from([("unrelated".into(), Wire::Int(i64::MAX))]))
+    crate::validation::deferred_types::with_session_for_test_async(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        async |type_checks| {
+            use carina_provider_protocol::types::Value as Wire;
+            let max = u64::try_from(i64::MAX).unwrap();
+            for seconds in [max, max + 1] {
+                let resource = Resource::with_provider("test", "sqs.Queue", "queue", None);
+                let bindings = ResolvedBindings::default();
+                let gate = ModuleConstraintGate::from_live_compositions(&[]);
+                let schemas = schemas();
+                let configs = [config(duration(seconds))];
+                let context = ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &configs,
+                    &NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                let result = prepare_create_request(resource, &context).await;
+                if seconds == max {
+                    let request = result.unwrap();
+                    assert_eq!(
+                        request
+                            .resource()
+                            .wire_attributes()
+                            .get("tags")
+                            .unwrap()
+                            .value(),
+                        &Wire::Map(BTreeMap::from([("unrelated".into(), Wire::Int(i64::MAX))]))
+                    );
+                } else {
+                    assert_duration_error(
+                        &result.unwrap_err(),
+                        "tags",
+                        &[crate::protocol_convert::WirePathSegment::Key(
+                            "unrelated".into(),
+                        )],
+                    );
+                }
+            }
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn native_create_rejects_a_non_wire_default_tag_before_dispatch() {
+    crate::validation::deferred_types::with_session_for_test_async(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        async |type_checks| {
+            let resource = Resource::with_provider("test", "sqs.Queue", "queue", None);
+            let id = resource.id.clone();
+            let bindings = ResolvedBindings::default();
+            let gate = ModuleConstraintGate::from_live_compositions(&[]);
+            let configs = [config(duration(u64::MAX))];
+            let schemas = schemas();
+            let context = ProviderPreparationContext::new(
+                &bindings,
+                &gate,
+                &configs,
+                &NoopNormalizer,
+                &[],
+                &schemas,
+                type_checks,
             );
-        } else {
+            let error = prepare_create_request(resource, &context)
+                .await
+                .expect_err("a merged default tag must be checked before native create");
+            let rendered = error.to_string();
             assert_duration_error(
-                &result.unwrap_err(),
+                &error,
                 "tags",
                 &[crate::protocol_convert::WirePathSegment::Key(
                     "unrelated".into(),
                 )],
             );
-        }
-    }
-}
-
-#[tokio::test]
-async fn native_create_rejects_a_non_wire_default_tag_before_dispatch() {
-    let resource = Resource::with_provider("test", "sqs.Queue", "queue", None);
-    let id = resource.id.clone();
-    let bindings = ResolvedBindings::default();
-    let gate = ModuleConstraintGate::from_live_compositions(&[]);
-    let configs = [config(duration(u64::MAX))];
-    let schemas = schemas();
-    let context =
-        ProviderPreparationContext::new(&bindings, &gate, &configs, &NoopNormalizer, &[], &schemas);
-    let error = prepare_create_request(resource, &context)
-        .await
-        .expect_err("a merged default tag must be checked before native create");
-    let rendered = error.to_string();
-    assert_duration_error(
-        &error,
-        "tags",
-        &[crate::protocol_convert::WirePathSegment::Key(
-            "unrelated".into(),
-        )],
-    );
-    assert!(rendered.contains(&id.to_string()), "{rendered}");
-    assert!(rendered.contains("tags.unrelated"), "{rendered}");
-    assert!(
-        rendered.contains("duration in seconds does not fit"),
-        "{rendered}"
-    );
-    assert!(!rendered.contains(&u64::MAX.to_string()), "{rendered}");
+            assert!(rendered.contains(&id.to_string()), "{rendered}");
+            assert!(rendered.contains("tags.unrelated"), "{rendered}");
+            assert!(
+                rendered.contains("duration in seconds does not fit"),
+                "{rendered}"
+            );
+            assert!(!rendered.contains(&u64::MAX.to_string()), "{rendered}");
+        },
+    )
+    .await
 }
 
 #[tokio::test]
 async fn native_update_checks_default_tags_outside_changed_attributes() {
-    let resource = Resource::with_provider("test", "sqs.Queue", "queue", None);
-    let from = State::existing(resource.id.clone(), HashMap::new());
-    let bindings = ResolvedBindings::default();
-    let gate = ModuleConstraintGate::from_live_compositions(&[]);
-    let configs = [config(duration(u64::MAX))];
-    let schemas = schemas();
-    let context =
-        ProviderPreparationContext::new(&bindings, &gate, &configs, &NoopNormalizer, &[], &schemas);
-    let error = prepare_update_request(resource, from, &["name".into()], &context)
-        .await
-        .expect_err("checking only the patch would miss an unrelated default tag");
-    assert_duration_error(
-        &error,
-        "tags",
-        &[crate::protocol_convert::WirePathSegment::Key(
-            "unrelated".into(),
-        )],
-    );
+    crate::validation::deferred_types::with_session_for_test_async(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        async |type_checks| {
+            let resource = Resource::with_provider("test", "sqs.Queue", "queue", None);
+            let from = State::existing(resource.id.clone(), HashMap::new());
+            let bindings = ResolvedBindings::default();
+            let gate = ModuleConstraintGate::from_live_compositions(&[]);
+            let configs = [config(duration(u64::MAX))];
+            let schemas = schemas();
+            let context = ProviderPreparationContext::new(
+                &bindings,
+                &gate,
+                &configs,
+                &NoopNormalizer,
+                &[],
+                &schemas,
+                type_checks,
+            );
+            let error = prepare_update_request(resource, from, &["name".into()], &context)
+                .await
+                .expect_err("checking only the patch would miss an unrelated default tag");
+            assert_duration_error(
+                &error,
+                "tags",
+                &[crate::protocol_convert::WirePathSegment::Key(
+                    "unrelated".into(),
+                )],
+            );
+        },
+    )
+    .await
 }
 
 #[tokio::test]
 async fn native_update_checks_observed_ignored_leaves_after_patch_substitution() {
-    let mut resource = Resource::with_provider("test", "sqs.Queue", "queue", None).with_attribute(
-        "tags",
-        tags(Value::Concrete(ConcreteValue::String("valid".into()))),
-    );
-    resource.directives.ignore_changes = vec![ParsedIgnorePath::new(vec![
-        ParsedIgnorePathSegment::Attribute("tags".into()),
-        ParsedIgnorePathSegment::MapKey("unrelated".into()),
-    ])];
-    let from = State::existing(
-        resource.id.clone(),
-        HashMap::from([("tags".into(), tags(duration(u64::MAX)))]),
-    );
-    let bindings = ResolvedBindings::default();
-    let gate = ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = schemas();
-    let context =
-        ProviderPreparationContext::new(&bindings, &gate, &[], &NoopNormalizer, &[], &schemas);
-    let error = prepare_update_request(resource, from, &["tags".into()], &context)
-        .await
-        .expect_err("an observed leaf can become non-wire after desired preparation");
-    assert_duration_error(
-        &error,
-        "tags",
-        &[crate::protocol_convert::WirePathSegment::Key(
-            "unrelated".into(),
-        )],
-    );
+    crate::validation::deferred_types::with_session_for_test_async(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        async |type_checks| {
+            let mut resource = Resource::with_provider("test", "sqs.Queue", "queue", None)
+                .with_attribute(
+                    "tags",
+                    tags(Value::Concrete(ConcreteValue::String("valid".into()))),
+                );
+            resource.directives.ignore_changes = vec![ParsedIgnorePath::new(vec![
+                ParsedIgnorePathSegment::Attribute("tags".into()),
+                ParsedIgnorePathSegment::MapKey("unrelated".into()),
+            ])];
+            let from = State::existing(
+                resource.id.clone(),
+                HashMap::from([("tags".into(), tags(duration(u64::MAX)))]),
+            );
+            let bindings = ResolvedBindings::default();
+            let gate = ModuleConstraintGate::from_live_compositions(&[]);
+            let schemas = schemas();
+            let context = ProviderPreparationContext::new(
+                &bindings,
+                &gate,
+                &[],
+                &NoopNormalizer,
+                &[],
+                &schemas,
+                type_checks,
+            );
+            let error = prepare_update_request(resource, from, &["tags".into()], &context)
+                .await
+                .expect_err("an observed leaf can become non-wire after desired preparation");
+            assert_duration_error(
+                &error,
+                "tags",
+                &[crate::protocol_convert::WirePathSegment::Key(
+                    "unrelated".into(),
+                )],
+            );
+        },
+    )
+    .await
 }
 
 #[test]
 fn native_data_source_checks_even_unschematized_attributes() {
-    let mut data = DataSource::pending_with_provider("test", "lookup", None);
-    data.id = crate::resource::ResourceId::with_provider_identity("test", "lookup", "lookup", None);
-    data.attributes
-        .insert("unread".into(), tags(duration(u64::MAX)));
-    let bindings = ResolvedBindings::default();
-    let gate = ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = SchemaRegistry::new();
-    let context =
-        ProviderPreparationContext::new(&bindings, &gate, &[], &NoopNormalizer, &[], &schemas);
-    let error = prepare_provider_ready_data_source(data, &context)
-        .expect_err("a native data-source provider must never receive a non-wire value");
-    assert_duration_error(
-        &error,
-        "unread",
-        &[crate::protocol_convert::WirePathSegment::Key(
-            "unrelated".into(),
-        )],
-    );
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        |type_checks| {
+            let mut data = DataSource::pending_with_provider("test", "lookup", None);
+            data.id = crate::resource::ResourceId::with_provider_identity(
+                "test", "lookup", "lookup", None,
+            );
+            data.attributes
+                .insert("unread".into(), tags(duration(u64::MAX)));
+            let bindings = ResolvedBindings::default();
+            let gate = ModuleConstraintGate::from_live_compositions(&[]);
+            let schemas = SchemaRegistry::new();
+            let context = ProviderPreparationContext::new(
+                &bindings,
+                &gate,
+                &[],
+                &NoopNormalizer,
+                &[],
+                &schemas,
+                type_checks,
+            );
+            let error = prepare_provider_ready_data_source(data, &context)
+                .expect_err("a native data-source provider must never receive a non-wire value");
+            assert_duration_error(
+                &error,
+                "unread",
+                &[crate::protocol_convert::WirePathSegment::Key(
+                    "unrelated".into(),
+                )],
+            );
+        },
+    )
 }
 
 struct ConfigFactory(AtomicUsize);
@@ -355,81 +444,111 @@ fn native_factory_rejects_non_wire_config_before_semantic_validation() {
 
 #[tokio::test]
 async fn checked_projection_preserves_native_scalars_and_late_secret_provenance() {
-    use crate::resource::{DeferredValue, EnumValueResolver};
-    use crate::schema::{CompiledAttributeType, TypeIdentity};
-    use carina_provider_protocol::types::Value as Wire;
-    let enum_type = CompiledAttributeType::enum_(
-        TypeIdentity::bare("Mode"),
-        Some(vec!["active".into()]),
-        Vec::new(),
-        None,
-        None,
-    );
-    let mode = EnumValueResolver::new(&enum_type)
-        .resolve_state_text("active")
-        .unwrap();
-    let resource = Resource::with_provider("test", "sqs.Queue", "queue", None).with_attribute(
-        "unread",
-        Value::Concrete(ConcreteValue::List(vec![
-            duration(i64::MAX as u64),
-            Value::Concrete(ConcreteValue::CanonicalEnum(mode)),
-        ])),
-    );
-    let configs = [config(Value::Deferred(DeferredValue::Secret(Box::new(
-        Value::Concrete(ConcreteValue::String("private-late-tag".into())),
-    ))))];
-    let bindings = ResolvedBindings::default();
-    let gate = ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = schemas();
-    let context =
-        ProviderPreparationContext::new(&bindings, &gate, &configs, &NoopNormalizer, &[], &schemas);
-    let request = prepare_create_request(resource, &context).await.unwrap();
-    let ready = request.resource();
-    assert_eq!(
-        ready.wire_attributes().get("unread").unwrap().value(),
-        &Wire::List(vec![Wire::Int(i64::MAX), Wire::String("active".into())])
-    );
-    let Value::Concrete(ConcreteValue::List(original)) = &ready.as_resource().attributes["unread"]
-    else {
-        panic!()
-    };
-    assert!(matches!(
-        original[0],
-        Value::Concrete(ConcreteValue::Duration(_))
-    ));
-    assert!(matches!(
-        original[1],
-        Value::Concrete(ConcreteValue::CanonicalEnum(_))
-    ));
-    let Value::Concrete(ConcreteValue::Map(tags)) = &ready.as_resource().attributes["tags"] else {
-        panic!()
-    };
-    assert!(matches!(
-        tags["unrelated"],
-        Value::Deferred(DeferredValue::Secret(_))
-    ));
-    assert!(ready.default_tag_keys.contains("unrelated"));
-    assert!(!format!("{request:?}").contains("private-late-tag"));
+    crate::validation::deferred_types::with_session_for_test_async(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        async |type_checks| {
+            use crate::resource::{DeferredValue, EnumValueResolver};
+            use crate::schema::{CompiledAttributeType, TypeIdentity};
+            use carina_provider_protocol::types::Value as Wire;
+            let enum_type = CompiledAttributeType::enum_(
+                TypeIdentity::bare("Mode"),
+                Some(vec!["active".into()]),
+                Vec::new(),
+                None,
+                None,
+            );
+            let mode = EnumValueResolver::new(&enum_type)
+                .resolve_state_text("active")
+                .unwrap();
+            let resource = Resource::with_provider("test", "sqs.Queue", "queue", None)
+                .with_attribute(
+                    "unread",
+                    Value::Concrete(ConcreteValue::List(vec![
+                        duration(i64::MAX as u64),
+                        Value::Concrete(ConcreteValue::CanonicalEnum(mode)),
+                    ])),
+                );
+            let configs = [config(Value::Deferred(DeferredValue::Secret(Box::new(
+                Value::Concrete(ConcreteValue::String("private-late-tag".into())),
+            ))))];
+            let bindings = ResolvedBindings::default();
+            let gate = ModuleConstraintGate::from_live_compositions(&[]);
+            let schemas = schemas();
+            let context = ProviderPreparationContext::new(
+                &bindings,
+                &gate,
+                &configs,
+                &NoopNormalizer,
+                &[],
+                &schemas,
+                type_checks,
+            );
+            let request = prepare_create_request(resource, &context).await.unwrap();
+            let ready = request.resource();
+            assert_eq!(
+                ready.wire_attributes().get("unread").unwrap().value(),
+                &Wire::List(vec![Wire::Int(i64::MAX), Wire::String("active".into())])
+            );
+            let Value::Concrete(ConcreteValue::List(original)) =
+                &ready.as_resource().attributes["unread"]
+            else {
+                panic!()
+            };
+            assert!(matches!(
+                original[0],
+                Value::Concrete(ConcreteValue::Duration(_))
+            ));
+            assert!(matches!(
+                original[1],
+                Value::Concrete(ConcreteValue::CanonicalEnum(_))
+            ));
+            let Value::Concrete(ConcreteValue::Map(tags)) = &ready.as_resource().attributes["tags"]
+            else {
+                panic!()
+            };
+            assert!(matches!(
+                tags["unrelated"],
+                Value::Deferred(DeferredValue::Secret(_))
+            ));
+            assert!(ready.default_tag_keys.contains("unrelated"));
+            assert!(!format!("{request:?}").contains("private-late-tag"));
+        },
+    )
+    .await
 }
 
 #[tokio::test]
 async fn nested_wire_failures_retain_list_indices_and_never_values() {
-    use crate::protocol_convert::WirePathSegment::{Index, Key};
-    let resource = Resource::with_provider("test", "sqs.Queue", "queue", None).with_attribute(
-        "unread",
-        tags(Value::Concrete(ConcreteValue::List(vec![duration(
-            u64::MAX,
-        )]))),
-    );
-    let bindings = ResolvedBindings::default();
-    let gate = ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = schemas();
-    let context =
-        ProviderPreparationContext::new(&bindings, &gate, &[], &NoopNormalizer, &[], &schemas);
-    let error = prepare_create_request(resource, &context)
-        .await
-        .unwrap_err();
-    assert_duration_error(&error, "unread", &[Key("unrelated".into()), Index(0)]);
-    assert!(error.to_string().contains("unread.unrelated[0]"));
-    assert!(std::error::Error::source(&error).is_none());
+    crate::validation::deferred_types::with_session_for_test_async(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        async |type_checks| {
+            use crate::protocol_convert::WirePathSegment::{Index, Key};
+            let resource = Resource::with_provider("test", "sqs.Queue", "queue", None)
+                .with_attribute(
+                    "unread",
+                    tags(Value::Concrete(ConcreteValue::List(vec![duration(
+                        u64::MAX,
+                    )]))),
+                );
+            let bindings = ResolvedBindings::default();
+            let gate = ModuleConstraintGate::from_live_compositions(&[]);
+            let schemas = schemas();
+            let context = ProviderPreparationContext::new(
+                &bindings,
+                &gate,
+                &[],
+                &NoopNormalizer,
+                &[],
+                &schemas,
+                type_checks,
+            );
+            let error = prepare_create_request(resource, &context)
+                .await
+                .unwrap_err();
+            assert_duration_error(&error, "unread", &[Key("unrelated".into()), Index(0)]);
+            assert!(error.to_string().contains("unread.unrelated[0]"));
+            assert!(std::error::Error::source(&error).is_none());
+        },
+    )
+    .await
 }

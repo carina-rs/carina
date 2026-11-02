@@ -35,12 +35,26 @@ pub fn load_module(path: &Path) -> Option<ParsedFile> {
     load_module_with_diagnostics(path).map(|loaded| loaded.parsed)
 }
 
+/// Load a module signature using the caller's provider catalog.
+///
+/// A dotted argument type is intentionally ambiguous during bootstrap: it can
+/// name either a provider value type or a managed-resource handle. Signature
+/// consumers that already own an enriched provider context must therefore use
+/// that context while parsing, or a valid bare handle in `depends_on` can be
+/// rejected before the signature is available to diagnose its call site.
+pub(crate) fn load_module_with_config(path: &Path, config: &ProviderContext) -> Option<ParsedFile> {
+    if !path.is_dir() {
+        return None;
+    }
+    load_directory_module_with_diagnostics_and_config(path, config).map(|loaded| loaded.parsed)
+}
+
 /// Diagnostic-preserving variant of [`load_module`].
 pub fn load_module_with_diagnostics(path: &Path) -> Option<LoadedModule> {
     if !path.is_dir() {
         return None;
     }
-    load_directory_module_with_diagnostics(path)
+    load_directory_module_with_diagnostics_and_config(path, &ProviderContext::default())
 }
 
 /// Collect `.crn` file paths directly inside `dir_path`, sorted by path.
@@ -73,6 +87,13 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
 
 /// Diagnostic-preserving variant of [`load_directory_module`].
 fn load_directory_module_with_diagnostics(dir_path: &Path) -> Option<LoadedModule> {
+    load_directory_module_with_diagnostics_and_config(dir_path, &ProviderContext::default())
+}
+
+fn load_directory_module_with_diagnostics_and_config(
+    dir_path: &Path,
+    config: &ProviderContext,
+) -> Option<LoadedModule> {
     let paths = sorted_crn_paths_in(dir_path).ok()?;
     let mut files: Vec<(PathBuf, String)> = Vec::with_capacity(paths.len());
     for path in paths {
@@ -80,8 +101,7 @@ fn load_directory_module_with_diagnostics(dir_path: &Path) -> Option<LoadedModul
             files.push((path, content));
         }
     }
-    let parsed_files =
-        crate::config_loader::parse_directory_files(&files, &ProviderContext::default()).ok()?;
+    let parsed_files = crate::config_loader::parse_directory_files(&files, config).ok()?;
     let duplicate_declarations =
         crate::config_loader::find_duplicate_declarations(dir_path, &parsed_files);
 

@@ -664,7 +664,14 @@ pub struct SentAttributes {
 }
 
 impl SentAttributes {
-    pub(crate) fn from_resource<S>(resource: &Resource<S>) -> Self {
+    pub(crate) fn from_resource<S, D>(
+        resource: &Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
+    ) -> Self {
         Self::only(resource.attributes.keys().cloned().collect())
     }
 
@@ -694,7 +701,15 @@ impl SentAttributes {
         )
     }
 
-    fn from_create_sent<S>(sent: &Sent, resource: &Resource<S>) -> Self {
+    fn from_create_sent<S, D>(
+        sent: &Sent,
+        resource: &Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
+    ) -> Self {
         match sent {
             Sent::AllRequestAttributes => Self::from_resource(resource),
             Sent::Only(attributes) => Self::only(attributes.clone()),
@@ -2288,9 +2303,14 @@ impl FreshPendingCreate {
     }
 
     /// Desired values and send evidence retained by this fresh continuation.
-    pub fn sent_desired_attributes_for<'a, S>(
+    pub fn sent_desired_attributes_for<'a, S, D>(
         &self,
-        resource: &'a Resource<S>,
+        resource: &'a Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
     ) -> SentDesiredAttributes<'a> {
         SentDesiredAttributes::new(
             resource.attributes.iter(),
@@ -2608,7 +2628,15 @@ impl SentRecord {
     /// Recover attribute send evidence while it is still retained in request
     /// form. Persisted continuations intentionally omit ordinary observable
     /// attribute names, so they cannot claim a sent desired basis.
-    fn sent_attributes_for<S>(&self, resource: &Resource<S>) -> Option<SentAttributes> {
+    fn sent_attributes_for<S, D>(
+        &self,
+        resource: &Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
+    ) -> Option<SentAttributes> {
         match self {
             Self::Request(sent) => Some(SentAttributes::from_create_sent(sent, resource)),
             Self::Persisted(_envelope) => None,
@@ -2724,9 +2752,14 @@ impl ObservedCreate {
 
     /// Resolved desired values and send evidence retained by the accepted
     /// create observation.
-    pub fn sent_desired_attributes_for<'a, S>(
+    pub fn sent_desired_attributes_for<'a, S, D>(
         &'a self,
-        fallback_resource: &'a Resource<S>,
+        fallback_resource: &'a Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
     ) -> Option<SentDesiredAttributes<'a>> {
         let sent = self.sent.sent_attributes_for(fallback_resource)?;
         Some(match self.resolved_desired_attributes.as_ref() {
@@ -5412,12 +5445,17 @@ impl std::error::Error for DefaultTagEncodingError {}
 ///
 /// Records which tag keys came from defaults as host-owned provenance on the
 /// resource, separate from provider-facing attributes.
-pub fn merge_default_tags<S>(
+pub fn merge_default_tags<S, D>(
     config: &ProviderConfig<
         crate::resource::NoPlaceholder,
         crate::resource::AbsoluteBindingAddress,
     >,
-    resources: &mut [Resource<S>],
+    resources: &mut [Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >],
     registry: &SchemaRegistry,
 ) -> ProviderResult<()> {
     if config.default_tags.is_empty() {
@@ -5789,6 +5827,71 @@ impl<'a> ResolvedComparison<'a> {
 
     pub fn context(&self) -> &crate::differ::ComparisonSchema<'a> {
         &self.context
+    }
+}
+
+/// Resolve the schema and comparison context for a resource without exposing
+/// provider CRUD. Runtime planning implements this with initialized providers;
+/// metadata-only workflows use [`MetadataComparisonResolver`] so identity
+/// reconciliation cannot accidentally initialize or dispatch a provider.
+pub trait ResourceComparisonResolver {
+    fn comparison_for<'a>(
+        &'a self,
+        registry: &'a SchemaRegistry,
+        id: &ResourceId,
+    ) -> Result<ResolvedComparison<'a>, ComparisonResolutionError>;
+}
+
+/// Comparison resolver for schema-only, provider-I/O-free workflows.
+///
+/// Provider routes are admitted explicitly from the finalized resource set.
+/// Reference scope remains unavailable because obtaining account/region scope
+/// may require provider initialization; ordinary typed and transformed values
+/// still use the same production comparison implementation.
+pub struct MetadataComparisonResolver {
+    routes: HashSet<ProviderInstanceKey>,
+    reference_scope: ReferenceScope,
+}
+
+impl MetadataComparisonResolver {
+    pub fn new<'a>(ids: impl IntoIterator<Item = &'a ResourceId>) -> Self {
+        Self {
+            routes: ids.into_iter().map(ProviderInstanceKey::from).collect(),
+            reference_scope: ReferenceScope::Unavailable,
+        }
+    }
+}
+
+impl ResourceComparisonResolver for MetadataComparisonResolver {
+    fn comparison_for<'a>(
+        &'a self,
+        registry: &'a SchemaRegistry,
+        id: &ResourceId,
+    ) -> Result<ResolvedComparison<'a>, ComparisonResolutionError> {
+        let schema = registry
+            .get(
+                &id.provider,
+                &id.resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .ok_or_else(|| ComparisonResolutionError::MissingResourceSchema { id: id.clone() })?;
+        let route = ProviderInstanceKey::from(id);
+        if !self.routes.contains(&route) {
+            return Err(ComparisonResolutionError::UnknownProviderInstance { instance: route });
+        }
+        if route.provider() != schema.owner() {
+            return Err(ComparisonResolutionError::SchemaOwnerMismatch {
+                id: id.clone(),
+                owner: schema.owner().to_string(),
+            });
+        }
+        Ok(ResolvedComparison {
+            owner_schema: schema,
+            context: crate::differ::ComparisonSchema::from_scope_and_forms(
+                &self.reference_scope,
+                schema.reference_forms(),
+            ),
+        })
     }
 }
 
@@ -6164,6 +6267,16 @@ impl ProviderRouter {
     }
 }
 
+impl ResourceComparisonResolver for ProviderRouter {
+    fn comparison_for<'a>(
+        &'a self,
+        registry: &'a SchemaRegistry,
+        id: &ResourceId,
+    ) -> Result<ResolvedComparison<'a>, ComparisonResolutionError> {
+        ProviderRouter::comparison_for(self, registry, id)
+    }
+}
+
 impl Provider for ProviderRouter {
     fn name(&self) -> &str {
         "router"
@@ -6312,6 +6425,8 @@ impl CanonicalCustomTypeValue {
 /// validator's canonical text representation.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum CustomTypeCanonicalizationError {
+    #[error("provider custom types are not loaded")]
+    ProvidersNotLoaded,
     #[error(
         "custom-type canonicalization requires an identified scalar declaration, got {type_name}"
     )]
@@ -6344,6 +6459,9 @@ pub enum CustomTypeCanonicalizationError {
 impl CustomTypeCanonicalizationError {
     pub(crate) fn into_type_error(self) -> crate::schema::TypeError {
         match self {
+            Self::ProvidersNotLoaded => {
+                crate::parser::CustomTypeValidationError::ProvidersNotLoaded.into()
+            }
             Self::EnumResolution { error, .. } => *error,
             Self::ConcreteKindMismatch {
                 identity,
@@ -6366,6 +6484,7 @@ impl CustomTypeCanonicalizationError {
 /// Return the identity carried by an identified scalar or enum declaration.
 pub fn identified_custom_type_identity(attribute_type: &AttributeType) -> Option<&TypeIdentity> {
     match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(unloaded) => Some(unloaded.identity()),
         RawShape::Reference { .. } => None,
         RawShape::String { identity, .. }
         | RawShape::Int { identity, .. }
@@ -6386,8 +6505,9 @@ pub fn identified_custom_type_identity(attribute_type: &AttributeType) -> Option
 /// strings by convention.
 pub fn identified_custom_type_scalar_kind(
     attribute_type: &AttributeType,
-) -> Option<RefinedScalarKind> {
-    match attribute_type.raw_shape() {
+) -> Result<Option<RefinedScalarKind>, crate::parser::UnloadedSchemaType> {
+    Ok(match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(unloaded) => return Err(unloaded.clone()),
         RawShape::Reference {
             identity: _identity,
             pattern: _pattern,
@@ -6413,11 +6533,12 @@ pub fn identified_custom_type_scalar_kind(
         | RawShape::Struct { .. }
         | RawShape::Union(_)
         | RawShape::Ref(_) => None,
-    }
+    })
 }
 
 fn scalar_kind_from_base(attribute_type: &AttributeType) -> Option<RefinedScalarKind> {
     match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => None,
         RawShape::Reference {
             identity: _identity,
             pattern: _pattern,
@@ -6447,18 +6568,38 @@ pub fn canonicalize_custom_type_value(
     declared_type: &AttributeType,
     value: &Value,
 ) -> Result<Option<CanonicalCustomTypeValue>, CustomTypeCanonicalizationError> {
+    match declared_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => {
+            return Err(CustomTypeCanonicalizationError::ProvidersNotLoaded);
+        }
+        RawShape::Reference { .. }
+        | RawShape::String { .. }
+        | RawShape::Int { .. }
+        | RawShape::Float { .. }
+        | RawShape::Bool
+        | RawShape::Duration
+        | RawShape::Enum { .. }
+        | RawShape::List { .. }
+        | RawShape::Map { .. }
+        | RawShape::Struct { .. }
+        | RawShape::Union(_)
+        | RawShape::Ref(_) => {}
+    }
     let identity = identified_custom_type_identity(declared_type).ok_or_else(|| {
         CustomTypeCanonicalizationError::UnidentifiedDeclaration {
             type_name: declared_type.type_name(),
         }
     })?;
-    let scalar_kind = identified_custom_type_scalar_kind(declared_type).ok_or_else(|| {
-        CustomTypeCanonicalizationError::MissingScalarKind {
+    let scalar_kind = identified_custom_type_scalar_kind(declared_type)
+        .map_err(|_| CustomTypeCanonicalizationError::ProvidersNotLoaded)?
+        .ok_or_else(|| CustomTypeCanonicalizationError::MissingScalarKind {
             identity: identity.clone(),
             type_name: declared_type.type_name(),
-        }
-    })?;
+        })?;
     match (declared_type.raw_shape(), value) {
+        (RawShape::UnloadedSchemaType(_), _) => {
+            Err(CustomTypeCanonicalizationError::ProvidersNotLoaded)
+        }
         (
             RawShape::String {
                 identity: _,
@@ -6948,6 +7089,7 @@ fn collect_type_names_from_type(
     use crate::schema::RawShape;
 
     match attr_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => {}
         RawShape::Reference {
             identity,
             pattern: _pattern,
@@ -7008,6 +7150,7 @@ fn local_custom_validator(
     attribute_type: &AttributeType,
 ) -> Option<&crate::schema::CustomValidator> {
     match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => None,
         RawShape::Reference {
             identity: _identity,
             pattern: _pattern,
@@ -7193,6 +7336,7 @@ impl CustomTypeDispatchTable {
         let mut bindings = HashMap::<TypeIdentity, CustomTypeDispatchBinding>::new();
         for (identity, declaration) in witness.identified_declarations() {
             let kind = identified_custom_type_scalar_kind(&declaration)
+                .expect("validated declarations have loaded scalar kinds")
                 .expect("validated provider schema guarantees a scalar bridge kind");
             let callback = local_custom_validator(&declaration).cloned();
             match bindings.entry(identity) {
@@ -7230,7 +7374,7 @@ impl CustomTypeDispatchTable {
         for (identity, declaration) in
             crate::schema::identified_declarations_from_witnesses(schemas, config)
         {
-            let Some(kind) = identified_custom_type_scalar_kind(&declaration) else {
+            let Ok(Some(kind)) = identified_custom_type_scalar_kind(&declaration) else {
                 return Err(CustomTypeDispatchTableError::MissingScalarKind { identity });
             };
             let callback = local_custom_validator(&declaration).cloned();
@@ -7390,25 +7534,27 @@ where
     }
 
     fn known_custom_types(&self) -> BTreeSet<crate::parser::OwnedTypeIdentity> {
-        let mut owners_by_identity =
-            BTreeMap::<TypeIdentity, crate::parser::NonEmptySchemaTypeOwners>::new();
+        // Keep incompatible kinds separate so annotation resolution can reject
+        // a cross-provider conflict before constructing a SchemaType.
+        let mut declarations_by_identity =
+            BTreeMap::<(TypeIdentity, RefinedScalarKind), crate::parser::OwnedTypeIdentity>::new();
         for (owner, indexed) in &self.index {
-            let owner_set = crate::parser::NonEmptySchemaTypeOwners::singleton(
-                crate::parser::SchemaTypeOwner::Provider(owner.clone()),
-            );
-            for identity in indexed.declarations.keys() {
-                owners_by_identity
-                    .entry(identity.clone())
-                    .and_modify(|owners| *owners = owners.union(&owner_set))
-                    .or_insert_with(|| owner_set.clone());
+            for (identity, declarations) in &indexed.declarations {
+                let owned = crate::parser::OwnedTypeIdentity::from_schema_declaration(
+                    owner,
+                    &declarations[0],
+                )
+                .expect("validated identified declarations have a scalar kind");
+                declarations_by_identity
+                    .entry((identity.clone(), owned.scalar_kind()))
+                    .and_modify(|existing| {
+                        *existing =
+                            existing.with_merged_owners(existing.owners().union(owned.owners()));
+                    })
+                    .or_insert(owned);
             }
         }
-        owners_by_identity
-            .into_iter()
-            .map(|(identity, owners)| {
-                crate::parser::OwnedTypeIdentity::with_owners(identity, owners)
-            })
-            .collect()
+        declarations_by_identity.into_values().collect()
     }
 }
 
@@ -7649,7 +7795,7 @@ fn validate_custom_type_annotation(
             if local_custom_validator(declaration).is_none()
                 && let Some(canonical) = canonical
             {
-                let Some(kind) = identified_custom_type_scalar_kind(declaration) else {
+                let Ok(Some(kind)) = identified_custom_type_scalar_kind(declaration) else {
                     return Err(CustomTypeValidationError::Rejected {
                         owner: owner.clone(),
                         identity: identity.clone(),
@@ -8168,6 +8314,66 @@ mod tests {
     }
 
     #[test]
+    fn provider_custom_type_index_retains_scalar_kinds_for_resolution() {
+        use crate::parser::{
+            OwnedTypeIdentity, ProviderContext, ProviderCustomTypes, ResourceTypePath, TypeExpr,
+        };
+        use crate::static_type::StaticTypeResolutionError;
+
+        let identity = TypeIdentity::from_dotted("shared.counter.Count");
+        let snapshots = [
+            ("one", RefinedScalarKind::Int),
+            ("two", RefinedScalarKind::Int),
+            ("three", RefinedScalarKind::Float),
+        ]
+        .map(|(owner, kind)| ProviderFactorySchemaSnapshot {
+            name: owner.into(),
+            witness: ValidatedProviderSchemaWitness::new(
+                Vec::new(),
+                ValidatedConfigSchema::validate(BTreeMap::from([(
+                    "count".into(),
+                    kind.identified_type(identity.clone()),
+                )]))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap(),
+        });
+        let factories: &[Box<dyn ProviderFactory>] = &[];
+        let resolver = FactoryCustomTypeResolver::with_index(
+            factories,
+            build_owner_custom_type_index(&snapshots),
+        );
+        let known = resolver.known_custom_types();
+        assert_eq!(known.len(), 2, "only owners with the same kind are grouped");
+        let int_type = known
+            .iter()
+            .find(|owned| owned.scalar_kind() == RefinedScalarKind::Int)
+            .unwrap();
+        assert!(int_type.provider_names().eq(["one", "two"]));
+        assert!(known.contains(&OwnedTypeIdentity::provider(
+            "three",
+            identity,
+            RefinedScalarKind::Float
+        )));
+
+        let context = ProviderContext {
+            custom_types: ProviderCustomTypes::loaded(
+                known.into_iter().collect(),
+                Box::new(|_, _| Ok(())),
+            ),
+            ..ProviderContext::default()
+        };
+        assert!(matches!(
+            crate::validation::resolve_type_expr(
+                &TypeExpr::DottedUnresolved(ResourceTypePath::new("shared", "counter.Count")),
+                &context
+            ),
+            Err(StaticTypeResolutionError::ConflictingScalarKinds { .. })
+        ));
+    }
+
+    #[test]
     fn loaded_custom_types_derive_known_config_identities_and_resolver_from_factories() {
         let identity = TypeIdentity::new(Some("test"), ["config"], "Endpoint");
         let factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>> =
@@ -8179,13 +8385,18 @@ mod tests {
                 .known()
                 .contains(&crate::parser::OwnedTypeIdentity::provider(
                     "config-owner",
-                    identity.clone()
+                    identity.clone(),
+                    crate::schema::RefinedScalarKind::String
                 ))
         );
         crate::parser::CustomTypeResolver::validate(
             &custom_types,
             crate::parser::CustomTypeValidationTarget::Annotation(
-                &crate::parser::OwnedTypeIdentity::provider("config-owner", identity),
+                &crate::parser::OwnedTypeIdentity::provider(
+                    "config-owner",
+                    identity,
+                    crate::schema::RefinedScalarKind::String,
+                ),
             ),
             &Value::Concrete(ConcreteValue::String("https://example.test".into())),
         )
@@ -8277,6 +8488,7 @@ mod tests {
             &crate::parser::OwnedTypeIdentity::provider(
                 "snapshot",
                 TypeIdentity::new(Some("test"), ["item"], "Identifier"),
+                crate::schema::RefinedScalarKind::String
             )
         ));
     }
@@ -9518,34 +9730,46 @@ mod tests {
         let bindings = crate::binding_index::ResolvedBindings::default();
         let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = crate::schema::SchemaRegistry::new();
-        let context = crate::executor::ProviderPreparationContext::new(
-            &bindings,
-            &gate,
-            &[],
-            &NoopNormalizer,
-            &[],
-            &schemas,
-        );
-        futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
-            resource, &context,
-        ))
-        .expect("test resource should pass provider preparation")
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let context = crate::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
+                    resource, &context,
+                ))
+                .expect("test resource should pass provider preparation")
+            },
+        )
     }
 
     fn ready_data_source_for_test(resource: DataSource) -> ProviderReadyDataSource {
         let bindings = crate::binding_index::ResolvedBindings::default();
         let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = crate::schema::SchemaRegistry::new();
-        let context = crate::executor::ProviderPreparationContext::new(
-            &bindings,
-            &gate,
-            &[],
-            &NoopNormalizer,
-            &[],
-            &schemas,
-        );
-        crate::executor::prepare_provider_ready_data_source(resource, &context)
-            .expect("test data source should pass provider preparation")
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let context = crate::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                crate::executor::prepare_provider_ready_data_source(resource, &context)
+                    .expect("test data source should pass provider preparation")
+            },
+        )
     }
 
     // Mock Provider for testing
@@ -10826,18 +11050,24 @@ mod tests {
         registry.insert("", schema.clone());
         let bindings = crate::binding_index::ResolvedBindings::default();
         let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
-        let context = crate::executor::ProviderPreparationContext::new(
-            &bindings,
-            &gate,
-            &[],
-            &NoopNormalizer,
-            &[],
-            &registry,
-        );
-        futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
-            resource, &context,
-        ))
-        .expect("ignore_changes path must resolve during provider preparation")
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let context = crate::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &NoopNormalizer,
+                    &[],
+                    &registry,
+                    type_checks,
+                );
+                futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
+                    resource, &context,
+                ))
+                .expect("ignore_changes path must resolve during provider preparation")
+            },
+        )
     }
 
     #[test]

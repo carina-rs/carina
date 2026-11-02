@@ -36,7 +36,6 @@ base64 = "0.22"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 clap_complete = { version = "4", features = ["unstable-dynamic"] }
-colored = "3"
 crossterm = "0.28"
 indexmap = "2"
 indicatif = "0.17"

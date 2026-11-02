@@ -1,3 +1,4 @@
+use super::ast::BindingSeedMetadata;
 use super::*;
 use crate::binding_index::{IterableBindings, LivePreDataSourceReadInputs, ResolvedBindings};
 use crate::resolver::resolve_refs_for_plan;
@@ -308,7 +309,9 @@ fn integer_arithmetic_accepts_typed_function_and_module_operands() {
     .expect("a typed Int module argument is a valid deferred arithmetic operand");
     assert!(matches!(
         module.attribute_params[0].value,
-        Some(Value::Deferred(DeferredValue::IntegerArithmetic(_)))
+        Some(BoundaryExpression::Value(Value::Deferred(
+            DeferredValue::IntegerArithmetic(_)
+        )))
     ));
 }
 
@@ -402,7 +405,7 @@ fn structural_for_declarations_keep_pipe_and_postfix_behavior() {
 
 #[test]
 fn structural_for_resource_pipe_is_not_exported_as_a_value() {
-    let error = parse(
+    let parsed = parse(
         r#"
         fn f(value) { 7 }
         let n = for x in [1] {
@@ -412,13 +415,16 @@ fn structural_for_resource_pipe_is_not_exported_as_a_value() {
         "#,
         &ProviderContext::default(),
     )
-    .expect_err("a resource and a computed pipe value cannot share one exported name");
+    .expect("the parser must retain the structural side of the resource pipe");
 
-    assert!(
-        error
-            .to_string()
-            .contains("'n' is a resource, not a value; reference one of its attributes"),
-        "unexpected exported resource pipe diagnostic: {error}",
+    assert_eq!(
+        parsed.export_params[0]
+            .value
+            .as_ref()
+            .and_then(BoundaryExpression::handle)
+            .map(|handle| handle.diagnostic_name()),
+        Some("n"),
+        "the computed pipe value must not escape under the resource binding name",
     );
 }
 
@@ -632,9 +638,13 @@ fn integer_arithmetic_in_a_for_body_resolves_after_its_deferred_iterable() {
         )]),
         crate::binding_index::BindingValueSource::Local,
     );
-    parsed
-        .expand_deferred_for_expressions(&bindings.project_iterable_bindings())
-        .expect("deferred loop expands");
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            parsed.expand_deferred_for_expressions(&bindings.project_iterable_bindings(), session)
+        },
+    )
+    .expect("deferred loop expands");
     assert_eq!(
         parsed
             .resources
@@ -654,13 +664,18 @@ fn cross_deferred_for_resolution_seam<E>(parsed: File<E>) -> ModuleResolvedFile<
 where
     E: ResolveExportBindingPhase<ParserPlaceholder>,
 {
-    crate::module_resolver::resolve_modules_with_providerless_config(
-        crate::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
+    crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
-        &crate::schema::SchemaRegistry::new(),
+        |session| {
+            crate::module_resolver::resolve_modules_with_providerless_config(
+                crate::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
+                std::path::Path::new("."),
+                session,
+                &crate::schema::SchemaRegistry::new(),
+            )
+            .expect("deferred fixture crosses the module-resolution seam")
+        },
     )
-    .expect("deferred fixture crosses the module-resolution seam")
 }
 
 fn known(type_expr: TypeExpr) -> TypeExpr {
@@ -831,7 +846,7 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
             ),
         },
         timeout_secs: None,
-        depends_on: Vec::new(),
+        depends_on: Default::default(),
         line: 1,
     });
     file.requires.push(RequireBlock::dummy(
@@ -1658,7 +1673,8 @@ fn fully_qualified_shape_keeps_bound_value_head_semantics_in_every_value_positio
             .export_params
             .iter()
             .find(|export| export.name == "exported")
-            .and_then(|export| export.value.as_ref()),
+            .and_then(|export| export.value.as_ref())
+            .and_then(BoundaryExpression::value),
         Some(&expected),
     );
     assert_eq!(parsed.resources[0].get_attr("name"), Some(&expected),);
@@ -1711,7 +1727,8 @@ fn fully_qualified_shape_keeps_bound_structural_head_semantics_in_every_value_po
                 .export_params
                 .iter()
                 .find(|export| export.name == "exported")
-                .and_then(|export| export.value.as_ref()),
+                .and_then(|export| export.value.as_ref())
+                .and_then(BoundaryExpression::value),
             Some(&expected),
         );
         assert_eq!(
@@ -2196,11 +2213,11 @@ fn parse_struct_type_expression() {
         fields: vec![
             (
                 "registry_prod".to_string(),
-                TypeExpr::Simple("aws_account_id".to_string()),
+                crate::parser::bare_type_for_test("aws_account_id".to_string()),
             ),
             (
                 "registry_dev".to_string(),
-                TypeExpr::Simple("aws_account_id".to_string()),
+                crate::parser::bare_type_for_test("aws_account_id".to_string()),
             ),
         ],
     };
@@ -2264,6 +2281,144 @@ fn struct_type_expr_display_renders_with_braces() {
 
     let empty = TypeExpr::Struct { fields: vec![] };
     assert_eq!(empty.to_string(), "struct {}");
+}
+
+#[test]
+fn schema_type_serde_preserves_every_scalar_kind_without_registry() {
+    use crate::schema::RefinedScalarKind;
+
+    for kind in [
+        RefinedScalarKind::String,
+        RefinedScalarKind::Int,
+        RefinedScalarKind::Float,
+    ] {
+        let original = TypeExpr::SchemaType {
+            owned: crate::parser::OwnedTypeIdentity::provider(
+                "test",
+                TypeIdentity::from_dotted("test.counter.Count"),
+                kind,
+            ),
+        };
+        let wire = serde_json::to_value(&original).unwrap();
+        assert_eq!(
+            wire["SchemaType"]["owned"]["scalar_kind"],
+            serde_json::to_value(kind).unwrap()
+        );
+        let decoded: TypeExpr = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded, original);
+        let lifted = crate::validation::lift_type_expr(&decoded).expect("decoded kind must lift");
+        assert_eq!(
+            crate::provider::identified_custom_type_scalar_kind(&lifted).unwrap(),
+            Some(kind)
+        );
+    }
+}
+
+#[test]
+fn schema_type_serde_rejects_empty_owners_with_or_without_scalar_kind() {
+    for scalar_kind in [Some(serde_json::json!("Int")), None] {
+        let mut owned = serde_json::json!({
+            "owners": [],
+            "identity": TypeIdentity::from_dotted("test.counter.Count"),
+        });
+        if let Some(kind) = scalar_kind {
+            owned["scalar_kind"] = kind;
+        }
+        assert!(
+            serde_json::from_value::<TypeExpr>(serde_json::json!({"SchemaType": {"owned": owned}}))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn schema_type_serde_rejects_scalar_kind_that_conflicts_with_its_declaration() {
+    let original = TypeExpr::SchemaType {
+        owned: crate::parser::OwnedTypeIdentity::provider(
+            "test",
+            TypeIdentity::bare("Count"),
+            crate::schema::RefinedScalarKind::Int,
+        ),
+    };
+    let mut wire = serde_json::to_value(&original).unwrap();
+    wire["SchemaType"]["owned"]["scalar_kind"] = serde_json::json!("String");
+    assert!(
+        serde_json::from_value::<TypeExpr>(wire).is_err(),
+        "decoding cannot change the scalar kind independently of its declaration"
+    );
+}
+
+#[test]
+fn schema_type_serde_rejects_scalar_metadata_without_declaration_evidence() {
+    let original = TypeExpr::SchemaType {
+        owned: crate::parser::OwnedTypeIdentity::provider(
+            "test",
+            TypeIdentity::bare("Count"),
+            crate::schema::RefinedScalarKind::Int,
+        ),
+    };
+    let mut wire = serde_json::to_value(&original).unwrap();
+    wire["SchemaType"]["owned"]
+        .as_object_mut()
+        .unwrap()
+        .remove("declaration");
+    assert!(
+        serde_json::from_value::<TypeExpr>(wire).is_err(),
+        "scalar metadata alone is not declaration evidence"
+    );
+    let mut wire = serde_json::to_value(&original).unwrap();
+    wire["SchemaType"]["owned"]["identity"] =
+        serde_json::to_value(TypeIdentity::bare("OtherCount")).unwrap();
+    assert!(
+        serde_json::from_value::<TypeExpr>(wire).is_err(),
+        "decoding must validate identity against the declaration too"
+    );
+}
+
+#[test]
+fn user_fn_loaded_catalog_strictly_checks_custom_type_arguments_and_returns() {
+    let config = ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
+                "test",
+                TypeIdentity::bare("AccountId"),
+                crate::schema::RefinedScalarKind::String,
+            )]),
+            Box::new(|target, _| {
+                Err(crate::parser::fixture_invalid_custom_type_value(
+                    target,
+                    crate::schema::TypeError::ValidationFailed {
+                        message: "rejected by loaded catalog".into(),
+                    },
+                ))
+            }),
+        ),
+        ..Default::default()
+    };
+    for source in [
+        "fn f(x: AccountId) { x }\nlet value = f('account')\n",
+        "fn f(): AccountId { 'account' }\nlet value = f()\n",
+    ] {
+        let error =
+            parse(source, &config).expect_err("loaded checking must invoke the provider validator");
+        assert!(
+            error.to_string().contains("rejected by loaded catalog"),
+            "{error}"
+        );
+    }
+    let loaded_empty = ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            Default::default(),
+            Box::new(|_, _| Ok(())),
+        ),
+        ..Default::default()
+    };
+    let error = parse(
+        "fn f(x: Arn) { x }\nlet value = f('arn:aws:s3:::bucket')\n",
+        &loaded_empty,
+    )
+    .expect_err("a loaded catalog must reject an undeclared Arn");
+    assert!(error.to_string().contains("Arn"), "{error}");
 }
 
 #[test]
@@ -4198,9 +4353,11 @@ fn resolve_provider_attributes_with_remote_substitutes_upstream_refs() {
         .clone()
         .into_expanded(&crate::schema::SchemaRegistry::new())
         .expect("provider config must contain no parser placeholders");
-    let resolved =
-        resolve_provider_attributes_with_remote(&expanded, &remote, &ProviderContext::default())
-            .expect("resolve must succeed");
+    let resolved = crate::validation::deferred_types::with_session_for_test(
+        &ProviderContext::default(),
+        |session| resolve_provider_attributes_with_remote(&expanded, &remote, session),
+    )
+    .expect("resolve must succeed");
 
     let assume_role = resolved
         .iter()
@@ -4274,9 +4431,11 @@ fn resolve_provider_attributes_with_remote_rejects_unknown_refs() {
             .expect("provider config must contain no parser placeholders");
     let empty: HashMap<String, HashMap<String, crate::resource::ExpandedValue>> = HashMap::new();
 
-    let error =
-        resolve_provider_attributes_with_remote(&parsed, &empty, &ProviderContext::default())
-            .expect_err("resolved provider configs must reject a missing binding");
+    let error = crate::validation::deferred_types::with_session_for_test(
+        &ProviderContext::default(),
+        |session| resolve_provider_attributes_with_remote(&parsed, &empty, session),
+    )
+    .expect_err("resolved provider configs must reject a missing binding");
 
     let message = error.to_string();
     assert!(message.contains("assume_role"), "{message}");
@@ -4303,19 +4462,23 @@ fn resolve_provider_attributes_with_remote_uses_sibling_user_functions() {
     )
     .unwrap();
 
-    let parsed = crate::module_resolver::resolve_modules_with_providerless_config(
-        parse_directory(tmp.path(), &ProviderContext::default()).unwrap(),
-        tmp.path(),
+    let parsed = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
-        &crate::schema::SchemaRegistry::new(),
+        |session| {
+            crate::module_resolver::resolve_modules_with_providerless_config(
+                parse_directory(tmp.path(), &ProviderContext::default()).unwrap(),
+                tmp.path(),
+                session,
+                &crate::schema::SchemaRegistry::new(),
+            )
+            .expect("provider config crosses the module-resolution seam")
+        },
     )
-    .expect("provider config crosses the module-resolution seam")
     .into_expanded(&crate::schema::SchemaRegistry::new())
     .expect("provider config must contain no parser placeholders");
-    let resolved = resolve_provider_attributes_with_remote(
-        &parsed,
-        &HashMap::new(),
+    let resolved = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
+        |session| resolve_provider_attributes_with_remote(&parsed, &HashMap::new(), session),
     )
     .expect("provider attributes should use the merged user-function scope");
     assert_eq!(
@@ -4346,19 +4509,23 @@ fn resolve_provider_attributes_with_remote_preserves_function_call_line() {
     )
     .unwrap();
 
-    let parsed = crate::module_resolver::resolve_modules_with_providerless_config(
-        parse_directory(tmp.path(), &ProviderContext::default()).unwrap(),
-        tmp.path(),
+    let parsed = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
-        &crate::schema::SchemaRegistry::new(),
+        |session| {
+            crate::module_resolver::resolve_modules_with_providerless_config(
+                parse_directory(tmp.path(), &ProviderContext::default()).unwrap(),
+                tmp.path(),
+                session,
+                &crate::schema::SchemaRegistry::new(),
+            )
+            .expect("provider config crosses the module-resolution seam")
+        },
     )
-    .expect("provider config crosses the module-resolution seam")
     .into_expanded(&crate::schema::SchemaRegistry::new())
     .expect("provider config must contain no parser placeholders");
-    let error = resolve_provider_attributes_with_remote(
-        &parsed,
-        &HashMap::new(),
+    let error = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
+        |session| resolve_provider_attributes_with_remote(&parsed, &HashMap::new(), session),
     )
     .expect_err("invalid sibling function should fail at the authored provider call");
     let ProviderConfigResolutionError::Parse(ParseError::Located { path, error }) = error else {
@@ -4401,9 +4568,11 @@ fn provider_default_tags_remain_deferred_and_saved_plan_validation_accepts_them(
     let parsed = cross_deferred_for_resolution_seam(parsed)
         .into_expanded(&crate::schema::SchemaRegistry::new())
         .expect("provider config must contain no parser placeholders");
-    let resolved =
-        resolve_provider_attributes_with_remote(&parsed, &remote, &ProviderContext::default())
-            .expect("default_tags do not participate in the provider-ready invariant");
+    let resolved = crate::validation::deferred_types::with_session_for_test(
+        &ProviderContext::default(),
+        |session| resolve_provider_attributes_with_remote(&parsed, &remote, session),
+    )
+    .expect("default_tags do not participate in the provider-ready invariant");
     let saved = SavedProviderConfigs::from(&resolved);
     assert!(matches!(
         saved.as_provider_configs()[0].default_tags.get("Owner"),
@@ -5343,7 +5512,12 @@ fn parse_empty_interpolation_does_not_break_sibling_bindings() {
     let resource_names: Vec<&str> = result
         .resources
         .iter()
-        .map(|r| r.binding.as_deref().unwrap_or(""))
+        .map(|r| {
+            r.binding
+                .as_ref()
+                .map(|binding| binding.as_str())
+                .unwrap_or("")
+        })
         .collect();
     assert!(
         resource_names.contains(&"bucket") && resource_names.contains(&"vpc"),
@@ -6976,7 +7150,9 @@ fn parse_if_module_argument_defers_nested_value_carriers() {
 
     assert!(matches!(
         parsed.attribute_params[0].value,
-        Some(Value::Deferred(DeferredValue::ModuleIf(_)))
+        Some(BoundaryExpression::Value(Value::Deferred(
+            DeferredValue::ModuleIf(_)
+        )))
     ));
     assert!(matches!(
         parsed.resources[0].get_attr("direct"),
@@ -8123,15 +8299,17 @@ fn parse_accepts_pascal_case_custom_types() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.arguments[0].static_type,
-        known(TypeExpr::Simple("aws_account_id".to_string()))
+        known(crate::parser::bare_type_for_test(
+            "aws_account_id".to_string()
+        ))
     );
     assert_eq!(
         result.arguments[1].static_type,
-        known(TypeExpr::Simple("ipv4_cidr".to_string()))
+        known(crate::parser::bare_type_for_test("ipv4_cidr".to_string()))
     );
     assert_eq!(
         result.arguments[2].static_type,
-        known(TypeExpr::Simple("arn".to_string()))
+        known(crate::parser::bare_type_for_test("arn".to_string()))
     );
 }
 
@@ -9071,7 +9249,9 @@ let result = mock.test.resource {{
 #[test]
 fn user_fn_evaluated_decrypt_result_is_redacted_at_parameter_boundary() {
     let config = ProviderContext {
-        decryptor: Some(Box::new(|_, _| Ok("hunter2plaintext".to_string()))),
+        decryptor: Some(std::sync::Arc::new(|_, _| {
+            Ok("hunter2plaintext".to_string())
+        })),
         ..ProviderContext::default()
     };
     let input = r#"
@@ -9095,7 +9275,9 @@ let result = mock.test.resource {
 #[test]
 fn user_fn_evaluated_decrypt_result_is_redacted_at_return_boundary() {
     let config = ProviderContext {
-        decryptor: Some(Box::new(|_, _| Ok("hunter2plaintext".to_string()))),
+        decryptor: Some(std::sync::Arc::new(|_, _| {
+            Ok("hunter2plaintext".to_string())
+        })),
         ..ProviderContext::default()
     };
     let input = r#"
@@ -9446,7 +9628,7 @@ fn parse_custom_schema_type_in_fn_param() {
     assert_eq!(func.params[0].name, "cidr_block");
     assert_eq!(
         func.params[0].param_type,
-        Some(TypeExpr::Simple("ipv4_cidr".to_string()))
+        Some(crate::parser::bare_type_for_test("ipv4_cidr".to_string()))
     );
 }
 
@@ -9461,7 +9643,9 @@ fn parse_ipv4_address_type_in_fn_param() {
     let func = result.user_functions.get("f").unwrap();
     assert_eq!(
         func.params[0].param_type,
-        Some(TypeExpr::Simple("ipv4_address".to_string()))
+        Some(crate::parser::bare_type_for_test(
+            "ipv4_address".to_string()
+        ))
     );
 }
 
@@ -9476,7 +9660,7 @@ fn parse_arn_type_in_fn_param() {
     let func = result.user_functions.get("f").unwrap();
     assert_eq!(
         func.params[0].param_type,
-        Some(TypeExpr::Simple("arn".to_string()))
+        Some(crate::parser::bare_type_for_test("arn".to_string()))
     );
 }
 
@@ -9491,7 +9675,7 @@ fn parse_custom_type_in_list_generic() {
     let func = result.user_functions.get("f").unwrap();
     assert_eq!(
         func.params[0].param_type,
-        Some(TypeExpr::List(Box::new(TypeExpr::Simple(
+        Some(TypeExpr::List(Box::new(crate::parser::bare_type_for_test(
             "ipv4_cidr".to_string()
         ))))
     );
@@ -9514,12 +9698,14 @@ fn parse_custom_type_in_module_arguments() {
     assert_eq!(result.arguments[0].name, "vpc_cidr");
     assert_eq!(
         result.arguments[0].static_type,
-        known(TypeExpr::Simple("ipv4_cidr".to_string()))
+        known(crate::parser::bare_type_for_test("ipv4_cidr".to_string()))
     );
     assert_eq!(result.arguments[1].name, "server_ip");
     assert_eq!(
         result.arguments[1].static_type,
-        known(TypeExpr::Simple("ipv4_address".to_string()))
+        known(crate::parser::bare_type_for_test(
+            "ipv4_address".to_string()
+        ))
     );
 }
 
@@ -9538,37 +9724,115 @@ fn parse_custom_type_in_attributes() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.attribute_params[0].static_type,
-        known_opt(TypeExpr::Simple("ipv4_cidr".to_string()))
+        known_opt(crate::parser::bare_type_for_test("ipv4_cidr".to_string()))
     );
 }
 
 #[test]
 fn type_expr_display_simple() {
     assert_eq!(
-        TypeExpr::Simple("ipv4_cidr".to_string()).to_string(),
+        crate::parser::bare_type_for_test("ipv4_cidr".to_string()).to_string(),
         "Ipv4Cidr"
     );
     assert_eq!(
-        TypeExpr::Simple("ipv4_address".to_string()).to_string(),
+        crate::parser::bare_type_for_test("ipv4_address".to_string()).to_string(),
         "Ipv4Address"
     );
-    assert_eq!(TypeExpr::Simple("arn".to_string()).to_string(), "Arn");
+    assert_eq!(
+        crate::parser::bare_type_for_test("arn".to_string()).to_string(),
+        "Arn"
+    );
 }
 
 #[test]
 fn type_expr_display_simple_is_pascal_case() {
     assert_eq!(
-        TypeExpr::Simple("aws_account_id".to_string()).to_string(),
+        crate::parser::bare_type_for_test("aws_account_id".to_string()).to_string(),
         "AwsAccountId"
     );
     assert_eq!(
-        TypeExpr::Simple("ipv4_cidr".to_string()).to_string(),
+        crate::parser::bare_type_for_test("ipv4_cidr".to_string()).to_string(),
         "Ipv4Cidr"
     );
-    assert_eq!(TypeExpr::Simple("arn".to_string()).to_string(), "Arn");
+    assert_eq!(
+        crate::parser::bare_type_for_test("arn".to_string()).to_string(),
+        "Arn"
+    );
 }
 
 // --- Issue #1285: Validate fn call arguments for custom types ---
+
+#[test]
+fn user_fn_domain_name_custom_types_validate_arguments() {
+    for (type_name, domain, valid) in [
+        ("DomainName", "example.com", true),
+        ("DomainName", "EXAMPLE.Com.", true),
+        ("DomainName", "*.example.com", false),
+        ("DomainName", "example..com", false),
+        ("DomainName", "localhost", false),
+        ("WildcardDomainName", "example.com", true),
+        ("WildcardDomainName", "*.example.com.", true),
+        ("WildcardDomainName", "a.*.com", false),
+        ("WildcardDomainName", "*.com", false),
+    ] {
+        let input = format!(
+            "fn f(domain: {type_name}) {{ domain }}\nlet b = aws.s3_bucket {{ name = f({domain:?}) }}"
+        );
+        let result = parse(&input, &ProviderContext::default());
+        if valid {
+            assert!(result.is_ok(), "{type_name}: {domain:?}: {result:?}");
+        } else {
+            let message = result.unwrap_err().to_string();
+            assert!(
+                message.contains(&format!("parameter 'domain': expected {type_name}")),
+                "{message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn user_fn_https_url_custom_type_validates_arguments() {
+    for (url, valid) in [
+        ("https://example.com:8443/oidc?q=1#keys", true),
+        ("http://example.com", false),
+        ("https://user@example.com", false),
+    ] {
+        let input =
+            format!("fn f(url: HttpsUrl) {{ url }}\nlet b = aws.s3_bucket {{ name = f({url:?}) }}");
+        let result = parse(&input, &ProviderContext::default());
+        if valid {
+            assert!(result.is_ok(), "{url:?}: {result:?}");
+        } else {
+            let message = result.unwrap_err().to_string();
+            assert!(
+                message.contains("parameter 'url': expected HttpsUrl"),
+                "{message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn user_fn_https_url_custom_type_validates_return_values() {
+    for (url, valid) in [
+        ("https://[2001:db8::1]/keys", true),
+        ("https://example.com:65536/keys", false),
+    ] {
+        let input =
+            format!("fn f(): HttpsUrl {{ {url:?} }}\nlet b = aws.s3_bucket {{ name = f() }}");
+        let result = parse(&input, &ProviderContext::default());
+        if valid {
+            assert!(result.is_ok(), "{url:?}: {result:?}");
+        } else {
+            let message = result.unwrap_err().to_string();
+            assert!(
+                message.contains("return value: expected HttpsUrl"),
+                "{message}"
+            );
+        }
+    }
+}
 
 #[test]
 fn user_fn_custom_type_cidr_arg_valid() {
@@ -9856,7 +10120,7 @@ fn user_fn_custom_type_ipv6_address_arg_invalid() {
 }
 
 #[test]
-fn user_fn_unresolved_custom_type_arn_arg_is_rejected() {
+fn user_fn_arn_argument_defers_without_schemas_and_rejects_unknown_loaded_type() {
     let input = r#"
         fn f(x: Arn) { x }
 
@@ -9864,12 +10128,62 @@ fn user_fn_unresolved_custom_type_arn_arg_is_rejected() {
             name = f("arn:aws:s3:::my-bucket")
         }
     "#;
-    let error = parse(input, &ProviderContext::default())
-        .expect_err("an ownerless, non-built-in Simple annotation must not validate");
+    let source_file = std::path::Path::new("/project/main.crn");
+    let parsed = parse_file(input, source_file, &ProviderContext::default())
+        .expect("bootstrap parsing must retain the unresolved check");
+    assert!(matches!(
+        parsed.resources[0].attributes["name"],
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
+    ));
+    let checks = parsed
+        .parser_binding_metadata
+        .pending_function_type_checks();
+    assert_eq!(checks.len(), 1, "the argument check must remain pending");
+    assert_eq!(checks[0].function_name, "f");
+    assert_eq!(checks[0].source_line, 5);
+    assert_eq!(checks[0].source_file.as_deref(), Some(source_file));
+    assert!(matches!(
+        parsed.user_functions["f"].params[0].param_type,
+        Some(TypeExpr::UnloadedSchemaType(_))
+    ));
+    let loaded = ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            Default::default(),
+            Box::new(|_, _| panic!("an unknown type must never validate")),
+        ),
+        ..Default::default()
+    };
+    let error = parse(input, &loaded).expect_err("a loaded catalog must reject an undeclared Arn");
     assert!(
-        error.to_string().contains("owner-qualified schema type"),
+        error.to_string().contains("unknown custom type 'Arn'"),
         "{error}"
     );
+}
+
+#[test]
+fn user_fn_unloaded_custom_type_return_defers_until_schemas_are_loaded() {
+    let parsed = parse(
+        "fn f(): AccountId { 'account' }\nlet value = f()\n",
+        &ProviderContext::default(),
+    )
+    .expect("an unloaded return annotation must preserve the deferred call");
+    assert!(matches!(
+        parsed.variables["value"],
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
+    ));
+}
+
+#[test]
+fn user_fn_unloaded_custom_type_argument_defers_until_schemas_are_loaded() {
+    let parsed = parse(
+        "fn f(x: AccountId) { x }\nlet value = f('account')\n",
+        &ProviderContext::default(),
+    )
+    .expect("an unloaded parameter annotation must preserve the deferred call");
+    assert!(matches!(
+        parsed.variables["value"],
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
+    ));
 }
 
 #[test]
@@ -10259,7 +10573,7 @@ fn env_derived_pre_field_subscript_is_redacted_in_unresolved_reference_diagnosti
 #[test]
 fn parse_decrypt_uses_config_decryptor() {
     let config = ProviderContext {
-        decryptor: Some(Box::new(|ciphertext, _key| {
+        decryptor: Some(std::sync::Arc::new(|ciphertext, _key| {
             Ok(format!("decrypted:{ciphertext}"))
         })),
         ..ProviderContext::default()
@@ -10301,7 +10615,7 @@ fn parse_decrypt_uses_config_decryptor() {
 #[test]
 fn decrypt_inside_interpolation_resolves_to_a_secret_string() {
     let config = ProviderContext {
-        decryptor: Some(Box::new(|ciphertext, _key| {
+        decryptor: Some(std::sync::Arc::new(|ciphertext, _key| {
             Ok(format!("decrypted:{ciphertext}"))
         })),
         ..ProviderContext::default()
@@ -10352,6 +10666,23 @@ fn parse_decrypt_without_decryptor_errors() {
 }
 
 #[test]
+fn builtin_custom_type_validation_uses_declared_scalar_kind() {
+    let error = validate_custom_type(
+        &TypeIdentity::bare("PositiveInt"),
+        &ExpandedValue::Concrete(ExpandedConcreteValue::String("5".into())),
+        &ProviderContext::default(),
+    )
+    .expect_err("a string cannot satisfy an Int refinement")
+    .to_string();
+
+    assert!(
+        error.contains("Type mismatch: expected PositiveInt"),
+        "{error}"
+    );
+    assert!(!error.contains("unknown custom type"), "{error}");
+}
+
+#[test]
 fn unresolved_simple_custom_type_never_falls_back_to_a_provider_validator() {
     let identity = TypeIdentity::bare("CustomType");
     let config = ProviderContext {
@@ -10359,6 +10690,7 @@ fn unresolved_simple_custom_type_never_falls_back_to_a_provider_validator() {
             std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
                 "test",
                 identity.clone(),
+                crate::schema::RefinedScalarKind::String,
             )]),
             Box::new(|_target, _value| {
                 panic!("an unresolved Simple node must not enter provider routing")
@@ -10446,6 +10778,7 @@ fn schema_custom_type_validation_accepts_a_loaded_context_witness() {
     let owned = crate::parser::OwnedTypeIdentity::provider(
         "test",
         TypeIdentity::from_dotted("test.Widget.Id"),
+        crate::schema::RefinedScalarKind::String,
     );
 
     validate_schema_custom_type(
@@ -10464,6 +10797,7 @@ fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
             std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
                 "test",
                 identity.clone(),
+                crate::schema::RefinedScalarKind::String,
             )]),
             Box::new(|_target, _value| panic!("secret plaintext reached provider validation")),
         ),
@@ -10471,7 +10805,11 @@ fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
     });
 
     validate_schema_custom_type(
-        &crate::parser::OwnedTypeIdentity::provider("test", identity),
+        &crate::parser::OwnedTypeIdentity::provider(
+            "test",
+            identity,
+            crate::schema::RefinedScalarKind::String,
+        ),
         &ExpandedValue::Deferred(ExpandedDeferredValue::Secret(Box::new(
             ExpandedValue::Concrete(ExpandedConcreteValue::String("do-not-leak".into())),
         ))),
@@ -10482,46 +10820,55 @@ fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
 
 #[test]
 fn provider_context_validator_receives_canonical_numeric_text() {
+    use crate::schema::RefinedScalarKind;
     use std::sync::{Arc, Mutex};
 
     let identity = TypeIdentity::bare("NumericBridge");
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let observed = Arc::clone(&seen);
-    let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {
-        custom_types: crate::parser::ProviderCustomTypes::loaded(
-            std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
-                "test",
-                identity.clone(),
-            )]),
-            Box::new(move |_owned, value| {
-                let observed_value = match value {
-                    crate::resource::ExpandedValue::Concrete(
-                        crate::resource::ExpandedConcreteValue::Int(value),
-                    ) => format!("int:{value}"),
-                    crate::resource::ExpandedValue::Concrete(
-                        crate::resource::ExpandedConcreteValue::Float(value),
-                    ) => format!("float:{value}"),
-                    crate::resource::ExpandedValue::Concrete(
-                        crate::resource::ExpandedConcreteValue::String(value),
-                    ) => {
-                        format!("string:{}", value.expose_plaintext())
-                    }
-                    other => format!("unexpected:{other:?}"),
-                };
-                observed.lock().unwrap().push(observed_value);
-                Ok(())
-            }),
+    for (kind, value) in [
+        (
+            RefinedScalarKind::Int,
+            ExpandedValue::Concrete(ExpandedConcreteValue::Int(-42)),
         ),
-        ..ProviderContext::default()
-    });
-
-    for value in [
-        ExpandedValue::Concrete(ExpandedConcreteValue::Int(-42)),
-        ExpandedValue::Concrete(ExpandedConcreteValue::Float(1.25)),
-        ExpandedValue::Concrete(ExpandedConcreteValue::String("literal".into())),
+        (
+            RefinedScalarKind::Float,
+            ExpandedValue::Concrete(ExpandedConcreteValue::Float(1.25)),
+        ),
+        (
+            RefinedScalarKind::String,
+            ExpandedValue::Concrete(ExpandedConcreteValue::String("literal".into())),
+        ),
     ] {
+        let observed = Arc::clone(&seen);
+        let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {
+            custom_types: crate::parser::ProviderCustomTypes::loaded(
+                std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
+                    "test",
+                    identity.clone(),
+                    kind,
+                )]),
+                Box::new(move |_owned, value| {
+                    let observed_value = match value {
+                        ExpandedValue::Concrete(ExpandedConcreteValue::Int(value)) => {
+                            format!("int:{value}")
+                        }
+                        ExpandedValue::Concrete(ExpandedConcreteValue::Float(value)) => {
+                            format!("float:{value}")
+                        }
+                        ExpandedValue::Concrete(ExpandedConcreteValue::String(value)) => {
+                            format!("string:{}", value.expose_plaintext())
+                        }
+                        other => format!("unexpected:{other:?}"),
+                    };
+                    observed.lock().unwrap().push(observed_value);
+                    Ok(())
+                }),
+            ),
+            ..ProviderContext::default()
+        });
+
         validate_schema_custom_type(
-            &crate::parser::OwnedTypeIdentity::provider("test", identity.clone()),
+            &crate::parser::OwnedTypeIdentity::provider("test", identity.clone(), kind),
             &value,
             &config,
         )
@@ -10583,8 +10930,16 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
     let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([
-                crate::parser::OwnedTypeIdentity::provider("one", identity.clone()),
-                crate::parser::OwnedTypeIdentity::provider("two", identity.clone()),
+                crate::parser::OwnedTypeIdentity::provider(
+                    "one",
+                    identity.clone(),
+                    crate::schema::RefinedScalarKind::Int,
+                ),
+                crate::parser::OwnedTypeIdentity::provider(
+                    "two",
+                    identity.clone(),
+                    crate::schema::RefinedScalarKind::Int,
+                ),
             ]),
             Box::new(move |target, value| {
                 let owner = match target {
@@ -10616,20 +10971,32 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
     });
 
     validate_schema_custom_type(
-        &crate::parser::OwnedTypeIdentity::provider("one", identity.clone()),
+        &crate::parser::OwnedTypeIdentity::provider(
+            "one",
+            identity.clone(),
+            crate::schema::RefinedScalarKind::Int,
+        ),
         &ExpandedValue::Concrete(ExpandedConcreteValue::Int(5)),
         &config,
     )
     .expect("owner one must get its own verdict");
     validate_schema_custom_type(
-        &crate::parser::OwnedTypeIdentity::provider("two", identity.clone()),
+        &crate::parser::OwnedTypeIdentity::provider(
+            "two",
+            identity.clone(),
+            crate::schema::RefinedScalarKind::Int,
+        ),
         &ExpandedValue::Concrete(ExpandedConcreteValue::Int(7)),
         &config,
     )
     .expect("owner two must get its own verdict");
     assert!(
         validate_schema_custom_type(
-            &crate::parser::OwnedTypeIdentity::provider("one", identity.clone()),
+            &crate::parser::OwnedTypeIdentity::provider(
+                "one",
+                identity.clone(),
+                crate::schema::RefinedScalarKind::Int
+            ),
             &ExpandedValue::Concrete(ExpandedConcreteValue::Int(7)),
             &config,
         )
@@ -10637,7 +11004,11 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
     );
     assert!(
         validate_schema_custom_type(
-            &crate::parser::OwnedTypeIdentity::provider("two", identity.clone()),
+            &crate::parser::OwnedTypeIdentity::provider(
+                "two",
+                identity.clone(),
+                crate::schema::RefinedScalarKind::Int
+            ),
             &ExpandedValue::Concrete(ExpandedConcreteValue::Int(5)),
             &config,
         )
@@ -10658,6 +11029,7 @@ fn parse_custom_validator_rejects_invalid() {
             std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
                 "test",
                 identity.clone(),
+                crate::schema::RefinedScalarKind::String,
             )]),
             Box::new(move |target, value| {
                 if target.identity() != &validator_identity {
@@ -10688,7 +11060,11 @@ fn parse_custom_validator_rejects_invalid() {
 
     // Test validate_custom_type directly since the grammar may not accept
     // arbitrary type names. This verifies the custom validator is called.
-    let owned = crate::parser::OwnedTypeIdentity::provider("test", identity);
+    let owned = crate::parser::OwnedTypeIdentity::provider(
+        "test",
+        identity,
+        crate::schema::RefinedScalarKind::String,
+    );
     let valid_result = validate_schema_custom_type(
         &owned,
         &ExpandedValue::Concrete(ExpandedConcreteValue::String("valid-data".into())),
@@ -10769,6 +11145,7 @@ fn parse_schema_type_display() {
         owned: crate::parser::OwnedTypeIdentity::provider(
             "awscc",
             TypeIdentity::from_schema_type("awscc", "ec2", "VpcId"),
+            crate::schema::RefinedScalarKind::String,
         ),
     };
     assert_eq!(t.to_string(), "awscc.ec2.VpcId");
@@ -12256,11 +12633,16 @@ fn expand_deferred_for_with_remote_bindings() {
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
     // Expand deferred for-expressions
-    parsed
-        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
-            resolve_remote_bindings(remote_bindings),
-        ))
-        .unwrap();
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            parsed.expand_deferred_for_expressions(
+                &IterableBindings::from_upstream_only(resolve_remote_bindings(remote_bindings)),
+                session,
+            )
+        },
+    )
+    .unwrap();
 
     // Deferred should be resolved
     assert_eq!(
@@ -12325,9 +12707,16 @@ fn expand_deferred_for_no_remote_data_stays_deferred() {
 
     // Empty remote_bindings — upstream hasn't been applied yet
     let remote_bindings: HashMap<String, HashMap<String, ExpandedValue>> = HashMap::new();
-    parsed
-        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote_bindings))
-        .unwrap();
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            parsed.expand_deferred_for_expressions(
+                &IterableBindings::from_upstream_only(remote_bindings),
+                session,
+            )
+        },
+    )
+    .unwrap();
 
     // Should remain deferred
     assert_eq!(
@@ -12378,11 +12767,16 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-    parsed
-        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
-            resolve_remote_bindings(remote_bindings),
-        ))
-        .unwrap();
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            parsed.expand_deferred_for_expressions(
+                &IterableBindings::from_upstream_only(resolve_remote_bindings(remote_bindings)),
+                session,
+            )
+        },
+    )
+    .unwrap();
 
     assert_eq!(parsed.deferred_for_expressions().len(), 0);
     assert_eq!(parsed.resources.len(), 2); // allow: direct — fixture test inspection
@@ -12447,11 +12841,16 @@ fn expand_deferred_for_indexed_binding_substitutes_index_and_value() {
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-    parsed
-        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
-            resolve_remote_bindings(remote_bindings),
-        ))
-        .unwrap();
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            parsed.expand_deferred_for_expressions(
+                &IterableBindings::from_upstream_only(resolve_remote_bindings(remote_bindings)),
+                session,
+            )
+        },
+    )
+    .unwrap();
 
     assert_eq!(parsed.resources.len(), 2); // allow: direct — fixture test inspection
     assert_eq!(
@@ -12530,23 +12929,29 @@ fn expand_deferred_for_children_depend_on_iterable_binding_for_all_binding_shape
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-    parsed
-        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
-            resolve_remote_bindings(remote_bindings),
-        ))
-        .unwrap();
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            parsed.expand_deferred_for_expressions(
+                &IterableBindings::from_upstream_only(resolve_remote_bindings(remote_bindings)),
+                session,
+            )
+        },
+    )
+    .unwrap();
 
     assert_eq!(parsed.deferred_for_expressions().len(), 0);
     assert_eq!(parsed.resources.len(), 3); // allow: direct — fixture test inspection
     for resource in &parsed.resources {
         assert!(
             resource
-                .dependency_bindings
+                .dependencies
+                .value_bindings
                 .iter()
                 .any(|binding| binding.as_str() == "orgs"),
             "expanded deferred-for child {} should depend on iterable binding `orgs`, got {:?}",
             resource.id,
-            resource.dependency_bindings
+            resource.dependencies.value_bindings
         );
     }
 }
@@ -12592,11 +12997,16 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
     remote_bindings.insert("anchor".to_string(), anchor_attrs);
     let remote_bindings = resolve_remote_bindings(remote_bindings);
 
-    parsed
-        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
-            remote_bindings.clone(),
-        ))
-        .unwrap();
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            parsed.expand_deferred_for_expressions(
+                &IterableBindings::from_upstream_only(remote_bindings.clone()),
+                session,
+            )
+        },
+    )
+    .unwrap();
     assert_eq!(parsed.deferred_for_expressions().len(), 0);
     assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
 
@@ -12609,16 +13019,21 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
         wait_aliases: &[],
     });
     let upstream_keys: HashSet<&str> = remote_bindings.keys().map(String::as_str).collect();
-    resolve_refs_for_plan(&mut parsed.resources, &bindings, &upstream_keys).unwrap();
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        |session| resolve_refs_for_plan(&mut parsed.resources, &bindings, &upstream_keys, session),
+    )
+    .unwrap();
 
     let child = &parsed.resources[0];
     assert!(
         child
-            .dependency_bindings
+            .dependencies
+            .value_bindings
             .iter()
             .any(|binding| binding.as_str() == "orgs"),
         "resolve_refs_for_plan must preserve deferred-for iterable dependency binding, got {:?}",
-        child.dependency_bindings
+        child.dependencies.value_bindings
     );
 }
 
@@ -12656,11 +13071,16 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-    parsed
-        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
-            resolve_remote_bindings(remote_bindings),
-        ))
-        .unwrap();
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            parsed.expand_deferred_for_expressions(
+                &IterableBindings::from_upstream_only(resolve_remote_bindings(remote_bindings)),
+                session,
+            )
+        },
+    )
+    .unwrap();
     assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
 
     // label must have the placeholder substituted in the interpolation.
@@ -12725,11 +13145,16 @@ fn expand_deferred_for_simple_binding_with_map_iterable_warns() {
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-    parsed
-        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
-            resolve_remote_bindings(remote_bindings),
-        ))
-        .unwrap();
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            parsed.expand_deferred_for_expressions(
+                &IterableBindings::from_upstream_only(resolve_remote_bindings(remote_bindings)),
+                session,
+            )
+        },
+    )
+    .unwrap();
 
     assert_eq!(
         parsed.resources.len(), // allow: direct — fixture test inspection
@@ -12779,11 +13204,16 @@ fn expand_deferred_for_map_binding_with_list_iterable_warns() {
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
 
-    parsed
-        .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
-            resolve_remote_bindings(remote_bindings),
-        ))
-        .unwrap();
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            parsed.expand_deferred_for_expressions(
+                &IterableBindings::from_upstream_only(resolve_remote_bindings(remote_bindings)),
+                session,
+            )
+        },
+    )
+    .unwrap();
 
     // Mismatch: should NOT expand silently with numeric indices
     assert_eq!(
@@ -13063,11 +13493,17 @@ fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
         errs.as_slice(),
         [ParseError::UndefinedDeferredIterable { name, .. }] if name == "org"
     ));
-    let err = crate::module_resolver::resolve_modules_providerless(
-        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
-    )
-    .expect_err("finalization must reject the bare undefined iterable");
+    let err = crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            crate::module_resolver::resolve_modules_providerless(
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                std::path::Path::new("."),
+                session,
+            )
+            .expect_err("finalization must reject the bare undefined iterable")
+        },
+    );
     let crate::module_resolver::ModuleError::Parse(parse_error) = err.root_cause() else {
         panic!("expected a typed parse error, got {err:?}");
     };
@@ -13451,7 +13887,7 @@ fn quoted_string_attrs_distinguish_quoted_from_bare_and_namespaced() {
         parsed
             .resources
             .iter()
-            .find(|r| r.binding.as_deref() == Some(binding))
+            .find(|r| r.binding.as_ref().map(|binding| binding.as_str()) == Some(binding))
             .map(|r| r.quoted_string_attrs.contains("target_type"))
             .unwrap_or(false)
     };
@@ -13487,7 +13923,7 @@ fn quoted_string_attrs_are_top_level_only() {
     let sg = parsed
         .resources
         .iter()
-        .find(|r| r.binding.as_deref() == Some("sg"))
+        .find(|r| r.binding.as_ref().map(|binding| binding.as_str()) == Some("sg"))
         .expect("sg resource present");
     assert!(sg.quoted_string_attrs.contains("name"));
     // `protocol` lives inside the `rules` block; only top-level
@@ -13509,7 +13945,7 @@ fn quoted_string_attrs_skipped_for_interpolated_strings() {
     let r = parsed
         .resources
         .iter()
-        .find(|r| r.binding.as_deref() == Some("r"))
+        .find(|r| r.binding.as_ref().map(|binding| binding.as_str()) == Some("r"))
         .expect("r resource present");
     // Interpolations parse to `Value::Deferred(DeferredValue::Interpolation)`, not a plain
     // string, so they are never recorded in `quoted_string_attrs`.
@@ -13688,11 +14124,11 @@ fn parsed_file_is_file_of_parsed_export_param() {
 
 #[test]
 fn inferred_file_holds_inferred_export_param() {
-    let one = InferredExportParam {
-        name: "vpc_id".to_string(),
-        static_type: crate::static_type::ExportStaticType::Declared(TypeExpr::String),
-        value: None,
-    };
+    let one = InferredExportParam::for_test(
+        "vpc_id",
+        crate::static_type::ExportStaticType::Declared(TypeExpr::String),
+        None,
+    );
     let f: InferredFile = InferredFile {
         export_params: vec![one],
         ..Default::default()
@@ -14125,10 +14561,14 @@ fn parse_directory_preserves_module_arg_dotted_string_literal() {
 
     let parsed = parse_directory(tmp.path(), &ProviderContext::default())
         .expect("directory fixture must parse");
-    let parsed = resolve_modules(parsed, tmp.path())
-        .expect("module expansion must succeed")
-        .into_expanded(&crate::schema::SchemaRegistry::new())
-        .expect("module fixture contains no parser placeholders");
+    let parsed = crate::validation::deferred_types::with_session_for_test(
+        &ProviderContext::default(),
+        |session| {
+            resolve_modules(parsed, tmp.path(), session).expect("module expansion must succeed")
+        },
+    )
+    .into_expanded(&crate::schema::SchemaRegistry::new())
+    .expect("module fixture contains no parser placeholders");
     let record = parsed
         .resources
         .iter()
@@ -14221,7 +14661,7 @@ fn parse_directory_preserves_export_param_dotted_string_literal() {
         .expect("domain export present");
 
     assert_eq!(
-        export.value.as_ref(),
+        export.value.as_ref().and_then(BoundaryExpression::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "publish.example.com".into()
         )))
@@ -14285,7 +14725,7 @@ fn parse_preserves_attribute_param_default_dotted_string_literal() {
         .expect("domain attribute param present");
 
     assert_eq!(
-        attr.value.as_ref(),
+        attr.value.as_ref().and_then(BoundaryExpression::value),
         Some(&Value::Concrete(ConcreteValue::String(
             "publish.example.com".into()
         )))
@@ -14972,7 +15412,7 @@ fn extract_directives_reads_depends_on_list() {
         .find(|r| r.id.identity_str().expect("resolved identity") == "bucket")
         .expect("bucket binding");
     assert_eq!(
-        bucket.directives.depends_on,
+        bucket.dependencies.depends_on.diagnostic_references(),
         vec!["role".to_string(), "key".to_string()]
     );
 }
@@ -15271,9 +15711,9 @@ fn extract_directives_accepts_empty_depends_on_list() {
         .find(|r| r.id.identity_str().expect("resolved identity") == "bucket")
         .expect("bucket binding");
     assert!(
-        bucket.directives.depends_on.is_empty(),
+        bucket.dependencies.depends_on.is_empty(),
         "empty depends_on list should produce an empty Vec, got {:?}",
-        bucket.directives.depends_on
+        bucket.dependencies.depends_on
     );
 }
 
@@ -15309,7 +15749,7 @@ fn extract_directives_depends_on_in_for_loop_resource() {
         panic!("deferred fixture body must be a resource")
     };
     assert_eq!(
-        template.directives().depends_on,
+        template.dependencies().depends_on.diagnostic_references(),
         vec!["role".to_string()],
         "for-body resource template should carry directives.depends_on"
     );
@@ -16502,6 +16942,7 @@ fn postfix_index_on_sibling_let_bound_computed_value_is_directory_scoped() {
         .iter()
         .find(|export| export.name == "account_id")
         .and_then(|export| export.value.as_ref())
+        .and_then(BoundaryExpression::value)
         .expect("account_id export value");
 
     assert!(matches!(
@@ -16830,27 +17271,49 @@ fn assert_bare_handle_is_pending_for_typed_resource_value(source: &str, binding:
 }
 
 #[test]
-fn bare_resource_handle_is_rejected_in_untyped_value_positions() {
+fn bare_resource_handle_is_rejected_in_runtime_value_positions() {
     for source in [
         r#"let vpc = mock.test.Thing { name = "source" }
 let values = [vpc, "ok"]"#,
         r#"let vpc = mock.test.Thing { name = "source" }
 let values = { primary = vpc }"#,
         r#"let vpc = mock.test.Thing { name = "source" }
-exports { handle: String = vpc }"#,
-        r#"let vpc = mock.test.Thing { name = "source" }
-exports { handle = vpc }"#,
-        r#"let vpc = mock.test.Thing { name = "source" }
 let rendered = "prefix-${vpc}""#,
         r#"let vpc = mock.test.Thing { name = "source" }
 mock.test.Consumer { name = "prefix-${vpc}" }"#,
         r#"let vpc = mock.test.Thing { name = "source" }
 mock.test.Consumer { name = upper(vpc) }"#,
-        r#"let vpc = mock.test.Thing { name = "source" }
-attributes { handle: String = vpc }"#,
     ] {
         assert_bare_handle_error(source, "vpc", "a resource");
     }
+}
+
+#[test]
+fn boundary_blocks_preserve_bare_resource_handles_for_typed_validation() {
+    let parsed = parse(
+        r#"let vpc = mock.test.Thing { name = "source" }
+attributes { output = vpc }
+exports { exported = vpc }"#,
+        &ProviderContext::default(),
+    )
+    .expect("boundary blocks retain structural handles until validation");
+
+    assert_eq!(
+        parsed.attribute_params[0]
+            .value
+            .as_ref()
+            .and_then(crate::parser::BoundaryExpression::handle)
+            .map(|handle| handle.diagnostic_name()),
+        Some("vpc"),
+    );
+    assert_eq!(
+        parsed.export_params[0]
+            .value
+            .as_ref()
+            .and_then(crate::parser::BoundaryExpression::handle)
+            .map(|handle| handle.diagnostic_name()),
+        Some("vpc"),
+    );
 }
 
 #[test]
@@ -17369,7 +17832,9 @@ fn integer_arithmetic_retains_provisional_metadata_for_both_operands() {
         parsed
             .parser_binding_metadata
             .value_structural_handles_by_name("n"),
-        Some(crate::eval_value::StructuralHandleMetadata::ExpressionOperands(operands))
+        Some(
+            crate::eval_value::UnexpandedStructuralHandleMetadata::ExpressionOperands(operands),
+        )
             if operands.len() == 2
     ));
 }
@@ -17424,9 +17889,14 @@ let us = provider mock {}
     let consumer = parsed
         .resources
         .iter()
-        .find(|resource| resource.binding.as_deref() == Some("consumer"))
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("consumer")
+        })
         .expect("consumer");
-    assert_eq!(consumer.directives.depends_on, vec!["dependency"]);
+    assert_eq!(
+        consumer.dependencies.depends_on.diagnostic_references(),
+        vec!["dependency"]
+    );
     assert_eq!(consumer.directives.provider_instance.as_deref(), Some("us"));
 }
 
@@ -17454,6 +17924,42 @@ let consumer = mock.test.Consumer {
         "unexpected error: {message}"
     );
     assert!(message.contains("line 5"), "unexpected error: {message}");
+}
+
+#[test]
+fn dependency_boundaries_reject_a_string_module_argument_with_the_same_message() {
+    for (boundary, source) in [
+        (
+            "directives.depends_on",
+            r#"
+arguments { dependency: String }
+let consumer = mock.test.Consumer {
+  name = "consumer"
+  directives { depends_on = [dependency] }
+}
+"#,
+        ),
+        (
+            "wait.depends_on",
+            r#"
+arguments { dependency: String }
+let target = mock.test.Thing { name = "target" }
+let ready = wait target {
+  until = target.name == "ready"
+  depends_on = [dependency]
+}
+"#,
+        ),
+    ] {
+        let error = parse(source, &ProviderContext::default())
+            .expect_err("a value-typed module argument is not a dependency handle");
+        assert!(
+            error.to_string().contains(&format!(
+                "{boundary}: expected a managed resource handle; got String"
+            )),
+            "unexpected {boundary} error: {error}",
+        );
+    }
 }
 
 #[test]
@@ -17585,6 +18091,7 @@ fn postfix_access_preserves_sibling_deferred_for_binding_as_resource_address() {
             .iter()
             .find(|export| export.name == name)
             .and_then(|export| export.value.as_ref())
+            .and_then(BoundaryExpression::value)
             .unwrap()
     };
     assert_eq!(value("role_grouped"), value("role_name"));
@@ -17879,9 +18386,15 @@ mod loop_var_field_access_matrix {
         );
         let mut remote = HashMap::new();
         remote.insert("up".to_string(), up_attrs);
-        p.expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
-            resolve_remote_bindings(remote),
-        ))
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                p.expand_deferred_for_expressions(
+                    &IterableBindings::from_upstream_only(resolve_remote_bindings(remote)),
+                    session,
+                )
+            },
+        )
         .unwrap();
 
         assert_eq!(p.deferred_for_expressions().len(), 0, "loop expanded");
@@ -17983,11 +18496,16 @@ mod loop_var_field_access_matrix {
                 GenericValue::Deferred(GenericDeferredValue::Placeholder(LoopSlot::Value))
             ));
         }
-        expanded
-            .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
-                resolve_remote_bindings(remote),
-            ))
-            .expect("subscripts and nested fields substitute");
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                expanded.expand_deferred_for_expressions(
+                    &IterableBindings::from_upstream_only(resolve_remote_bindings(remote)),
+                    session,
+                )
+            },
+        )
+        .expect("subscripts and nested fields substitute");
 
         let resolved = |binding: &str| {
             expanded
@@ -18037,11 +18555,16 @@ mod loop_var_field_access_matrix {
         let mut remote = HashMap::new();
         remote.insert("up".to_string(), attrs);
 
-        let error = parsed
-            .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(
-                resolve_remote_bindings(remote),
-            ))
-            .expect_err("known missing keys must fail during deferred-for expansion");
+        let error = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                parsed.expand_deferred_for_expressions(
+                    &IterableBindings::from_upstream_only(resolve_remote_bindings(remote)),
+                    session,
+                )
+            },
+        )
+        .expect_err("known missing keys must fail during deferred-for expansion");
         assert!(
             error.to_string().contains("key 'missing' not found"),
             "unexpected expansion error: {error}"
@@ -18074,9 +18597,14 @@ mod loop_var_field_access_matrix {
         let mut resolved = ResolvedBindings::default();
         resolved.set("q", attrs, crate::binding_index::BindingValueSource::Local);
 
-        parsed
-            .expand_deferred_for_expressions(&resolved.project_iterable_bindings())
-            .expect("a miss in a local desired-side view remains deferred");
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                parsed
+                    .expand_deferred_for_expressions(&resolved.project_iterable_bindings(), session)
+            },
+        )
+        .expect("a miss in a local desired-side view remains deferred");
 
         let name = parsed
             .resources
@@ -18212,6 +18740,7 @@ fn deferred_user_calls_share_the_root_lexical_scope() {
             .iter()
             .find(|parameter| parameter.name == name)
             .and_then(|parameter| parameter.value.as_ref())
+            .and_then(BoundaryExpression::value)
             .unwrap_or_else(|| panic!("missing attribute {name}"));
         let Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
@@ -18234,6 +18763,16 @@ fn deferred_user_calls_share_the_root_lexical_scope() {
         std::ptr::eq(first_scope, second_scope),
         "deferred calls must share one lexical scope allocation",
     );
+}
+#[test]
+fn wait_depends_on_accepts_bare_and_dotted_dependency_operands() {
+    let parsed = parse("let ready = wait cert { until = cert.status == \"issued\" depends_on = [r, producer.validation_record] }\n", &ProviderContext::default()).unwrap();
+    let operands = parsed.wait_bindings[0]
+        .depends_on
+        .iter()
+        .map(|operand| operand.diagnostic_reference())
+        .collect::<Vec<_>>();
+    assert_eq!(operands, ["r", "producer.validation_record"]);
 }
 
 #[test]

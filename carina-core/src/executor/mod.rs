@@ -64,8 +64,7 @@ pub struct PlanSchedulerEndpoint {
 /// scheduler's behavior for unaffected effects.
 pub fn build_plan_scheduler_dependency_edges(
     plan_effects: &[Effect],
-    unresolved_resources: &HashMap<ResourceId, &UnresolvedResource>,
-    compositions: &[crate::resource::LiveComposition],
+    unresolved_resources: &HashMap<ResolvedResourceId, &UnresolvedResource>,
 ) -> BTreeSet<(PlanSchedulerEndpoint, PlanSchedulerEndpoint)> {
     let parallel::ExpandedEffects {
         effects,
@@ -79,7 +78,6 @@ pub fn build_plan_scheduler_dependency_edges(
     let scheduler::SchedulerDeps { deps_of, .. } = scheduler::build_scheduler_deps_from_resources(
         &effects,
         unresolved_resources,
-        compositions,
         &deferred_replace_delete_deps,
     );
 
@@ -107,6 +105,7 @@ pub fn build_plan_scheduler_dependency_edges(
         .collect()
 }
 
+use crate::resource::ResolvedResourceId;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -384,9 +383,14 @@ impl AcceptedRequest {
     /// accepted request. Production executor paths retain resolved values;
     /// provider-ready bootstrap and test paths may use the supplied resource
     /// as their already-resolved fallback.
-    pub fn sent_desired_attributes<'a, S>(
+    pub fn sent_desired_attributes<'a, S, D>(
         &'a self,
-        fallback_resource: &'a Resource<S>,
+        fallback_resource: &'a Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
     ) -> SentDesiredAttributes<'a> {
         match self.resolved_desired_attributes.as_ref() {
             Some(attributes) => {
@@ -474,6 +478,7 @@ pub struct LiveExecutionInput<'a> {
     /// Provider factories used for provider-defined custom type validation at
     /// the apply boundary. Enum resolution uses the schema registry below and
     /// never delegates spelling conversion to a factory.
+    pub provider_context: crate::parser::ProviderContext,
     pub factories: &'a [Box<dyn crate::provider::ProviderFactory>],
     /// Schema registry used to re-apply structural and enum canonicalization
     /// after apply-time reference resolution and provider normalization.
@@ -505,6 +510,7 @@ pub struct SavedExecutionInput<'a> {
         crate::resource::NoPlaceholder,
         crate::resource::AbsoluteBindingAddress,
     >],
+    pub provider_context: crate::parser::ProviderContext,
     pub factories: &'a [Box<dyn crate::provider::ProviderFactory>],
     pub schemas: &'a crate::schema::SchemaRegistry,
     pub parallelism: NonZeroUsize,
@@ -531,23 +537,11 @@ impl RuntimeCompositions<'_> {
     fn scheduler_dependencies<S>(
         self,
         effects: &[Effect<S>],
-        unresolved_resources: &HashMap<ResourceId, UnresolvedResource<S>>,
+        unresolved_resources: &HashMap<ResolvedResourceId, UnresolvedResource<S>>,
         deferred_replace_delete_deps: &[(usize, usize)],
     ) -> scheduler::SchedulerDeps {
-        match self {
-            Self::Live(compositions) => scheduler::build_scheduler_deps(
-                effects,
-                unresolved_resources,
-                compositions,
-                deferred_replace_delete_deps,
-            ),
-            Self::Saved(compositions) => scheduler::build_saved_scheduler_deps(
-                effects,
-                unresolved_resources,
-                compositions,
-                deferred_replace_delete_deps,
-            ),
-        }
+        let _ = self;
+        scheduler::build_scheduler_deps(effects, unresolved_resources, deferred_replace_delete_deps)
     }
 }
 
@@ -563,6 +557,7 @@ pub(super) struct RuntimeExecutionInput<'a, S = ModuleSource> {
         crate::resource::NoPlaceholder,
         crate::resource::AbsoluteBindingAddress,
     >],
+    pub(super) type_checks: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     pub(super) factories: &'a [Box<dyn crate::provider::ProviderFactory>],
     pub(super) schemas: &'a crate::schema::SchemaRegistry,
     pub(super) parallelism: NonZeroUsize,
@@ -570,8 +565,14 @@ pub(super) struct RuntimeExecutionInput<'a, S = ModuleSource> {
     pub(super) checkpoint_sink: ExecutionCheckpointSink<S>,
 }
 
-impl<'a> From<LiveExecutionInput<'a>> for RuntimeExecutionInput<'a, ModuleSource> {
-    fn from(input: LiveExecutionInput<'a>) -> Self {
+impl<'a> LiveExecutionInput<'a> {
+    fn in_session<'s>(
+        self,
+        type_checks: &'s dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> RuntimeExecutionInput<'s, ModuleSource>
+    where
+        'a: 's,
+    {
         let LiveExecutionInput {
             plan,
             provider_check_inputs,
@@ -581,13 +582,14 @@ impl<'a> From<LiveExecutionInput<'a>> for RuntimeExecutionInput<'a, ModuleSource
             data_source_values,
             normalizer,
             provider_configs,
+            provider_context: _provider_context,
             factories,
             schemas,
             parallelism,
             precompleted_success_count,
             checkpoint_sink,
-        } = input;
-        Self {
+        } = self;
+        RuntimeExecutionInput {
             plan,
             provider_check_inputs,
             compositions: RuntimeCompositions::Live(compositions),
@@ -596,6 +598,7 @@ impl<'a> From<LiveExecutionInput<'a>> for RuntimeExecutionInput<'a, ModuleSource
             data_source_values,
             normalizer,
             provider_configs,
+            type_checks,
             factories,
             schemas,
             parallelism,
@@ -605,8 +608,14 @@ impl<'a> From<LiveExecutionInput<'a>> for RuntimeExecutionInput<'a, ModuleSource
     }
 }
 
-impl<'a> From<SavedExecutionInput<'a>> for RuntimeExecutionInput<'a, SavedModuleSource> {
-    fn from(input: SavedExecutionInput<'a>) -> Self {
+impl<'a> SavedExecutionInput<'a> {
+    fn in_session<'s>(
+        self,
+        type_checks: &'s dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> RuntimeExecutionInput<'s, SavedModuleSource>
+    where
+        'a: 's,
+    {
         let SavedExecutionInput {
             plan,
             provider_check_inputs,
@@ -616,13 +625,14 @@ impl<'a> From<SavedExecutionInput<'a>> for RuntimeExecutionInput<'a, SavedModule
             data_source_values,
             normalizer,
             provider_configs,
+            provider_context: _provider_context,
             factories,
             schemas,
             parallelism,
             precompleted_success_count,
             checkpoint_sink,
-        } = input;
-        Self {
+        } = self;
+        RuntimeExecutionInput {
             plan,
             provider_check_inputs,
             compositions: RuntimeCompositions::Saved(compositions),
@@ -631,6 +641,7 @@ impl<'a> From<SavedExecutionInput<'a>> for RuntimeExecutionInput<'a, SavedModule
             data_source_values,
             normalizer,
             provider_configs,
+            type_checks,
             factories,
             schemas,
             parallelism,
@@ -659,13 +670,18 @@ impl<'a> From<SavedExecutionInput<'a>> for RuntimeExecutionInput<'a, SavedModule
 pub enum ProviderCheckInputs<'a, S = ModuleSource> {
     Authored,
     PlanNormalized {
-        resource_origins: &'a HashMap<ResourceId, UnresolvedResource<S>>,
-        data_source_origins: &'a [DataSource<S>],
+        resource_origins: &'a HashMap<ResolvedResourceId, UnresolvedResource<S>>,
+        data_source_origins: &'a [DataSource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            (),
+        >],
     },
 }
 
 impl<S: Clone> ProviderCheckInputs<'_, S> {
-    fn resource_origins(&self) -> Option<&HashMap<ResourceId, UnresolvedResource<S>>> {
+    fn resource_origins(&self) -> Option<&HashMap<ResolvedResourceId, UnresolvedResource<S>>> {
         match self {
             Self::Authored => None,
             Self::PlanNormalized {
@@ -676,9 +692,14 @@ impl<S: Clone> ProviderCheckInputs<'_, S> {
 
     pub(in crate::executor) fn resource_input(
         &self,
-        resolved: &Resource<S>,
+        resolved: &Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            (),
+        >,
         runtime_authored: bool,
-    ) -> Result<provider_ready::CheckInput<Resource<S>>, String> {
+    ) -> Result<provider_ready::ResourceCheckInput<S>, String> {
         if runtime_authored || matches!(self, Self::Authored) {
             return Ok(provider_ready::CheckInput::Authored(resolved.clone()));
         }
@@ -702,8 +723,13 @@ impl<S: Clone> ProviderCheckInputs<'_, S> {
 
     pub(in crate::executor) fn data_source_input(
         &self,
-        resolved: &DataSource<S>,
-    ) -> Result<provider_ready::CheckInput<DataSource<S>>, String> {
+        resolved: &DataSource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            (),
+        >,
+    ) -> Result<provider_ready::DataSourceCheckInput<S>, String> {
         match self {
             Self::Authored => Ok(provider_ready::CheckInput::Authored(resolved.clone())),
             Self::PlanNormalized {
@@ -781,8 +807,13 @@ fn visit_unknowns(value: &Value, f: &mut impl FnMut(&ApplyTimeUnknown)) {
     }
 }
 
-pub fn unresolved_data_source_inputs<S>(
-    resource: &DataSource<S>,
+pub fn unresolved_data_source_inputs<S, D>(
+    resource: &DataSource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
 ) -> Vec<UnresolvedDataSourceInput> {
     resource
         .attributes
@@ -1846,7 +1877,20 @@ pub async fn execute_live_plan(
     observer: &dyn ExecutionObserver,
     shutdown: ShutdownToken,
 ) -> ExecutionOutcome {
-    execute_runtime_plan(provider, provider, input.into(), observer, shutdown).await
+    let catalog = input.provider_context.clone();
+    let checks =
+        crate::validation::deferred_types::TypeCheckSession::run_async(&catalog, async |session| {
+            execute_runtime_plan(
+                provider,
+                provider,
+                input.in_session(session),
+                observer,
+                shutdown,
+            )
+            .await
+        })
+        .await;
+    publish_execution_checks(checks)
 }
 
 /// Test-only execution entry point for focused provider fixtures without an
@@ -1881,7 +1925,62 @@ pub async fn execute_saved_plan(
     observer: &dyn ExecutionObserver<SavedModuleSource>,
     shutdown: ShutdownToken,
 ) -> ExecutionOutcome<SavedModuleSource> {
-    execute_runtime_plan(provider, provider, input.into(), observer, shutdown).await
+    let catalog = input.provider_context.clone();
+    let checks =
+        crate::validation::deferred_types::TypeCheckSession::run_async(&catalog, async |session| {
+            execute_runtime_plan(
+                provider,
+                provider,
+                input.in_session(session),
+                observer,
+                shutdown,
+            )
+            .await
+        })
+        .await;
+    publish_execution_checks(checks)
+}
+
+fn publish_execution_checks<S>(
+    checks: crate::validation::deferred_types::ProviderTypeCheckResult<ExecutionOutcome<S>>,
+) -> ExecutionOutcome<S> {
+    let mut sink = ExecutionTypeCheckSink {
+        diagnostics: Vec::new(),
+    };
+    let mut outcome = checks.publish(&mut sink);
+    let result = match &mut outcome {
+        ExecutionOutcome::Completed(result) | ExecutionOutcome::Cancelled(result) => result,
+    };
+    for diagnostic in sink.diagnostics {
+        let message = match diagnostic {
+            crate::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning)
+            | crate::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(warning) => warning.message,
+        };
+        if !result
+            .failures
+            .failures
+            .iter()
+            .any(|failure| failure.kind.to_string().contains(&message))
+        {
+            result.failures.failures.push(EffectFailure {
+                endpoint: None,
+                kind: EffectFailureKind::message(message),
+            });
+        }
+    }
+    outcome
+}
+
+struct ExecutionTypeCheckSink {
+    diagnostics: Vec<crate::validation::deferred_types::ProviderTypeCheckDiagnostic>,
+}
+impl crate::validation::deferred_types::ProviderTypeCheckSink for ExecutionTypeCheckSink {
+    fn record(
+        &mut self,
+        diagnostic: crate::validation::deferred_types::ProviderTypeCheckDiagnostic,
+    ) {
+        self.diagnostics.push(diagnostic);
+    }
 }
 
 async fn execute_runtime_plan<S: Clone + crate::resource::AnonymousIdentityModuleSource>(
@@ -1917,9 +2016,15 @@ async fn execute_test_runtime_plan(
         input.schemas,
         input.plan.effects().iter().map(Effect::resource_id),
     );
-    let mut input: RuntimeExecutionInput<'_> = input.into();
-    input.schemas = &schemas;
-    execute_runtime_plan(provider, &comparison_provider, input, observer, shutdown).await
+    let catalog = input.provider_context.clone();
+    let checks =
+        crate::validation::deferred_types::TypeCheckSession::run_async(&catalog, async |session| {
+            let mut input = input.in_session(session);
+            input.schemas = &schemas;
+            execute_runtime_plan(provider, &comparison_provider, input, observer, shutdown).await
+        })
+        .await;
+    publish_execution_checks(checks)
 }
 
 #[cfg(test)]

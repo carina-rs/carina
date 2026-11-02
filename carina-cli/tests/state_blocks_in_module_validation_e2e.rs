@@ -196,7 +196,7 @@ fn state_block_in_imported_but_uncalled_nested_module_is_rejected() {
 
     let diagnostics = fixture.validate();
 
-    assert_path_prefixed_rejection(&diagnostics, "../module/./helper");
+    assert_path_prefixed_rejection(&diagnostics, "../module/helper");
 }
 
 #[test]

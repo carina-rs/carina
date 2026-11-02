@@ -1,5 +1,6 @@
 //! Semantic checks: provider region, module calls, unused bindings, undefined references.
 
+use carina_core::parser::ExportParamLike;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
@@ -23,7 +24,7 @@ use carina_core::upstream_exports::UpstreamRefDiagnostic;
 use carina_core::validation::typecheck::{self, TypecheckInference};
 
 use super::{
-    DiagnosticEngine, DiagnosticSource, ProviderValidationDeduplicator, carina_diagnostic,
+    DiagnosticRun, DiagnosticSource, ProviderValidationDeduplicator, carina_diagnostic,
     carina_diagnostic_range, parse_error_to_diagnostic, parser_span_range,
 };
 
@@ -485,7 +486,9 @@ impl SemanticLookup for AttributeParameter {
     }
 
     fn value(&self) -> Option<&Value> {
-        self.value.as_ref()
+        self.value
+            .as_ref()
+            .and_then(carina_core::parser::BoundaryExpression::value)
     }
 }
 
@@ -510,7 +513,9 @@ impl SemanticLookup for ParsedExportParam {
     }
 
     fn value(&self) -> Option<&Value> {
-        self.value.as_ref()
+        self.value
+            .as_ref()
+            .and_then(carina_core::parser::BoundaryExpression::value)
     }
 }
 
@@ -714,6 +719,7 @@ fn collect_enum_provider_namespaces(
     use carina_core::schema::RawShape;
 
     match attr_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => {}
         RawShape::Enum { identity, .. } => {
             if let Some(provider) = &identity.provider {
                 namespaces.insert(provider.clone());
@@ -780,7 +786,7 @@ where
     Some((identity_graph.resources, identity_graph.providers))
 }
 
-impl DiagnosticEngine {
+impl DiagnosticRun<'_> {
     /// Report anonymous resources that would share an identity scheme derived
     /// from mutable attributes. The core check owns classification and
     /// grouping; this adapter only maps the directory-wide result back onto
@@ -1461,64 +1467,35 @@ impl DiagnosticEngine {
         let signatures = carina_core::module_resolver::load_resolved_module_signatures(
             parsed,
             base_path,
-            &self.provider_context,
+            self.provider_context.catalog(),
         );
-        let validation_context = match &self.provider_context {
-            super::DiagnosticProviderContext::Loaded(provider_context) => {
-                carina_core::validation::ValidationTypeContext::new(
-                    parsed,
-                    &self.schemas,
-                    provider_context,
-                    &signatures,
-                )
-            }
-            super::DiagnosticProviderContext::Unloaded(provider_context) => {
-                carina_core::validation::ValidationTypeContext::new_providerless(
-                    parsed,
-                    &self.schemas,
-                    provider_context,
-                    &signatures,
-                )
-            }
-        };
+        let validation_context = carina_core::validation::ValidationTypeContext::in_session(
+            parsed,
+            &self.schemas,
+            self.provider_context,
+            &signatures,
+        );
         let binding_use_report =
             carina_core::validation::check_bare_binding_uses(parsed, &validation_context);
         let bindings =
-            BindingIndex::from_parsed_with_module_signatures(parsed, &self.schemas, &signatures);
-        match &self.provider_context {
-            super::DiagnosticProviderContext::Loaded(provider_context) => {
-                carina_core::validation::check_module_calls(
-                    carina_core::validation::ModuleCallCheckInput {
-                        authored: parsed,
-                        semantic: Some(parsed),
-                        base_dir: Some(base_path),
-                        imported_signatures: &signatures,
-                        provider_context,
-                        schemas: &self.schemas,
-                        binding_use_report: &binding_use_report,
-                        bindings: &bindings,
-                        reference_checks:
-                            carina_core::validation::ModuleCallReferenceChecks::Enabled,
-                    },
-                )
-            }
-            super::DiagnosticProviderContext::Unloaded(provider_context) => {
-                carina_core::validation::check_module_calls_providerless(
-                    carina_core::validation::ModuleCallCheckInput {
-                        authored: parsed,
-                        semantic: Some(parsed),
-                        base_dir: Some(base_path),
-                        imported_signatures: &signatures,
-                        provider_context,
-                        schemas: &self.schemas,
-                        binding_use_report: &binding_use_report,
-                        bindings: &bindings,
-                        reference_checks:
-                            carina_core::validation::ModuleCallReferenceChecks::Enabled,
-                    },
-                )
-            }
-        }
+            BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
+                parsed,
+                &self.schemas,
+                None,
+                &signatures,
+                self.provider_context,
+            );
+        carina_core::validation::check_module_calls(carina_core::validation::ModuleCallCheckInput {
+            authored: parsed,
+            semantic: Some(parsed),
+            base_dir: Some(base_path),
+            imported_signatures: &signatures,
+            provider_context: self.provider_context,
+            schemas: &self.schemas,
+            binding_use_report: &binding_use_report,
+            bindings: &bindings,
+            reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
+        })
     }
 
     /// Run a directory-scoped parse with the current editor buffer substituted
@@ -1544,40 +1521,27 @@ impl DiagnosticEngine {
         }
         let result = carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
             base_path,
-            &self.provider_context,
+            self.provider_context.catalog(),
             &overrides,
         )?;
         let covered_findings = self.module_call_findings_for_resolution(&result.parsed, base_path);
         // Module expansion is a no-op for configs without `module_call`.
         // Failures retain the authored parse for source-level checks; only the
         // successful outcome can replace it with the expanded graph.
-        let module_resolution = match &self.provider_context {
-            super::DiagnosticProviderContext::Loaded(provider_context) => {
-                carina_core::module_resolver::resolve_modules_with_diagnostics(
-                    &result.parsed,
-                    base_path,
-                    provider_context,
-                    &self.schemas,
-                    &covered_findings,
-                )
-            }
-            super::DiagnosticProviderContext::Unloaded(provider_context) => {
-                carina_core::module_resolver::resolve_modules_with_providerless_diagnostics(
-                    &result.parsed,
-                    base_path,
-                    provider_context,
-                    &self.schemas,
-                    &covered_findings,
-                )
-            }
-        };
+        let module_resolution = carina_core::module_resolver::resolve_modules_with_diagnostics(
+            &result.parsed,
+            base_path,
+            self.provider_context,
+            &self.schemas,
+            &covered_findings,
+        );
         let module_resolution = match module_resolution {
             carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded {
                 mut graph,
             } => {
                 let _ = carina_core::parser::resolve_expanded_provider_unresolved_attributes(
                     &mut graph,
-                    &self.provider_context,
+                    self.provider_context.catalog(),
                 );
                 let _ = carina_core::parser::finalize_provider_configs(&mut graph);
                 MergedModuleResolution::Expanded { graph }
@@ -1917,32 +1881,20 @@ impl DiagnosticEngine {
         }
         let merged = carina_core::config_loader::parse_directory_with_overrides(
             base_path,
-            &self.provider_context,
+            self.provider_context.catalog(),
             &overrides,
         )
         .ok()?;
-        let module_resolution = match &self.provider_context {
-            super::DiagnosticProviderContext::Loaded(provider_context) => {
-                carina_core::module_resolver::resolve_modules_with_config(
-                    merged.clone(),
-                    base_path,
-                    provider_context,
-                    &self.schemas,
-                )
-            }
-            super::DiagnosticProviderContext::Unloaded(provider_context) => {
-                carina_core::module_resolver::resolve_modules_with_providerless_config(
-                    merged.clone(),
-                    base_path,
-                    provider_context,
-                    &self.schemas,
-                )
-            }
-        };
+        let module_resolution = carina_core::module_resolver::resolve_modules_with_config(
+            merged.clone(),
+            base_path,
+            self.provider_context,
+            &self.schemas,
+        );
         if let Ok(mut resolved) = module_resolution {
             if let Err(error) = carina_core::parser::resolve_expanded_provider_unresolved_attributes(
                 &mut resolved,
-                &self.provider_context,
+                self.provider_context.catalog(),
             ) {
                 return Some(error);
             }
@@ -1974,7 +1926,7 @@ impl DiagnosticEngine {
         }
         if let Err(e) = carina_core::parser::resolve_provider_unresolved_attributes(
             &mut merged,
-            &self.provider_context,
+            self.provider_context.catalog(),
         ) {
             return Some(e);
         }
@@ -2014,7 +1966,7 @@ impl DiagnosticEngine {
                 },
             };
             let Ok(parsed) =
-                carina_core::parser::parse_file(&content, &file, &self.provider_context)
+                carina_core::parser::parse_file(&content, &file, self.provider_context.catalog())
             else {
                 continue;
             };
@@ -2433,7 +2385,11 @@ impl DiagnosticEngine {
             .collect::<Vec<_>>();
 
         for attr_param in &parsed.attribute_params {
-            if let Some(value) = &attr_param.value {
+            if let Some(value) = attr_param
+                .value
+                .as_ref()
+                .and_then(carina_core::parser::BoundaryExpression::value)
+            {
                 // Check for undefined binding references in parser-native shapes
                 // (`Value::Deferred(DeferredValue::ResourceRef)` for `name.attr`, `Value::Deferred(DeferredValue::BindingRef)`
                 // for bare `name`, since #2847).
@@ -2480,7 +2436,16 @@ impl DiagnosticEngine {
                 if let Some(type_expr) = &attr_param.static_type
                     && let Some(semantic_value) = semantic_view.value_for_typecheck(attr_param)
                 {
-                    let type_error = match self.provider_context.loaded() {
+                    // Declaration resolution owns an unnameable annotation. Value
+                    // checking starts only after that producer can classify it.
+                    let Ok(resolved_type) = carina_core::validation::resolve_type_expr(
+                        type_expr,
+                        self.provider_context.catalog(),
+                    ) else {
+                        continue;
+                    };
+                    let type_expr = &resolved_type;
+                    let type_error = match self.provider_context.loaded_context() {
                         Some(provider_context) => typecheck::check_type_expr_value(
                             type_expr,
                             semantic_value,
@@ -2490,15 +2455,24 @@ impl DiagnosticEngine {
                                 schemas: &self.schemas,
                             },
                         )
+                        .require_provider_schemas()
                         .err(),
                         None => typecheck::check_type_expr_value_providerless(
                             type_expr,
                             semantic_value,
-                            &self.provider_context,
+                            self.provider_context.catalog(),
                             TypecheckInference::Available {
                                 bindings: inference_bindings,
                                 schemas: &self.schemas,
                             },
+                        )
+                        .record_at(
+                            self.provider_context,
+                            carina_core::validation::deferred_types::ProviderTypeCheckSite::new(
+                                attr_param.source_file(),
+                                attr_param.source_span(),
+                                format!("attribute '{}'", attr_param.name),
+                            ),
                         )
                         .err(),
                     };
@@ -2532,7 +2506,7 @@ impl DiagnosticEngine {
         let resolved_attribute_params =
             carina_core::validation::resolve_attribute_static_types_for_consumer(
                 &attribute_params,
-                &self.provider_context,
+                self.provider_context.catalog(),
             );
         if let Err(ref_errors) =
             carina_core::validation::validate_consumer_attribute_param_ref_types_with_bindings(
@@ -2671,7 +2645,9 @@ impl DiagnosticEngine {
                                 continue;
                             };
                             fallback = param.clone();
-                            fallback.value = Some(value.clone());
+                            fallback.value = Some(carina_core::parser::BoundaryExpression::Value(
+                                value.clone(),
+                            ));
                             &fallback
                         }
                     };
@@ -2734,20 +2710,12 @@ impl DiagnosticEngine {
         param: &ParsedExportParam<ParserPlaceholder, B>,
         value_bindings: &GenericResolvedBindings<ParserPlaceholder, B>,
     ) -> Option<String> {
-        match self.provider_context.loaded() {
-            Some(provider_context) => carina_core::validation::check_export_values_pre_apply(
-                std::slice::from_ref(param),
-                value_bindings,
-                provider_context,
-            )
-            .err(),
-            None => carina_core::validation::check_export_values_pre_apply_providerless(
-                std::slice::from_ref(param),
-                value_bindings,
-                &self.provider_context,
-            )
-            .err(),
-        }
+        carina_core::validation::check_export_values_pre_apply(
+            std::slice::from_ref(param),
+            value_bindings,
+            self.provider_context,
+        )
+        .err()
     }
 
     fn check_inferred_export_types<D, B: BindingAddress>(
@@ -2799,24 +2767,42 @@ impl DiagnosticEngine {
         } else {
             self.infer_export_params_without_loaded_provider_schemas(inference_input)
         };
-        let export_bindings =
-            carina_core::binding_index::BindingIndex::from_parsed(inference_input, &self.schemas);
+        let signatures = carina_core::module_resolver::ResolvedModuleSignatures::default();
+        let export_bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
+            inference_input, &self.schemas, None, &signatures, self.provider_context,
+        );
+        let mut boundary_export_params = inferred_export_params.parameters().to_vec();
+        for parameter in &mut boundary_export_params {
+            let Some(type_expr) = parameter.type_expr_opt_mut() else {
+                continue;
+            };
+            if let Ok(resolved) = carina_core::validation::resolve_type_expr(
+                type_expr,
+                self.provider_context.catalog(),
+            ) {
+                *type_expr = resolved;
+            }
+        }
         if let Err(ref_errors) =
             carina_core::validation::validate_export_param_ref_types_with_bindings(
-                inferred_export_params.parameters(),
+                &boundary_export_params,
                 &export_bindings,
             )
         {
-            for error_msg in ref_errors.split('\n') {
-                if let Some((line, col)) = self.find_ref_error_position(doc, error_msg) {
-                    diagnostics.push(carina_diagnostic(
-                        line,
-                        col,
-                        col + 1,
-                        DiagnosticSeverity::WARNING,
-                        error_msg.to_string(),
-                    ));
+            for error in ref_errors {
+                if error.source_file() != doc.source_file() {
+                    continue;
                 }
+                let span = error.source_span();
+                let line = span.start_line().saturating_sub(1) as u32;
+                let col = span.start_column().saturating_sub(1) as u32;
+                diagnostics.push(carina_diagnostic(
+                    line,
+                    col,
+                    col + error.name.len() as u32,
+                    DiagnosticSeverity::ERROR,
+                    error.to_string(),
+                ));
             }
         }
 
@@ -2837,13 +2823,6 @@ impl DiagnosticEngine {
         D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
         carina_core::validation::inference::infer_export_params(parsed, &self.schemas)
-    }
-
-    /// Find the position of a ref type error in exports by extracting the param name.
-    fn find_ref_error_position(&self, doc: &Document, error_msg: &str) -> Option<(u32, u32)> {
-        // Error format: "export 'NAME': type mismatch ..."
-        let name = error_msg.strip_prefix("export '")?.split('\'').next()?;
-        self.find_exports_param_position(doc, name)
     }
 
     /// Find the position of an exports parameter name in the document.
@@ -2881,28 +2860,12 @@ impl DiagnosticEngine {
     /// Check if a TypeExpr contains unknown type names.
     fn check_unknown_type_names(&self, type_expr: &TypeExpr) -> Option<String> {
         match type_expr {
-            TypeExpr::Simple(name) => {
-                if carina_core::parser::BUILTIN_BARE_CUSTOM_TYPES.contains(&name.as_str()) {
-                    return None;
-                }
-                // The document's provisional parse has no provider context,
-                // so a registered bare provider type may still be a `Simple`
-                // node here. The authoritative directory parse promotes it to
-                // owner-bearing `SchemaType`; mirror only the recognition
-                // check here and never route validation by bare identity.
-                let identity = carina_core::schema::TypeIdentity::bare(
-                    carina_core::parser::snake_to_pascal(name),
-                );
-                if self
-                    .provider_context
-                    .known_custom_types()
-                    .iter()
-                    .any(|owned| owned.identity() == &identity)
-                {
-                    return None;
-                }
-                Some(format!("Unknown type '{name}'."))
-            }
+            TypeExpr::UnloadedSchemaType(_) => carina_core::validation::resolve_type_expr(
+                type_expr,
+                self.provider_context.catalog(),
+            )
+            .err()
+            .map(|error| error.to_string()),
             TypeExpr::List(inner) => self.check_unknown_type_names(inner),
             TypeExpr::Map(inner) => self.check_unknown_type_names(inner),
             TypeExpr::Struct { fields } => fields
@@ -2916,6 +2879,7 @@ impl DiagnosticEngine {
             | TypeExpr::Int
             | TypeExpr::Float
             | TypeExpr::Duration
+            | TypeExpr::Simple(_)
             | TypeExpr::Ref(_)
             | TypeExpr::DottedUnresolved(_)
             | TypeExpr::SchemaType { .. }
@@ -3055,6 +3019,8 @@ impl DiagnosticEngine {
         value.visit_resource_refs_with_usage(&mut |path, usage| {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
+            let mut diagnostic_binding = binding_name.to_string();
+            let mut diagnostic_attribute = attribute_name.to_string();
             let message = match binding_index.ref_type(path) {
                 RefType::UnknownAttribute(error)
                     if carina_core::validation::suppress_coalesce_existence_error(
@@ -3064,47 +3030,53 @@ impl DiagnosticEngine {
                     return;
                 }
                 RefType::UnknownAttribute(RefTypeError::UnknownAttribute {
+                    binding,
+                    attribute,
                     known_attributes,
                     target: RefTargetKind::Schema { resource_type },
-                    ..
                 }) => {
+                    diagnostic_binding = binding;
+                    diagnostic_attribute = attribute;
                     let known_attrs: Vec<&str> =
                         known_attributes.iter().map(String::as_str).collect();
-                    let suggestion = suggest_similar_name(attribute_name, &known_attrs)
+                    let suggestion = suggest_similar_name(&diagnostic_attribute, &known_attrs)
                         .map(|suggestion| format!(" Did you mean '{}'?", suggestion))
                         .unwrap_or_default();
                     format!(
                         "Unknown attribute '{}' on '{}' (type '{}'){}",
-                        attribute_name, binding_name, resource_type, suggestion,
+                        diagnostic_attribute, diagnostic_binding, resource_type, suggestion,
                     )
                 }
                 RefType::UnknownAttribute(RefTypeError::UnknownAttribute {
+                    binding,
+                    attribute,
                     known_attributes,
                     target: RefTargetKind::LiveComposition,
-                    ..
                 }) => {
+                    diagnostic_binding = binding;
+                    diagnostic_attribute = attribute;
                     let known_attrs: Vec<&str> =
                         known_attributes.iter().map(String::as_str).collect();
-                    let suffix = suggest_similar_name(attribute_name, &known_attrs)
+                    let suffix = suggest_similar_name(&diagnostic_attribute, &known_attrs)
                         .map(|suggestion| format!(". Did you mean '{}'?", suggestion))
                         .unwrap_or_else(|| ".".to_string());
                     format!(
                         "Unknown attribute '{}' on '{}'{}",
-                        attribute_name, binding_name, suffix,
+                        diagnostic_attribute, diagnostic_binding, suffix,
                     )
                 }
                 RefType::UnknownAttribute(error) => error.to_string(),
                 RefType::Typed(_) | RefType::Unchecked | RefType::UnknownBinding { .. } => return,
             };
 
-            let ref_text = format!("{}.{}", binding_name, attribute_name);
+            let ref_text = format!("{}.{}", diagnostic_binding, diagnostic_attribute);
             if let Some((line, col)) = self.find_ref_value_position(doc, &ref_text) {
                 // Highlight just the attribute part (after the dot)
-                let attr_col = col + binding_name.len() as u32 + 1; // +1 for the dot
+                let attr_col = col + diagnostic_binding.len() as u32 + 1; // +1 for the dot
                 diagnostics.push(carina_diagnostic(
                     line,
                     attr_col,
-                    attr_col + attribute_name.len() as u32,
+                    attr_col + diagnostic_attribute.len() as u32,
                     DiagnosticSeverity::WARNING,
                     message,
                 ));
@@ -3237,9 +3209,14 @@ impl DiagnosticEngine {
     /// `dep_name` hints carried by `DependsOnDiagnostic` (#2874) to
     /// resolve a precise span. Falls back to whole-buffer scan only
     /// for diagnostics that have no hints (e.g. cycle errors).
-    pub(super) fn check_depends_on(&self, doc: &Document, parsed: &ParsedFile) -> Vec<Diagnostic> {
+    pub(super) fn check_depends_on(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+        argument_types: &carina_core::validation::ResolvedArgumentTypes,
+    ) -> Vec<Diagnostic> {
         use carina_core::validation::depends_on::{Severity, validate_depends_on};
-        let diags = validate_depends_on(parsed);
+        let diags = validate_depends_on(parsed, argument_types);
         if diags.is_empty() {
             return Vec::new();
         }

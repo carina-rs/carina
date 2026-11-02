@@ -1,0 +1,81 @@
+{
+  "version": 20,
+  "exports_version": 1,
+  "serial": 1,
+  "lineage": "test-lineage-legacy-orphan-unknown",
+  "carina_version": "0.8.0",
+  "resources": [
+    {
+      "resource_type": "ec2.Vpc",
+      "identity": "awscc_ec2_vpc_0bc2a2bb",
+      "provider": "awscc",
+      "current": {
+        "kind": "applied",
+        "identifier": "vpc-0123456789abcdef0",
+        "attributes": {
+          "cidr_block": "10.0.0.0/16",
+          "enable_dns_support": true,
+          "enable_dns_hostnames": true,
+          "vpc_id": "vpc-0123456789abcdef0",
+          "tags": {
+            "Name": "test-vpc"
+          }
+        },
+        "nested_write_only": {}
+      },
+      "binding": "awscc_ec2_vpc_0bc2a2bb",
+      "dependency_bindings": [],
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "protected": false,
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "cidr_block": { "kind": "leaf" },
+          "enable_dns_support": { "kind": "leaf" },
+          "enable_dns_hostnames": { "kind": "leaf" },
+          "tags": { "kind": "leaf" }
+        }
+      }
+    },
+    {
+      "resource_type": "ec2.Subnet",
+      "identity": "removed_module.subnet",
+      "provider": "awscc",
+      "current": {
+        "kind": "applied",
+        "identifier": "subnet-0123456789abcdef0",
+        "attributes": {
+          "vpc_id": "vpc-0123456789abcdef0",
+          "cidr_block": "10.0.1.0/24",
+          "availability_zone": "ap-northeast-1a",
+          "subnet_id": "subnet-0123456789abcdef0",
+          "tags": {
+            "Name": "test-subnet"
+          }
+        },
+        "nested_write_only": {}
+      },
+      "binding": "removed_module.subnet",
+      "dependency_bindings": [
+        "awscc_ec2_vpc_0bc2a2bb",
+        "removed_module.gone"
+      ],
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "protected": false,
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "vpc_id": { "kind": "leaf" },
+          "cidr_block": { "kind": "leaf" },
+          "availability_zone": { "kind": "leaf" },
+          "tags": { "kind": "leaf" }
+        }
+      }
+    }
+  ],
+  "exports": {}
+}

@@ -12,8 +12,8 @@ use crate::binding_index::{
 use crate::differ::secret_grafted_comparison_view;
 use crate::effect::{BasicEffect, DeletedInstanceKey, Effect, EffectGeneration};
 use crate::executor::provider_ready::{
-    CheckInput, ProviderPreparationContext, ResolvedCheckInput, managed_update_schema,
-    prepare_provider_ready_resource_after_resolution,
+    CheckInput, DataSourceCheckInput, ProviderPreparationContext, ResolvedCheckInput,
+    ResourceCheckInput, managed_update_schema, prepare_provider_ready_resource_after_resolution,
 };
 use crate::provider::{
     AppliedIdentifier, CompletedResume, CreateFailureKind, CreateRequest, DeleteRequest,
@@ -22,9 +22,11 @@ use crate::provider::{
     UpdateRequest,
 };
 use crate::resolver::resolve_ref_value;
+#[cfg(test)]
+use crate::resource::Resource;
 use crate::resource::{
-    AbsoluteBindingAddress, ConcreteValue, Current, DataSource, DeferredValue, Resource,
-    ResourceId, State, Value,
+    AbsoluteBindingAddress, ConcreteValue, Current, DataSource, DeferredValue, ResourceId, State,
+    Value,
 };
 use crate::schema::SchemaKind;
 use crate::value::{SerializationContext, SerializationError};
@@ -189,7 +191,7 @@ pub(super) async fn refresh_pending_states<S: Clone>(
 /// that populate asynchronously (ACM `domain_validation_options`,
 /// CloudFront `domain_name`, etc.).
 pub(super) async fn resolve_resource<S: Clone>(
-    input: Result<CheckInput<Resource<S>>, String>,
+    input: Result<ResourceCheckInput<S>, String>,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<(ProviderReadyResource, SecretPreservingAttributes), EffectFailureKind> {
     let bindings = context.bindings();
@@ -198,8 +200,8 @@ pub(super) async fn resolve_resource<S: Clone>(
         CheckInput::Authored(source) => {
             let mut resolved = source.clone();
             for (key, expr) in &source.attributes {
-                let resolved_value =
-                    resolve_ref_value(expr, bindings).map_err(EffectFailureKind::message)?;
+                let resolved_value = resolve_ref_value(expr, bindings, context.type_checks())
+                    .map_err(EffectFailureKind::message)?;
                 assert_fully_resolved(&resolved_value, key, bindings)
                     .map_err(|error| EffectFailureKind::Execution { error })?;
                 resolved.attributes.insert(key.clone(), resolved_value);
@@ -219,8 +221,8 @@ pub(super) async fn resolve_resource<S: Clone>(
                 let expr = source_expr
                     .filter(|source_expr| needs_apply_resolution(source_expr))
                     .unwrap_or(target_expr);
-                let resolved_value =
-                    resolve_ref_value(expr, bindings).map_err(EffectFailureKind::message)?;
+                let resolved_value = resolve_ref_value(expr, bindings, context.type_checks())
+                    .map_err(EffectFailureKind::message)?;
                 assert_fully_resolved(&resolved_value, key, bindings)
                     .map_err(|error| EffectFailureKind::Execution { error })?;
                 if resolves_at_apply {
@@ -234,7 +236,8 @@ pub(super) async fn resolve_resource<S: Clone>(
                     continue;
                 }
                 let resolved_value =
-                    resolve_ref_value(source_expr, bindings).map_err(EffectFailureKind::message)?;
+                    resolve_ref_value(source_expr, bindings, context.type_checks())
+                        .map_err(EffectFailureKind::message)?;
                 assert_fully_resolved(&resolved_value, key, bindings)
                     .map_err(|error| EffectFailureKind::Execution { error })?;
                 if needs_apply_resolution(source_expr) {
@@ -294,15 +297,21 @@ fn needs_apply_resolution(value: &Value) -> bool {
 }
 
 pub(super) fn resolve_data_source<S: Clone>(
-    input: Result<CheckInput<DataSource<S>>, String>,
-    bindings: &ResolvedBindings,
-) -> Result<ResolvedCheckInput<DataSource<S>>, ReportedError> {
+    input: Result<DataSourceCheckInput<S>, String>,
+    context: &ProviderPreparationContext<'_>,
+) -> Result<
+    ResolvedCheckInput<
+        DataSource<S, crate::resource::NoPlaceholder, crate::resource::AbsoluteBindingAddress, ()>,
+    >,
+    ReportedError,
+> {
+    let bindings = context.bindings();
     let checked = match input.map_err(ReportedError::message)? {
         CheckInput::Authored(source) => {
             let mut resolved = source.clone();
             for (key, expr) in &source.attributes {
-                let resolved_value =
-                    resolve_ref_value(expr, bindings).map_err(ReportedError::message)?;
+                let resolved_value = resolve_ref_value(expr, bindings, context.type_checks())
+                    .map_err(ReportedError::message)?;
                 assert_fully_resolved(&resolved_value, key, bindings)?;
                 resolved.attributes.insert(key.clone(), resolved_value);
             }
@@ -321,8 +330,8 @@ pub(super) fn resolve_data_source<S: Clone>(
                 let expr = source_expr
                     .filter(|source_expr| needs_apply_resolution(source_expr))
                     .unwrap_or(target_expr);
-                let resolved_value =
-                    resolve_ref_value(expr, bindings).map_err(ReportedError::message)?;
+                let resolved_value = resolve_ref_value(expr, bindings, context.type_checks())
+                    .map_err(ReportedError::message)?;
                 assert_fully_resolved(&resolved_value, key, bindings)?;
                 if resolves_at_apply {
                     validation_attributes.insert(key.clone(), resolved_value.clone());
@@ -335,7 +344,8 @@ pub(super) fn resolve_data_source<S: Clone>(
                     continue;
                 }
                 let resolved_value =
-                    resolve_ref_value(source_expr, bindings).map_err(ReportedError::message)?;
+                    resolve_ref_value(source_expr, bindings, context.type_checks())
+                        .map_err(ReportedError::message)?;
                 assert_fully_resolved(&resolved_value, key, bindings)?;
                 if needs_apply_resolution(source_expr) {
                     validation_attributes.insert(key.clone(), resolved_value.clone());
@@ -358,7 +368,9 @@ pub(super) fn resolved_resource(
     resource: Resource,
 ) -> Result<crate::resource::ResolvedResource, SerializationError> {
     crate::resource::assert_resource_fully_resolved(&resource)?;
-    Ok(crate::resource::ResolvedResource::new(resource))
+    Ok(crate::resource::ResolvedResource::new(
+        resource.with_dependency_phase(()),
+    ))
 }
 
 /// Reject a resolved attribute value that still carries an unresolved
@@ -1124,14 +1136,16 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             let check_input = ctx
                 .provider_check_inputs
                 .resource_input(to.as_inner(), ctx.runtime_authored);
-            let resolve_source = check_input
+            let resolve_source_attributes = check_input
                 .as_ref()
                 .ok()
                 .and_then(|input| match input {
                     CheckInput::Authored(_) => None,
-                    CheckInput::PlanNormalized { authored, .. } => Some(authored.clone()),
+                    CheckInput::PlanNormalized { authored, .. } => {
+                        Some(authored.attributes.clone())
+                    }
                 })
-                .unwrap_or_else(|| to.as_inner().clone());
+                .unwrap_or_else(|| to.attributes.clone());
             let (resolved_to, resolved_desired_attributes) =
                 match resolve_resource(check_input, preparation).await {
                     Ok(r) => r,
@@ -1178,12 +1192,12 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             let mut candidates = HashMap::new();
             for (key, new_value) in &resolved_resource.attributes {
                 if effective_changed.contains(key)
-                    || resolve_source.attributes.get(key) == Some(new_value)
+                    || resolve_source_attributes.get(key) == Some(new_value)
                 {
                     continue;
                 }
                 if let Some(value) =
-                    secret_grafted_comparison_view(new_value, resolve_source.attributes.get(key))
+                    secret_grafted_comparison_view(new_value, resolve_source_attributes.get(key))
                 {
                     candidates.insert(key.clone(), value.into_owned());
                 }
@@ -1335,7 +1349,9 @@ mod process_basic_result_tests {
         outcome: BasicEffectResult,
         exec: &mut ExecutionState<'_, crate::resource::ModuleSource>,
     ) {
-        let effect = Effect::Create(crate::resource::ResolvedResource::new(resource));
+        let effect = Effect::Create(crate::resource::ResolvedResource::new(
+            resource.into_value_snapshot(),
+        ));
         process_basic_result(
             StartedBasicEffectResult::new(
                 super::super::wait::started_effect_for_test(
@@ -1437,7 +1453,9 @@ mod process_basic_result_tests {
 
         let resolved_attrs =
             SecretPreservingAttributes::from_provider_values(&HashMap::new(), &HashMap::new());
-        let effect = Effect::Create(crate::resource::ResolvedResource::new(resource));
+        let effect = Effect::Create(crate::resource::ResolvedResource::new(
+            resource.into_value_snapshot(),
+        ));
         process_basic_result(
             StartedBasicEffectResult::new(
                 super::super::wait::started_effect_for_test(
@@ -1625,7 +1643,10 @@ mod process_basic_result_tests {
             default: Box::new(fallback.clone()),
         });
         assert_eq!(
-            crate::resolver::resolve_ref_value_status(&expression, bindings),
+            crate::validation::deferred_types::with_session_for_test(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                |session| crate::resolver::resolve_ref_value_status(&expression, bindings, session)
+            ),
             Ok(crate::resolver::ValueResolution::Present(fallback)),
             "an absent attribute not listed as missing is definitively absent",
         );
@@ -2005,10 +2026,13 @@ mod assert_fully_resolved_tests {
         )
         .unwrap();
 
-        let error = resolve_ref_value(&value, &bindings)
-            .map_err(ReportedError::message)
-            .and_then(|resolved| assert_fully_resolved(&resolved, "name", &bindings))
-            .expect_err("the apply path must reject the final computed list access");
+        let error = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&value, &bindings, session),
+        )
+        .map_err(ReportedError::message)
+        .and_then(|resolved| assert_fully_resolved(&resolved, "name", &bindings))
+        .expect_err("the apply path must reject the final computed list access");
 
         assert!(
             error

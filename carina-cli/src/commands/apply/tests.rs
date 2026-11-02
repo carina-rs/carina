@@ -1,7 +1,7 @@
 use super::*;
 use carina_core::binding_index::LivePreApplyInputs;
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
-use carina_core::effect::{Effect, UnresolvedSavedEffect};
+use carina_core::effect::{Effect, ResolvedMovePairs, UnresolvedSavedEffect};
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer,
     PatchOp, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,
@@ -9,8 +9,8 @@ use carina_core::provider::{
 };
 use carina_core::resource::{
     DataSource, DeferredValue, LiveComposition, LiveCompositionArgument, LiveCompositionSignature,
-    ModuleConstraintId, PendingModuleConstraint, PlaceholderKind, ResolvedDataSource,
-    ResolvedResource, Resource, ResourceId, ResourceIdentity,
+    ModuleConstraintId, PendingModuleConstraint, PlaceholderKind, ResolvedResource, Resource,
+    ResourceId, ResourceIdentity,
 };
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 use carina_core::schema::{
@@ -32,7 +32,6 @@ mod cancellation_fixture;
 use cancellation_fixture::ApplyCancellationFixture;
 
 use crate::commands::plan::PlanFileContents;
-use crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK;
 use crate::commands::shared::state_writeback::{ApplyStateSave, build_state_after_apply};
 use crate::fixture_read_outcome;
 use crate::wiring::{
@@ -74,6 +73,7 @@ fn validate_with_test_factories(
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> Vec<AppError> {
     let providers = crate::wiring::ProviderLoad::for_test_with_load_errors(
+        &crate::test_support::TestCommandRuntime::new(),
         crate::wiring::LoadedProviderFactory::for_test(factories),
         &parsed.providers,
         load_errors,
@@ -108,13 +108,18 @@ where
         .and_then(|call| call.source_file().parent())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| Path::new(".").to_path_buf());
-    carina_core::module_resolver::resolve_modules_with_providerless_config(
-        carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
-        &base_dir,
+    carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
-        &carina_core::schema::SchemaRegistry::new(),
+        |session| {
+            carina_core::module_resolver::resolve_modules_with_providerless_config(
+                carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
+                &base_dir,
+                session,
+                &carina_core::schema::SchemaRegistry::new(),
+            )
+            .expect("test fixture crosses module resolution")
+        },
     )
-    .expect("test fixture crosses module resolution")
 }
 
 fn resolve_file_for_test<E>(
@@ -301,6 +306,7 @@ fn spawn_mock_http_server(
                 match listener.accept() {
                     Ok(connection) => break connection,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        // wall-clock-ok: hang guard for the real loopback server accept; no speed property is asserted.
                         assert!(Instant::now() < deadline, "server accept timed out");
                         std::thread::sleep(Duration::from_millis(10));
                     }
@@ -363,10 +369,15 @@ fn mock_http_ready_config(
         unresolved_attributes: IndexMap::new(),
         binding: None,
     });
-    let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
-        &parsed,
-        &HashMap::new(),
+    let resolved = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
+        |session| {
+            carina_core::parser::resolve_provider_attributes_with_remote(
+                &parsed,
+                &HashMap::new(),
+                session,
+            )
+        },
     )
     .expect("mock HTTP provider config must resolve");
     carina_core::executor::prepare_provider_ready_config(
@@ -416,6 +427,9 @@ async fn execute_mock_http_plan(
     let outcome = carina_core::executor::execute_live_plan(
         provider,
         carina_core::executor::LiveExecutionInput {
+            provider_context: carina_core::parser::ProviderContext::clone(
+                &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            ),
             plan,
             provider_check_inputs: carina_core::executor::ProviderCheckInputs::Authored,
             compositions: &[],
@@ -484,7 +498,7 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
 
     let fresh_resource = mock_http_resource("fresh-trap", server_address, "trap_after_send");
     let fresh_id = fresh_resource.id.clone();
-    let fresh_resources = vec![ResolvedResource::new(fresh_resource)];
+    let fresh_resources = vec![resolved(fresh_resource)];
     let mut fresh_plan = Plan::new();
     fresh_plan.add(Effect::Create(fresh_resources[0].clone()));
     let fresh_result = execute_mock_http_plan(
@@ -565,7 +579,7 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
     )
     .with_identifier("old-applied-id");
     let current_states = HashMap::from([(replacement_id.clone(), old_state)]);
-    let replacement_resources = vec![ResolvedResource::new(desired)];
+    let replacement_resources = vec![resolved(desired)];
     let replacement_raw_resources = replacement_resources
         .iter()
         .map(|resource| resource.as_resource().clone())
@@ -806,6 +820,7 @@ fn saved_plan_secret_verification_errors_are_typed_and_distinct() {
 
 #[tokio::test]
 async fn migrated_legacy_reserved_attributes_do_not_report_saved_plan_drift() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let json = serde_json::json!({
         "version": 10,
         "serial": 1,
@@ -851,6 +866,7 @@ async fn migrated_legacy_reserved_attributes_do_not_report_saved_plan_drift() {
         HashMap::from([("name".to_string(), string_value("kept"))]),
     );
     let result = detect_drift_for_test(
+        color_mode,
         &[resource],
         &[crate::commands::plan::ReloadedCurrentStateEntry::managed(
             id,
@@ -869,7 +885,18 @@ async fn migrated_legacy_reserved_attributes_do_not_report_saved_plan_drift() {
 }
 
 fn resolved(resource: Resource) -> ResolvedResource {
-    ResolvedResource::new(resource)
+    crate::test_support::resolved(resource)
+}
+
+fn resolved_inner(
+    resource: Resource,
+) -> carina_core::resource::Resource<
+    carina_core::resource::ModuleSource,
+    carina_core::resource::NoPlaceholder,
+    carina_core::resource::AbsoluteBindingAddress,
+    (),
+> {
+    resolved(resource).into_inner()
 }
 
 fn resolved_provider_configs(
@@ -879,19 +906,29 @@ fn resolved_provider_configs(
         .clone()
         .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("test provider configuration must contain no parser placeholders");
-    carina_core::parser::resolve_provider_attributes_with_remote(
-        &parsed,
-        &HashMap::new(),
+    carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
+        |session| {
+            carina_core::parser::resolve_provider_attributes_with_remote(
+                &parsed,
+                &HashMap::new(),
+                session,
+            )
+        },
     )
     .expect("test provider configs must resolve")
 }
 
 fn empty_resolved_provider_configs() -> carina_core::parser::ResolvedProviderConfigs {
-    carina_core::parser::resolve_provider_attributes_with_remote(
-        &carina_core::parser::ExpandedInferredFile::default(),
-        &HashMap::new(),
+    carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
+        |session| {
+            carina_core::parser::resolve_provider_attributes_with_remote(
+                &carina_core::parser::ExpandedInferredFile::default(),
+                &HashMap::new(),
+                session,
+            )
+        },
     )
     .expect("empty provider configs must resolve")
 }
@@ -939,6 +976,7 @@ where
 
 fn record_with_test_context(contents: PlanFileContents) -> PlanFile {
     let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
         (),
         Vec::new(),
         contents.provider_configs.as_provider_configs(),
@@ -954,6 +992,7 @@ fn record_with_test_schemas(contents: PlanFileContents, schemas: &SchemaRegistry
         .map(|(provider, _resource_type, _kind, schema)| (provider.to_string(), schema.clone()))
         .collect::<Vec<_>>();
     let ctx = ValidatedConfig::from_factories_with_additional_schemas_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
         (),
         Vec::new(),
         contents.provider_configs.as_provider_configs(),
@@ -993,11 +1032,17 @@ for account_id in orgs.accounts {
         &ProviderContext::default(),
     )
     .expect("parse saved-plan loop provenance fixture");
-    let parsed = carina_core::module_resolver::resolve_modules_providerless(
-        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        Path::new("."),
+    let parsed = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            carina_core::module_resolver::resolve_modules_providerless(
+                carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                Path::new("."),
+                session,
+            )
+            .expect("cross the deferred-body resolution seam")
+        },
     )
-    .expect("cross the deferred-body resolution seam")
     .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("saved-plan loop fixture must contain only loop slots");
 
@@ -1044,12 +1089,12 @@ for account_id in orgs.accounts {
         to: carina_core::resource::ResolvedResourceId::new(resource.id.clone()),
         origin: Some(origin.clone()),
     });
-    plan.add(Effect::DeferredCreate(
-        carina_core::effect::DeferredCreatePayload::new(Box::new(bound)),
-    ));
-    plan.add(Effect::DeferredCreate(
-        carina_core::effect::DeferredCreatePayload::new(Box::new(unbound)),
-    ));
+    plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
+        Box::new(bound),
+    )));
+    plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
+        Box::new(unbound),
+    )));
 
     let plan_file = record_with_builtin_mock_schemas(PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
@@ -1070,8 +1115,11 @@ for account_id in orgs.accounts {
         }]),
         backend_config: None,
         plan,
-        sorted_resources: vec![resource.clone()],
-        unresolved_resources: vec![resource],
+        sorted_resources: vec![resource.clone().into_value_snapshot()],
+        unresolved_resources: vec![resource]
+            .into_iter()
+            .map(|resource| resource.into_value_snapshot())
+            .collect(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
@@ -1080,6 +1128,10 @@ for account_id in orgs.accounts {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+
+        sorted_value_destroy_dependencies: vec![Default::default(); 1],
+        sorted_explicit_destroy_dependencies: vec![Default::default(); 1],
+        legacy_dependency_classification: None,
     });
 
     let encoded = serde_json::to_value(&plan_file).expect("serialize current-format plan");
@@ -1136,21 +1188,22 @@ async fn run_saved_plan_schema_fingerprint_case(
     resource_type: &str,
     identity: &str,
     secret_bearing: bool,
+    start: Option<std::sync::Arc<std::sync::Barrier>>,
 ) -> (Result<Option<Duration>, AppError>, String) {
-    let user_dirs = carina_core::TestUserDirs::new();
-    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
-    let fixture = ApplyCancellationFixture::new();
+    let mut fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let mock_state_path = tmp.path().join("mock-provider-state.json");
     let op_log_path = tmp.path().join("provider-operations.log");
     std::fs::write(&mock_state_path, "{}").expect("empty mock provider state");
-    let _mock_state = crate::commands::shared::cancellation_test_support::ScopedEnv::set(
-        "CARINA_MOCK_STATE_FILE",
-        &mock_state_path,
-    );
-    let _op_log = crate::commands::shared::cancellation_test_support::ScopedEnv::set(
-        "CARINA_MOCK_OP_LOG",
-        &op_log_path,
+    fixture.configure_mock(
+        carina_provider_mock::MockBehavior {
+            observations: carina_provider_mock::MockObservations {
+                operation_log: Some(std::path::PathBuf::from(&op_log_path)),
+                ..carina_provider_mock::MockObservations::default()
+            },
+            ..carina_provider_mock::MockBehavior::default()
+        },
+        carina_provider_mock::MockScope::file(std::path::PathBuf::from(&mock_state_path)).unwrap(),
     );
 
     let mut resource = Resource::with_provider(
@@ -1192,8 +1245,11 @@ async fn run_saved_plan_schema_fingerprint_case(
         }]),
         backend_config: None,
         plan,
-        sorted_resources: vec![resource.clone()],
-        unresolved_resources: vec![resource],
+        sorted_resources: vec![resource.clone().into_value_snapshot()],
+        unresolved_resources: vec![resource]
+            .into_iter()
+            .map(|resource| resource.into_value_snapshot())
+            .collect(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
@@ -1205,12 +1261,19 @@ async fn run_saved_plan_schema_fingerprint_case(
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+
+        sorted_value_destroy_dependencies: vec![Default::default(); 1],
+        sorted_explicit_destroy_dependencies: vec![Default::default(); 1],
+        legacy_dependency_classification: None,
     };
     let plan_file = record_with_test_schemas(contents, planning_schemas);
 
     let observer_factory = fixture.observer_factory();
+    if let Some(start) = start {
+        start.wait();
+    }
     let result = run_apply_from_plan_locked(
-        &user_dirs,
+        fixture.runtime(),
         inspected_saved_plan(plan_file),
         &ProviderContext::default(),
         true,
@@ -1226,8 +1289,82 @@ async fn run_saved_plan_schema_fingerprint_case(
         false,
     )
     .await;
+    assert_eq!(fixture.runtime().provider_load_count(), 1);
+    if matches!(result, Err(AppError::SavedPlanSchemaMismatch(_))) {
+        assert_eq!(std::fs::read_to_string(&mock_state_path).unwrap(), "{}");
+    }
     let operations = std::fs::read_to_string(op_log_path).unwrap_or_default();
     (result, operations)
+}
+
+#[test]
+fn concurrent_cli_invocations_keep_mock_runtime_separate() {
+    let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+    std::thread::scope(|threads| {
+        let a_start = start.clone();
+        let a = threads.spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let schemas = mock_schema_registry([ResourceSchema::new("removed.Widget")
+                    .attribute(
+                        AttributeSchema::required("name", AttributeType::string()).build(),
+                    )]);
+                let (result, operations) = run_saved_plan_schema_fingerprint_case(
+                    &schemas,
+                    "removed.Widget",
+                    "same",
+                    true,
+                    Some(a_start),
+                )
+                .await;
+                assert!(matches!(result, Err(AppError::SavedPlanSchemaMismatch(_))));
+                assert_eq!(
+                    operations, "",
+                    "schema rejection must not observe another invocation's orphan read"
+                );
+            });
+        });
+        let b = threads.spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+            runtime.block_on(async {
+                let mut fixture = crate::commands::shared::cancellation_test_support::CancellationFixtureBase::new();
+                let provider_state = fixture.readiness_path("mock.json");
+                let log = fixture.readiness_path("operations.log");
+                let state_path = fixture.state_path().display();
+                fixture.write_crn(format!("backend local {{ path = \"{state_path}\" }}\nprovider mock {{}}\n"));
+                fixture.write_backend_lock();
+                let mut state = StateFile::new();
+                let mut orphan = ResourceState::try_applied("test.resource", "orphan", "mock", "mock-id").unwrap();
+                orphan.set_persisted_attribute("name".to_owned(), serde_json::json!("scope-b"));
+                state.upsert_resource(orphan).unwrap();
+                fixture.write_state(&state);
+                let encoded = serde_json::json!({"test.resource.orphan": {"name": "scope-b"}}).to_string();
+                std::fs::write(&provider_state, &encoded).unwrap();
+                fixture.configure_mock(carina_provider_mock::MockBehavior {
+                    observations: carina_provider_mock::MockObservations { operation_log: Some(log.clone()), ..Default::default() },
+                    ..Default::default()
+                }, carina_provider_mock::MockScope::file(provider_state.clone()).unwrap());
+                start.wait();
+                crate::commands::state::run_state_refresh(
+                    fixture.runtime(), fixture.config_path(), true, &ProviderContext::default(), fixture.shutdown_token(),
+                ).await.unwrap();
+                assert_eq!(fixture.runtime().provider_load_count(), 1);
+                assert_eq!(std::fs::read_to_string(provider_state).unwrap(), encoded);
+                let operations = std::fs::read_to_string(log).unwrap();
+                assert!(operations.lines().any(|line| line == "read test.resource.orphan"));
+                assert!(!operations.contains("removed.Widget"));
+                let saved = fixture.read_state().await;
+                let row = saved.find_resource("mock", "test.resource", "orphan").unwrap();
+                assert_eq!(row.persisted_attributes().unwrap().get("name"), Some(string_value("scope-b")));
+            });
+        });
+        a.join().unwrap();
+        b.join().unwrap();
+    });
 }
 
 #[tokio::test]
@@ -1235,9 +1372,14 @@ async fn saved_plan_apply_rejects_removed_provider_type_before_provider_call() {
     let planning_schemas = mock_schema_registry([ResourceSchema::new("removed.Widget")
         .attribute(AttributeSchema::required("name", AttributeType::string()).build())]);
 
-    let (result, operations) =
-        run_saved_plan_schema_fingerprint_case(&planning_schemas, "removed.Widget", "gone", false)
-            .await;
+    let (result, operations) = run_saved_plan_schema_fingerprint_case(
+        &planning_schemas,
+        "removed.Widget",
+        "gone",
+        false,
+        None,
+    )
+    .await;
     let error = result.expect_err("a removed planned type must invalidate the saved plan");
     let AppError::SavedPlanSchemaMismatch(mismatch) = &error else {
         panic!("expected typed schema mismatch, got {error:?}");
@@ -1267,9 +1409,14 @@ async fn secret_bearing_saved_plan_checks_schema_before_secret_rehydration() {
     let planning_schemas = mock_schema_registry([ResourceSchema::new("removed.Widget")
         .attribute(AttributeSchema::required("name", AttributeType::string()).build())]);
 
-    let (result, operations) =
-        run_saved_plan_schema_fingerprint_case(&planning_schemas, "removed.Widget", "secret", true)
-            .await;
+    let (result, operations) = run_saved_plan_schema_fingerprint_case(
+        &planning_schemas,
+        "removed.Widget",
+        "secret",
+        true,
+        None,
+    )
+    .await;
     let error = result.expect_err("schema mismatch must win over unavailable secret inputs");
     assert!(
         matches!(error, AppError::SavedPlanSchemaMismatch(_)),
@@ -1301,6 +1448,7 @@ async fn saved_plan_apply_rejects_changed_attribute_flag_before_provider_call() 
         "test.resource",
         "changed",
         false,
+        None,
     )
     .await;
     let error = result.expect_err("a changed write_only flag must invalidate the saved plan");
@@ -1326,6 +1474,7 @@ async fn saved_plan_apply_accepts_unchanged_provider_schema() {
         "test.resource",
         "unchanged",
         false,
+        None,
     )
     .await;
     result.expect("an unchanged provider schema must remain executable");
@@ -1374,6 +1523,10 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
+        legacy_dependency_classification: None,
     };
     let plan_file = record_with_test_schemas(contents, &schemas);
 
@@ -1382,7 +1535,7 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
         ProviderLoad::for_test_with_provider_phase::<
             carina_core::resource::NoPlaceholder,
             carina_core::resource::AbsoluteBindingAddress,
-        >(Vec::new(), &[])
+        >(fixture.runtime(), Vec::new(), &[])
         .into_complete()
         .expect("test provider load is complete"),
         Path::new("."),
@@ -1412,10 +1565,15 @@ fn checked_exports(
     params: &[carina_core::parser::ExpandedInferredExportParam],
 ) -> carina_core::validation::ExportsCheckedPreApply<carina_core::parser::ExpandedInferredExportParam>
 {
-    carina_core::validation::check_export_values_pre_apply(
-        params,
-        &carina_core::binding_index::ResolvedBindings::default(),
+    carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            carina_core::validation::check_export_values_pre_apply(
+                params,
+                &carina_core::binding_index::ResolvedBindings::default(),
+                session,
+            )
+        },
     )
     .expect("test exports must pass the secret boundary")
 }
@@ -1444,10 +1602,15 @@ fn saved_provider_configs(
 ) -> carina_core::parser::SavedProviderConfigs {
     let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers = configs;
-    let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
-        &parsed,
-        &HashMap::new(),
+    let resolved = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::default(),
+        |session| {
+            carina_core::parser::resolve_provider_attributes_with_remote(
+                &parsed,
+                &HashMap::new(),
+                session,
+            )
+        },
     )
     .expect("test provider configs must resolve");
     carina_core::parser::SavedProviderConfigs::from(&resolved)
@@ -1507,7 +1670,7 @@ fn module_composition<P: PlaceholderKind + PartialEq, B: carina_core::resource::
             }],
         },
         binding: Some(binding.clone()),
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
         module_name: "checked_module".to_string(),
         instance: "root.checked".to_string(),
         call_path: {
@@ -1572,7 +1735,10 @@ fn saved_plan_import_rehydration_respects_current_provider_instance() {
         to_span: None,
         id: string_value("provider-id"),
     }];
-    let identifiers = import_identifiers_from_current_config(&plan, &parsed);
+    let identifiers = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| import_identifiers_from_current_config(&plan, &parsed, session),
+    );
 
     assert!(
         !identifiers.contains_key(&planned_id),
@@ -1613,6 +1779,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.compositions = vec![current];
     let provider_inputs = load_and_resolve_provider_configs(
+        &crate::test_support::TestCommandRuntime::new(),
         &parsed,
         tmp.path(),
         &ProviderContext::default(),
@@ -1642,9 +1809,18 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
+        legacy_dependency_classification: None,
     }
     .record_for_test(
-        &ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
+        &ValidatedConfig::from_factories_for_test(
+            &crate::test_support::TestCommandRuntime::new(),
+            (),
+            Vec::new(),
+            &[],
+        ),
         Vec::new(),
     )
     .expect("test plan provider evidence must be valid");
@@ -1662,6 +1838,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
             plan_file: Path::new("plan.json"),
             source_dir: tmp.path(),
         },
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
     );
 
     let error = result.expect_err(
@@ -1686,6 +1863,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
             plan_file: Path::new("plan.json"),
             source_dir: tmp.path(),
         },
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
     )
     .expect_err("an unreadable live call source must fail with its typed identity error");
     let AppError::CompositionSourceIdentity(identity_error) = error else {
@@ -1700,7 +1878,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
 
 #[tokio::test]
 async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_corrupt() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let source_file = tmp.path().join("source.crn");
     std::fs::write(&source_file, "source fixture").expect("write composition source");
@@ -1732,6 +1910,10 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
+        legacy_dependency_classification: None,
     });
     let encoded = serde_json::to_value(plan_file).expect("serialize plan fixture");
     let overlong = "a".repeat(4097);
@@ -1804,9 +1986,7 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
 
 #[tokio::test]
 async fn saved_plan_persists_pending_state_migration_before_drift_return() {
-    let user_dirs = carina_core::TestUserDirs::new();
-    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
-    let fixture = ApplyCancellationFixture::new();
+    let mut fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let state_path = tmp.path().join("carina.state.json");
     let mock_state_path = tmp.path().join("mock-provider-state.json");
@@ -1840,6 +2020,34 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         HashMap::from([("name".to_string(), string_value("planned"))]),
     )
     .with_identifier("mock-id");
+    let loaded = carina_state::check_and_migrate(
+        &std::fs::read_to_string(&state_path).expect("read legacy state"),
+    )
+    .expect("decode legacy state")
+    .into_state();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph_for_legacy_classification({
+        let mut configuration = carina_core::parser::ExpandedParsedFile::default();
+        configuration.resources = vec![resource.clone()];
+        configuration.into()
+    })
+    .expect("fixture migration graph");
+    let no_moves: Plan = Plan::new();
+    let moves = ResolvedMovePairs::from_saved_plan(no_moves.move_effects());
+    let migration = match loaded
+        .classify_legacy_graph(graph, &moves, Default::default())
+        .expect("legacy classification")
+    {
+        carina_state::LegacyClassificationOutcome::Classified(migration) => migration,
+        carina_state::LegacyClassificationOutcome::RequiresReads(rows) => {
+            panic!("empty state must not need reads: {rows}")
+        }
+    };
+    let legacy_dependency_classification = Some(
+        migration
+            .report_and_validate(|warning| panic!("unexpected warning: {warning:?}"))
+            .expect("migration graph validates")
+            .classification,
+    );
     let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
@@ -1859,8 +2067,14 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         }]),
         backend_config: None,
         plan: Plan::new(),
-        sorted_resources: vec![resource.clone()],
-        unresolved_resources: vec![resource],
+        sorted_resources: vec![resolved_inner(resource.clone())],
+        sorted_value_destroy_dependencies: vec![Default::default()],
+        sorted_explicit_destroy_dependencies: vec![Default::default()],
+        legacy_dependency_classification,
+        unresolved_resources: vec![resource]
+            .into_iter()
+            .map(|resource| resource.into_value_snapshot())
+            .collect(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
@@ -1876,13 +2090,11 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
     let plan_file = record_with_builtin_mock_schemas(contents);
     let backend =
         Arc::<dyn StateBackend>::from(crate::commands::local_backend_for_test(state_path.clone()));
-    unsafe {
-        std::env::set_var("CARINA_MOCK_STATE_FILE", &mock_state_path);
-    }
+    fixture.use_mock_file(std::path::PathBuf::from(&mock_state_path));
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
-        &user_dirs,
+        fixture.runtime(),
         inspected_saved_plan(plan_file),
         &ProviderContext::default(),
         true,
@@ -1899,9 +2111,6 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
     )
     .await;
 
-    unsafe {
-        std::env::remove_var("CARINA_MOCK_STATE_FILE");
-    }
     let error = result.expect_err("drift must still abort the saved-plan apply");
     assert!(error.to_string().contains("drift"), "error: {error}");
     let persisted: serde_json::Value =
@@ -1911,6 +2120,180 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         persisted["version"],
         serde_json::json!(StateFile::CURRENT_VERSION),
         "the pending schema migration must be saved before drift can return early"
+    );
+}
+
+#[tokio::test]
+async fn saved_plan_classifies_v20_dependency_names_before_early_migration_write() {
+    let mut fixture = ApplyCancellationFixture::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state_path = tmp.path().join("carina.state.json");
+    let mock_state_path = tmp.path().join("mock-provider-state.json");
+    let lineage = "22222222-2222-2222-2222-222222222222";
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 20,
+            "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
+            "serial": 9,
+            "lineage": lineage,
+            "carina_version": "0.0.0-test",
+            "resources": [{
+                "resource_type": "test.resource",
+                "identity": "example",
+                "provider": "mock",
+                "binding": "example",
+                "dependency_bindings": ["dependency"],
+                "current": {
+                    "kind": "applied",
+                    "identifier": "example-id",
+                    "attributes": {"name": "planned"},
+                    "nested_write_only": {}
+                }
+            }],
+            "exports": {}
+        }))
+        .expect("serialize v20 state"),
+    )
+    .expect("write v20 state");
+    std::fs::write(
+        &mock_state_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "test.resource.example": { "name": "drifted" }
+        }))
+        .expect("serialize provider state"),
+    )
+    .expect("write provider state");
+
+    let mut dependency = Resource::with_provider("mock", "test.resource", "dependency", None);
+    dependency.binding = Some(absolute_binding("dependency"));
+    dependency.set_attr("name", string_value("dependency"));
+    let dependency_id = dependency.id.clone();
+    let mut example = Resource::with_provider("mock", "test.resource", "example", None);
+    example.binding = Some(absolute_binding("example"));
+    example.set_attr("name", string_value("planned"));
+    let example_id = example.id.clone();
+    let migration_resources = vec![dependency.clone(), example.clone()];
+    let graph_file = carina_core::parser::ExpandedParsedFile::default();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph_for_legacy_classification({
+        let mut configuration = graph_file;
+        configuration.resources = migration_resources.clone();
+        configuration.data_sources = Vec::new();
+        configuration.into()
+    })
+    .expect("saved-plan migration graph resolves");
+    let loaded_state = carina_state::check_and_migrate(
+        &std::fs::read_to_string(&state_path).expect("read v20 classification state"),
+    )
+    .expect("v20 classification state loads")
+    .into_state();
+    let no_move_plan: Plan = Plan::new();
+    let moved_pairs = ResolvedMovePairs::from_saved_plan(no_move_plan.move_effects());
+    let migration = match loaded_state
+        .classify_legacy_graph(graph, &moved_pairs, Default::default())
+        .expect("saved-plan migration classification resolves")
+    {
+        carina_state::LegacyClassificationOutcome::Classified(migration) => migration,
+        carina_state::LegacyClassificationOutcome::RequiresReads(rows) => {
+            panic!("saved-plan fixture unexpectedly requires reads: {rows}")
+        }
+    };
+    let legacy_dependency_classification = Some(
+        migration
+            .report_and_validate(|_| panic!("fixture has no warnings"))
+            .expect("saved-plan migration graph validates")
+            .classification,
+    );
+    let planned_example = State::existing(
+        example_id.clone(),
+        HashMap::from([("name".to_string(), string_value("planned"))]),
+    )
+    .with_identifier("example-id");
+    let contents = PlanFileContents {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-10-31T00:00:00Z".to_string(),
+        source_path: tmp.path().display().to_string(),
+        state_lineage: Some(lineage.to_string()),
+        state_serial: Some(9),
+        provider_configs: saved_provider_configs(vec![ProviderConfig {
+            name: "mock".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        }]),
+        backend_config: None,
+        plan: Plan::new(),
+        sorted_resources: vec![
+            resolved_inner(dependency.clone()),
+            resolved_inner(example.clone()),
+        ],
+        sorted_value_destroy_dependencies: vec![Default::default(), Default::default()],
+        sorted_explicit_destroy_dependencies: vec![Default::default(), Default::default()],
+        legacy_dependency_classification,
+        unresolved_resources: vec![dependency, example]
+            .into_iter()
+            .map(|resource| resource.into_value_snapshot())
+            .collect(),
+        compositions: Vec::new(),
+        data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
+        data_source_values: Vec::new(),
+        current_states: vec![
+            crate::commands::plan::CurrentStateEntry::managed(
+                dependency_id.clone(),
+                State::not_found(dependency_id.clone()),
+            ),
+            crate::commands::plan::CurrentStateEntry::managed(example_id, planned_example),
+        ],
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+    };
+    let plan_file = record_with_builtin_mock_schemas(contents);
+    let backend =
+        Arc::<dyn StateBackend>::from(crate::commands::local_backend_for_test(state_path.clone()));
+    fixture.use_mock_file(mock_state_path.clone());
+
+    let observer_factory = fixture.observer_factory();
+    let result = run_apply_from_plan_locked(
+        fixture.runtime(),
+        inspected_saved_plan(plan_file),
+        &ProviderContext::default(),
+        true,
+        backend,
+        StateLock::disabled_for_test(),
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("plan.json"),
+            source_dir: tmp.path(),
+        },
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(1).expect("non-zero parallelism"),
+        false,
+    )
+    .await;
+
+    let error = result.expect_err("drift must still abort the saved-plan apply");
+    assert!(error.to_string().contains("drift"), "error: {error}");
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).expect("read migrated state"))
+            .expect("parse migrated state");
+    assert_eq!(
+        persisted["version"],
+        serde_json::json!(StateFile::CURRENT_VERSION)
+    );
+    assert_eq!(
+        persisted["resources"][0]["dependency_bindings"],
+        serde_json::json!([{
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "dependency"
+        }])
     );
 }
 
@@ -1998,7 +2381,7 @@ impl ProviderFactory for FailBCreateFactory {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let project = tempfile::tempdir().expect("tempdir");
     let source_path = project.path().join("broken-provider.wasm");
     let installed_path = project
@@ -2018,6 +2401,7 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
         binding: None,
     };
     let planning_context = ValidatedConfig::from_factories_for_test_with_provider_phase(
+        &user_dirs,
         (),
         vec![Box::new(FailBCreateFactory)],
         std::slice::from_ref(&provider_config),
@@ -2042,6 +2426,10 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
+        legacy_dependency_classification: None,
     }
     .record_for_test(&planning_context, Vec::new())
     .expect("planning context must record provider evidence");
@@ -2093,7 +2481,7 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let project = tempfile::tempdir().expect("tempdir");
     let source = format!(
         "file://{}",
@@ -2113,6 +2501,7 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
     };
     let provider_configs = vec![provider_config.clone(), provider_config];
     let planning_context = ValidatedConfig::from_factories_for_test_with_provider_phase(
+        &user_dirs,
         (),
         vec![Box::new(FailBCreateFactory)],
         &provider_configs,
@@ -2137,6 +2526,10 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
+        legacy_dependency_classification: None,
     }
     .record_for_test(&planning_context, Vec::new())
     .expect("planning context must record provider evidence");
@@ -2175,8 +2568,6 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
 
 #[tokio::test]
 async fn secret_bearing_saved_plan_apply_loads_providers_once() {
-    let user_dirs = carina_core::TestUserDirs::new();
-    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
     let fixture = ApplyCancellationFixture::new();
     let config = format!(
         r#"backend local {{ path = "{}" }}
@@ -2188,15 +2579,12 @@ let secret_resource = mock.test.resource {{
 "#,
         fixture.state_path().display()
     );
-    let fixture = fixture.with_raw_config(config);
+    let mut fixture = fixture.with_raw_config(config);
     let provider_state_path = fixture.config_path().join("mock-provider-state.json");
-    let _provider_state = crate::commands::shared::cancellation_test_support::ScopedEnv::set(
-        "CARINA_MOCK_STATE_FILE",
-        &provider_state_path,
-    );
+    fixture.use_mock_file(std::path::PathBuf::from(&provider_state_path));
     let plan_path = fixture.config_path().join("plan.json");
     crate::commands::plan::run_plan(
-        &user_dirs,
+        fixture.runtime(),
         fixture.config_path(),
         Some(&plan_path),
         None,
@@ -2212,9 +2600,9 @@ let secret_resource = mock.test.resource {{
     .await
     .expect("secret-bearing plan must be recorded");
 
-    let load_count = crate::wiring::track_provider_loads_for_test();
+    let loads_before = fixture.runtime().provider_load_count();
     run_apply_from_plan(
-        &user_dirs,
+        fixture.runtime(),
         &plan_path,
         true,
         false,
@@ -2227,7 +2615,7 @@ let secret_resource = mock.test.resource {{
     .expect("secret-bearing saved plan must apply");
 
     assert_eq!(
-        load_count.count(),
+        fixture.runtime().provider_load_count() - loads_before,
         1,
         "current-config secret validation and locked verification must share one provider load"
     );
@@ -2238,11 +2626,17 @@ async fn state_bucket_bootstrap_prepares_resolved_upstream_provider_config() {
     let (_temp, downstream, parsed) =
         crate::provider_upstream_test_support::provider_upstream_fixture();
     let expanded = resolve_file_for_test(parsed);
-    let inputs = load_apply_provider_inputs(&expanded, &downstream, &ProviderContext::default())
-        .await
-        .expect("bootstrap provider inputs must resolve");
+    let inputs = load_apply_provider_inputs(
+        &crate::test_support::TestCommandRuntime::new(),
+        &expanded,
+        &downstream,
+        &ProviderContext::default(),
+    )
+    .await
+    .expect("bootstrap provider inputs must resolve");
     let received_role_arn = Arc::new(Mutex::new(None));
     let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
         (),
         vec![Box::new(
             crate::provider_upstream_test_support::ProviderConfigCaptureFactory {
@@ -2271,11 +2665,17 @@ async fn apply_provider_loading_remains_all_strict_for_tag_only_upstreams() {
         .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("provider default-tags fixture has no parser placeholders");
 
-    let error =
-        match load_apply_provider_inputs(&parsed, &base_dir, &ProviderContext::default()).await {
-            Ok(_) => panic!("apply must load every declared upstream strictly"),
-            Err(error) => error,
-        };
+    let error = match load_apply_provider_inputs(
+        &crate::test_support::TestCommandRuntime::new(),
+        &parsed,
+        &base_dir,
+        &ProviderContext::default(),
+    )
+    .await
+    {
+        Ok(_) => panic!("apply must load every declared upstream strictly"),
+        Err(error) => error,
+    };
 
     let message = error.to_string();
     assert!(message.contains("upstream_state 'mgmt'"), "{message}");
@@ -2284,7 +2684,7 @@ async fn apply_provider_loading_remains_all_strict_for_tag_only_upstreams() {
 
 #[tokio::test]
 async fn apply_verifies_backend_before_loading_bootstrap_provider_upstreams() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let temp = tempfile::tempdir().unwrap();
     let upstream = temp.path().join("upstream");
     let downstream = temp.path().join("downstream");
@@ -2325,7 +2725,7 @@ async fn apply_verifies_backend_before_loading_bootstrap_provider_upstreams() {
 
 #[tokio::test]
 async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let temp = tempfile::tempdir().unwrap();
     let upstream = temp.path().join("upstream");
     let downstream = temp.path().join("downstream");
@@ -2376,10 +2776,14 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     let expanded = resolve_module_file_for_test(parsed.clone().into_parsed())
         .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("provider upstream fixture has no parser placeholders");
-    let stale_inputs =
-        load_apply_provider_inputs(&expanded, &downstream, &ProviderContext::default())
-            .await
-            .unwrap();
+    let stale_inputs = load_apply_provider_inputs(
+        &user_dirs,
+        &expanded,
+        &downstream,
+        &ProviderContext::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         stale_inputs.configs().as_provider_configs()[0]
             .attributes
@@ -2400,6 +2804,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     .expect("bootstrap reload must succeed");
     let received_role_arn = Arc::new(Mutex::new(None));
     let ctx = ValidatedWiring::from_factories_for_test_with_provider_phase(
+        &user_dirs,
         vec![Box::new(
             crate::provider_upstream_test_support::ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -2439,7 +2844,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
 
 #[test]
 fn bootstrap_reload_rejects_nested_forwarding_mismatch() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let fixture = tempfile::tempdir().expect("tempdir");
     let outer = fixture.path().join("outer");
     let inner = outer.join("inner");
@@ -2546,7 +2951,7 @@ let y = m { n = x.s }
 
 #[test]
 fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     for nested in [false, true] {
         let fixture = write_module_output_mismatch_fixture(nested);
         let loaded = load_configuration_with_config(
@@ -3243,9 +3648,10 @@ fn seed_apply_cascade_state(
         .with_attribute("vpc_id", serde_json::json!("vpc-old"))
         .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
         .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
-        subnet_state
-            .dependency_bindings
-            .insert(absolute_binding("vpc"));
+        subnet_state.dependency_bindings =
+            crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+                "awscc", "ec2.Vpc", "vpc", None,
+            )]);
         state_file
             .upsert_resource(subnet_state)
             .expect("test state setup must be valid");
@@ -3272,7 +3678,7 @@ fn seed_apply_cascade_state_with_deposed(
                 ("cidr_block".to_string(), serde_json::json!("10.220.0.0/16")),
                 ("vpc_id".to_string(), serde_json::json!(identifier)),
             ]),
-            BTreeSet::new(),
+            Default::default(),
         ));
     }
 
@@ -3305,6 +3711,7 @@ async fn run_apply_cascade_fixture(
     shared: &ApplyCascadeShared,
 ) -> Result<Option<Duration>, AppError> {
     let wiring = ValidatedWiring::from_factories_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
         vec![Box::new(ApplyCascadeAwsccFactory {
             shared: shared.clone(),
         })],
@@ -3660,6 +4067,7 @@ fn load_and_resolve_module_data_source_fixture(
     .expect("module data-source fixture must load");
     let unresolved_parsed = loaded.unresolved_parsed;
     let providers = crate::wiring::ProviderLoad::for_test_with_load_errors(
+        &crate::test_support::TestCommandRuntime::new(),
         crate::wiring::LoadedProviderFactory::for_test(vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })]),
@@ -3702,6 +4110,7 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
     );
 
     let wiring = ValidatedWiring::from_factories_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -3711,10 +4120,15 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         .clone()
         .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("module data-source fixture has no parser placeholders");
-    let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
-        &expanded,
-        &HashMap::new(),
+    let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
+        |session| {
+            carina_core::parser::resolve_provider_attributes_with_remote(
+                &expanded,
+                &HashMap::new(),
+                session,
+            )
+        },
     )
     .expect("module data-source provider configs must resolve");
     let validated = validated_resolved_apply_config_for_test(&wiring, &parsed, &unresolved_parsed);
@@ -3775,6 +4189,7 @@ async fn apply_reads_module_data_source_and_resolves_consumer_interpolation() {
     let (parsed, unresolved_parsed) =
         load_and_resolve_module_data_source_fixture(&fixture, &shared);
     let wiring = ValidatedWiring::from_factories_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -3877,6 +4292,7 @@ let lookup = read mock.iam.Roles {{
         >::resource_ref("checked", "value", Vec::new()),
     );
     let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+        fixture.runtime(),
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -3964,7 +4380,9 @@ fn export_only_fast_path_is_disabled_when_deferred_reads_exist() {
     );
     let mut plan = Plan::new();
     plan.add(carina_core::effect::Effect::Read {
-        resource: carina_core::resource::ResolvedDataSource::new(data_source.clone()),
+        resource: carina_core::resource::ResolvedDataSource::new(
+            (data_source.clone()).into_value_snapshot(),
+        ),
     });
     let mut target: Resource = Resource::with_provider("mock", "iam.Role", "target_role", None);
     target.binding = Some(absolute_binding("target_role"));
@@ -4000,7 +4418,8 @@ fn apply_time_classification_uses_folded_data_source_preserved_dependency() {
         .attributes
         .insert("name_regex".to_string(), string_value("^target-role$"));
     data_source
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert(absolute_binding("registry_publish.target_role"));
     let id = data_source.id.clone();
     let mut target: Resource =
@@ -4043,7 +4462,7 @@ fn saved_plan_data_source_outcomes_must_match_configured_set_exactly() {
         id: unexpected.id.clone(),
         value: DataSourceValue::deferred_to_apply(Vec::new()),
     };
-    let extra = data_source_values_from_saved_plan::<carina_core::resource::ModuleSource>(
+    let extra = data_source_values_from_saved_plan::<carina_core::resource::ModuleSource, ()>(
         &[],
         &[unexpected_outcome],
     )
@@ -4064,9 +4483,7 @@ fn saved_plan_data_source_outcomes_must_match_configured_set_exactly() {
 
 #[tokio::test]
 async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read() {
-    let user_dirs = carina_core::TestUserDirs::new();
-    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
-    let fixture = ApplyCancellationFixture::new();
+    let mut fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let mock_state_path = tmp.path().join("mock-provider-state.json");
     std::fs::write(
@@ -4080,9 +4497,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
     )
     .expect("mock provider state");
 
-    unsafe {
-        std::env::set_var("CARINA_MOCK_STATE_FILE", &mock_state_path);
-    }
+    fixture.use_mock_file(std::path::PathBuf::from(&mock_state_path));
 
     let target_id = ResourceId::with_provider_identity("mock", "test.resource", "target", None);
     let mut target: Resource = Resource::with_provider("mock", "test.resource", "target", None);
@@ -4125,16 +4540,32 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         }),
     );
 
+    let parsed = carina_core::parser::ExpandedParsedFile::default();
+    let expanded_graph = carina_core::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = vec![target.clone(), consumer.clone()];
+        configuration.data_sources = (std::slice::from_ref(&lookup)).to_vec();
+        configuration.into()
+    })
+    .expect("saved-plan fixture dependencies must resolve");
+    let schemas = SchemaRegistry::new();
+
     let mut plan = Plan::new();
-    plan.add(carina_core::effect::Effect::Create(resolved(
-        target.clone(),
-    )));
+    plan.add(carina_core::effect::Effect::Create(
+        expanded_graph
+            .resolve_resource(target.clone(), &schemas)
+            .expect("target graph metadata must resolve"),
+    ));
     plan.add(carina_core::effect::Effect::Read {
-        resource: ResolvedDataSource::new(lookup.clone()),
+        resource: expanded_graph
+            .resolve_data_source(lookup.clone())
+            .expect("lookup graph metadata must resolve"),
     });
-    plan.add(carina_core::effect::Effect::Create(resolved(
-        consumer.clone(),
-    )));
+    plan.add(carina_core::effect::Effect::Create(
+        expanded_graph
+            .resolve_resource(consumer.clone(), &schemas)
+            .expect("consumer graph metadata must resolve"),
+    ));
 
     let provider_configs = saved_provider_configs(vec![ProviderConfig {
         name: "mock".to_string(),
@@ -4156,11 +4587,25 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         provider_configs,
         backend_config: None,
         plan,
-        sorted_resources: vec![target.clone(), consumer.clone()],
-        unresolved_resources: vec![target, consumer],
+        sorted_resources: vec![
+            target.clone().into_value_snapshot(),
+            consumer.clone().into_value_snapshot(),
+        ],
+        sorted_value_destroy_dependencies: vec![
+            Default::default(),
+            carina_core::resource::PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::new(target_id.clone()),
+            ]),
+        ],
+        sorted_explicit_destroy_dependencies: vec![Default::default(), Default::default()],
+        legacy_dependency_classification: None,
+        unresolved_resources: vec![target, consumer]
+            .into_iter()
+            .map(|resource| resource.into_value_snapshot())
+            .collect(),
         compositions: Vec::new(),
-        data_sources: vec![lookup.clone()],
-        data_source_origins: vec![lookup.clone()],
+        data_sources: vec![lookup.clone().into_value_snapshot()],
+        data_source_origins: vec![lookup.clone().into_value_snapshot()],
         data_source_values: vec![crate::commands::plan::SavedDataSourceValue {
             id: lookup.id.clone(),
             value: DataSourceValue::deferred_to_apply(Vec::new()),
@@ -4202,7 +4647,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
-        &user_dirs,
+        fixture.runtime(),
         inspected_saved_plan(plan_file),
         &ProviderContext::default(),
         true,
@@ -4218,10 +4663,6 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         false,
     )
     .await;
-
-    unsafe {
-        std::env::remove_var("CARINA_MOCK_STATE_FILE");
-    }
 
     result.expect("saved-plan apply should execute the deferred read before consumer create");
     let state = fixture.read_state().await;
@@ -4240,18 +4681,22 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
 
 #[tokio::test]
 async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create() {
-    let user_dirs = carina_core::TestUserDirs::new();
-    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
-    let fixture = ApplyCancellationFixture::new();
+    let mut fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let mock_state_path = tmp.path().join("mock-provider-state.json");
     let op_log_path = tmp.path().join("op.log");
     std::fs::write(&mock_state_path, "{}").expect("empty mock provider state");
 
-    unsafe {
-        std::env::set_var("CARINA_MOCK_STATE_FILE", &mock_state_path);
-        std::env::set_var("CARINA_MOCK_OP_LOG", &op_log_path);
-    }
+    fixture.configure_mock(
+        carina_provider_mock::MockBehavior {
+            observations: carina_provider_mock::MockObservations {
+                operation_log: Some(std::path::PathBuf::from(&op_log_path)),
+                ..carina_provider_mock::MockObservations::default()
+            },
+            ..carina_provider_mock::MockBehavior::default()
+        },
+        carina_provider_mock::MockScope::file(std::path::PathBuf::from(&mock_state_path)).unwrap(),
+    );
 
     let mut producer: Resource = Resource::with_provider("mock", "test.resource", "producer", None);
     producer.binding = Some(absolute_binding("producer"));
@@ -4263,7 +4708,8 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
     consumer.set_attr("name", string_value("consumer"));
     consumer.set_attr("comment", root_resource_ref("producer", "identifier"));
     consumer
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert(absolute_binding("producer"));
     let consumer_id = consumer.id.clone();
 
@@ -4274,13 +4720,20 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
     let saved_composition = composition
         .into_saved_with_resolver(&mut source_identities)
         .expect("save composition");
+    let mut graph_file = carina_core::parser::ExpandedParsedFile::default();
+    graph_file.resources = vec![producer.clone(), consumer.clone()];
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(graph_file.into())
+        .expect("saved constraint fixture graph");
+    let resolved_consumer = graph
+        .resolve_resource(consumer.clone(), &SchemaRegistry::new())
+        .expect("consumer graph dependencies");
+    let consumer_for_sorted = resolved_consumer.as_inner().clone();
+    let consumer_for_unresolved = consumer.clone().into_value_snapshot();
     let mut plan = Plan::new();
     plan.add(carina_core::effect::Effect::Create(resolved(
         producer.clone(),
     )));
-    plan.add(carina_core::effect::Effect::Create(resolved(
-        consumer.clone(),
-    )));
+    plan.add(carina_core::effect::Effect::Create(resolved_consumer));
     let contents = PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
@@ -4300,8 +4753,16 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         }]),
         backend_config: None,
         plan,
-        sorted_resources: vec![producer.clone(), consumer.clone()],
-        unresolved_resources: vec![producer, consumer],
+        sorted_resources: vec![resolved_inner(producer.clone()), consumer_for_sorted],
+        sorted_value_destroy_dependencies: vec![
+            Default::default(),
+            carina_core::resource::PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::new(producer_id.clone()),
+            ]),
+        ],
+        sorted_explicit_destroy_dependencies: vec![Default::default(), Default::default()],
+        legacy_dependency_classification: None,
+        unresolved_resources: vec![producer.into_value_snapshot(), consumer_for_unresolved],
         compositions: vec![saved_composition],
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
@@ -4324,7 +4785,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
-        &user_dirs,
+        fixture.runtime(),
         inspected_saved_plan(plan_file),
         &ProviderContext::default(),
         true,
@@ -4340,11 +4801,6 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         false,
     )
     .await;
-
-    unsafe {
-        std::env::remove_var("CARINA_MOCK_STATE_FILE");
-        std::env::remove_var("CARINA_MOCK_OP_LOG");
-    }
 
     let error = result.expect_err("saved-plan module constraint must fail apply");
     assert!(error.to_string().contains("1 failed"), "error: {error}");
@@ -4366,7 +4822,6 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
 
 #[tokio::test]
 async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
-    let user_dirs = carina_core::TestUserDirs::new();
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut source_identities = CompositionSourceIdentityResolver::new(tmp.path())
@@ -4385,6 +4840,9 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         backend_config: None,
         plan: Plan::new(),
         sorted_resources: Vec::new(),
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
+        legacy_dependency_classification: None,
         unresolved_resources: Vec::new(),
         compositions: vec![saved_composition],
         data_sources: Vec::new(),
@@ -4399,7 +4857,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
 
     let observer_factory = fixture.observer_factory();
     let error = run_apply_from_plan_locked(
-        &user_dirs,
+        fixture.runtime(),
         inspected_saved_plan(plan_file),
         &ProviderContext::default(),
         true,
@@ -4433,7 +4891,6 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
 
 #[tokio::test]
 async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
-    let user_dirs = carina_core::TestUserDirs::new();
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let contents = PlanFileContents {
@@ -4468,6 +4925,10 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
+        legacy_dependency_classification: None,
     };
     let plan_file = record_with_test_context(contents);
     let plan_path = tmp.path().join("unresolved-provider-config.plan.json");
@@ -4483,7 +4944,7 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
     let observer_factory = fixture.observer_factory();
 
     let error = run_apply_from_plan_locked(
-        &user_dirs,
+        fixture.runtime(),
         inspected_saved_plan(plan_file),
         &ProviderContext::default(),
         true,
@@ -4512,7 +4973,6 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
 
 #[tokio::test]
 async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
-    let user_dirs = carina_core::TestUserDirs::new();
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let (_provider_temp, downstream, _) =
@@ -4535,16 +4995,22 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
     )
     .expect("load plan fixture")
     .parsed;
-    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-        parsed,
-        &downstream,
+    let parsed = carina_core::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),
-        &SchemaRegistry::new(),
+        |session| {
+            carina_core::module_resolver::resolve_modules_with_providerless_config(
+                parsed,
+                &downstream,
+                session,
+                &SchemaRegistry::new(),
+            )
+            .expect("test fixture crosses module resolution")
+        },
     )
-    .expect("test fixture crosses module resolution")
     .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("saved-plan provider fixture has no parser placeholders");
     let plan_inputs = load_and_resolve_provider_configs(
+        fixture.runtime(),
         &parsed,
         &downstream,
         &ProviderContext::default(),
@@ -4579,6 +5045,10 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
+        legacy_dependency_classification: None,
     };
     let plan_file = record_with_test_context(contents);
     let plan_path = tmp.path().join("deferred-default-tags.plan.json");
@@ -4594,7 +5064,7 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
     let observer_factory = fixture.observer_factory();
 
     run_apply_from_plan_locked(
-        &user_dirs,
+        fixture.runtime(),
         inspected_saved_plan(plan_file),
         &ProviderContext::default(),
         true,
@@ -4628,7 +5098,7 @@ async fn live_apply_noop_rejects_unconsumed_module_constraint() {
     let unresolved_parsed = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
         carina_core::parser::ParsedFile::default(),
     );
-    let wiring = ValidatedWiring::from_factories_for_test(Vec::new(), &[]);
+    let wiring = ValidatedWiring::from_factories_for_test(fixture.runtime(), Vec::new(), &[]);
     let observer_factory = fixture.observer_factory();
 
     let error = run_apply_locked(
@@ -4759,19 +5229,25 @@ fn apply_emits_legacy_override_warning_to_stderr() {
     let remote_bindings = HashMap::new();
     let wait_aliases = Vec::new();
     let projected_state = crate::wiring::ProjectedStateRead::for_test_unmoved(Some(&state));
-    let (override_aware, _) = OverrideAwareResources::build_pair_with_stability(
-        &canonical_resources_for_test(vec![resource], &SchemaRegistry::new()),
-        &projected_state,
-        LivePreApplyInputs {
-            managed: &[],
-            compositions: &[],
-            managed_current: &current_states,
-            data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &remote_bindings,
-            wait_aliases: &wait_aliases,
+    let (override_aware, _) = carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            OverrideAwareResources::build_pair_with_stability(
+                &canonical_resources_for_test(vec![resource], &SchemaRegistry::new()),
+                &projected_state,
+                LivePreApplyInputs {
+                    managed: &[],
+                    compositions: &[],
+                    managed_current: &current_states,
+                    data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
+                    remote_bindings: &remote_bindings,
+                    wait_aliases: &wait_aliases,
+                },
+                &HashMap::new(),
+                OverrideAwareBuildMode::Apply,
+                session,
+            )
         },
-        &HashMap::new(),
-        OverrideAwareBuildMode::Apply,
     )
     .expect("override-aware resources should build");
 
@@ -4833,16 +5309,15 @@ fn apply_does_not_require_flag_after_v7_to_v8_migration() {
 
 #[tokio::test]
 async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases_lock() {
-    let user_dirs = carina_core::TestUserDirs::new();
     let fixture = ApplyCancellationFixture::new()
         .with_resources(["first", "second", "third"])
         .cancel_after_successes(1);
     let token = fixture.cancel_token();
-    let load_count = crate::wiring::track_provider_loads_for_test();
+    let loads_before = fixture.runtime().provider_load_count();
 
     let observer_factory = fixture.observer_factory();
     let err = run_apply_with_observer_factory(
-        &user_dirs,
+        fixture.runtime(),
         fixture.config_path(),
         true,
         true,
@@ -4859,7 +5334,11 @@ async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases
         matches!(err, AppError::Interrupted),
         "expected Interrupted, got {err:?}"
     );
-    assert_eq!(load_count.count(), 1, "live apply must load providers once");
+    assert_eq!(
+        fixture.runtime().provider_load_count() - loads_before,
+        1,
+        "live apply must load providers once"
+    );
 
     let state = fixture.read_state().await;
     assert!(fixture.state_path().exists());
@@ -4887,15 +5366,10 @@ async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases
 
 #[tokio::test]
 async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
-    let user_dirs = carina_core::TestUserDirs::new();
-    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
-    let fixture = ApplyCancellationFixture::new()
+    let mut fixture = ApplyCancellationFixture::new()
         .with_resources(["slow"])
-        .with_delayed_create("slow", Duration::from_millis(75));
-    let _mock_state = crate::commands::shared::cancellation_test_support::ScopedEnv::set(
-        "CARINA_MOCK_STATE_FILE",
-        fixture.config_path().join("source-apply-mock-state.json"),
-    );
+        .with_blocked_create("slow");
+    fixture.use_mock_file(fixture.config_path().join("source-apply-mock-state.json"));
     let loaded = load_configuration_with_config(
         fixture.config_path(),
         fixture.provider_context(),
@@ -4905,7 +5379,7 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
     let parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
-    let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base_dir)
+    let providers = ProviderLoad::load(fixture.runtime(), &parsed.providers, base_dir)
         .expect("mock provider must load");
     let validated_config = providers
         .validate_config_pair(
@@ -4920,7 +5394,7 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
     let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(15));
     let backend = fixture.lock_loss_backend_handle();
 
-    let error = run_apply_locked_canonical(
+    let apply = run_apply_locked_canonical(
         validated_config,
         true,
         backend.clone(),
@@ -4931,9 +5405,18 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
         &observer_factory,
         NonZeroUsize::new(1).unwrap(),
         false,
-    )
-    .await
-    .expect_err("heartbeat lock loss must fail apply");
+    );
+    tokio::pin!(apply);
+    tokio::select! {
+        () = fixture.wait_for_blocked_create() => {},
+        outcome = &mut apply => panic!("apply returned before the mock create blocked: {outcome:?}"),
+    }
+    backend.provider_is_blocked();
+    backend.wait_for_renewal_failure().await;
+    fixture.release_blocked_create();
+    let error = apply
+        .await
+        .expect_err("heartbeat lock loss must fail apply");
 
     assert!(matches!(error, AppError::StateLockLost { .. }));
     let rendered = error.to_string();
@@ -4950,15 +5433,10 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
 
 #[tokio::test]
 async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
-    let user_dirs = carina_core::TestUserDirs::new();
-    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
-    let fixture = ApplyCancellationFixture::new()
+    let mut fixture = ApplyCancellationFixture::new()
         .with_resources(["slow"])
-        .with_delayed_create("slow", Duration::from_millis(75));
-    let _mock_state = crate::commands::shared::cancellation_test_support::ScopedEnv::set(
-        "CARINA_MOCK_STATE_FILE",
-        fixture.config_path().join("saved-plan-mock-state.json"),
-    );
+        .with_blocked_create("slow");
+    fixture.use_mock_file(fixture.config_path().join("saved-plan-mock-state.json"));
     let mut resource: Resource = Resource::with_provider("mock", "test.resource", "slow", None);
     resource.binding = Some(absolute_binding("slow"));
     resource.set_attr("name", string_value("slow"));
@@ -4986,8 +5464,11 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
         }]),
         backend_config: None,
         plan,
-        sorted_resources: vec![resource.clone()],
-        unresolved_resources: vec![resource],
+        sorted_resources: vec![resource.clone().into_value_snapshot()],
+        unresolved_resources: vec![resource]
+            .into_iter()
+            .map(|resource| resource.into_value_snapshot())
+            .collect(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
@@ -4999,14 +5480,18 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
+
+        sorted_value_destroy_dependencies: vec![Default::default(); 1],
+        sorted_explicit_destroy_dependencies: vec![Default::default(); 1],
+        legacy_dependency_classification: None,
     };
     let plan_file = record_with_builtin_mock_schemas(contents);
     let observer_factory = fixture.observer_factory();
     let backend = fixture.lock_loss_backend_handle();
     let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(15));
 
-    let error = run_apply_from_plan_locked(
-        &user_dirs,
+    let apply = run_apply_from_plan_locked(
+        fixture.runtime(),
         inspected_saved_plan(plan_file),
         fixture.provider_context(),
         true,
@@ -5020,9 +5505,18 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
         &observer_factory,
         NonZeroUsize::new(1).unwrap(),
         false,
-    )
-    .await
-    .expect_err("heartbeat lock loss must fail saved-plan apply");
+    );
+    tokio::pin!(apply);
+    tokio::select! {
+        () = fixture.wait_for_blocked_create() => {},
+        outcome = &mut apply => panic!("apply returned before the mock create blocked: {outcome:?}"),
+    }
+    backend.provider_is_blocked();
+    backend.wait_for_renewal_failure().await;
+    fixture.release_blocked_create();
+    let error = apply
+        .await
+        .expect_err("heartbeat lock loss must fail saved-plan apply");
 
     assert!(matches!(error, AppError::StateLockLost { .. }));
     assert_eq!(backend.locked_writes(), 0, "lost lock must not save state");
@@ -5032,7 +5526,6 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
 #[tokio::test]
 async fn apply_cancel_token_integration_persists_completed_state_releases_lock_and_returns_interrupted()
  {
-    let user_dirs = carina_core::TestUserDirs::new();
     // Regression test for #3498: a cancelled apply must persist completed
     // resources to state, release the lock, and return AppError::Interrupted.
     // The resource names mirror the publish-ALB scenario that surfaced this
@@ -5044,7 +5537,7 @@ async fn apply_cancel_token_integration_persists_completed_state_releases_lock_a
 
     let observer_factory = fixture.observer_factory();
     let err = run_apply_with_observer_factory(
-        &user_dirs,
+        fixture.runtime(),
         fixture.config_path(),
         true,
         true,
@@ -5082,8 +5575,6 @@ async fn apply_cancel_token_integration_persists_completed_state_releases_lock_a
 
 #[tokio::test]
 async fn apply_cleanup_priority_persists_completed_state_and_releases_lock() {
-    let user_dirs = carina_core::TestUserDirs::new();
-    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
     let fixture = ApplyCancellationFixture::new()
         .with_resources(["a_completed", "z_blocked"])
         .with_blocked_create("z_blocked");
@@ -5091,7 +5582,7 @@ async fn apply_cleanup_priority_persists_completed_state_and_releases_lock() {
     let observer_factory = fixture.observer_factory();
 
     let apply = run_apply_with_observer_factory(
-        &user_dirs,
+        fixture.runtime(),
         fixture.config_path(),
         true,
         true,
@@ -5131,10 +5622,6 @@ async fn apply_cleanup_priority_persists_completed_state_and_releases_lock() {
 
 #[tokio::test]
 async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
-    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
-    unsafe {
-        std::env::remove_var("CARINA_MOCK_STATE_FILE");
-    }
     let fixture = ApplyCancellationFixture::new()
         .with_resources_and_exports(["a", "b"], &[("ax", "a.name"), ("bx", "b.id")]);
     let loaded = load_configuration_with_config(
@@ -5158,7 +5645,11 @@ async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
         validation_errors.is_empty(),
         "fixture must validate, got: {validation_errors:?}"
     );
-    let wiring = ValidatedWiring::from_factories_for_test(vec![Box::new(FailBCreateFactory)], &[]);
+    let wiring = ValidatedWiring::from_factories_for_test(
+        fixture.runtime(),
+        vec![Box::new(FailBCreateFactory)],
+        &[],
+    );
     let observer_factory = fixture.observer_factory();
     let err = run_apply_locked(
         validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
@@ -5235,6 +5726,7 @@ async fn run_apply_locked_defers_value_resolvable_data_source_read_until_referen
         "fixture must validate, got: {validation_errors:?}"
     );
     let wiring = ValidatedWiring::from_factories_for_test(
+        fixture.runtime(),
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -5298,6 +5790,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_fails() {
     let shared = ApplyCascadeShared::default();
     shared.fail_delete_identifier("vpc-old");
     let wiring = ValidatedWiring::from_factories_for_test(
+        fixture.runtime(),
         vec![Box::new(ApplyCascadeAwsccFactory {
             shared: shared.clone(),
         })],
@@ -5366,6 +5859,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dep
     let shared = ApplyCascadeShared::default();
     shared.fail_delete_identifier("subnet-old");
     let wiring = ValidatedWiring::from_factories_for_test(
+        fixture.runtime(),
         vec![Box::new(ApplyCascadeAwsccFactory {
             shared: shared.clone(),
         })],
@@ -5594,6 +6088,7 @@ awscc.ec2.Subnet {{
     let fixture = fixture.with_raw_config(crn);
     let shared = ApplyCascadeShared::default();
     let wiring = ValidatedWiring::from_factories_for_test(
+        fixture.runtime(),
         vec![Box::new(ApplyCascadeAwsccFactory {
             shared: shared.clone(),
         })],
@@ -5646,9 +6141,10 @@ awscc.ec2.Subnet {{
     .with_attribute("vpc_id", serde_json::json!("vpc-old"))
     .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
     .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
-    subnet_state
-        .dependency_bindings
-        .insert(absolute_binding("vpc"));
+    subnet_state.dependency_bindings =
+        crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+            "awscc", "ec2.Vpc", "vpc", None,
+        )]);
 
     let mut state_file = carina_state::StateFile::new();
     state_file
@@ -5718,6 +6214,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         "fixture must validate, got: {validation_errors:?}"
     );
     let wiring = ValidatedWiring::from_factories_for_test(
+        fixture.runtime(),
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -5842,6 +6339,7 @@ let nat = mock.ec2.NatGateway {{
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
     let wiring = ValidatedWiring::from_factories_for_test(
+        fixture.runtime(),
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -6017,6 +6515,7 @@ let igw = mock.ec2.InternetGateway {{{tags}
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
     let wiring = ValidatedWiring::from_factories_for_test(
+        fixture.runtime(),
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -6185,6 +6684,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
     let wiring = ValidatedWiring::from_factories_for_test(
+        fixture.runtime(),
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -6497,6 +6997,7 @@ let consumer = mock.iam.Role {{
         "fixture must validate, got: {validation_errors:?}"
     );
     let wiring = ValidatedWiring::from_factories_for_test(
+        fixture.runtime(),
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -6808,6 +7309,7 @@ impl StateBackend for BootstrapWriteFailureBackend {
 }
 
 async fn bootstrap_declared_state_bucket(
+    color_mode: crate::output_style::ColorMode,
     provider: &BootstrapRecordingProvider,
     backend: &dyn StateBackend,
 ) -> Result<(Resource, SchemaRegistry), AppError> {
@@ -6834,9 +7336,11 @@ async fn bootstrap_declared_state_bucket(
     let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
 
     create_checked_bootstrap_resource_for_test(
+        color_mode,
         provider,
         resource.clone(),
         BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
             backend,
             parsed: &parsed,
             provider_configs: &provider_configs,
@@ -6852,14 +7356,16 @@ async fn bootstrap_declared_state_bucket(
 
 #[tokio::test]
 async fn declared_state_bucket_bootstrap_success_seeds_protected_provider_state() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::Success,
     };
     let (_temp, backend) = bootstrap_test_backend();
-    let (resource, _schemas) = bootstrap_declared_state_bucket(&provider, backend.as_ref())
-        .await
-        .expect("declared state bucket create must seed state");
+    let (resource, _schemas) =
+        bootstrap_declared_state_bucket(color_mode, &provider, backend.as_ref())
+            .await
+            .expect("declared state bucket create must seed state");
     let id = resource.id.clone();
     let expected_identity = id
         .identity_str()
@@ -6886,14 +7392,16 @@ async fn declared_state_bucket_bootstrap_success_seeds_protected_provider_state(
 
 #[tokio::test]
 async fn declared_state_bucket_bootstrap_partial_success_seeds_partial_read_state() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::PartialSuccess,
     };
     let (_temp, backend) = bootstrap_test_backend();
-    let (resource, _schemas) = bootstrap_declared_state_bucket(&provider, backend.as_ref())
-        .await
-        .expect("partial-success bootstrap must seed state");
+    let (resource, _schemas) =
+        bootstrap_declared_state_bucket(color_mode, &provider, backend.as_ref())
+            .await
+            .expect("partial-success bootstrap must seed state");
     let id = resource.id.clone();
 
     let state = backend
@@ -6925,24 +7433,15 @@ async fn declared_state_bucket_bootstrap_partial_success_seeds_partial_read_stat
 
 #[test]
 fn partial_state_bucket_warning_color_spans_do_not_cross_newlines() {
-    struct ColorOverrideGuard;
-
-    impl Drop for ColorOverrideGuard {
-        fn drop(&mut self) {
-            colored::control::unset_override();
-        }
-    }
+    let color_mode = crate::output_style::ColorMode::Ansi;
 
     let diagnostic = carina_core::provider::PartialReadDiagnostic::new(
         "bootstrap read incomplete".to_string(),
         vec!["versioning".to_string()],
     )
     .expect("fixture diagnostic has a missing attribute");
-    let rendered = {
-        colored::control::set_override(true);
-        let _guard = ColorOverrideGuard;
-        format_partial_state_bucket_create_warning("state-bucket", &diagnostic)
-    };
+    let rendered =
+        { format_partial_state_bucket_create_warning(color_mode, "state-bucket", &diagnostic) };
 
     assert!(
         rendered.contains("\u{1b}["),
@@ -6978,6 +7477,7 @@ fn partial_state_bucket_warning_color_spans_do_not_cross_newlines() {
 
 #[tokio::test]
 async fn declared_state_bucket_bootstrap_seed_prevents_phantom_create_plan() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use carina_core::effect::Effect;
 
     let provider = BootstrapRecordingProvider {
@@ -6985,9 +7485,10 @@ async fn declared_state_bucket_bootstrap_seed_prevents_phantom_create_plan() {
         behavior: BootstrapCreateBehavior::Success,
     };
     let (_temp, backend) = bootstrap_test_backend();
-    let (resource, schemas) = bootstrap_declared_state_bucket(&provider, backend.as_ref())
-        .await
-        .expect("declared state bucket create must seed state");
+    let (resource, schemas) =
+        bootstrap_declared_state_bucket(color_mode, &provider, backend.as_ref())
+            .await
+            .expect("declared state bucket create must seed state");
     let id = resource.id.clone();
 
     let state_file = backend
@@ -7005,7 +7506,7 @@ async fn declared_state_bucket_bootstrap_seed_prevents_phantom_create_plan() {
         &schemas,
         std::slice::from_ref(&resource),
     );
-    let resolved_resource = ResolvedResource::new(resource);
+    let resolved_resource = resolved(resource);
     let saved_attrs = state_file.build_saved_attrs().lift(&schemas);
     let plan = carina_core::differ::create_plan_for_test(
         std::slice::from_ref(&resolved_resource),
@@ -7035,13 +7536,15 @@ async fn declared_state_bucket_bootstrap_seed_prevents_phantom_create_plan() {
 
 #[tokio::test]
 async fn declared_state_bucket_successful_create_seed_write_failure_is_actionable() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::Success,
     };
-    let error = bootstrap_declared_state_bucket(&provider, &BootstrapWriteFailureBackend)
-        .await
-        .expect_err("a successful create followed by a seed write failure must be actionable");
+    let error =
+        bootstrap_declared_state_bucket(color_mode, &provider, &BootstrapWriteFailureBackend)
+            .await
+            .expect_err("a successful create followed by a seed write failure must be actionable");
 
     let AppError::StateBucketSeed(seed) = &error else {
         panic!("seed write failure lost its bootstrap context: {error:?}");
@@ -7075,6 +7578,7 @@ async fn declared_state_bucket_successful_create_seed_write_failure_is_actionabl
 
 #[tokio::test]
 async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::Success,
@@ -7102,9 +7606,11 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
     let (_temp, backend) = bootstrap_test_backend();
     let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
     let error = create_checked_bootstrap_resource_for_test(
+        color_mode,
         &provider,
         resource,
         BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
             backend: backend.as_ref(),
             parsed: &parsed,
             provider_configs: &provider_configs,
@@ -7151,6 +7657,7 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
 
 #[tokio::test]
 async fn state_bucket_provider_error_keeps_typed_terminal_error() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::Untracked,
@@ -7173,9 +7680,11 @@ async fn state_bucket_provider_error_keeps_typed_terminal_error() {
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
     let error = create_checked_bootstrap_resource_for_test(
+        color_mode,
         &provider,
         resource,
         BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
             backend: backend.as_ref(),
             parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
@@ -7200,6 +7709,7 @@ async fn state_bucket_provider_error_keeps_typed_terminal_error() {
 
 #[tokio::test]
 async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::Success,
@@ -7227,9 +7737,11 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
     let result = create_checked_bootstrap_resource_for_test(
+        color_mode,
         &provider,
         resource,
         BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
             backend: backend.as_ref(),
             parsed: &parsed,
             provider_configs: &provider_configs,
@@ -7252,6 +7764,7 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
 
 #[tokio::test]
 async fn bootstrap_created_failure_seeds_observed_state_before_error() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::Created,
@@ -7279,9 +7792,11 @@ async fn bootstrap_created_failure_seeds_observed_state_before_error() {
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
     let error = create_checked_bootstrap_resource_for_test(
+        color_mode,
         &provider,
         resource,
         BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
             backend: backend.as_ref(),
             parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
@@ -7343,6 +7858,7 @@ async fn bootstrap_created_failure_seeds_observed_state_before_error() {
 
 #[tokio::test]
 async fn bootstrap_unobserved_created_failure_seeds_identifier_and_partial_read_before_error() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::CreatedNotFound,
@@ -7364,9 +7880,11 @@ async fn bootstrap_unobserved_created_failure_seeds_identifier_and_partial_read_
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
     let error = create_checked_bootstrap_resource_for_test(
+        color_mode,
         &provider,
         resource,
         BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
             backend: backend.as_ref(),
             parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
@@ -7432,6 +7950,7 @@ async fn bootstrap_unobserved_created_failure_seeds_identifier_and_partial_read_
 
 #[tokio::test]
 async fn bootstrap_in_flight_failure_seeds_pending_state_before_error() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::InFlight,
@@ -7454,9 +7973,11 @@ async fn bootstrap_in_flight_failure_seeds_pending_state_before_error() {
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
     let error = create_checked_bootstrap_resource_for_test(
+        color_mode,
         &provider,
         resource,
         BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
             backend: backend.as_ref(),
             parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
@@ -7500,6 +8021,7 @@ async fn bootstrap_in_flight_failure_seeds_pending_state_before_error() {
 
 #[tokio::test]
 async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::InFlight,
@@ -7519,9 +8041,11 @@ async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
     );
     let provider_configs = empty_resolved_provider_configs();
     let error = create_checked_bootstrap_resource_for_test(
+        color_mode,
         &provider,
         resource,
         BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
             backend: &BootstrapWriteFailureBackend,
             parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
@@ -7973,7 +8497,7 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
 
     let schema = schema.validate().expect("IAM schema must validate");
     let d = diff(
-        &ResolvedResource::new(resource),
+        &resolved(resource),
         &current,
         &saved,
         Some(&prev_explicit),
@@ -8696,11 +9220,11 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
 
     // Export param references registry_prod.account_id using the
     // parser-produced ResourceRef shape.
-    let export_params = vec![ExportParameter {
-        name: "account_id".to_string(),
-        static_type: fixture_unchecked_export_static_type(),
-        value: Some(root_resource_ref("registry_prod", "account_id")),
-    }];
+    let export_params = vec![ExportParameter::for_test(
+        "account_id".to_string(),
+        fixture_unchecked_export_static_type(),
+        Some(root_resource_ref("registry_prod", "account_id")),
+    )];
 
     // Mirror production callers: the resource is in sorted_resources
     // with a binding; provider-returned attributes flow in via
@@ -8708,7 +9232,7 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
     let mut registry_prod: Resource =
         Resource::with_provider("awscc", "organizations.account", "registry-prod", None);
     registry_prod.binding = Some(absolute_binding("registry_prod"));
-    let sorted_resources = vec![registry_prod];
+    let sorted_resources = [registry_prod];
 
     let post_apply_states =
         crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
@@ -8718,7 +9242,11 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
         );
     let exports = resolve_and_materialize_exports_for_test(ResolveExportValuesPostApplyInput {
         export_params: &checked_exports(&export_params),
-        sorted_resources: &sorted_resources,
+        sorted_resources: &sorted_resources
+            .iter()
+            .cloned()
+            .map(Resource::into_value_snapshot)
+            .collect::<Vec<_>>(),
         pre_resolve_compositions: &[],
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -8800,20 +9328,20 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
             pending_constraints: Vec::new(),
         },
         binding: Some(absolute_binding("github_actions_carina")),
-        dependency_bindings: std::collections::BTreeSet::new(),
+        dependency_bindings: Default::default(),
         module_name: "github_module".to_string(),
         instance: "github_actions_carina".to_string(),
         call_path: crate::test_composition_call_path(),
         quoted_string_attrs: std::collections::HashSet::new(),
     };
-    let sorted_resources = vec![role_resource];
+    let sorted_resources = [role_resource];
     let pre_resolve_compositions = vec![composition];
 
-    let export_params = vec![ExportParameter {
-        name: "role_arn".to_string(),
-        static_type: fixture_unchecked_export_static_type(),
-        value: Some(root_resource_ref("github_actions_carina", "role_arn")),
-    }];
+    let export_params = vec![ExportParameter::for_test(
+        "role_arn".to_string(),
+        fixture_unchecked_export_static_type(),
+        Some(root_resource_ref("github_actions_carina", "role_arn")),
+    )];
 
     let post_apply_states =
         crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
@@ -8823,7 +9351,11 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
         );
     let exports = resolve_and_materialize_exports_for_test(ResolveExportValuesPostApplyInput {
         export_params: &checked_exports(&export_params),
-        sorted_resources: &sorted_resources,
+        sorted_resources: &sorted_resources
+            .iter()
+            .cloned()
+            .map(Resource::into_value_snapshot)
+            .collect::<Vec<_>>(),
         pre_resolve_compositions: &pre_resolve_compositions,
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -8909,7 +9441,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
                     pending_constraints: Vec::new(),
                 },
                 binding: Some(absolute_binding(binding)),
-                dependency_bindings: std::collections::BTreeSet::new(),
+                dependency_bindings: Default::default(),
                 module_name: "mod".to_string(),
                 instance: binding.to_string(),
                 call_path: crate::test_composition_call_path(),
@@ -8931,13 +9463,13 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
         "role_arn",
     );
 
-    let sorted_resources = vec![role_resource];
+    let sorted_resources = [role_resource];
 
-    let export_params = vec![ExportParameter {
-        name: "role_arn".to_string(),
-        static_type: fixture_unchecked_export_static_type(),
-        value: Some(root_resource_ref("outer", "public_role_arn")),
-    }];
+    let export_params = vec![ExportParameter::for_test(
+        "role_arn".to_string(),
+        fixture_unchecked_export_static_type(),
+        Some(root_resource_ref("outer", "public_role_arn")),
+    )];
 
     let pre_resolve_compositions = vec![inner_virtual, outer_virtual];
     let post_apply_states =
@@ -8948,7 +9480,11 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
         );
     let exports = resolve_and_materialize_exports_for_test(ResolveExportValuesPostApplyInput {
         export_params: &checked_exports(&export_params),
-        sorted_resources: &sorted_resources,
+        sorted_resources: &sorted_resources
+            .iter()
+            .cloned()
+            .map(Resource::into_value_snapshot)
+            .collect::<Vec<_>>(),
         pre_resolve_compositions: &pre_resolve_compositions,
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -9095,7 +9631,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
             pending_constraints: Vec::new(),
         },
         binding: Some(absolute_binding("carina_module")),
-        dependency_bindings: std::collections::BTreeSet::new(),
+        dependency_bindings: Default::default(),
         module_name: "carina_module".to_string(),
         instance: "carina_module".to_string(),
         call_path: crate::test_composition_call_path(),
@@ -9125,13 +9661,19 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
             wait_aliases: &[],
         },
     );
-    resolve_managed_refs_with_state_and_remote(&mut sorted_resources, &bindings).unwrap();
+    carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            resolve_managed_refs_with_state_and_remote(&mut sorted_resources, &bindings, session)
+        },
+    )
+    .unwrap();
 
-    let export_params = vec![ExportParameter {
-        name: "role_arn".to_string(),
-        static_type: fixture_unchecked_export_static_type(),
-        value: Some(root_resource_ref("carina_module", "role_arn")),
-    }];
+    let export_params = vec![ExportParameter::for_test(
+        "role_arn".to_string(),
+        fixture_unchecked_export_static_type(),
+        Some(root_resource_ref("carina_module", "role_arn")),
+    )];
 
     let post_apply_states =
         crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
@@ -9141,7 +9683,11 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         );
     let exports = resolve_and_materialize_exports_for_test(ResolveExportValuesPostApplyInput {
         export_params: &checked_exports(&export_params),
-        sorted_resources: &sorted_resources,
+        sorted_resources: &sorted_resources
+            .iter()
+            .cloned()
+            .map(Resource::into_value_snapshot)
+            .collect::<Vec<_>>(),
         pre_resolve_compositions: &pre_resolve_compositions,
         post_apply_states: &post_apply_states,
         schemas: &carina_core::schema::SchemaRegistry::new(),
@@ -9239,11 +9785,11 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
     };
 
     // The export: `exports { admin_access_role_arns = admin_access_roles.arns }`.
-    let export_params = vec![ExportParameter {
-        name: "admin_access_role_arns".to_string(),
-        static_type: fixture_unchecked_export_static_type(),
-        value: Some(root_resource_ref("admin_access_roles", "arns")),
-    }];
+    let export_params = vec![ExportParameter::for_test(
+        "admin_access_role_arns".to_string(),
+        fixture_unchecked_export_static_type(),
+        Some(root_resource_ref("admin_access_roles", "arns")),
+    )];
 
     let data_source_values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
         DataSourceValue::read(data_source_states[&data_source.id].clone())
@@ -9317,7 +9863,14 @@ impl tokio::io::AsyncRead for NeverReady {
 async fn confirm_apply_returns_confirmed_on_yes() {
     let input = &b"yes\n"[..];
     let cancel = carina_core::shutdown::ShutdownToken::running();
-    let outcome = confirm_apply(input, cancel, false).await.unwrap();
+    let outcome = confirm_apply(
+        &crate::test_support::TestCommandRuntime::new(),
+        input,
+        cancel,
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(outcome, ApplyConfirmation::Confirmed);
 }
 
@@ -9325,7 +9878,14 @@ async fn confirm_apply_returns_confirmed_on_yes() {
 async fn confirm_apply_returns_cancelled_on_no() {
     let input = &b"no\n"[..];
     let cancel = carina_core::shutdown::ShutdownToken::running();
-    let outcome = confirm_apply(input, cancel, false).await.unwrap();
+    let outcome = confirm_apply(
+        &crate::test_support::TestCommandRuntime::new(),
+        input,
+        cancel,
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(outcome, ApplyConfirmation::Cancelled);
 }
 
@@ -9333,7 +9893,14 @@ async fn confirm_apply_returns_cancelled_on_no() {
 async fn confirm_apply_returns_cancelled_on_empty_input() {
     let input = &b"\n"[..];
     let cancel = carina_core::shutdown::ShutdownToken::running();
-    let outcome = confirm_apply(input, cancel, false).await.unwrap();
+    let outcome = confirm_apply(
+        &crate::test_support::TestCommandRuntime::new(),
+        input,
+        cancel,
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(outcome, ApplyConfirmation::Cancelled);
 }
 
@@ -9342,7 +9909,14 @@ async fn confirm_apply_auto_approve_skips_read() {
     // Reader would hang forever; auto_approve must short-circuit without reading.
     let input = tokio::io::BufReader::new(tokio::io::empty());
     let cancel = carina_core::shutdown::ShutdownToken::running();
-    let outcome = confirm_apply(input, cancel, true).await.unwrap();
+    let outcome = confirm_apply(
+        &crate::test_support::TestCommandRuntime::new(),
+        input,
+        cancel,
+        true,
+    )
+    .await
+    .unwrap();
     assert_eq!(outcome, ApplyConfirmation::Confirmed);
 }
 
@@ -9350,7 +9924,10 @@ async fn confirm_apply_auto_approve_skips_read() {
 async fn confirm_apply_returns_interrupted_when_cancel_fires_after_subscription() {
     let reader = tokio::io::BufReader::new(NeverReady);
     let (trigger, cancel) = carina_core::shutdown::testing::shutdown_channel();
-    let waiting = tokio::spawn(confirm_apply(reader, cancel.clone(), false));
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let waiting_cancel = cancel.clone();
+    let waiting =
+        tokio::spawn(async move { confirm_apply(&runtime, reader, waiting_cancel, false).await });
     tokio::task::yield_now().await;
     trigger.request_graceful_shutdown();
     let err = waiting.await.unwrap().unwrap_err();
@@ -9362,7 +9939,14 @@ async fn confirm_apply_returns_interrupted_when_cancel_token_fires() {
     let (trigger, token) = carina_core::shutdown::testing::shutdown_channel();
     trigger.request_graceful_shutdown();
     let reader = tokio::io::BufReader::new(NeverReady);
-    let err = confirm_apply(reader, token, false).await.unwrap_err();
+    let err = confirm_apply(
+        &crate::test_support::TestCommandRuntime::new(),
+        reader,
+        token,
+        false,
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(err, AppError::Interrupted));
 }
 
@@ -9394,11 +9978,17 @@ mod apply_deferred_for_parity {
             &ProviderContext::default(),
         )
         .expect("parse");
-        carina_core::module_resolver::resolve_modules_providerless(
-            carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
+        carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                carina_core::module_resolver::resolve_modules_providerless(
+                    carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    std::path::Path::new("."),
+                    session,
+                )
+                .expect("cross the deferred-body resolution seam")
+            },
         )
-        .expect("cross the deferred-body resolution seam")
     }
 
     fn comparison_schemas() -> SchemaRegistry {
@@ -9765,12 +10355,13 @@ mod saved_plan_version_tests {
     use tempfile::TempDir;
 
     use super::{
-        ApplyTarget, PlanFileHeader, saved_plan_replan_project_dir, saved_provider_configs,
+        ApplyTarget, PlanFileHeader, resolved, resolved_inner, saved_plan_replan_project_dir,
+        saved_provider_configs,
     };
 
     #[tokio::test]
     async fn format_28_saved_plan_is_rejected_before_deferred_payload_decode() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("format-28.plan.json");
         let old_plan = serde_json::json!({
@@ -9815,7 +10406,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_25_plan_is_rejected_after_provider_artifacts_become_mandatory() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("reviewed-plan.json");
         let old_plan = serde_json::json!({
@@ -9854,16 +10445,16 @@ mod saved_plan_version_tests {
     /// headers before attempting to decode any format-specific payload.
     #[tokio::test]
     async fn previous_emitted_and_older_plan_versions_are_rejected_before_payload_decoding() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            38,
-            "carina#4072 requires format 38 to reject fail-open directive plans",
+            39,
+            "carina#3803 requires format 39 for resolved dependencies, alongside format 38 directive templates",
         );
-        let previous = 37;
+        let previous = 38;
 
-        for older_version in [previous, 36, 35, 34, 33, 32] {
+        for older_version in [previous, 37, 36, 35, 34, 33, 32] {
             let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
             let old_plan = serde_json::json!({
                 "version": older_version,
@@ -9900,7 +10491,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_33_plan_is_rejected_with_regeneration_guidance() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("format-33-plan.json");
         let old_plan = serde_json::json!({
@@ -9942,7 +10533,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_22_plan_without_schema_fingerprints_is_rejected_with_replan_command() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("reviewed-plan.json");
         let old_plan = serde_json::json!({
@@ -10004,7 +10595,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn future_saved_plan_without_source_path_is_rejected_by_version() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("future-plan");
         std::fs::write(&plan_path, r#"{"version":99,"timestamp":"x"}"#).expect("write future plan");
@@ -10054,7 +10645,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn current_saved_plan_without_source_path_is_corrupt_without_command() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("current-plan");
         let malformed = serde_json::json!({
@@ -10106,7 +10697,7 @@ mod saved_plan_version_tests {
     /// stub `effects: []` / resource arrays are enough.
     #[tokio::test]
     async fn version_3_saved_plan_is_rejected() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
         // A v3 plan: everything required by the pre-#3248 PlanFile
@@ -10196,7 +10787,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_10_saved_plan_is_rejected_after_constraint_metadata_bump() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
         let v10 = serde_json::json!({
@@ -10268,7 +10859,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_13_saved_plan_is_rejected_after_orphan_ownership_change() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
         let v13 = serde_json::json!({
@@ -10325,7 +10916,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_15_saved_plan_is_rejected_after_wait_rhs_typing_change() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
         let v15 = serde_json::json!({
@@ -10382,7 +10973,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_18_saved_plan_is_rejected_after_abandoned_generation_shape_change() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
         let v18 = serde_json::json!({
@@ -10439,7 +11030,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_19_saved_plan_is_rejected_after_current_state_tagging_change() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
         let v19 = serde_json::json!({
@@ -10497,7 +11088,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn saved_plan_decode_rejects_legacy_import_shape_by_version() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("reviewed-plan");
         let import_id = carina_core::resource::ResolvedResourceId::new(
@@ -10572,7 +11163,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn saved_plan_decode_reports_malformed_current_version_as_corrupt() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("reviewed-plan");
         let malformed = serde_json::json!({
@@ -10673,9 +11264,9 @@ mod saved_plan_version_tests {
         let plan_input_states = crate::plan_input_current_from_states(
             current_states.clone(),
             &SchemaRegistry::new(),
-            &[],
+            &[] as &[carina_core::resource::Resource],
         );
-        let resolved_resource = carina_core::resource::ResolvedResource::new(resource.clone());
+        let resolved_resource = resolved(resource.clone());
         let plan = carina_core::differ::create_plan_for_test(
             std::slice::from_ref(&resolved_resource),
             &[],
@@ -10702,8 +11293,14 @@ mod saved_plan_version_tests {
             provider_configs: saved_provider_configs(Vec::new()),
             backend_config: None,
             plan,
-            sorted_resources: vec![resource.clone()],
-            unresolved_resources: vec![resource],
+            sorted_resources: vec![resolved_inner(resource.clone())],
+            sorted_value_destroy_dependencies: vec![Default::default()],
+            sorted_explicit_destroy_dependencies: vec![Default::default()],
+            legacy_dependency_classification: None,
+            unresolved_resources: vec![resource]
+                .into_iter()
+                .map(|resource| resource.into_value_snapshot())
+                .collect(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
             data_source_origins: Vec::new(),
@@ -10721,6 +11318,7 @@ mod saved_plan_version_tests {
                 carina_core::resource::NoPlaceholder,
                 carina_core::resource::AbsoluteBindingAddress,
             >(
+                &crate::test_support::TestCommandRuntime::new(),
                 (),
                 Vec::new(),
                 &[],
@@ -10763,7 +11361,7 @@ mod saved_plan_version_tests {
         json: &serde_json::Value,
         expectation: &str,
     ) -> String {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         std::fs::write(plan_path, serde_json::to_string(json).unwrap()).expect("write plan");
 
         let result = crate::commands::apply::run_apply_from_plan(
@@ -11025,6 +11623,7 @@ fn apply_exit_code_prioritizes_failure_over_partial() {
 
 #[test]
 fn skipped_export_does_not_downgrade_partial_success() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let result = {
         let mut result: ExecutionResult = ExecutionResult::empty();
         result.partial_count = 1;
@@ -11032,6 +11631,7 @@ fn skipped_export_does_not_downgrade_partial_success() {
     };
 
     let err = finish_apply(
+        color_mode,
         &result,
         SkippedExports::from_names_for_test(&["role_arn"]),
         Duration::ZERO,
@@ -11049,6 +11649,7 @@ fn skipped_export_does_not_downgrade_partial_success() {
 
 #[test]
 fn interrupted_apply_summary_counts_unknown_outcome() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let result = {
         let mut result: ExecutionResult = ExecutionResult::empty();
         result.success_count = 1;
@@ -11056,7 +11657,13 @@ fn interrupted_apply_summary_counts_unknown_outcome() {
         result
     };
 
-    let err = finish_apply(&result, SkippedExports::default(), Duration::ZERO).unwrap_err();
+    let err = finish_apply(
+        color_mode,
+        &result,
+        SkippedExports::default(),
+        Duration::ZERO,
+    )
+    .unwrap_err();
 
     assert!(matches!(&err, AppError::ExecutionFailed(_)));
     assert_eq!(
@@ -11067,10 +11674,10 @@ fn interrupted_apply_summary_counts_unknown_outcome() {
 
 #[test]
 fn failed_apply_final_error_names_endpoint_and_typed_cause() {
-    let effect = Effect::Create(carina_core::resource::ResolvedResource::new(Resource::new(
-        "test.resource",
-        "failed",
-    )));
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let effect = Effect::Create(carina_core::resource::ResolvedResource::new(
+        (Resource::new("test.resource", "failed")).into_value_snapshot(),
+    ));
     let mut result: ExecutionResult = ExecutionResult::empty();
     result.failure_sink().record(
         &carina_core::executor::NoopExecutionObserver,
@@ -11090,7 +11697,13 @@ fn failed_apply_final_error_names_endpoint_and_typed_cause() {
             },
         },
     );
-    let error = finish_apply(&result, SkippedExports::default(), Duration::ZERO).unwrap_err();
+    let error = finish_apply(
+        color_mode,
+        &result,
+        SkippedExports::default(),
+        Duration::ZERO,
+    )
+    .unwrap_err();
     let rendered = error.to_string();
     assert!(
         rendered.contains("create test.resource.failed: execution error")
@@ -11102,4 +11715,49 @@ fn failed_apply_final_error_names_endpoint_and_typed_cause() {
     };
     assert_eq!(report.failures().len(), 1);
     assert!(report.failures()[0].to_string().contains("root detail"));
+}
+
+#[test]
+fn saved_plan_reloaded_resolved_data_source_retains_folded_module_dependency() {
+    let mut target =
+        Resource::with_provider("mock", "iam.Role", "registry_publish.target_role", None);
+    target.binding = Some(absolute_binding("registry_publish.target_role"));
+
+    let mut data_source =
+        DataSource::with_provider("mock", "iam.Roles", "registry_publish.roles", None);
+    data_source.binding = Some(absolute_binding("registry_publish.roles"));
+    data_source
+        .attributes
+        .insert("name_regex".to_string(), string_value("^target-role$"));
+    data_source
+        .dependencies
+        .value_bindings
+        .insert(absolute_binding("registry_publish.target_role"));
+
+    let graph = carina_core::resolved_graph::resolve_expanded_graph({
+        let mut configuration = carina_core::parser::ExpandedParsedFile::default();
+        configuration.resources = (std::slice::from_ref(&target)).to_vec();
+        configuration.data_sources = (std::slice::from_ref(&data_source)).to_vec();
+        configuration.into()
+    })
+    .expect("module-expanded graph resolves");
+    let resolved = graph
+        .resolve_data_source(data_source)
+        .expect("folded saved-plan data source resolves");
+    let resolved = carina_core::resource::SavedResolvedDataSource::from(resolved);
+    let encoded = serde_json::to_string(&resolved).expect("encode resolved saved-plan data source");
+    let reloaded: carina_core::resource::SavedResolvedDataSource =
+        serde_json::from_str(&encoded).expect("reload resolved saved-plan data source");
+    let id = reloaded.id.clone();
+
+    let classified = crate::wiring::classify_apply_time_resolved_data_source_read_inputs(
+        std::slice::from_ref(&reloaded),
+        std::slice::from_ref(&target),
+        &HashMap::new(),
+    );
+
+    assert!(
+        classified.contains_key(&id),
+        "a folded module data-source input must remain deferred after saved-plan reload",
+    );
 }

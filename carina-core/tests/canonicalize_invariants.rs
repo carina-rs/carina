@@ -17,6 +17,19 @@
 use carina_core::resource::{
     BindingAddress, ConcreteValue, DeferredValue, InterpolationPart, PlaceholderKind, Value,
 };
+use carina_core::validation::deferred_types::{
+    ProviderTypeCheckDiagnostic, ProviderTypeCheckSink, TypeCheckSession,
+};
+
+struct TestTypeCheckSink;
+impl ProviderTypeCheckSink for TestTypeCheckSink {
+    fn record(&mut self, diagnostic: ProviderTypeCheckDiagnostic) {
+        match diagnostic {
+            ProviderTypeCheckDiagnostic::Deferred(warning) => eprintln!("{}", warning.message),
+            ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => panic!("{}", error.message),
+        }
+    }
+}
 
 fn check_value<P: PlaceholderKind, B: BindingAddress>(v: &Value<P, B>, path: &str) {
     match v {
@@ -95,15 +108,19 @@ fn parse_root_and_resolve(source: &str) -> carina_core::parser::ExpandedParsedFi
     let root = tempfile::tempdir().expect("canonicalization fixture root");
     std::fs::write(root.path().join("canonicalize.crn"), source)
         .expect("write canonicalization fixture");
-    let parsed = carina_core::config_loader::parse_directory(
-        root.path(),
+    TypeCheckSession::run(
         &carina_core::parser::ProviderContext::default(),
+        |session| {
+            let parsed =
+                carina_core::config_loader::parse_directory(root.path(), session.catalog())
+                    .expect("parse should succeed");
+            carina_core::module_resolver::resolve_modules_providerless(parsed, root.path(), session)
+                .expect("module-resolution boundary should succeed")
+        },
     )
-    .expect("parse should succeed");
-    carina_core::module_resolver::resolve_modules_providerless(parsed, root.path())
-        .expect("module-resolution boundary should succeed")
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
-        .expect("canonicalization fixture contains no parser placeholders")
+    .publish(&mut TestTypeCheckSink)
+    .into_expanded(&carina_core::schema::SchemaRegistry::new())
+    .expect("canonicalization fixture contains no parser placeholders")
 }
 
 #[test]
@@ -143,12 +160,12 @@ fn parse_resolve_yields_canonical_interpolations() {
         check_value(v, &format!("let {}", name));
     }
     for param in &parsed.attribute_params {
-        if let Some(ref v) = param.value {
+        if let Some(v) = param.value.as_ref().and_then(|value| value.value()) {
             check_value(v, &format!("attributes.{}", param.name));
         }
     }
     for export in &parsed.export_params {
-        if let Some(ref v) = export.value {
+        if let Some(v) = export.value.as_ref().and_then(|value| value.value()) {
             check_value(v, &format!("exports.{}", export.name));
         }
     }

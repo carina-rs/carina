@@ -25,9 +25,7 @@ use crate::provider::{
 };
 #[cfg(test)]
 use crate::provider::{ReadOutcome, fixture_read_outcome_for_identifier};
-#[cfg(test)]
-use crate::resource::ResolvedResourceId;
-use crate::resource::{Current, ResourceId, State, Value};
+use crate::resource::{Current, ResolvedResourceId, ResourceId, State, Value};
 use crate::shutdown::{CleanupAwareLoop, CleanupInterrupted, LoopStep};
 use crate::value::format_value_user_facing;
 use crate::wait::predicate::WaitPredicate;
@@ -63,7 +61,7 @@ pub(super) fn effect_started_for_test<S>(effect: &Effect<S>) -> ExecutionEvent<'
 /// Borrowed, internally consistent view of one [`Effect::Wait`].
 pub(super) struct WaitEffectRef<'a, S> {
     effect: &'a Effect<S>,
-    identity: &'a crate::resource::AbsoluteBindingAddress,
+    id: &'a ResolvedResourceId,
     target: &'a ManagedWaitTarget,
     until: &'a WaitPredicate,
     timeout: Duration,
@@ -73,7 +71,7 @@ pub(super) struct WaitEffectRef<'a, S> {
 impl<'a, S> WaitEffectRef<'a, S> {
     pub(super) fn from_effect(effect: &'a Effect<S>) -> Option<Self> {
         let Effect::Wait {
-            identity,
+            id,
             target_id,
             until,
             timeout,
@@ -85,7 +83,7 @@ impl<'a, S> WaitEffectRef<'a, S> {
         };
         Some(Self {
             effect,
-            identity,
+            id,
             target: target_id,
             until,
             timeout: *timeout,
@@ -93,8 +91,8 @@ impl<'a, S> WaitEffectRef<'a, S> {
         })
     }
 
-    pub(super) fn identity(&self) -> &crate::resource::AbsoluteBindingAddress {
-        self.identity
+    pub(super) fn id(&self) -> &ResolvedResourceId {
+        self.id
     }
 
     pub(super) fn target(&self) -> &ManagedWaitTarget {
@@ -756,7 +754,7 @@ pub(super) async fn execute_wait_effect_with_heartbeat_cadence<S>(
 ) -> WaitOutcome {
     let WaitEffectRef {
         effect,
-        identity: _,
+        id: _,
         target,
         until,
         timeout,
@@ -875,7 +873,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use tokio::sync::{oneshot, watch};
+    use tokio::sync::watch;
 
     const CLEANUP_TEST_BOUND: Duration = Duration::from_secs(1);
 
@@ -887,13 +885,13 @@ mod tests {
 
     fn wait_effect(timeout: Duration, interval: Duration) -> Effect {
         Effect::Wait {
-            identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
+            id: crate::resource::ResolvedResourceId::with_identity("__wait", "cert_issued"),
             target_id: managed_wait_target(),
             until: equals_status("ISSUED"),
             until_surface: "cert.status == ISSUED".to_string(),
             timeout,
             interval,
-            explicit_dependencies: HashSet::new(),
+            explicit_dependencies: Default::default(),
         }
     }
 
@@ -930,6 +928,7 @@ mod tests {
     struct ReadSequenceProvider {
         responses: Mutex<Vec<State>>,
         reads: Mutex<usize>,
+        read_started: tokio::sync::Notify,
         pending: bool,
     }
 
@@ -938,6 +937,7 @@ mod tests {
             Self {
                 responses: Mutex::new(responses),
                 reads: Mutex::new(0),
+                read_started: tokio::sync::Notify::new(),
                 pending: false,
             }
         }
@@ -946,6 +946,7 @@ mod tests {
             Self {
                 responses: Mutex::new(Vec::new()),
                 reads: Mutex::new(0),
+                read_started: tokio::sync::Notify::new(),
                 pending: true,
             }
         }
@@ -972,6 +973,7 @@ mod tests {
                     let mut reads = self.reads.lock().unwrap();
                     *reads += 1;
                 }
+                self.read_started.notify_one();
                 if self.pending {
                     return std::future::pending().await;
                 }
@@ -1206,7 +1208,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wait_abandons_in_flight_provider_read_when_cleanup_is_prioritized() {
         tokio::time::timeout(CLEANUP_TEST_BOUND, async {
             let provider = ReadSequenceProvider::pending();
@@ -1308,7 +1310,7 @@ mod tests {
         .expect("sleep-parked cleanup regression test exceeded its one-second bound");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wait_abandons_before_read_when_cleanup_is_already_prioritized() {
         let provider = Arc::new(ReadSequenceProvider::new(vec![state_with_status("ISSUED")]));
         let (trigger, shutdown) = crate::shutdown::testing::shutdown_channel();
@@ -1319,39 +1321,23 @@ mod tests {
             "the test trigger and shutdown token must share cleanup-priority state"
         );
 
-        let worker_provider = Arc::clone(&provider);
-        let (result_tx, result_rx) = oneshot::channel();
-        let worker = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .build()
-                .expect("failed to build wait-test runtime");
-            let result = runtime.block_on(async move {
-                let effect = wait_effect(Duration::from_secs(60), Duration::from_secs(60));
-                let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
-                let observer = NoopWaitObserver;
-                let cleanup_loop = shutdown.cleanup_aware_loop();
-
-                execute_wait_effect(
-                    &cleanup_loop,
-                    worker_provider.as_ref(),
-                    WaitEffectRef::from_effect(&effect).unwrap(),
-                    &provider_identifier,
-                    cancel_rx,
-                    &observer,
-                )
-                .await
-            });
-            let _ = result_tx.send(result);
-        });
-
-        let result = tokio::time::timeout(CLEANUP_TEST_BOUND, result_rx)
-            .await
-            .expect("already-active cleanup wait did not return within one second")
-            .expect("already-active cleanup wait worker exited without an outcome");
-        worker
-            .join()
-            .expect("already-active cleanup wait worker panicked");
+        let effect = wait_effect(Duration::from_secs(60), Duration::from_secs(60));
+        let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
+        let observer = NoopWaitObserver;
+        let cleanup_loop = shutdown.cleanup_aware_loop();
+        let result = tokio::time::timeout(
+            CLEANUP_TEST_BOUND,
+            execute_wait_effect(
+                &cleanup_loop,
+                provider.as_ref(),
+                WaitEffectRef::from_effect(&effect).unwrap(),
+                &provider_identifier,
+                cancel_rx,
+                &observer,
+            ),
+        )
+        .await
+        .expect("already-active cleanup must abandon before starting a read");
 
         assert!(
             matches!(result, WaitOutcome::Abandoned),
@@ -1364,7 +1350,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wait_reaches_satisfied_during_graceful_shutdown() {
         tokio::time::timeout(CLEANUP_TEST_BOUND, async {
             let provider = ReadSequenceProvider::new(vec![state_with_status("ISSUED")]);
@@ -1459,7 +1445,7 @@ mod tests {
         assert_eq!(provider.read_count(), 3);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wait_returns_timeout_when_predicate_stays_false() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
         let effect = wait_effect(Duration::from_millis(10), Duration::from_millis(2));
@@ -1483,10 +1469,8 @@ mod tests {
         else {
             panic!("expected Timeout, got {result:?}");
         };
-        assert!(
-            elapsed >= Duration::from_millis(10),
-            "timeout should report elapsed time, got {elapsed:?}"
-        );
+        assert_eq!(elapsed, Duration::from_millis(10));
+        assert_eq!(provider.read_count(), 6);
         assert_eq!(
             last_attrs.get("status"),
             Some(&Value::Concrete(ConcreteValue::String(
@@ -1597,7 +1581,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wait_returns_unsatisfiable_when_cancelled() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
         let effect = wait_effect(Duration::from_secs(60), Duration::from_millis(1));
@@ -1615,7 +1599,7 @@ mod tests {
                         let _ = cancel_tx.send(WaitSignal::NoMutatorRemaining);
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    provider.read_started.notified().await;
                 }
             },
             execute_wait_effect(
@@ -1650,13 +1634,13 @@ mod tests {
         let shutdown = crate::shutdown::ShutdownToken::running();
         let cleanup_loop = shutdown.cleanup_aware_loop();
         let effect: crate::effect::Effect = crate::effect::Effect::Wait {
-            identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
+            id: crate::resource::ResolvedResourceId::with_identity("__wait", "cert_issued"),
             target_id: managed_wait_target(),
             until: equals_status("ISSUED"),
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: Duration::from_millis(100),
             interval: Duration::from_millis(1),
-            explicit_dependencies: HashSet::new(),
+            explicit_dependencies: Default::default(),
         };
 
         let result = execute_wait_effect_with_heartbeat_cadence(

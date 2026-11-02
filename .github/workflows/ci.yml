@@ -90,6 +90,14 @@ jobs:
       - run: bash scripts/check-error-source-not-in-display.sh
       - run: bash scripts/test-check-error-source-not-in-display.sh
 
+  no-wall-clock-test-assertions:
+    name: Check Wall Clock Test Assertions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/test-check-no-wall-clock-test-assertions.sh
+      - run: bash scripts/check-no-wall-clock-test-assertions.sh
+
   docs-spellings:
     name: Docs Spelling Check
     runs-on: ubuntu-latest
@@ -220,6 +228,7 @@ jobs:
           -p carina-provider-mock-http
           --target wasm32-wasip2
       - run: cargo nextest run --workspace --all-features
+      - run: scripts/test-in-process-isolation.sh
       # nextest does not run doctests; cover them with cargo test --doc.
       - run: cargo test --workspace --doc --all-features
 

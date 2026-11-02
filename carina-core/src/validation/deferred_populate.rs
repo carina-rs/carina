@@ -368,6 +368,7 @@ fn path_traverses_deferred(top_attr: EffectiveAttribute<'_>, segments: &[PathSeg
             }
             PathSegment::Field { name } => {
                 match current_type.shape() {
+                    Shape::UnloadedSchemaType(_) => return false,
                     Shape::Struct { .. } | Shape::Union => {}
                     Shape::Reference { .. }
                     | Shape::String { .. }
@@ -616,7 +617,7 @@ mod tests {
                 )),
             },
             timeout_secs: None,
-            depends_on: vec![],
+            depends_on: Default::default(),
             line: 0,
         });
         let diags = validate_deferred_populate_refs(&parsed, &registry_for_acm());

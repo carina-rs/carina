@@ -87,9 +87,20 @@ let distribution = mock.test.resource {{
                 .with_attribute("comment", serde_json::json!("dist-v1"))
                 .with_attribute("web_acl_arn", serde_json::json!("web-acl-old-id"));
         distribution.binding = Some(absolute_binding("distribution"));
-        distribution
-            .dependency_bindings
-            .insert(absolute_binding("web_acl"));
+        distribution.dependency_bindings =
+            carina_core::resource::PersistedDestroyDependencies::decode_persisted(
+                [
+                    carina_core::resource::ResolvedResourceId::with_provider_identity(
+                        "mock",
+                        "test.resource",
+                        "web_acl",
+                        None,
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap();
         state
             .upsert_resource(distribution)
             .expect("test state setup must be valid");

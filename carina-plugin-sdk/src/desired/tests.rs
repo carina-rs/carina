@@ -1,3 +1,19 @@
+async fn with_type_checks<T>(
+    producer: impl for<'s> AsyncFnOnce(
+        &'s carina_core::validation::deferred_types::TypeCheckSession<'s>,
+    ) -> T,
+) -> T {
+    let mut diagnostics = Vec::new();
+    let output = carina_core::validation::deferred_types::TypeCheckSession::run_async(
+        &carina_core::parser::ProviderContext::default(),
+        producer,
+    )
+    .await
+    .publish(&mut diagnostics);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    output
+}
+
 use super::*;
 use carina_core::protocol_convert::ProtocolConvertError;
 use carina_core::resource::{ApplyTimeUnknown, ConcreteValue, DeferredValue, Value};
@@ -915,159 +931,221 @@ fn native_queries_preserve_pending_identity_and_provider_instance() {
 
 #[tokio::test]
 async fn provider_ready_inputs_are_infallible_and_preserve_checked_scalar_and_secret_views() {
-    use carina_core::executor::{
-        ModuleConstraintGate, ProviderPreparationContext, prepare_create_request,
-        prepare_provider_ready_data_source,
-    };
-    use carina_core::provider::NoopNormalizer;
-    use carina_core::schema::{
-        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, SchemaRegistry,
-    };
-    let mut schemas = SchemaRegistry::new();
-    let schema = PatternResourceSchema::new("sqs.Queue")
-        .attribute(
-            PatternAttributeSchema::optional(
-                "tags",
-                PatternAttributeType::map(PatternAttributeType::string()),
+    with_type_checks(async |type_checks| {
+        use carina_core::executor::{
+            ModuleConstraintGate, ProviderPreparationContext, prepare_create_request,
+            prepare_provider_ready_data_source,
+        };
+        use carina_core::provider::NoopNormalizer;
+        use carina_core::schema::{
+            PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, SchemaRegistry,
+        };
+        let mut schemas = SchemaRegistry::new();
+        let schema = PatternResourceSchema::new("sqs.Queue")
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "tags",
+                    PatternAttributeType::map(PatternAttributeType::string()),
+                )
+                .build(),
             )
-            .build(),
+            .validate()
+            .unwrap();
+        let witness = carina_core::schema::ValidatedProviderSchemaWitness::new(
+            vec![schema],
+            carina_core::schema::ValidatedConfigSchema::validate(Default::default()).unwrap(),
+            Default::default(),
         )
-        .validate()
         .unwrap();
-    let witness = carina_core::schema::ValidatedProviderSchemaWitness::new(
-        vec![schema],
-        carina_core::schema::ValidatedConfigSchema::validate(Default::default()).unwrap(),
-        Default::default(),
-    )
-    .unwrap();
-    schemas.insert_provider_witness("test", &witness).unwrap();
-    let config = carina_core::parser::ExpandedProviderConfig {
-        name: "test".into(),
-        attributes: Default::default(),
-        default_tags: [("unread_secret".into(), secret("private-late-tag"))]
-            .into_iter()
-            .collect(),
-        source: None,
-        version: None,
-        revision: None,
-        unresolved_attributes: Default::default(),
-        binding: None,
-    };
-    let configs = [config];
-    let bindings = carina_core::binding_index::ResolvedBindings::default();
-    let gate = ModuleConstraintGate::from_live_compositions(&[]);
-    let context =
-        ProviderPreparationContext::new(&bindings, &gate, &configs, &NoopNormalizer, &[], &schemas);
-    let resource = Resource::with_provider("test", "sqs.Queue", "queue", None).with_attribute(
-        "unread",
-        list(vec![Value::Concrete(ConcreteValue::Duration(
-            std::time::Duration::from_secs(i64::MAX as u64),
-        ))]),
-    );
-    let request = prepare_create_request(resource, &context).await.unwrap();
-    let inputs = DesiredInputs::from_provider_ready(request.resource());
-    assert_eq!(inputs.id(), &request.resource().id);
-    let Some(DesiredValue::List(values)) = inputs.attribute("unread") else {
-        panic!()
-    };
-    assert!(matches!(
-        values.iter().next(),
-        Some(DesiredValue::Known(DesiredScalar::Int(i64::MAX)))
-    ));
-    let Some(DesiredValue::Map(tags)) = inputs.attribute("tags") else {
-        panic!()
-    };
-    assert!(matches!(
-        tags.get("unread_secret"),
-        Some(DesiredValue::Deferred(_))
-    ));
+        schemas.insert_provider_witness("test", &witness).unwrap();
+        let config = carina_core::parser::ExpandedProviderConfig {
+            name: "test".into(),
+            attributes: Default::default(),
+            default_tags: [("unread_secret".into(), secret("private-late-tag"))]
+                .into_iter()
+                .collect(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: Default::default(),
+            binding: None,
+        };
+        let configs = [config];
+        let bindings = carina_core::binding_index::ResolvedBindings::default();
+        let gate = ModuleConstraintGate::from_live_compositions(&[]);
+        let context = ProviderPreparationContext::new(
+            &bindings,
+            &gate,
+            &configs,
+            &NoopNormalizer,
+            &[],
+            &schemas,
+            type_checks,
+        );
+        let resource = Resource::with_provider("test", "sqs.Queue", "queue", None).with_attribute(
+            "unread",
+            list(vec![Value::Concrete(ConcreteValue::Duration(
+                std::time::Duration::from_secs(i64::MAX as u64),
+            ))]),
+        );
+        let request = prepare_create_request(resource, &context).await.unwrap();
+        let inputs = DesiredInputs::from_provider_ready(request.resource());
+        assert_eq!(inputs.id(), &request.resource().id);
+        let Some(DesiredValue::List(values)) = inputs.attribute("unread") else {
+            panic!()
+        };
+        assert!(matches!(
+            values.iter().next(),
+            Some(DesiredValue::Known(DesiredScalar::Int(i64::MAX)))
+        ));
+        let Some(DesiredValue::Map(tags)) = inputs.attribute("tags") else {
+            panic!()
+        };
+        assert!(matches!(
+            tags.get("unread_secret"),
+            Some(DesiredValue::Deferred(_))
+        ));
 
-    let mut data =
-        carina_core::resource::DataSource::with_provider("test", "lookup", "lookup", None);
-    data.attributes.insert(
-        "unread".into(),
-        Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
-            i64::MAX as u64,
-        ))),
-    );
-    let ready = prepare_provider_ready_data_source(data, &context).unwrap();
-    let inputs = DesiredInputs::from_provider_ready(&ready);
-    assert!(matches!(
-        inputs.attribute("unread"),
-        Some(DesiredValue::Known(DesiredScalar::Int(i64::MAX)))
-    ));
+        let mut data =
+            carina_core::resource::DataSource::with_provider("test", "lookup", "lookup", None);
+        data.attributes.insert(
+            "unread".into(),
+            Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+                i64::MAX as u64,
+            ))),
+        );
+        let ready = prepare_provider_ready_data_source(data, &context).unwrap();
+        let inputs = DesiredInputs::from_provider_ready(&ready);
+        assert!(matches!(
+            inputs.attribute("unread"),
+            Some(DesiredValue::Known(DesiredScalar::Int(i64::MAX)))
+        ));
+    })
+    .await
 }
 
 #[tokio::test]
 async fn provider_ready_inputs_preserve_env_string_diagnostic_sensitivity() {
-    use carina_core::executor::{
-        ModuleConstraintGate, ProviderPreparationContext, prepare_create_request,
-    };
-    let sensitive =
-        carina_core::builtins::evaluate_builtin_to_value("env", &[string("PATH")]).unwrap();
-    let Value::Concrete(ConcreteValue::String(text)) = &sensitive else {
-        panic!("env returns a string")
-    };
-    assert!(text.diagnostic_literal().is_none());
-    let mut resource = Resource::with_provider("test", "test.Resource", "sensitive", None)
-        .with_attribute("token", sensitive.clone())
-        .with_attribute("nested", map([("token", sensitive.clone())]))
-        .with_attribute("list", list(vec![sensitive.clone()]))
-        .with_attribute(
-            "string_list",
-            Value::Concrete(ConcreteValue::StringList(vec![text.clone()])),
+    with_type_checks(async |type_checks| {
+        use carina_core::executor::{
+            ModuleConstraintGate, ProviderPreparationContext, prepare_create_request,
+        };
+        let sensitive =
+            carina_core::builtins::evaluate_builtin_to_value("env", &[string("PATH")]).unwrap();
+        let Value::Concrete(ConcreteValue::String(text)) = &sensitive else {
+            panic!("env returns a string")
+        };
+        assert!(text.diagnostic_literal().is_none());
+        let mut resource = Resource::with_provider("test", "test.Resource", "sensitive", None)
+            .with_attribute("token", sensitive.clone())
+            .with_attribute("nested", map([("token", sensitive.clone())]))
+            .with_attribute("list", list(vec![sensitive.clone()]))
+            .with_attribute(
+                "string_list",
+                Value::Concrete(ConcreteValue::StringList(vec![text.clone()])),
+            );
+        let bindings = carina_core::binding_index::ResolvedBindings::default();
+        let gate = ModuleConstraintGate::from_live_compositions(&[]);
+        let schemas = carina_core::schema::SchemaRegistry::new();
+        let context = ProviderPreparationContext::new(
+            &bindings,
+            &gate,
+            &[],
+            &carina_core::provider::NoopNormalizer,
+            &[],
+            &schemas,
+            type_checks,
         );
-    let bindings = carina_core::binding_index::ResolvedBindings::default();
-    let gate = ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = carina_core::schema::SchemaRegistry::new();
-    let context = ProviderPreparationContext::new(
-        &bindings,
-        &gate,
-        &[],
-        &carina_core::provider::NoopNormalizer,
-        &[],
-        &schemas,
-    );
-    let request = prepare_create_request(resource.clone(), &context)
-        .await
-        .unwrap();
-    let ready = DesiredInputs::from_provider_ready(request.resource());
-    let owner = NativeDesiredNormalization::from_core(&mut resource).unwrap();
-    for inputs in [ready, owner.inputs()] {
-        let Some(DesiredValue::Known(DesiredScalar::String(text))) = inputs.attribute("token")
-        else {
-            panic!("known string")
-        };
-        assert!(text.diagnostic_literal().is_none());
-        let Some(DesiredValue::Map(nested)) = inputs.attribute("nested") else {
-            panic!()
-        };
-        let Some(DesiredValue::Known(DesiredScalar::String(text))) = nested.get("token") else {
-            panic!()
-        };
-        assert!(text.diagnostic_literal().is_none());
-        for name in ["list", "string_list"] {
-            let Some(DesiredValue::List(values)) = inputs.attribute(name) else {
-                panic!()
-            };
-            let Some(DesiredValue::Known(DesiredScalar::String(text))) = values.iter().next()
+        let request = prepare_create_request(resource.clone(), &context)
+            .await
+            .unwrap();
+        let ready = DesiredInputs::from_provider_ready(request.resource());
+        let owner = NativeDesiredNormalization::from_core(&mut resource).unwrap();
+        for inputs in [ready, owner.inputs()] {
+            let Some(DesiredValue::Known(DesiredScalar::String(text))) = inputs.attribute("token")
             else {
+                panic!("known string")
+            };
+            assert!(text.diagnostic_literal().is_none());
+            let Some(DesiredValue::Map(nested)) = inputs.attribute("nested") else {
                 panic!()
             };
-            assert!(text.diagnostic_literal().is_none(), "{name}");
+            let Some(DesiredValue::Known(DesiredScalar::String(text))) = nested.get("token") else {
+                panic!()
+            };
+            assert!(text.diagnostic_literal().is_none());
+            for name in ["list", "string_list"] {
+                let Some(DesiredValue::List(values)) = inputs.attribute(name) else {
+                    panic!()
+                };
+                let Some(DesiredValue::Known(DesiredScalar::String(text))) = values.iter().next()
+                else {
+                    panic!()
+                };
+                assert!(text.diagnostic_literal().is_none(), "{name}");
+            }
         }
-    }
+    })
+    .await
 }
 
 #[tokio::test]
-async fn native_and_wasm_normalization_views_iterate_maps_in_the_same_order() {
-    let mut resource = Resource::with_provider("test", "test.Resource", "ordered", None)
-        .with_attribute("z", map([("z", string("last")), ("a", string("first"))]))
-        .with_attribute("a", string("first"));
+async fn native_and_wasm_views_share_sorted_order_for_unsorted_authored_maps() {
+    use carina_core::executor::{
+        ModuleConstraintGate, ProviderPreparationContext, prepare_create_request,
+    };
+    let mut resource = Resource::with_provider("test", "test.Resource", "ordered", None);
+    resource.attributes = IndexMap::from([
+        (
+            "z".into(),
+            map([("z", string("last")), ("a", string("first"))]),
+        ),
+        ("a".into(), string("first")),
+    ]);
+    assert_eq!(
+        resource
+            .attributes
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["z", "a"]
+    );
+    let Value::Concrete(ConcreteValue::Map(authored_nested)) = &resource.attributes["z"] else {
+        panic!()
+    };
+    assert_eq!(
+        authored_nested
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["z", "a"]
+    );
+
     let batch = NormalizationBatch::new(std::slice::from_ref(&resource)).unwrap();
-    let mut guest = DesiredResource::from_wire(batch.resources()[0].clone())
+    let mut wire = batch.resources()[0].clone();
+    roundtrip(&mut wire);
+    let mut guest = DesiredResource::from_wire(wire)
         .into_normalization()
         .unwrap();
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let gate = ModuleConstraintGate::from_live_compositions(&[]);
+    let schemas = carina_core::schema::SchemaRegistry::new();
+    let request = with_type_checks(async |type_checks| {
+        let context = ProviderPreparationContext::new(
+            &bindings,
+            &gate,
+            &[],
+            &carina_core::provider::NoopNormalizer,
+            &[],
+            &schemas,
+            type_checks,
+        );
+        prepare_create_request(resource.clone(), &context)
+            .await
+            .unwrap()
+    })
+    .await;
+    let ready = DesiredInputs::from_provider_ready(request.resource());
     let native = NativeDesiredNormalization::from_core(&mut resource).unwrap();
     let native_inputs = native.inputs();
     let guest_view = guest.view();
@@ -1085,63 +1163,13 @@ async fn native_and_wasm_normalization_views_iterate_maps_in_the_same_order() {
             nested.entries.keys().cloned().collect::<Vec<_>>(),
         )
     };
-    assert_eq!(map_names(&native_inputs), map_names(&guest_inputs));
-    assert_eq!(
-        map_names(&native_inputs),
-        (vec!["a".into(), "z".into()], vec!["a".into(), "z".into()])
+    let expected = (
+        vec!["a".to_owned(), "z".to_owned()],
+        vec!["a".to_owned(), "z".to_owned()],
     );
-}
-
-#[tokio::test]
-async fn provider_ready_inputs_use_protocol_map_order() {
-    use carina_core::executor::{
-        ModuleConstraintGate, ProviderPreparationContext, prepare_create_request,
-    };
-    let mut resource = Resource::with_provider("test", "test.Resource", "ordered", None)
-        .with_attribute("z", map([("z", string("last")), ("a", string("first"))]))
-        .with_attribute("a", string("first"));
-    let bindings = carina_core::binding_index::ResolvedBindings::default();
-    let gate = ModuleConstraintGate::from_live_compositions(&[]);
-    let mut schemas = carina_core::schema::SchemaRegistry::new();
-    let witness = carina_core::schema::ValidatedProviderSchemaWitness::new(
-        vec![
-            carina_core::schema::PatternResourceSchema::new("test.Resource")
-                .validate()
-                .unwrap(),
-        ],
-        carina_core::schema::ValidatedConfigSchema::validate(Default::default()).unwrap(),
-        Default::default(),
-    )
-    .unwrap();
-    schemas.insert_provider_witness("test", &witness).unwrap();
-    let context = ProviderPreparationContext::new(
-        &bindings,
-        &gate,
-        &[],
-        &carina_core::provider::NoopNormalizer,
-        &[],
-        &schemas,
-    );
-    let request = prepare_create_request(resource.clone(), &context)
-        .await
-        .unwrap();
-    let ready = DesiredInputs::from_provider_ready(request.resource());
-    let owner = NativeDesiredNormalization::from_core(&mut resource).unwrap();
-    for inputs in [ready, owner.inputs()] {
-        let tree = match &inputs.tree {
-            InputsTree::Owned(tree) => tree,
-            InputsTree::Borrowed(tree) => tree,
-        };
-        assert_eq!(
-            tree.entries.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["a", "z"]
-        );
-        let Some(DesiredValue::Map(map)) = tree.get("z") else {
-            panic!()
-        };
-        assert_eq!(
-            map.entries.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["a", "z"]
-        );
+    for inputs in [&ready, &native_inputs, &guest_inputs] {
+        assert_eq!(map_names(inputs), expected);
     }
+    assert_eq!(map_names(&ready), map_names(&guest_inputs));
+    assert_eq!(map_names(&native_inputs), map_names(&guest_inputs));
 }

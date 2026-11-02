@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 /// Lexically normalize a diagnostic source path without consulting the
 /// filesystem. Parent components cancel an immediately preceding normal
 /// component, while leading parents remain intact.
-pub(crate) fn normalize_source_path(path: &Path) -> PathBuf {
+pub fn normalize_source_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -632,12 +632,17 @@ pub(crate) fn lift_saved_state_enum_leaves(
 ///
 /// Resources whose schema is not in `registry` (or that have no state)
 /// are skipped.
-pub fn lift_current_state_enum_leaves<S>(
+pub fn lift_current_state_enum_leaves<S, D>(
     current_states: &mut std::collections::HashMap<
         crate::resource::ResourceId,
         crate::resource::Current,
     >,
-    resources: &[crate::resource::Resource<S>],
+    resources: &[crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >],
     registry: &crate::schema::SchemaRegistry,
 ) {
     for resource in resources {

@@ -1,4 +1,4 @@
-use colored::Colorize;
+use crate::output_style::Colorize;
 use std::path::Path;
 
 use carina_core::plan::{Plan, PlanError, PlanErrorKind};
@@ -6,6 +6,7 @@ use carina_core::plan::{Plan, PlanError, PlanErrorKind};
 use crate::error::AppError;
 
 pub(crate) fn render_plan_errors_and_abort<S>(
+    color_mode: crate::output_style::ColorMode,
     plan: &Plan<S>,
     project_dir: &Path,
 ) -> Result<(), AppError> {
@@ -14,14 +15,18 @@ pub(crate) fn render_plan_errors_and_abort<S>(
         return Ok(());
     }
 
-    Err(render_plan_errors(errors, project_dir))
+    Err(render_plan_errors(color_mode, errors, project_dir))
 }
 
-fn render_plan_errors(errors: &[PlanError], project_dir: &Path) -> AppError {
+fn render_plan_errors(
+    color_mode: crate::output_style::ColorMode,
+    errors: &[PlanError],
+    project_dir: &Path,
+) -> AppError {
     for err in errors {
         eprintln!(
             "{} {}",
-            "Error:".red().bold(),
+            "Error:".red(color_mode).bold(color_mode),
             err.display_with_project_dir(project_dir)
         );
     }
@@ -32,14 +37,22 @@ impl<R> crate::wiring::PostExpansionDiagnostics<R> {
     /// Render this diagnostic outcome in plan-error order and return the
     /// command error that must abort apply. There is deliberately no success
     /// branch: receiving this type already selected the diagnostic outcome.
-    pub(crate) fn render_and_abort(&self, project_dir: &Path) -> AppError {
-        render_plan_errors(self.errors().as_slice(), project_dir)
+    pub(crate) fn render_and_abort(
+        &self,
+        color_mode: crate::output_style::ColorMode,
+        project_dir: &Path,
+    ) -> AppError {
+        render_plan_errors(color_mode, self.errors().as_slice(), project_dir)
     }
 }
 
 impl crate::wiring::DiagnosticPlan {
-    pub(crate) fn render_and_abort(&self, project_dir: &Path) -> AppError {
-        render_plan_errors(self.errors.as_slice(), project_dir)
+    pub(crate) fn render_and_abort(
+        &self,
+        color_mode: crate::output_style::ColorMode,
+        project_dir: &Path,
+    ) -> AppError {
+        render_plan_errors(color_mode, self.errors.as_slice(), project_dir)
     }
 }
 
@@ -109,26 +122,28 @@ mod tests {
         plan
     }
 
-    fn abort_summary(plan: &Plan) -> String {
-        render_plan_errors_and_abort(plan, Path::new("."))
+    fn abort_summary(color_mode: crate::output_style::ColorMode, plan: &Plan) -> String {
+        render_plan_errors_and_abort(color_mode, plan, Path::new("."))
             .expect_err("plan errors must abort")
             .to_string()
     }
 
     #[test]
     fn empty_plan_error_helper_returns_ok() {
-        assert!(render_plan_errors_and_abort(&Plan::new(), Path::new(".")).is_ok());
+        let color_mode = crate::output_style::ColorMode::Plain;
+        assert!(render_plan_errors_and_abort(color_mode, &Plan::new(), Path::new(".")).is_ok());
     }
 
     #[test]
     fn schema_not_registered_plan_aborts_with_generic_summary() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let plan = plan_with_errors(vec![error(PlanErrorKind::SchemaNotRegistered(
             SchemaNotRegisteredError {
                 resource_type: "mock.test.resource".to_string(),
                 resource_identity: "example".to_string(),
             },
         ))]);
-        let summary = abort_summary(&plan);
+        let summary = abort_summary(color_mode, &plan);
 
         assert_eq!(summary, "plan failed with 1 error(s)");
         assert!(
@@ -139,13 +154,14 @@ mod tests {
 
     #[test]
     fn replacement_cannot_coexist_plan_aborts_with_generic_summary() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let plan = plan_with_errors(vec![error(PlanErrorKind::ReplacementCannotCoexist(
             ReplacementCannotCoexistError {
                 resource_type: "mock.test.resource".to_string(),
                 resource_identity: "example".to_string(),
             },
         ))]);
-        let summary = abort_summary(&plan);
+        let summary = abort_summary(color_mode, &plan);
 
         assert_eq!(summary, "plan failed with 1 error(s)");
         assert!(
@@ -156,11 +172,12 @@ mod tests {
 
     #[test]
     fn prevent_destroy_summary_describes_effective_protection() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let plan = plan_with_errors(vec![error(PlanErrorKind::PreventDestroy {
             action: PreventDestroyAction::Delete,
             source: PreventDestroySource::ExplicitDirective,
         })]);
-        let summary = abort_summary(&plan);
+        let summary = abort_summary(color_mode, &plan);
 
         assert_eq!(
             summary,
@@ -170,6 +187,7 @@ mod tests {
 
     #[test]
     fn mixed_error_summary_counts_only_actual_prevent_destroy_errors() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let plan = plan_with_errors(vec![
             error(PlanErrorKind::PreventDestroy {
                 action: PreventDestroyAction::Delete,
@@ -182,7 +200,7 @@ mod tests {
                 },
             )),
         ]);
-        let summary = abort_summary(&plan);
+        let summary = abort_summary(color_mode, &plan);
 
         assert_eq!(
             summary,

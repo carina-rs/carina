@@ -11,7 +11,8 @@ use carina_core::provider::{
     ResourceWirePayload,
 };
 use carina_core::resource::{
-    ConcreteValue, DeferredValue, Resource, ResourceId, Value, ValueString,
+    AbsoluteBindingAddress, ConcreteValue, DeferredValue, NoPlaceholder, Resource, ResourceId,
+    UnexpandedDependencyFields, Value, ValueString,
 };
 use carina_provider_protocol::normalization::{
     NormalizationErrorKind as Kind, NormalizationPathSegment as Segment, NormalizationResource,
@@ -593,13 +594,15 @@ impl Encoder<'_> {
 }
 
 /// A staged native normalization. Dropping it or failing finish leaves the target intact.
-pub struct NativeDesiredNormalization<'a, S> {
-    target: &'a mut Resource<S>,
+pub struct NativeDesiredNormalization<'a, S, D = UnexpandedDependencyFields> {
+    target: &'a mut Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>,
     batch: NormalizationBatch,
     inner: DesiredNormalization,
 }
-impl<'a, S> NativeDesiredNormalization<'a, S> {
-    pub fn from_core(target: &'a mut Resource<S>) -> NativeProviderResult<Self> {
+impl<'a, S, D> NativeDesiredNormalization<'a, S, D> {
+    pub fn from_core(
+        target: &'a mut Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>,
+    ) -> NativeProviderResult<Self> {
         let (batch, inner) = decode_native(target)?;
         Ok(Self {
             target,
@@ -630,8 +633,8 @@ impl<'a, S> NativeDesiredNormalization<'a, S> {
     }
 }
 
-fn decode_native<S>(
-    resource: &Resource<S>,
+fn decode_native<S, D>(
+    resource: &Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>,
 ) -> NativeProviderResult<(NormalizationBatch, DesiredNormalization)> {
     let into_error = |error| NativeProviderError::from(error).for_resource(resource.id.clone());
     let batch = NormalizationBatch::new(std::slice::from_ref(resource)).map_err(into_error)?;

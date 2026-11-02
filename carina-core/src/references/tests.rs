@@ -201,7 +201,7 @@ impl Fixture {
             identifier: Some("resource-123".into()),
             attributes: HashMap::from([("key".into(), current)]),
             exists: true,
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
             partial_read: None,
         };
         let current = crate::resource::into_plan_input_current_map(
@@ -209,8 +209,11 @@ impl Fixture {
             &registry,
             std::slice::from_ref(&resource),
         );
-        let desired =
-            ResolvedResource::collect_resolved_with_schemas([resource], &registry).unwrap();
+        let desired = ResolvedResource::collect_resolved_with_schemas(
+            [resource.into_value_snapshot()],
+            &registry,
+        )
+        .unwrap();
         let saved = RawSavedAttrs::default().lift(&registry);
         Self {
             desired,
@@ -410,7 +413,10 @@ async fn round5_cascade_unordered_list_with_resource_ref_records_its_own_pairs()
             &fixture.registry,
             std::slice::from_ref(&producer),
         ));
-    let mut unresolved = fixture.desired[0].as_resource().clone();
+    let mut unresolved = fixture.desired[0]
+        .as_resource()
+        .clone()
+        .with_dependency_phase(crate::resource::UnexpandedDependencyFields::default());
     unresolved.attributes.insert(
         "key".into(),
         list(
@@ -418,14 +424,19 @@ async fn round5_cascade_unordered_list_with_resource_ref_records_its_own_pairs()
             Value::root_resource_ref("producer", "id", Vec::new()),
         ),
     );
-    let unresolved = ResolvedResource::collect_resolved_with_schemas(
-        [producer.clone(), unresolved],
-        &fixture.registry,
-    )
-    .unwrap();
+    let unresolved_resources = [producer.clone(), unresolved];
+    let graph =
+        crate::resolved_graph::ExpandedBindingIndex::for_test_resources(&unresolved_resources)
+            .unwrap();
+    let unresolved = unresolved_resources
+        .into_iter()
+        .map(|resource| graph.resolve_resource(resource, &fixture.registry))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     fixture.desired.insert(
         0,
-        ResolvedResource::resolve_with_schemas(producer, &fixture.registry).unwrap(),
+        ResolvedResource::resolve_with_schemas(producer.into_value_snapshot(), &fixture.registry)
+            .unwrap(),
     );
     let desired =
         crate::resource::plan_input_desired_resources(&fixture.desired, &fixture.registry);
@@ -435,7 +446,9 @@ async fn round5_cascade_unordered_list_with_resource_ref_records_its_own_pairs()
             crate::parser::ExpandedFile::<()>::default().into_deferred_for_expressions(),
             |_| DeferredForExpansionChoice::Retain,
         )
-        .1,
+        .1
+        .resolve_graph(&graph)
+        .unwrap(),
     );
     let mut preparation = ReferencePreparation::default();
     let prepared = preparation
@@ -570,8 +583,11 @@ async fn round8_enumerates_other_resources_without_judging_unused_outcomes() {
                     std::slice::from_ref(&other),
                 ));
             fixture.desired.extend(
-                ResolvedResource::collect_resolved_with_schemas([other], &fixture.registry)
-                    .unwrap(),
+                ResolvedResource::collect_resolved_with_schemas(
+                    [other.into_value_snapshot()],
+                    &fixture.registry,
+                )
+                .unwrap(),
             );
             let references = fixture.prepare().await.unwrap();
             let plan = fixture.plan(&references).unwrap();
@@ -907,7 +923,11 @@ async fn round8_whole_batch_errors_are_cached_for_each_value_and_judged_on_use()
     )]))
     .lift(&fixture.registry);
     fixture.desired.extend(
-        ResolvedResource::collect_resolved_with_schemas([other], &fixture.registry).unwrap(),
+        ResolvedResource::collect_resolved_with_schemas(
+            [other.into_value_snapshot()],
+            &fixture.registry,
+        )
+        .unwrap(),
     );
     fixture.router.add_provider_instance(
         ProviderInstanceKey::new("test", Some("other".into())),
@@ -1411,8 +1431,11 @@ async fn resolution_cache_is_per_run_and_includes_type_and_provider_instance() {
         &fixture.registry,
         &[other.clone()],
     );
-    let other =
-        ResolvedResource::collect_resolved_with_schemas([other], &fixture.registry).unwrap();
+    let other = ResolvedResource::collect_resolved_with_schemas(
+        [other.into_value_snapshot()],
+        &fixture.registry,
+    )
+    .unwrap();
     let witness = run
         .prepare(
             &other,
@@ -1494,8 +1517,11 @@ async fn ignored_reference_differences_do_not_resolve() {
     resource.directives.ignore_changes = vec![crate::resource::ParsedIgnorePath::new(vec![
         crate::resource::ParsedIgnorePathSegment::Attribute("key".into()),
     ])];
-    fixture.desired =
-        ResolvedResource::collect_resolved_with_schemas([resource], &fixture.registry).unwrap();
+    fixture.desired = ResolvedResource::collect_resolved_with_schemas(
+        [resource.into_value_snapshot()],
+        &fixture.registry,
+    )
+    .unwrap();
     let witness = fixture.prepare().await.unwrap();
     assert!(fixture.calls.lock().unwrap().is_empty());
     assert!(fixture.plan(&witness).unwrap().effects().is_empty());
@@ -1738,7 +1764,7 @@ async fn unordered_reference_list_elements_share_one_resolution_path() {
         identifier: Some("resource-123".into()),
         attributes: HashMap::from([("key".into(), list(&["alias/b", "alias/a"]))]),
         exists: true,
-        dependency_bindings: BTreeSet::new(),
+        dependency_bindings: Default::default(),
         partial_read: None,
     };
     fixture.current = crate::resource::into_plan_input_current_map(
@@ -2127,7 +2153,7 @@ async fn round3_apply_concrete_plan_reference_reresolves_without_widening_equiva
             Value::root_resource_ref("dependency", "key", vec![]),
         );
         let origins = HashMap::from([(
-            target.id.clone(),
+            crate::resource::ResolvedResourceId::new(target.id.clone()),
             UnresolvedResource::from_pre_resolve(origin),
         )]);
         let mut bindings = ResolvedBindings::default();
@@ -2139,6 +2165,9 @@ async fn round3_apply_concrete_plan_reference_reresolves_without_widening_equiva
         let outcome = crate::executor::execute_live_plan(
             &fixture.router,
             LiveExecutionInput {
+                provider_context: crate::parser::ProviderContext::clone(
+                    &crate::parser::LoadedProviderContext::empty_for_test(),
+                ),
                 plan: &plan,
                 provider_check_inputs: ProviderCheckInputs::PlanNormalized {
                     resource_origins: &origins,
@@ -2579,7 +2608,8 @@ fn round2_reference_validation_is_offline_for_declarations_and_annotations() {
     let schemas = factory.schemas();
     let factories: Arc<Vec<Box<dyn ProviderFactory>>> = Arc::new(vec![Box::new(factory)]);
     let custom_types = provider_custom_types_from_factories(factories);
-    let owned = OwnedTypeIdentity::provider("test", identity());
+    let owned =
+        OwnedTypeIdentity::provider("test", identity(), crate::schema::RefinedScalarKind::String);
     custom_types
         .validate(
             CustomTypeValidationTarget::Annotation(&owned),
@@ -2614,7 +2644,7 @@ fn round2_reference_validation_is_offline_for_declarations_and_annotations() {
     assert!(attribute.value_type().validate(&string("bad")).is_err());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn round2_provider_instance_batches_run_concurrently() {
     let mut fixture = Fixture::new(string("alias/live"), string("key/a"), HashMap::new(), false);
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
@@ -2646,7 +2676,11 @@ async fn round2_provider_instance_batches_run_concurrently() {
             &[other.clone()],
         ));
     fixture.desired.extend(
-        ResolvedResource::collect_resolved_with_schemas([other], &fixture.registry).unwrap(),
+        ResolvedResource::collect_resolved_with_schemas(
+            [other.into_value_snapshot()],
+            &fixture.registry,
+        )
+        .unwrap(),
     );
     let witness = tokio::time::timeout(std::time::Duration::from_secs(1), fixture.prepare())
         .await

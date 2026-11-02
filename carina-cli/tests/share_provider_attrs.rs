@@ -24,15 +24,14 @@ fn share_provider_attrs_resolves_default_tags() {
     .collect();
 
     let config = load_configuration(&fixture).expect("load_configuration");
-    let user_root = tempfile::tempdir().expect("create isolated user directory");
-    let user_dirs = carina_core::UserDirs::under(user_root.path());
+    let runtime = carina_cli::test_support::TestCommandRuntime::new();
 
     // Run the CLI's full validate-and-resolve pipeline so module
     // expansion + finalize happen. The test-support boundary still exercises
     // the real command-scoped load; this source-less mock configuration uses
     // the built-in provider catalog.
     let parsed = carina_cli::commands::validate_and_resolve_with_provider_load_for_test(
-        &user_dirs,
+        &runtime,
         &config.parsed,
         &fixture,
         true,

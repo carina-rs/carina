@@ -52,6 +52,15 @@ impl MidRunStateWriter {
             }
         }
     }
+
+    /// Persist a graph-classified schema migration while the heartbeat owns
+    /// the same lock used by later incremental writes.
+    pub(crate) async fn write_schema_migration(
+        &self,
+        state: &mut StateFile,
+    ) -> Result<(), AppError> {
+        self.write_state(state).await
+    }
 }
 
 /// Proof that the background saver has stopped before final state is built.
@@ -399,7 +408,7 @@ mod tests {
         assert_eq!(backend.serials(), [1, 2]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cleanup_stop_aborts_an_in_flight_checkpoint_before_final_write() {
         let backend = Arc::new(RecordingBackend::slow_first());
         let saver = start_saver(backend.clone());
@@ -426,7 +435,7 @@ mod tests {
         assert_eq!(backend.serials(), [2]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn normal_stop_escalates_to_cleanup_while_a_checkpoint_is_hung() {
         let backend = Arc::new(RecordingBackend::slow_first());
         let saver = start_saver(backend.clone());

@@ -2653,6 +2653,52 @@ aws.s3.Bucket {
     }
 
     #[test]
+    fn wait_depends_on_dotted_handle_round_trips_and_is_idempotent() {
+        let context = crate::parser::ProviderContext::default();
+        let config = FormatConfig::default();
+        for dependencies in [
+            "[r,producer.validation_record]",
+            "[(producer.validation_record),r,]",
+            "[\n# module output handle\nproducer.validation_record,\nr,\n]",
+        ] {
+            let source = format!(
+                "let ready=wait cert{{until=cert.status==\"issued\" depends_on={dependencies}}}\n"
+            );
+            let original = crate::parser::parse(&source, &context)
+                .expect("semantic parser accepts dotted handles");
+            let formatted =
+                format(&source, &config).expect("formatter accepts dotted dependency handles");
+            assert!(
+                formatted.contains("producer.validation_record"),
+                "{formatted}"
+            );
+            if dependencies.contains('#') {
+                assert!(formatted.contains("# module output handle"), "{formatted}");
+            }
+            let reparsed =
+                crate::parser::parse(&formatted, &context).expect("formatted wait reparses");
+            let original = &original.wait_bindings[0];
+            let reparsed = &reparsed.wait_bindings[0];
+            assert_eq!(original.binding, reparsed.binding);
+            assert_eq!(original.target, reparsed.target);
+            assert_eq!(
+                (
+                    &original.until_predicate.root,
+                    &original.until_predicate.attribute_segments
+                ),
+                (
+                    &reparsed.until_predicate.root,
+                    &reparsed.until_predicate.attribute_segments
+                )
+            );
+            assert_eq!(original.until_predicate.rhs, reparsed.until_predicate.rhs);
+            assert_eq!(original.timeout_secs, reparsed.timeout_secs);
+            assert_eq!(original.depends_on, reparsed.depends_on);
+            assert_eq!(format(&formatted, &config).unwrap(), formatted);
+        }
+    }
+
+    #[test]
     fn issue_3049_wait_block_collapses_unformatted_source() {
         // Unformatted single-line source must produce the canonical
         // multi-line shape, with proper spacing in the header and around

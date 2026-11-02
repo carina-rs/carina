@@ -275,7 +275,11 @@ impl MockService for ConflictingStatePuts {
                 _ => {}
             }
             if state_serial(&request).is_some() {
-                self.conflicts.fetch_add(1, Ordering::SeqCst);
+                let attempt = self.conflicts.fetch_add(1, Ordering::SeqCst) + 1;
+                assert!(
+                    attempt <= 5,
+                    "state write retried beyond the five-attempt limit: {attempt}"
+                );
                 return Box::pin(async {
                     MockResponse::error(412, "PreconditionFailed", "forced state write conflict")
                 });
@@ -306,8 +310,8 @@ impl TestLockFile {
         &self.id
     }
 
-    fn is_expired(&self) -> bool {
-        Utc::now() > self.expires
+    fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
+        now > self.expires
     }
 }
 
@@ -569,13 +573,10 @@ async fn repeated_state_write_conflicts_are_bounded() {
     state.increment_serial();
     enabled.store(true, Ordering::SeqCst);
 
-    let error = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        backend.write_state(&state),
-    )
-    .await
-    .expect("state write conflicts must have a bounded retry limit")
-    .expect_err("every conditional state PUT should conflict");
+    let error = backend
+        .write_state(&state)
+        .await
+        .expect_err("every conditional state PUT should conflict");
 
     assert_eq!(conflicts.load(Ordering::SeqCst), 5);
     assert_eq!(
@@ -887,6 +888,7 @@ async fn locked_state_conflict_rechecks_ownership_before_retrying() {
         })
     };
 
+    // wall-clock-ok: original hang guard for the controlled in-process S3 conflict handshake.
     tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
         .await
         .expect("locked state PUT must reach the controlled conflict");
@@ -907,9 +909,10 @@ async fn locked_state_conflict_rechecks_ownership_before_retrying() {
         .unwrap();
     release.add_permits(1);
 
+    // wall-clock-ok: original hang guard for the writer after releasing its conflict response.
     let error = tokio::time::timeout(std::time::Duration::from_secs(1), attempted_write)
         .await
-        .expect("locked state write must finish after the conflict is released")
+        .expect("released state writer must return")
         .unwrap()
         .expect_err("a writer that lost its lock must not retry the state PUT");
     assert!(
@@ -1023,7 +1026,7 @@ async fn acquire_lock_takes_over_expired_lock() {
     // Plant an expired lock under the same key the backend uses.
     let expired = test_lock("apply", -60);
     assert!(
-        expired.is_expired(),
+        expired.is_expired_at(expired.created),
         "precondition: planted lock is expired"
     );
     let body = serde_json::to_vec(&expired).unwrap();

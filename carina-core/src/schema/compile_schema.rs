@@ -20,6 +20,9 @@ impl PatternAttributeType<Draft> {
         issues: &mut Vec<SchemaDefinitionIssue>,
     ) -> Option<CompiledAttributeType> {
         let kind = match self.kind {
+            AttrTypeKind::UnloadedSchemaType(unloaded) => {
+                AttrTypeKind::UnloadedSchemaType(unloaded)
+            }
             AttrTypeKind::Reference {
                 identity,
                 pattern,
