@@ -7462,9 +7462,11 @@ pub fn is_deferred_desired_leaf(value: &Value) -> bool {
     matches!(value, Value::Deferred(_))
 }
 
-/// Return whether `value` recursively contains
-/// `Value::Deferred(DeferredValue::Unknown)`.
-pub fn value_contains_unknown(value: &Value) -> bool {
+/// Inspect a tree for `Value::Deferred(DeferredValue::Unknown)` nodes.
+///
+/// This structural inventory enforces the state-format invariant; it makes no
+/// claim that the tree can be evaluated or that historical hashes are values.
+pub fn value_contains_unknown<P: ValueKind>(value: &Value<P>) -> bool {
     match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             deferred.values().into_iter().any(value_contains_unknown)
@@ -8407,6 +8409,18 @@ impl From<&PersistedDirectives> for Directives {
 }
 
 impl From<PersistedDirectives> for Directives {
+    fn from(directives: PersistedDirectives) -> Self {
+        Self::from(&directives)
+    }
+}
+
+impl From<&PersistedDirectives> for Directives<AbsoluteBindingAddress, SnapshotLeaf> {
+    fn from(directives: &PersistedDirectives) -> Self {
+        snapshot_directives(Directives::from(directives))
+    }
+}
+
+impl From<PersistedDirectives> for Directives<AbsoluteBindingAddress, SnapshotLeaf> {
     fn from(directives: PersistedDirectives) -> Self {
         Self::from(&directives)
     }

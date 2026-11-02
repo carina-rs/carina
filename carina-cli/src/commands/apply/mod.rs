@@ -25,13 +25,13 @@ use carina_core::executor::{
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ProviderRouter};
-#[cfg(test)]
-use carina_core::resource::ConcreteValue;
 use carina_core::resource::{
     CanonicalComparisonAttributes, CompositionSourceIdentityResolver, Current, DataSource,
-    ModuleSource, ResolvedResource, Resource, ResourceId, SavedDataSource, SavedModuleSource,
-    State, Value,
+    ModuleSource, NoPlaceholder, PlanValueKind, ResolvedResource, Resource, ResourceId,
+    SavedDataSource, SavedModuleSource, SnapshotLeaf, SnapshotState, Value,
 };
+#[cfg(test)]
+use carina_core::resource::{ConcreteValue, State};
 use carina_core::shutdown::ShutdownToken;
 use carina_core::value::format_value;
 use carina_state::{BackendLock, LockInfo, RowBasis, StateBackend, StateFile};
@@ -46,11 +46,10 @@ use carina_core::parser::{
 use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::plan::{
-    CheckExportsPreApplyInput, PlanFile, PlanFileDecodeError, PreparedPlanIdentityData,
-    ProviderUpstreamScope, ReloadedCompositionRehydrationError, ReloadedPlanFile,
-    ResolvedProviderInputs, SavedDataSourceValue, UpstreamMissingStatePolicy,
-    collect_historical_display_attributes, load_and_resolve_provider_configs,
-    prepare_plan_identity_and_provider_inputs,
+    CheckExportsPreApplyInput, LivePlanFileValues, PlanFile, PlanFileDecodeError,
+    PreparedPlanIdentityData, ProviderUpstreamScope, ReloadedPlanFile, ResolvedProviderInputs,
+    SavedDataSourceValue, UpstreamMissingStatePolicy, collect_historical_display_attributes,
+    load_and_resolve_provider_configs, prepare_plan_identity_and_provider_inputs,
 };
 use crate::commands::shared::effect_execution::{
     execute_import_effects, execute_state_only_effects,
@@ -121,6 +120,13 @@ fn saved_plan_secret_rehydration_error(
     let carina_core::value::SecretRehydrationSiteError { location, source } = error;
     let replan = apply_target.replan_command().to_string();
     let error = match source {
+        carina_core::value::SecretRehydrationError::UnavailableSecret(source) => {
+            SavedPlanSecretVerificationError::UnavailableSecret {
+                location,
+                replan,
+                error: source,
+            }
+        }
         carina_core::value::SecretRehydrationError::HashMismatch => {
             SavedPlanSecretVerificationError::HashMismatch { location, replan }
         }
@@ -472,7 +478,7 @@ fn finalize_module_constraints(
 }
 
 fn finalize_saved_module_constraints(
-    compositions: &[carina_core::resource::SavedComposition],
+    compositions: &[carina_core::resource::SavedComposition<NoPlaceholder>],
     bindings: &ResolvedBindings,
     provider_context: &carina_core::parser::LoadedProviderContext,
 ) -> Result<(), AppError> {
@@ -780,7 +786,7 @@ async fn execute_effects_with_observer(
 /// schema compatibility and all typed secret placeholders have been verified.
 async fn execute_rehydrated_saved_plan(
     plan_file: &ExecutablePlanFile,
-    compositions: &[carina_core::resource::SavedComposition],
+    compositions: &[carina_core::resource::SavedComposition<NoPlaceholder>],
     context: ApplyExecutionContext<'_, SavedModuleSource>,
     state: ApplyExecutionState<'_, SavedModuleSource, ()>,
 ) -> ExecutionOutcome<SavedModuleSource> {
@@ -1028,7 +1034,7 @@ pub async fn refresh_pending_states(
         match read_with_retry(provider, &target).await {
             Ok(state) => {
                 println!("  {} Refresh {}", "✓".green(color_mode), id);
-                managed_current.insert(id.clone(), Current::from_state(state));
+                managed_current.insert(id.clone(), Current::from_snapshot(state));
             }
             Err(error) => {
                 println!("  {} Refresh {} - {}", "!".yellow(color_mode), id, error);
@@ -1354,8 +1360,8 @@ async fn persist_directives_only(
 #[derive(Debug)]
 pub(crate) struct DriftCheckResult {
     drift_messages: Option<Vec<String>>,
-    actual_states: HashMap<ResourceId, State>,
-    verified_planned_states: HashMap<ResourceId, State>,
+    actual_states: HashMap<ResourceId, SnapshotState>,
+    verified_planned_states: HashMap<ResourceId, SnapshotState>,
 }
 
 impl DriftCheckResult {
@@ -1363,7 +1369,12 @@ impl DriftCheckResult {
         self.drift_messages.as_deref()
     }
 
-    fn into_verified_states(self) -> (HashMap<ResourceId, State>, HashMap<ResourceId, State>) {
+    fn into_verified_states(
+        self,
+    ) -> (
+        HashMap<ResourceId, SnapshotState>,
+        HashMap<ResourceId, SnapshotState>,
+    ) {
         debug_assert!(self.drift_messages.is_none());
         (self.actual_states, self.verified_planned_states)
     }
@@ -1438,7 +1449,7 @@ pub(crate) async fn detect_drift<S: Clone>(
                         .await
                         .map_err(AppError::Provider)?
                 }
-                None => State::not_found(historical_id.clone()),
+                None => SnapshotState::not_found(historical_id.clone()),
             },
             Some(Current::MissingIdentifier(_state)) => {
                 return Err(AppError::Validation(format!(
@@ -1446,12 +1457,14 @@ pub(crate) async fn detect_drift<S: Clone>(
                     resource.id
                 )));
             }
-            Some(Current::CreateInFlight(_pending)) => State::not_found(historical_id.clone()),
-            Some(Current::CreateOutcomeUnknown(_unknown)) => {
-                State::not_found(historical_id.clone())
+            Some(Current::CreateInFlight(_pending)) => {
+                SnapshotState::not_found(historical_id.clone())
             }
-            Some(Current::Absent(_state)) => State::not_found(historical_id.clone()),
-            None => State::not_found(historical_id.clone()),
+            Some(Current::CreateOutcomeUnknown(_unknown)) => {
+                SnapshotState::not_found(historical_id.clone())
+            }
+            Some(Current::Absent(_state)) => SnapshotState::not_found(historical_id.clone()),
+            None => SnapshotState::not_found(historical_id.clone()),
         };
         // The provider read uses the pre-move address, but every downstream
         // saved-plan map is keyed by the moved-to runtime address.
@@ -2931,19 +2944,17 @@ fn ensure_saved_plan_backend_matches_current(
 }
 
 trait SavedPlanResourceLike {
+    type Stage: carina_core::resource::PlanValueKind;
     fn id(&self) -> &ResourceId;
     fn binding(&self) -> Option<&str>;
-    fn attributes(&self) -> &indexmap::IndexMap<String, Value>;
+    fn attributes(&self) -> &indexmap::IndexMap<String, Value<Self::Stage>>;
 }
 
-impl<S, D> SavedPlanResourceLike
-    for carina_core::resource::Resource<
-        S,
-        carina_core::resource::NoPlaceholder,
-        carina_core::resource::AbsoluteBindingAddress,
-        D,
-    >
+impl<S, D, P: carina_core::resource::PlanValueKind> SavedPlanResourceLike
+    for carina_core::resource::Resource<S, P, carina_core::resource::AbsoluteBindingAddress, D>
 {
+    type Stage = P;
+
     fn id(&self) -> &ResourceId {
         &self.id
     }
@@ -2952,19 +2963,16 @@ impl<S, D> SavedPlanResourceLike
         self.binding.as_ref().map(|binding| binding.as_str())
     }
 
-    fn attributes(&self) -> &indexmap::IndexMap<String, Value> {
+    fn attributes(&self) -> &indexmap::IndexMap<String, Value<P>> {
         &self.attributes
     }
 }
 
-impl<S, D> SavedPlanResourceLike
-    for carina_core::resource::DataSource<
-        S,
-        carina_core::resource::NoPlaceholder,
-        carina_core::resource::AbsoluteBindingAddress,
-        D,
-    >
+impl<S, D, P: carina_core::resource::PlanValueKind> SavedPlanResourceLike
+    for carina_core::resource::DataSource<S, P, carina_core::resource::AbsoluteBindingAddress, D>
 {
+    type Stage = P;
+
     fn id(&self) -> &ResourceId {
         &self.id
     }
@@ -2973,36 +2981,42 @@ impl<S, D> SavedPlanResourceLike
         self.binding.as_ref().map(|binding| binding.as_str())
     }
 
-    fn attributes(&self) -> &indexmap::IndexMap<String, Value> {
+    fn attributes(&self) -> &indexmap::IndexMap<String, Value<P>> {
         &self.attributes
     }
 }
 
-fn rehydrate_saved_resource_like<T, U, Rehydrate>(
-    saved: &mut [T],
+fn rehydrate_saved_resource_like<T, U, R, Rehydrate, Convert>(
+    saved: &[T],
     candidates: &HashMap<ResourceId, U>,
     apply_target: ApplyTarget<'_>,
     rehydrate: Rehydrate,
-) -> Result<(), AppError>
+    convert: Convert,
+) -> Result<Vec<R>, AppError>
 where
     T: SavedPlanResourceLike,
-    Rehydrate: Fn(&T, &U) -> Result<T, carina_core::value::SecretRehydrationSiteError>,
+    Rehydrate: Fn(&T, &U) -> Result<R, carina_core::value::SecretRehydrationSiteError>,
+    Convert: Fn(&T) -> Result<R, carina_core::resource::UnavailableSecretError>,
 {
-    for entry in saved {
-        if !entry
-            .attributes()
-            .values()
-            .any(carina_core::value::contains_redacted_secret)
-        {
-            continue;
-        }
-        let candidate = candidates
-            .get(entry.id())
-            .ok_or_else(|| saved_plan_secret_shape_error(entry.id().to_string(), apply_target))?;
-        *entry = rehydrate(entry, candidate)
-            .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
-    }
-    Ok(())
+    saved
+        .iter()
+        .map(|entry| {
+            if !entry
+                .attributes()
+                .values()
+                .any(carina_core::value::contains_redacted_secret)
+            {
+                return convert(entry).map_err(|error| {
+                    saved_plan_secret_rehydration_error(error.into(), apply_target)
+                });
+            }
+            let candidate = candidates.get(entry.id()).ok_or_else(|| {
+                saved_plan_secret_shape_error(entry.id().to_string(), apply_target)
+            })?;
+            rehydrate(entry, candidate)
+                .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))
+        })
+        .collect()
 }
 
 fn matching_resource_like<'a, T, U>(saved: &T, fresh: &'a [U]) -> Option<&'a U>
@@ -3024,11 +3038,11 @@ where
         })
 }
 
-fn import_identifiers_from_current_config<S>(
-    plan: &carina_core::plan::Plan<S>,
+fn import_identifiers_from_current_config<S, V: PlanValueKind>(
+    plan: &carina_core::plan::Plan<S, V>,
     parsed: &carina_core::parser::ExpandedInferredFile,
     session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
-) -> HashMap<ResourceId, Value> {
+) -> Result<HashMap<ResourceId, Value>, carina_core::resolver::ResolutionError> {
     let mut identifiers = HashMap::new();
     let bindings = bootstrap_resolved_bindings(parsed);
     let unresolved_upstream_bindings = HashSet::new();
@@ -3051,10 +3065,10 @@ fn import_identifiers_from_current_config<S>(
             }
             _ => None,
         }) {
-            identifiers.insert(id.as_inner().clone(), value);
+            identifiers.insert(id.as_inner().clone(), value?);
         }
     }
-    identifiers
+    Ok(identifiers)
 }
 
 /// Reproduce the state-aware desired-side preparation that plan runs before
@@ -3161,10 +3175,10 @@ async fn prepare_saved_plan_secret_candidates(
 }
 
 fn rehydrate_desired_plan_file(
-    plan_file: &mut ReloadedPlanFile,
+    plan_file: ReloadedPlanFile<SnapshotLeaf>,
     candidates: &SavedPlanSecretCandidates,
     apply_target: ApplyTarget<'_>,
-) -> Result<(), AppError> {
+) -> Result<ReloadedPlanFile, AppError> {
     rehydrate_desired_plan_file_from_parts(
         plan_file,
         candidates.parsed(),
@@ -3175,12 +3189,12 @@ fn rehydrate_desired_plan_file(
 }
 
 fn rehydrate_desired_plan_file_from_parts(
-    plan_file: &mut ReloadedPlanFile,
+    plan_file: ReloadedPlanFile<SnapshotLeaf>,
     parsed: &carina_core::parser::ExpandedInferredFile,
     provider_inputs: &ResolvedProviderInputs,
     apply_target: ApplyTarget<'_>,
     provider_context: &carina_core::parser::LoadedProviderContext,
-) -> Result<(), AppError> {
+) -> Result<ReloadedPlanFile, AppError> {
     crate::wiring::settle_type_checks(
         carina_core::validation::deferred_types::TypeCheckSession::run(
             provider_context,
@@ -3198,7 +3212,7 @@ fn rehydrate_desired_plan_file_from_parts(
                     }
                 }
                 let import_identifiers =
-                    import_identifiers_from_current_config(plan_file.plan(), parsed, session);
+                    import_identifiers_from_current_config(plan_file.plan(), parsed, session)?;
 
                 let rehydrated_plan = carina_core::value::rehydrate_plan_desired_secrets(
                     plan_file.plan(),
@@ -3208,88 +3222,106 @@ fn rehydrate_desired_plan_file_from_parts(
                     parsed.deferred_for_expressions(),
                 )
                 .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
-                *plan_file.plan_mut() = rehydrated_plan;
 
-                rehydrate_saved_resource_like(
-                    plan_file.sorted_resources_mut(),
+                let sorted_resources = rehydrate_saved_resource_like(
+                    plan_file.sorted_resources(),
                     &resource_candidates,
                     apply_target,
                     carina_core::value::rehydrate_resource_secrets,
+                    Resource::to_value_resource,
                 )?;
-                rehydrate_saved_resource_like(
-                    plan_file.unresolved_resources_mut(),
+                let unresolved_resources = rehydrate_saved_resource_like(
+                    plan_file.unresolved_resources(),
                     &resource_candidates,
                     apply_target,
                     carina_core::value::rehydrate_resource_secrets,
+                    Resource::to_value_resource,
                 )?;
 
                 let mut composition_source_identities = CompositionSourceIdentityResolver::new(
                     carina_core::config_loader::get_base_dir(apply_target.source_dir()),
                 )
                 .map_err(AppError::from)?;
-                plan_file
-            .rehydrate_composition_secrets(&parsed.compositions, &mut composition_source_identities)
-            .map_err(|error| match error {
-                ReloadedCompositionRehydrationError::MissingCandidate(origin_id) => {
-                    let call_chain = origin_id
-                        .calls()
-                        .map(|call| {
-                            let source_file = call.source_file().to_string_lossy();
-                            format!(
-                                "{}:{}:{}",
-                                source_file.escape_debug(),
-                                call.start_line(),
-                                call.start_column(),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" -> ");
-                    saved_plan_secret_shape_error(
-                        format!(
-                            "composition call id chain {call_chain} disagreed with the saved plan",
-                        ),
-                        apply_target,
-                    )
+                let mut composition_candidates = HashMap::new();
+                if plan_file
+                    .compositions()
+                    .iter()
+                    .any(|saved| saved.contains_redacted_secret_placeholder())
+                {
+                    for live in &parsed.compositions {
+                        let origin = composition_source_identities
+                            .saved_origin_id(live.call_path())
+                            .map_err(AppError::from)?;
+                        composition_candidates.insert(origin, live);
+                    }
                 }
-                ReloadedCompositionRehydrationError::Secret(error) => {
-                    saved_plan_secret_rehydration_error(error, apply_target)
-                }
-                ReloadedCompositionRehydrationError::SourceIdentity(error) => AppError::from(error),
-            })?;
+                let compositions = plan_file.compositions().iter().map(|saved| {
+                    let candidate = composition_candidates.get(&saved.origin_id).copied();
+                    if saved.contains_redacted_secret_placeholder() && candidate.is_none() {
+                        let call_chain = saved.origin_id.calls().map(|call| {
+                            format!("{}:{}:{}", call.source_file().to_string_lossy().escape_debug(),
+                                call.start_line(), call.start_column())
+                        }).collect::<Vec<_>>().join(" -> ");
+                        return Err(saved_plan_secret_shape_error(
+                            format!("composition call id chain {call_chain} disagreed with the saved plan"), apply_target));
+                    }
+                    carina_core::value::rehydrate_saved_composition_with_candidate(saved, candidate)
+                        .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))
+                }).collect::<Result<_, _>>()?;
 
-                rehydrate_saved_resource_like(
-                    plan_file.data_sources_mut(),
+                let data_sources = rehydrate_saved_resource_like(
+                    plan_file.data_sources(),
                     &data_source_candidates,
                     apply_target,
                     carina_core::value::rehydrate_data_source_secrets,
+                    carina_core::resource::DataSource::to_value_data_source,
                 )?;
-                rehydrate_saved_resource_like(
-                    plan_file.data_source_origins_mut(),
+                let data_source_origins = rehydrate_saved_resource_like(
+                    plan_file.data_source_origins(),
                     &data_source_candidates,
                     apply_target,
                     carina_core::value::rehydrate_data_source_secrets,
+                    carina_core::resource::DataSource::to_value_data_source,
                 )?;
 
                 let fresh_provider_configs =
                     carina_core::parser::SavedProviderConfigs::from(provider_inputs.configs());
-                plan_file
-                    .rehydrate_provider_config_secrets(&fresh_provider_configs)
+                let provider_configs = plan_file
+                    .provider_configs()
+                    .rehydrate_secrets(&fresh_provider_configs)
                     .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
-                for (binding, attributes) in plan_file.upstream_snapshot_mut() {
-                    if let Some((key, _)) = attributes
-                        .iter()
-                        .find(|(_, value)| carina_core::value::contains_redacted_secret(value))
-                    {
-                        return Err(saved_plan_secret_shape_error(
-                            format!(
-                                "upstream_state {binding}.{key}: secret placeholders cannot occur in valid upstream exports"
-                            ),
-                            apply_target,
-                        ));
-                    }
-                }
+                let upstream_snapshot = plan_file
+                    .upstream_snapshot()
+                    .iter()
+                    .map(|(binding, attrs)| {
+                        let attrs = attrs
+                            .iter()
+                            .map(|(key, value)| {
+                                value
+                                    .to_value_at(format!("upstream_state {binding}.{key}"))
+                                    .map(|value| (key.clone(), value))
+                                    .map_err(|error| {
+                                        saved_plan_secret_rehydration_error(
+                                            error.into(),
+                                            apply_target,
+                                        )
+                                    })
+                            })
+                            .collect::<Result<_, _>>()?;
+                        Ok((binding.clone(), attrs))
+                    })
+                    .collect::<Result<_, AppError>>()?;
 
-                Ok(())
+                Ok(plan_file.into_live(LivePlanFileValues {
+                    plan: rehydrated_plan,
+                    sorted_resources,
+                    unresolved_resources,
+                    compositions,
+                    data_sources,
+                    data_source_origins,
+                    provider_configs,
+                    upstream_snapshot,
+                }))
             },
         ),
         AppError::Validation,
@@ -3513,12 +3545,13 @@ async fn run_apply_from_plan_with_observer_factory(
     // provider instance that will execute. Complete its diagnostics before
     // current-config secret validation, backend drift, saved-plan backend
     // mismatch, or the state-lock gate.
-    let providers = ProviderLoad::load(
-        runtime,
-        inspected_plan.provider_configs().as_provider_configs(),
-        base_dir,
-    )?
-    .into_complete()?;
+    let loading_configs = inspected_plan
+        .provider_configs()
+        .as_provider_configs()
+        .iter()
+        .map(carina_core::parser::ProviderConfig::loading_projection)
+        .collect::<Vec<_>>();
+    let providers = ProviderLoad::load(runtime, &loading_configs, base_dir)?.into_complete()?;
     // Backend drift remains a mutation-safety gate even when the saved plan
     // has no secrets. Loading the syntax tree is deliberately separate from
     // validation and provider-config resolution: placeholder-free plans may
@@ -3666,7 +3699,7 @@ async fn run_apply_from_plan_locked_owned(
     }
 
     let project_dir = apply_target.source_dir();
-    let legacy_data_source_origins = inspected_plan.data_source_origins().to_vec();
+    let legacy_data_source_ids = inspected_plan.legacy_data_source_ids();
     // Read current state and validate lineage. carina#3315: a
     // pending in-memory schema migration must be persisted under
     // the apply lock so the carina#3283 warning text matches
@@ -3728,9 +3761,9 @@ async fn run_apply_from_plan_locked_owned(
     // only after checking the saved plan against the original
     // on-disk serial, then persist that cleanup together with any schema
     // migration before drift detection can return early.
-    let removed_legacy_data_source_rows = state_file
-        .as_mut()
-        .is_some_and(|state| state.remove_legacy_data_source_rows(&legacy_data_source_origins) > 0);
+    let removed_legacy_data_source_rows = state_file.as_mut().is_some_and(|state| {
+        state.remove_legacy_data_source_rows_by_ids(&legacy_data_source_ids) > 0
+    });
     if let Some(mut state) = state_file.take() {
         if state.requires_legacy_dependency_migration() {
             let classification = try_with_lock!(
@@ -4330,29 +4363,36 @@ async fn run_apply_from_plan_locked(
     accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
     let color_mode = runtime.color_mode();
-    let inspected_plan = match ProviderLoad::load(
-        runtime,
-        inspected_plan.provider_configs().as_provider_configs(),
-        apply_target.source_dir(),
-    )
-    .and_then(ProviderLoad::into_complete)
-    .and_then(|providers| {
-        ProviderBoundPlanFile::for_test(inspected_plan, providers, apply_target.source_dir())
-    }) {
-        Ok(inspected_plan) => inspected_plan,
-        Err(error) => {
-            return finish_lock_command(
-                color_mode,
-                backend.as_ref(),
-                LockCommandOutcome::Kept {
-                    result: Err(error),
-                    lock,
-                },
-                &cancel,
-            )
-            .await;
-        }
-    };
+    let loading_configs = inspected_plan
+        .provider_configs()
+        .as_provider_configs()
+        .iter()
+        .map(carina_core::parser::ProviderConfig::loading_projection)
+        .collect::<Vec<_>>();
+    let inspected_plan =
+        match ProviderLoad::load(runtime, &loading_configs, apply_target.source_dir())
+            .and_then(ProviderLoad::into_complete)
+            .and_then(|providers| {
+                ProviderBoundPlanFile::for_test(
+                    inspected_plan,
+                    providers,
+                    apply_target.source_dir(),
+                )
+            }) {
+            Ok(inspected_plan) => inspected_plan,
+            Err(error) => {
+                return finish_lock_command(
+                    color_mode,
+                    backend.as_ref(),
+                    LockCommandOutcome::Kept {
+                        result: Err(error),
+                        lock,
+                    },
+                    &cancel,
+                )
+                .await;
+            }
+        };
     let outcome = run_apply_from_plan_locked_owned(
         color_mode,
         inspected_plan,

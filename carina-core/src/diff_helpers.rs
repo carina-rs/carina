@@ -15,7 +15,6 @@ use crate::schema::{
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
     ValidatedResourceSchema, empty_defs_for_schema_walks,
 };
-use crate::value::CanonicalState;
 
 /// Schema-aware value equality shared by the plan renderer
 /// (`detail_rows`) and the unchanged-count helper below (carina#3073).
@@ -56,33 +55,44 @@ pub(crate) fn schema_aware_equal<
 /// callers from accidentally pairing an attribute with definitions from another
 /// resource. Both operands are canonicalized through the state pipeline before
 /// comparison. When the schema or named attribute is unavailable, comparison
-/// falls back to schema-blind semantic equality without cloning either value.
-pub fn resource_attribute_values_equal(
-    old: &Value,
-    new: &Value,
+/// falls back to schema-blind semantic equality. Historical hashes remain snapshot
+/// leaves throughout canonicalization and comparison.
+pub fn resource_attribute_values_equal<
+    P: crate::resource::StateValueLeaf,
+    Q: crate::resource::StateValueLeaf,
+>(
+    old: &Value<P>,
+    new: &Value<Q>,
     schema: Option<&ValidatedResourceSchema>,
     attribute_name: &str,
     context: &crate::differ::ObservationComparison<'_>,
 ) -> bool {
+    let old = crate::resource::state_value_snapshot(old);
+    let new = crate::resource::state_value_snapshot(new);
     let Some(attribute) = schema.and_then(|schema| schema.effective_attribute(attribute_name))
     else {
-        return old.semantically_equal(new);
+        return old.semantically_equal(&new);
     };
 
     let effective_type = attribute.value_type();
-    let old = attribute.canonicalize_state(old.clone());
-    let new = attribute.canonicalize_state(new.clone());
-    match (old, new) {
-        (CanonicalState::Absent, CanonicalState::Absent) => true,
-        (CanonicalState::Present(old), CanonicalState::Present(new)) => schema_aware_equal(
+    let canonicalize = |value| {
+        crate::value::canonicalize_snapshot_with_type(
+            value,
+            effective_type.as_type(),
+            effective_type.defs(),
+            effective_type.ancestry(),
+        )
+    };
+    match (canonicalize(old), canonicalize(new)) {
+        (None, None) => true,
+        (Some(old), Some(new)) => schema_aware_equal(
             &old,
             &new,
             Some(effective_type.as_type()),
             effective_type.defs(),
             context,
         ),
-        (CanonicalState::Present(_), CanonicalState::Absent)
-        | (CanonicalState::Absent, CanonicalState::Present(_)) => false,
+        (Some(_), None) | (None, Some(_)) => false,
     }
 }
 
@@ -472,6 +482,66 @@ mod tests {
             attribute_name,
             &crate::differ::exact_comparison_context_for_tests(),
         )
+    }
+
+    #[test]
+    fn historical_attribute_comparison_verifies_root_and_nested_secret_hashes() {
+        let secret = |text: &str| -> Value {
+            Value::Deferred(crate::resource::DeferredValue::Secret(Box::new(
+                Value::Concrete(ConcreteValue::String(text.into())),
+            )))
+        };
+        for nested in [false, true] {
+            let schema_type = if nested {
+                PatternAttributeType::struct_(
+                    "Config",
+                    vec![
+                        PatternStructField::required("password", PatternAttributeType::string())
+                            .build(),
+                    ],
+                )
+            } else {
+                PatternAttributeType::string()
+            };
+            let schema = PatternResourceSchema::new("test.Widget")
+                .attribute(PatternAttributeSchema::optional("config", schema_type).build())
+                .validate()
+                .expect("schema fixture");
+            let config = |text: &str| -> Value {
+                if nested {
+                    Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                        "password".to_string(),
+                        secret(text),
+                    )])))
+                } else {
+                    secret(text)
+                }
+            };
+            let historical = crate::value::redact_secrets_in_value(&config("original"))
+                .expect("capture historical secret evidence");
+            let context = crate::differ::exact_comparison_context_for_tests();
+            assert!(super::resource_attribute_values_equal(
+                &historical,
+                &config("original"),
+                Some(&schema),
+                "config",
+                &context,
+            ));
+            assert!(!super::resource_attribute_values_equal(
+                &historical,
+                &config("changed"),
+                Some(&schema),
+                "config",
+                &context,
+            ));
+            assert!(super::resource_attribute_values_equal(
+                &historical,
+                &historical,
+                Some(&schema),
+                "config",
+                &context,
+            ));
+        }
     }
 
     fn compute_unchanged_count(

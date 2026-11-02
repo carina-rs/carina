@@ -27,7 +27,8 @@ use carina_core::resource::Resource;
 use carina_core::resource::{
     AbsoluteBindingAddress, ConcreteValue, Current, DataSource, PartialReadMarker, PendingReRead,
     PersistedDestroyDependencies, PersistedDestroyDependencyProjection, PersistedDirectives,
-    ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity, State, Value,
+    ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity, SnapshotState,
+    SnapshotValue, State, StateValueLeaf, UnavailableSecretError, Value,
 };
 use carina_core::schema::{
     CompiledResourceSchema as ResourceSchema, FieldName, SchemaKind, SchemaRegistry,
@@ -95,8 +96,8 @@ impl SelectedStateAttributes {
         keys
     }
 
-    fn from_provider_values_lossy(
-        attributes: &HashMap<String, Value>,
+    fn from_provider_values_lossy<P: StateValueLeaf>(
+        attributes: &HashMap<String, Value<P>>,
         schema: Option<&ResourceSchema>,
         additionally_recorded: &[String],
     ) -> Self {
@@ -117,8 +118,8 @@ impl SelectedStateAttributes {
         }
     }
 
-    fn try_from_provider_values(
-        attributes: &HashMap<String, Value>,
+    fn try_from_provider_values<P: StateValueLeaf>(
+        attributes: &HashMap<String, Value<P>>,
         schema: Option<&ResourceSchema>,
         additionally_recorded: &[String],
         preferred_hashes: Option<&PersistedAttributes>,
@@ -370,6 +371,8 @@ pub enum ResourceStateEncodingError {
     Serialization(#[from] SerializationError),
     #[error(transparent)]
     PersistedAttributes(#[from] PersistedAttributesError),
+    #[error(transparent)]
+    UnavailableSecret(#[from] UnavailableSecretError),
     #[error("sent attributes are outside the desired resource: {attributes:?}")]
     InvalidSentAttributes { attributes: Vec<String> },
 }
@@ -1813,7 +1816,16 @@ impl StateFile {
             D,
         >],
     ) -> usize {
-        let data_source_ids: HashSet<_> = data_sources.iter().map(|source| &source.id).collect();
+        self.remove_legacy_data_source_rows_by_ids(data_sources.iter().map(|source| &source.id))
+    }
+
+    /// Remove legacy identifier-less rows using addresses recorded in state or
+    /// a saved plan. Historical definition values never become desired input.
+    pub fn remove_legacy_data_source_rows_by_ids<'a>(
+        &mut self,
+        data_source_ids: impl IntoIterator<Item = &'a ResourceId>,
+    ) -> usize {
+        let data_source_ids: HashSet<_> = data_source_ids.into_iter().collect();
         let original_len = self.resources.len();
         self.resources.retain(|row| {
             matches!(
@@ -1841,9 +1853,9 @@ impl StateFile {
         self.restore_partial_read_markers_in(states.iter_mut());
     }
 
-    fn restore_partial_read_markers_in<'a>(
+    fn restore_partial_read_markers_in<'a, P: StateValueLeaf + 'a>(
         &self,
-        states: impl Iterator<Item = (&'a ResourceId, &'a mut State)>,
+        states: impl Iterator<Item = (&'a ResourceId, &'a mut State<P>)>,
     ) {
         for (id, current) in states {
             if !current.exists {
@@ -1873,7 +1885,7 @@ impl StateFile {
     /// planning and saved-plan drift checking.
     pub fn restore_recorded_write_only_attributes_in_state(
         &self,
-        current: &mut State,
+        current: &mut SnapshotState,
         schemas: &SchemaRegistry,
     ) {
         if !current.exists {
@@ -1940,7 +1952,7 @@ impl StateFile {
                 attributes,
                 partial_read,
                 ..
-            } => Current::from_state(State {
+            } => Current::from_snapshot(SnapshotState {
                 id: id.clone(),
                 identifier: Some(identifier.as_str().to_string()),
                 attributes: attributes.to_values(),
@@ -1959,7 +1971,7 @@ impl StateFile {
                 write_only_attributes: _write_only_attributes,
                 nested_write_only: _nested_write_only,
                 partial_read,
-            } => Current::from_state(State {
+            } => Current::from_snapshot(SnapshotState {
                 id: id.clone(),
                 identifier: None,
                 attributes: attributes.to_values(),
@@ -3358,11 +3370,11 @@ impl DeposedInstance {
     /// Rebuild this generation from a provider read while carrying write-only
     /// values only from this persisted generation. Provider echoes never
     /// become provenance for a deposed row.
-    pub fn refreshed_attributes_for_resource_and_schema<S>(
+    pub fn refreshed_attributes_for_resource_and_schema<S, P: StateValueLeaf>(
         &self,
         resource: &ResolvedResource<S>,
         schema: Option<&ResourceSchema>,
-        fresh_attributes: &HashMap<String, Value>,
+        fresh_attributes: &HashMap<String, Value<P>>,
     ) -> DeposedAttributes {
         let carried_write_only = recorded_write_only_keys(schema, &self.attributes, &[]);
         let mut selected =
@@ -3684,9 +3696,9 @@ impl<'de> Deserialize<'de> for ResourceState {
 #[cfg(any(test, feature = "test-utils"))]
 impl WritableResourceState {
     #[doc(hidden)]
-    pub fn with_attributes_from_state(
+    pub fn with_attributes_from_state<P: StateValueLeaf>(
         mut self,
-        state: &State,
+        state: &State<P>,
     ) -> Result<ResourceState, ResourceStateEncodingError> {
         let previous = self.0.persisted_attributes().cloned().unwrap_or_default();
         let encoded = state
@@ -3725,9 +3737,9 @@ impl WritableResourceState {
 impl RefreshableResourceState<'_> {
     /// Replace the provider-observed portion of an orphan row while retaining
     /// every host-owned field from the existing state entry.
-    pub fn refreshed_from_provider_state(
+    pub fn refreshed_from_provider_state<P: StateValueLeaf>(
         self,
-        state: &State,
+        state: &State<P>,
         schema: Option<&ResourceSchema>,
     ) -> Result<ResourceState, ResourceStateEncodingError> {
         let source = self.0;
@@ -3779,20 +3791,21 @@ impl RefreshableResourceState<'_> {
 fn resource_with_secret_shape_union<S: Clone>(
     resource: &ResolvedResource<S>,
     applied: &SecretPreservingAttributes,
-) -> ResolvedResource<S> {
+) -> Result<ResolvedResource<S>, UnavailableSecretError> {
     let mut resolved = resource.as_inner().clone();
     resolved.attributes = applied
         .values()
         .iter()
         .map(|(key, value)| {
+            let value = value.to_value_at(format!("{}.{key}", resource.id))?;
             let protected = resource.attributes.get(key).map_or_else(
                 || value.clone(),
-                |authored_shape| union_secret_shapes_after_resolution(value, authored_shape),
+                |authored_shape| union_secret_shapes_after_resolution(&value, authored_shape),
             );
-            (key.clone(), protected)
+            Ok((key.clone(), protected))
         })
-        .collect();
-    ResolvedResource::new(resolved)
+        .collect::<Result<_, UnavailableSecretError>>()?;
+    Ok(ResolvedResource::new(resolved))
 }
 
 impl ResourceState {
@@ -4162,11 +4175,11 @@ impl ResourceState {
     /// ```
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
-    pub fn from_provider_state(
+    pub fn from_provider_state<P: StateValueLeaf>(
         resource_type: impl Into<String>,
         identity: impl Into<ResourceIdentity>,
         provider: impl Into<String>,
-        state: &State,
+        state: &State<P>,
     ) -> Result<Self, ResourceStateEncodingError> {
         WritableResourceState(Self::new(resource_type, identity, provider))
             .with_attributes_from_state(state)
@@ -4202,7 +4215,7 @@ impl ResourceState {
         let attributes = PersistedAttributes::from_persisted_values(HashMap::from([(
             "bucket".to_string(),
             PersistedValue::encode_provider_value(
-                &Value::Concrete(ConcreteValue::String(
+                &Value::<carina_core::resource::NoPlaceholder>::Concrete(ConcreteValue::String(
                     bucket_name.as_str().to_string().into(),
                 )),
                 None,
@@ -4222,10 +4235,10 @@ impl ResourceState {
 
     /// Encode a provider/history fallback that has no persisted generation to
     /// carry from. All schema write-only values are excluded.
-    pub fn deposed_attributes_without_previous<S>(
+    pub fn deposed_attributes_without_previous<S, P: StateValueLeaf>(
         resource: &ResolvedResource<S>,
         schema: Option<&ResourceSchema>,
-        attributes: &HashMap<String, Value>,
+        attributes: &HashMap<String, Value<P>>,
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
     ) -> DeposedAttributes {
         let selected = SelectedStateAttributes::from_provider_values_lossy(attributes, schema, &[])
@@ -4326,7 +4339,7 @@ impl ResourceState {
         &mut self,
         resource: &ResolvedResource<S>,
         existing: Option<&ResourceState>,
-        stored_attributes: &HashMap<String, Value>,
+        stored_attributes: &HashMap<String, SnapshotValue>,
         schema: Option<&ResourceSchema>,
         authoring_basis: DesiredAuthoringBasis<'_>,
         comparison: &ComparisonContext<'_, R>,
@@ -4380,7 +4393,7 @@ impl ResourceState {
     fn carried_explicit_for_stored_values<S, R: ReferenceEquality>(
         resource: &ResolvedResource<S>,
         existing: Option<&ResourceState>,
-        stored_attributes: &HashMap<String, Value>,
+        stored_attributes: &HashMap<String, SnapshotValue>,
         schema: Option<&ResourceSchema>,
         comparison: &ComparisonContext<'_, R>,
     ) -> ExplicitFields {
@@ -4422,7 +4435,8 @@ impl ResourceState {
     ) -> Result<Self, ResourceStateEncodingError> {
         let applied_desired = created
             .resolved_desired_attributes()
-            .map(|attributes| resource_with_secret_shape_union(resource, attributes));
+            .map(|attributes| resource_with_secret_shape_union(resource, attributes))
+            .transpose()?;
         let writeback_resource = applied_desired.as_ref().unwrap_or(resource);
         let sent_desired = created.sent_desired_attributes_for(writeback_resource);
         let previous = existing.and_then(ResourceState::persisted_attributes);
@@ -4579,7 +4593,7 @@ impl ResourceState {
                     if matches!(row.explicit, ExplicitFields::Unrecorded) {
                         row.explicit = explicit::build_from_read_resource_for_stored_values(
                             resource,
-                            &HashMap::new(),
+                            &HashMap::<String, SnapshotValue>::new(),
                             schema,
                             comparison,
                         );
@@ -4678,9 +4692,13 @@ impl ResourceState {
     ///
     /// Returns an error if any provider attribute value cannot be converted to
     /// JSON, such as non-finite float values.
-    pub fn from_provider_state_for_resource_and_schema<S: Clone, R: ReferenceEquality>(
+    pub fn from_provider_state_for_resource_and_schema<
+        S: Clone,
+        R: ReferenceEquality,
+        P: StateValueLeaf,
+    >(
         resource: &ResolvedResource<S>,
-        state: &State,
+        state: &State<P>,
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
         row_basis: RowBasis<'_>,
@@ -4694,7 +4712,8 @@ impl ResourceState {
         let applied_desired = match row_basis {
             RowBasis::Applied(request) => request
                 .resolved_desired_attributes()
-                .map(|attributes| resource_with_secret_shape_union(resource, attributes)),
+                .map(|attributes| resource_with_secret_shape_union(resource, attributes))
+                .transpose()?,
             RowBasis::Imported | RowBasis::Carried => None,
         };
         let writeback_resource = applied_desired.as_ref().unwrap_or(resource);
@@ -4856,7 +4875,7 @@ impl ResourceState {
         rs.populate_desired_metadata(
             resource,
             existing,
-            &state.attributes,
+            &state.to_snapshot().attributes,
             schema,
             authoring_basis,
             comparison,

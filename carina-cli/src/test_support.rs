@@ -155,8 +155,11 @@ pub(crate) fn refresh_target(
     identifier: &carina_core::provider::AppliedIdentifier,
 ) -> carina_state::RefreshTarget {
     refresh_current(carina_core::resource::Current::from_state(
-        carina_core::resource::State::existing(id.clone(), std::collections::HashMap::new())
-            .with_identifier(identifier.as_str()),
+        carina_core::resource::State::<carina_core::resource::NoPlaceholder>::existing(
+            id.clone(),
+            std::collections::HashMap::new(),
+        )
+        .with_identifier(identifier.as_str()),
     ))
     .read_target()
     .unwrap()

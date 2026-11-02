@@ -836,6 +836,15 @@ fn parse_account_guard_clause(msg: &str, kind: &str) -> Option<AccountGuardClaus
 #[derive(Debug, thiserror::Error)]
 pub enum SavedPlanSecretVerificationError {
     #[error(
+        "Saved-plan secret is unavailable at {location}: {error}; re-run `{replan}` after restoring its value."
+    )]
+    UnavailableSecret {
+        location: String,
+        replan: String,
+        error: carina_core::resource::UnavailableSecretError,
+    },
+
+    #[error(
         "Saved-plan secret verification failed at {location}: the secret changed since the plan was created; re-run `{replan}`."
     )]
     HashMismatch { location: String, replan: String },
@@ -947,6 +956,10 @@ pub enum AppError {
 
     #[error(transparent)]
     ExportBoundary(#[from] carina_core::validation::ExportBoundaryError),
+
+    /// An authored reference selected unavailable historical secret evidence.
+    #[error(transparent)]
+    ValueResolution(#[from] carina_core::resolver::ResolutionError),
 
     /// Provider installation, egress consent, or initialization failed.
     #[error(transparent)]

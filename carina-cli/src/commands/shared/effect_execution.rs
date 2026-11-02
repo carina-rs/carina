@@ -177,7 +177,7 @@ pub(crate) async fn execute_import_effects<S: Clone>(
                         iteration.mutate(|result| {
                             result.applied_states.insert(
                                 id.clone().into_inner(),
-                                carina_core::executor::Applied::Imported(state),
+                                carina_core::executor::Applied::Imported(state.to_snapshot()),
                             );
                             result.success_count += 1;
                         });

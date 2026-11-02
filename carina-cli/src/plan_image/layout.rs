@@ -2404,7 +2404,13 @@ mod tests {
 
     fn update(resource: ResolvedResource) -> Effect {
         Effect::Update {
-            from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
+            from: Box::new(
+                (State::<carina_core::resource::NoPlaceholder>::existing(
+                    resource.id.clone(),
+                    HashMap::new(),
+                ))
+                .to_snapshot(),
+            ),
             identifier: AppliedIdentifier::new(format!(
                 "{}-id",
                 resource

@@ -239,7 +239,7 @@ pub struct DeferredReplaceDelete {
 pub struct PriorInstanceDestroyDependencies(PersistedDestroyDependencies);
 
 impl PriorInstanceDestroyDependencies {
-    pub fn from_refreshed_state(state: &State) -> Self {
+    pub fn from_refreshed_state<P: crate::resource::StateValueLeaf>(state: &State<P>) -> Self {
         Self(state.dependency_bindings.clone())
     }
     pub fn into_persisted(self) -> PersistedDestroyDependencies {

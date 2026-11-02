@@ -8631,7 +8631,9 @@ mod tests {
             resource: &carina_core::provider::ProviderReadyDataSource,
         ) -> BoxFuture<'_, ProviderResult<State>> {
             let id = resource.id.clone();
-            Box::pin(async move { Ok(State::not_found(id)) })
+            Box::pin(
+                async move { Ok(State::<carina_core::resource::NoPlaceholder>::not_found(id)) },
+            )
         }
 
         fn create(
@@ -9933,14 +9935,14 @@ mod tests {
         let mut states = HashMap::from([
             (
                 first_id.clone(),
-                State::existing(
+                SnapshotState::existing(
                     first_id.clone(),
                     HashMap::from([("value".to_string(), original_value.clone())]),
                 ),
             ),
             (
                 second_id.clone(),
-                State::existing(
+                SnapshotState::existing(
                     second_id.clone(),
                     HashMap::from([("value".to_string(), original_value)]),
                 ),
@@ -10006,7 +10008,8 @@ mod tests {
             "comment".to_string(),
             carina_core::resource::SnapshotValue::redacted(hash),
         )]);
-        let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), attributes))]);
+        let mut states =
+            HashMap::from([(id.clone(), SnapshotState::existing(id.clone(), attributes))]);
         apply_wit_state_attribute_updates(
             "normalize_state",
             &mut states,

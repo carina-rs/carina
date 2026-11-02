@@ -17,7 +17,7 @@ use carina_core::provider::{
     BoxFuture, InitializedProvider, ProviderFactory, ProviderInitialization, ProviderInstanceKey,
     ProviderResult, ProviderRouter,
 };
-use carina_core::resource::{Current, ResolvedResource, ResourceId, State, Value};
+use carina_core::resource::{Current, ResolvedResource, ResourceId, SnapshotState, State, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, StructField,
     TypeIdentity, ValidatedResourceSchema,
@@ -258,7 +258,7 @@ pub struct FixturePlan {
     pub unresolved_resources: Vec<UnresolvedResource>,
     pub compositions: Vec<carina_core::resource::LiveComposition>,
     pub managed_current: HashMap<ResourceId, Current>,
-    pub data_source_states: HashMap<ResourceId, State>,
+    pub data_source_states: HashMap<ResourceId, SnapshotState>,
     pub state_file: Option<StateFile>,
     pub schemas: SchemaRegistry,
     pub moved_origins: HashMap<ResourceId, ResourceId>,
@@ -570,11 +570,12 @@ where
             let (loaded_id, current) = expansion_prelude.build_current(&resource.id);
             managed_current.insert(loaded_id, current);
         }
-        data_source_states.extend(
-            data_sources
-                .iter()
-                .map(|source| (source.id.clone(), State::not_found(source.id.clone()))),
-        );
+        data_source_states.extend(data_sources.iter().map(|source| {
+            (
+                source.id.clone(),
+                State::<carina_core::resource::NoPlaceholder>::not_found(source.id.clone()),
+            )
+        }));
 
         orphans = expansion_prelude
             .loaded_orphans(
@@ -588,15 +589,19 @@ where
             managed_current.insert(resource.id.clone(), Current::absent(resource.id.clone()));
         }
         for ds in &data_sources {
-            data_source_states.insert(ds.id.clone(), State::not_found(ds.id.clone()));
+            data_source_states.insert(
+                ds.id.clone(),
+                State::<carina_core::resource::NoPlaceholder>::not_found(ds.id.clone()),
+            );
         }
     }
     let data_source_values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
         DataSourceValue::read(
-            data_source_states
+            (data_source_states
                 .get(&data_source.id)
                 .cloned()
-                .expect("fixture initialized every data-source state"),
+                .expect("fixture initialized every data-source state"))
+            .to_snapshot(),
         )
     });
 

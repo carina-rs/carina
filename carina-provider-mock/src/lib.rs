@@ -2495,7 +2495,7 @@ mod tests {
         else {
             panic!("legacy payload should remain a user map")
         };
-        assert_eq!(payload.get("$x"), Some(&string_value("kept")));
+        assert_eq!(payload.get("$x"), Some(&string_value("kept").to_snapshot()));
         let Some(Value::Concrete(ConcreteValue::CanonicalEnum(mode))) =
             state.attributes.get("mode")
         else {
@@ -2541,7 +2541,7 @@ mod tests {
             attrs["raw"].decode(),
             Some(string_value(
                 "_secret:argon2:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            )),
+            ).to_snapshot()),
             "mock v1 never assigned row-aware semantics to raw legacy strings",
         );
     }
@@ -2593,11 +2593,11 @@ mod tests {
             ))
             .expect("fresh mock v2 state should reload")
             .into_state();
-        assert_eq!(state.attributes.get("comment"), Some(&plain));
+        assert_eq!(state.attributes.get("comment"), Some(&plain.to_snapshot()));
         assert!(matches!(
             state.attributes.get("tags"),
             Some(Value::Concrete(ConcreteValue::Map(values)))
-                if values.get("nested") == Some(&plain)
+                if values.get("nested") == Some(&plain.to_snapshot())
         ));
     }
 
@@ -2720,7 +2720,10 @@ mod tests {
             ))
             .expect("new mock state should reload")
             .into_state();
-        assert_eq!(state.attributes.get("payload"), Some(&payload));
+        assert_eq!(
+            state.attributes.get("payload"),
+            Some(&payload.to_snapshot())
+        );
     }
 
     #[test]
@@ -2748,7 +2751,12 @@ mod tests {
             .decode()
             .expect("canonical enum fixture is non-null");
         let resource = Resource::with_provider("mock", "test.resource", "enum", None)
-            .with_attribute("mode", canonical.clone());
+            .with_attribute(
+                "mode",
+                canonical
+                    .to_value_at("mock.test.resource.enum.mode")
+                    .expect("ordinary enum fixture is available as an authored value"),
+            );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -2845,7 +2853,9 @@ mod tests {
             let mut from_attrs = HashMap::new();
             from_attrs.insert("name".to_string(), string_value("web-acl-new"));
             from_attrs.insert("comment".to_string(), string_value("v1"));
-            let from = State::existing(id.clone(), from_attrs).with_identifier("mock-id");
+            let from =
+                State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), from_attrs)
+                    .with_identifier("mock-id");
             let bindings = carina_core::binding_index::ResolvedBindings::default();
             let module_gate =
                 carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
@@ -2874,7 +2884,7 @@ mod tests {
                     );
                     let request = carina_core::executor::prepare_update_request(
                         update_resource,
-                        from,
+                        from.to_snapshot(),
                         &["comment".to_string()],
                         &preparation,
                     )

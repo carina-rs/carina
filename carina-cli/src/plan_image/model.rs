@@ -1494,7 +1494,13 @@ mod tests {
         );
         let mut plan = Plan::new();
         plan.add(Effect::Update {
-            from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
+            from: Box::new(
+                (State::<carina_core::resource::NoPlaceholder>::existing(
+                    resource.id.clone(),
+                    HashMap::new(),
+                ))
+                .to_snapshot(),
+            ),
             identifier: AppliedIdentifier::new("service-id").unwrap(),
             to: resolved_one(resource.clone()),
             changed_attributes: vec!["password".to_string(), "description".to_string()],

@@ -914,6 +914,36 @@ impl Plan {
     }
 }
 
+impl<S: Clone> Plan<S> {
+    /// Capture an execution plan as historical/display data without redaction.
+    pub fn to_snapshot(&self) -> SnapshotPlan<S> {
+        let effects = self
+            .effects
+            .iter()
+            .map(|effect| {
+                effect.try_map_value_stage(
+                        |_, _, value| Ok::<_, std::convert::Infallible>(value.to_snapshot()),
+                        |_, value| Ok(value.to_snapshot()),
+                        |template| {
+                            crate::effect::value_stage::map_template::<
+                                S,
+                                NoPlaceholder,
+                                SnapshotLeaf,
+                                _,
+                            >(
+                                template,
+                                |value| Ok(value.to_snapshot()),
+                                |_, value| Ok(value.to_snapshot()),
+                            )
+                        },
+                    )
+            })
+            .collect::<Result<Vec<_>, std::convert::Infallible>>()
+            .expect("snapshot capture is infallible");
+        self.clone().with_value_stage(effects)
+    }
+}
+
 impl<S, V: PlanValueKind> Plan<S, V> {
     pub(crate) fn with_value_stage<Q: PlanValueKind>(
         self,
@@ -1009,16 +1039,16 @@ impl<S, V: PlanValueKind> Plan<S, V> {
     /// Other updates keep their plan-time source after drift verification;
     /// ignored updates must use the fresh source so a value changed between
     /// plan and apply is never written back accidentally.
-    pub fn rebase_ignored_update_sources(
+    pub fn rebase_ignored_update_sources<P: crate::resource::StateValueLeaf>(
         &mut self,
-        actual_states: &HashMap<ResourceId, crate::resource::State>,
+        actual_states: &HashMap<ResourceId, crate::resource::State<P>>,
     ) {
         for effect in &mut self.effects {
             if let Effect::Update { from, to, .. } = effect
                 && !to.ignore_changes().is_empty()
                 && let Some(actual) = actual_states.get(&to.id)
             {
-                **from = actual.clone().into();
+                **from = actual.to_snapshot();
             }
         }
     }

@@ -1278,7 +1278,7 @@ fn test_deferred_replace_keeps_unrelated_same_type_delete() {
 fn test_resolved_ref_loses_dependency_for_tree_nesting() {
     // VPC: Update effect (tags changed)
     let vpc_to = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
-    let vpc_from = State::existing(
+    let vpc_from = State::<carina_core::resource::NoPlaceholder>::existing(
         ResourceId::with_identity("ec2.Vpc", "vpc"),
         HashMap::from([(
             "cidr_block".to_string(),
@@ -1313,7 +1313,7 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         identifier: crate::fixture_applied_identifier("vpc-id"),
-        from: Box::new(vpc_from),
+        from: Box::new(vpc_from.to_snapshot()),
         to: resolved(vpc_to),
         changed_attributes: vec!["tags".to_string()],
     });
@@ -1406,7 +1406,11 @@ fn format_effect_update_separates_type_and_name_with_space() {
     to.id = id.clone();
     let effect = Effect::Update {
         identifier: crate::fixture_applied_identifier("role-id"),
-        from: Box::new(State::existing(id.clone(), HashMap::new()).with_identifier("role-id")),
+        from: Box::new(
+            (State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("role-id"))
+            .to_snapshot(),
+        ),
         to: resolved(to),
         changed_attributes: Vec::new(),
     };
@@ -1971,7 +1975,7 @@ fn delete_pretty_attribute_does_not_strike_indentation() {
     // vertical layout with indented continuation lines, mirroring the
     // real CloudFront `default_cache_behavior` shape from the bug
     // report.
-    let mut forwarded_values = IndexMap::new();
+    let mut forwarded_values: IndexMap<String, Value> = IndexMap::new();
     forwarded_values.insert(
         "query_string".to_string(),
         Value::Concrete(ConcreteValue::Bool(false)),
@@ -2070,11 +2074,12 @@ fn forcing_changed_uses_plain_green_cli_value() {
     let effect = Effect::Update {
         identifier: crate::fixture_applied_identifier("w"),
         from: Box::new(
-            State::existing(
+            (State::<carina_core::resource::NoPlaceholder>::existing(
                 ResourceId::with_identity("test.Widget", "w"),
                 HashMap::new(),
             )
-            .with_identifier("w"),
+            .with_identifier("w"))
+            .to_snapshot(),
         ),
         to: resolved(Resource::new("test.Widget", "w")),
         changed_attributes: vec!["name".to_string()],
@@ -2105,11 +2110,12 @@ fn forcing_changed_multiline_green_style_does_not_cross_newline() {
     let effect = Effect::Update {
         identifier: crate::fixture_applied_identifier("w"),
         from: Box::new(
-            State::existing(
+            (State::<carina_core::resource::NoPlaceholder>::existing(
                 ResourceId::with_identity("test.Widget", "w"),
                 HashMap::new(),
             )
-            .with_identifier("w"),
+            .with_identifier("w"))
+            .to_snapshot(),
         ),
         to: resolved(Resource::new("test.Widget", "w")),
         changed_attributes: vec!["rules".to_string()],
@@ -2140,11 +2146,12 @@ fn string_list_diff_renders_preformatted_literals_without_adding_quotes() {
     let effect = Effect::Update {
         identifier: crate::fixture_applied_identifier("w"),
         from: Box::new(
-            State::existing(
+            (State::<carina_core::resource::NoPlaceholder>::existing(
                 ResourceId::with_identity("test.Widget", "w"),
                 HashMap::new(),
             )
-            .with_identifier("w"),
+            .with_identifier("w"))
+            .to_snapshot(),
         ),
         to: resolved(Resource::new("test.Widget", "w")),
         changed_attributes: vec!["items".to_string()],
@@ -2363,7 +2370,14 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
     });
     plan.add(Effect::Update {
         identifier: crate::fixture_applied_identifier("logs-id"),
-        from: Box::new(State::existing(to_id.clone(), HashMap::new()).with_identifier("logs-id")),
+        from: Box::new(
+            (State::<carina_core::resource::NoPlaceholder>::existing(
+                to_id.clone(),
+                HashMap::new(),
+            )
+            .with_identifier("logs-id"))
+            .to_snapshot(),
+        ),
         to: resolved(updated),
         changed_attributes: Vec::new(),
     });
@@ -2455,7 +2469,14 @@ fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
     });
     plan.add(Effect::Update {
         identifier: crate::fixture_applied_identifier("child-id"),
-        from: Box::new(State::existing(to_id.clone(), HashMap::new()).with_identifier("child-id")),
+        from: Box::new(
+            (State::<carina_core::resource::NoPlaceholder>::existing(
+                to_id.clone(),
+                HashMap::new(),
+            )
+            .with_identifier("child-id"))
+            .to_snapshot(),
+        ),
         to: resolved(updated),
         changed_attributes: Vec::new(),
     });

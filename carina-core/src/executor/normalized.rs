@@ -200,7 +200,9 @@ fn reject_provider_boundary_block_aliases<S, D>(
 
 /// Return whether any state attribute recursively contains
 /// `Value::Deferred(DeferredValue::Unknown)`.
-pub fn states_contain_unknown(states: &HashMap<ResourceId, State>) -> bool {
+pub fn states_contain_unknown<P: crate::resource::StateValueLeaf>(
+    states: &HashMap<ResourceId, State<P>>,
+) -> bool {
     states
         .values()
         .any(|state| state.attributes.values().any(value_contains_unknown))

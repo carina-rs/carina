@@ -6,7 +6,9 @@ use carina_core::effect::{Effect, EffectGeneration};
 use carina_core::identifier::{DesiredCreateOnlyValues, StateCreateOnlyValues};
 use carina_core::plan::Plan;
 use carina_core::provider::{ComparisonResolutionError, ProviderRouter};
-use carina_core::resource::{Current, ResolvedResource, ResolvedResourceId, ResourceId, Value};
+use carina_core::resource::{
+    Current, ResolvedResource, ResolvedResourceId, ResourceId, SnapshotValue,
+};
 use carina_core::schema::{SchemaRegistry, ValidatedResourceSchema};
 
 /// One plan-time suggestion. Rendering belongs to this typed value rather
@@ -360,7 +362,7 @@ pub fn detect_moved_block_hints<S>(
 
 struct DestroyCandidate<'a> {
     id: &'a ResolvedResourceId,
-    attributes: &'a HashMap<String, Value>,
+    attributes: &'a HashMap<String, SnapshotValue>,
 }
 
 struct CreateCandidate<'schema> {
@@ -375,7 +377,7 @@ enum GraphNode {
     Created(usize),
 }
 
-fn current_attributes(current: &Current) -> Option<&HashMap<String, Value>> {
+fn current_attributes(current: &Current) -> Option<&HashMap<String, SnapshotValue>> {
     match current {
         Current::Absent(state) => Some(&state.state().attributes),
         Current::Present(present) => Some(&present.state().attributes),
@@ -560,7 +562,7 @@ mod tests {
         value: &str,
         generation: EffectGeneration,
     ) {
-        let state = State::existing(
+        let state = State::<carina_core::resource::NoPlaceholder>::existing(
             resource_id.as_inner().clone(),
             HashMap::from([(CREATE_ONLY_ATTRIBUTE.to_string(), concrete_string(value))]),
         )
@@ -732,7 +734,7 @@ mod tests {
             .and_then(Current::attributes_mut)
             .expect("test prior has attributes");
         prior_attributes.clear();
-        prior_attributes.insert("type".to_string(), concrete_string("CNAME"));
+        prior_attributes.insert("type".to_string(), concrete_string("CNAME").to_snapshot());
 
         let enum_identity = TypeIdentity::new(Some(PROVIDER), ["route53", "RecordSet"], "Type");
         let enum_type = PatternAttributeType::enum_(
@@ -794,7 +796,8 @@ mod tests {
             Value::Concrete(ConcreteValue::List(vec![
                 concrete_string("zone-a"),
                 concrete_string("zone-b"),
-            ])),
+            ]))
+            .to_snapshot(),
         );
         let desired = Resource::from_id(id("vpcs[0]", None).into_inner()).with_attribute(
             "zones",
@@ -844,7 +847,10 @@ mod tests {
             .get_mut(old_id.as_inner())
             .and_then(Current::attributes_mut)
             .expect("test prior has attributes")
-            .insert("name".to_string(), concrete_string("old-provider-name"));
+            .insert(
+                "name".to_string(),
+                concrete_string("old-provider-name").to_snapshot(),
+            );
         let desired = Resource::from_id(id("vpcs[0]", None).into_inner())
             .with_attribute(CREATE_ONLY_ATTRIBUTE, concrete_string(CIDR))
             .with_attribute("name", concrete_string("new-provider-name"));
@@ -891,7 +897,10 @@ mod tests {
             .and_then(Current::attributes_mut)
             .expect("test prior has attributes");
         prior_attributes.clear();
-        prior_attributes.insert("name".to_string(), concrete_string("record.example.com"));
+        prior_attributes.insert(
+            "name".to_string(),
+            concrete_string("record.example.com").to_snapshot(),
+        );
         let desired = Resource::from_id(id("records[0]", None).into_inner())
             .with_attribute("name", concrete_string("record.example.com"));
         plan.add(Effect::Create(resolved(desired)));
@@ -936,8 +945,16 @@ mod tests {
             "temporary_name": null,
             "previous_attributes": previous_attributes,
         }]);
-        let plan: carina_core::plan::SavedPlan =
+        let saved: carina_core::plan::SavedPlan =
             serde_json::from_value(encoded).expect("replacement plan must deserialize");
+        let plan = carina_core::value::rehydrate_plan_desired_secrets(
+            &saved,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            carina_core::parser::ExpandedInferredFile::default().deferred_for_expressions(),
+        )
+        .expect("ordinary desired values cross the snapshot boundary");
 
         let hints = detect_moved_block_hints(&plan, &prior, &schemas(true));
 

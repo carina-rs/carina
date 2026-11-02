@@ -2725,9 +2725,9 @@ mod tests {
     impl std::error::Error for TestOperationError {}
 
     fn redacted_secret_and_digest(plaintext: &str) -> (CoreSnapshotValue, String) {
-        let secret = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
-            ConcreteValue::String(plaintext.into()),
-        ))));
+        let secret: CoreValue = CoreValue::Deferred(DeferredValue::Secret(Box::new(
+            CoreValue::Concrete(ConcreteValue::String(plaintext.into())),
+        )));
         let persisted = carina_core::value::PersistedValue::encode_provider_value(&secret, None)
             .expect("serialize test secret")
             .as_json()
@@ -3984,9 +3984,9 @@ mod tests {
     #[test]
     fn persisted_state_rejects_live_secret_without_exposing_plaintext() {
         let plaintext = "persisted-boundary-secret-must-not-leak";
-        let secret = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
-            ConcreteValue::String(plaintext.into()),
-        ))));
+        let secret: CoreValue = CoreValue::Deferred(DeferredValue::Secret(Box::new(
+            CoreValue::Concrete(ConcreteValue::String(plaintext.into())),
+        )));
         let nested = CoreValue::Concrete(ConcreteValue::Map(indexmap::indexmap! {
             "token".to_string() => secret.clone(),
         }));
@@ -4535,7 +4535,7 @@ mod tests {
             "region".into(),
             CoreValue::Concrete(ConcreteValue::String("us-east-1".into())),
         );
-        let core = CoreState::existing(id.clone(), attrs);
+        let core = CoreState::<carina_core::resource::NoPlaceholder>::existing(id.clone(), attrs);
 
         let mut resource = CoreResource::from_id(id.clone());
         resource.attributes = core.attributes.clone().into_iter().collect();
@@ -4572,7 +4572,8 @@ mod tests {
             "cidr".into(),
             CoreValue::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         )]);
-        let core = CoreState::existing(id.clone(), attrs).with_identifier("vpc-12345");
+        let core = CoreState::<carina_core::resource::NoPlaceholder>::existing(id.clone(), attrs)
+            .with_identifier("vpc-12345");
 
         let mut resource = CoreResource::from_id(id.clone());
         resource.attributes = core.attributes.clone().into_iter().collect();
@@ -4591,7 +4592,7 @@ mod tests {
     fn persisted_state_and_saved_attrs_use_redacted_secret_variants() {
         let (redacted, digest) = redacted_secret_and_digest("wire-secret");
         let id = CoreResourceId::with_provider_identity("aws", "test.Resource", "example", None);
-        let state = CoreState::existing(
+        let state = CoreSnapshotState::existing(
             id.clone(),
             HashMap::from([("token".to_string(), redacted.clone())]),
         );
@@ -4750,7 +4751,8 @@ mod tests {
     fn persisted_core_redacted_secrets_use_the_dedicated_wit_variant() {
         let (redacted, digest) = redacted_secret_and_digest("core-to-wit-secret");
         let id = CoreResourceId::with_provider_identity("mock", "test.Resource", "main", None);
-        let state = CoreState::existing(id, HashMap::from([("token".to_string(), redacted)]));
+        let state =
+            CoreSnapshotState::existing(id, HashMap::from([("token".to_string(), redacted)]));
         let wit = core_to_wit_persisted_state(&state).expect("encode persisted state");
 
         assert!(matches!(
@@ -5068,7 +5070,7 @@ mod tests {
             .await
             .unwrap();
         let create = core_to_wit_create_request(&create).res;
-        let from = CoreState::existing(
+        let from = CoreState::<carina_core::resource::NoPlaceholder>::existing(
             resource.id.clone(),
             HashMap::from([
                 (
@@ -5083,7 +5085,7 @@ mod tests {
         );
         let update = carina_core::executor::prepare_update_request(
             resource,
-            from,
+            from.to_snapshot(),
             &["top".into(), "nested".into()],
             &context,
         )
@@ -5142,7 +5144,7 @@ mod tests {
                 "token",
                 CV::Concrete(ConcreteValue::String("unchanged".into())),
             );
-        let from = CoreState::existing(
+        let from = CoreSnapshotState::existing(
             resource.id.clone(),
             HashMap::from([
                 ("b".to_string(), CV::Concrete(ConcreteValue::Int(1))),
@@ -6517,7 +6519,7 @@ mod tests {
             dsl_transform: Some(proto::DslTransform::HyphenToUnderscore),
         };
         let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
-        let state = carina_core::resource::Value::Concrete(
+        let state: CoreSnapshotValue = carina_core::resource::Value::Concrete(
             carina_core::resource::ConcreteValue::String("ap-northeast-1a".into()),
         );
 
@@ -6554,7 +6556,7 @@ mod tests {
         };
         let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
 
-        let garbage = carina_core::resource::Value::Concrete(
+        let garbage: CoreSnapshotValue = carina_core::resource::Value::Concrete(
             carina_core::resource::ConcreteValue::String("garbage-not-an-az".into()),
         );
         assert_eq!(
@@ -6563,7 +6565,7 @@ mod tests {
             "unknown dynamic enum strings must remain String for strict validation"
         );
 
-        let az_shaped_garbage = carina_core::resource::Value::Concrete(
+        let az_shaped_garbage: CoreSnapshotValue = carina_core::resource::Value::Concrete(
             carina_core::resource::ConcreteValue::String("foo_bar_42".into()),
         );
         assert_eq!(
@@ -6572,7 +6574,7 @@ mod tests {
             "already-DSL-looking unknown strings must stay String without data-form membership"
         );
 
-        let already_dsl = carina_core::resource::Value::Concrete(
+        let already_dsl: CoreSnapshotValue = carina_core::resource::Value::Concrete(
             carina_core::resource::ConcreteValue::enum_identifier("ap_northeast_1a".to_string()),
         );
         match carina_core::utils::lift_enum_leaves(&already_dsl, &core_attr) {
@@ -6588,7 +6590,7 @@ mod tests {
         }
 
         for raw in ["   ", "", "AP-NORTHEAST-1A"] {
-            let value = carina_core::resource::Value::Concrete(
+            let value: carina_core::resource::Value = carina_core::resource::Value::Concrete(
                 carina_core::resource::ConcreteValue::String(raw.to_string().into()),
             );
             assert_eq!(
@@ -6598,7 +6600,7 @@ mod tests {
             );
         }
 
-        let valid = carina_core::resource::Value::Concrete(
+        let valid: carina_core::resource::Value = carina_core::resource::Value::Concrete(
             carina_core::resource::ConcreteValue::String("ap-northeast-1a".into()),
         );
         match carina_core::utils::lift_enum_leaves(&valid, &core_attr) {

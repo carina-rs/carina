@@ -233,7 +233,10 @@ fn mock_resource(name: &str, binding: &str) -> Resource {
 }
 
 fn state_not_found(resource: &Resource) -> CurrentStateEntry {
-    CurrentStateEntry::managed(resource.id.clone(), State::not_found(resource.id.clone()))
+    CurrentStateEntry::managed(
+        resource.id.clone(),
+        State::<NoPlaceholder>::not_found(resource.id.clone()),
+    )
 }
 
 fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
@@ -348,11 +351,12 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
             )]),
             attribute_spans: Default::default(),
         }),
-        plan,
+        plan: plan.to_snapshot(),
         sorted_resources: sorted_resources
             .iter()
             .cloned()
             .map(|resource| resolved(resource).into_inner())
+            .map(|value| value.to_snapshot())
             .collect(),
         sorted_value_destroy_dependencies: sorted_resources
             .iter()
@@ -368,6 +372,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
         unresolved_resources: sorted_resources
             .into_iter()
             .map(Resource::into_value_snapshot)
+            .map(|value| value.to_snapshot())
             .collect(),
         compositions: vec![],
         data_sources: vec![],
@@ -486,7 +491,7 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
             )]),
             attribute_spans: Default::default(),
         }),
-        plan,
+        plan: plan.to_snapshot(),
         sorted_resources: vec![],
         sorted_value_destroy_dependencies: vec![],
         sorted_explicit_destroy_dependencies: vec![],

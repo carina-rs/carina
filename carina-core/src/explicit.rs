@@ -12,7 +12,8 @@ use crate::differ::{ComparisonContext, ReferenceEquality};
 use crate::provider::SentDesiredAttributes;
 use crate::resource::{
     CanonicalComparisonAttributes, ConcreteValue, ListElementPairing, MaskedComparisonAttributes,
-    Resource, StateValueLeaf, Value, pair_list_elements, pair_list_elements_with_uniqueness,
+    Resource, SnapshotValue, StateValueLeaf, Value, pair_list_elements,
+    pair_list_elements_with_uniqueness,
 };
 use crate::schema::{
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
@@ -152,14 +153,14 @@ pub(crate) fn build_from_resource<S, D>(
 /// not evidence that the provider added them. Use
 /// [`build_from_resource_for_stored_values_after_send`] only when typed send
 /// evidence is available.
-pub fn build_from_read_resource_for_stored_values<S, D, R: ReferenceEquality>(
+pub fn build_from_read_resource_for_stored_values<S, D, P: StateValueLeaf, R: ReferenceEquality>(
     resource: &Resource<
         S,
         crate::resource::NoPlaceholder,
         crate::resource::AbsoluteBindingAddress,
         D,
     >,
-    stored_attributes: &HashMap<String, Value>,
+    stored_attributes: &HashMap<String, Value<P>>,
     schema: Option<&ResourceSchema>,
     comparison: &ComparisonContext<'_, R>,
 ) -> ExplicitFields {
@@ -189,15 +190,20 @@ pub fn build_from_read_resource_for_stored_values<S, D, R: ReferenceEquality>(
 /// lists without a concrete stored-list counterpart use the legacy union
 /// [`ExplicitFields::List`] representation rather than recording unjustified
 /// indices.
-pub fn build_from_resource_for_stored_values_after_send<S, D, R: ReferenceEquality>(
+pub fn build_from_resource_for_stored_values_after_send<
+    S,
+    D,
+    P: StateValueLeaf,
+    R: ReferenceEquality,
+>(
     resource: &Resource<
         S,
         crate::resource::NoPlaceholder,
         crate::resource::AbsoluteBindingAddress,
         D,
     >,
-    prior_stored_authoring: Option<(&HashMap<String, Value>, &ExplicitFields)>,
-    stored_attributes: &HashMap<String, Value>,
+    prior_stored_authoring: Option<(&HashMap<String, Value<P>>, &ExplicitFields)>,
+    stored_attributes: &HashMap<String, Value<P>>,
     sent_desired: &SentDesiredAttributes<'_>,
     schema: Option<&ResourceSchema>,
     comparison: &ComparisonContext<'_, R>,
@@ -269,14 +275,14 @@ impl StoredValueAuthoringBasis {
     }
 }
 
-fn build_for_stored_values<S, D, R: ReferenceEquality>(
+fn build_for_stored_values<S, D, P: StateValueLeaf, R: ReferenceEquality>(
     resource: &Resource<
         S,
         crate::resource::NoPlaceholder,
         crate::resource::AbsoluteBindingAddress,
         D,
     >,
-    stored_attributes: &HashMap<String, Value>,
+    stored_attributes: &HashMap<String, Value<P>>,
     schema: Option<&ResourceSchema>,
     basis: StoredValueAuthoringBasis,
     comparison: &ComparisonContext<'_, R>,
@@ -316,16 +322,21 @@ fn build_for_stored_values<S, D, R: ReferenceEquality>(
 /// removal crosses an ambiguous list identity, the list becomes
 /// [`ExplicitFields::WholeValue`]. That keeps the removal visible without assigning
 /// it to a guessed element.
-pub fn build_carried_from_resource_for_stored_values<S, D, R: ReferenceEquality>(
+pub fn build_carried_from_resource_for_stored_values<
+    S,
+    D,
+    P: StateValueLeaf,
+    R: ReferenceEquality,
+>(
     resource: &Resource<
         S,
         crate::resource::NoPlaceholder,
         crate::resource::AbsoluteBindingAddress,
         D,
     >,
-    prior_stored_attributes: &HashMap<String, Value>,
+    prior_stored_attributes: &HashMap<String, Value<P>>,
     prior_explicit: &ExplicitFields,
-    fresh_stored_attributes: &HashMap<String, Value>,
+    fresh_stored_attributes: &HashMap<String, Value<P>>,
     schema: Option<&ResourceSchema>,
     comparison: &ComparisonContext<'_, R>,
 ) -> ExplicitFields {
@@ -346,12 +357,27 @@ pub fn build_carried_from_resource_for_stored_values<S, D, R: ReferenceEquality>
         | ExplicitFields::WholeValue { .. }
         | ExplicitFields::Unrecorded => return rebuilt,
     };
+    // Authoring metadata compares historical trees. Lift the live desired
+    // shape here without admitting snapshots to desired-resource APIs.
+    let prior_snapshot = prior_stored_attributes
+        .iter()
+        .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
+        .collect();
+    let fresh_snapshot = fresh_stored_attributes
+        .iter()
+        .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
+        .collect();
+    let desired_snapshot = resource
+        .attributes
+        .iter()
+        .map(|(key, value)| (key.clone(), value.to_snapshot()))
+        .collect();
     carry_struct_fields(
         prior_children,
         rebuilt,
-        Some(CarryMap::Hash(prior_stored_attributes)),
-        CarryMap::Index(&resource.attributes),
-        CarryMap::Hash(fresh_stored_attributes),
+        Some(CarryMap::Hash(&prior_snapshot)),
+        CarryMap::Index(&desired_snapshot),
+        CarryMap::Hash(&fresh_snapshot),
         CarryContext::resource(schema, defs, *comparison),
     )
     .explicit
@@ -364,12 +390,12 @@ struct CarriedNode {
 
 #[derive(Clone, Copy)]
 enum CarryMap<'a> {
-    Hash(&'a HashMap<String, Value>),
-    Index(&'a IndexMap<String, Value>),
+    Hash(&'a HashMap<String, SnapshotValue>),
+    Index(&'a IndexMap<String, SnapshotValue>),
 }
 
 impl<'a> CarryMap<'a> {
-    fn get(self, key: &str) -> Option<&'a Value> {
+    fn get(self, key: &str) -> Option<&'a SnapshotValue> {
         match self {
             Self::Hash(fields) => fields.get(key),
             Self::Index(fields) => fields.get(key),
@@ -444,9 +470,9 @@ impl<'a, R: ReferenceEquality> CarryContext<'a, R> {
 fn carry_node<R: ReferenceEquality>(
     prior_explicit: &ExplicitFields,
     rebuilt: ExplicitFields,
-    prior_stored: Option<&Value>,
-    desired: &Value,
-    fresh: &Value,
+    prior_stored: Option<&SnapshotValue>,
+    desired: &SnapshotValue,
+    fresh: &SnapshotValue,
     context: CarryContext<'_, R>,
 ) -> CarriedNode {
     match prior_explicit {
@@ -472,8 +498,8 @@ fn carry_node<R: ReferenceEquality>(
 fn carry_legacy_list<R: ReferenceEquality>(
     element: &ExplicitFields,
     rebuilt: ExplicitFields,
-    desired: &Value,
-    fresh: &Value,
+    desired: &SnapshotValue,
+    fresh: &SnapshotValue,
     context: CarryContext<'_, R>,
 ) -> CarriedNode {
     let (Some(desired_items), Some(fresh_items)) = (concrete_list(desired), concrete_list(fresh))
@@ -506,8 +532,8 @@ fn carry_legacy_list<R: ReferenceEquality>(
 fn carry_whole_value<R: ReferenceEquality>(
     rebuilt: ExplicitFields,
     pending: &PendingPaths,
-    desired: &Value,
-    fresh: &Value,
+    desired: &SnapshotValue,
+    fresh: &SnapshotValue,
     context: CarryContext<'_, R>,
 ) -> CarriedNode {
     let (Some(desired_items), Some(fresh_items)) = (concrete_list(desired), concrete_list(fresh))
@@ -557,9 +583,9 @@ fn carry_whole_value<R: ReferenceEquality>(
 fn carry_struct<R: ReferenceEquality>(
     prior_children: &HashMap<String, ExplicitFields>,
     rebuilt: ExplicitFields,
-    prior_stored: Option<&Value>,
-    desired: &Value,
-    fresh: &Value,
+    prior_stored: Option<&SnapshotValue>,
+    desired: &SnapshotValue,
+    fresh: &SnapshotValue,
     context: CarryContext<'_, R>,
 ) -> CarriedNode {
     let (Some(desired_fields), Some(fresh_fields)) = (concrete_map(desired), concrete_map(fresh))
@@ -638,9 +664,9 @@ fn carry_struct_fields<R: ReferenceEquality>(
 fn carry_list<R: ReferenceEquality>(
     prior_elements: &[ExplicitFields],
     rebuilt: ExplicitFields,
-    prior_stored: Option<&Value>,
-    desired: &Value,
-    fresh: &Value,
+    prior_stored: Option<&SnapshotValue>,
+    desired: &SnapshotValue,
+    fresh: &SnapshotValue,
     context: CarryContext<'_, R>,
 ) -> CarriedNode {
     let (Some(desired_items), Some(fresh_items)) = (concrete_list(desired), concrete_list(fresh))
@@ -874,8 +900,8 @@ fn carried_list_without_alignment(
 }
 
 fn mutually_unique_pairs<R: ReferenceEquality>(
-    left: &[Value],
-    right: &[Value],
+    left: &[SnapshotValue],
+    right: &[SnapshotValue],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
     comparison: &ComparisonContext<'_, R>,
@@ -902,8 +928,8 @@ fn mutually_unique_pairs<R: ReferenceEquality>(
 
 fn pending_paths_by_element<R: ReferenceEquality>(
     elements: &[ExplicitFields],
-    desired_items: &[Value],
-    fresh_items: &[Value],
+    desired_items: &[SnapshotValue],
+    fresh_items: &[SnapshotValue],
     item_context: CarryContext<'_, R>,
 ) -> (Vec<BTreeSet<Vec<String>>>, Vec<Option<usize>>) {
     let authored_by_element: Vec<_> = elements
@@ -932,8 +958,8 @@ fn pending_paths_by_element<R: ReferenceEquality>(
 
 fn pending_candidate_paths<R: ReferenceEquality>(
     prior_authored_counts: BTreeMap<Vec<String>, usize>,
-    desired_items: &[Value],
-    fresh_items: &[Value],
+    desired_items: &[SnapshotValue],
+    fresh_items: &[SnapshotValue],
     item_context: CarryContext<'_, R>,
 ) -> (BTreeSet<Vec<String>>, Vec<Option<usize>>) {
     let broad_candidates: BTreeSet<_> = prior_authored_counts
@@ -1042,7 +1068,7 @@ fn collect_authored_paths(
     }
 }
 
-fn field_path_is_present(value: &Value, path: &[String]) -> bool {
+fn field_path_is_present(value: &SnapshotValue, path: &[String]) -> bool {
     let Some((head, tail)) = path.split_first() else {
         return true;
     };
@@ -1067,7 +1093,7 @@ fn field_path_is_present(value: &Value, path: &[String]) -> bool {
     }
 }
 
-fn concrete_map(value: &Value) -> Option<&IndexMap<String, Value>> {
+fn concrete_map(value: &SnapshotValue) -> Option<&IndexMap<String, SnapshotValue>> {
     if let Value::Concrete(ConcreteValue::Map(fields)) = value {
         Some(fields)
     } else {
@@ -1075,7 +1101,7 @@ fn concrete_map(value: &Value) -> Option<&IndexMap<String, Value>> {
     }
 }
 
-fn concrete_list(value: &Value) -> Option<&[Value]> {
+fn concrete_list(value: &SnapshotValue) -> Option<&[SnapshotValue]> {
     if let Value::Concrete(ConcreteValue::List(items)) = value {
         Some(items)
     } else {
@@ -2989,7 +3015,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("authored".into())),
             ),
         ])));
-        let stored_item = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        let stored_item: SnapshotValue = Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "effect".to_string(),
                 Value::Concrete(ConcreteValue::String("Allow".into())),

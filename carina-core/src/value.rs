@@ -4233,17 +4233,37 @@ pub fn rehydrate_saved_composition_secrets(
     crate::resource::SavedComposition<crate::resource::NoPlaceholder>,
     SecretRehydrationSiteError,
 > {
+    rehydrate_saved_composition_with_candidate(saved, Some(evaluated))
+}
+
+/// Convert a saved composition after optionally verifying its secret values.
+/// Without a candidate, every ordinary value crosses the checked snapshot
+/// conversion and any hash returns its typed unavailable-secret error.
+pub fn rehydrate_saved_composition_with_candidate(
+    saved: &crate::resource::SavedComposition,
+    evaluated: Option<&crate::resource::LiveComposition>,
+) -> Result<
+    crate::resource::SavedComposition<crate::resource::NoPlaceholder>,
+    SecretRehydrationSiteError,
+> {
+    let restore = |value: &SnapshotValue, candidate: Option<&Value>, location: String| {
+        if evaluated.is_some() {
+            restore_snapshot_entry(value, candidate, location)
+        } else {
+            value
+                .to_value_at(location)
+                .map_err(SecretRehydrationSiteError::from)
+        }
+    };
     let arguments = saved
         .signature
         .arguments
         .iter()
         .map(|(key, argument)| {
-            restore_snapshot_entry(
+            restore(
                 argument.value(),
                 evaluated
-                    .signature
-                    .arguments
-                    .get(key)
+                    .and_then(|evaluated| evaluated.signature.arguments.get(key))
                     .map(|argument| argument.value()),
                 format!("{}.arguments.{key}", saved.id),
             )
@@ -4256,11 +4276,9 @@ pub fn rehydrate_saved_composition_secrets(
         .iter()
         .map(|(key, attribute)| {
             let candidate = evaluated
-                .signature
-                .attributes
-                .get(key)
+                .and_then(|evaluated| evaluated.signature.attributes.get(key))
                 .and_then(|attribute| attribute.value());
-            restore_snapshot_entry(
+            restore(
                 &attribute.to_value(),
                 candidate.as_ref(),
                 format!("{}.attributes.{key}", saved.id),
@@ -14631,7 +14649,7 @@ pub(crate) fn canonicalize_snapshot_attribute_map_with_schema<Attributes>(
         .collect();
 }
 
-fn canonicalize_snapshot_with_type(
+pub(crate) fn canonicalize_snapshot_with_type(
     value: SnapshotValue,
     ty: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,

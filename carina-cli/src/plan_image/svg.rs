@@ -1267,7 +1267,13 @@ mod tests {
         );
         let mut plan = Plan::new();
         plan.add(Effect::Update {
-            from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
+            from: Box::new(
+                (State::<carina_core::resource::NoPlaceholder>::existing(
+                    resource.id.clone(),
+                    HashMap::new(),
+                ))
+                .to_snapshot(),
+            ),
             identifier: AppliedIdentifier::new("credential-id").unwrap(),
             to: resolved(resource.clone()),
             changed_attributes: vec!["secret_token".to_string(), "write_only_token".to_string()],
@@ -1323,7 +1329,13 @@ mod tests {
             .collect();
         let mut plan = Plan::new();
         plan.add(Effect::Update {
-            from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
+            from: Box::new(
+                (State::<carina_core::resource::NoPlaceholder>::existing(
+                    resource.id.clone(),
+                    HashMap::new(),
+                ))
+                .to_snapshot(),
+            ),
             identifier: AppliedIdentifier::new("long-label-id").unwrap(),
             to: resolved(resource.clone()),
             changed_attributes,
@@ -1428,7 +1440,13 @@ mod tests {
         let mut plan = Plan::new();
         for resource in [&desired[0], &desired[2]] {
             plan.add(Effect::Update {
-                from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
+                from: Box::new(
+                    (State::<carina_core::resource::NoPlaceholder>::existing(
+                        resource.id.clone(),
+                        HashMap::new(),
+                    ))
+                    .to_snapshot(),
+                ),
                 identifier: AppliedIdentifier::new(format!(
                     "{}-id",
                     resource.binding.as_ref().unwrap()

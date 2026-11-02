@@ -142,7 +142,7 @@ use carina_core::resource::DeferredValue;
 use carina_core::resource::{
     AbsoluteBindingAddress, BindingAddress, ConcreteValue, Current, DataSource, LiveComposition,
     ModuleSource, NoPlaceholder, ParserPlaceholder, PartialReadMarker, PlaceholderKind,
-    ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
+    ResolvedResource, ResolvedResourceId, Resource, ResourceId, SnapshotState as State, Value,
 };
 #[cfg(any(test, feature = "test-utils"))]
 use carina_core::schema::ValidatedResourceSchema;
@@ -3559,7 +3559,8 @@ fn detect_legacy_loop_moves_with_ctx(
         &|binding| state_view.entries_by_binding(claims, binding),
         claims,
         reserved_moves,
-    )?)
+    )
+    .map_err(Box::new)?)
 }
 
 fn detect_anonymous_to_named_moves_with_ctx(
@@ -3598,7 +3599,8 @@ fn detect_anonymous_to_named_moves_with_ctx(
                 .unwrap_or_default()
         },
         claims,
-    )?)
+    )
+    .map_err(Box::new)?)
 }
 
 fn detect_anonymous_to_named_moves_to_fixed_point(
@@ -5843,7 +5845,11 @@ async fn read_addressed_data_sources_phase2(
         {
             continue;
         }
-        orphan_resources.push(orphan.binding_resource());
+        // This live resource supplies only binding identity. Historical values
+        // are selected from ManagedCurrentView below, across the checked seam.
+        let mut resource: Resource = Resource::from_id(id.clone());
+        resource.binding = orphan.binding_address().cloned();
+        orphan_resources.push(resource);
     }
     let managed = addressed
         .sorted_resources
@@ -6961,6 +6967,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                         &outcome_unknown_import_replacements,
                     )
                     .await?;
+                let mut state_block_result = Ok(());
                 let mut plan = prepared.value.finish(|plan| {
                     add_deposed_delete_effects(plan, state_file, &addressed.moved_pairs);
                     block_deletes_on_prior_consumer_updates(plan, &directives_map);
@@ -6972,7 +6979,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
 
                     // State blocks run after differ/deposed identifier errors so `removed`
                     // remains the explicit recovery that can suppress those diagnostics.
-                    add_state_block_effects(
+                    state_block_result = add_state_block_effects(
                         plan,
                         &parsed.state_blocks,
                         state_file,
@@ -6986,6 +6993,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                         },
                     );
                 });
+                state_block_result?;
 
                 let analysis = carina_core::effect::deps::build_effect_dependency_analysis(
                     plan.effects(),
@@ -8942,26 +8950,39 @@ fn state_block_import(
     state_file: Option<&StateFile>,
     identifier: impl FnOnce() -> Value,
 ) -> Option<StateBlockImport> {
+    match try_state_block_import(id, state_file, || {
+        Ok::<_, std::convert::Infallible>(identifier())
+    }) {
+        Ok(import) => import,
+        Err(never) => match never {},
+    }
+}
+
+fn try_state_block_import<E>(
+    id: ResolvedResourceId,
+    state_file: Option<&StateFile>,
+    identifier: impl FnOnce() -> Result<Value, E>,
+) -> Result<Option<StateBlockImport>, E> {
     let disposition = state_file
         .map(|state| state.import_target_disposition_for_id(id.as_inner()))
         .unwrap_or(carina_state::ImportTargetDisposition::Vacant);
-    match disposition {
+    Ok(match disposition {
         carina_state::ImportTargetDisposition::Vacant => Some(StateBlockImport {
             effect: Effect::Import {
                 id,
-                identifier: identifier(),
+                identifier: identifier()?,
             },
             outcome_unknown_replacement: None,
         }),
         carina_state::ImportTargetDisposition::ReplaceCreateOutcomeUnknown => {
-            let (effect, replacement) = Effect::import_replacing_outcome_unknown(id, identifier());
+            let (effect, replacement) = Effect::import_replacing_outcome_unknown(id, identifier()?);
             Some(StateBlockImport {
                 effect,
                 outcome_unknown_replacement: Some(replacement),
             })
         }
         carina_state::ImportTargetDisposition::Occupied => None,
-    }
+    })
 }
 
 pub struct StateBlockEvaluationContext<'a> {
@@ -8997,7 +9018,7 @@ pub fn add_state_block_effects<D>(
         D,
     >],
     context: StateBlockEvaluationContext<'_>,
-) {
+) -> Result<(), carina_core::resolver::ResolutionError> {
     // Import identifier expressions use the same binding authority and
     // upstream deferral policy as ordinary resource attributes.
     let StateBlockEvaluationContext {
@@ -9028,7 +9049,7 @@ pub fn add_state_block_effects<D>(
                 // against the same binding view as resource attributes.
                 // Deferred upstream-state refs remain typed placeholders for
                 // display and apply-time resolution.
-                let Some(import) = state_block_import(
+                let Some(import) = try_state_block_import(
                     resolve_import_target(to, desired_resources),
                     state_file.as_ref(),
                     || {
@@ -9039,7 +9060,8 @@ pub fn add_state_block_effects<D>(
                             session,
                         )
                     },
-                ) else {
+                )?
+                else {
                     continue;
                 };
                 let StateBlockImport {
@@ -9157,6 +9179,7 @@ pub fn add_state_block_effects<D>(
     for effect in new_effects {
         plan.add(effect);
     }
+    Ok(())
 }
 
 /// Add delete-pending deposed generations from state to the plan.
@@ -9347,7 +9370,7 @@ pub async fn refresh_loaded_resource_with_retry(
     match loaded.read_target() {
         Some(target) => read_managed_state_with_retry(provider, &target, state_file, schemas)
             .await
-            .map(Current::from_state),
+            .map(Current::from_snapshot),
         None => Ok(loaded.into_current()),
     }
 }
@@ -9971,7 +9994,10 @@ async fn read_data_sources_phase2_pass(
                             if let Some(progress) = progress {
                                 progress.finish();
                             }
-                            Ok(Some((resource.id, DataSourceValue::read(state))))
+                            Ok(Some((
+                                resource.id,
+                                DataSourceValue::read(state.to_snapshot()),
+                            )))
                         }
                     }
                 }
@@ -10702,10 +10728,10 @@ impl MigrationCheckConfig {
                         &self.resources.data_sources,
                         |data_source| match state_file.build_state_for_resource(&data_source.id) {
                             Current::Present(present) => {
-                                DataSourceValue::read(present.state().clone())
+                                DataSourceValue::read((present.state().clone()).to_snapshot())
                             }
                             Current::MissingIdentifier(state) => {
-                                DataSourceValue::read(state.state().clone())
+                                DataSourceValue::read((state.state().clone()).to_snapshot())
                             }
                             Current::Absent(_)
                             | Current::CreateInFlight(_)

@@ -336,19 +336,11 @@ fn create_state_for_writeback(outcome: CreateOutcome) -> SnapshotState {
     complete_create_for_writeback(outcome, request).0
 }
 
-fn lifted_saved_attrs<P: StateValueLeaf>(
-    entries: impl IntoIterator<Item = (ResourceId, HashMap<String, Value<P>>)>,
+fn lifted_saved_attrs(
+    entries: impl IntoIterator<Item = (ResourceId, HashMap<String, SnapshotValue>)>,
 ) -> carina_core::provider::LiftedSavedAttrs {
-    RawSavedAttrs::from_decoded_values_for_test(
-        entries
-            .into_iter()
-            .map(|(id, attributes)| {
-                let state = State::existing(id.clone(), attributes).to_snapshot();
-                (id, state.attributes)
-            })
-            .collect(),
-    )
-    .lift(&carina_core::schema::SchemaRegistry::new())
+    RawSavedAttrs::from_decoded_values_for_test(entries.into_iter().collect())
+        .lift(&carina_core::schema::SchemaRegistry::new())
 }
 
 fn migrate_legacy_state_attribute(
@@ -378,7 +370,7 @@ fn migrate_legacy_state_attribute(
 }
 
 fn redacted_secret_and_legacy_marker(plaintext: &str) -> (SnapshotValue, String) {
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+    let secret: Value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String(plaintext.into()),
     ))));
     let persisted = PersistedValue::encode_provider_value(&secret, None)
@@ -5121,7 +5113,7 @@ async fn test_wasm_update_accepts_redacted_secret_in_current_state() {
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "secret-update", None);
     let (persisted_secret, _) = redacted_secret_and_legacy_marker("stored-write-only-secret");
-    let from = State::existing(
+    let from = SnapshotState::existing(
         id.clone(),
         HashMap::from([
             (
@@ -5171,7 +5163,7 @@ async fn test_wasm_update_carries_unchanged_redacted_secret_into_outcome() {
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "secret-carry", None);
     let (persisted_secret, _) = redacted_secret_and_legacy_marker("stored-write-only-secret");
-    let from = State::existing(
+    let from = SnapshotState::existing(
         id.clone(),
         HashMap::from([
             (
@@ -5236,7 +5228,7 @@ async fn test_wasm_update_preserves_cloud_attribute_with_nested_stored_secret_fo
     let created_identifier = created.identifier().clone();
 
     let (persisted_secret, _) = redacted_secret_and_legacy_marker("cloud-secret");
-    let from = State::existing(
+    let from = SnapshotState::existing(
         id.clone(),
         HashMap::from([
             (
@@ -5272,7 +5264,10 @@ async fn test_wasm_update_preserves_cloud_attribute_with_nested_stored_secret_fo
         .await
         .expect("read after update should succeed")
         .into_state();
-    assert_eq!(read.attributes.get("payload"), Some(&cloud_payload));
+    assert_eq!(
+        read.attributes.get("payload"),
+        Some(&cloud_payload.to_snapshot())
+    );
     assert_eq!(
         read.attributes.get("color"),
         Some(&Value::Concrete(ConcreteValue::String("blue".into())))
@@ -5313,7 +5308,7 @@ async fn test_wasm_mock_provider_normalizer() {
             Value::Concrete(ConcreteValue::Bool(true)),
         ),
     ]);
-    let state = carina_core::resource::State::existing(id.clone(), attrs.clone());
+    let state = carina_core::resource::SnapshotState::existing(id.clone(), attrs.clone());
     let mut states = HashMap::from([(id.clone(), state)]);
     normalize_provider_states(normalizer.as_ref(), &mut states)
         .await
@@ -5337,7 +5332,7 @@ async fn test_wasm_mock_provider_normalizer() {
     let mut pending_states = HashMap::from([
         (
             first_id.clone(),
-            State::existing(
+            SnapshotState::existing(
                 first_id.clone(),
                 HashMap::from([(
                     "__mock_normalize_state__".to_string(),
@@ -5347,7 +5342,7 @@ async fn test_wasm_mock_provider_normalizer() {
         ),
         (
             second_id.clone(),
-            State::existing(
+            SnapshotState::existing(
                 second_id.clone(),
                 HashMap::from([(
                     "__mock_normalize_state__".to_string(),
@@ -5720,7 +5715,7 @@ async fn test_wasm_pending_state_accepts_one_rekeyed_result_and_rejects_zero_res
     let rekeyed_id = ResourceId::pending_with_provider("mock", "test.resource", None);
     let mut rekeyed_states = HashMap::from([(
         rekeyed_id.clone(),
-        State::existing(
+        SnapshotState::existing(
             rekeyed_id.clone(),
             HashMap::from([
                 (
@@ -5747,7 +5742,7 @@ async fn test_wasm_pending_state_accepts_one_rekeyed_result_and_rejects_zero_res
     let dropped_id = ResourceId::pending_with_provider("mock", "test.resource", None);
     let mut dropped_states = HashMap::from([(
         dropped_id.clone(),
-        State::existing(
+        SnapshotState::existing(
             dropped_id,
             HashMap::from([(
                 "__mock_drop_state_result__".to_string(),
@@ -5765,7 +5760,7 @@ async fn test_wasm_pending_state_accepts_one_rekeyed_result_and_rejects_zero_res
     let hydrate_id = ResourceId::pending_with_provider("mock", "test.resource", None);
     let mut hydrate_states = HashMap::from([(
         hydrate_id.clone(),
-        State::existing(
+        SnapshotState::existing(
             hydrate_id.clone(),
             HashMap::from([(
                 "__mock_rekey_state_result__".to_string(),
@@ -5797,7 +5792,7 @@ async fn test_wasm_pending_state_accepts_one_rekeyed_result_and_rejects_zero_res
     let dropped_hydrate_id = ResourceId::pending_with_provider("mock", "test.resource", None);
     let mut dropped_hydrate_states = HashMap::from([(
         dropped_hydrate_id.clone(),
-        State::existing(
+        SnapshotState::existing(
             dropped_hydrate_id,
             HashMap::from([(
                 "__mock_drop_state_result__".to_string(),
@@ -5841,7 +5836,7 @@ async fn test_wasm_resolved_wire_key_collisions_are_normalized_one_at_a_time() {
     let mut states = HashMap::from([
         (
             first_id.clone(),
-            State::existing(
+            SnapshotState::existing(
                 first_id.clone(),
                 HashMap::from([(
                     "__mock_normalize_state__".to_string(),
@@ -5851,7 +5846,7 @@ async fn test_wasm_resolved_wire_key_collisions_are_normalized_one_at_a_time() {
         ),
         (
             second_id.clone(),
-            State::existing(
+            SnapshotState::existing(
                 second_id.clone(),
                 HashMap::from([(
                     "__mock_normalize_state__".to_string(),
@@ -5877,11 +5872,11 @@ async fn test_wasm_resolved_wire_key_collisions_are_normalized_one_at_a_time() {
     let mut hydrate_states = HashMap::from([
         (
             first_id.clone(),
-            State::existing(first_id.clone(), HashMap::new()),
+            SnapshotState::existing(first_id.clone(), HashMap::new()),
         ),
         (
             second_id.clone(),
-            State::existing(second_id.clone(), HashMap::new()),
+            SnapshotState::existing(second_id.clone(), HashMap::new()),
         ),
     ]);
     let saved_attrs = lifted_saved_attrs([
@@ -5986,7 +5981,7 @@ async fn test_wasm_normalizer_rejects_missing_and_extra_state_keys_atomically() 
         let mut states = HashMap::from([
             (
                 id.clone(),
-                State::existing(
+                SnapshotState::existing(
                     id,
                     HashMap::from([(
                         "original".to_string(),
@@ -5996,7 +5991,7 @@ async fn test_wasm_normalizer_rejects_missing_and_extra_state_keys_atomically() 
             ),
             (
                 update_id.clone(),
-                State::existing(
+                SnapshotState::existing(
                     update_id,
                     HashMap::from([(
                         "__mock_normalize_state__".to_string(),
@@ -6023,7 +6018,7 @@ async fn test_wasm_normalizer_rejects_missing_and_extra_state_keys_atomically() 
         let mut states = HashMap::from([
             (
                 id.clone(),
-                State::existing(
+                SnapshotState::existing(
                     id,
                     HashMap::from([(
                         "original".to_string(),
@@ -6033,7 +6028,7 @@ async fn test_wasm_normalizer_rejects_missing_and_extra_state_keys_atomically() 
             ),
             (
                 update_id.clone(),
-                State::existing(update_id.clone(), HashMap::new()),
+                SnapshotState::existing(update_id.clone(), HashMap::new()),
             ),
         ]);
         let before = states.clone();
@@ -6064,7 +6059,7 @@ async fn test_wasm_hydrate_read_state_round_trips_structural_redacted_secret() {
         .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+    let secret: Value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String("wasm-wire-secret".into()),
     ))));
     let persisted = PersistedValue::encode_provider_value(&secret, None)
@@ -6082,7 +6077,10 @@ async fn test_wasm_hydrate_read_state_round_trips_structural_redacted_secret() {
             hash: expected_hash.clone(),
         }));
     let id = ResourceId::with_provider_identity("mock", "test.resource", "secret-state", None);
-    let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), HashMap::new()))]);
+    let mut states = HashMap::from([(
+        id.clone(),
+        SnapshotState::existing(id.clone(), HashMap::new()),
+    )]);
     let saved_attrs = lifted_saved_attrs([(
         id.clone(),
         HashMap::from([("__mock_hydrate_read_state__".to_string(), persisted_secret)]),
@@ -6120,15 +6118,15 @@ async fn test_wasm_hydrate_keeps_marker_strings_plain_top_level_and_nested() {
     let mut states = HashMap::from([
         (
             top_plain_id.clone(),
-            State::existing(top_plain_id.clone(), HashMap::new()),
+            SnapshotState::existing(top_plain_id.clone(), HashMap::new()),
         ),
         (
             top_secret_id.clone(),
-            State::existing(top_secret_id.clone(), HashMap::new()),
+            SnapshotState::existing(top_secret_id.clone(), HashMap::new()),
         ),
         (
             nested_id.clone(),
-            State::existing(nested_id.clone(), HashMap::new()),
+            SnapshotState::existing(nested_id.clone(), HashMap::new()),
         ),
     ]);
     let nested = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
@@ -6213,7 +6211,10 @@ async fn test_wasm_hydrate_read_state_write_only_legacy_secret_plans_no_change()
         id.clone(),
         HashMap::from([("__mock_write_only_secret__".to_string(), typed)]),
     )]);
-    let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), HashMap::new()))]);
+    let mut states = HashMap::from([(
+        id.clone(),
+        SnapshotState::existing(id.clone(), HashMap::new()),
+    )]);
     hydrate_provider_states(
         normalizer.as_ref(),
         &mut states,
@@ -6275,7 +6276,7 @@ async fn test_wasm_normalize_state_trap_is_an_error_and_does_not_mutate_state() 
     );
     let mut states = HashMap::from([(
         id.clone(),
-        State::existing(
+        SnapshotState::existing(
             id,
             HashMap::from([(
                 "original".to_string(),
@@ -6508,7 +6509,7 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
     );
     let mut states = HashMap::from([(
         id.clone(),
-        State::existing(
+        SnapshotState::existing(
             id.clone(),
             HashMap::from([(
                 "original".to_string(),
@@ -6543,7 +6544,7 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
     );
     let mut hydrate_states = HashMap::from([(
         hydrate_id.clone(),
-        State::existing(
+        SnapshotState::existing(
             hydrate_id.clone(),
             HashMap::from([(
                 "original".to_string(),
@@ -6627,7 +6628,7 @@ async fn test_wasm_normalize_state_rejects_nested_non_finite_float_without_mutat
     let id = ResourceId::with_provider_identity("mock", "test.resource", "bad-state", None);
     let mut states = HashMap::from([(
         id.clone(),
-        State::existing(
+        SnapshotState::existing(
             id,
             HashMap::from([(
                 "values".to_string(),
@@ -6656,7 +6657,10 @@ async fn test_wasm_hydrate_rejects_non_finite_saved_attribute_without_mutation()
         .await
         .expect("normalizer should initialize");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "bad-saved", None);
-    let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), HashMap::new()))]);
+    let mut states = HashMap::from([(
+        id.clone(),
+        SnapshotState::existing(id.clone(), HashMap::new()),
+    )]);
     let before = states.clone();
     let saved_attrs = lifted_saved_attrs([(
         id,
@@ -6720,7 +6724,7 @@ async fn test_wasm_mock_provider_hydrate_read_state_preserves_host_ids() {
         .iter()
         .cloned()
         .map(|id| {
-            let state = State::existing(id.clone(), HashMap::new());
+            let state = SnapshotState::existing(id.clone(), HashMap::new());
             (id, state)
         })
         .collect::<HashMap<_, _>>();

@@ -1064,8 +1064,8 @@ fn append_dangling_reference_notes(
 /// Taking the typed effect keeps arbitrary text from being promoted into a
 /// [`RenderedValue`] by downstream renderers. Callers remain responsible for
 /// deciding whether their display surface should show this fallback.
-pub fn delete_identifier_fallback_row<V: crate::resource::PlanValueKind>(
-    effect: &Effect<crate::resource::ModuleSource, V>,
+pub fn delete_identifier_fallback_row<S, V: crate::resource::PlanValueKind>(
+    effect: &Effect<S, V>,
 ) -> Option<DetailRow> {
     let Effect::Delete { identifier, .. } = effect else {
         return None;

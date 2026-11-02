@@ -2996,14 +2996,31 @@ impl ResolvedBindings {
         source: BindingValueSource,
         completeness: BindingCompleteness,
     ) {
+        self.set_historical_with_completeness(
+            name,
+            attrs
+                .into_iter()
+                .map(|(key, value)| (key, value.to_snapshot()))
+                .collect(),
+            source,
+            completeness,
+        );
+    }
+
+    /// Install historical binding evidence. Resolution selects an attribute
+    /// before the snapshot-to-value conversion, so unrelated hashes stay opaque.
+    pub(crate) fn set_historical_with_completeness(
+        &mut self,
+        name: &str,
+        attrs: HashMap<String, crate::resource::SnapshotValue>,
+        source: BindingValueSource,
+        completeness: BindingCompleteness,
+    ) {
         let definitive_attributes = attrs.keys().cloned().collect();
         self.by_name.insert(
             name.to_string(),
             ResolvedBinding {
-                attributes: attrs
-                    .into_iter()
-                    .map(|(key, value)| (key, value.to_snapshot()))
-                    .collect(),
+                attributes: attrs,
                 source,
                 completeness,
                 definitive_attributes,

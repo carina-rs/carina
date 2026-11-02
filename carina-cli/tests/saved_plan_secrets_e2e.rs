@@ -7,7 +7,9 @@ use std::process::{Command, Output};
 use serde_json::Value;
 use tempfile::TempDir;
 
-use carina_core::resource::{ConcreteValue, DeferredValue, RedactedSecretHash, Value as CoreValue};
+use carina_core::resource::{
+    ConcreteValue, DeferredValue, ExpandedValue as CoreValue, RedactedSecretHash,
+};
 use carina_core::value::{PERSISTED_SECRET_KEY, PersistedValue};
 
 const V2_SECRET_PREFIX: &str = "$argon2id$";
@@ -3238,5 +3240,70 @@ exports {
         fs::read(scenario.project.join("carina.state.json")).expect("Carina state after plan"),
         state_before,
         "plan rejection mutated Carina state",
+    );
+}
+
+#[test]
+fn current_saved_plan_root_and_nested_hashes_round_trip_byte_for_byte() {
+    use carina_cli::commands::plan::PlanFile;
+    use carina_core::resource::{
+        ConcreteValue, DeferredValue, SnapshotLeaf, Value as SnapshotTree,
+    };
+    assert_eq!(PlanFile::CURRENT_VERSION, 39);
+    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v39.plan.json");
+    let plan: PlanFile = serde_json::from_str(fixture).unwrap();
+    assert_eq!(
+        carina_core::utils::pretty_with_newline(&plan).unwrap(),
+        fixture
+    );
+    let mut wire: Value = serde_json::from_str(fixture).unwrap();
+    let attributes = wire["unresolved_resources"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find_map(|resource| {
+            let attrs = resource["attributes"].as_object_mut()?;
+            attrs.get("comment")?.get("RedactedSecret")?;
+            Some(attrs)
+        })
+        .expect("current fixture contains a root hash");
+    let root = attributes["comment"].clone();
+    attributes.insert(
+        "nested_secret".into(),
+        serde_json::json!({
+            "Map": { "plain": { "String": "still selectable" },
+                     "list": { "List": [{ "Map": { "token": root } }] } }
+        }),
+    );
+    let plan: PlanFile = serde_json::from_value(wire).unwrap();
+    let bytes = carina_core::utils::pretty_with_newline_bytes(&plan).unwrap();
+    let decoded: PlanFile = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        carina_core::utils::pretty_with_newline_bytes(&decoded).unwrap(),
+        bytes
+    );
+    let resource = decoded
+        .unresolved_resources
+        .iter()
+        .find(|resource| resource.attributes.contains_key("nested_secret"))
+        .unwrap();
+    assert!(matches!(
+        &resource.attributes["comment"],
+        SnapshotTree::Deferred(DeferredValue::Placeholder(
+            SnapshotLeaf::RedactedSecret { .. }
+        ))
+    ));
+    let nested = &resource.attributes["nested_secret"];
+    assert_eq!(
+        nested.to_value_at("plan.nested_secret").unwrap_err().path(),
+        "plan.nested_secret.list[0].token"
+    );
+    let SnapshotTree::Concrete(ConcreteValue::Map(fields)) = nested else {
+        unreachable!()
+    };
+    assert!(
+        fields["plain"]
+            .to_value_at("plan.nested_secret.plain")
+            .is_ok()
     );
 }

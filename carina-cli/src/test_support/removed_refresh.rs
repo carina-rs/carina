@@ -231,23 +231,28 @@ async fn removed_no_refresh_saved_plan_apply() {
         "old",
         None,
     );
-    let mut snapshot = carina_core::resource::State::existing(
-        id.clone(),
-        std::collections::HashMap::from([(
-            "token".into(),
-            carina_core::resource::Value::Deferred(carina_core::resource::DeferredValue::Secret(
-                Box::new(carina_core::resource::Value::Concrete(
-                    carina_core::resource::ConcreteValue::String("historical-secret".into()),
-                )),
-            )),
-        )]),
-    );
+    let mut snapshot =
+        carina_core::resource::State::<carina_core::resource::NoPlaceholder>::existing(
+            id.clone(),
+            std::collections::HashMap::from([(
+                "token".into(),
+                carina_core::resource::Value::Deferred(
+                    carina_core::resource::DeferredValue::Secret(Box::new(
+                        carina_core::resource::Value::Concrete(
+                            carina_core::resource::ConcreteValue::String(
+                                "historical-secret".into(),
+                            ),
+                        ),
+                    )),
+                ),
+            )]),
+        );
     snapshot.identifier = Some("old-id".into());
     let snapshot = carina_core::value::redact_secrets_in_state(&snapshot).unwrap();
     let entry = plan::CurrentStateEntry::Managed {
         id,
         current: plan::SavedManagedCurrent::from_current(
-            carina_core::resource::Current::from_state(snapshot),
+            carina_core::resource::Current::from_snapshot(snapshot),
         ),
     };
     let mut saved: serde_json::Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();

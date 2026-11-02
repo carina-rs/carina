@@ -9,11 +9,11 @@ use indexmap::IndexMap;
 fn tags<S, D>(
     resource: &Resource<
         S,
-        carina_core::resource::NoPlaceholder,
+        carina_core::resource::SnapshotLeaf,
         carina_core::resource::AbsoluteBindingAddress,
         D,
     >,
-) -> &IndexMap<String, Value> {
+) -> &IndexMap<String, carina_core::resource::SnapshotValue> {
     match resource.get_attr("tags") {
         Some(Value::Concrete(ConcreteValue::Map(tags))) => tags,
         other => panic!(

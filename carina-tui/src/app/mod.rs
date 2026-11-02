@@ -136,8 +136,8 @@ impl App {
         )
     }
 
-    pub fn from_display(
-        display: PlanDisplay<'_>,
+    pub fn from_display<S, V: carina_core::resource::PlanValueKind>(
+        display: PlanDisplay<'_, S, V>,
         schemas: &SchemaRegistry,
         prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
         provider: &ProviderRouter,
@@ -166,8 +166,8 @@ impl App {
         Ok(Self::from_nodes(plan, nodes, replacement_display))
     }
 
-    fn from_nodes(
-        plan: &Plan,
+    fn from_nodes<S, V: carina_core::resource::PlanValueKind>(
+        plan: &Plan<S, V>,
         mut nodes: Vec<TreeNode>,
         replacement_display: Vec<ReplaceDisplayInfo<'_>>,
     ) -> Self {
@@ -684,7 +684,10 @@ impl App {
 /// - Builds forward/reverse dependency maps from `ResourceRef` attributes
 /// - Assigns each resource a single parent (shallowest dependency)
 /// - Sorts siblings by `(resource_type, binding_name)`
-fn build_tree_structure(plan: &Plan, nodes: &mut [TreeNode]) {
+fn build_tree_structure<S, V: carina_core::resource::PlanValueKind>(
+    plan: &Plan<S, V>,
+    nodes: &mut [TreeNode],
+) {
     if nodes.is_empty() {
         return;
     }
@@ -719,7 +722,10 @@ fn build_tree_structure(plan: &Plan, nodes: &mut [TreeNode]) {
 }
 
 /// Shorten effect labels: strip provider prefix and use binding name or compact hint.
-fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
+fn shorten_effect_labels<S, V: carina_core::resource::PlanValueKind>(
+    plan: &Plan<S, V>,
+    nodes: &mut [TreeNode],
+) {
     for (idx, effect) in plan.effects().iter().enumerate() {
         // carina#3181 PR D: `Effect` payloads are typestate structs;
         // reach them through the shared `ResourceLike` view.
@@ -794,8 +800,8 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
     }
 }
 
-fn effect_to_node(
-    display: &PlanDisplay<'_>,
+fn effect_to_node<S, V: carina_core::resource::PlanValueKind>(
+    display: &PlanDisplay<'_, S, V>,
     index: usize,
     schemas: &SchemaRegistry,
     replacement_info: Option<ReplaceDisplayInfo<'_>>,

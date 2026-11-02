@@ -15,6 +15,7 @@ use carina_core::differ::{Orphan, Orphans, into_all_prior_states, lift_prior_sta
 use carina_core::effect::Effect;
 use carina_core::executor::UnresolvedDataSourceInput;
 use carina_core::parser::{ProviderContext, ResourceTypePath, StateBlockAddress};
+#[cfg(test)]
 use carina_core::plan::Plan;
 use carina_core::plan::{
     CreateOutcomeUnknownAbsentResolution, create_outcome_unknown_absent_resolution,
@@ -25,8 +26,10 @@ use carina_core::provider::{
 };
 use carina_core::resource::{
     AbsoluteBindingAddress, Current, DataSource, ResolvedDataSource, ResolvedResource,
-    ResolvedResourceId, ResourceId, ResourceIdentity, State, Value,
+    ResolvedResourceId, ResourceId, ResourceIdentity, SnapshotState, SnapshotValue,
 };
+#[cfg(test)]
+use carina_core::resource::{State, Value};
 use carina_core::shutdown::{
     CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
 };
@@ -891,7 +894,7 @@ enum StateCommandStateKind {
 /// from flattening an in-flight create into an empty attribute-bearing state.
 enum StateCommandCurrent<'a> {
     State {
-        state: &'a State,
+        state: &'a SnapshotState,
         kind: StateCommandStateKind,
     },
     CreateInFlight(&'a InFlightCreate),
@@ -1299,8 +1302,8 @@ async fn run_state_lookup(
 ///
 /// Each resource in the state becomes a `Read` effect so the TUI can
 /// render it with all attributes in the detail panel.
-fn build_plan_from_state(state: &StateFile) -> Plan {
-    let mut plan = Plan::new();
+fn build_plan_from_state(state: &StateFile) -> carina_core::plan::SnapshotPlan {
+    let mut plan = carina_core::plan::SnapshotPlan::default();
     for rs in state.resources() {
         let id = ResolvedResourceId::with_provider_identity(
             &rs.provider,
@@ -1387,7 +1390,7 @@ fn format_state_show(state: &StateFile) -> String {
 
 fn format_attributes_for_show(
     output: &mut String,
-    attributes: HashMap<String, Value>,
+    attributes: HashMap<String, SnapshotValue>,
     indent: &str,
 ) {
     let mut keys: Vec<&String> = attributes.keys().collect();
@@ -2371,7 +2374,7 @@ async fn refresh_existing_resources_until_cancelled(
                 }
             }
         };
-        let result: Result<(ResourceId, State), AppError> = match next {
+        let result: Result<(ResourceId, SnapshotState), AppError> = match next {
             CleanupInterrupted::Completed(Some(result)) => result,
             CleanupInterrupted::Completed(None) => break,
             CleanupInterrupted::Abandoned => {
@@ -2386,7 +2389,7 @@ async fn refresh_existing_resources_until_cancelled(
 
         let (id, state) = result?;
         refreshed.insert(id.clone());
-        managed_current.insert(id, Current::from_state(state));
+        managed_current.insert(id, Current::from_snapshot(state));
     }
 
     drop(in_flight);
@@ -2706,18 +2709,16 @@ fn desired_resource_for_deposed<'a>(
 }
 
 fn synthetic_deposed_resource(target: &DeposedRefreshTarget) -> ResolvedResource {
-    let mut resource = ResolvedResource::from_id(target.id().clone());
-    for (key, value) in target.generation().persisted_attributes().to_values() {
-        resource.set_attr(key, value);
-    }
-    resource
+    // The generation retains its persisted hash shapes. This resource only
+    // identifies the schema/route and never contains historical values.
+    ResolvedResource::from_id(target.id().clone())
 }
 
 async fn normalize_deposed_read_state<P>(
     provider: &P,
     target: &DeposedRefreshTarget,
     resource: &ResolvedResource,
-    fresh_state: &mut State,
+    fresh_state: &mut SnapshotState,
     schemas: &carina_core::schema::SchemaRegistry,
 ) -> Result<(), ProviderError>
 where
@@ -3161,7 +3162,7 @@ mod tests {
             )
             .expect("state fixture is valid");
         let fresh = Current::from_state(
-            State::existing(
+            State::<carina_core::resource::NoPlaceholder>::existing(
                 desired.id.clone(),
                 HashMap::from([(
                     "function_name".to_string(),
@@ -3770,7 +3771,12 @@ mod tests {
         ) -> BoxFuture<'_, ProviderResult<State>> {
             self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let id = resource.id.clone();
-            Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+            Box::pin(async move {
+                Ok(State::<carina_core::resource::NoPlaceholder>::existing(
+                    id,
+                    HashMap::new(),
+                ))
+            })
         }
 
         fn create(
@@ -3910,7 +3916,12 @@ mod tests {
                 self.trigger.request_graceful_shutdown();
             }
             let id = resource.id.clone();
-            Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+            Box::pin(async move {
+                Ok(State::<carina_core::resource::NoPlaceholder>::existing(
+                    id,
+                    HashMap::new(),
+                ))
+            })
         }
 
         fn create(
@@ -4496,7 +4507,7 @@ mod tests {
     struct DeposedRefreshTestProvider {
         read_results: HashMap<(String, String), Result<State, String>>,
         hydrate_saved_attrs: bool,
-        hydrated_saved_values: Mutex<Vec<Value>>,
+        hydrated_saved_values: Mutex<Vec<SnapshotValue>>,
     }
 
     impl DeposedRefreshTestProvider {
@@ -4854,7 +4865,7 @@ mod tests {
         let current_states = HashMap::from([(
             source.id.clone(),
             Current::from_state(
-                State::existing(
+                State::<carina_core::resource::NoPlaceholder>::existing(
                     source.id.clone(),
                     HashMap::from([
                         ("name".to_string(), string_value("source")),
@@ -4957,8 +4968,11 @@ mod tests {
             .iter()
             .map(|resource| resource.id.clone())
             .collect();
-        let refreshed =
-            State::existing(child.id.clone(), HashMap::new()).with_identifier("widget-1");
+        let refreshed = State::<carina_core::resource::NoPlaceholder>::existing(
+            child.id.clone(),
+            HashMap::new(),
+        )
+        .with_identifier("widget-1");
         let provider = DeposedRefreshTestProvider::default()
             .with_saved_attr_hydration()
             .with_read_state(&child.id, "widget-1", refreshed);
@@ -5706,11 +5720,15 @@ mod tests {
             Some("west".to_string()),
         );
         let provider = DeposedRefreshTestProvider::default()
-            .with_read_state(&gone_id, "vpc-gone", State::not_found(gone_id.clone()))
+            .with_read_state(
+                &gone_id,
+                "vpc-gone",
+                State::<carina_core::resource::NoPlaceholder>::not_found(gone_id.clone()),
+            )
             .with_read_state(
                 &alive_id,
                 "vpc-alive",
-                State::existing(
+                State::<carina_core::resource::NoPlaceholder>::existing(
                     alive_id.clone(),
                     HashMap::from([
                         ("vpc_id".to_string(), string_value("vpc-alive")),
@@ -5747,6 +5765,7 @@ mod tests {
                 .expect("row has applied attributes")
                 .get("vpc_id"),
             carina_core::value::json_to_dsl_value(&json!("vpc-current"))
+                .map(|value| value.to_snapshot())
         );
         assert_eq!(row.deposed.len(), 1);
         assert_eq!(row.deposed[0].key, alive_key);
@@ -5755,10 +5774,12 @@ mod tests {
         assert_eq!(
             row.deposed[0].persisted_attributes().get("vpc_id"),
             carina_core::value::json_to_dsl_value(&json!("vpc-alive"))
+                .map(|value| value.to_snapshot())
         );
         assert_eq!(
             row.deposed[0].persisted_attributes().get("cidr_block"),
             carina_core::value::json_to_dsl_value(&json!("10.0.1.0/16"))
+                .map(|value| value.to_snapshot())
         );
         assert_eq!(
             summary,
@@ -5790,7 +5811,7 @@ mod tests {
         let provider = DeposedRefreshTestProvider::default().with_read_state(
             &id,
             "vpc-gone",
-            State::not_found(id.clone()),
+            State::<carina_core::resource::NoPlaceholder>::not_found(id.clone()),
         );
 
         let summary = refresh_deposed_generations_until_cancelled(
@@ -5843,7 +5864,7 @@ mod tests {
         let provider = DeposedRefreshTestProvider::default().with_read_state(
             &id,
             "db-old",
-            State::existing(
+            State::<carina_core::resource::NoPlaceholder>::existing(
                 id.clone(),
                 HashMap::from([("endpoint".to_string(), string_value("new.example"))]),
             )
@@ -5889,10 +5910,12 @@ mod tests {
         assert_eq!(
             attributes.get("password"),
             carina_core::value::json_to_dsl_value(&json!("previous-password"))
+                .map(|value| value.to_snapshot())
         );
         assert_eq!(
             attributes.get("endpoint"),
             carina_core::value::json_to_dsl_value(&json!("new.example"))
+                .map(|value| value.to_snapshot())
         );
     }
 
@@ -5915,7 +5938,7 @@ mod tests {
         let provider = DeposedRefreshTestProvider::default().with_read_state(
             &id,
             "db-old",
-            State::existing(
+            State::<carina_core::resource::NoPlaceholder>::existing(
                 id.clone(),
                 HashMap::from([(
                     "password".to_string(),
@@ -5962,6 +5985,7 @@ mod tests {
         assert_eq!(
             attributes.get("password"),
             carina_core::value::json_to_dsl_value(&json!("previous-password"))
+                .map(|value| value.to_snapshot())
         );
     }
 
@@ -5984,7 +6008,7 @@ mod tests {
         let provider = DeposedRefreshTestProvider::default().with_read_state(
             &id,
             "db-old",
-            State::existing(
+            State::<carina_core::resource::NoPlaceholder>::existing(
                 id.clone(),
                 HashMap::from([("password".to_string(), string_value("plain-secret"))]),
             )
@@ -6046,7 +6070,7 @@ mod tests {
         let provider = DeposedRefreshTestProvider::default().with_read_state(
             &ResolvedResourceId::new(id.clone()),
             "db-old",
-            State::existing(
+            State::<carina_core::resource::NoPlaceholder>::existing(
                 id.clone(),
                 HashMap::from([
                     ("password".to_string(), string_value("plain-secret")),
@@ -6093,10 +6117,12 @@ mod tests {
         assert_eq!(
             attributes.get("endpoint"),
             carina_core::value::json_to_dsl_value(&json!("db.example"))
+                .map(|value| value.to_snapshot())
         );
         assert_eq!(
             attributes.get("password"),
-            carina_core::value::json_to_dsl_value(&json!("old-hash")),
+            carina_core::value::json_to_dsl_value(&json!("old-hash"))
+                .map(|value| value.to_snapshot()),
             "deposed refresh must carry its persisted value instead of a provider echo"
         );
     }
@@ -6124,7 +6150,7 @@ mod tests {
         let provider = DeposedRefreshTestProvider::default().with_read_state(
             &ResolvedResourceId::new(id.clone()),
             "db-old",
-            State::existing(
+            State::<carina_core::resource::NoPlaceholder>::existing(
                 id.clone(),
                 HashMap::from([("password".to_string(), string_value("plain-secret"))]),
             )
@@ -6198,7 +6224,7 @@ mod tests {
         let provider = DeposedRefreshTestProvider::default().with_read_state(
             &ResolvedResourceId::new(id.clone()),
             "vpc-old",
-            State::existing(
+            State::<carina_core::resource::NoPlaceholder>::existing(
                 id.clone(),
                 HashMap::from([(
                     "tags".to_string(),
@@ -6321,7 +6347,7 @@ mod tests {
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
-        let fresh = State::existing(
+        let fresh = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([
                 ("cidr_block".to_string(), string_value("10.0.1.0/24")),
@@ -6398,7 +6424,8 @@ mod tests {
                 .persisted_attributes()
                 .expect("refreshed orphan has attributes")
                 .get("token"),
-            carina_core::value::json_to_dsl_value(&json!("old-token")),
+            carina_core::value::json_to_dsl_value(&json!("old-token"))
+                .map(|value| value.to_snapshot()),
             "orphan refresh must carry the previous write-only value even if the provider echoes it"
         );
         assert!(refreshed.protected);
@@ -6451,7 +6478,7 @@ mod tests {
                     .with_attribute("items", json!(["a", "b"])),
             )
             .expect("test state setup must be valid");
-        let fresh = State::existing(
+        let fresh = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "items".to_string(),
@@ -6505,7 +6532,9 @@ mod tests {
                     .with_attribute("config", json!({})),
             )
             .expect("test state setup must be valid");
-        let fresh = State::existing(id.clone(), HashMap::new()).with_identifier("settings-current");
+        let fresh =
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("settings-current");
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "test",
@@ -6561,7 +6590,7 @@ mod tests {
             .upsert_resource(prior)
             .expect("test state setup must be valid");
 
-        let fresh = State::existing(
+        let fresh = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "tags".to_string(),
@@ -6656,7 +6685,7 @@ mod tests {
             .upsert_resource(prior)
             .expect("test state setup must be valid");
 
-        let fresh = State::existing(
+        let fresh = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([
                 (
@@ -6740,8 +6769,11 @@ mod tests {
         let id = desired.id.clone();
         let applied = resolved(applied);
         let desired = resolved(desired);
-        let provider_state =
-            State::existing(id.clone(), provider_attributes).with_identifier("provider-id");
+        let provider_state = State::<carina_core::resource::NoPlaceholder>::existing(
+            id.clone(),
+            provider_attributes,
+        )
+        .with_identifier("provider-id");
         let accepted_create = AcceptedRequest::create_for_test();
         let prior = ResourceState::from_provider_state_for_resource_and_schema(
             &applied,
@@ -6984,7 +7016,7 @@ mod tests {
                     .with_attribute("password", structural_legacy_secret(&"ab".repeat(32))),
             )
             .expect("test state setup must be valid");
-        let fresh = State::existing(
+        let fresh = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([("password".to_string(), string_value("plain-secret"))]),
         )
@@ -7040,7 +7072,7 @@ mod tests {
         let mut provider_tags = indexmap::IndexMap::new();
         provider_tags.insert("Name".to_string(), string_value("new-name"));
         provider_tags.insert("SecretTag".to_string(), string_value("plain-secret"));
-        let fresh = State::existing(
+        let fresh = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "tags".to_string(),
@@ -7116,7 +7148,7 @@ mod tests {
                     .expect("fixture identifier is non-empty"),
             )
             .expect("test state setup must be valid");
-        let fresh = State::existing(
+        let fresh = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([("password".to_string(), string_value("plain-secret"))]),
         )
@@ -7175,7 +7207,9 @@ mod tests {
         state
             .upsert_resource(existing)
             .expect("test state setup must be valid");
-        let fresh = State::existing(id.clone(), HashMap::new()).with_identifier("db-current");
+        let fresh =
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("db-current");
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
@@ -7205,7 +7239,7 @@ mod tests {
             row.persisted_attributes()
                 .expect("row has applied attributes")
                 .get("password"),
-            carina_core::value::json_to_dsl_value(&json!("old")),
+            carina_core::value::json_to_dsl_value(&json!("old")).map(|value| value.to_snapshot()),
         );
         assert_eq!(row.write_only_attributes(), ["password"]);
     }
@@ -7229,7 +7263,9 @@ mod tests {
         state
             .upsert_resource(existing)
             .expect("test state setup must be valid");
-        let fresh = State::existing(id.clone(), HashMap::new()).with_identifier("db-current");
+        let fresh =
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+                .with_identifier("db-current");
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
@@ -7261,7 +7297,7 @@ mod tests {
             row.persisted_attributes()
                 .expect("row has applied attributes")
                 .get("password"),
-            carina_core::value::json_to_dsl_value(&json!(marker))
+            carina_core::value::json_to_dsl_value(&json!(marker)).map(|value| value.to_snapshot())
         );
     }
 
@@ -7289,7 +7325,7 @@ mod tests {
             .with_read_state(
                 &id,
                 "db-old",
-                State::existing(
+                State::<carina_core::resource::NoPlaceholder>::existing(
                     id.clone(),
                     HashMap::from([("endpoint".to_string(), string_value("new.example"))]),
                 )
@@ -7320,10 +7356,12 @@ mod tests {
         assert_eq!(
             attrs.get("endpoint"),
             carina_core::value::json_to_dsl_value(&json!("new.example"))
+                .map(|value| value.to_snapshot())
         );
         assert_eq!(
             attrs.get("description"),
             carina_core::value::json_to_dsl_value(&json!("kept from state"))
+                .map(|value| value.to_snapshot())
         );
         assert_eq!(
             summary,
@@ -7375,7 +7413,7 @@ mod tests {
         let provider = DeposedRefreshTestProvider::default().with_read_state(
             &id,
             "widget-old",
-            State::existing(
+            State::<carina_core::resource::NoPlaceholder>::existing(
                 id.clone(),
                 HashMap::from([("status".to_string(), string_value("Enabled"))]),
             )
@@ -7477,7 +7515,7 @@ mod tests {
         let provider = DeposedRefreshTestProvider::default().with_read_state(
             &id,
             "db-old",
-            State::existing(
+            State::<carina_core::resource::NoPlaceholder>::existing(
                 id.clone(),
                 HashMap::from([("password".to_string(), string_value("plain-secret"))]),
             )
@@ -7565,6 +7603,7 @@ mod tests {
         assert_eq!(
             row.deposed[0].persisted_attributes().get("vpc_id"),
             carina_core::value::json_to_dsl_value(&json!("vpc-old"))
+                .map(|value| value.to_snapshot())
         );
         assert_eq!(
             summary,
@@ -7596,7 +7635,7 @@ mod tests {
             .upsert_resource(row)
             .expect("test state setup must be valid");
         let desired = Resource::with_provider("awscc", "ec2.Vpc", "main", None);
-        let fresh = State::existing(
+        let fresh = State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([("vpc_id".to_string(), string_value("vpc-current"))]),
         )
