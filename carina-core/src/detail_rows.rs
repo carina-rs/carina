@@ -3479,6 +3479,150 @@ mod tests {
     }
 
     #[test]
+    fn redacted_saved_plan_update_and_replace_render_before_rehydration() {
+        let secret = |plaintext: &str| {
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String(plaintext.into()),
+            ))))
+        };
+        let attributes = |plaintext: &str| {
+            HashMap::from([
+                ("password".to_string(), secret(plaintext)),
+                (
+                    "credentials".to_string(),
+                    Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                        ("token".into(), secret(plaintext)),
+                        (
+                            "public".into(),
+                            Value::Concrete(ConcreteValue::String("public-value".into())),
+                        ),
+                    ]))),
+                ),
+            ])
+        };
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "",
+            PatternResourceSchema::new("test.Widget")
+                .attribute(
+                    PatternAttributeSchema::optional("password", PatternAttributeType::string())
+                        .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::optional(
+                        "credentials",
+                        PatternAttributeType::map(PatternAttributeType::string()),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        for replacement in [false, true] {
+            let mut desired = Resource::new("test.Widget", "example");
+            for (key, value) in attributes("new-private-token") {
+                desired.set_attr(key, value);
+            }
+            let id = desired.id.clone();
+            let to = ResolvedResource::resolve_raw_fixture(desired, &registry).unwrap();
+            let previous =
+                crate::test_support::snapshot_attributes(attributes("old-private-token"));
+            let mut plan = Plan::new();
+            if replacement {
+                plan.add(Effect::Create(to));
+                plan.add(Effect::Delete {
+                    id: crate::resource::ResolvedResourceId::new(id.clone()),
+                    identifier: crate::effect::fixture_applied_identifier("widget-id"),
+                    generation: EffectGeneration::Current,
+                    directives: Default::default(),
+                    binding: None,
+                    dependencies: Default::default(),
+                    explicit_dependencies: Default::default(),
+                    blocked_by_updates: Default::default(),
+                });
+                plan.replace_display_mut().push(ReplaceDisplayMetadata {
+                    create_idx: 0,
+                    delete_idx: 1,
+                    create_before_destroy: false,
+                    changed_create_only: ChangedCreateOnly::try_from(vec!["password".to_string()])
+                        .unwrap(),
+                    cascade_ref_hints: Vec::new(),
+                    temporary_name: None,
+                    previous_attributes: previous,
+                });
+            } else {
+                plan.add(Effect::Update {
+                    from: Box::new(crate::resource::SnapshotState::existing(
+                        id.clone(),
+                        previous,
+                    )),
+                    identifier: crate::effect::fixture_applied_identifier("widget-id"),
+                    to,
+                    changed_attributes: vec!["password".into(), "credentials".into()],
+                });
+            }
+            let saved = crate::value::redact_secrets_in_plan(&plan).unwrap();
+            let wire = serde_json::to_string(&SavedPlan::from(saved)).unwrap();
+            assert!(!wire.contains("old-private-token"));
+            assert!(!wire.contains("new-private-token"));
+            let unresolved: UnresolvedSavedPlan = serde_json::from_str(&wire).unwrap();
+            let loaded = unresolved.resolve_with_schemas(&registry).unwrap();
+            let historical = HistoricalDisplayAttributes::for_plan(&loaded);
+            let (registry, provider) =
+                crate::provider::comparison_fixture_for_test(&registry, std::iter::once(&id));
+            let rows = if replacement {
+                let Effect::Create(to) = &loaded.effects()[0] else {
+                    panic!("replacement create");
+                };
+                super::build_replace_detail_rows_from_display(
+                    &loaded,
+                    to,
+                    loaded.replace_display_info().next().unwrap(),
+                    &historical,
+                    Some(&registry),
+                    DetailLevel::Full,
+                    None,
+                    &provider,
+                    DetailComparisons::RecordedEffects,
+                )
+            } else {
+                build_detail_rows_by_instance(
+                    &loaded.effects()[0],
+                    Some(&registry),
+                    DetailLevel::Full,
+                    &historical,
+                    None,
+                    &provider,
+                    DetailComparisons::RecordedEffects,
+                )
+            }
+            .expect("redacted saved-plan rows must render before rehydration");
+            assert!(rows.iter().any(|row| matches!(
+                row,
+                DetailRow::Changed { key, old, new }
+                    | DetailRow::ChangedForcesReplacement { key, old, new }
+                    if key == "password" && old.plain() == "(secret)" && new.plain() == "(secret)"
+            )), "{rows:?}");
+            let rendered = format!("{rows:?}");
+            assert!(!rendered.contains("old-private-token"));
+            assert!(!rendered.contains("new-private-token"));
+            let masked = if replacement {
+                &historical.deletes.values().next().unwrap().attributes
+            } else {
+                &historical.updates[&id].attributes
+            };
+            assert!(masked["password"].secret_hash().is_some());
+            assert!(
+                masked["credentials"]
+                    .get("token")
+                    .unwrap()
+                    .secret_hash()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
     fn saved_plan_secret_rehydration_renders_from_rehydrated_effect() {
         let secret = |plaintext: &str| {
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(

@@ -961,6 +961,10 @@ pub enum AppError {
     #[error(transparent)]
     ValueResolution(#[from] carina_core::resolver::ResolutionError),
 
+    /// Snapshot redaction or another serialization boundary failed.
+    #[error(transparent)]
+    Serialization(#[from] carina_core::value::SerializationError),
+
     #[error(transparent)]
     DeferredForExpansion(#[from] carina_core::parser::DeferredForExpansionError),
 
@@ -1519,12 +1523,6 @@ impl From<String> for AppError {
 impl From<&str> for AppError {
     fn from(s: &str) -> Self {
         AppError::Config(s.to_string())
-    }
-}
-
-impl From<carina_core::value::SerializationError> for AppError {
-    fn from(e: carina_core::value::SerializationError) -> Self {
-        AppError::Config(e.to_string())
     }
 }
 

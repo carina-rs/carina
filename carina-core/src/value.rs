@@ -3221,10 +3221,13 @@ fn project_secret_shape<P: ValueKind, Q: ValueKind>(
     shape: &Value<Q>,
     mode: SecretShapeProjectionMode,
 ) -> Value<P> {
-    if mode.preserves_secret_value()
-        && (matches!(value, Value::Deferred(DeferredValue::Secret(_)))
-            || matches!(value, Value::Deferred(DeferredValue::Placeholder(leaf)) if leaf.redacted_secret_hash().is_some()))
+    // Historical hashes already carry sensitivity. Display must keep them
+    // opaque rather than introduce a live Secret that needs evaluation.
+    if matches!(value, Value::Deferred(DeferredValue::Placeholder(leaf)) if leaf.redacted_secret_hash().is_some())
     {
+        return value.clone();
+    }
+    if mode.preserves_secret_value() && matches!(value, Value::Deferred(DeferredValue::Secret(_))) {
         return value.clone();
     }
     if !contains_secret(shape) {

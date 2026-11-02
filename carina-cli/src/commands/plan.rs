@@ -5471,7 +5471,7 @@ fn map_plan_save_error(error: PlanSaveError, flag: &str) -> AppError {
              applied ({reason}). Apply the upstream module(s) first, \
              or rerun without {flag}."
         )),
-        PlanSaveError::Serialization(error) => AppError::Config(error.to_string()),
+        PlanSaveError::Serialization(error) => AppError::from(error),
         PlanSaveError::CompositionSourceIdentity(error) => AppError::from(error),
         PlanSaveError::ProviderEvidence(error) => {
             AppError::Config(format!("Cannot save plan: {error}"))
@@ -8813,6 +8813,45 @@ mod plan_serialization_error_tests {
         Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path,
         }))
+    }
+
+    #[test]
+    fn plan_save_serialization_preserves_unavailable_secret_at_cli_boundary() {
+        use crate::error::AppError;
+        use carina_core::resource::SnapshotValue;
+        use carina_core::value::{redact_plaintext_using_secret_shape, redact_secrets_in_value};
+
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("private-token".into()),
+        ))));
+        let historical = SnapshotValue::Concrete(carina_core::resource::ConcreteValue::Map(
+            indexmap::IndexMap::from([("token".into(), redact_secrets_in_value(&secret).unwrap())]),
+        ));
+        let whole_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::Map(indexmap::IndexMap::from([("token".into(), secret)])),
+        ))));
+        for flag in [None, Some("--out"), Some("--json")] {
+            let error = redact_plaintext_using_secret_shape(&historical, &whole_secret)
+                .expect_err("whole-container redaction cannot recover a nested historical hash");
+            let expected = match &error {
+                SerializationError::UnavailableSecret(error) => error.clone(),
+                other => panic!("expected typed unavailable-secret error, got {other:?}"),
+            };
+            assert_eq!(expected.path(), "state.token");
+            let error = match flag {
+                Some(flag) => super::map_plan_save_error(error.into(), flag),
+                None => AppError::from(error),
+            };
+            assert!(
+                matches!(
+                    &error,
+                    AppError::Serialization(SerializationError::UnavailableSecret(actual))
+                        if actual == &expected
+                ),
+                "CLI flattened the serialization failure: {error:?}"
+            );
+            assert_eq!(error.to_string(), expected.to_string());
+        }
     }
 
     #[test]
