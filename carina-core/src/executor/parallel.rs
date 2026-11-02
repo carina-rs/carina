@@ -1344,7 +1344,7 @@ pub(super) async fn execute_effects_sequential<
     }
     for report in abandonment.create_reports {
         match report {
-            CancelledCreateReport::Untracked => {}
+            CancelledCreateReport::NotCreated => {}
             CancelledCreateReport::OutcomeUnknown(unknown) => {
                 accumulated.insert_unpublished(
                     unknown.id().clone(),
@@ -1634,7 +1634,7 @@ mod tests {
             Box::pin(async move {
                 if id.identity_str().expect("resolved identity") == "alb" {
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                    Err(attempt.untracked(ProviderError::api_error("alb create failed")))
+                    Err(attempt.not_created(ProviderError::api_error("alb create failed")))
                 } else {
                     Ok(crate::provider::CreateOutcome::fixture_success(
                         AppliedState::new(id, "cert-id", HashMap::new())

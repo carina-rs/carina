@@ -87,7 +87,7 @@ use carina_provider_protocol::types::{
 };
 use std::collections::{BTreeMap, HashMap};
 
-/// Failure while projecting validated SDK schemas onto version-19 JSON.
+/// Failure while projecting validated SDK schemas onto version-20 JSON.
 #[derive(Debug)]
 pub enum SchemaSerializationError {
     Convert(carina_core::protocol_convert::ProtocolConvertError),
@@ -190,7 +190,7 @@ impl ProviderSchemaCache {
 
 /// Dispatch one identity bridge call through the cached table.
 ///
-/// The validated provider schemas determine the scalar kind. The version-19
+/// The validated provider schemas determine the scalar kind. The version-20
 /// guest ABI deliberately carries only the identity and canonical text.
 pub fn dispatch_custom_type_validation(
     cache: &ProviderSchemaCache,
@@ -238,7 +238,7 @@ pub enum BindingPattern {
 /// token must also serialize as finite JSON. If an initial create has already
 /// dispatched work but its identifier-less token cannot cross the WASM
 /// boundary, the guest traps so the host can classify the attempt from its
-/// per-call egress record instead of erasing it as untracked.
+/// per-call egress record instead of erasing it as not created.
 ///
 /// The phase comes only from the token; callers cannot supply a second phase:
 ///
@@ -401,7 +401,7 @@ impl<T: PhasedToken> Pending<T> {
 ///     error: ProviderError,
 /// ) -> CreateVerdict<()> {
 ///     let _issued = attempt.issued(identifier, Sent::AllRequestAttributes);
-///     CreateAttempt::new().untracked(error)
+///     CreateAttempt::new().not_created(error)
 /// }
 /// ```
 #[derive(Debug)]
@@ -412,8 +412,10 @@ impl CreateAttempt {
         Self(())
     }
 
-    pub fn untracked<T>(self, error: ProviderError) -> CreateVerdict<T> {
-        CreateVerdict(carina_provider_protocol::types::CreateVerdict::Untracked(
+    /// Report that nothing was created: no request left the provider, or the
+    /// cloud rejected it without creating anything.
+    pub fn not_created<T>(self, error: ProviderError) -> CreateVerdict<T> {
+        CreateVerdict(carina_provider_protocol::types::CreateVerdict::NotCreated(
             error,
         ))
     }
@@ -474,7 +476,7 @@ impl CreateAttempt {
 /// use carina_plugin_sdk::types::ProviderError;
 ///
 /// fn classify(attempt: PollAttempt, error: ProviderError) -> PollVerdict<()> {
-///     attempt.undetermined(error)
+///     attempt.unchanged(error)
 /// }
 /// ```
 #[derive(Debug)]
@@ -487,8 +489,10 @@ impl PollAttempt {
         Self { sent }
     }
 
-    pub fn untracked<T>(self, error: ProviderError) -> PollVerdict<T> {
-        PollVerdict(carina_provider_protocol::types::PollVerdict::Untracked(
+    /// Report that nothing was created: no request left the provider, or the
+    /// cloud rejected it without creating anything.
+    pub fn not_created<T>(self, error: ProviderError) -> PollVerdict<T> {
+        PollVerdict(carina_provider_protocol::types::PollVerdict::NotCreated(
             error,
         ))
     }
@@ -535,7 +539,7 @@ impl PollAttempt {
     }
 }
 
-/// Create typestate after the provider has observed a cloud identifier.
+/// Create typestate after the provider has reported a cloud identifier.
 #[derive(Debug)]
 pub struct IssuedCreate {
     identifier: AppliedIdentifier,
@@ -619,23 +623,26 @@ impl IssuedCreate {
         )
     }
 
-    pub fn failed<T>(
+    pub fn identifier_reported<T>(
         self,
         observation: carina_provider_protocol::types::Observation<ReadOutcome, ProviderError>,
         error: ProviderError,
     ) -> CreateVerdict<T> {
-        CreateVerdict(carina_provider_protocol::types::CreateVerdict::Created(
-            carina_provider_protocol::types::CreatedFailure {
-                identifier: self.identifier,
-                observation,
-                sent: self.sent,
-                error,
-            },
-        ))
+        CreateVerdict(
+            carina_provider_protocol::types::CreateVerdict::IdentifierReported(
+                carina_provider_protocol::types::CreateIdentified {
+                    identifier: self.identifier,
+                    observation,
+                    sent: self.sent,
+                    error,
+                },
+            ),
+        )
     }
 
-    pub fn discarded<T>(self, error: ProviderError) -> CreateVerdict<T> {
-        CreateVerdict(carina_provider_protocol::types::CreateVerdict::Discarded(
+    /// Report that no cloud resource remains, even if one existed earlier.
+    pub fn no_resource<T>(self, error: ProviderError) -> CreateVerdict<T> {
+        CreateVerdict(carina_provider_protocol::types::CreateVerdict::NoResource(
             error,
         ))
     }
@@ -671,23 +678,26 @@ impl FinishingCreate {
         )
     }
 
-    pub fn failed<T>(
+    pub fn identifier_reported<T>(
         self,
         observation: carina_provider_protocol::types::Observation<ReadOutcome, ProviderError>,
         error: ProviderError,
     ) -> CreateVerdict<T> {
-        CreateVerdict(carina_provider_protocol::types::CreateVerdict::Created(
-            carina_provider_protocol::types::CreatedFailure {
-                identifier: self.identifier,
-                observation,
-                sent: self.sent,
-                error,
-            },
-        ))
+        CreateVerdict(
+            carina_provider_protocol::types::CreateVerdict::IdentifierReported(
+                carina_provider_protocol::types::CreateIdentified {
+                    identifier: self.identifier,
+                    observation,
+                    sent: self.sent,
+                    error,
+                },
+            ),
+        )
     }
 
-    pub fn discarded<T>(self, error: ProviderError) -> CreateVerdict<T> {
-        CreateVerdict(carina_provider_protocol::types::CreateVerdict::Discarded(
+    /// Report that no cloud resource remains, even if one existed earlier.
+    pub fn no_resource<T>(self, error: ProviderError) -> CreateVerdict<T> {
+        CreateVerdict(carina_provider_protocol::types::CreateVerdict::NoResource(
             error,
         ))
     }
@@ -708,8 +718,10 @@ impl ResumeAttempt {
         Self(())
     }
 
-    pub fn untracked<T>(self, error: ProviderError) -> ResumeVerdict<T> {
-        ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Untracked(
+    /// Report that nothing was created: no request left the provider, or the
+    /// cloud rejected it without creating anything.
+    pub fn not_created<T>(self, error: ProviderError) -> ResumeVerdict<T> {
+        ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::NotCreated(
             error,
         ))
     }
@@ -868,22 +880,25 @@ impl ResumedCreate {
         )
     }
 
-    pub fn failed<T>(
+    pub fn identifier_reported<T>(
         self,
         observation: carina_provider_protocol::types::Observation<ReadOutcome, ProviderError>,
         error: ProviderError,
     ) -> ResumeVerdict<T> {
-        ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Created(
-            carina_provider_protocol::types::ResumedFailure {
-                identifier: self.identifier,
-                observation,
-                error,
-            },
-        ))
+        ResumeVerdict(
+            carina_provider_protocol::types::ResumeVerdict::IdentifierReported(
+                carina_provider_protocol::types::ResumeIdentified {
+                    identifier: self.identifier,
+                    observation,
+                    error,
+                },
+            ),
+        )
     }
 
-    pub fn discarded<T>(self, error: ProviderError) -> ResumeVerdict<T> {
-        ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Discarded(
+    /// Report that no cloud resource remains, even if one existed earlier.
+    pub fn no_resource<T>(self, error: ProviderError) -> ResumeVerdict<T> {
+        ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::NoResource(
             error,
         ))
     }
@@ -917,22 +932,25 @@ impl FinishingResume {
         )
     }
 
-    pub fn failed<T>(
+    pub fn identifier_reported<T>(
         self,
         observation: carina_provider_protocol::types::Observation<ReadOutcome, ProviderError>,
         error: ProviderError,
     ) -> ResumeVerdict<T> {
-        ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Created(
-            carina_provider_protocol::types::ResumedFailure {
-                identifier: self.identifier,
-                observation,
-                error,
-            },
-        ))
+        ResumeVerdict(
+            carina_provider_protocol::types::ResumeVerdict::IdentifierReported(
+                carina_provider_protocol::types::ResumeIdentified {
+                    identifier: self.identifier,
+                    observation,
+                    error,
+                },
+            ),
+        )
     }
 
-    pub fn discarded<T>(self, error: ProviderError) -> ResumeVerdict<T> {
-        ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::Discarded(
+    /// Report that no cloud resource remains, even if one existed earlier.
+    pub fn no_resource<T>(self, error: ProviderError) -> ResumeVerdict<T> {
+        ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::NoResource(
             error,
         ))
     }
@@ -1018,7 +1036,7 @@ pub type ProtocolResumeVerdict<T> =
 /// use carina_plugin_sdk::{CreateVerdict, types::ProviderError};
 ///
 /// fn bypass(error: ProviderError) -> CreateVerdict<()> {
-///     CreateVerdict::Untracked(error)
+///     CreateVerdict::NotCreated(error)
 /// }
 /// ```
 #[derive(Debug)]
@@ -1494,9 +1512,9 @@ pub const fn continuation_phase_regresses(
 
 /// Fixed guest-transport seam for polling a host-owned continuation.
 ///
-/// A backward phase transition preserves the previous continuation via `Undetermined`.
+/// A backward phase transition preserves the previous continuation via `Unchanged`.
 /// An identifier-bearing operation continuation may advance to a read-back token.
-/// A read-back token without an identifier ends polling via `Untracked`.
+/// A read-back token without an identifier ends polling via `NotCreated`.
 pub fn dispatch_poll_create<P: CarinaProvider + ?Sized>(
     provider: &P,
     id: &ResourceId,
@@ -1507,7 +1525,7 @@ pub fn dispatch_poll_create<P: CarinaProvider + ?Sized>(
     poll_request: PollRequest,
 ) -> Result<ProtocolCreateStep<P::CreateToken>, Box<ProtocolPollVerdict<P::CreateToken>>> {
     if continuation_phase_regresses(progress.phase(), token.phase()) {
-        return Err(Box::new(types::PollVerdict::Undetermined(
+        return Err(Box::new(types::PollVerdict::Unchanged(
             create_phase_mismatch(id),
         )));
     }
@@ -1516,9 +1534,9 @@ pub fn dispatch_poll_create<P: CarinaProvider + ?Sized>(
         None => Poll::Unissued(
             PollAttempt::from_sent(sent),
             token.into_operation().map_err(|_token| {
-                Box::new(types::PollVerdict::Untracked(read_back_without_identifier(
-                    id,
-                )))
+                Box::new(types::PollVerdict::NotCreated(
+                    read_back_without_identifier(id),
+                ))
             })?,
         ),
     };
@@ -1540,7 +1558,7 @@ pub fn dispatch_resume_create<P: CarinaProvider + ?Sized>(
     poll_request: PollRequest,
 ) -> Result<ProtocolResumeStep<P::CreateToken>, Box<ProtocolResumeVerdict<P::CreateToken>>> {
     if continuation_phase_regresses(progress.phase(), token.phase()) {
-        return Err(Box::new(types::ResumeVerdict::Undetermined(
+        return Err(Box::new(types::ResumeVerdict::Unchanged(
             create_phase_mismatch(id),
         )));
     }
@@ -1549,7 +1567,7 @@ pub fn dispatch_resume_create<P: CarinaProvider + ?Sized>(
         None => Resume::Unissued(
             ResumeAttempt::new(),
             token.into_operation().map_err(|_token| {
-                Box::new(types::ResumeVerdict::Untracked(
+                Box::new(types::ResumeVerdict::NotCreated(
                     read_back_without_identifier(id),
                 ))
             })?,
@@ -2131,7 +2149,7 @@ mod tests {
             poll_request,
         )
         .unwrap_err();
-        let types::PollVerdict::Untracked(error) = *verdict else {
+        let types::PollVerdict::NotCreated(error) = *verdict else {
             panic!("invalid read-back must end polling, got {verdict:?}");
         };
         assert!(error.message.contains("requires an identifier"));
@@ -2148,7 +2166,7 @@ mod tests {
             poll_request,
         )
         .unwrap_err();
-        let types::ResumeVerdict::Untracked(error) = *verdict else {
+        let types::ResumeVerdict::NotCreated(error) = *verdict else {
             panic!("invalid resumed read-back must end polling, got {verdict:?}");
         };
         assert!(error.message.contains("requires an identifier"));
@@ -2182,7 +2200,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        let types::PollVerdict::Undetermined(error) = *verdict else {
+        let types::PollVerdict::Unchanged(error) = *verdict else {
             panic!("a regression must keep the previous continuation, got {verdict:?}");
         };
         assert!(error.message.contains("phase does not match its token"));
@@ -2217,7 +2235,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        let types::ResumeVerdict::Undetermined(error) = *verdict else {
+        let types::ResumeVerdict::Unchanged(error) = *verdict else {
             panic!("a regression must keep the previous continuation, got {verdict:?}");
         };
         assert!(error.message.contains("phase does not match its token"));

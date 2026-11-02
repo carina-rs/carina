@@ -325,7 +325,7 @@ carina_state::ResourceState::from_provider_state_for_resource_and_schema(
                         let row = resolved_comparison
                             .context()
                             .with_observation(|comparison| match error.kind() {
-                                carina_core::provider::CreateFailureKind::Untracked(_error) => {
+                                carina_core::provider::CreateFailureKind::NoResource(_error) => {
                                     Ok(None)
                                 }
                                 carina_core::provider::CreateFailureKind::OutcomeUnknown {
@@ -336,11 +336,11 @@ carina_state::ResourceState::from_provider_state_for_resource_and_schema(
                                         &resolved, unknown, None, schema, comparison,
                                     ),
                                 )),
-                                carina_core::provider::CreateFailureKind::Created {
-                                    created,
+                                carina_core::provider::CreateFailureKind::IdentifierReported {
+                                    identified,
                                     error: _provider_error,
                                 } => carina_state::ResourceState::from_observation(
-                                    &resolved, created, None, schema, None, comparison,
+                                    &resolved, identified, None, schema, None, comparison,
                                 )
                                 .map(Some)
                                 .map_err(|source| {

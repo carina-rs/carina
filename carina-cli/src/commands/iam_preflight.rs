@@ -842,7 +842,7 @@ mod tests {
             '_,
             Result<carina_core::provider::CreateOutcome, carina_core::provider::CreateFailure>,
         > {
-            Box::pin(async move { Err(attempt.untracked(ProviderError::internal("unused"))) })
+            Box::pin(async move { Err(attempt.not_created(ProviderError::internal("unused"))) })
         }
 
         fn resume_create(

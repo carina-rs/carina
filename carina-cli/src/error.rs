@@ -2024,7 +2024,7 @@ mod tests {
         let id = ResourceId::with_provider_identity("mock", "s3.Bucket", "state", None);
         let create = crate::dispatch_fixture_create(
             &id,
-            crate::FixtureCreateResult::Untracked {
+            crate::FixtureCreateResult::NotCreated {
                 error: ProviderError::api_error("create leaf"),
             },
         );

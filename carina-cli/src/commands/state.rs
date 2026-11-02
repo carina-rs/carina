@@ -3829,9 +3829,9 @@ mod tests {
             '_,
             Result<carina_core::provider::CreateOutcome, carina_core::provider::CreateFailure>,
         > {
-            Box::pin(
-                async move { Err(attempt.untracked(ProviderError::internal("unexpected create"))) },
-            )
+            Box::pin(async move {
+                Err(attempt.not_created(ProviderError::internal("unexpected create")))
+            })
         }
 
         fn resume_create(
@@ -3974,9 +3974,9 @@ mod tests {
             '_,
             Result<carina_core::provider::CreateOutcome, carina_core::provider::CreateFailure>,
         > {
-            Box::pin(
-                async move { Err(attempt.untracked(ProviderError::internal("unexpected create"))) },
-            )
+            Box::pin(async move {
+                Err(attempt.not_created(ProviderError::internal("unexpected create")))
+            })
         }
 
         fn resume_create(
@@ -4615,9 +4615,9 @@ mod tests {
             '_,
             Result<carina_core::provider::CreateOutcome, carina_core::provider::CreateFailure>,
         > {
-            Box::pin(
-                async move { Err(attempt.untracked(ProviderError::internal("unexpected create"))) },
-            )
+            Box::pin(async move {
+                Err(attempt.not_created(ProviderError::internal("unexpected create")))
+            })
         }
 
         fn resume_create(

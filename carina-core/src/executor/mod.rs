@@ -116,7 +116,7 @@ use crate::effect::{DeletedInstanceKey, Effect};
 use crate::parser::ProviderConfig;
 use crate::provider::{
     AppliedIdentifier, CreateFailure, CreateFailureKind, CreateOutcome, CreateRequest,
-    InFlightCreate, ObservedCreate, PartialReadDiagnostic, PatchOp, Provider, ProviderError,
+    IdentifiedCreate, InFlightCreate, PartialReadDiagnostic, PatchOp, Provider, ProviderError,
     ProviderNormalizer, ProviderReadyDataSource, ResumeCreateRequest, ResumeFailure,
     ResumeFailureKind, ResumeOutcome, SentAttributes, SentDesiredAttributes, UnknownCreateOutcome,
     UpdateRequest,
@@ -172,8 +172,8 @@ async fn dispatch_create_with_attempt<P: Provider + ?Sized>(
             CreateFailureKind::OutcomeUnknown { unknown, error } => {
                 Err(CreateFailure::outcome_unknown_at_dispatch(unknown, error))
             }
-            CreateFailureKind::Created { created, error } => {
-                let (created, valid) = created.validate_request_sent(&request_attributes);
+            CreateFailureKind::IdentifierReported { identified, error } => {
+                let (identified, valid) = identified.validate_request_sent(&request_attributes);
                 let error = if valid {
                     error
                 } else {
@@ -183,7 +183,7 @@ async fn dispatch_create_with_attempt<P: Provider + ?Sized>(
                     )
                     .for_resource(id.clone())
                 };
-                Err(CreateFailure::created(created, error))
+                Err(CreateFailure::identifier_reported(identified, error))
             }
             CreateFailureKind::InFlight { pending, error } => {
                 let (pending, valid) = pending.validate_fresh_sent(&request_attributes);
@@ -198,7 +198,9 @@ async fn dispatch_create_with_attempt<P: Provider + ?Sized>(
                 };
                 Err(CreateFailure::in_flight(pending, error))
             }
-            CreateFailureKind::Untracked(error) => Err(CreateFailure::untracked_at_dispatch(error)),
+            CreateFailureKind::NoResource(error) => {
+                Err(CreateFailure::not_created_at_dispatch(error))
+            }
         },
     }
 }
@@ -226,8 +228,8 @@ pub async fn dispatch_resume_create<P: Provider + ?Sized>(
                 .for_resource(id),
         )),
         Err(failure) => match failure.into_kind() {
-            ResumeFailureKind::Created { created, error } => {
-                if created.id() != &id {
+            ResumeFailureKind::IdentifierReported { identified, error } => {
+                if identified.id() != &id {
                     return Err(starting.into_resume_failure(
                         ProviderError::internal_caused_by(
                             "provider returned a resumed failure for another resource",
@@ -236,7 +238,7 @@ pub async fn dispatch_resume_create<P: Provider + ?Sized>(
                         .for_resource(id),
                     ));
                 }
-                let (created, valid) = created.validate_request_sent(&request_attributes);
+                let (identified, valid) = identified.validate_request_sent(&request_attributes);
                 let error = if valid {
                     error
                 } else {
@@ -246,7 +248,7 @@ pub async fn dispatch_resume_create<P: Provider + ?Sized>(
                     )
                     .for_resource(id)
                 };
-                Err(ResumeFailure::created(created, error))
+                Err(ResumeFailure::identifier_reported(identified, error))
             }
             ResumeFailureKind::InFlight { pending, error } => {
                 if pending.id() != &id {
@@ -270,7 +272,9 @@ pub async fn dispatch_resume_create<P: Provider + ?Sized>(
                 };
                 Err(ResumeFailure::in_flight(pending, error))
             }
-            ResumeFailureKind::Ended(error) => Err(ResumeFailure::ended_from_verdict(error)),
+            ResumeFailureKind::NoResource(error) => {
+                Err(ResumeFailure::no_resource_from_verdict(error))
+            }
         },
     }
 }
@@ -434,7 +438,7 @@ pub enum Applied {
         state: State,
         request: AcceptedRequest,
     },
-    Observed(Arc<ObservedCreate>),
+    Observed(Arc<IdentifiedCreate>),
     CreateInFlight(InFlightCreate),
     CreateOutcomeUnknown(UnknownCreateOutcome),
     CreateEnded,

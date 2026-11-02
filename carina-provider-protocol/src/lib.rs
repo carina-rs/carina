@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 /// Protocol version for host-plugin communication.
 /// Increment when making breaking changes to the protocol types or methods.
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
 
 /// Oldest provider protocol version this host can load safely.
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = PROTOCOL_VERSION;
@@ -596,13 +596,13 @@ mod operation_poll_tests {
         let result = block_on_ready(drive_pending_with_clock(
             Duration::from_secs(5),
             Duration::from_secs(30),
-            ready(Ok::<_, &'static str>(OperationStep::Verdict("discarded"))),
+            ready(Ok::<_, &'static str>(OperationStep::Verdict("no_resource"))),
             |_pending: String, _finality| ready(Ok(OperationStep::Done("settled"))),
             |_| ready(()),
             std::time::Instant::now,
         ));
 
-        assert_eq!(result, Ok(DriveOutcome::Verdict("discarded")));
+        assert_eq!(result, Ok(DriveOutcome::Verdict("no_resource")));
     }
 
     #[test]

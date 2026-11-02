@@ -188,7 +188,7 @@ pub fn visit_normalized_resource<T>(
     visitor(&resource.resource)
 }
 
-/// Render one error chain for protocol-v19 metadata's string-only failure
+/// Render one error chain for protocol-v20 metadata's string-only failure
 /// channel. Each source is appended at most once even when a legacy outer
 /// display already includes its immediate source text.
 #[doc(hidden)]
@@ -216,15 +216,15 @@ pub fn wit_to_proto_applied_identifier(
     proto::AppliedIdentifier::new(identifier)
 }
 
-/// Return the honest directive default for protocol-19 WIT resource records.
+/// Return the honest directive default for protocol-20 WIT resource records.
 ///
-/// Protocol 19 does not transport directives on create, poll-create,
+/// Protocol 20 does not transport directives on create, poll-create,
 /// resume-create, or read-data-source requests. Providers
 /// therefore receive all-false directives on those paths (see carina#4151).
 /// Desired normalization uses a separate record without directive fields.
 /// Delete-request directives are transported separately after host resolution.
 #[doc(hidden)]
-pub fn protocol_19_default_resource_directives() -> proto::Directives {
+pub fn protocol_20_default_resource_directives() -> proto::Directives {
     proto::Directives::default()
 }
 
@@ -803,7 +803,7 @@ macro_rules! export_provider {
                 operation: &str,
                 error: &(dyn ::std::error::Error + 'static),
             ) -> String {
-                // Protocol v19 metadata exports return a bare string rather
+                // Protocol v20 metadata exports return a bare string rather
                 // than `result`. A JSON string is deliberately the wrong
                 // top-level shape for both schema records and config maps, so
                 // the host reports its normal typed schema-decode failure
@@ -1265,7 +1265,7 @@ macro_rules! export_provider {
                 /// initial create without an identifier must trap so the host
                 /// classifies its per-call egress record; a poll can instead
                 /// reuse its last decodable token. Once an identifier exists,
-                /// the failure becomes `Created` plus `ReadFailed`.
+                /// the failure becomes `IdentifierReported` plus `ReadFailed`.
                 PendingToken {
                     progress: wit_types::CreateProgress,
                     sent: wit_types::SentAttributes,
@@ -1274,16 +1274,16 @@ macro_rules! export_provider {
                 },
                 /// A finished result established an identifier; only its
                 /// returned attributes failed to cross the boundary.
-                CreatedAttributes(wit_types::CreatedFailure),
+                IdentifierReportedAttributes(wit_types::CreateIdentified),
             }
 
             impl CreateStepEncodeFailure {
-                fn created_failure(
+                fn create_identified(
                     identifier: proto::AppliedIdentifier,
                     sent: wit_types::SentAttributes,
                     error: wit_types::ProviderError,
-                ) -> wit_types::CreatedFailure {
-                    wit_types::CreatedFailure {
+                ) -> wit_types::CreateIdentified {
+                    wit_types::CreateIdentified {
                         identifier: identifier.into_inner(),
                         read: wit_types::Observation::ReadFailed(error.clone()),
                         sent,
@@ -1300,7 +1300,7 @@ macro_rules! export_provider {
                             error,
                         } => match wit_create_identifier(progress) {
                             Some(identifier) => {
-                                wit_types::CreateVerdict::Created(wit_types::CreatedFailure {
+                                wit_types::CreateVerdict::IdentifierReported(wit_types::CreateIdentified {
                                     identifier,
                                     read: wit_types::Observation::ReadFailed(error.clone()),
                                     sent,
@@ -1308,11 +1308,11 @@ macro_rules! export_provider {
                                 })
                             }
                             None => panic!(
-                                "WASM boundary failed to encode a dispatched create continuation token without an identifier; refusing to report the create as untracked"
+                                "WASM boundary failed to encode a dispatched create continuation token without an identifier; refusing to report the create as not created"
                             ),
                         },
-                        Self::CreatedAttributes(created) => {
-                            wit_types::CreateVerdict::Created(created)
+                        Self::IdentifierReportedAttributes(identified) => {
+                            wit_types::CreateVerdict::IdentifierReported(identified)
                         }
                     }
                 }
@@ -1349,8 +1349,8 @@ macro_rules! export_provider {
                                 error,
                             })
                         }
-                        Self::CreatedAttributes(created) => {
-                            wit_types::PollVerdict::Created(created)
+                        Self::IdentifierReportedAttributes(identified) => {
+                            wit_types::PollVerdict::IdentifierReported(identified)
                         }
                     }
                 }
@@ -1364,7 +1364,7 @@ macro_rules! export_provider {
                     poll_after_secs: u32,
                     error: wit_types::ProviderError,
                 },
-                Created(wit_types::ResumedFailure),
+                IdentifierReported(wit_types::ResumeIdentified),
                 /// A resent create still has the persisted pre-call resume
                 /// continuation available if its replacement token cannot be
                 /// encoded.
@@ -1372,11 +1372,11 @@ macro_rules! export_provider {
             }
 
             impl ResumeStepEncodeFailure {
-                fn created(
+                fn identifier_reported(
                     identifier: proto::AppliedIdentifier,
                     error: wit_types::ProviderError,
                 ) -> Self {
-                    Self::Created(wit_types::ResumedFailure {
+                    Self::IdentifierReported(wit_types::ResumeIdentified {
                         identifier: identifier.into_inner(),
                         read: wit_types::Observation::ReadFailed(error.clone()),
                         error,
@@ -1412,7 +1412,7 @@ macro_rules! export_provider {
                                 error,
                             })
                         }
-                        Self::Created(created) => wit_types::ResumeVerdict::Created(created),
+                        Self::IdentifierReported(identified) => wit_types::ResumeVerdict::IdentifierReported(identified),
                         Self::Resent(error) => {
                             error.into_resent_resume_verdict(previous)
                         }
@@ -1519,8 +1519,8 @@ macro_rules! export_provider {
                         Err(error) => {
                             let error =
                                 boundary_encode_to_provider_error(operation, None, error);
-                            Err(CreateStepEncodeFailure::CreatedAttributes(
-                                CreateStepEncodeFailure::created_failure(
+                            Err(CreateStepEncodeFailure::IdentifierReportedAttributes(
+                                CreateStepEncodeFailure::create_identified(
                                     identifier,
                                     wit_types::SentAttributes::All,
                                     error,
@@ -1542,8 +1542,8 @@ macro_rules! export_provider {
                         Err(error) => {
                             let error =
                                 boundary_encode_to_provider_error(operation, None, error);
-                            Err(CreateStepEncodeFailure::CreatedAttributes(
-                                CreateStepEncodeFailure::created_failure(
+                            Err(CreateStepEncodeFailure::IdentifierReportedAttributes(
+                                CreateStepEncodeFailure::create_identified(
                                     identifier,
                                     wit_types::SentAttributes::All,
                                     error,
@@ -1576,12 +1576,12 @@ macro_rules! export_provider {
                 }
             }
 
-            fn sdk_to_wit_created_failure(
-                created: proto::CreatedFailure<proto::ReadOutcome, proto::ProviderError>,
+            fn sdk_to_wit_create_identified(
+                identified: proto::CreateIdentified<proto::ReadOutcome, proto::ProviderError>,
                 operation: &'static str,
-            ) -> wit_types::CreatedFailure {
-                let (identifier, observation, sent, error) = created.into_parts();
-                wit_types::CreatedFailure {
+            ) -> wit_types::CreateIdentified {
+                let (identifier, observation, sent, error) = identified.into_parts();
+                wit_types::CreateIdentified {
                     identifier: identifier.into_inner(),
                     read: proto_to_wit_observation(observation, operation),
                     sent: proto_to_wit_sent(&sent),
@@ -1589,12 +1589,12 @@ macro_rules! export_provider {
                 }
             }
 
-            fn sdk_to_wit_resumed_failure(
-                created: proto::ResumedFailure<proto::ReadOutcome, proto::ProviderError>,
+            fn sdk_to_wit_resume_identified(
+                identified: proto::ResumeIdentified<proto::ReadOutcome, proto::ProviderError>,
                 operation: &'static str,
-            ) -> wit_types::ResumedFailure {
-                let (identifier, observation, error) = created.into_parts();
-                wit_types::ResumedFailure {
+            ) -> wit_types::ResumeIdentified {
+                let (identifier, observation, error) = identified.into_parts();
+                wit_types::ResumeIdentified {
                     identifier: identifier.into_inner(),
                     read: proto_to_wit_observation(observation, operation),
                     error: proto_to_wit_provider_error(error),
@@ -1606,16 +1606,16 @@ macro_rules! export_provider {
                 operation: &'static str,
             ) -> Result<wit_types::CreateVerdict, CreateStepEncodeFailure> {
                 match verdict {
-                    proto::CreateVerdict::Untracked(error) => Ok(
-                        wit_types::CreateVerdict::Untracked(proto_to_wit_provider_error(error)),
+                    proto::CreateVerdict::NotCreated(error) => Ok(
+                        wit_types::CreateVerdict::NotCreated(proto_to_wit_provider_error(error)),
                     ),
-                    proto::CreateVerdict::Created(created) => Ok(
-                        wit_types::CreateVerdict::Created(sdk_to_wit_created_failure(
-                            created, operation,
+                    proto::CreateVerdict::IdentifierReported(identified) => Ok(
+                        wit_types::CreateVerdict::IdentifierReported(sdk_to_wit_create_identified(
+                            identified, operation,
                         )),
                     ),
-                    proto::CreateVerdict::Discarded(error) => Ok(
-                        wit_types::CreateVerdict::Discarded(proto_to_wit_provider_error(error)),
+                    proto::CreateVerdict::NoResource(error) => Ok(
+                        wit_types::CreateVerdict::NoResource(proto_to_wit_provider_error(error)),
                     ),
                     proto::CreateVerdict::InFlight(in_flight) => {
                         let proto::CreateInFlight { pending, error } = in_flight;
@@ -1635,17 +1635,17 @@ macro_rules! export_provider {
                 previous_pending: wit_types::PendingCreate,
             ) -> wit_types::PollVerdict {
                 match verdict {
-                    proto::PollVerdict::Untracked(error) => {
-                        wit_types::PollVerdict::Untracked(proto_to_wit_provider_error(error))
+                    proto::PollVerdict::NotCreated(error) => {
+                        wit_types::PollVerdict::NotCreated(proto_to_wit_provider_error(error))
                     }
-                    proto::PollVerdict::Created(created) => wit_types::PollVerdict::Created(
-                        sdk_to_wit_created_failure(created, operation),
+                    proto::PollVerdict::IdentifierReported(identified) => wit_types::PollVerdict::IdentifierReported(
+                        sdk_to_wit_create_identified(identified, operation),
                     ),
-                    proto::PollVerdict::Discarded(error) => {
-                        wit_types::PollVerdict::Discarded(proto_to_wit_provider_error(error))
+                    proto::PollVerdict::NoResource(error) => {
+                        wit_types::PollVerdict::NoResource(proto_to_wit_provider_error(error))
                     }
-                    proto::PollVerdict::Undetermined(error) => {
-                        wit_types::PollVerdict::Undetermined(proto_to_wit_provider_error(error))
+                    proto::PollVerdict::Unchanged(error) => {
+                        wit_types::PollVerdict::Unchanged(proto_to_wit_provider_error(error))
                     }
                     proto::PollVerdict::InFlight(in_flight) => {
                         let proto::CreateInFlight { pending, error } = in_flight;
@@ -1675,7 +1675,7 @@ macro_rules! export_provider {
                         Err(error) => {
                             let error =
                                 boundary_encode_to_provider_error(operation, None, error);
-                            Err(ResumeStepEncodeFailure::created(identifier, error))
+                            Err(ResumeStepEncodeFailure::identifier_reported(identifier, error))
                         }
                     },
                     proto::ResumeStep::PartialSuccess {
@@ -1692,7 +1692,7 @@ macro_rules! export_provider {
                         Err(error) => {
                             let error =
                                 boundary_encode_to_provider_error(operation, None, error);
-                            Err(ResumeStepEncodeFailure::created(identifier, error))
+                            Err(ResumeStepEncodeFailure::identifier_reported(identifier, error))
                         }
                     },
                     proto::ResumeStep::Pending(pending) => {
@@ -1713,17 +1713,17 @@ macro_rules! export_provider {
                 previous_pending: wit_types::ResumePending,
             ) -> wit_types::ResumeVerdict {
                 match verdict {
-                    proto::ResumeVerdict::Untracked(error) => {
-                        wit_types::ResumeVerdict::Untracked(proto_to_wit_provider_error(error))
+                    proto::ResumeVerdict::NotCreated(error) => {
+                        wit_types::ResumeVerdict::NotCreated(proto_to_wit_provider_error(error))
                     }
-                    proto::ResumeVerdict::Created(created) => wit_types::ResumeVerdict::Created(
-                        sdk_to_wit_resumed_failure(created, operation),
+                    proto::ResumeVerdict::IdentifierReported(identified) => wit_types::ResumeVerdict::IdentifierReported(
+                        sdk_to_wit_resume_identified(identified, operation),
                     ),
-                    proto::ResumeVerdict::Discarded(error) => {
-                        wit_types::ResumeVerdict::Discarded(proto_to_wit_provider_error(error))
+                    proto::ResumeVerdict::NoResource(error) => {
+                        wit_types::ResumeVerdict::NoResource(proto_to_wit_provider_error(error))
                     }
-                    proto::ResumeVerdict::Undetermined(error) => {
-                        wit_types::ResumeVerdict::Undetermined(proto_to_wit_provider_error(error))
+                    proto::ResumeVerdict::Unchanged(error) => {
+                        wit_types::ResumeVerdict::Unchanged(proto_to_wit_provider_error(error))
                     }
                     proto::ResumeVerdict::InFlight(in_flight) => {
                         let proto::ResumeInFlight { pending, error } = in_flight;
@@ -2273,7 +2273,7 @@ macro_rules! export_provider {
                 fn read_data_source(
                     res: wit_types::ResourceDef,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
-                    let directives = helpers::protocol_19_default_resource_directives();
+                    let directives = helpers::protocol_20_default_resource_directives();
                     let proto_res = wit_to_proto_resource(&res, directives).map_err(|error| {
                         boundary_decode_to_provider_error("read_data_source", None, error)
                     })?;
@@ -2291,11 +2291,11 @@ macro_rules! export_provider {
                     request: wit_types::CreateRequest,
                 ) -> Result<wit_types::CreateStep, wit_types::CreateVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
-                    let directives = helpers::protocol_19_default_resource_directives();
+                    let directives = helpers::protocol_20_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
-                            return Err(wit_types::CreateVerdict::Untracked(
+                            return Err(wit_types::CreateVerdict::NotCreated(
                                 boundary_decode_to_provider_error("create", None, error),
                             ));
                         }
@@ -2323,11 +2323,11 @@ macro_rules! export_provider {
                 ) -> Result<wit_types::CreateStep, wit_types::PollVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let previous_pending = pending.clone();
-                    let directives = helpers::protocol_19_default_resource_directives();
+                    let directives = helpers::protocol_20_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
-                            return Err(wit_types::PollVerdict::Undetermined(
+                            return Err(wit_types::PollVerdict::Unchanged(
                                 boundary_decode_to_provider_error("poll_create", None, error),
                             ));
                         }
@@ -2337,7 +2337,7 @@ macro_rules! export_provider {
                     >(pending, &proto_request) {
                         Ok(poll) => poll,
                         Err(error) => {
-                            return Err(wit_types::PollVerdict::Undetermined(error));
+                            return Err(wit_types::PollVerdict::Unchanged(error));
                         }
                     };
                     let provider = get_provider().lock().unwrap();
@@ -2371,11 +2371,11 @@ macro_rules! export_provider {
                 ) -> Result<wit_types::ResumeStep, wit_types::ResumeVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let previous_pending = pending.clone();
-                    let directives = helpers::protocol_19_default_resource_directives();
+                    let directives = helpers::protocol_20_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
-                            return Err(wit_types::ResumeVerdict::Undetermined(
+                            return Err(wit_types::ResumeVerdict::Unchanged(
                                 boundary_decode_to_provider_error("resume_create", None, error),
                             ));
                         }
@@ -2385,7 +2385,7 @@ macro_rules! export_provider {
                     >(pending) {
                         Ok(resume) => resume,
                         Err(error) => {
-                            return Err(wit_types::ResumeVerdict::Undetermined(error));
+                            return Err(wit_types::ResumeVerdict::Unchanged(error));
                         }
                     };
                     let provider = get_provider().lock().unwrap();
@@ -2825,7 +2825,7 @@ mod tests {
 
     #[test]
     fn wit_resource_protocol_directives_are_all_false_without_transport() {
-        let directives = protocol_19_default_resource_directives();
+        let directives = protocol_20_default_resource_directives();
 
         assert!(!directives.force_delete);
         assert!(!directives.create_before_destroy);

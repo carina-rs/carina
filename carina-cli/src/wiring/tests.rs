@@ -4320,7 +4320,7 @@ impl Provider for CascadeCreateProvider {
                     )])));
             }
 
-            Err(attempt.untracked(ProviderError::internal(format!("unexpected create {id}"))))
+            Err(attempt.not_created(ProviderError::internal(format!("unexpected create {id}"))))
         })
     }
 
@@ -14232,9 +14232,9 @@ mod resolved_value_constraint_gate {
             _request: CreateRequest,
             attempt: carina_core::provider::CreateAttempt,
         ) -> BoxFuture<'_, Result<CreateOutcome, carina_core::provider::CreateFailure>> {
-            Box::pin(
-                async move { Err(attempt.untracked(ProviderError::internal("unexpected create"))) },
-            )
+            Box::pin(async move {
+                Err(attempt.not_created(ProviderError::internal("unexpected create")))
+            })
         }
 
         unexpected_resume_create!();

@@ -3076,7 +3076,7 @@ impl Provider for FailBCreateProvider {
         Box::pin(async move {
             if id.identity_str().expect("resolved identity") == "b" {
                 return Err(
-                    attempt.untracked(ProviderError::api_error("create failed").for_resource(id))
+                    attempt.not_created(ProviderError::api_error("create failed").for_resource(id))
                 );
             }
             let resource = request.resource().as_resource().clone();
@@ -3558,7 +3558,7 @@ impl Provider for ApplyCascadeProvider {
                     )]))),
                 _ => {
                     Err(attempt
-                        .untracked(ProviderError::internal(format!("unexpected create {id}"))))
+                        .not_created(ProviderError::internal(format!("unexpected create {id}"))))
                 }
             }
         })
@@ -7171,9 +7171,9 @@ fn s3_backend_config_with_encrypt(encrypt: bool) -> carina_core::parser::Expande
 enum BootstrapCreateBehavior {
     Success,
     PartialSuccess,
-    Untracked,
-    Created,
-    CreatedNotFound,
+    NotCreated,
+    IdentifierReported,
+    IdentifierReportedNotFound,
     InFlight,
 }
 
@@ -7255,10 +7255,10 @@ impl Provider for BootstrapRecordingProvider {
                         ))
                 })
             }
-            BootstrapCreateBehavior::Untracked => Box::pin(async move {
-                Err(attempt.untracked(ProviderError::internal("bootstrap create failed")))
+            BootstrapCreateBehavior::NotCreated => Box::pin(async move {
+                Err(attempt.not_created(ProviderError::internal("bootstrap create failed")))
             }),
-            BootstrapCreateBehavior::Created => {
+            BootstrapCreateBehavior::IdentifierReported => {
                 let identifier =
                     AppliedIdentifier::new("bucket-id").expect("fixture identifier is non-empty");
                 let issued = attempt.issued(
@@ -7275,13 +7275,13 @@ impl Provider for BootstrapRecordingProvider {
                 )
                 .expect("fixture identifier is non-empty");
                 Box::pin(async move {
-                    Err(issued.failed(
+                    Err(issued.identifier_reported(
                         carina_core::provider::Observation::Read(ReadOutcome::found(observed)),
                         ProviderError::internal("bootstrap created then failed"),
                     ))
                 })
             }
-            BootstrapCreateBehavior::CreatedNotFound => {
+            BootstrapCreateBehavior::IdentifierReportedNotFound => {
                 let identifier = AppliedIdentifier::new("missing-bucket-id")
                     .expect("fixture identifier is non-empty");
                 let issued = attempt.issued(
@@ -7289,7 +7289,7 @@ impl Provider for BootstrapRecordingProvider {
                     carina_core::provider::Sent::only(Vec::<String>::new()),
                 );
                 Box::pin(async move {
-                    Err(issued.failed(
+                    Err(issued.identifier_reported(
                         carina_core::provider::Observation::Read(ReadOutcome::not_found(id)),
                         ProviderError::internal("bootstrap identifier could not be observed"),
                     ))
@@ -7774,7 +7774,7 @@ async fn state_bucket_provider_error_keeps_typed_terminal_error() {
     let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
-        behavior: BootstrapCreateBehavior::Untracked,
+        behavior: BootstrapCreateBehavior::NotCreated,
     };
     let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
     resource.set_attr(
@@ -7877,11 +7877,11 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
 }
 
 #[tokio::test]
-async fn bootstrap_created_failure_seeds_observed_state_before_error() {
+async fn bootstrap_create_identified_seeds_observed_state_before_error() {
     let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
-        behavior: BootstrapCreateBehavior::Created,
+        behavior: BootstrapCreateBehavior::IdentifierReported,
     };
     let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
     resource.set_attr(
@@ -7920,19 +7920,19 @@ async fn bootstrap_created_failure_seeds_observed_state_before_error() {
         },
     )
     .await
-    .expect_err("created failure must still be reported");
+    .expect_err("identifier-reported failure must still be reported");
 
     let AppError::StateBucketCreate(error) = &error else {
-        panic!("created bootstrap failure lost its classification: {error:?}")
+        panic!("identifier-reported bootstrap failure lost its classification: {error:?}")
     };
-    let carina_core::provider::CreateFailureKind::Created {
-        created,
+    let carina_core::provider::CreateFailureKind::IdentifierReported {
+        identified,
         error: _provider_error,
     } = error.create_failure().kind()
     else {
-        panic!("created bootstrap failure returned another verdict: {error:?}")
+        panic!("identifier-reported bootstrap failure returned another verdict: {error:?}")
     };
-    match created.observation() {
+    match identified.observation() {
         carina_core::provider::CreateObservation::Observed(state) => {
             assert_eq!(state.identifier().as_str(), "bucket-id")
         }
@@ -7961,7 +7961,7 @@ async fn bootstrap_created_failure_seeds_observed_state_before_error() {
         ..
     } = row.current()
     else {
-        panic!("created bootstrap failure must seed an applied row");
+        panic!("identifier-reported bootstrap failure must seed an applied row");
     };
     assert_eq!(identifier.as_str(), "bucket-id");
     assert_eq!(
@@ -7971,11 +7971,11 @@ async fn bootstrap_created_failure_seeds_observed_state_before_error() {
 }
 
 #[tokio::test]
-async fn bootstrap_unobserved_created_failure_seeds_identifier_and_partial_read_before_error() {
+async fn bootstrap_unobserved_create_identified_seeds_identifier_and_partial_read_before_error() {
     let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
-        behavior: BootstrapCreateBehavior::CreatedNotFound,
+        behavior: BootstrapCreateBehavior::IdentifierReportedNotFound,
     };
     let resource = Resource::with_provider("aws", "s3.Bucket", "state", None).with_attribute(
         "bucket",
@@ -8008,19 +8008,19 @@ async fn bootstrap_unobserved_created_failure_seeds_identifier_and_partial_read_
         },
     )
     .await
-    .expect_err("unobserved created failure must still be reported");
+    .expect_err("unobserved identifier-reported failure must still be reported");
 
     let AppError::StateBucketCreate(error) = &error else {
         panic!("unobserved bootstrap failure lost its classification: {error:?}")
     };
-    let carina_core::provider::CreateFailureKind::Created {
-        created,
+    let carina_core::provider::CreateFailureKind::IdentifierReported {
+        identified,
         error: _provider_error,
     } = error.create_failure().kind()
     else {
         panic!("unobserved bootstrap failure returned another verdict: {error:?}")
     };
-    match created.observation() {
+    match identified.observation() {
         carina_core::provider::CreateObservation::Observed(state) => {
             panic!("not-found bootstrap observation became found: {state:?}")
         }

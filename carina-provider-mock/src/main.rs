@@ -23,12 +23,12 @@ use std::sync::Mutex;
 enum CreateMode {
     #[default]
     Normal,
-    Untracked,
-    Created,
+    NotCreated,
+    IdentifierReported,
     Pending,
     Resumed,
-    Discarded,
-    Undetermined,
+    NoResource,
+    Unchanged,
     MalformedPending,
     Resend,
 }
@@ -358,12 +358,12 @@ impl MockProcessProvider {
         };
         match value {
             "normal" => CreateMode::Normal,
-            "untracked" => CreateMode::Untracked,
-            "created" => CreateMode::Created,
+            "not_created" => CreateMode::NotCreated,
+            "identifier_reported" => CreateMode::IdentifierReported,
             "pending" => CreateMode::Pending,
             "resumed" => CreateMode::Resumed,
-            "discarded" => CreateMode::Discarded,
-            "undetermined" => CreateMode::Undetermined,
+            "no_resource" => CreateMode::NoResource,
+            "unchanged" => CreateMode::Unchanged,
             "malformed_pending" => CreateMode::MalformedPending,
             "resend" => CreateMode::Resend,
             _unsupported => CreateMode::Normal,
@@ -988,7 +988,7 @@ impl CarinaProvider for MockProcessProvider {
             panic!("intentional mock create trap");
         }
         if id.identity == "__mock_create_error__" {
-            return Err(attempt.untracked(ProviderError {
+            return Err(attempt.not_created(ProviderError {
                 kind: ProviderErrorKind::Internal,
                 message: "intentional mock create error".to_string(),
                 resource_id: Some(id.clone()),
@@ -1098,8 +1098,8 @@ impl CarinaProvider for MockProcessProvider {
             "create_read_back_pending_polls",
         );
         match mode {
-            CreateMode::Untracked => Err(attempt.untracked(Self::create_mode_error(id, mode))),
-            CreateMode::Created => {
+            CreateMode::NotCreated => Err(attempt.not_created(Self::create_mode_error(id, mode))),
+            CreateMode::IdentifierReported => {
                 let (identifier, attributes) = self.create_done(request, None);
                 let observation = Observation::Read(ReadOutcome::Found {
                     state: AppliedState {
@@ -1112,8 +1112,10 @@ impl CarinaProvider for MockProcessProvider {
                 Err(match canonical_identifier {
                     Some(identifier) => issued
                         .canonicalize(identifier)
-                        .failed(observation, Self::create_mode_error(id, mode)),
-                    None => issued.failed(observation, Self::create_mode_error(id, mode)),
+                        .identifier_reported(observation, Self::create_mode_error(id, mode)),
+                    None => {
+                        issued.identifier_reported(observation, Self::create_mode_error(id, mode))
+                    }
                 })
             }
             CreateMode::Normal if pending_polls == 0 && read_back_pending_polls > 0 => {
@@ -1139,7 +1141,7 @@ impl CarinaProvider for MockProcessProvider {
                 sent,
                 1,
             )),
-            CreateMode::Resumed | CreateMode::Discarded => {
+            CreateMode::Resumed | CreateMode::NoResource => {
                 let identifier = Self::mint_identifier(&request.resource.attributes);
                 self.remember_state(&identifier, &request.resource.attributes);
                 Ok(attempt.issued(identifier, sent).pending(
@@ -1152,7 +1154,7 @@ impl CarinaProvider for MockProcessProvider {
                 ))
             }
             CreateMode::Pending
-            | CreateMode::Undetermined
+            | CreateMode::Unchanged
             | CreateMode::MalformedPending
             | CreateMode::Resend => Ok(attempt.pending(
                 CreateOperation {
@@ -1228,8 +1230,8 @@ impl CarinaProvider for MockProcessProvider {
                     }
                     mode @ (CreateMode::Pending
                     | CreateMode::Resumed
-                    | CreateMode::Discarded
-                    | CreateMode::Undetermined
+                    | CreateMode::NoResource
+                    | CreateMode::Unchanged
                     | CreateMode::Resend) => Ok(attempt.pending(
                         CreateOperation {
                             remaining,
@@ -1247,10 +1249,11 @@ impl CarinaProvider for MockProcessProvider {
                         1,
                         Self::create_mode_error(id, CreateMode::MalformedPending),
                     )),
-                    CreateMode::Untracked => {
-                        Err(attempt.untracked(Self::create_mode_error(id, CreateMode::Untracked)))
+                    CreateMode::NotCreated => {
+                        Err(attempt
+                            .not_created(Self::create_mode_error(id, CreateMode::NotCreated)))
                     }
-                    CreateMode::Created => {
+                    CreateMode::IdentifierReported => {
                         let identifier = Self::mint_identifier(&request.resource.attributes);
                         self.remember_state(&identifier, &request.resource.attributes);
                         let observation =
@@ -1259,15 +1262,15 @@ impl CarinaProvider for MockProcessProvider {
                         Err(match canonical_identifier {
                             Some(identifier) => issued
                                 .canonicalize(identifier)
-                                .failed(
+                                .identifier_reported(
                                     observation,
-                                    Self::create_mode_error(id, CreateMode::Created),
+                                    Self::create_mode_error(id, CreateMode::IdentifierReported),
                                 )
                                 .into(),
                             None => issued
-                                .failed(
+                                .identifier_reported(
                                     observation,
-                                    Self::create_mode_error(id, CreateMode::Created),
+                                    Self::create_mode_error(id, CreateMode::IdentifierReported),
                                 )
                                 .into(),
                         })
@@ -1313,8 +1316,8 @@ impl CarinaProvider for MockProcessProvider {
                 }
                 mode @ (CreateMode::Pending
                 | CreateMode::Resumed
-                | CreateMode::Discarded
-                | CreateMode::Undetermined
+                | CreateMode::NoResource
+                | CreateMode::Unchanged
                 | CreateMode::Resend) => Ok(issued.pending(
                     CreateToken::Operation(CreateOperation {
                         remaining,
@@ -1323,23 +1326,23 @@ impl CarinaProvider for MockProcessProvider {
                     }),
                     1,
                 )),
-                CreateMode::MalformedPending | CreateMode::Untracked => {
-                    Err(issued.discarded(Self::create_mode_error(id, mode)).into())
+                CreateMode::MalformedPending | CreateMode::NotCreated => {
+                    Err(issued.no_resource(Self::create_mode_error(id, mode)).into())
                 }
-                CreateMode::Created => {
+                CreateMode::IdentifierReported => {
                     let observation = Observation::Read(ReadOutcome::NotFound { id: id.clone() });
                     Err(match canonical_identifier {
                         Some(identifier) => issued
                             .canonicalize(identifier)
-                            .failed(
+                            .identifier_reported(
                                 observation,
-                                Self::create_mode_error(id, CreateMode::Created),
+                                Self::create_mode_error(id, CreateMode::IdentifierReported),
                             )
                             .into(),
                         None => issued
-                            .failed(
+                            .identifier_reported(
                                 observation,
-                                Self::create_mode_error(id, CreateMode::Created),
+                                Self::create_mode_error(id, CreateMode::IdentifierReported),
                             )
                             .into(),
                     })
@@ -1463,17 +1466,17 @@ impl CarinaProvider for MockProcessProvider {
                             None => resumed.completed(found),
                         })
                     }
-                    CreateMode::Discarded | CreateMode::Untracked => {
-                        Err(attempt.untracked(Self::create_mode_error(id, mode)))
+                    CreateMode::NoResource | CreateMode::NotCreated => {
+                        Err(attempt.not_created(Self::create_mode_error(id, mode)))
                     }
-                    CreateMode::Undetermined => Err(attempt.preserve(
+                    CreateMode::Unchanged => Err(attempt.preserve(
                         CreateOperation {
                             remaining,
                             polls_served,
                             mode,
                         },
                         1,
-                        Self::create_mode_error(id, CreateMode::Undetermined),
+                        Self::create_mode_error(id, CreateMode::Unchanged),
                     )),
                     CreateMode::MalformedPending => Err(attempt.preserve(
                         CreateOperation {
@@ -1497,20 +1500,22 @@ impl CarinaProvider for MockProcessProvider {
                             None => issued.succeeded(attributes).into(),
                         })
                     }
-                    CreateMode::Created => {
+                    CreateMode::IdentifierReported => {
                         let identifier = Self::mint_identifier(&request.resource.attributes);
                         self.remember_state(&identifier, &request.resource.attributes);
                         let observation =
                             Observation::Read(ReadOutcome::NotFound { id: id.clone() });
                         let resumed = attempt.issued(identifier);
                         Err(match canonical_identifier {
-                            Some(identifier) => resumed.canonicalize(identifier).failed(
+                            Some(identifier) => {
+                                resumed.canonicalize(identifier).identifier_reported(
+                                    observation,
+                                    Self::create_mode_error(id, CreateMode::IdentifierReported),
+                                )
+                            }
+                            None => resumed.identifier_reported(
                                 observation,
-                                Self::create_mode_error(id, CreateMode::Created),
-                            ),
-                            None => resumed.failed(
-                                observation,
-                                Self::create_mode_error(id, CreateMode::Created),
+                                Self::create_mode_error(id, CreateMode::IdentifierReported),
                             ),
                         })
                     }
@@ -1575,16 +1580,17 @@ impl CarinaProvider for MockProcessProvider {
                         None => resumed.completed(found),
                     })
                 }
-                CreateMode::Discarded | CreateMode::Untracked | CreateMode::MalformedPending => {
-                    Err(resumed.discarded(Self::create_mode_error(id, mode)))
+                CreateMode::NoResource | CreateMode::NotCreated | CreateMode::MalformedPending => {
+                    Err(resumed.no_resource(Self::create_mode_error(id, mode)))
                 }
-                CreateMode::Undetermined | CreateMode::Created => {
+                CreateMode::Unchanged | CreateMode::IdentifierReported => {
                     let observation = Observation::Read(ReadOutcome::NotFound { id: id.clone() });
                     Err(match canonical_identifier {
                         Some(identifier) => resumed
                             .canonicalize(identifier)
-                            .failed(observation, Self::create_mode_error(id, mode)),
-                        None => resumed.failed(observation, Self::create_mode_error(id, mode)),
+                            .identifier_reported(observation, Self::create_mode_error(id, mode)),
+                        None => resumed
+                            .identifier_reported(observation, Self::create_mode_error(id, mode)),
                     })
                 }
             },

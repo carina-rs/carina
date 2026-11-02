@@ -1128,15 +1128,15 @@ impl MockProvider {
     ) -> Result<CreateOutcome, CreateFailure> {
         let mode = &self.behavior.create_mode;
         if let Some(err) = self.create_fail_error_for(&id) {
-            return Err(attempt.untracked(err));
+            return Err(attempt.not_created(err));
         }
         let sent = self.behavior.create_sent.sent();
         let fail_after_create = match mode {
             CreateMode::Success => false,
-            CreateMode::Created => true,
-            CreateMode::Untracked => {
-                return Err(attempt.untracked(ProviderError::api_error(
-                    "builtin mock returned an untracked create verdict",
+            CreateMode::IdentifierReported => true,
+            CreateMode::NotCreated => {
+                return Err(attempt.not_created(ProviderError::api_error(
+                    "builtin mock returned a not-created create verdict",
                 )));
             }
             CreateMode::Pending | CreateMode::MalformedPending => {
@@ -1159,7 +1159,7 @@ impl MockProvider {
             .and_then(|delay| delay.for_resource(&id))
         {
             if let Err(error) = Self::signal_ready(&self.behavior.observations.create_ready) {
-                return Err(attempt.untracked(error));
+                return Err(attempt.not_created(error));
             }
             if let Some(release) = &self.behavior.create_release {
                 // Readiness/release files order tests without a finite sleep.
@@ -1173,20 +1173,20 @@ impl MockProvider {
 
         let state_guard = match self.lock_state_file() {
             Ok(guard) => guard,
-            Err(error) => return Err(attempt.untracked(error)),
+            Err(error) => return Err(attempt.not_created(error)),
         };
         let mut states = match state_guard.load_states_for_operation() {
             Ok(states) => states,
-            Err(error) => return Err(attempt.untracked(error)),
+            Err(error) => return Err(attempt.not_created(error)),
         };
         let key = match Self::resolved_resource_key(&id) {
             Ok(key) => key,
-            Err(error) => return Err(attempt.untracked(error)),
+            Err(error) => return Err(attempt.not_created(error)),
         };
 
         let mut persisted_values = resource.resolved_attributes();
         if let Err(error) = self.canonicalize_mock_reference_write(&id, &mut persisted_values) {
-            return Err(attempt.untracked(error));
+            return Err(attempt.not_created(error));
         }
         Self::add_server_list_defaults(&id, &mut persisted_values);
         let attrs = persisted_values
@@ -1196,7 +1196,7 @@ impl MockProvider {
             .map_err(|e| ProviderError::internal(format!("Failed to convert value: {}", e)));
         let mut attrs = match attrs {
             Ok(attrs) => attrs,
-            Err(error) => return Err(attempt.untracked(error)),
+            Err(error) => return Err(attempt.not_created(error)),
         };
         Self::populate_generated_attribute_json(&id, &mut attrs);
 
@@ -1212,7 +1212,7 @@ impl MockProvider {
             .save(&states)
             .map_err(|e| ProviderError::internal_caused_by("Failed to save state", e))
         {
-            return Err(attempt.untracked(error));
+            return Err(attempt.not_created(error));
         }
 
         let mut state_attrs = persisted_values;
@@ -1229,10 +1229,13 @@ impl MockProvider {
             AppliedState::from_identifier(id.clone(), identifier.clone(), state_attrs.clone());
         let issued = attempt.issued(identifier, sent);
         if let Err(error) = self.append_op_log_if_configured("create", &id) {
-            return Err(issued.failed(Observation::Read(ReadOutcome::found(observed_state)), error));
+            return Err(issued.identifier_reported(
+                Observation::Read(ReadOutcome::found(observed_state)),
+                error,
+            ));
         }
         if fail_after_create {
-            return Err(issued.failed(
+            return Err(issued.identifier_reported(
                 Observation::Read(ReadOutcome::found(observed_state)),
                 ProviderError::api_error("builtin mock failed after creating the resource"),
             ));
@@ -1565,21 +1568,21 @@ impl Provider for MockProvider {
             let id = request.id().clone();
             let mode = &self.behavior.resume_mode;
             match mode {
-                ResumeMode::Discarded => {
+                ResumeMode::NoResource => {
                     let (resume, create_request) = request.into_parts();
                     drop(create_request);
-                    return Err(resume.discarded(ProviderError::not_found(
-                        "builtin mock reports that the recorded create ended",
+                    return Err(resume.no_resource(ProviderError::not_found(
+                        "builtin mock reports that the recorded create left no resource",
                     )));
                 }
-                ResumeMode::Untracked => {
+                ResumeMode::NotCreated => {
                     let (resume, create_request) = request.into_parts();
                     drop(create_request);
-                    return Err(resume.untracked(ProviderError::api_error(
+                    return Err(resume.not_created(ProviderError::api_error(
                         "builtin mock lost the resume response",
                     )));
                 }
-                ResumeMode::Undetermined | ResumeMode::MalformedPending => {
+                ResumeMode::Unchanged | ResumeMode::MalformedPending => {
                     let (resume, create_request) = request.into_parts();
                     drop(create_request);
                     return Err(resume.preserve(ProviderError::internal(
@@ -1598,7 +1601,9 @@ impl Provider for MockProvider {
                         "builtin mock create remains in progress",
                     )));
                 }
-                ResumeMode::Resumed | ResumeMode::Resend | ResumeMode::CreatedReadFailed => {}
+                ResumeMode::Resumed
+                | ResumeMode::Resend
+                | ResumeMode::IdentifierReportedReadFailed => {}
                 ResumeMode::Unsupported(unsupported) => {
                     let (resume, create_request) = request.into_parts();
                     drop(create_request);
@@ -1640,8 +1645,8 @@ impl Provider for MockProvider {
                 Ok(attributes) => attributes,
                 Err(error) => return Err(resumed.preserve(error)),
             };
-            if *mode == ResumeMode::CreatedReadFailed {
-                return Err(resumed.failed(
+            if *mode == ResumeMode::IdentifierReportedReadFailed {
+                return Err(resumed.identifier_reported(
                     Observation::ReadFailed(ProviderError::api_error(
                         "builtin mock post-apply read failed",
                     )),
@@ -1998,7 +2003,7 @@ mod tests {
         let b_log = tmp.path().join("b.log");
         let a = ConfiguredBuiltinMock::new(
             MockBehavior {
-                create_mode: CreateMode::Created,
+                create_mode: CreateMode::IdentifierReported,
                 observations: MockObservations {
                     operation_log: Some(a_log.clone()),
                     ..MockObservations::default()
@@ -2046,13 +2051,13 @@ mod tests {
                 Err(ref error)
                     if matches!(
                         **error,
-                        CreateFailureKind::Created {
-                            created: _,
+                        CreateFailureKind::IdentifierReported {
+                            identified: _,
                             error: _
                         }
                     )
             ),
-            "instance A must retain its created verdict, got {a:?}"
+            "instance A must retain its identifier-reported verdict, got {a:?}"
         );
         assert!(
             matches!(b, Ok(CreateOutcomeKind::Success { state: _ })),
@@ -2160,8 +2165,8 @@ mod tests {
             .unwrap();
 
         for (mode, expected) in [
-            ("untracked", "untracked"),
-            ("created", "created"),
+            ("not_created", "not_created"),
+            ("identifier_reported", "identifier_reported"),
             ("pending", "in_flight"),
             ("malformed_pending", "in_flight"),
         ] {
@@ -2195,9 +2200,12 @@ mod tests {
                 .map(CreateOutcome::into_kind)
                 .map_err(CreateFailure::into_kind);
             match (expected, result) {
-                ("untracked", Err(CreateFailureKind::Untracked(error))) => drop(error),
-                ("created", Err(CreateFailureKind::Created { created, error })) => {
-                    assert_eq!(created.identifier().as_str(), "mock-id");
+                ("not_created", Err(CreateFailureKind::NoResource(error))) => drop(error),
+                (
+                    "identifier_reported",
+                    Err(CreateFailureKind::IdentifierReported { identified, error }),
+                ) => {
+                    assert_eq!(identified.identifier().as_str(), "mock-id");
                     drop(error);
                 }
                 ("in_flight", Err(CreateFailureKind::InFlight { pending, error })) => {
@@ -2217,11 +2225,11 @@ mod tests {
                 (expected, Ok(CreateOutcomeKind::PartialSuccess { state, diagnostic })) => {
                     panic!("expected {expected}, got partial {state:?}: {diagnostic:?}")
                 }
-                (expected, Err(CreateFailureKind::Untracked(error))) => {
-                    panic!("expected {expected}, got untracked {error}")
+                (expected, Err(CreateFailureKind::NoResource(error))) => {
+                    panic!("expected {expected}, got not_created {error}")
                 }
-                (expected, Err(CreateFailureKind::Created { created, error })) => {
-                    panic!("expected {expected}, got created {created:?}: {error}")
+                (expected, Err(CreateFailureKind::IdentifierReported { identified, error })) => {
+                    panic!("expected {expected}, got identifier-reported {identified:?}: {error}")
                 }
                 (expected, Err(CreateFailureKind::InFlight { pending, error })) => {
                     panic!("expected {expected}, got in flight {pending:?}: {error}")
@@ -2263,9 +2271,9 @@ mod tests {
             Ok(CreateOutcomeKind::PartialSuccess { state, diagnostic }) => {
                 panic!("expected pending, got {state:?}: {diagnostic:?}")
             }
-            Err(CreateFailureKind::Untracked(error)) => panic!("expected pending, got {error}"),
-            Err(CreateFailureKind::Created { created, error }) => {
-                panic!("expected pending, got {created:?}: {error}")
+            Err(CreateFailureKind::NoResource(error)) => panic!("expected pending, got {error}"),
+            Err(CreateFailureKind::IdentifierReported { identified, error }) => {
+                panic!("expected pending, got {identified:?}: {error}")
             }
             Err(CreateFailureKind::OutcomeUnknown { unknown, error }) => {
                 panic!(
@@ -2277,8 +2285,8 @@ mod tests {
 
         for (mode, expected) in [
             ("resumed", "resumed"),
-            ("discarded", "ended"),
-            ("undetermined", "in_flight"),
+            ("no_resource", "no_resource"),
+            ("unchanged", "in_flight"),
             ("pending", "in_flight"),
             ("malformed_pending", "in_flight"),
             ("resend", "resent"),
@@ -2343,7 +2351,7 @@ mod tests {
                         panic!("unexpected partial resend {state:?}: {diagnostic:?}")
                     }
                 },
-                ("ended", Err(ResumeFailureKind::Ended(error))) => drop(error),
+                ("no_resource", Err(ResumeFailureKind::NoResource(error))) => drop(error),
                 ("in_flight", Err(ResumeFailureKind::InFlight { pending, error })) => {
                     assert_eq!(pending.id(), &id);
                     drop(error);
@@ -2357,11 +2365,11 @@ mod tests {
                 (expected, Ok(ResumeOutcomeKind::Resent(outcome))) => {
                     panic!("expected {expected}, got resent {outcome:?}")
                 }
-                (expected, Err(ResumeFailureKind::Ended(error))) => {
-                    panic!("expected {expected}, got ended {error}")
+                (expected, Err(ResumeFailureKind::NoResource(error))) => {
+                    panic!("expected {expected}, got no-resource {error}")
                 }
-                (expected, Err(ResumeFailureKind::Created { created, error })) => {
-                    panic!("expected {expected}, got created {created:?}: {error}")
+                (expected, Err(ResumeFailureKind::IdentifierReported { identified, error })) => {
+                    panic!("expected {expected}, got identifier-reported {identified:?}: {error}")
                 }
                 (expected, Err(ResumeFailureKind::InFlight { pending, error })) => {
                     panic!("expected {expected}, got in flight {pending:?}: {error}")
@@ -3032,7 +3040,7 @@ mod tests {
         let err = runtime
             .block_on(dispatch_mock_create(&provider, id, resource))
             .expect_err("create should fail when CARINA_MOCK_CREATE_FAIL_FOR matches");
-        assert_eq!(err.to_string(), "create failed before it could be tracked");
+        assert_eq!(err.to_string(), "create failed and left no resource");
         let message = std::error::Error::source(&err)
             .expect("classified create failure retains the provider error")
             .to_string();

@@ -998,10 +998,13 @@ fn spawn_http_ok_server() -> Option<(SocketAddr, std::thread::JoinHandle<usize>)
 
 fn create_failure_error(failure: CreateFailure) -> ProviderError {
     match failure.into_kind() {
-        CreateFailureKind::Untracked(error) => error,
+        CreateFailureKind::NoResource(error) => error,
         CreateFailureKind::OutcomeUnknown { unknown: _, error } => error,
         CreateFailureKind::InFlight { pending: _, error } => error,
-        CreateFailureKind::Created { created: _, error } => error,
+        CreateFailureKind::IdentifierReported {
+            identified: _,
+            error,
+        } => error,
     }
 }
 
@@ -1042,7 +1045,7 @@ async fn initial_create_trap_after_dispatched_egress_is_outcome_unknown() {
 
     assert!(bytes_read > 0, "the request must actually leave the guest");
     let CreateFailureKind::OutcomeUnknown { unknown, error } = failure.into_kind() else {
-        panic!("a trap after dispatched egress must not be classified untracked")
+        panic!("a trap after dispatched egress must not be classified not_created")
     };
     assert_eq!(unknown.id(), &id);
     assert!(error.to_string().contains("WASM guest trapped"));
@@ -1085,7 +1088,7 @@ async fn initial_create_unencodable_pending_token_after_egress_is_outcome_unknow
 
     assert!(bytes_read > 0, "the request must actually leave the guest");
     let CreateFailureKind::OutcomeUnknown { unknown, error } = failure.into_kind() else {
-        panic!("a continuation encode failure after egress must never be untracked")
+        panic!("a continuation encode failure after egress must never be not_created")
     };
     assert_eq!(unknown.id(), &id);
     let rendered = error.to_string();
@@ -1093,7 +1096,7 @@ async fn initial_create_unencodable_pending_token_after_egress_is_outcome_unknow
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn initial_create_trap_without_egress_is_untracked() {
+async fn initial_create_trap_without_egress_is_not_created() {
     let path = skip_if_no_http_wasm!();
     let (factory, _cache) = load_http_factory(&path).await;
     let provider = factory
@@ -1122,14 +1125,14 @@ async fn initial_create_trap_without_egress_is_untracked() {
         .await
         .expect_err("the guest must trap before issuing the request");
 
-    let CreateFailureKind::Untracked(error) = failure.into_kind() else {
-        panic!("a trap with no dispatched egress must remain untracked")
+    let CreateFailureKind::NoResource(error) = failure.into_kind() else {
+        panic!("a trap with no dispatched egress must remain not_created")
     };
     assert!(error.to_string().contains("WASM guest trapped"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn provider_declared_untracked_remains_untracked_after_egress() {
+async fn provider_declared_not_created_remains_not_created_after_egress() {
     let path = skip_if_no_http_wasm!();
     let Some((server_address, server)) = spawn_http_ok_server() else {
         return;
@@ -1143,17 +1146,17 @@ async fn provider_declared_untracked_remains_untracked_after_egress() {
     let id = ResourceId::with_provider_identity(
         "mock_http",
         "test.send_phase",
-        "declared-untracked-after-egress",
+        "declared-not_created-after-egress",
         None,
     );
     let resource = with_http_create_behavior(
         http_send_phase_resource(
-            "declared-untracked-after-egress",
+            "declared-not_created-after-egress",
             &format!("http://phase-test.invalid:{}/", server_address.port()),
             "POST",
             &http_probe_body(),
         ),
-        "untracked_after_send",
+        "not_created_after_send",
     );
 
     let failure = provider
@@ -1164,10 +1167,10 @@ async fn provider_declared_untracked_remains_untracked_after_egress() {
     let bytes_read = server.join().expect("loopback server should finish");
 
     assert!(bytes_read > 0, "the request must actually leave the guest");
-    let CreateFailureKind::Untracked(error) = failure.into_kind() else {
-        panic!("a decoded provider-declared untracked verdict must remain authoritative")
+    let CreateFailureKind::NoResource(error) = failure.into_kind() else {
+        panic!("a decoded provider-declared not_created verdict must remain authoritative")
     };
-    assert!(error.to_string().contains("provider declared untracked"));
+    assert!(error.to_string().contains("provider declared not_created"));
 }
 
 fn persisted_create_for_resume(
@@ -1820,7 +1823,7 @@ async fn host_egress_denial_traps_instead_of_reaching_guest_send_phase_classific
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("the host egress policy must trap the guest");
-    let CreateFailureKind::Untracked(error) = failure.into_kind() else {
+    let CreateFailureKind::NoResource(error) = failure.into_kind() else {
         panic!("a policy-denied request must not count as dispatched egress")
     };
     let rendered = error.to_string();
@@ -2685,7 +2688,7 @@ async fn test_wasm_identifierless_read_back_resume_ends_invalid_continuation() {
         .await
         .expect_err("identifier-less read-back is permanently invalid")
         .into_kind();
-    let ResumeFailureKind::Ended(error) = failure else {
+    let ResumeFailureKind::NoResource(error) = failure else {
         panic!("invalid read-back must end polling, got {failure:?}");
     };
     assert!(
@@ -3003,7 +3006,8 @@ async fn test_wasm_pending_update_polls_until_success() {
             .await
             .expect("setup create should succeed"),
     );
-    let created_identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
+    let identified_identifier =
+        AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
     resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
     resource.set_attr(
         "update_pending_polls",
@@ -3018,7 +3022,7 @@ async fn test_wasm_pending_update_polls_until_success() {
 
     let state = provider
         .provider()
-        .update(&id, &created_identifier, request)
+        .update(&id, &identified_identifier, request)
         .await
         .expect("pending update should settle")
         .into_state_for_writeback();
@@ -3052,7 +3056,8 @@ async fn test_wasm_update_read_back_completes_within_budget() {
             .await
             .expect("setup create should succeed"),
     );
-    let created_identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
+    let identified_identifier =
+        AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
     resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
     resource.set_attr(
         "update_read_back_pending_polls",
@@ -3070,7 +3075,7 @@ async fn test_wasm_update_read_back_completes_within_budget() {
 
     let state = provider
         .provider()
-        .update(&id, &created_identifier, request)
+        .update(&id, &identified_identifier, request)
         .await
         .expect("update read-back should settle within the default budget")
         .into_state_for_writeback();
@@ -3104,7 +3109,8 @@ async fn test_wasm_update_read_back_budget_returns_partial_then_refresh_complete
             .await
             .expect("setup create should succeed"),
     );
-    let created_identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
+    let identified_identifier =
+        AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
     resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
     resource.set_attr(
         "update_read_back_pending_polls",
@@ -3122,7 +3128,7 @@ async fn test_wasm_update_read_back_budget_returns_partial_then_refresh_complete
 
     let outcome = provider
         .provider()
-        .update(&id, &created_identifier, request)
+        .update(&id, &identified_identifier, request)
         .await
         .expect("the final update attempt should return a partial success");
     let diagnostic = outcome
@@ -3173,7 +3179,8 @@ async fn test_wasm_update_read_back_phase_regression_is_protocol_violation_and_r
             .await
             .expect("setup create should succeed"),
     );
-    let created_identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
+    let identified_identifier =
+        AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
     resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
     resource.set_attr(
         "update_read_back_pending_polls",
@@ -3196,14 +3203,14 @@ async fn test_wasm_update_read_back_phase_regression_is_protocol_violation_and_r
 
     let error = provider
         .provider()
-        .update(&id, &created_identifier, request)
+        .update(&id, &identified_identifier, request)
         .await
         .expect_err("read-back must not regress to operation pending");
     assert!(error.to_string().contains("polling protocol"), "{error}");
 
     let recovered = provider
         .provider()
-        .read(&id, &created_identifier, ReadRequest)
+        .read(&id, &identified_identifier, ReadRequest)
         .await
         .expect("the retained update identifier must remain usable for recovery")
         .into_state();
@@ -3394,16 +3401,16 @@ async fn test_wasm_pending_over_budget_times_out_without_poisoning_instance() {
             assert_eq!(pending.id(), &id);
             assert_eq!(error.variant_name(), "timeout");
         }
-        CreateFailureKind::Untracked(error) => {
-            panic!("pending create was downgraded to untracked: {error}")
+        CreateFailureKind::NoResource(error) => {
+            panic!("pending create was downgraded to not_created: {error}")
         }
         CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
             "pending create outcome became unknown for {}: {error}",
             unknown.id()
         ),
-        CreateFailureKind::Created { created, error } => panic!(
-            "pending create was classified as created for {}: {error}",
-            created.identifier()
+        CreateFailureKind::IdentifierReported { identified, error } => panic!(
+            "pending create was classified as identifier-reported for {}: {error}",
+            identified.identifier()
         ),
     }
 
@@ -3418,7 +3425,7 @@ async fn test_wasm_pending_over_budget_times_out_without_poisoning_instance() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn wasm_mock_exercises_untracked_created_and_malformed_pending_verdicts() {
+async fn wasm_mock_exercises_not_created_identifier_reported_and_malformed_pending_verdicts() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
@@ -3426,46 +3433,54 @@ async fn wasm_mock_exercises_untracked_created_and_malformed_pending_verdicts() 
         .await
         .expect("provider should init");
 
-    let untracked_id =
-        ResourceId::with_provider_identity("mock", "test.resource", "mode-untracked", None);
-    let untracked = resource_with_string_attribute(
+    let not_created_id =
+        ResourceId::with_provider_identity("mock", "test.resource", "mode-not_created", None);
+    let not_created = resource_with_string_attribute(
         "test.resource",
-        "mode-untracked",
+        "mode-not_created",
         "create_mode",
-        "untracked",
+        "not_created",
     );
-    let untracked = provider
+    let not_created = provider
         .provider()
-        .create_for_test(&untracked_id, create_request_for_test(untracked).await)
+        .create_for_test(&not_created_id, create_request_for_test(not_created).await)
         .await
-        .expect_err("untracked mode must return a classified failure")
+        .expect_err("not_created mode must return a classified failure")
         .into_kind();
-    assert!(matches!(untracked, CreateFailureKind::Untracked(_error)));
+    assert!(matches!(not_created, CreateFailureKind::NoResource(_error)));
 
-    let created_id =
-        ResourceId::with_provider_identity("mock", "test.resource", "mode-created", None);
-    let mut created =
-        resource_with_string_attribute("test.resource", "mode-created", "create_mode", "created");
-    created.set_attr(
+    let identified_id = ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "mode-identifier-reported",
+        None,
+    );
+    let mut identified = resource_with_string_attribute(
+        "test.resource",
+        "mode-identifier-reported",
+        "create_mode",
+        "identifier_reported",
+    );
+    identified.set_attr(
         "name",
         Value::Concrete(ConcreteValue::String("created-name".into())),
     );
-    created.set_attr(
+    identified.set_attr(
         "create_sent",
         Value::Concrete(ConcreteValue::String("name".into())),
     );
-    let created = provider
+    let identified = provider
         .provider()
-        .create_for_test(&created_id, create_request_for_test(created).await)
+        .create_for_test(&identified_id, create_request_for_test(identified).await)
         .await
-        .expect_err("created mode must preserve its observed resource")
+        .expect_err("identifier-reported mode must preserve its observed resource")
         .into_kind();
-    let CreateFailureKind::Created { created, error } = created else {
-        panic!("created mode returned the wrong failure variant");
+    let CreateFailureKind::IdentifierReported { identified, error } = identified else {
+        panic!("identifier-reported mode returned the wrong failure variant");
     };
     drop(error);
-    assert_minted_mock_identifier(created.identifier().as_str());
-    match created.sent() {
+    assert_minted_mock_identifier(identified.identifier().as_str());
+    match identified.sent() {
         SentRecord::Request(Sent::Only(attributes)) => {
             assert_eq!(
                 attributes,
@@ -3473,10 +3488,12 @@ async fn wasm_mock_exercises_untracked_created_and_malformed_pending_verdicts() 
             );
         }
         SentRecord::Request(Sent::AllRequestAttributes) => {
-            panic!("created mode ignored its sent subset")
+            panic!("identifier-reported mode ignored its sent subset")
         }
         SentRecord::Persisted(envelope) => {
-            panic!("fresh created verdict unexpectedly used a persisted envelope: {envelope:?}")
+            panic!(
+                "fresh identifier-reported verdict unexpectedly used a persisted envelope: {envelope:?}"
+            )
         }
     }
 
@@ -3499,22 +3516,22 @@ async fn wasm_mock_exercises_untracked_created_and_malformed_pending_verdicts() 
             assert_eq!(pending.id(), &malformed_id);
             drop(error);
         }
-        CreateFailureKind::Untracked(error) => {
-            panic!("undecodable token was downgraded to untracked: {error}")
+        CreateFailureKind::NoResource(error) => {
+            panic!("undecodable token was downgraded to not_created: {error}")
         }
         CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
             "undecodable token became outcome unknown for {}: {error}",
             unknown.id()
         ),
-        CreateFailureKind::Created { created, error } => panic!(
-            "undecodable token was classified as created for {}: {error}",
-            created.identifier()
+        CreateFailureKind::IdentifierReported { identified, error } => panic!(
+            "undecodable token was classified as identifier-reported for {}: {error}",
+            identified.identifier()
         ),
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn initial_issued_encode_failure_is_created_never_untracked() {
+async fn initial_issued_encode_failure_is_identifier_reported_never_not_created() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
@@ -3537,12 +3554,12 @@ async fn initial_issued_encode_failure_is_created_never_untracked() {
         .expect_err("guest encoding failure must remain classified")
         .into_kind();
     match failure {
-        CreateFailureKind::Created { created, error } => {
-            assert_minted_mock_identifier(created.identifier().as_str());
+        CreateFailureKind::IdentifierReported { identified, error } => {
+            assert_minted_mock_identifier(identified.identifier().as_str());
             assert!(!error.to_string().is_empty());
         }
-        CreateFailureKind::Untracked(error) => {
-            panic!("issued create was lost as untracked: {error}")
+        CreateFailureKind::NoResource(error) => {
+            panic!("issued create was lost as not_created: {error}")
         }
         CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
             "issued create lost its identifier as outcome unknown for {}: {error}",
@@ -3555,7 +3572,7 @@ async fn initial_issued_encode_failure_is_created_never_untracked() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn initial_unissued_pending_token_encode_failure_without_egress_is_untracked() {
+async fn initial_unissued_pending_token_encode_failure_without_egress_is_not_created() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
@@ -3582,12 +3599,12 @@ async fn initial_unissued_pending_token_encode_failure_without_egress_is_untrack
         .expect_err("an unissued unencodable continuation must trap")
         .into_kind()
     {
-        CreateFailureKind::Untracked(error) => {
+        CreateFailureKind::NoResource(error) => {
             assert!(error.to_string().contains("WASM guest trapped"));
         }
-        CreateFailureKind::Created { created, error } => panic!(
+        CreateFailureKind::IdentifierReported { identified, error } => panic!(
             "unissued create unexpectedly retained identifier {}: {error}",
-            created.identifier()
+            identified.identifier()
         ),
         CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
             "pre-dispatch token encoding failure became outcome unknown for {}: {error}",
@@ -3600,7 +3617,7 @@ async fn initial_unissued_pending_token_encode_failure_without_egress_is_untrack
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn initial_issued_pending_token_encode_failure_is_created() {
+async fn initial_issued_pending_token_encode_failure_is_identifier_reported() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
@@ -3627,9 +3644,9 @@ async fn initial_issued_pending_token_encode_failure_is_created() {
         .expect_err("an issued create with no encodable continuation must be retained")
         .into_kind()
     {
-        CreateFailureKind::Created { created, error } => {
-            assert_minted_mock_identifier(created.identifier().as_str());
-            let read_error = match created.observation() {
+        CreateFailureKind::IdentifierReported { identified, error } => {
+            assert_minted_mock_identifier(identified.identifier().as_str());
+            let read_error = match identified.observation() {
                 CreateObservation::Observed(state) => {
                     panic!("token encoding failure became an observed create: {state:?}")
                 }
@@ -3642,13 +3659,13 @@ async fn initial_issued_pending_token_encode_failure_is_created() {
             };
             assert!(read_error.to_string().contains("pending token"));
             assert!(matches!(
-                created.sent(),
+                identified.sent(),
                 SentRecord::Request(Sent::AllRequestAttributes)
             ));
             assert!(error.to_string().contains("pending token"));
         }
-        CreateFailureKind::Untracked(error) => {
-            panic!("issued create was lost as untracked: {error}")
+        CreateFailureKind::NoResource(error) => {
+            panic!("issued create was lost as not_created: {error}")
         }
         CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
             "issued create lost its identifier as outcome unknown for {}: {error}",
@@ -3691,16 +3708,16 @@ async fn unissued_poll_token_encode_failure_keeps_previous_continuation() {
             assert_eq!(token["polls_served"], 0);
             assert!(error.to_string().contains("poll_create pending token"));
         }
-        CreateFailureKind::Untracked(error) => {
+        CreateFailureKind::NoResource(error) => {
             panic!("poll token encoding failure lost the previous continuation: {error}")
         }
         CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
             "poll token encoding failure became outcome unknown for {}: {error}",
             unknown.id()
         ),
-        CreateFailureKind::Created { created, error } => panic!(
+        CreateFailureKind::IdentifierReported { identified, error } => panic!(
             "unissued poll unexpectedly retained identifier {}: {error}",
-            created.identifier()
+            identified.identifier()
         ),
     }
 }
@@ -3746,16 +3763,16 @@ async fn issued_poll_token_encode_failure_keeps_previous_continuation() {
             );
             assert!(error.to_string().contains("poll_create pending token"));
         }
-        CreateFailureKind::Untracked(error) => {
-            panic!("issued poll was lost as untracked: {error}")
+        CreateFailureKind::NoResource(error) => {
+            panic!("issued poll was lost as not_created: {error}")
         }
         CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
             "issued poll became outcome unknown for {}: {error}",
             unknown.id()
         ),
-        CreateFailureKind::Created { created, error } => panic!(
+        CreateFailureKind::IdentifierReported { identified, error } => panic!(
             "issued poll ended the in-flight operation for {}: {error}",
-            created.identifier()
+            identified.identifier()
         ),
     }
 }
@@ -3810,12 +3827,12 @@ async fn resume_pending_token_encode_failure_keeps_previous_continuation() {
             );
             assert!(error.to_string().contains("pending token"));
         }
-        Err(ResumeFailureKind::Ended(error)) => {
+        Err(ResumeFailureKind::NoResource(error)) => {
             panic!("token encoding failure incorrectly ended the create: {error}")
         }
-        Err(ResumeFailureKind::Created { created, error }) => panic!(
+        Err(ResumeFailureKind::IdentifierReported { identified, error }) => panic!(
             "token encoding failure unexpectedly finalized {}: {error}",
-            created.identifier()
+            identified.identifier()
         ),
         Ok(ResumeOutcomeKind::Resumed(created)) => {
             panic!("token encoding failure unexpectedly resumed {created:?}")
@@ -3830,7 +3847,7 @@ async fn resume_pending_token_encode_failure_keeps_previous_continuation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn wasm_mock_exercises_resumed_discarded_undetermined_repending_and_resend() {
+async fn wasm_mock_exercises_resumed_no_resource_unchanged_repending_and_resend() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
@@ -3840,8 +3857,8 @@ async fn wasm_mock_exercises_resumed_discarded_undetermined_repending_and_resend
 
     for (mode, identifier, expected) in [
         ("resumed", Some("mock-id"), "resumed"),
-        ("discarded", Some("mock-id"), "ended"),
-        ("undetermined", None, "in_flight"),
+        ("no_resource", Some("mock-id"), "no_resource"),
+        ("unchanged", None, "in_flight"),
         ("pending", None, "in_flight"),
         ("resend", None, "resent"),
     ] {
@@ -3887,7 +3904,7 @@ async fn wasm_mock_exercises_resumed_discarded_undetermined_repending_and_resend
                     )
                 }
             },
-            ("ended", Err(ResumeFailureKind::Ended(error))) => drop(error),
+            ("no_resource", Err(ResumeFailureKind::NoResource(error))) => drop(error),
             ("in_flight", Err(ResumeFailureKind::InFlight { pending, error })) => {
                 assert_eq!(pending.id(), &id);
                 drop(error);
@@ -3901,11 +3918,11 @@ async fn wasm_mock_exercises_resumed_discarded_undetermined_repending_and_resend
             (expected, Ok(ResumeOutcomeKind::Resent(outcome))) => {
                 panic!("expected {expected}, got resent {outcome:?}")
             }
-            (expected, Err(ResumeFailureKind::Ended(error))) => {
-                panic!("expected {expected}, got ended {error}")
+            (expected, Err(ResumeFailureKind::NoResource(error))) => {
+                panic!("expected {expected}, got no-resource {error}")
             }
-            (expected, Err(ResumeFailureKind::Created { created, error })) => {
-                panic!("expected {expected}, got created {created:?}: {error}")
+            (expected, Err(ResumeFailureKind::IdentifierReported { identified, error })) => {
+                panic!("expected {expected}, got identifier-reported {identified:?}: {error}")
             }
             (expected, Err(ResumeFailureKind::InFlight { pending, error })) => {
                 panic!("expected {expected}, got in flight {pending:?}: {error}")
@@ -3936,12 +3953,12 @@ async fn wasm_mock_exercises_resumed_discarded_undetermined_repending_and_resend
             assert_eq!(pending.id(), &malformed_id);
             drop(error);
         }
-        Err(ResumeFailureKind::Ended(error)) => {
+        Err(ResumeFailureKind::NoResource(error)) => {
             panic!("undecodable resume token incorrectly ended the row: {error}")
         }
-        Err(ResumeFailureKind::Created { created, error }) => panic!(
-            "undecodable resume token was classified as created for {}: {error}",
-            created.identifier()
+        Err(ResumeFailureKind::IdentifierReported { identified, error }) => panic!(
+            "undecodable resume token was classified as identifier-reported for {}: {error}",
+            identified.identifier()
         ),
         Ok(ResumeOutcomeKind::Resumed(created)) => panic!(
             "undecodable resume token unexpectedly resumed {}",
@@ -4023,9 +4040,11 @@ async fn canonicalized_composite_identifiers_survive_finished_and_resumed_paths(
         Ok(ResumeOutcomeKind::Resent(outcome)) => {
             panic!("expected resumed canonical identifier, got resent {outcome:?}")
         }
-        Err(ResumeFailureKind::Ended(error)) => panic!("canonical resume ended: {error}"),
-        Err(ResumeFailureKind::Created { created, error }) => {
-            panic!("canonical resume failed after create {created:?}: {error}")
+        Err(ResumeFailureKind::NoResource(error)) => {
+            panic!("canonical resume returned no-resource: {error}")
+        }
+        Err(ResumeFailureKind::IdentifierReported { identified, error }) => {
+            panic!("canonical resume failed after create {identified:?}: {error}")
         }
         Err(ResumeFailureKind::InFlight { pending, error }) => {
             panic!("canonical resume stayed in flight {pending:?}: {error}")
@@ -4071,16 +4090,16 @@ async fn test_wasm_operation_budget_includes_initial_guest_call() {
             error,
             carina_core::provider::ProviderError::Timeout(_timeout)
         )),
-        CreateFailureKind::Untracked(error) => {
-            panic!("slow initial call was classified as untracked: {error}")
+        CreateFailureKind::NoResource(error) => {
+            panic!("slow initial call was classified as not_created: {error}")
         }
         CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
             "slow initial call became outcome unknown for {}: {error}",
             unknown.id()
         ),
-        CreateFailureKind::Created { created, error } => panic!(
-            "slow initial call was classified as created for {}: {error}",
-            created.identifier()
+        CreateFailureKind::IdentifierReported { identified, error } => panic!(
+            "slow initial call was classified as identifier-reported for {}: {error}",
+            identified.identifier()
         ),
     }
 }
@@ -6300,10 +6319,7 @@ async fn test_wasm_normalize_state_trap_is_an_error_and_does_not_mutate_state() 
         .create_for_test(&create_id, create_request_for_test(resource).await)
         .await
         .expect_err("the shared provider instance must remain poisoned after a normalizer trap");
-    assert_eq!(
-        error.to_string(),
-        "create failed before it could be tracked"
-    );
+    assert_eq!(error.to_string(), "create failed and left no resource");
     let rendered = std::error::Error::source(&error)
         .expect("classified create failure retains the poisoned provider error")
         .to_string();
@@ -6339,7 +6355,7 @@ async fn test_wasm_crud_trap_poisons_instance_with_original_operation() {
         .expect_err("the mock create hook must trap");
     assert_eq!(
         initial_error.to_string(),
-        "create failed before it could be tracked"
+        "create failed and left no resource"
     );
     let initial_source = std::error::Error::source(&initial_error)
         .expect("classified create failure retains the trap")
@@ -6389,10 +6405,7 @@ async fn test_wasm_provider_returned_error_does_not_poison_instance() {
         .create_for_test(&error_id, create_request_for_test(error_resource).await)
         .await
         .expect_err("the mock create hook must return a provider error");
-    assert_eq!(
-        error.to_string(),
-        "create failed before it could be tracked"
-    );
+    assert_eq!(error.to_string(), "create failed and left no resource");
     assert!(
         std::error::Error::source(&error)
             .expect("classified create failure retains the guest provider error")
