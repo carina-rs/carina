@@ -889,8 +889,12 @@ mod tests {
         plan.add(Effect::Update {
             identifier: crate::fixture_applied_identifier("subnet-old"),
             from: Box::new(
-                State::existing(update_id.clone(), Default::default())
-                    .with_identifier("subnet-old"),
+                (State::<carina_core::resource::NoPlaceholder>::existing(
+                    update_id.clone(),
+                    Default::default(),
+                )
+                .with_identifier("subnet-old"))
+                .to_snapshot(),
             ),
             to: resolved(update_to),
             changed_attributes: vec!["cidr".to_string()],

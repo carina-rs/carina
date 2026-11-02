@@ -3552,7 +3552,11 @@ mod tests {
         let current_states = HashMap::from([(
             resource.id.clone(),
             Current::from_state(
-                State::existing(resource.id.clone(), HashMap::new()).with_identifier("vpc-new"),
+                State::<carina_core::resource::NoPlaceholder>::existing(
+                    resource.id.clone(),
+                    HashMap::new(),
+                )
+                .with_identifier("vpc-new"),
             ),
         )]);
         let deposed_key = DeposedKey::new_unique();
@@ -3607,7 +3611,10 @@ mod tests {
     #[test]
     fn destroy_delete_uses_identifier_carried_by_present_current() {
         let resource = Resource::with_provider("mock", "test.Widget", "current", None);
-        let state = State::existing(resource.id.clone(), HashMap::new());
+        let state = State::<carina_core::resource::NoPlaceholder>::existing(
+            resource.id.clone(),
+            HashMap::new(),
+        );
         let identifier = crate::fixture_applied_identifier("typed-provider-id");
         let current_states = HashMap::from([(
             resource.id.clone(),

@@ -836,6 +836,15 @@ fn parse_account_guard_clause(msg: &str, kind: &str) -> Option<AccountGuardClaus
 #[derive(Debug, thiserror::Error)]
 pub enum SavedPlanSecretVerificationError {
     #[error(
+        "Saved-plan secret is unavailable at {location}: {error}; re-run `{replan}` after restoring its value."
+    )]
+    UnavailableSecret {
+        location: String,
+        replan: String,
+        error: carina_core::resource::UnavailableSecretError,
+    },
+
+    #[error(
         "Saved-plan secret verification failed at {location}: the secret changed since the plan was created; re-run `{replan}`."
     )]
     HashMismatch { location: String, replan: String },
@@ -947,6 +956,17 @@ pub enum AppError {
 
     #[error(transparent)]
     ExportBoundary(#[from] carina_core::validation::ExportBoundaryError),
+
+    /// An authored reference selected unavailable historical secret evidence.
+    #[error(transparent)]
+    ValueResolution(#[from] carina_core::resolver::ResolutionError),
+
+    /// Snapshot redaction or another serialization boundary failed.
+    #[error(transparent)]
+    Serialization(#[from] carina_core::value::SerializationError),
+
+    #[error(transparent)]
+    DeferredForExpansion(#[from] carina_core::parser::DeferredForExpansionError),
 
     /// Provider installation, egress consent, or initialization failed.
     #[error(transparent)]
@@ -1077,6 +1097,8 @@ pub enum AppError {
 
     #[error(transparent)]
     PlanComparison(#[from] carina_core::differ::PlanComparisonError),
+    #[error(transparent)]
+    Comparison(#[from] carina_core::differ::ComparisonError),
 
     /// Host-side AWS credential resolution failed before a guest started.
     #[error(transparent)]
@@ -1504,15 +1526,25 @@ impl From<&str> for AppError {
     }
 }
 
-impl From<carina_core::value::SerializationError> for AppError {
-    fn from(e: carina_core::value::SerializationError) -> Self {
-        AppError::Config(e.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_loop_expansion_preserves_unavailable_secret_error() {
+        use carina_core::resource::{ConcreteValue, DeferredValue, Value};
+        let secret: Value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("private".into()),
+        ))));
+        let snapshot = carina_core::value::redact_secrets_in_value(&secret).unwrap();
+        let unavailable = snapshot.to_value_at("loop.items").unwrap_err();
+        let error = AppError::from(
+            carina_core::parser::DeferredForExpansionError::UnavailableSecret(unavailable),
+        );
+        assert!(matches!(error, AppError::DeferredForExpansion(
+            carina_core::parser::DeferredForExpansionError::UnavailableSecret(error)
+        ) if error.path() == "loop.items"));
+    }
 
     #[tokio::test]
     async fn wire_preparation_errors_render_the_typed_reason_once_at_cli_boundaries() {

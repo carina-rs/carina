@@ -77,7 +77,15 @@ fn write_multifile_root(project: &Project, body: &str) {
     project.write("providers.crn", "provider mock {}\n");
 }
 
-fn resource<'a>(plan: &'a PlanFile, binding: &str) -> &'a carina_core::resource::SavedResource {
+fn resource<'a>(
+    plan: &'a PlanFile,
+    binding: &str,
+) -> &'a carina_core::resource::Resource<
+    carina_core::resource::SavedModuleSource,
+    carina_core::resource::SnapshotLeaf,
+    carina_core::resource::AbsoluteBindingAddress,
+    (),
+> {
     plan.unresolved_resources
         .iter()
         .find(|resource| resource.binding.as_ref().map(|binding| binding.as_str()) == Some(binding))
@@ -87,7 +95,10 @@ fn resource<'a>(plan: &'a PlanFile, binding: &str) -> &'a carina_core::resource:
 fn graph_resource<'a>(
     plan: &'a PlanFile,
     binding: &str,
-) -> &'a carina_core::resource::SchemaUnresolvedResource {
+) -> &'a carina_core::resource::SchemaUnresolvedResource<
+    carina_core::resource::SavedModuleSource,
+    carina_core::resource::SnapshotLeaf,
+> {
     plan.plan
         .effects()
         .iter()
@@ -150,7 +161,9 @@ let consumer = mock.test.resource {
     assert!(
         matches!(
             secret,
-            Value::Deferred(DeferredValue::RedactedSecret { .. })
+            Value::Deferred(DeferredValue::Placeholder(
+                carina_core::resource::SnapshotLeaf::RedactedSecret { .. }
+            ))
         ),
         "saved plans must redact the resolved secret expression: {secret:?}",
     );

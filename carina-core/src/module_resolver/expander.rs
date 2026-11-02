@@ -1,6 +1,7 @@
 //! Module-call expansion, argument substitution, and intra-module
 //! reference rewriting.
 
+use crate::resource::ValueKind;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use indexmap::IndexMap;
@@ -1256,7 +1257,6 @@ fn source_argument_name<B: BindingAddress, C: BindingAddress>(
                 }
                 | DeferredValue::Access(_)
                 | DeferredValue::Secret(_)
-                | DeferredValue::RedactedSecret { hash: _ }
                 | DeferredValue::Unknown(
                     ApplyTimeUnknown::UpstreamExport { path: _ }
                     | ApplyTimeUnknown::UpstreamAllExports { binding: _ }
@@ -1583,7 +1583,6 @@ fn authored_value_reference_path(value: &Value) -> Option<crate::resource::Autho
             }
             | DeferredValue::Access(_)
             | DeferredValue::Secret(_)
-            | DeferredValue::RedactedSecret { hash: _ }
             | DeferredValue::Unknown(
                 ApplyTimeUnknown::UpstreamExport { path: _ }
                 | ApplyTimeUnknown::UpstreamAllExports { binding: _ }
@@ -1725,7 +1724,6 @@ fn module_parameter_postfix<B: BindingAddress>(
                     source_line: _,
                 }
                 | DeferredValue::Secret(_)
-                | DeferredValue::RedactedSecret { hash: _ }
                 | DeferredValue::Unknown(
                     ApplyTimeUnknown::UpstreamExport { path: _ }
                     | ApplyTimeUnknown::UpstreamAllExports { binding: _ }
@@ -2829,8 +2827,7 @@ fn expanded_if_dependency(value: &ModuleResolvedValue) -> ExpandedIfDependency {
                 args: _,
                 reason: _,
                 source_line: _,
-            }
-            | DeferredValue::RedactedSecret { hash: _ },
+            },
         ) => ExpandedIfDependency::Runtime,
     }
 }
@@ -3022,9 +3019,7 @@ fn select_expanded_module_ifs(
             | ConcreteValue::StringList(_),
         )
         | Value::Deferred(
-            DeferredValue::ResourceRef { path: _ }
-            | DeferredValue::BindingRef { binding: _ }
-            | DeferredValue::RedactedSecret { hash: _ },
+            DeferredValue::ResourceRef { path: _ } | DeferredValue::BindingRef { binding: _ },
         ) => value.clone(),
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             let _dependency = expanded_unknown_dependency(reason);
@@ -3210,9 +3205,7 @@ fn evaluate_expanded_module_functions(
             | ConcreteValue::StringList(_),
         )
         | Value::Deferred(
-            DeferredValue::ResourceRef { path: _ }
-            | DeferredValue::BindingRef { binding: _ }
-            | DeferredValue::RedactedSecret { hash: _ },
+            DeferredValue::ResourceRef { path: _ } | DeferredValue::BindingRef { binding: _ },
         ) => value.clone(),
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             let _dependency = expanded_unknown_dependency(reason);
@@ -3560,7 +3553,6 @@ fn expand_module_composition(
                             }
                             | DeferredValue::Access(_)
                             | DeferredValue::Secret(_)
-                            | DeferredValue::RedactedSecret { hash: _ }
                             | DeferredValue::Unknown(
                                 ApplyTimeUnknown::UpstreamExport { path: _ }
                                 | ApplyTimeUnknown::UpstreamAllExports { binding: _ }
@@ -4181,8 +4173,7 @@ fn select_authored_module_ifs_for_test(
                 args: _,
                 source_line: _,
             }
-            | DeferredValue::Access(_)
-            | DeferredValue::RedactedSecret { hash: _ },
+            | DeferredValue::Access(_),
         ) => value.clone(),
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             let _dependency = expanded_unknown_dependency(reason);
@@ -4400,9 +4391,7 @@ fn substitute_module_if_paths_in_secret<B: BindingAddress>(
             | ConcreteValue::StringList(_),
         )
         | Value::Deferred(
-            DeferredValue::ResourceRef { path: _ }
-            | DeferredValue::BindingRef { binding: _ }
-            | DeferredValue::RedactedSecret { hash: _ },
+            DeferredValue::ResourceRef { path: _ } | DeferredValue::BindingRef { binding: _ },
         ) => value.clone(),
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             let _dependency = expanded_unknown_dependency(reason);
@@ -4710,8 +4699,7 @@ fn substitute_arguments_with_position<B: BindingAddress>(
             | ConcreteValue::Bool(_)
             | ConcreteValue::Duration(_)
             | ConcreteValue::StringList(_),
-        )
-        | Value::Deferred(DeferredValue::RedactedSecret { hash: _ }) => value.clone(),
+        ) => value.clone(),
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             let _dependency = expanded_unknown_dependency(reason);
             value.clone()
@@ -4790,7 +4778,6 @@ fn substitute_arguments_with_position<B: BindingAddress>(
                     source_line: _,
                 }
                 | DeferredValue::Secret(_)
-                | DeferredValue::RedactedSecret { hash: _ }
                 | DeferredValue::Unknown(
                     ApplyTimeUnknown::UpstreamExport { path: _ }
                     | ApplyTimeUnknown::UpstreamAllExports { binding: _ }

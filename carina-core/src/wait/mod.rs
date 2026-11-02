@@ -6,6 +6,7 @@ pub mod augment;
 mod observation;
 pub mod predicate;
 pub use observation::WaitObservation;
+pub(crate) use observation::evaluation_inputs;
 pub use predicate::{AttrPath, AttrPathError, WaitPredicate};
 
 use serde::{Deserialize, Serialize};

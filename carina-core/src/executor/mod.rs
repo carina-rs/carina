@@ -32,10 +32,10 @@ pub use crate::data_source_value::UnresolvedDataSourceInput;
 pub use crate::effect::deps::UnresolvedResource;
 pub use provider_ready::{
     ModuleConstraintFailure, ModuleConstraintGate, ModuleConstraintGateError,
-    ProviderConfigPreparationError, ProviderConfigValidationError, ProviderPreparationContext,
-    ProviderPreparationError, ProviderReadyConfig, ProviderValueConstraintErrors,
-    prepare_create_request, prepare_provider_ready_config, prepare_provider_ready_data_source,
-    prepare_provider_ready_resource, prepare_update_request,
+    ModuleConstraintViolations, ProviderConfigPreparationError, ProviderConfigValidationError,
+    ProviderPreparationContext, ProviderPreparationError, ProviderReadyConfig,
+    ProviderValueConstraintErrors, prepare_create_request, prepare_provider_ready_config,
+    prepare_provider_ready_data_source, prepare_provider_ready_resource, prepare_update_request,
 };
 /// Phase of an executor scheduler endpoint after deferred replacements have
 /// been expanded.
@@ -124,7 +124,7 @@ use crate::provider::{
 use crate::resource::{
     ApplyTimeUnknown, ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart,
     ModuleSource, ResolvedResource, Resource, ResourceId, ResourceIdentity, SavedModuleSource,
-    State, Value,
+    SnapshotState as State, Value,
 };
 use crate::wait::WaitObservation;
 
@@ -499,9 +499,9 @@ pub struct LiveExecutionInput<'a> {
 /// Keeping the composition slice in a distinct input type prevents a
 /// deserialized plan from entering the live validation/expansion lifecycle.
 pub struct SavedExecutionInput<'a> {
-    pub plan: &'a crate::plan::SavedPlan,
+    pub plan: &'a crate::plan::Plan<SavedModuleSource>,
     pub provider_check_inputs: ProviderCheckInputs<'a, SavedModuleSource>,
-    pub compositions: &'a [crate::resource::SavedComposition],
+    pub compositions: &'a [crate::resource::SavedComposition<crate::resource::NoPlaceholder>],
     pub bindings: ResolvedBindings,
     pub managed_current: HashMap<ResourceId, Current>,
     pub data_source_values: crate::data_source_value::ExecutableDataSourceValues<SavedModuleSource>,
@@ -521,7 +521,7 @@ pub struct SavedExecutionInput<'a> {
 #[derive(Clone, Copy)]
 pub(super) enum RuntimeCompositions<'a> {
     Live(&'a [crate::resource::LiveComposition]),
-    Saved(&'a [crate::resource::SavedComposition]),
+    Saved(&'a [crate::resource::SavedComposition<crate::resource::NoPlaceholder>]),
 }
 
 impl RuntimeCompositions<'_> {
@@ -801,8 +801,7 @@ fn visit_unknowns(value: &Value, f: &mut impl FnMut(&ApplyTimeUnknown)) {
         }
         Value::Concrete(_)
         | Value::Deferred(DeferredValue::ResourceRef { .. })
-        | Value::Deferred(DeferredValue::BindingRef { .. })
-        | Value::Deferred(DeferredValue::RedactedSecret { .. }) => {}
+        | Value::Deferred(DeferredValue::BindingRef { .. }) => {}
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
@@ -851,7 +850,7 @@ pub async fn read_data_source_with_retry(
     let max_retries = 3;
     for attempt in 0..=max_retries {
         match provider.read_data_source(resource).await {
-            Ok(state) => return Ok(state),
+            Ok(state) => return Ok(state.into()),
             Err(e) if attempt < max_retries && is_throttling_error(&e) => {
                 let delay = Duration::from_secs(1 << attempt);
                 eprintln!(
@@ -1394,6 +1393,7 @@ pub enum FailureReport<'a, S> {
         context: FailureEventContext<'a>,
     },
     ModuleConstraint(Box<ModuleConstraintFailure>),
+    ModuleConstraintResolution(crate::module_resolver::ModuleConstraintResolutionError),
 }
 
 impl FailureSink {
@@ -1411,6 +1411,15 @@ impl FailureSink {
             FailureReport::ModuleConstraint(failure) => {
                 (EffectFailure::module_constraint(failure), None)
             }
+            FailureReport::ModuleConstraintResolution(error) => (
+                EffectFailure {
+                    endpoint: None,
+                    kind: EffectFailureKind::Execution {
+                        error: ReportedError::new(error),
+                    },
+                },
+                None,
+            ),
         };
         self.failures.push(failure);
         let recorded = RecordedFailure {
@@ -1827,12 +1836,19 @@ pub(super) fn record_effect_failure<S: Clone>(
 fn record_module_constraint_failure<S: Clone>(
     accumulator: &mut ExecutionAccumulator<S>,
     observer: &dyn ExecutionObserver<S>,
-    failure: ModuleConstraintFailure,
+    error: ModuleConstraintGateError,
 ) {
-    accumulator.mutate(|result| {
-        result
+    accumulator.mutate(|result| match error {
+        ModuleConstraintGateError::UnavailableSecret(error) => result
             .failures
-            .record(observer, FailureReport::ModuleConstraint(Box::new(failure)))
+            .record(observer, FailureReport::ModuleConstraintResolution(error)),
+        ModuleConstraintGateError::Violations(violations) => {
+            for failure in violations.into_failures() {
+                result
+                    .failures
+                    .record(observer, FailureReport::ModuleConstraint(Box::new(failure)));
+            }
+        }
     });
 }
 

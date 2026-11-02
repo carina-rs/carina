@@ -6,7 +6,9 @@ use carina_core::effect::{Effect, EffectGeneration};
 use carina_core::identifier::{DesiredCreateOnlyValues, StateCreateOnlyValues};
 use carina_core::plan::Plan;
 use carina_core::provider::{ComparisonResolutionError, ProviderRouter};
-use carina_core::resource::{Current, ResolvedResource, ResolvedResourceId, ResourceId, Value};
+use carina_core::resource::{
+    Current, ResolvedResource, ResolvedResourceId, ResourceId, SnapshotValue,
+};
 use carina_core::schema::{SchemaRegistry, ValidatedResourceSchema};
 
 /// One plan-time suggestion. Rendering belongs to this typed value rather
@@ -208,7 +210,7 @@ pub fn detect_moved_block_hints<S>(
     prior: &HashMap<ResourceId, Current>,
     schemas: &SchemaRegistry,
     comparison_provider: &ProviderRouter,
-) -> Result<MovedBlockHints, ComparisonResolutionError> {
+) -> carina_core::provider::ProviderResult<MovedBlockHints> {
     let mut replacement_creates = HashSet::new();
     let mut replacement_deletes = HashSet::new();
     for replacement in plan.replace_display_info() {
@@ -272,7 +274,7 @@ pub fn detect_moved_block_hints<S>(
     let mut created_to_destroyed = vec![Vec::new(); created.len()];
     for (destroyed_index, destroyed_resource) in destroyed.iter().enumerate() {
         for (created_index, created_resource) in created.iter().enumerate() {
-            if resources_match(destroyed_resource, created_resource) {
+            if resources_match(destroyed_resource, created_resource)? {
                 destroyed_to_created[destroyed_index].push(created_index);
                 created_to_destroyed[created_index].push(destroyed_index);
             }
@@ -360,13 +362,13 @@ pub fn detect_moved_block_hints<S>(
 
 struct DestroyCandidate<'a> {
     id: &'a ResolvedResourceId,
-    attributes: &'a HashMap<String, Value>,
+    attributes: &'a HashMap<String, SnapshotValue>,
 }
 
 struct CreateCandidate<'schema> {
     id: ResolvedResourceId,
     schema: &'schema ValidatedResourceSchema,
-    comparison: carina_core::differ::ObservationComparison<'schema>,
+    comparison: carina_core::differ::ComparisonSchema<'schema>,
     create_only_values: DesiredCreateOnlyValues,
 }
 
@@ -375,7 +377,7 @@ enum GraphNode {
     Created(usize),
 }
 
-fn current_attributes(current: &Current) -> Option<&HashMap<String, Value>> {
+fn current_attributes(current: &Current) -> Option<&HashMap<String, SnapshotValue>> {
     match current {
         Current::Absent(state) => Some(&state.state().attributes),
         Current::Present(present) => Some(&present.state().attributes),
@@ -410,7 +412,7 @@ fn create_candidate<'schema, S>(
     Ok(Some(CreateCandidate {
         id: created.resolved_id(),
         schema,
-        comparison: comparison.context().observation(),
+        comparison: *comparison.context(),
         create_only_values,
     }))
 }
@@ -419,21 +421,24 @@ fn create_candidate<'schema, S>(
 /// Desired attributes omitted by configuration are intentionally ignored, so
 /// a match means the compared values agree, not that the full states are
 /// identical.
-fn resources_match(destroyed: &DestroyCandidate<'_>, created: &CreateCandidate<'_>) -> bool {
+fn resources_match(
+    destroyed: &DestroyCandidate<'_>,
+    created: &CreateCandidate<'_>,
+) -> Result<bool, carina_core::differ::ComparisonError> {
     if destroyed.id.provider() != created.id.provider()
         || destroyed.id.resource_type() != created.id.resource_type()
         || destroyed.id.provider_instance() != created.id.provider_instance()
     {
-        return false;
+        return Ok(false);
     }
 
     let prior_values =
         StateCreateOnlyValues::from_state_attributes(created.schema, destroyed.attributes);
-    created.create_only_values.all_match(
-        &prior_values,
-        created.schema.as_schema(),
-        &created.comparison,
-    )
+    created.comparison.with_observation(|comparison| {
+        created
+            .create_only_values
+            .all_match(&prior_values, created.schema.as_schema(), comparison)
+    })
 }
 
 fn render_address(id: &ResolvedResourceId) -> String {
@@ -560,7 +565,7 @@ mod tests {
         value: &str,
         generation: EffectGeneration,
     ) {
-        let state = State::existing(
+        let state = State::<carina_core::resource::NoPlaceholder>::existing(
             resource_id.as_inner().clone(),
             HashMap::from([(CREATE_ONLY_ATTRIBUTE.to_string(), concrete_string(value))]),
         )
@@ -732,7 +737,7 @@ mod tests {
             .and_then(Current::attributes_mut)
             .expect("test prior has attributes");
         prior_attributes.clear();
-        prior_attributes.insert("type".to_string(), concrete_string("CNAME"));
+        prior_attributes.insert("type".to_string(), concrete_string("CNAME").to_snapshot());
 
         let enum_identity = TypeIdentity::new(Some(PROVIDER), ["route53", "RecordSet"], "Type");
         let enum_type = PatternAttributeType::enum_(
@@ -794,7 +799,8 @@ mod tests {
             Value::Concrete(ConcreteValue::List(vec![
                 concrete_string("zone-a"),
                 concrete_string("zone-b"),
-            ])),
+            ]))
+            .to_snapshot(),
         );
         let desired = Resource::from_id(id("vpcs[0]", None).into_inner()).with_attribute(
             "zones",
@@ -844,7 +850,10 @@ mod tests {
             .get_mut(old_id.as_inner())
             .and_then(Current::attributes_mut)
             .expect("test prior has attributes")
-            .insert("name".to_string(), concrete_string("old-provider-name"));
+            .insert(
+                "name".to_string(),
+                concrete_string("old-provider-name").to_snapshot(),
+            );
         let desired = Resource::from_id(id("vpcs[0]", None).into_inner())
             .with_attribute(CREATE_ONLY_ATTRIBUTE, concrete_string(CIDR))
             .with_attribute("name", concrete_string("new-provider-name"));
@@ -891,7 +900,10 @@ mod tests {
             .and_then(Current::attributes_mut)
             .expect("test prior has attributes");
         prior_attributes.clear();
-        prior_attributes.insert("name".to_string(), concrete_string("record.example.com"));
+        prior_attributes.insert(
+            "name".to_string(),
+            concrete_string("record.example.com").to_snapshot(),
+        );
         let desired = Resource::from_id(id("records[0]", None).into_inner())
             .with_attribute("name", concrete_string("record.example.com"));
         plan.add(Effect::Create(resolved(desired)));
@@ -936,8 +948,16 @@ mod tests {
             "temporary_name": null,
             "previous_attributes": previous_attributes,
         }]);
-        let plan: carina_core::plan::SavedPlan =
+        let saved: carina_core::plan::SavedPlan =
             serde_json::from_value(encoded).expect("replacement plan must deserialize");
+        let plan = carina_core::value::rehydrate_plan_desired_secrets(
+            &saved,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            carina_core::parser::ExpandedInferredFile::default().deferred_for_expressions(),
+        )
+        .expect("ordinary desired values cross the snapshot boundary");
 
         let hints = detect_moved_block_hints(&plan, &prior, &schemas(true));
 

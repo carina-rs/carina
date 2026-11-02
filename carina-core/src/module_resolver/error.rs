@@ -572,6 +572,7 @@ fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
             error: _,
         }
         | ParseError::Syntax(_)
+        | ParseError::UnavailableSecret(_)
         | ParseError::InvalidExpression { .. }
         | ParseError::IntegerArithmetic { .. }
         | ParseError::UnboundLoopRead { .. }

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::resource::{DataSource, State};
+use crate::resource::{DataSource, SnapshotState};
 
 use super::basic::StartedBasicEffectResult;
 use super::wait::{StartedEffect, WaitOutcome};
@@ -26,7 +26,7 @@ pub(super) enum SingleEffectResult<'a, S> {
                 (),
             >,
         >,
-        outcome: Result<(SecretPreservingAttributes, State), super::EffectFailureKind>,
+        outcome: Result<(SecretPreservingAttributes, SnapshotState), super::EffectFailureKind>,
         duration: Duration,
     },
     /// `Effect::Wait` execution outcome. On success carries the

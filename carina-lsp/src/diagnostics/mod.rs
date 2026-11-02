@@ -3171,5 +3171,10 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
         ParseError::UserFunctionError(msg) => {
             carina_diagnostic_range(Range::default(), DiagnosticSeverity::ERROR, msg.to_string())
         }
+        ParseError::UnavailableSecret(error) => carina_diagnostic_range(
+            Range::default(),
+            DiagnosticSeverity::ERROR,
+            error.to_string(),
+        ),
     }
 }

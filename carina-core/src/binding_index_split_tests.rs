@@ -57,7 +57,8 @@ fn updating_changed_iterable_defers_missing_element_output() {
     let current = crate::resource::into_plan_input_current_map_from_states(
         HashMap::from([(
             resource.id.clone(),
-            State::existing(resource.id.clone(), HashMap::new()).with_identifier("source-id"),
+            State::<crate::resource::NoPlaceholder>::existing(resource.id.clone(), HashMap::new())
+                .with_identifier("source-id"),
         )]),
         &crate::schema::SchemaRegistry::new(),
         &[],
@@ -161,7 +162,7 @@ fn pre_apply_records_dsl_attributes() {
         wait_aliases: &[],
     });
     let view = bindings.get("a").expect("binding present");
-    assert_eq!(view.get("value"), Some(&s("hello")));
+    assert_eq!(view.get("value"), Some(&(s("hello")).to_snapshot()));
 }
 
 #[test]
@@ -189,8 +190,11 @@ fn pre_apply_merges_state_for_missing_dsl_keys() {
         wait_aliases: &[],
     });
     let view = bindings.get("a").expect("binding present");
-    assert_eq!(view.get("dsl_only"), Some(&s("from_dsl")));
-    assert_eq!(view.get("state_only"), Some(&s("from_state")));
+    assert_eq!(view.get("dsl_only"), Some(&(s("from_dsl")).to_snapshot()));
+    assert_eq!(
+        view.get("state_only"),
+        Some(&(s("from_state")).to_snapshot())
+    );
 }
 
 #[test]
@@ -259,7 +263,10 @@ fn add_compositions_layers_on_top_of_resources() {
     // Both bindings present after layering.
     assert!(bindings.get("a").is_some());
     let v_view = bindings.get("v").expect("composition binding present");
-    assert_eq!(v_view.get("role_arn"), Some(&s("post_apply_arn")));
+    assert_eq!(
+        v_view.get("role_arn"),
+        Some(&(s("post_apply_arn")).to_snapshot())
+    );
 }
 
 #[test]
@@ -282,7 +289,7 @@ fn add_compositions_overwrites_same_name_resource_binding() {
         .expect("layer_live_compositions_post_apply");
 
     let view = bindings.get("rd").expect("rd binding present");
-    assert_eq!(view.get("v"), Some(&s("post_apply")));
+    assert_eq!(view.get("v"), Some(&(s("post_apply")).to_snapshot()));
 }
 
 #[test]
@@ -328,12 +335,12 @@ fn managed_plus_virtual_layering() {
 
     assert_eq!(
         typed.get("a").and_then(|m| m.get("value")),
-        Some(&s("hello")),
+        Some(&(s("hello")).to_snapshot()),
         "managed binding mismatch",
     );
     assert_eq!(
         typed.get("v").and_then(|m| m.get("forwarded")),
-        Some(&s("via_virtual")),
+        Some(&(s("via_virtual")).to_snapshot()),
         "composition binding mismatch",
     );
 }

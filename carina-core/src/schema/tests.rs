@@ -4806,10 +4806,9 @@ fn schema_validate_with_origins_reshapes_custom_namespaced_type() {
     fn validate_mode(v: &Value) -> Result<(), String> {
         match v {
             Value::Concrete(ConcreteValue::String(s)) if s == "test.r.Mode.fast" => Ok(()),
-            Value::Concrete(ConcreteValue::String(s)) => Err(format!(
-                "invalid Mode '{}': expected fast",
-                s.expose_plaintext()
-            )),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(s)) => Err(
+                format!("invalid Mode '{}': expected fast", s.expose_plaintext()),
+            ),
             _ => Err("expected String".to_string()),
         }
     }
@@ -6080,10 +6079,9 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
         None,
         None,
         legacy_validator(|value| match value {
-            Value::Concrete(ConcreteValue::String(value)) => Err(format!(
-                "schema validator rejected {}",
-                value.expose_plaintext()
-            )),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(value)) => Err(
+                format!("schema validator rejected {}", value.expose_plaintext()),
+            ),
             _ => Ok(()),
         }),
         None,
@@ -6171,9 +6169,11 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
         ),
     ]);
     let lookup = |_declared_type: &AttributeType, value: &Value| match value {
-        Value::Concrete(ConcreteValue::String(value)) => Err(TypeError::ValidationFailed {
-            message: format!("provider lookup rejected {}", value.expose_plaintext()),
-        }),
+        crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(value)) => {
+            Err(TypeError::ValidationFailed {
+                message: format!("provider lookup rejected {}", value.expose_plaintext()),
+            })
+        }
         _ => Ok(()),
     };
 
@@ -6250,9 +6250,9 @@ fn secret_enum_literal_masks_typed_value_and_validator_message() {
                     None,
                     vec![],
                     Some(legacy_validator(|value| match value {
-                        Value::Concrete(ConcreteValue::String(value)) => {
-                            Err(format!("provider rejected {}", value.expose_plaintext()))
-                        }
+                        crate::resource::Value::Concrete(
+                            crate::resource::ConcreteValue::String(value),
+                        ) => Err(format!("provider rejected {}", value.expose_plaintext())),
                         _ => Err("expected a string".to_string()),
                     })),
                     None,
@@ -6501,15 +6501,17 @@ fn secret_structured_string_enum_error_is_masked_without_literal_quotes() {
         None,
         None,
         validator(|value| match value {
-            Value::Concrete(ConcreteValue::String(value)) => Err(TypeError::InvalidEnumVariant {
-                value: value.clone().into(),
-                value_kind: InvalidEnumValueKind::String,
-                attribute: None,
-                type_name: Some("Mode".to_string()),
-                expected: vec![ExpectedEnumVariant::from_namespaced(
-                    None, "Mode", "allowed", false,
-                )],
-            }),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(value)) => {
+                Err(TypeError::InvalidEnumVariant {
+                    value: value.clone().into(),
+                    value_kind: InvalidEnumValueKind::String,
+                    attribute: None,
+                    type_name: Some("Mode".to_string()),
+                    expected: vec![ExpectedEnumVariant::from_namespaced(
+                        None, "Mode", "allowed", false,
+                    )],
+                })
+            }
             other => Err(TypeError::TypeMismatch {
                 expected: "String".to_string(),
                 got: other.type_name(),
@@ -7606,7 +7608,9 @@ fn resolve_block_names_same_block_and_canonical_name() {
     assert!(resources[0].attributes.contains_key("ingress"));
     // Value should be unchanged
     match resources[0].get_attr("ingress") {
-        Some(Value::Concrete(ConcreteValue::List(items))) => assert_eq!(items.len(), 1),
+        Some(crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(items))) => {
+            assert_eq!(items.len(), 1)
+        }
         other => panic!("expected List, got {:?}", other),
     }
 }
@@ -7669,7 +7673,9 @@ fn resolve_block_names_same_block_and_canonical_name_multiple_items() {
 
     assert!(resources[0].attributes.contains_key("ingress"));
     match resources[0].get_attr("ingress") {
-        Some(Value::Concrete(ConcreteValue::List(items))) => assert_eq!(items.len(), 2),
+        Some(crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(items))) => {
+            assert_eq!(items.len(), 2)
+        }
         other => panic!("expected List with 2 items, got {:?}", other),
     }
 }
@@ -7748,7 +7754,7 @@ fn resolve_block_names_nested_same_block_and_canonical_name() {
     resolve_block_names(&mut resources, &schemas).unwrap();
 
     let config = match resources[0].get_attr("config") {
-        Some(Value::Concrete(ConcreteValue::Map(m))) => m,
+        Some(crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(m))) => m,
         _ => panic!("expected Map"),
     };
     // Key should remain as "tag" (no rename needed since block_name == canonical)
@@ -7757,7 +7763,9 @@ fn resolve_block_names_nested_same_block_and_canonical_name() {
         "expected 'tag' key to remain (block_name == canonical name)"
     );
     match config.get("tag") {
-        Some(Value::Concrete(ConcreteValue::List(items))) => assert_eq!(items.len(), 1),
+        Some(crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(items))) => {
+            assert_eq!(items.len(), 1)
+        }
         other => panic!("expected List, got {:?}", other),
     }
 }
@@ -12064,10 +12072,9 @@ fn custom_namespaced_string_literal_routes_validator_text_to_extra_message() {
     fn validate_mode(v: &Value) -> Result<(), String> {
         match v {
             Value::Concrete(ConcreteValue::String(s)) if s == "test.r.Mode.fast" => Ok(()),
-            Value::Concrete(ConcreteValue::String(s)) => Err(format!(
-                "invalid Mode '{}': expected fast",
-                s.expose_plaintext()
-            )),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(s)) => Err(
+                format!("invalid Mode '{}': expected fast", s.expose_plaintext()),
+            ),
             _ => Err("expected String".to_string()),
         }
     }
@@ -13915,7 +13922,9 @@ fn union_custom_with_int_base_picks_custom_error_for_int_input() {
     // `TypeMismatch` from the bare `Int` member's success path.
     fn must_be_positive(v: &Value) -> Result<(), String> {
         match v {
-            Value::Concrete(ConcreteValue::Int(n)) if *n > 0 => Ok(()),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::Int(n)) if *n > 0 => {
+                Ok(())
+            }
             _ => Err("must be positive".to_string()),
         }
     }
@@ -13994,13 +14003,15 @@ fn custom_validator_can_capture_external_state() {
         None,
         validator(move |v| match v {
             Value::Concrete(ConcreteValue::String(s)) if s == &allowed_region => Ok(()),
-            Value::Concrete(ConcreteValue::String(s)) => Err(TypeError::ValidationFailed {
-                message: format!(
-                    "expected region {}, got {}",
-                    allowed_region,
-                    s.expose_plaintext()
-                ),
-            }),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(s)) => {
+                Err(TypeError::ValidationFailed {
+                    message: format!(
+                        "expected region {}, got {}",
+                        allowed_region,
+                        s.expose_plaintext()
+                    ),
+                })
+            }
             other => Err(TypeError::TypeMismatch {
                 expected: "String".to_string(),
                 got: other.type_name(),
@@ -14037,16 +14048,18 @@ fn custom_validator_returns_structured_type_error_directly() {
         None,
         validator(|v| match v {
             Value::Concrete(ConcreteValue::String(s)) if s == "fast" || s == "slow" => Ok(()),
-            Value::Concrete(ConcreteValue::String(s)) => Err(TypeError::InvalidEnumVariant {
-                value: s.clone().into(),
-                value_kind: InvalidEnumValueKind::String,
-                attribute: None,
-                type_name: Some("Mode".to_string()),
-                expected: vec![
-                    ExpectedEnumVariant::from_namespaced(None, "Mode", "fast", false),
-                    ExpectedEnumVariant::from_namespaced(None, "Mode", "slow", false),
-                ],
-            }),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(s)) => {
+                Err(TypeError::InvalidEnumVariant {
+                    value: s.clone().into(),
+                    value_kind: InvalidEnumValueKind::String,
+                    attribute: None,
+                    type_name: Some("Mode".to_string()),
+                    expected: vec![
+                        ExpectedEnumVariant::from_namespaced(None, "Mode", "fast", false),
+                        ExpectedEnumVariant::from_namespaced(None, "Mode", "slow", false),
+                    ],
+                })
+            }
             other => Err(TypeError::TypeMismatch {
                 expected: "String".to_string(),
                 got: other.type_name(),
@@ -15012,8 +15025,9 @@ fn validate_map_with_ref_enum_key_uses_supplied_defs() {
         root: map_type,
         defs,
     };
-    let crate::value::CanonicalState::Present(Value::Concrete(ConcreteValue::Map(canonical))) =
-        schema.canonicalize_state(value)
+    let crate::value::CanonicalState::Present(crate::resource::Value::Concrete(
+        crate::resource::ConcreteValue::Map(canonical),
+    )) = schema.canonicalize_state(value)
     else {
         panic!("canonicalization must retain a map");
     };
@@ -15034,7 +15048,7 @@ fn validate_map_with_ref_enum_key_uses_supplied_defs() {
 // alias strings to `CanonicalEnum` so old state validates again.
 #[test]
 fn lift_state_enum_leaves_fixes_awscc251() {
-    use crate::utils::lift_state_enum_leaves;
+    use crate::test_support::lift_state_enum_leaves;
     use indexmap::IndexMap;
 
     let version_enum = PatternAttributeType::enum_(
@@ -15131,24 +15145,29 @@ fn lift_state_enum_leaves_fixes_awscc251() {
         .expect("lifted state must pass strict Enum validation");
 
     // The lifted values are CanonicalEnum in the provider API spelling.
-    let Value::Concrete(ConcreteValue::Map(policy)) = &attrs["policy"] else {
+    let crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(policy)) =
+        &attrs["policy"]
+    else {
         panic!("policy should be a Map");
     };
     assert!(matches!(
         &policy["version"],
-        Value::Concrete(ConcreteValue::CanonicalEnum(c))
+        crate::resource::Value::Concrete(crate::resource::ConcreteValue::CanonicalEnum(c))
             if c.identity().to_string() == "aws.iam.PolicyDocument.Version"
                 && c.api_value() == "2012-10-17"
     ));
-    let Value::Concrete(ConcreteValue::List(stmts)) = &policy["statement"] else {
+    let crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(stmts)) =
+        &policy["statement"]
+    else {
         panic!("statement should be a List");
     };
-    let Value::Concrete(ConcreteValue::Map(stmt)) = &stmts[0] else {
+    let crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(stmt)) = &stmts[0]
+    else {
         panic!("statement[0] should be a Map");
     };
     assert!(matches!(
         &stmt["effect"],
-        Value::Concrete(ConcreteValue::CanonicalEnum(c))
+        crate::resource::Value::Concrete(crate::resource::ConcreteValue::CanonicalEnum(c))
             if c.identity().to_string() == "aws.iam.PolicyDocument.Effect"
                 && c.api_value() == "Allow"
     ));
@@ -15156,7 +15175,7 @@ fn lift_state_enum_leaves_fixes_awscc251() {
 
 #[test]
 fn lift_state_enums_is_idempotent_and_preserves_invalid() {
-    use crate::utils::lift_state_enum_leaves;
+    use crate::test_support::lift_state_enum_leaves;
     use indexmap::IndexMap;
 
     let version_enum = PatternAttributeType::enum_(
@@ -15189,13 +15208,14 @@ fn lift_state_enums_is_idempotent_and_preserves_invalid() {
         Value::Concrete(ConcreteValue::Map(already.clone())),
     );
     lift_state_enum_leaves(&mut attrs, validated.as_schema());
-    let Value::Concrete(ConcreteValue::Map(p)) = &attrs["policy"] else {
+    let crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(p)) = &attrs["policy"]
+    else {
         panic!("map");
     };
     assert!(
         matches!(
             &p["version"],
-            Value::Concrete(ConcreteValue::CanonicalEnum(c))
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::CanonicalEnum(c))
                 if c.identity().to_string() == "aws.iam.PolicyDocument.Version"
                     && c.api_value() == "2012-10-17"
         ),
@@ -15216,7 +15236,9 @@ fn lift_state_enums_is_idempotent_and_preserves_invalid() {
         Value::Concrete(ConcreteValue::Map(bad)),
     );
     lift_state_enum_leaves(&mut attrs2, validated.as_schema());
-    let Value::Concrete(ConcreteValue::Map(p2)) = &attrs2["policy"] else {
+    let crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(p2)) =
+        &attrs2["policy"]
+    else {
         panic!("map");
     };
     assert_eq!(
@@ -15232,7 +15254,7 @@ fn lift_state_enums_is_idempotent_and_preserves_invalid() {
 
 #[test]
 fn dynamic_enum_lift_raw_string_requires_transform_and_structural_dsl_member() {
-    use crate::utils::lift_state_enum_leaves;
+    use crate::test_support::lift_state_enum_leaves;
 
     fn az_schema() -> ResourceSchema {
         let zone_name = AttributeType::enum_(
@@ -15269,7 +15291,7 @@ fn dynamic_enum_lift_raw_string_requires_transform_and_structural_dsl_member() {
     assert!(
         matches!(
             lifted_value("ap-northeast-1z"),
-            Value::Concrete(ConcreteValue::CanonicalEnum(c))
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::CanonicalEnum(c))
                 if c.identity().to_string() == "aws.AvailabilityZone.ZoneName"
                     && c.api_value() == "ap-northeast-1z"
         ),

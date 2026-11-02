@@ -339,9 +339,10 @@ async fn native_update_checks_observed_ignored_leaves_after_patch_substitution()
                 &schemas,
                 type_checks,
             );
-            let error = prepare_update_request(resource, from, &["tags".into()], &context)
-                .await
-                .expect_err("an observed leaf can become non-wire after desired preparation");
+            let error =
+                prepare_update_request(resource, (from).to_snapshot(), &["tags".into()], &context)
+                    .await
+                    .expect_err("an observed leaf can become non-wire after desired preparation");
             assert_duration_error(
                 &error,
                 "tags",

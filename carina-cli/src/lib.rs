@@ -146,6 +146,33 @@ pub(crate) fn plan_input_current_from_states<D>(
 }
 
 #[cfg(test)]
+pub(crate) fn plan_input_current_from_snapshots<D>(
+    states: std::collections::HashMap<
+        carina_core::resource::ResourceId,
+        carina_core::resource::SnapshotState,
+    >,
+    schemas: &carina_core::schema::SchemaRegistry,
+    resources: &[carina_core::resource::Resource<
+        carina_core::resource::ModuleSource,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::AbsoluteBindingAddress,
+        D,
+    >],
+) -> std::collections::HashMap<
+    carina_core::resource::ResourceId,
+    carina_core::resource::PlanInputCurrent,
+> {
+    carina_core::resource::into_plan_input_current_map(
+        states
+            .into_iter()
+            .map(|(id, state)| (id, carina_core::resource::Current::from_snapshot(state)))
+            .collect(),
+        schemas,
+        resources,
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn fixture_applied_identifier(
     identifier: impl Into<String>,
 ) -> carina_core::provider::AppliedIdentifier {

@@ -377,7 +377,7 @@ mod tests {
     fn wait_observation<'a>(
         target_id: &'a ResourceId,
         predicate: &'a WaitPredicate,
-        last_attrs: &'a HashMap<String, Value>,
+        last_attrs: &'a HashMap<String, carina_core::resource::SnapshotValue>,
     ) -> WaitObservation<'a> {
         WaitObservation::new("demo_ready", target_id, predicate, last_attrs)
     }
@@ -687,7 +687,7 @@ mod tests {
     fn plain_partial_success_detail_lines_are_stable() {
         let color_mode = crate::output_style::ColorMode::Plain;
         let effect = dummy_create_effect();
-        let state = carina_core::resource::State::not_found(ResourceId::with_identity(
+        let state = carina_core::resource::SnapshotState::not_found(ResourceId::with_identity(
             "aws.s3.Bucket",
             "demo",
         ));

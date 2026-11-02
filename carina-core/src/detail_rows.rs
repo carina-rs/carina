@@ -23,8 +23,8 @@ use crate::plan::{Plan, ReplaceDisplayInfo};
 use crate::provider::{ComparisonResolutionError, ProviderResult, ProviderRouter};
 use crate::provider::{NestedWriteOnlyRecord, PersistedAttributes};
 use crate::resource::{
-    CanonicalComparisonAttributes, ConcreteValue, DefaultTagKeys, DeferredValue, ResourceId, Value,
-    pair_list_elements,
+    CanonicalComparisonAttributes, ConcreteValue, DefaultTagKeys, DeferredValue, ResourceId,
+    SnapshotValue as Value, pair_list_elements,
 };
 use crate::schema::{
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
@@ -123,7 +123,7 @@ impl HistoricalDisplayAttributes {
     /// Build the fail-safe display view available from a plan alone. Desired
     /// secret shapes mask their historical counterparts; callers with state
     /// provenance should then refine it through the persisted-shape methods.
-    pub fn for_plan<S>(plan: &Plan<S>) -> Self {
+    pub fn for_plan<S, V: crate::resource::PlanValueKind>(plan: &Plan<S, V>) -> Self {
         let mut display = Self {
             updates: HashMap::new(),
             deletes: HashMap::new(),
@@ -350,9 +350,9 @@ impl HistoricalDisplayAttributes {
     }
 }
 
-fn mask_attributes_using_secret_shape(
+fn mask_attributes_using_secret_shape<Q: crate::resource::ValueKind>(
     plaintext: &HashMap<String, Value>,
-    shape: &IndexMap<String, Value>,
+    shape: &IndexMap<String, crate::resource::Value<Q>>,
 ) -> HashMap<String, Value> {
     plaintext
         .iter()
@@ -796,8 +796,12 @@ pub enum DetailComparisons<'a> {
 /// Read-only display input. Prepared rows can enter this view only through
 /// their owning [`PreparedPlanDisplay`], so they cannot be paired with another
 /// plan, even one with the same number of effects.
-pub struct PlanDisplay<'a, S = crate::resource::ModuleSource> {
-    plan: &'a Plan<S>,
+pub struct PlanDisplay<
+    'a,
+    S = crate::resource::ModuleSource,
+    V: crate::resource::PlanValueKind = crate::resource::NoPlaceholder,
+> {
+    plan: &'a Plan<S, V>,
     historical: &'a HistoricalDisplayAttributes,
     rows: DisplayRows<'a>,
 }
@@ -810,11 +814,11 @@ enum DisplayRows<'a> {
     Build(DetailComparisons<'a>),
 }
 
-impl<'a, S> PlanDisplay<'a, S> {
+impl<'a, S, V: crate::resource::PlanValueKind> PlanDisplay<'a, S, V> {
     /// A saved plan or a test comparison that builds its rows on demand.
     /// This constructor cannot accept prepared rows.
     pub fn unprepared(
-        plan: &'a Plan<S>,
+        plan: &'a Plan<S, V>,
         historical: &'a HistoricalDisplayAttributes,
         comparisons: DetailComparisons<'a>,
     ) -> Self {
@@ -825,7 +829,7 @@ impl<'a, S> PlanDisplay<'a, S> {
         }
     }
 
-    pub fn plan(&self) -> &'a Plan<S> {
+    pub fn plan(&self) -> &'a Plan<S, V> {
         self.plan
     }
 
@@ -897,8 +901,8 @@ impl<'a, S> PlanDisplay<'a, S> {
 
 /// Build detail rows for an effect using delete attributes keyed by resource
 /// id plus generation.
-pub fn build_detail_rows_by_instance<S>(
-    effect: &Effect<S>,
+pub fn build_detail_rows_by_instance<S, V: crate::resource::PlanValueKind>(
+    effect: &Effect<S, V>,
     registry: Option<&SchemaRegistry>,
     detail: DetailLevel,
     historical_attributes: &HistoricalDisplayAttributes,
@@ -965,7 +969,7 @@ pub fn build_detail_rows_by_instance<S>(
                             comparison,
                             true,
                         )
-                    })
+                    })?
                 }
             }
         }
@@ -1060,7 +1064,9 @@ fn append_dangling_reference_notes(
 /// Taking the typed effect keeps arbitrary text from being promoted into a
 /// [`RenderedValue`] by downstream renderers. Callers remain responsible for
 /// deciding whether their display surface should show this fallback.
-pub fn delete_identifier_fallback_row(effect: &Effect) -> Option<DetailRow> {
+pub fn delete_identifier_fallback_row<S, V: crate::resource::PlanValueKind>(
+    effect: &Effect<S, V>,
+) -> Option<DetailRow> {
     let Effect::Delete { identifier, .. } = effect else {
         return None;
     };
@@ -1072,12 +1078,16 @@ pub fn delete_identifier_fallback_row(effect: &Effect) -> Option<DetailRow> {
     })
 }
 
-fn build_create_rows(
-    attributes: &IndexMap<String, Value>,
+fn build_create_rows<P: crate::resource::StateValueLeaf>(
+    attributes: &IndexMap<String, crate::resource::Value<P>>,
     default_tag_keys: &DefaultTagKeys,
     schema: Option<&ResourceSchema>,
     detail: DetailLevel,
 ) -> Vec<DetailRow> {
+    let attributes: IndexMap<_, _> = attributes
+        .iter()
+        .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
+        .collect();
     let mut rows = Vec::new();
 
     let mut keys: Vec<_> = attributes.keys().collect();
@@ -1192,14 +1202,9 @@ fn default_tag_annotation(default_tag_keys: &DefaultTagKeys, key: &str) -> Optio
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_update_rows<S, D, R: ReferenceEquality>(
+fn build_update_rows<S, D, R: ReferenceEquality, V: crate::resource::PlanValueKind>(
     historical: &HistoricalUpdateAttributes,
-    to: &crate::resource::Resource<
-        S,
-        crate::resource::NoPlaceholder,
-        crate::resource::AbsoluteBindingAddress,
-        D,
-    >,
+    to: &crate::resource::Resource<S, V, crate::resource::AbsoluteBindingAddress, D>,
     changed_attributes: &[String],
     schema: Option<&ResourceSchema>,
     detail: DetailLevel,
@@ -1536,21 +1541,21 @@ fn project_from_attrs<R: ReferenceEquality>(
     }
 }
 
-fn build_attribute_diff_rows<S, D, R: ReferenceEquality>(
-    to: &crate::resource::Resource<
-        S,
-        crate::resource::NoPlaceholder,
-        crate::resource::AbsoluteBindingAddress,
-        D,
-    >,
+fn build_attribute_diff_rows<S, D, R: ReferenceEquality, V: crate::resource::PlanValueKind>(
+    to: &crate::resource::Resource<S, V, crate::resource::AbsoluteBindingAddress, D>,
     to_attributes: &CanonicalComparisonAttributes,
     ctx: AttributeDiffContext<'_, R>,
 ) -> AttributeDiffRows {
+    let payload_attributes: IndexMap<_, _> = to
+        .attributes
+        .iter()
+        .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
+        .collect();
     let mut rows = Vec::new();
 
     let mut keys: Vec<_> = to_attributes.keys().cloned().collect();
     keys.extend(
-        to.attributes
+        payload_attributes
             .keys()
             .filter(|key| {
                 !to_attributes.contains_key(key) && ctx.payload_key_is_changed(key.as_str())
@@ -1573,7 +1578,7 @@ fn build_attribute_diff_rows<S, D, R: ReferenceEquality>(
         let payload_only = !to_attributes.contains_key(&key);
         let new_value = to_attributes
             .get(&key)
-            .or_else(|| to.attributes.get(&key))
+            .or_else(|| payload_attributes.get(&key))
             .expect("display keys come from a desired value view");
         // Look up `old_value` from the projected map so MapDiff /
         // ListOfMapsDiff rows don't surface server-side default leaves
@@ -1806,14 +1811,9 @@ fn build_attribute_diff_rows<S, D, R: ReferenceEquality>(
 /// effect. This helper owns the delete-index lookup so every renderer consumes
 /// the same masked historical view rather than reconstructing that lookup.
 #[allow(clippy::too_many_arguments)]
-pub fn build_replace_detail_rows_from_display<S, D>(
-    plan: &Plan<S>,
-    to: &crate::resource::Resource<
-        S,
-        crate::resource::NoPlaceholder,
-        crate::resource::AbsoluteBindingAddress,
-        D,
-    >,
+pub fn build_replace_detail_rows_from_display<S, D, V: crate::resource::PlanValueKind>(
+    plan: &Plan<S, V>,
+    to: &crate::resource::Resource<S, V, crate::resource::AbsoluteBindingAddress, D>,
     replacement: ReplaceDisplayInfo<'_>,
     historical_display: &HistoricalDisplayAttributes,
     registry: Option<&SchemaRegistry>,
@@ -1883,7 +1883,7 @@ pub fn build_replace_detail_rows_from_display<S, D>(
                     explicit,
                     comparison,
                 )
-            })
+            })?
         }
     };
     if let DetailComparisons::Planning(references) = comparisons {
@@ -1898,16 +1898,16 @@ pub fn build_replace_detail_rows_from_display<S, D>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_replace_rows_from_attributes<S, D, R: ReferenceEquality>(
+fn build_replace_rows_from_attributes<
+    S,
+    D,
+    R: ReferenceEquality,
+    V: crate::resource::PlanValueKind,
+>(
     previous_attributes: &HashMap<String, Value>,
     stored_attributes: Option<&HashMap<String, Value>>,
     nested_write_only: &NestedWriteOnlyRecord,
-    to: &crate::resource::Resource<
-        S,
-        crate::resource::NoPlaceholder,
-        crate::resource::AbsoluteBindingAddress,
-        D,
-    >,
+    to: &crate::resource::Resource<S, V, crate::resource::AbsoluteBindingAddress, D>,
     comparison_attributes: &CanonicalComparisonAttributes,
     changed_create_only: &[String],
     temporary_name: Option<&crate::effect::TemporaryName>,
@@ -3078,14 +3078,9 @@ mod tests {
     };
 
     #[allow(clippy::too_many_arguments)]
-    fn build_replace_detail_rows_from_display<S, D>(
-        plan: &Plan<S>,
-        to: &crate::resource::Resource<
-            S,
-            crate::resource::NoPlaceholder,
-            crate::resource::AbsoluteBindingAddress,
-            D,
-        >,
+    fn build_replace_detail_rows_from_display<S, D, V: crate::resource::PlanValueKind>(
+        plan: &Plan<S, V>,
+        to: &crate::resource::Resource<S, V, crate::resource::AbsoluteBindingAddress, D>,
         replacement: ReplaceDisplayInfo<'_>,
         historical_display: &HistoricalDisplayAttributes,
         registry: Option<&SchemaRegistry>,
@@ -3117,14 +3112,16 @@ mod tests {
         defs: &std::collections::BTreeMap<String, AttributeType>,
         detail: DetailLevel,
     ) -> Vec<MapDiffEntryIR> {
+        let old_value = old_value.map(Value::to_snapshot);
+        let new_value = new_value.to_snapshot();
         crate::differ::exact_comparison_schema_for_tests()
             .with_references(
                 &crate::references::prepare_empty_for_tests(),
                 &ResourceId::with_identity("test.Resource", "example"),
                 |comparison| {
                     super::compute_map_diff_entries(
-                        old_value,
-                        new_value,
+                        old_value.as_ref(),
+                        &new_value,
                         attr_type,
                         defs,
                         detail,
@@ -3147,14 +3144,16 @@ mod tests {
         Vec<ListOfMapsDiffItem>,
         Vec<ListOfMapsDiffItem>,
     ) {
+        let old_value = old_value.map(Value::to_snapshot);
+        let new_value = new_value.to_snapshot();
         crate::differ::exact_comparison_schema_for_tests()
             .with_references(
                 &crate::references::prepare_empty_for_tests(),
                 &ResourceId::with_identity("test.Resource", "example"),
                 |comparison| {
                     super::compute_list_of_maps_diff_parts(
-                        old_value,
-                        new_value,
+                        old_value.as_ref(),
+                        &new_value,
                         attr_type,
                         defs,
                         detail,
@@ -3198,7 +3197,7 @@ mod tests {
                 if let Some(attributes) = delete_attributes.get(key.id()) {
                     historical_attributes.set_delete_from_provider_and_persisted(
                         key,
-                        attributes,
+                        &crate::test_support::snapshot_attributes(attributes.clone()),
                         None,
                         &empty_nested_write_only,
                     );
@@ -3297,7 +3296,7 @@ mod tests {
         };
         let explicit = HashMap::from([(to.id.clone(), explicit)]);
         let effect = Effect::Update {
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             identifier: crate::effect::fixture_applied_identifier("example"),
             to: resolved(to.clone()),
             changed_attributes: vec!["config".into(), "tags".into()],
@@ -3316,7 +3315,8 @@ mod tests {
         );
         let mut plan = Plan::new();
         plan.add(effect);
-        let wire = serde_json::to_vec(&SavedPlan::from(plan)).unwrap();
+        let wire = serde_json::to_vec(&SavedPlan::from(crate::test_support::snapshot_plan(&plan)))
+            .unwrap();
         let saved: UnresolvedSavedPlan = serde_json::from_slice(&wire).unwrap();
         let saved = saved.resolve_with_schemas(&registry).unwrap();
         let mut historical = HistoricalDisplayAttributes::for_plan(&saved);
@@ -3386,13 +3386,15 @@ mod tests {
         for changed in [vec!["name".to_string()], vec!["key".to_string()]] {
             let effect = Effect::Update {
                 identifier: crate::provider::AppliedIdentifier::new("resource-123").unwrap(),
-                from: Box::new(from.clone()),
+                from: Box::new((from.clone()).to_snapshot()),
                 to: resolved(to.clone()),
                 changed_attributes: changed.clone(),
             };
             let mut plan = Plan::new();
             plan.add(effect.clone());
-            let wire = serde_json::to_vec(&SavedPlan::from(plan)).unwrap();
+            let wire =
+                serde_json::to_vec(&SavedPlan::from(crate::test_support::snapshot_plan(&plan)))
+                    .unwrap();
             let unresolved: UnresolvedSavedPlan = serde_json::from_slice(&wire).unwrap();
             let saved_plan = unresolved.resolve_with_schemas(&registry).unwrap();
             let historical = HistoricalDisplayAttributes::for_plan(&saved_plan);
@@ -3452,10 +3454,10 @@ mod tests {
                 temporary_value: "example-temp".into(),
                 can_rename: true,
             }),
-            previous_attributes: HashMap::from([(
+            previous_attributes: crate::test_support::snapshot_attributes(HashMap::from([(
                 "key".into(),
                 Value::Concrete(ConcreteValue::String("key/old".into())),
-            )]),
+            )])),
         });
         let rows = build_replace_detail_rows_from_display(
             &plan,
@@ -3474,6 +3476,150 @@ mod tests {
                 .any(|row| matches!(row, DetailRow::Changed { key, new, .. } if key == "name" && new.plain() == "'example-temp'")),
             "{rows:?}"
         );
+    }
+
+    #[test]
+    fn redacted_saved_plan_update_and_replace_render_before_rehydration() {
+        let secret = |plaintext: &str| {
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String(plaintext.into()),
+            ))))
+        };
+        let attributes = |plaintext: &str| {
+            HashMap::from([
+                ("password".to_string(), secret(plaintext)),
+                (
+                    "credentials".to_string(),
+                    Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                        ("token".into(), secret(plaintext)),
+                        (
+                            "public".into(),
+                            Value::Concrete(ConcreteValue::String("public-value".into())),
+                        ),
+                    ]))),
+                ),
+            ])
+        };
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "",
+            PatternResourceSchema::new("test.Widget")
+                .attribute(
+                    PatternAttributeSchema::optional("password", PatternAttributeType::string())
+                        .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::optional(
+                        "credentials",
+                        PatternAttributeType::map(PatternAttributeType::string()),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        for replacement in [false, true] {
+            let mut desired = Resource::new("test.Widget", "example");
+            for (key, value) in attributes("new-private-token") {
+                desired.set_attr(key, value);
+            }
+            let id = desired.id.clone();
+            let to = ResolvedResource::resolve_raw_fixture(desired, &registry).unwrap();
+            let previous =
+                crate::test_support::snapshot_attributes(attributes("old-private-token"));
+            let mut plan = Plan::new();
+            if replacement {
+                plan.add(Effect::Create(to));
+                plan.add(Effect::Delete {
+                    id: crate::resource::ResolvedResourceId::new(id.clone()),
+                    identifier: crate::effect::fixture_applied_identifier("widget-id"),
+                    generation: EffectGeneration::Current,
+                    directives: Default::default(),
+                    binding: None,
+                    dependencies: Default::default(),
+                    explicit_dependencies: Default::default(),
+                    blocked_by_updates: Default::default(),
+                });
+                plan.replace_display_mut().push(ReplaceDisplayMetadata {
+                    create_idx: 0,
+                    delete_idx: 1,
+                    create_before_destroy: false,
+                    changed_create_only: ChangedCreateOnly::try_from(vec!["password".to_string()])
+                        .unwrap(),
+                    cascade_ref_hints: Vec::new(),
+                    temporary_name: None,
+                    previous_attributes: previous,
+                });
+            } else {
+                plan.add(Effect::Update {
+                    from: Box::new(crate::resource::SnapshotState::existing(
+                        id.clone(),
+                        previous,
+                    )),
+                    identifier: crate::effect::fixture_applied_identifier("widget-id"),
+                    to,
+                    changed_attributes: vec!["password".into(), "credentials".into()],
+                });
+            }
+            let saved = crate::value::redact_secrets_in_plan(&plan).unwrap();
+            let wire = serde_json::to_string(&SavedPlan::from(saved)).unwrap();
+            assert!(!wire.contains("old-private-token"));
+            assert!(!wire.contains("new-private-token"));
+            let unresolved: UnresolvedSavedPlan = serde_json::from_str(&wire).unwrap();
+            let loaded = unresolved.resolve_with_schemas(&registry).unwrap();
+            let historical = HistoricalDisplayAttributes::for_plan(&loaded);
+            let (registry, provider) =
+                crate::provider::comparison_fixture_for_test(&registry, std::iter::once(&id));
+            let rows = if replacement {
+                let Effect::Create(to) = &loaded.effects()[0] else {
+                    panic!("replacement create");
+                };
+                super::build_replace_detail_rows_from_display(
+                    &loaded,
+                    to,
+                    loaded.replace_display_info().next().unwrap(),
+                    &historical,
+                    Some(&registry),
+                    DetailLevel::Full,
+                    None,
+                    &provider,
+                    DetailComparisons::RecordedEffects,
+                )
+            } else {
+                build_detail_rows_by_instance(
+                    &loaded.effects()[0],
+                    Some(&registry),
+                    DetailLevel::Full,
+                    &historical,
+                    None,
+                    &provider,
+                    DetailComparisons::RecordedEffects,
+                )
+            }
+            .expect("redacted saved-plan rows must render before rehydration");
+            assert!(rows.iter().any(|row| matches!(
+                row,
+                DetailRow::Changed { key, old, new }
+                    | DetailRow::ChangedForcesReplacement { key, old, new }
+                    if key == "password" && old.plain() == "(secret)" && new.plain() == "(secret)"
+            )), "{rows:?}");
+            let rendered = format!("{rows:?}");
+            assert!(!rendered.contains("old-private-token"));
+            assert!(!rendered.contains("new-private-token"));
+            let masked = if replacement {
+                &historical.deletes.values().next().unwrap().attributes
+            } else {
+                &historical.updates[&id].attributes
+            };
+            assert!(masked["password"].secret_hash().is_some());
+            assert!(
+                masked["credentials"]
+                    .get("token")
+                    .unwrap()
+                    .secret_hash()
+                    .is_some()
+            );
+        }
     }
 
     #[test]
@@ -3508,7 +3654,7 @@ mod tests {
         );
         let mut plan = Plan::new();
         plan.add(Effect::Update {
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             identifier: crate::effect::fixture_applied_identifier("widget-id"),
             to,
             changed_attributes: vec!["password".to_string()],
@@ -3539,7 +3685,9 @@ mod tests {
         };
         assert!(matches!(
             to.attributes.get("password"),
-            Some(Value::Deferred(DeferredValue::Secret(_)))
+            Some(crate::resource::Value::Deferred(
+                crate::resource::DeferredValue::Secret(_)
+            ))
         ));
 
         let historical = HistoricalDisplayAttributes::for_plan(&rehydrated);
@@ -3583,8 +3731,10 @@ mod tests {
                 &id,
                 |comparison| {
                     build_replace_rows_from_attributes(
-                        &from.attributes,
-                        Some(&from.attributes),
+                        &crate::test_support::snapshot_attributes((from.attributes).clone()),
+                        Some(&crate::test_support::snapshot_attributes(
+                            (from.attributes).clone(),
+                        )),
                         &NestedWriteOnlyRecord::new(),
                         &to,
                         &comparison_attributes,
@@ -3656,7 +3806,7 @@ mod tests {
             );
         let effect = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("widget-id"),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["name".to_string()],
         };
@@ -3707,7 +3857,7 @@ mod tests {
             .with_attribute("settings", settings(true));
         let effect = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("widget-id"),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["name".to_string()],
         };
@@ -3772,7 +3922,7 @@ mod tests {
             .expect("ignore_changes path must resolve");
         let effect = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("widget-id"),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to,
             changed_attributes: vec!["name".to_string()],
         };
@@ -3858,24 +4008,26 @@ mod tests {
             .with_attribute("rules", rules(true));
         let effect = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("widget-id"),
-            from: Box::new(from.clone()),
+            from: Box::new((from.clone()).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["name".to_string()],
         };
         let mut plan = Plan::new();
         plan.add(effect);
         let mut historical = HistoricalDisplayAttributes::for_plan(&plan);
-        let persisted = PersistedAttributes::from_typed_persisted_wire_values(HashMap::from([
-            (
-                "name".to_string(),
-                Value::Concrete(ConcreteValue::String("before".into())),
-            ),
-            ("rules".to_string(), rules(true)),
-        ]))
+        let persisted = PersistedAttributes::from_typed_persisted_wire_values(
+            crate::test_support::snapshot_attributes(HashMap::from([
+                (
+                    "name".to_string(),
+                    Value::Concrete(ConcreteValue::String("before".into())),
+                ),
+                ("rules".to_string(), rules(true)),
+            ])),
+        )
         .expect("persisted attributes must encode");
         historical.set_update_from_provider_and_persisted(
             id.clone(),
-            &from.attributes,
+            &crate::test_support::snapshot_attributes((from.attributes).clone()),
             Some(&persisted),
         );
         let explicit = HashMap::from([(
@@ -3942,7 +4094,7 @@ mod tests {
             Resource::new("test.Widget", "example").with_attribute("config", empty_config.clone());
         let effect = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("widget-id"),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["config".to_string()],
         };
@@ -4129,7 +4281,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier(
                 from.id.identity_display().to_string(),
             ),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["versioning".to_string()],
         };
@@ -4189,7 +4341,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier(
                 from.id.identity_display().to_string(),
             ),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["tags".to_string()],
         };
@@ -4332,6 +4484,7 @@ mod tests {
             ),
         ]
         .into_iter()
+        .map(|(key, value)| (key, value.to_snapshot()))
         .collect();
         let mut plan = Plan::new();
         plan.add(Effect::Create(resolved(to.clone())));
@@ -4450,7 +4603,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier(
                 from.id.identity_display().to_string(),
             ),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["versioning".to_string()],
         };
@@ -4506,7 +4659,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier(
                 from.id.identity_display().to_string(),
             ),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["trigger_diff".to_string()],
         };
@@ -4632,7 +4785,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier(
                 from.id.identity_display().to_string(),
             ),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["removed_attr".to_string()],
         };
@@ -4671,7 +4824,7 @@ mod tests {
                 .unwrap(),
             cascade_ref_hints: Vec::new(),
             temporary_name: None,
-            previous_attributes,
+            previous_attributes: crate::test_support::snapshot_attributes(previous_attributes),
         });
         let replacement = plan.replace_display_info().next().unwrap();
         let historical = HistoricalDisplayAttributes::for_plan(&plan);
@@ -4725,10 +4878,10 @@ mod tests {
             changed_create_only: ChangedCreateOnly::try_from(vec!["comment".to_string()]).unwrap(),
             cascade_ref_hints: Vec::new(),
             temporary_name: None,
-            previous_attributes: HashMap::from([(
+            previous_attributes: crate::test_support::snapshot_attributes(HashMap::from([(
                 "comment".to_string(),
                 Value::Concrete(ConcreteValue::String(PLAINTEXT.into())),
-            )]),
+            )])),
         });
 
         let mut historical = HistoricalDisplayAttributes::for_plan(&plan);
@@ -4801,7 +4954,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier(
                 from.id.identity_display().to_string(),
             ),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["rules".to_string()],
         };
@@ -4863,7 +5016,7 @@ mod tests {
         );
         let effect = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("listener-id"),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["rules".to_string()],
         };
@@ -4919,7 +5072,7 @@ mod tests {
         );
         let effect = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("listener-id"),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["rules".to_string()],
         };
@@ -4976,7 +5129,7 @@ mod tests {
             .with_attribute("settings", settings(vec![rule(None), rule(None)]));
         let effect = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("listener-id"),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["settings".to_string()],
         };
@@ -5066,7 +5219,7 @@ mod tests {
         );
         let effect = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("listener-set-id"),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["listeners".to_string()],
         };
@@ -5178,7 +5331,10 @@ mod tests {
         let id = desired.id.clone();
         let effect = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("listener-id"),
-            from: Box::new(State::existing(id.clone(), stored)),
+            from: Box::new(State::existing(
+                id.clone(),
+                crate::test_support::snapshot_attributes(stored),
+            )),
             to: resolved(desired),
             changed_attributes: vec!["rules".to_string()],
         };
@@ -5220,13 +5376,13 @@ mod tests {
                 assert_eq!(entries[0].key.plain(), "Environment");
                 assert_eq!(
                     entries[0].value.value(),
-                    &Value::Concrete(ConcreteValue::String("prod".into()))
+                    &Value::Concrete(ConcreteValue::String("prod".into())).to_snapshot()
                 );
                 assert!(entries[0].annotation.is_none());
                 assert_eq!(entries[1].key.plain(), "Name");
                 assert_eq!(
                     entries[1].value.value(),
-                    &Value::Concrete(ConcreteValue::String("test".into()))
+                    &Value::Concrete(ConcreteValue::String("test".into())).to_snapshot()
                 );
                 assert!(entries[1].annotation.is_none());
             }
@@ -5291,15 +5447,18 @@ mod tests {
             .find(|e| e.key.raw() == "statement")
             .expect("expected `statement` entry");
         match stmt_entry.value.value() {
-            Value::Concrete(ConcreteValue::List(items)) => {
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(items)) => {
                 assert_eq!(items.len(), 2, "list-of-maps preserved structurally");
                 assert!(
-                    matches!(items[0], Value::Concrete(ConcreteValue::Map(_))),
-                    "inner element kept as Value::Concrete(ConcreteValue::Map), not stringified"
+                    matches!(
+                        items[0],
+                        crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(_))
+                    ),
+                    "inner element kept as crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map), not stringified"
                 );
             }
             other => panic!(
-                "expected Value::Concrete(ConcreteValue::List), got {:?}",
+                "expected crate::resource::Value::Concrete(crate::resource::ConcreteValue::List), got {:?}",
                 other
             ),
         }
@@ -5342,7 +5501,7 @@ mod tests {
                 assert_eq!(entries[0].key.plain(), "Name");
                 assert_eq!(
                     entries[0].value.value(),
-                    &Value::Concrete(ConcreteValue::String("test".into()))
+                    &Value::Concrete(ConcreteValue::String("test".into())).to_snapshot()
                 );
             }
             other => panic!("expected MapExpanded, got {:?}", other),
@@ -5401,7 +5560,7 @@ mod tests {
         assert!(
             matches!(
                 pretty_value.unwrap().value(),
-                Value::Concrete(ConcreteValue::List(_))
+                crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(_))
             ),
             "PrettyAttribute should retain the list structure behind its typed wrapper"
         );
@@ -6038,7 +6197,7 @@ mod tests {
         assert!(
             matches!(
                 pretty_value.unwrap().value(),
-                Value::Concrete(ConcreteValue::List(_))
+                crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(_))
             ),
             "PrettyAttribute should retain the list structure behind its typed wrapper"
         );
@@ -6092,7 +6251,7 @@ mod tests {
         assert!(
             matches!(
                 pretty.unwrap().value(),
-                Value::Concrete(ConcreteValue::List(_))
+                crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(_))
             ),
             "PrettyAttribute should retain the list structure behind its typed wrapper"
         );
@@ -6226,7 +6385,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier(
                 from.id.identity_display().to_string(),
             ),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["policy".to_string()],
         };
@@ -6275,7 +6434,7 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("permission-id"),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["function_name".to_string()],
         });
@@ -6331,7 +6490,7 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("widget-id"),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["name".to_string()],
         });
@@ -6393,7 +6552,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier(
                 from.id.identity_display().to_string(),
             ),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["policy".to_string(), "description".to_string()],
         };
@@ -6437,7 +6596,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier(
                 from.id.identity_display().to_string(),
             ),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["policy".to_string()],
         };
@@ -6479,7 +6638,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier(
                 from.id.identity_display().to_string(),
             ),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["policy".to_string()],
         };
@@ -6544,7 +6703,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier(
                 from.id.identity_display().to_string(),
             ),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["modes".to_string()],
         };
@@ -6586,7 +6745,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier(
                 from.id.identity_display().to_string(),
             ),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["policy".to_string()],
         };
@@ -6649,7 +6808,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier(
                 from.id.identity_display().to_string(),
             ),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["policy".to_string(), "description".to_string()],
         };
@@ -6719,8 +6878,8 @@ mod tests {
         )]));
 
         let diff = compute_string_list_change(
-            Some(&old),
-            &new,
+            Some(&(old).to_snapshot()),
+            &(new).to_snapshot(),
             Some(&attr_type),
             crate::schema::empty_defs_for_schema_walks(),
         )
@@ -6758,8 +6917,8 @@ mod tests {
         let new = enum_list(&["Allow", "Y"]);
 
         let diff = compute_string_list_change(
-            Some(&old),
-            &new,
+            Some(&(old).to_snapshot()),
+            &(new).to_snapshot(),
             Some(&attr_type),
             crate::schema::empty_defs_for_schema_walks(),
         )
@@ -6812,8 +6971,8 @@ mod tests {
         ]));
 
         let diff = compute_string_list_change(
-            Some(&old),
-            &new,
+            Some(&(old).to_snapshot()),
+            &(new).to_snapshot(),
             Some(&attr_type),
             crate::schema::empty_defs_for_schema_walks(),
         )
@@ -6864,8 +7023,8 @@ mod tests {
 
             assert!(
                 compute_string_list_change(
-                    Some(&old),
-                    &new,
+                    Some(&(old).to_snapshot()),
+                    &(new).to_snapshot(),
                     Some(&attr_type),
                     crate::schema::empty_defs_for_schema_walks(),
                 )
@@ -6889,8 +7048,8 @@ mod tests {
 
         assert!(
             compute_string_list_change(
-                Some(&old),
-                &new,
+                Some(&(old).to_snapshot()),
+                &(new).to_snapshot(),
                 Some(&attr_type),
                 crate::schema::empty_defs_for_schema_walks(),
             )
@@ -7022,7 +7181,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier(
                 from.id.identity_display().to_string(),
             ),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["modes".to_string()],
         };
@@ -7243,7 +7402,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier(
                 from.id.identity_display().to_string(),
             ),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["tags".to_string()],
         };
@@ -7288,7 +7447,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier(
                 from.id.identity_display().to_string(),
             ),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["password".to_string()],
         };
@@ -7673,7 +7832,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier(
                 from.id.identity_display().to_string(),
             ),
-            from: Box::new(from),
+            from: Box::new((from).to_snapshot()),
             to: resolved(to),
             changed_attributes: vec!["modes".to_string()],
         };

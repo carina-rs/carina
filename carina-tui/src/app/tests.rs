@@ -243,7 +243,7 @@ fn whole_value_list_uses_whole_value_detail_row() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         identifier: crate::fixture_applied_identifier("listener-id"),
-        from: Box::new(from),
+        from: Box::new(from.to_snapshot()),
         to,
         changed_attributes: vec!["rules".to_string()],
     });

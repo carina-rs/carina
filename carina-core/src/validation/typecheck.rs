@@ -563,7 +563,6 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
             DeferredValue::FunctionCall { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Unavailable { .. }
-            | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => return Assignable,
@@ -899,9 +898,7 @@ pub(crate) fn value_kind_name<P: PlaceholderKind, B: BindingAddress>(
         Value::Deferred(DeferredValue::Access(_)) => "access value",
         Value::Deferred(DeferredValue::ModuleIf(_)) => "conditional value",
         Value::Deferred(DeferredValue::IntegerArithmetic(_)) => "Int",
-        Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => {
-            "secret value"
-        }
+        Value::Deferred(DeferredValue::Secret(_)) => "secret value",
         Value::Deferred(DeferredValue::Unknown(_)) => "unknown value",
         Value::Deferred(DeferredValue::Placeholder(_)) => "module argument value",
     }

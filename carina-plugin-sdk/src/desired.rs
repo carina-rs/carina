@@ -723,7 +723,6 @@ fn retain_native_value_metadata(tree: &mut DesiredValue, original: &Value, owner
             | DeferredValue::Unavailable { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Access(_)
-            | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_),
         ) => {}
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},

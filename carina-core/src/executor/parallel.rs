@@ -1316,7 +1316,8 @@ pub(super) async fn execute_effects_sequential<
                 }
                 outcome @ (WaitOutcome::Timeout { .. }
                 | WaitOutcome::NotFound(_)
-                | WaitOutcome::ReadFailed(_)) => {
+                | WaitOutcome::ReadFailed(_)
+                | WaitOutcome::UnavailableSecret(_)) => {
                     let failure = wait_failure(outcome, effects[finished_idx].resource_id());
                     started.failed(&mut accumulated, failure, duration);
                     failed_indices.insert(finished_idx);
@@ -1380,9 +1381,7 @@ pub(super) async fn execute_effects_sequential<
             type_checks,
         )
     {
-        for failure in error.failures() {
-            super::record_module_constraint_failure(&mut accumulated, observer, failure.clone());
-        }
+        super::record_module_constraint_failure(&mut accumulated, observer, error);
     }
     let result = accumulated.finish(&input.checkpoint_sink);
     (result, cancelled)
@@ -1562,7 +1561,7 @@ mod tests {
         let id = to.id.clone();
         Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("id"),
-            from: Box::new(state_for(&id)),
+            from: Box::new((state_for(&id)).to_snapshot()),
             to: resolved(to),
             changed_attributes: writes.iter().map(|attr| (*attr).to_string()).collect(),
         }
@@ -2096,7 +2095,7 @@ mod tests {
         );
         let child = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("id"),
-            from: Box::new(state_for(&child.id)),
+            from: Box::new((state_for(&child.id)).to_snapshot()),
             to: resolved(child),
             changed_attributes: vec!["name".to_string()],
         };
@@ -2117,7 +2116,7 @@ mod tests {
         );
         let child = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("id"),
-            from: Box::new(state_for(&child.id)),
+            from: Box::new((state_for(&child.id)).to_snapshot()),
             to: resolved(child),
             changed_attributes: vec!["name".to_string()],
         };
@@ -2142,7 +2141,7 @@ mod tests {
             parent,
             Effect::Update {
                 identifier: crate::effect::fixture_applied_identifier("id"),
-                from: Box::new(state_for(&child_id)),
+                from: Box::new((state_for(&child_id)).to_snapshot()),
                 to: resolved(child.clone()),
                 changed_attributes: vec!["name".to_string()],
             },
@@ -2256,7 +2255,7 @@ mod tests {
             parent,
             Effect::Update {
                 identifier: crate::effect::fixture_applied_identifier("id"),
-                from: Box::new(state_for(&child_id)),
+                from: Box::new((state_for(&child_id)).to_snapshot()),
                 to: resolved_child,
                 changed_attributes: vec!["name".to_string()],
             },

@@ -18,7 +18,7 @@ use crate::provider::{LiftedSavedAttrs, Provider, ProviderRouter};
 use crate::resource::{
     AbsoluteBindingAddress, ConcreteValue, Current, Directives, PlanInputCurrent, PlanInputDesired,
     PlanInputDesiredResources, ResolvedDataSource, ResolvedResource, ResolvedResourceId, Resource,
-    ResourceId, State, Value, plan_input_desired_resources,
+    ResourceId, SnapshotState as State, Value, plan_input_desired_resources,
 };
 use crate::schema::{
     AttrTypeKind, CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
@@ -224,7 +224,7 @@ pub(crate) struct PendingReplace {
     pub cascade_ref_hints: Vec<(String, String)>,
     pub temporary_name: Option<TemporaryName>,
     pub consumer_updates: ResolvedDependencies,
-    pub previous_attributes: HashMap<String, Value>,
+    pub previous_attributes: HashMap<String, crate::resource::SnapshotValue>,
 }
 
 struct RefAttr {
@@ -232,17 +232,17 @@ struct RefAttr {
     hint: String,
 }
 
-fn contains_authored_create_only_value(
+fn contains_authored_create_only_value<P: crate::resource::StateValueLeaf>(
     attr_type: &AttributeType,
-    value: &Value,
+    value: &Value<P>,
     schema: &ResourceSchema,
 ) -> bool {
     contains_authored_create_only_value_on_path(attr_type, value, schema, &mut Vec::new())
 }
 
-fn contains_authored_create_only_value_on_path<'schema>(
+fn contains_authored_create_only_value_on_path<'schema, P: crate::resource::StateValueLeaf>(
     attr_type: &'schema AttributeType,
-    value: &Value,
+    value: &Value<P>,
     schema: &'schema ResourceSchema,
     ref_chain: &mut Vec<&'schema str>,
 ) -> bool {
@@ -308,9 +308,15 @@ fn contains_authored_create_only_value_on_path<'schema>(
     }
 }
 
-struct UnorderedCreateOnlyMatcher<'items, 'schema, 'context, 'comparison> {
-    desired_items: &'items [(usize, &'items Value)],
-    current_items: &'items [Value],
+struct UnorderedCreateOnlyMatcher<
+    'items,
+    'schema,
+    'context,
+    'comparison,
+    P: crate::resource::StateValueLeaf,
+> {
+    desired_items: &'items [(usize, &'items Value<P>)],
+    current_items: &'items [Value<P>],
     element_type: &'schema AttributeType,
     schema: &'schema ResourceSchema,
     context: &'context PlanningComparison<'comparison>,
@@ -318,7 +324,7 @@ struct UnorderedCreateOnlyMatcher<'items, 'schema, 'context, 'comparison> {
     current_matches: &'items mut [Option<usize>],
 }
 
-impl UnorderedCreateOnlyMatcher<'_, '_, '_, '_> {
+impl<P: crate::resource::StateValueLeaf> UnorderedCreateOnlyMatcher<'_, '_, '_, '_, P> {
     fn matches(&mut self, desired_index: usize, seen_current: &mut [bool]) -> bool {
         for current_index in 0..self.current_items.len() {
             if seen_current[current_index]
@@ -349,10 +355,10 @@ impl UnorderedCreateOnlyMatcher<'_, '_, '_, '_> {
     }
 }
 
-fn create_only_values_compatible(
+fn create_only_values_compatible<P: crate::resource::StateValueLeaf>(
     attr_type: &AttributeType,
-    current: &Value,
-    desired: &Value,
+    current: &Value<P>,
+    desired: &Value<P>,
     schema: &ResourceSchema,
     context: &PlanningComparison<'_>,
     removal_evidence: AuthoredRemovalEvidence,
@@ -368,10 +374,10 @@ fn create_only_values_compatible(
     )
 }
 
-fn authored_create_only_value_is_compatible(
+fn authored_create_only_value_is_compatible<P: crate::resource::StateValueLeaf>(
     attr_type: &AttributeType,
-    current: Option<&Value>,
-    desired: &Value,
+    current: Option<&Value<P>>,
+    desired: &Value<P>,
     schema: &ResourceSchema,
     context: &PlanningComparison<'_>,
     removal_evidence: AuthoredRemovalEvidence,
@@ -389,10 +395,10 @@ fn authored_create_only_value_is_compatible(
         })
 }
 
-fn create_only_values_compatible_on_path<'schema>(
+fn create_only_values_compatible_on_path<'schema, P: crate::resource::StateValueLeaf>(
     attr_type: &'schema AttributeType,
-    current: &Value,
-    desired: &Value,
+    current: &Value<P>,
+    desired: &Value<P>,
     schema: &'schema ResourceSchema,
     context: &PlanningComparison<'_>,
     removal_evidence: AuthoredRemovalEvidence,
@@ -1251,7 +1257,7 @@ fn create_plan_parts(
                             prev_explicit: prev_explicit_for_resource,
                             schema: Some(schema),
                             context,
-                            observations: &resolved_comparison.context().observation(),
+                            observations: &context.observation(),
                         },
                         validated_schema,
                     )
@@ -1545,13 +1551,27 @@ fn create_plan_parts(
                     Current::CreateOutcomeUnknown(_unknown) => None,
                     Current::MissingIdentifier(unidentified) => Some(unidentified.state()),
                 });
-        let wait_has_work = cached_state
-            .map(|state| {
+        let cached_inputs = match cached_state
+            .map(|state| crate::wait::evaluation_inputs(&until, &state.attributes))
+            .transpose()
+        {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                plan.add_error(PlanError::new(
+                    diagnostic_id,
+                    PlanErrorKind::UnavailableSecret(error),
+                ));
+                continue;
+            }
+        };
+        let wait_has_work = cached_inputs
+            .as_ref()
+            .map(|inputs| {
                 let target_is_mutating = plan
                     .effects()
                     .iter()
                     .any(|e| e.resource_id() == target_id.as_inner() && e.is_mutating());
-                let target_needs_wait = !until.evaluate(&state.attributes);
+                let target_needs_wait = !until.evaluate(inputs);
 
                 target_is_mutating || target_needs_wait
             })

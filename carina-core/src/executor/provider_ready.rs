@@ -317,19 +317,31 @@ impl<T> ResolvedCheckInput<T> {
     }
 }
 
-/// Aggregate returned by the module constraint gate.
+/// Resolution failures and evaluated violations remain distinct at every gate.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ModuleConstraintGateError {
+    #[error(transparent)]
+    UnavailableSecret(#[from] crate::module_resolver::ModuleConstraintResolutionError),
+    #[error(transparent)]
+    Violations(#[from] ModuleConstraintViolations),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModuleConstraintGateError {
+pub struct ModuleConstraintViolations {
     failures: Vec<ModuleConstraintFailure>,
 }
 
-impl ModuleConstraintGateError {
+impl ModuleConstraintViolations {
     pub fn failures(&self) -> &[ModuleConstraintFailure] {
         &self.failures
     }
+
+    pub fn into_failures(self) -> Vec<ModuleConstraintFailure> {
+        self.failures
+    }
 }
 
-impl fmt::Display for ModuleConstraintGateError {
+impl fmt::Display for ModuleConstraintViolations {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.failures.is_empty() {
             return f.write_str(
@@ -346,7 +358,7 @@ impl fmt::Display for ModuleConstraintGateError {
     }
 }
 
-impl std::error::Error for ModuleConstraintGateError {}
+impl std::error::Error for ModuleConstraintViolations {}
 
 /// Apply-time module constraint gate shared by one execution.
 ///
@@ -363,7 +375,7 @@ pub struct ModuleConstraintGate {
 
 enum ModuleConstraintCompositions {
     Live(Vec<LiveComposition>),
-    Saved(Vec<SavedComposition>),
+    Saved(Vec<SavedComposition<NoPlaceholder>>),
 }
 
 impl ModuleConstraintGate {
@@ -374,7 +386,7 @@ impl ModuleConstraintGate {
         }
     }
 
-    pub fn from_saved_compositions(compositions: &[SavedComposition]) -> Self {
+    pub fn from_saved_compositions(compositions: &[SavedComposition<NoPlaceholder>]) -> Self {
         Self {
             compositions: ModuleConstraintCompositions::Saved(compositions.to_vec()),
             reported_failures: Mutex::new(HashSet::new()),
@@ -386,7 +398,8 @@ impl ModuleConstraintGate {
         bindings: &ResolvedBindings,
         terminal: bool,
         session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-    ) -> Vec<ModuleConstraintFailure> {
+    ) -> Result<Vec<ModuleConstraintFailure>, crate::module_resolver::ModuleConstraintResolutionError>
+    {
         match &self.compositions {
             ModuleConstraintCompositions::Live(compositions) => {
                 evaluate_live_pending_constraints(compositions, bindings, terminal, session)
@@ -413,7 +426,7 @@ impl ModuleConstraintGate {
         bindings: &ResolvedBindings,
         session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<(), ModuleConstraintGateError> {
-        let failures = self.evaluate(bindings, false, session);
+        let failures = self.evaluate(bindings, false, session)?;
         if failures.is_empty() {
             return Ok(());
         }
@@ -429,9 +442,10 @@ impl ModuleConstraintGate {
 
         // An empty diagnostic still returns Err: reporting suppression must
         // never turn a known violation into permission to call a provider.
-        Err(ModuleConstraintGateError {
+        Err(ModuleConstraintViolations {
             failures: new_failures,
-        })
+        }
+        .into())
     }
 
     /// Evaluate every remaining constraint at the end of apply.
@@ -451,7 +465,7 @@ impl ModuleConstraintGate {
         report_unresolved: bool,
         session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<(), ModuleConstraintGateError> {
-        let failures = self.evaluate(bindings, report_unresolved, session);
+        let failures = self.evaluate(bindings, report_unresolved, session)?;
         self.report_new(failures)
     }
 
@@ -470,7 +484,7 @@ impl ModuleConstraintGate {
         if failures.is_empty() {
             Ok(())
         } else {
-            Err(ModuleConstraintGateError { failures })
+            Err(ModuleConstraintViolations { failures }.into())
         }
     }
 }
@@ -520,9 +534,24 @@ pub enum ProviderPreparationError {
     /// current provider value is unobservable.
     #[error(transparent)]
     IgnoredWriteOnly(#[from] crate::provider::IgnoredWriteOnlyValueError),
+    #[error(transparent)]
+    UnavailableSecret(#[from] crate::resource::UnavailableSecretError),
     /// Provider-specific normalization failed before dispatch.
     #[error("{0}")]
     Provider(crate::provider::ProviderError),
+}
+
+impl From<crate::provider::UpdatePatchError> for ProviderPreparationError {
+    fn from(error: crate::provider::UpdatePatchError) -> Self {
+        match error {
+            crate::provider::UpdatePatchError::IgnoredWriteOnly(error) => {
+                Self::IgnoredWriteOnly(error)
+            }
+            crate::provider::UpdatePatchError::UnavailableSecret(error) => {
+                Self::UnavailableSecret(error)
+            }
+        }
+    }
 }
 
 impl From<ProviderWireError> for ProviderPreparationError {
@@ -1030,7 +1059,7 @@ pub(super) fn managed_update_schema<'a, S, D>(
 /// Prepare a checked update request through the provider-boundary gate.
 pub async fn prepare_update_request(
     resource: Resource,
-    from: crate::resource::State,
+    from: crate::resource::SnapshotState,
     changed_attributes: &[String],
     context: &ProviderPreparationContext<'_>,
 ) -> Result<UpdateRequest, ProviderPreparationError> {
@@ -1176,7 +1205,7 @@ mod provider_config_tests {
     #[tokio::test]
     async fn prepare_update_request_resolves_schema_default_directives() {
         let resource = Resource::with_provider("test", "widget", "example", None);
-        let from = crate::resource::State::existing(resource.id.clone(), HashMap::new());
+        let from = crate::resource::SnapshotState::existing(resource.id.clone(), HashMap::new());
         let bindings = ResolvedBindings::default();
         let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
         let mut schemas = SchemaRegistry::new();
@@ -1214,7 +1243,7 @@ mod provider_config_tests {
     async fn prepare_update_request_rejects_a_missing_managed_schema() {
         let resource = Resource::with_provider("test", "widget", "example", None);
         let id = resource.id.clone();
-        let from = crate::resource::State::existing(id.clone(), HashMap::new());
+        let from = crate::resource::SnapshotState::existing(id.clone(), HashMap::new());
         let bindings = ResolvedBindings::default();
         let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = SchemaRegistry::new();

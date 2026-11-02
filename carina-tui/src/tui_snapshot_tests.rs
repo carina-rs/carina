@@ -218,7 +218,8 @@ fn build_map_key_diff_plan() -> Plan {
                 .into_iter()
                 .collect(),
             )
-            .with_identifier("my-vpc-id"),
+            .with_identifier("my-vpc-id")
+            .to_snapshot(),
         ),
         to: resolved(
             Resource::new("ec2.Vpc", "my-vpc")

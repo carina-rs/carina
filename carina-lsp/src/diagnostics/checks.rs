@@ -324,11 +324,7 @@ fn value_depends_on_module_output(
             | ConcreteValue::Duration(_)
             | ConcreteValue::StringList(_),
         )
-        | Value::Deferred(
-            DeferredValue::Unknown(_)
-            | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Placeholder(_),
-        ) => false,
+        | Value::Deferred(DeferredValue::Unknown(_) | DeferredValue::Placeholder(_)) => false,
     }
 }
 
@@ -421,7 +417,7 @@ impl<'a> ContextFreeValue<'a> {
                 | Value::Deferred(DeferredValue::Access(_))
                 | Value::Deferred(DeferredValue::Unknown(_))
                 | Value::Deferred(DeferredValue::Placeholder(_))
-                | Value::Deferred(DeferredValue::RedactedSecret { .. }) => false,
+                 => false,
                 Value::Concrete(ConcreteValue::List(items)) => {
                     items.iter().all(is_context_free)
                 }

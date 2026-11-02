@@ -10,8 +10,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::effect::{
-    ChangedCreateOnly, Effect, EffectGeneration, EffectWithSource, MoveAuthority, SavedEffect,
-    TemporaryName, UnresolvedSavedEffect,
+    ChangedCreateOnly, Effect, EffectGeneration, EffectWithSource, MoveAuthority, TemporaryName,
+    UnresolvedSavedEffect,
 };
 use crate::hint::ProjectCommand;
 use crate::module_resolver::ModuleConstraintDiagnostic;
@@ -19,8 +19,8 @@ use crate::name_override::NameOverride;
 use crate::provider::{AppliedIdentifier, Timestamp};
 pub use crate::resource::PreventDestroySource;
 use crate::resource::{
-    AbsoluteBindingAddress, DeposedKey, Directives, ResolvedResource, ResolvedResourceId,
-    ResourceId, Value,
+    AbsoluteBindingAddress, DeposedKey, Directives, NoPlaceholder, PlanValueKind, ResolvedResource,
+    ResolvedResourceId, ResourceId, SnapshotLeaf, SnapshotValue,
 };
 pub use crate::resource::{ModuleSource, SavedModuleSource};
 
@@ -162,6 +162,7 @@ pub enum PlanErrorKind {
     },
     /// A module argument constraint failed after its inputs became known.
     ModuleConstraint(ModuleConstraintDiagnostic),
+    UnavailableSecret(crate::resource::UnavailableSecretError),
 }
 
 /// The sole resolution seam for a resource that is confirmed absent after an
@@ -257,6 +258,17 @@ impl From<crate::provider::IgnoredWriteOnlyValueError> for PlanErrorKind {
         Self::IgnoredWriteOnlyValueUnavailable {
             attribute: error.attribute().to_string(),
             path: error.path().to_string(),
+        }
+    }
+}
+
+impl From<crate::provider::UpdatePatchError> for PlanErrorKind {
+    fn from(error: crate::provider::UpdatePatchError) -> Self {
+        match error {
+            crate::provider::UpdatePatchError::IgnoredWriteOnly(error) => error.into(),
+            crate::provider::UpdatePatchError::UnavailableSecret(error) => {
+                Self::UnavailableSecret(error)
+            }
         }
     }
 }
@@ -414,6 +426,7 @@ impl PlanErrorKind {
                 }
             }
             Self::ModuleConstraint(diagnostic) => std::fmt::Display::fmt(diagnostic, f),
+            Self::UnavailableSecret(error) => std::fmt::Display::fmt(error, f),
             Self::IgnoredWriteOnlyValueUnavailable { attribute, path } => write!(
                 f,
                 "cannot send attribute `{attribute}` because ignored write-only path `{path}` must be preserved, but its current value cannot be known"
@@ -447,6 +460,7 @@ impl PlanError {
             | PlanErrorKind::WaitTargetMissing { .. }
             | PlanErrorKind::WaitTargetIsDataSource { .. }
             | PlanErrorKind::WaitPredicateInvalid { .. }
+            | PlanErrorKind::UnavailableSecret(_)
             | PlanErrorKind::IgnoredWriteOnlyValueUnavailable { .. }
             | PlanErrorKind::ResolvedValueConstraint { .. }) => {
                 write!(f, "{}: ", self.resource_id)?;
@@ -512,7 +526,7 @@ pub(crate) struct ReplaceDisplayMetadata {
     /// Pre-replace state values. Used by display and snapshot tests;
     /// may contain secrets (the redaction walker visits this field
     /// in Phase 7).
-    pub previous_attributes: HashMap<String, Value>,
+    pub previous_attributes: HashMap<String, SnapshotValue>,
 }
 
 /// Borrowed public view of replacement display metadata.
@@ -535,20 +549,20 @@ pub struct ReplaceDisplayInfo<'a> {
     /// Temporary name when CBD used a name swap. `None` for DBC.
     pub temporary_name: Option<&'a TemporaryName>,
     /// Pre-replace state values used as the "from" side of display diffs.
-    pub(crate) previous_attributes: &'a HashMap<String, Value>,
+    pub(crate) previous_attributes: &'a HashMap<String, SnapshotValue>,
 }
 
 /// Opaque historical replacement values that may only be converted through
 /// the persisted-state writeback encoder.
 #[derive(Debug, Clone, Copy)]
 pub struct ReplacementPreviousAttributesForStateWriteback<'a> {
-    attributes: &'a HashMap<String, Value>,
+    attributes: &'a HashMap<String, SnapshotValue>,
 }
 
 impl<'a> ReplacementPreviousAttributesForStateWriteback<'a> {
     /// Borrow plan-time provider/history values for the state layer's sealed
     /// writeback selection step.
-    pub fn provider_attributes(self) -> &'a HashMap<String, Value> {
+    pub fn provider_attributes(self) -> &'a HashMap<String, SnapshotValue> {
         self.attributes
     }
 }
@@ -589,7 +603,7 @@ pub(crate) struct ReplacementGroup {
     pub consumer_updates: ResolvedDependencies,
     /// Pre-replace attribute values, captured for display + snapshot.
     /// The redaction walker visits this in Phase 7.
-    pub previous_attributes: HashMap<String, Value>,
+    pub previous_attributes: HashMap<String, SnapshotValue>,
 }
 
 pub(crate) struct ReplacementDelete {
@@ -659,11 +673,11 @@ impl IgnoredChangeSummary {
 /// Plan containing Effects to be executed
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(
-    serialize = "S: Serialize + Clone",
-    deserialize = "S: serde::de::DeserializeOwned"
+    serialize = "S: Serialize + Clone, V: PlanValueKind",
+    deserialize = "S: serde::de::DeserializeOwned, V: PlanValueKind"
 ))]
-pub struct Plan<S = ModuleSource> {
-    effects: Vec<EffectWithSource<S>>,
+pub struct Plan<S = ModuleSource, V: PlanValueKind = NoPlaceholder> {
+    effects: Vec<EffectWithSource<S, V>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     ignored_change_summaries: Vec<IgnoredChangeSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -683,7 +697,7 @@ pub struct Plan<S = ModuleSource> {
     destroy_ordering_notices: Vec<DestroyOrderingNotice>,
 }
 
-impl<S> Default for Plan<S> {
+impl<S, V: PlanValueKind> Default for Plan<S, V> {
     fn default() -> Self {
         Self {
             effects: Vec::new(),
@@ -697,7 +711,8 @@ impl<S> Default for Plan<S> {
     }
 }
 
-pub type SavedPlan = Plan<SavedModuleSource>;
+pub type SavedPlan = Plan<SavedModuleSource, SnapshotLeaf>;
+pub type SnapshotPlan<S = ModuleSource> = Plan<S, SnapshotLeaf>;
 
 /// Deserialized saved-plan effects before managed resources have crossed the
 /// fingerprint-checked schema-resolution boundary.
@@ -819,8 +834,8 @@ impl UnresolvedSavedPlan {
     }
 }
 
-impl From<Plan> for SavedPlan {
-    fn from(plan: Plan) -> Self {
+impl<V: PlanValueKind> From<Plan<ModuleSource, V>> for Plan<SavedModuleSource, V> {
+    fn from(plan: Plan<ModuleSource, V>) -> Self {
         let Plan {
             effects,
             ignored_change_summaries,
@@ -831,7 +846,7 @@ impl From<Plan> for SavedPlan {
             destroy_ordering_notices,
         } = plan;
         Self {
-            effects: effects.into_iter().map(SavedEffect::from).collect(),
+            effects: effects.into_iter().map(EffectWithSource::from).collect(),
             ignored_change_summaries,
             replace_display,
             permanent_name_overrides,
@@ -899,16 +914,70 @@ impl Plan {
     }
 }
 
-impl<S> Plan<S> {
-    pub fn add(&mut self, effect: Effect<S>) {
+impl<S: Clone> Plan<S> {
+    /// Capture an execution plan as historical/display data without redaction.
+    pub fn to_snapshot(&self) -> SnapshotPlan<S> {
+        let effects = self
+            .effects
+            .iter()
+            .map(|effect| {
+                effect.try_map_value_stage(
+                        |_, _, value| Ok::<_, std::convert::Infallible>(value.to_snapshot()),
+                        |_, value| Ok(value.to_snapshot()),
+                        |template| {
+                            crate::effect::value_stage::map_template::<
+                                S,
+                                NoPlaceholder,
+                                SnapshotLeaf,
+                                _,
+                            >(
+                                template,
+                                |value| Ok(value.to_snapshot()),
+                                |_, value| Ok(value.to_snapshot()),
+                            )
+                        },
+                    )
+            })
+            .collect::<Result<Vec<_>, std::convert::Infallible>>()
+            .expect("snapshot capture is infallible");
+        self.clone().with_value_stage(effects)
+    }
+}
+
+impl<S, V: PlanValueKind> Plan<S, V> {
+    pub(crate) fn with_value_stage<Q: PlanValueKind>(
+        self,
+        effects: Vec<Effect<S, Q>>,
+    ) -> Plan<S, Q> {
+        let Plan {
+            effects: _,
+            ignored_change_summaries,
+            replace_display,
+            permanent_name_overrides,
+            errors,
+            abandoned_deposed,
+            destroy_ordering_notices,
+        } = self;
+        Plan {
+            effects,
+            ignored_change_summaries,
+            replace_display,
+            permanent_name_overrides,
+            errors,
+            abandoned_deposed,
+            destroy_ordering_notices,
+        }
+    }
+
+    pub fn add(&mut self, effect: Effect<S, V>) {
         self.effects.push(effect);
     }
 
-    pub fn effects(&self) -> &[Effect<S>] {
+    pub fn effects(&self) -> &[Effect<S, V>] {
         &self.effects
     }
 
-    pub fn move_effects(&self) -> crate::effect::SavedMoveEffects<'_, S> {
+    pub fn move_effects(&self) -> crate::effect::SavedMoveEffects<'_, S, V> {
         crate::effect::SavedMoveEffects::from_effects(&self.effects)
     }
 
@@ -970,16 +1039,16 @@ impl<S> Plan<S> {
     /// Other updates keep their plan-time source after drift verification;
     /// ignored updates must use the fresh source so a value changed between
     /// plan and apply is never written back accidentally.
-    pub fn rebase_ignored_update_sources(
+    pub fn rebase_ignored_update_sources<P: crate::resource::StateValueLeaf>(
         &mut self,
-        actual_states: &HashMap<ResourceId, crate::resource::State>,
+        actual_states: &HashMap<ResourceId, crate::resource::State<P>>,
     ) {
         for effect in &mut self.effects {
             if let Effect::Update { from, to, .. } = effect
                 && !to.ignore_changes().is_empty()
                 && let Some(actual) = actual_states.get(&to.id)
             {
-                **from = actual.clone();
+                **from = actual.to_snapshot();
             }
         }
     }
@@ -1112,7 +1181,7 @@ impl<S> Plan<S> {
         });
     }
 
-    pub(crate) fn effects_mut(&mut self) -> &mut Vec<Effect<S>> {
+    pub(crate) fn effects_mut(&mut self) -> &mut Vec<Effect<S, V>> {
         &mut self.effects
     }
 
@@ -1168,7 +1237,7 @@ impl<S> Plan<S> {
     /// Remove effects that don't satisfy the predicate
     pub fn retain<F>(&mut self, f: F)
     where
-        F: FnMut(&Effect<S>) -> bool,
+        F: FnMut(&Effect<S, V>) -> bool,
     {
         let mut keep = f;
         let mut old_to_new = vec![None; self.effects.len()];
@@ -1407,6 +1476,7 @@ mod tests {
 
     use crate::resource::{
         DataSource, RelativeBindingName, ResolvedDataSource, ResolvedResource, Resource, RootScope,
+        Value,
     };
 
     fn render_plan_error_kind(kind: PlanErrorKind) -> String {
@@ -1460,7 +1530,7 @@ mod tests {
         }
     }
 
-    fn previous_attributes() -> HashMap<String, Value> {
+    fn previous_attributes() -> HashMap<String, SnapshotValue> {
         HashMap::from([(
             "cidr_block".to_string(),
             Value::Concrete(crate::resource::ConcreteValue::String("10.0.0.0/16".into())),
@@ -2053,7 +2123,10 @@ mod tests {
         let json = serde_json::to_string(&plan).unwrap();
         let deserialized = deserialize_plan(&json);
 
-        assert_eq!(deserialized, SavedPlan::from(plan));
+        assert_eq!(
+            deserialized,
+            SavedPlan::from(crate::test_support::snapshot_plan(&plan))
+        );
     }
 
     #[test]
@@ -2131,7 +2204,7 @@ mod tests {
         let json = serde_json::to_string(&plan).unwrap();
         let deserialized = deserialize_plan(&json);
         assert_eq!(plan.effects().len(), deserialized.effects().len());
-        let saved = SavedPlan::from(plan);
+        let saved = SavedPlan::from(crate::test_support::snapshot_plan(&plan));
         assert_eq!(saved.effects(), deserialized.effects());
     }
 }

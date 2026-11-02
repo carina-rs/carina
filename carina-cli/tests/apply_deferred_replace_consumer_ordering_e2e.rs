@@ -282,11 +282,14 @@ fn string(value: &str) -> Value {
 }
 
 fn state_not_found(resource: &Resource) -> CurrentStateEntry {
-    CurrentStateEntry::managed(resource.id.clone(), State::not_found(resource.id.clone()))
+    CurrentStateEntry::managed(
+        resource.id.clone(),
+        State::<NoPlaceholder>::not_found(resource.id.clone()),
+    )
 }
 
 fn consumer_current_state(id: &ResourceId) -> State {
-    State::existing(
+    State::<carina_core::resource::NoPlaceholder>::existing(
         id.clone(),
         HashMap::from([
             ("name".to_string(), string("consumer")),
@@ -394,7 +397,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
     })));
     plan.add(Effect::Update {
         identifier: AppliedIdentifier::new("consumer-id").expect("fixture identifier is non-empty"),
-        from: Box::new(consumer_from.clone()),
+        from: Box::new(consumer_from.clone().to_snapshot()),
         to: resolved(consumer.clone()),
         changed_attributes: vec!["web_acl_arn".to_string()],
     });
@@ -421,11 +424,12 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
             )]),
             attribute_spans: Default::default(),
         }),
-        plan,
+        plan: plan.to_snapshot(),
         sorted_resources: sorted_resources
             .iter()
             .cloned()
             .map(|resource| resolved(resource).into_inner())
+            .map(|value| value.to_snapshot())
             .collect(),
         sorted_value_destroy_dependencies: sorted_resources
             .iter()
@@ -441,6 +445,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         unresolved_resources: sorted_resources
             .into_iter()
             .map(Resource::into_value_snapshot)
+            .map(|value| value.to_snapshot())
             .collect(),
         compositions: vec![],
         data_sources: vec![],

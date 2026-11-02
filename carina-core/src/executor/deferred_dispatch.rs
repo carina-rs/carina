@@ -301,11 +301,11 @@ pub(super) fn materialize_deferred_create<
         identity_inputs.type_checks,
     )
     .map_err(|message| DeferredCreateFailure::ValueAccess {
-        error: DeferredForExpansionError::Resolution {
-            line: template.line(),
-            expression: crate::value::format_value(&template.iterable),
+        error: DeferredForExpansionError::resolution(
+            template.line(),
+            crate::value::format_value(&template.iterable),
             message,
-        },
+        ),
     })? {
         crate::resolver::ValueResolution::Present(value) => value,
         crate::resolver::ValueResolution::Absent => {
@@ -346,10 +346,9 @@ pub(super) fn materialize_deferred_create<
                 mismatch: Box::new(mismatch),
             }
         }
-        error @ DeferredForExpansionError::ValueAccess { .. } => {
-            DeferredCreateFailure::ValueAccess { error }
-        }
-        error @ DeferredForExpansionError::Resolution { .. } => {
+        error @ (DeferredForExpansionError::UnavailableSecret(_)
+        | DeferredForExpansionError::ValueAccess { .. }
+        | DeferredForExpansionError::Resolution { .. }) => {
             DeferredCreateFailure::ValueAccess { error }
         }
         DeferredForExpansionError::Directives(error) => DeferredCreateFailure::Directives { error },

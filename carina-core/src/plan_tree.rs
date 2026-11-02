@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::detail_rows::DetailRow;
 use crate::effect::Effect;
 use crate::plan::{DeferredSummaryAction, DeferredSummaryEntry, Plan, ReplaceDisplayInfo};
-use crate::resource::{AbsoluteBindingAddress, ConcreteValue, DeferredValue, LoopSlot, Value};
+use crate::resource::{AbsoluteBindingAddress, ConcreteValue, DeferredValue, Value};
 use crate::value::{
     RenderedValue, is_upstream_deferred_marker_value, render_value_with_upstream_deferred_label,
 };
@@ -23,8 +23,8 @@ pub enum ChildRenderItem {
     Normal(usize),
 }
 
-pub fn child_render_items<S>(
-    effects: &[Effect<S>],
+pub fn child_render_items<S, V: crate::resource::PlanValueKind>(
+    effects: &[Effect<S, V>],
     child_indices: &[usize],
 ) -> Vec<ChildRenderItem> {
     child_indices
@@ -40,7 +40,9 @@ pub struct DeferredSummaryForPlan {
     pub entries: Vec<DeferredSummaryEntry>,
 }
 
-pub fn deferred_summary_for_plan<S>(plan: &Plan<S>) -> DeferredSummaryForPlan {
+pub fn deferred_summary_for_plan<S, V: crate::resource::PlanValueKind>(
+    plan: &Plan<S, V>,
+) -> DeferredSummaryForPlan {
     let entries = plan
         .effects()
         .iter()
@@ -71,26 +73,15 @@ pub fn deferred_summary_for_plan<S>(plan: &Plan<S>) -> DeferredSummaryForPlan {
     DeferredSummaryForPlan { entries }
 }
 
-pub fn deferred_for_source<S>(
-    template: &crate::parser::DeferredForExpression<
-        S,
-        crate::resource::NoPlaceholder,
-        LoopSlot,
-        AbsoluteBindingAddress,
-    >,
+pub fn deferred_for_source<S, P: crate::resource::ValueKind, T: crate::resource::ValueKind>(
+    template: &crate::parser::DeferredForExpression<S, P, T, AbsoluteBindingAddress>,
 ) -> String {
     crate::value::format_value(&template.iterable)
 }
 
-pub fn deferred_for_verb<S, D>(
-    plan: &Plan<S>,
-    template: &crate::parser::DeferredForExpression<
-        S,
-        crate::resource::NoPlaceholder,
-        LoopSlot,
-        AbsoluteBindingAddress,
-        D,
-    >,
+pub fn deferred_for_verb<S, D, V: crate::resource::PlanValueKind>(
+    plan: &Plan<S, V>,
+    template: &crate::parser::DeferredForExpression<S, V, V::Template, AbsoluteBindingAddress, D>,
 ) -> &'static str {
     let roots = template.root_bindings();
     if plan.effects().iter().any(|effect| {
@@ -104,14 +95,13 @@ pub fn deferred_for_verb<S, D>(
     }
 }
 
-pub fn deferred_for_display_name<S, D>(
-    template: &crate::parser::DeferredForExpression<
-        S,
-        crate::resource::NoPlaceholder,
-        LoopSlot,
-        AbsoluteBindingAddress,
-        D,
-    >,
+pub fn deferred_for_display_name<
+    S,
+    D,
+    P: crate::resource::ValueKind,
+    T: crate::resource::ValueKind,
+>(
+    template: &crate::parser::DeferredForExpression<S, P, T, AbsoluteBindingAddress, D>,
     verb: &str,
 ) -> String {
     let upstream_binding = template.binding_description();
@@ -124,14 +114,13 @@ pub fn deferred_for_display_name<S, D>(
     }
 }
 
-pub fn deferred_for_detail_rows<S, D>(
-    template: &crate::parser::DeferredForExpression<
-        S,
-        crate::resource::NoPlaceholder,
-        LoopSlot,
-        AbsoluteBindingAddress,
-        D,
-    >,
+pub fn deferred_for_detail_rows<
+    S,
+    D,
+    P: crate::resource::ValueKind,
+    T: crate::resource::ValueKind,
+>(
+    template: &crate::parser::DeferredForExpression<S, P, T, AbsoluteBindingAddress, D>,
     upstream_binding: &str,
     verb: &str,
 ) -> Vec<DetailRow> {
@@ -149,8 +138,8 @@ pub fn deferred_for_detail_rows<S, D>(
     rows
 }
 
-pub fn render_deferred_for_template_value(
-    value: &Value<LoopSlot, AbsoluteBindingAddress>,
+pub fn render_deferred_for_template_value<P: crate::resource::ValueKind>(
+    value: &Value<P, AbsoluteBindingAddress>,
     upstream_binding: &str,
     verb: &str,
 ) -> RenderedValue {
@@ -183,7 +172,7 @@ struct PlanTreeDependencies {
 }
 
 impl PlanTreeDependencies {
-    fn from_effect<S>(effect: &Effect<S>) -> Self {
+    fn from_effect<S, V: crate::resource::PlanValueKind>(effect: &Effect<S, V>) -> Self {
         let mut referenced_bindings = HashSet::new();
         let (resolved, attributes) = match effect {
             Effect::Read { resource } => (effect.blocking_keys(), Some(&resource.attributes)),
@@ -210,7 +199,13 @@ impl PlanTreeDependencies {
         };
         if let Some(attributes) = attributes {
             for value in attributes.values() {
-                crate::deps::collect_dependencies(value, &mut referenced_bindings);
+                // Display walks references without evaluating historical leaves.
+                value.visit_resource_refs(&mut |path| {
+                    referenced_bindings.insert(path.binding_address().clone());
+                });
+                value.visit_binding_refs(&mut |binding| {
+                    referenced_bindings.insert(binding.clone());
+                });
             }
         }
         Self {
@@ -237,7 +232,9 @@ impl DependencyGraph {
 }
 
 /// Build the dependency graph maps from a plan's effects.
-pub fn build_dependency_graph<S>(plan: &Plan<S>) -> DependencyGraph {
+pub fn build_dependency_graph<S, V: crate::resource::PlanValueKind>(
+    plan: &Plan<S, V>,
+) -> DependencyGraph {
     build_dependency_graph_from_effects(plan.effects(), plan.replace_display_info())
 }
 
@@ -246,12 +243,12 @@ pub fn build_dependency_graph<S>(plan: &Plan<S>) -> DependencyGraph {
 /// This is the same analysis as [`build_dependency_graph`], but permits
 /// display-only callers to append lightweight synthetic effects without
 /// cloning the plan or the values carried by its real effects.
-pub fn build_dependency_graph_from_effects<'a, E, S>(
+pub fn build_dependency_graph_from_effects<'a, E, S, V: crate::resource::PlanValueKind>(
     effects: &[E],
     replacement_display: impl IntoIterator<Item = ReplaceDisplayInfo<'a>>,
 ) -> DependencyGraph
 where
-    E: AsRef<Effect<S>>,
+    E: AsRef<Effect<S, V>>,
 {
     let replacement_display = replacement_display.into_iter().collect::<Vec<_>>();
     let suppressed_deletes = replacement_display
@@ -397,8 +394,8 @@ where
 ///
 /// Returns (roots, dependents) where roots are sorted and each parent's
 /// children are sorted by (resource_type, binding_name).
-pub fn build_single_parent_tree<S>(
-    plan: &Plan<S>,
+pub fn build_single_parent_tree<S, V: crate::resource::PlanValueKind>(
+    plan: &Plan<S, V>,
     graph: &DependencyGraph,
 ) -> (Vec<usize>, HashMap<usize, Vec<usize>>) {
     let id_to_effect = &graph.id_to_effect;
@@ -554,8 +551,8 @@ pub fn build_single_parent_tree<S>(
 /// skip ResourceRef attributes that redundantly reference the parent.
 pub fn extract_compact_hint<
     S,
-    P: crate::resource::PlaceholderKind,
-    T: crate::resource::PlaceholderKind,
+    P: crate::resource::ValueKind,
+    T: crate::resource::ValueKind,
     D,
     B: crate::resource::BindingAddress,
     R,
@@ -591,7 +588,7 @@ where
 }
 
 fn extract_compact_hint_from_attributes<
-    P: crate::resource::PlaceholderKind,
+    P: crate::resource::ValueKind,
     B: crate::resource::BindingAddress,
 >(
     attrs: &indexmap::IndexMap<String, crate::resource::Value<P, B>>,
@@ -1001,10 +998,10 @@ mod tests {
             temporary_name: None,
             permanent_name_override: None,
             consumer_updates: Default::default(),
-            previous_attributes: HashMap::from([(
+            previous_attributes: crate::test_support::snapshot_attributes(HashMap::from([(
                 "cidr_block".to_string(),
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-            )]),
+            )])),
         });
 
         let graph = build_dependency_graph(&plan);

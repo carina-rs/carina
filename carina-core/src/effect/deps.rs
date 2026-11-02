@@ -798,7 +798,7 @@ mod tests {
             identifier: crate::effect::fixture_applied_identifier(
                 resource.id.identity_display().to_string(),
             ),
-            from: Box::new(state_for(&resource.id)),
+            from: Box::new((state_for(&resource.id)).to_snapshot()),
             to: ResolvedResource::from_resolved_parts_with_reads(
                 resource.with_dependency_phase(()),
                 dependencies,

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::resource::{
     AbsoluteBindingAddress, AccessPath, ApplyTimeUnknown, DataSource, ModuleSource, ResourceId,
-    State,
+    SnapshotState as State,
 };
 
 /// A data-source input attribute whose unresolved value shapes make the read
@@ -317,8 +317,8 @@ pub enum DataSourceReadStateMergeError {
 mod tests {
     use super::*;
     use crate::resource::{
-        AbsoluteBindingAddress, ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value,
-        RelativeBindingName, RootScope,
+        AbsoluteBindingAddress, ConcreteValue, RelativeBindingName, RootScope,
+        SnapshotValue as Value,
     };
 
     fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {

@@ -78,7 +78,8 @@ fn plan_error_summary(errors: &[PlanError]) -> String {
             | PlanErrorKind::DestroyCreateInFlight
             | PlanErrorKind::CreateOutcomeUnknown { .. }
             | PlanErrorKind::ResumeCreateRoutingMismatch { .. }
-            | PlanErrorKind::ModuleConstraint(_) => other_count += 1,
+            | PlanErrorKind::ModuleConstraint(_)
+            | PlanErrorKind::UnavailableSecret(_) => other_count += 1,
         }
     }
 

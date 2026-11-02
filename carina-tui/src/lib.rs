@@ -230,8 +230,8 @@ impl std::error::Error for TuiError {
 /// matching CLI `--detail full` behavior.
 /// When prior authoring records are provided, ambiguous pending list removals
 /// use the same whole-value display as the CLI.
-pub fn run(
-    display: carina_core::detail_rows::PlanDisplay<'_>,
+pub fn run<S, V: carina_core::resource::PlanValueKind>(
+    display: carina_core::detail_rows::PlanDisplay<'_, S, V>,
     schemas: &SchemaRegistry,
     prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
     provider: &ProviderRouter,
@@ -417,7 +417,8 @@ mod tests {
                         Value::Concrete(ConcreteValue::String("old".into())),
                     )]),
                 )
-                .with_identifier("widget-id"),
+                .with_identifier("widget-id")
+                .to_snapshot(),
             ),
             to: ResolvedResource::new(
                 (Resource::new("test.Widget", "example")

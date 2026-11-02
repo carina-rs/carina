@@ -71,13 +71,18 @@ fn resolved(resource: Resource) -> ResolvedResource {
 
 fn resolved_inner(
     resource: Resource,
-) -> Resource<
+) -> carina_core::resource::Resource<
     carina_core::resource::ModuleSource,
     carina_core::resource::NoPlaceholder,
     carina_core::resource::AbsoluteBindingAddress,
     (),
 > {
-    resolved(resource).into_inner()
+    carina_core::resource::ResolvedResource::resolve_with_schemas(
+        resource.into_value_snapshot(),
+        &carina_core::schema::SchemaRegistry::new(),
+    )
+    .expect("fixture identity and directives resolve")
+    .into_inner()
 }
 
 fn loaded_provider_context() -> LoadedProviderContext {
@@ -236,7 +241,12 @@ fn record_test_plan(contents: PlanFileContents, providers: &[&str]) -> PlanFile 
         &crate::test_support::TestCommandRuntime::new(),
         (),
         factories,
-        contents.provider_configs.as_provider_configs(),
+        &contents
+            .provider_configs
+            .as_provider_configs()
+            .iter()
+            .map(carina_core::parser::ProviderConfig::loading_projection)
+            .collect::<Vec<_>>(),
     );
     contents
         .record_for_test(&ctx, Vec::new())
@@ -254,14 +264,14 @@ fn final_state_save_inputs(sorted_resources: &[ResolvedResource]) -> Arc<ApplySt
 
 fn complete_create(state: State) -> Applied {
     Applied::Complete {
-        state,
+        state: state.to_snapshot(),
         request: AcceptedRequest::create_for_test(),
     }
 }
 
 fn complete_update(state: State, sent: &[&str], removed: &[&str]) -> Applied {
     Applied::Complete {
-        state,
+        state: state.to_snapshot(),
         request: AcceptedRequest::update_for_test(sent, removed),
     }
 }
@@ -493,7 +503,7 @@ async fn ignored_write_only_parent_is_not_in_sent_attributes_and_writeback_keeps
         .as_schema();
 
     let create_request = AcceptedRequest::create_for_test();
-    let create_state = State::existing(
+    let create_state = State::<carina_core::resource::NoPlaceholder>::existing(
         id.clone(),
         HashMap::from([(
             "comment".to_string(),
@@ -516,7 +526,7 @@ async fn ignored_write_only_parent_is_not_in_sent_attributes_and_writeback_keeps
         .upsert_resource(created_row)
         .expect("create-time row is valid");
 
-    let from = State::existing(
+    let from: State = State::<carina_core::resource::NoPlaceholder>::existing(
         id.clone(),
         HashMap::from([(
             "comment".to_string(),
@@ -526,7 +536,7 @@ async fn ignored_write_only_parent_is_not_in_sent_attributes_and_writeback_keeps
     .with_identifier("provider-id");
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        from: Box::new(from),
+        from: Box::new(from.to_snapshot()),
         identifier: AppliedIdentifier::new("provider-id").expect("non-empty identifier"),
         to: updated.clone(),
         changed_attributes: vec!["comment".to_string()],
@@ -614,7 +624,7 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
     let mut current_states = HashMap::from([(
         id.clone(),
         Current::from_state(
-            State::existing(
+            State::<carina_core::resource::NoPlaceholder>::existing(
                 id.clone(),
                 HashMap::from([(
                     "status".to_string(),
@@ -627,7 +637,7 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
     let provider = TestProvider::with_read_state(
         &id,
         identifier,
-        State::existing(
+        State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "status".to_string(),
@@ -680,7 +690,7 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
             .persisted_attributes()
             .expect("saved resource has applied attributes")
             .get("status"),
-        carina_core::value::json_to_dsl_value(&json!("after"))
+        carina_core::value::json_to_dsl_value(&json!("after")).map(|value| value.to_snapshot())
     );
 }
 
@@ -694,7 +704,7 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
     let mut current_states = HashMap::from([(
         id.clone(),
         Current::from_state(
-            State::existing(
+            State::<carina_core::resource::NoPlaceholder>::existing(
                 id.clone(),
                 HashMap::from([(
                     "status".to_string(),
@@ -704,7 +714,11 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
             .with_identifier(identifier),
         ),
     )]);
-    let provider = TestProvider::with_read_state(&id, identifier, State::not_found(id.clone()));
+    let provider = TestProvider::with_read_state(
+        &id,
+        identifier,
+        State::<carina_core::resource::NoPlaceholder>::not_found(id.clone()),
+    );
 
     let mut pending_refreshes = HashMap::new();
     let pending_identifier =
@@ -756,7 +770,7 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
     let mut current_states = HashMap::from([(
         id.clone(),
         Current::from_state(
-            State::existing(
+            State::<carina_core::resource::NoPlaceholder>::existing(
                 id.clone(),
                 HashMap::from([(
                     "status".to_string(),
@@ -811,7 +825,7 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
             .persisted_attributes()
             .expect("saved resource has applied attributes")
             .get("status"),
-        carina_core::value::json_to_dsl_value(&json!("saved"))
+        carina_core::value::json_to_dsl_value(&json!("saved")).map(|value| value.to_snapshot())
     );
 }
 
@@ -876,7 +890,9 @@ fn plan_file_serde_round_trip() {
         key_field,
         keys: ReleasedListKeys::try_new(vec![ReleasedListKey::new(
             "stickiness.enabled",
-            Value::Concrete(ConcreteValue::String("true".into())),
+            Value::<carina_core::resource::NoPlaceholder>::Concrete(ConcreteValue::String(
+                "true".into(),
+            )),
         )])
         .expect("saved release fixture has one key"),
     });
@@ -894,15 +910,24 @@ fn plan_file_serde_round_trip() {
     let present_id = ResourceId::with_provider_identity("aws", "s3.Bucket", "present-bucket", None);
     let missing_id = ResourceId::with_provider_identity("aws", "s3.Bucket", "missing-bucket", None);
     let current_states = vec![
-        CurrentStateEntry::managed(absent_id.clone(), State::not_found(absent_id.clone())),
+        CurrentStateEntry::managed(
+            absent_id.clone(),
+            State::<carina_core::resource::NoPlaceholder>::not_found(absent_id.clone()),
+        ),
         CurrentStateEntry::managed(
             present_id.clone(),
-            State::existing(present_id.clone(), HashMap::new())
-                .with_identifier("present-provider-id"),
+            State::<carina_core::resource::NoPlaceholder>::existing(
+                present_id.clone(),
+                HashMap::new(),
+            )
+            .with_identifier("present-provider-id"),
         ),
         CurrentStateEntry::managed(
             missing_id.clone(),
-            State::existing(missing_id.clone(), HashMap::new()),
+            State::<carina_core::resource::NoPlaceholder>::existing(
+                missing_id.clone(),
+                HashMap::new(),
+            ),
         ),
     ];
     let data_source = DataSource::with_provider("aws", "sts.CallerIdentity", "caller", None);
@@ -942,11 +967,12 @@ fn plan_file_serde_round_trip() {
                 ]),
                 attribute_spans: HashMap::new(),
             }),
-            plan,
+            plan: plan.to_snapshot(),
             sorted_resources: sorted_resources
                 .iter()
                 .cloned()
                 .map(resolved_inner)
+                .map(|value| value.to_snapshot())
                 .collect(),
             sorted_value_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
             sorted_explicit_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
@@ -954,17 +980,24 @@ fn plan_file_serde_round_trip() {
             unresolved_resources: sorted_resources
                 .into_iter()
                 .map(Resource::into_value_snapshot)
+                .map(|value| value.to_snapshot())
                 .collect(),
             current_states,
             compositions: vec![],
-            data_sources: vec![data_source.into_value_snapshot()],
+            data_sources: (vec![data_source.into_value_snapshot()])
+                .into_iter()
+                .map(|value| value.to_snapshot())
+                .collect(),
             data_source_origins: vec![],
             data_source_values: vec![SavedDataSourceValue {
                 id: data_source_id.clone(),
-                value: DataSourceValue::read(State::existing(
-                    data_source_id.clone(),
-                    HashMap::new(),
-                )),
+                value: DataSourceValue::read(
+                    (State::<carina_core::resource::NoPlaceholder>::existing(
+                        data_source_id.clone(),
+                        HashMap::new(),
+                    ))
+                    .to_snapshot(),
+                ),
             }],
             upstream_snapshot: HashMap::new(),
             upstream_sources: Vec::new(),
@@ -1665,7 +1698,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
     );
 
     // 4. Simulate state after apply
-    let applied_state = State::existing(
+    let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
         resources_run1[0].id.clone(),
         vec![(
             "bucket_name".to_string(),
@@ -1791,7 +1824,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
         Some(Value::Concrete(ConcreteValue::String(s))) => s.clone(),
         _ => panic!("role_name should be set after prefix resolution"),
     };
-    let applied_state = State::existing(
+    let applied_state = State::<carina_core::resource::NoPlaceholder>::existing(
         resources_run1[0].id.clone(),
         vec![
             (
@@ -1883,7 +1916,11 @@ async fn detect_drift_errors_when_resource_missing_from_planned_states() {
     let id = resource.id.clone();
 
     // Provider returns a non-existing state (identifier is None since no planned state)
-    let provider = TestProvider::with_read_state(&id, "", State::not_found(id.clone()));
+    let provider = TestProvider::with_read_state(
+        &id,
+        "",
+        State::<carina_core::resource::NoPlaceholder>::not_found(id.clone()),
+    );
 
     // planned_states is empty - resource is missing
     let planned_states = Vec::new();
@@ -1919,7 +1956,7 @@ async fn detect_drift_returns_none_when_no_drift() {
     let id = resource.id.clone();
     let identifier = "my-bucket";
 
-    let state = State::existing(
+    let state = State::<carina_core::resource::NoPlaceholder>::existing(
         id.clone(),
         HashMap::from([(
             "name".to_string(),
@@ -1984,8 +2021,12 @@ async fn detect_drift_treats_empty_non_marker_struct_and_absent_as_equal() {
             HashMap::from([("config".to_string(), empty_config.clone())]),
         ),
     ] {
-        let planned = State::existing(id.clone(), planned_attributes).with_identifier(identifier);
-        let actual = State::existing(id.clone(), actual_attributes).with_identifier(identifier);
+        let planned =
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), planned_attributes)
+                .with_identifier(identifier);
+        let actual =
+            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), actual_attributes)
+                .with_identifier(identifier);
         let provider = TestProvider::with_read_state(&id, identifier, actual);
         let planned_states = vec![ReloadedCurrentStateEntry::managed(id.clone(), planned)];
 
@@ -2031,8 +2072,10 @@ async fn detect_drift_ignores_top_level_attribute_added_after_plan() {
             .validate()
             .expect("ignore_changes fixture schema must be valid"),
     );
-    let planned = State::existing(id.clone(), HashMap::new()).with_identifier(identifier);
-    let actual = State::existing(
+    let planned =
+        State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+            .with_identifier(identifier);
+    let actual = State::<carina_core::resource::NoPlaceholder>::existing(
         id.clone(),
         HashMap::from([(
             "comment".to_string(),
@@ -2098,7 +2141,7 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
     let resource = Resource::with_provider("aws", "lambda.Permission", "invoke", None);
     let id = resource.id.clone();
     let identifier = "permission-id";
-    let planned = State::existing(
+    let planned = State::<carina_core::resource::NoPlaceholder>::existing(
         id.clone(),
         HashMap::from([(
             "function_name".to_string(),
@@ -2106,7 +2149,7 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
         )]),
     )
     .with_identifier(identifier);
-    let actual = State::existing(
+    let actual = State::<carina_core::resource::NoPlaceholder>::existing(
         id.clone(),
         HashMap::from([(
             "function_name".to_string(),
@@ -2185,7 +2228,7 @@ async fn detect_drift_restores_legacy_unlisted_write_only_secret_from_state_file
     let provider = TestProvider::with_read_state(
         &id,
         identifier,
-        State::existing(
+        State::<carina_core::resource::NoPlaceholder>::existing(
             id.clone(),
             HashMap::from([(
                 "name".to_string(),
@@ -2233,8 +2276,11 @@ async fn detect_drift_uses_identifier_carried_by_present_current() {
     let id = resource.id.clone();
     let identifier =
         AppliedIdentifier::new("typed-provider-id").expect("fixture identifier is non-empty");
-    let planned = State::existing(id.clone(), HashMap::new());
-    let actual = State::existing(id.clone(), HashMap::new()).with_identifier("typed-provider-id");
+    let planned =
+        State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new());
+    let actual =
+        State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
+            .with_identifier("typed-provider-id");
     let provider = TestProvider::with_read_state(&id, "typed-provider-id", actual);
     let planned_states = vec![ReloadedCurrentStateEntry::managed_current(
         id.clone(),
@@ -2264,7 +2310,7 @@ async fn detect_drift_returns_messages_when_drift_detected() {
     let id = resource.id.clone();
     let identifier = "my-bucket";
 
-    let planned = State::existing(
+    let planned = State::<carina_core::resource::NoPlaceholder>::existing(
         id.clone(),
         HashMap::from([(
             "name".to_string(),
@@ -2274,7 +2320,7 @@ async fn detect_drift_returns_messages_when_drift_detected() {
     .with_identifier(identifier);
 
     // Actual state has different attribute value
-    let actual = State::existing(
+    let actual = State::<carina_core::resource::NoPlaceholder>::existing(
         id.clone(),
         HashMap::from([(
             "name".to_string(),
@@ -2343,7 +2389,7 @@ fn orphaned_state_resource_produces_delete_effect() {
     for resource in &desired {
         current_states.insert(
             resource.id.clone(),
-            State::existing(
+            State::<carina_core::resource::NoPlaceholder>::existing(
                 resource.id.clone(),
                 HashMap::from([(
                     "bucket".to_string(),
@@ -2932,7 +2978,7 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
     assert_eq!(row.deposed.len(), 1);
     assert_eq!(
         row.deposed[0].persisted_attributes().get("status"),
-        carina_core::value::json_to_dsl_value(&json!("alive"))
+        carina_core::value::json_to_dsl_value(&json!("alive")).map(|value| value.to_snapshot())
     );
 }
 
@@ -3029,7 +3075,7 @@ async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
     let mut data_source = DataSource::with_provider("mock", "test.lookup", "lookup", None);
     data_source.binding = Some(absolute_binding("lookup"));
     let data_sources = vec![data_source];
-    let data_source_state = State::existing(
+    let data_source_state = State::<carina_core::resource::NoPlaceholder>::existing(
         data_source_id.clone(),
         HashMap::from([(
             "answer".to_string(),
@@ -3039,7 +3085,8 @@ async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
     let result = {
         let mut result = ApplyResult::empty();
         result.success_count = 1;
-        result.data_source_states = HashMap::from([(data_source_id, data_source_state)]);
+        result.data_source_states =
+            HashMap::from([(data_source_id, data_source_state.to_snapshot())]);
         result
     };
     let export_params = vec![InferredExportParam::for_test(
@@ -3050,7 +3097,7 @@ async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
         })),
     )];
     let data_source_values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
-        DataSourceValue::read(result.data_source_states[&data_source.id].clone())
+        DataSourceValue::read((result.data_source_states[&data_source.id].clone()).to_snapshot())
     });
 
     let _ = finalize_apply(
@@ -3175,8 +3222,8 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
             // Simulate provider.read() returning not-found for this identifier.
             // In the real code the typed orphan supplies `AppliedIdentifier`
             // and the provider returns `ReadOutcome::NotFound`.
-            let refreshed = State::not_found(id.clone());
-            orphan.with_refreshed_state(refreshed)
+            let refreshed = State::<carina_core::resource::NoPlaceholder>::not_found(id.clone());
+            orphan.with_refreshed_state(refreshed.to_snapshot())
         })
         .collect::<carina_state::LoadedOrphans>()
         .into_plan_orphans();
@@ -3410,7 +3457,10 @@ fn refresh_false_without_state_file_treats_resources_as_new() {
     // Simulate refresh=false with no state file
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
     for res in &desired {
-        current_states.insert(res.id.clone(), State::not_found(res.id.clone()));
+        current_states.insert(
+            res.id.clone(),
+            State::<carina_core::resource::NoPlaceholder>::not_found(res.id.clone()),
+        );
     }
 
     let plan = create_plan(
@@ -3466,7 +3516,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
     let identifier = "vpc-0abc123";
 
     // Simulate the imported state returned by the provider read
-    let imported_state = State::existing(
+    let imported_state: State = State::<carina_core::resource::NoPlaceholder>::existing(
         id.clone(),
         HashMap::from([(
             "cidr_block".to_string(),
@@ -3476,7 +3526,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
     .with_identifier(identifier);
 
     let mut applied_states = HashMap::new();
-    applied_states.insert(id.clone(), Applied::Imported(imported_state));
+    applied_states.insert(id.clone(), Applied::Imported(imported_state.to_snapshot()));
 
     // Build a plan with an Import effect
     let mut plan = Plan::new();
@@ -3615,7 +3665,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
             .persisted_attributes()
             .expect("saved resource has applied attributes")
             .get("ipv4_netmask_length"),
-        carina_core::value::json_to_dsl_value(&json!(16)),
+        carina_core::value::json_to_dsl_value(&json!(16)).map(|value| value.to_snapshot()),
         "write-only attribute should be persisted in state"
     );
     assert_eq!(
@@ -3631,6 +3681,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
             .expect("saved resource has applied attributes")
             .get("cidr_block"),
         carina_core::value::json_to_dsl_value(&json!("10.0.0.0/16"))
+            .map(|value| value.to_snapshot())
     );
 }
 
@@ -3662,7 +3713,7 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
     let id = resource.id.clone();
     let applied_states = HashMap::from([(
         id.clone(),
-        complete_create(State::existing(
+        complete_create(State::<carina_core::resource::NoPlaceholder>::existing(
             id,
             HashMap::from([(
                 "allocation_id".to_string(),
@@ -3829,7 +3880,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
             .persisted_attributes()
             .expect("saved resource has applied attributes")
             .get("ipv4_netmask_length"),
-        carina_core::value::json_to_dsl_value(&json!(24)),
+        carina_core::value::json_to_dsl_value(&json!(24)).map(|value| value.to_snapshot()),
         "write-only attribute should reflect the updated desired value"
     );
 }
@@ -3874,7 +3925,7 @@ fn plan_file_serialization_redacts_secrets() {
     );
     state_attrs.insert("master_password".to_string(), secret_password.clone());
     state_attrs.insert("secret_number".to_string(), secret_arithmetic);
-    let state_with_secret = State::existing(
+    let state_with_secret = State::<carina_core::resource::NoPlaceholder>::existing(
         ResourceId::with_provider_identity("awscc", "rds.db_instance", "my-db", None),
         state_attrs,
     );
@@ -3893,9 +3944,9 @@ fn plan_file_serialization_redacts_secrets() {
             )]),
             backend_config: None,
             plan: redact_secrets_in_plan(&plan).unwrap(),
-            sorted_resources: vec![resolved_inner(
-                redact_secrets_in_resource(&resource_with_secret).unwrap(),
-            )],
+            sorted_resources: vec![
+                redact_secrets_in_resource(&resolved_inner(resource_with_secret.clone())).unwrap(),
+            ],
             sorted_value_destroy_dependencies: vec![Default::default()],
             sorted_explicit_destroy_dependencies: vec![Default::default()],
             legacy_dependency_classification: None,
@@ -3958,11 +4009,14 @@ fn plan_file_serialization_rejects_pending_resource_identity() {
                 "mock",
             )]),
             backend_config: None,
-            plan: Plan::new(),
-            sorted_resources: vec![
+            plan: carina_core::plan::SnapshotPlan::default(),
+            sorted_resources: (vec![
                 Resource::pending_with_provider("mock", "test.resource", None)
                     .into_resolved_dependency_phase_for_test(),
-            ],
+            ])
+            .into_iter()
+            .map(|value| value.to_snapshot())
+            .collect(),
             sorted_value_destroy_dependencies: vec![Default::default()],
             sorted_explicit_destroy_dependencies: vec![Default::default()],
             legacy_dependency_classification: None,
@@ -4002,13 +4056,16 @@ fn plan_file_validation_rejects_missing_resource_identity() {
                 "mock",
             )]),
             backend_config: None,
-            plan: Plan::new(),
-            sorted_resources: vec![resolved_inner(Resource::with_provider(
+            plan: carina_core::plan::SnapshotPlan::default(),
+            sorted_resources: (vec![resolved_inner(Resource::with_provider(
                 "mock",
                 "test.resource",
                 "alpha",
                 None,
-            ))],
+            ))])
+            .into_iter()
+            .map(|value| value.to_snapshot())
+            .collect(),
             sorted_value_destroy_dependencies: vec![Default::default()],
             sorted_explicit_destroy_dependencies: vec![Default::default()],
             legacy_dependency_classification: None,
@@ -4076,7 +4133,7 @@ fn plan_file_with_deferred_effect(effect: Effect) -> PlanFile {
                 "mock",
             )]),
             backend_config: None,
-            plan,
+            plan: plan.to_snapshot(),
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
             sorted_explicit_destroy_dependencies: Vec::new(),
@@ -4181,7 +4238,7 @@ fn plan_file_managed_row_predicate_rejects_data_source_with_legacy_state_entry()
     let mut contents = plan_file_contents_with_unchanged_managed_wait_target();
     contents.current_states.push(CurrentStateEntry::managed(
         source.id.clone(),
-        State::not_found(source.id.clone()),
+        State::<carina_core::resource::NoPlaceholder>::not_found(source.id.clone()),
     ));
     contents.data_sources.push(source.into_value_snapshot());
     let plan = record_test_plan(contents, &["mock"]);
@@ -4427,8 +4484,11 @@ fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
         state_serial: None,
         provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test("mock")]),
         backend_config: None,
-        plan,
-        sorted_resources: vec![managed_target.into_inner()],
+        plan: plan.to_snapshot(),
+        sorted_resources: (vec![managed_target.into_inner()])
+            .into_iter()
+            .map(|value| value.to_snapshot())
+            .collect(),
         sorted_value_destroy_dependencies: vec![Default::default()],
         sorted_explicit_destroy_dependencies: vec![Default::default()],
         legacy_dependency_classification: None,
@@ -4439,7 +4499,8 @@ fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
         data_source_values: Vec::new(),
         current_states: vec![CurrentStateEntry::managed(
             target_id.clone(),
-            State::existing(target_id, HashMap::new()).with_identifier("managed-id"),
+            State::<carina_core::resource::NoPlaceholder>::existing(target_id, HashMap::new())
+                .with_identifier("managed-id"),
         )],
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
@@ -4554,14 +4615,17 @@ fn plan_file_validation_rejects_blocked_data_source_without_plan_errors() {
                 "mock",
             )]),
             backend_config: None,
-            plan,
+            plan: plan.to_snapshot(),
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
             sorted_explicit_destroy_dependencies: Vec::new(),
             legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
-            data_sources: vec![data_source.clone().into_value_snapshot()],
+            data_sources: (vec![data_source.clone().into_value_snapshot()])
+                .into_iter()
+                .map(|value| value.to_snapshot())
+                .collect(),
             data_source_origins: Vec::new(),
             data_source_values: vec![SavedDataSourceValue {
                 id: data_source.id,
@@ -4957,7 +5021,7 @@ fn recorded_builtin_only_plan_round_trips_with_current_top_level_keys() {
 fn zero_referenced_provider_plan_round_trips() {
     let mut contents = plan_file_contents_with_unchanged_managed_wait_target();
     contents.provider_configs = saved_provider_configs(Vec::new());
-    contents.plan = Plan::new();
+    contents.plan = carina_core::plan::SnapshotPlan::default();
     contents.sorted_resources.clear();
     contents.current_states.clear();
 
@@ -4994,19 +5058,16 @@ fn state_only_unloaded_provider_records_absent_schema_and_round_trips() {
     let retired = ResourceId::with_provider_identity("retired", "legacy.Widget", "gone", None);
     let mut contents = plan_file_contents_with_unchanged_managed_wait_target();
     contents.provider_configs = saved_provider_configs(Vec::new());
-    contents.plan = Plan::new();
+    contents.plan = carina_core::plan::SnapshotPlan::default();
     contents.plan.add(Effect::Remove {
         id: carina_core::resource::ResolvedResourceId::new(retired.clone()),
     });
     contents.sorted_resources.clear();
     contents.current_states = vec![CurrentStateEntry::managed(
         retired,
-        State::not_found(ResourceId::with_provider_identity(
-            "retired",
-            "legacy.Widget",
-            "gone",
-            None,
-        )),
+        State::<carina_core::resource::NoPlaceholder>::not_found(
+            ResourceId::with_provider_identity("retired", "legacy.Widget", "gone", None),
+        ),
     )];
 
     let ctx = ValidatedConfig::from_factories_for_test(
@@ -5053,7 +5114,7 @@ fn recording_invalid_provider_artifact_inventory_does_not_panic() {
     };
     let mut contents = plan_file_contents_with_unchanged_managed_wait_target();
     contents.provider_configs = saved_provider_configs(vec![configured.clone()]);
-    contents.plan = Plan::new();
+    contents.plan = carina_core::plan::SnapshotPlan::default();
     contents.plan.add(Effect::Remove {
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
             "aws",
@@ -5427,7 +5488,8 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
         "id".to_string(),
         Value::Concrete(ConcreteValue::String("a-id".into())),
     );
-    let a_state = State::existing(a_id.clone(), a_attrs).with_identifier("a-id");
+    let a_state = State::<carina_core::resource::NoPlaceholder>::existing(a_id.clone(), a_attrs)
+        .with_identifier("a-id");
     let failed_effect = Effect::Create(resolved(resource_a.clone()));
 
     let result = {
@@ -5552,7 +5614,7 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
     let sorted_resources = vec![resolved(resource.clone())];
     let export_resources = [resource.clone()];
     let resource_id = resource.id.clone();
-    let state = State::existing(
+    let state = State::<carina_core::resource::NoPlaceholder>::existing(
         resource_id.clone(),
         HashMap::from([(
             "name".to_string(),

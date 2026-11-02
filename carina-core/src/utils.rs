@@ -572,7 +572,7 @@ fn shape_for_projection<'a>(
 /// `Union` types are not recursed into because the active arm cannot be known
 /// without re-running validation.
 pub fn lift_state_enum_leaves(
-    attributes: &mut std::collections::HashMap<String, Value>,
+    attributes: &mut std::collections::HashMap<String, crate::resource::SnapshotValue>,
     schema: &crate::schema::CompiledResourceSchema,
 ) {
     for (name, attr) in &schema.attributes {
@@ -594,7 +594,7 @@ pub fn lift_state_enum_leaves(
 pub(crate) fn lift_saved_state_enum_leaves(
     saved_attrs: &mut std::collections::HashMap<
         crate::resource::ResourceId,
-        std::collections::HashMap<String, Value>,
+        std::collections::HashMap<String, crate::resource::SnapshotValue>,
     >,
     registry: &crate::schema::SchemaRegistry,
 ) {
@@ -608,7 +608,10 @@ pub(crate) fn lift_saved_state_enum_leaves(
             crate::schema::SchemaKind::Resource,
         ) {
             lift_state_enum_leaves(attrs, schema.as_schema());
-            crate::value::canonicalize_state_attribute_map_with_schema(attrs, schema.as_schema());
+            crate::value::canonicalize_snapshot_attribute_map_with_schema(
+                attrs,
+                schema.as_schema(),
+            );
         }
     }
 }
@@ -662,7 +665,7 @@ pub fn lift_current_state_enum_leaves<S, D>(
 pub fn lift_current_state_enum_leaves_for_data_sources(
     current_states: &mut std::collections::HashMap<
         crate::resource::ResourceId,
-        crate::resource::State,
+        crate::resource::SnapshotState,
     >,
     data_sources: &[crate::resource::DataSource],
     registry: &crate::schema::SchemaRegistry,
@@ -680,7 +683,10 @@ pub fn lift_current_state_enum_leaves_for_data_sources(
 ///
 /// Returns `Some(new_value)` when at least one nested value was lifted and
 /// `None` when nothing changed, so callers can skip cloning.
-pub fn lift_enum_leaves(value: &Value, attr_type: &AttributeType) -> Option<Value> {
+pub fn lift_enum_leaves<P: crate::resource::ValueKind>(
+    value: &Value<P>,
+    attr_type: &AttributeType,
+) -> Option<Value<P>> {
     lift_enum_leaves_projected(value, attr_type, None)
 }
 
@@ -689,19 +695,19 @@ pub fn lift_enum_leaves(value: &Value, attr_type: &AttributeType) -> Option<Valu
 /// (`AttributeType::Ref`) are followed during the value walk
 /// (carina#3340). Callers that hold a resource schema should prefer
 /// this entry point.
-pub fn lift_enum_leaves_with_defs(
-    value: &Value,
+pub fn lift_enum_leaves_with_defs<P: crate::resource::ValueKind>(
+    value: &Value<P>,
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
-) -> Option<Value> {
+) -> Option<Value<P>> {
     lift_enum_leaves_projected(value, attr_type, Some(defs))
 }
 
-fn lift_enum_leaves_projected(
-    value: &Value,
+fn lift_enum_leaves_projected<P: crate::resource::ValueKind>(
+    value: &Value<P>,
     attr_type: &AttributeType,
     defs: Option<&std::collections::BTreeMap<String, AttributeType>>,
-) -> Option<Value> {
+) -> Option<Value<P>> {
     // Leaf case: this position is itself an Enum.
     if let Some((identity, values, _, validate, dsl_map)) = attr_type.enum_parts() {
         let raw = match value {
@@ -1807,7 +1813,7 @@ mod tests {
     /// absent from the registry is skipped without panic.
     #[test]
     fn lift_saved_state_enum_leaves_resolves_schema_per_resource() {
-        use crate::resource::{ConcreteValue, Resource, ResourceId, Value};
+        use crate::resource::{ConcreteValue, Resource, ResourceId, SnapshotValue as Value};
         use crate::schema::SchemaRegistry;
         use std::collections::HashMap;
 
@@ -1857,13 +1863,15 @@ mod tests {
 
         lift_saved_state_enum_leaves(&mut saved, &registry);
 
-        let Value::Concrete(ConcreteValue::Map(pd)) = &saved[&known.id]["policy_document"] else {
+        let crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(pd)) =
+            &saved[&known.id]["policy_document"]
+        else {
             panic!("policy_document map");
         };
         assert!(
             matches!(
                 &pd["version"],
-                Value::Concrete(ConcreteValue::CanonicalEnum(c))
+                crate::resource::Value::Concrete(crate::resource::ConcreteValue::CanonicalEnum(c))
                     if c.identity().to_string() == "aws.iam.PolicyDocument.Version"
                         && c.api_value() == "2012-10-17"
             ),
@@ -1965,7 +1973,8 @@ mod tests {
             None,
             None,
         );
-        let quoted = Value::Concrete(ConcreteValue::String("A.json".into()));
+        let quoted: crate::resource::ExpandedValue =
+            Value::Concrete(ConcreteValue::String("A.json".into()));
 
         assert_eq!(lift_enum_leaves(&quoted, &attr_type), None);
     }

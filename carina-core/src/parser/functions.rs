@@ -408,7 +408,6 @@ fn contains_deferred_user_function_call(value: &Value) -> bool {
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Unavailable { .. }
-            | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => false,
@@ -511,7 +510,6 @@ pub(crate) fn contains_module_argument_matching<B: BindingAddress>(
         GenericValue::Deferred(
             DeferredValue::ResourceRef { path: _ }
             | DeferredValue::BindingRef { binding: _ }
-            | DeferredValue::RedactedSecret { hash: _ }
             | DeferredValue::Unknown(_),
         )
         | GenericValue::Concrete(
@@ -1509,7 +1507,6 @@ fn substitute_fn_params_with_position<B: BindingAddress>(
         ))
         | GenericValue::Deferred(DeferredValue::ResourceRef { path: _ })
         | GenericValue::Deferred(DeferredValue::BindingRef { binding: _ })
-        | GenericValue::Deferred(DeferredValue::RedactedSecret { hash: _ })
         | GenericValue::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::EnumIdentifier(_)
@@ -1784,7 +1781,6 @@ pub(super) fn try_evaluate_fn_value<Source: Clone>(
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Coalesce { .. }
             | DeferredValue::Secret(_)
-            | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => Ok(value),

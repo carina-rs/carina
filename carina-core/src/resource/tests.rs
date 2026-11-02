@@ -30,6 +30,7 @@ fn resolved_dependency_reads_use_typed_json_entries_and_round_trip() {
     );
 }
 
+type State = super::State;
 type Value = ExpandedValue;
 type ConcreteValue = ExpandedConcreteValue;
 type DeferredValue = ExpandedDeferredValue;
@@ -212,7 +213,9 @@ fn loop_placeholder_uses_the_existing_unknown_wire_shape() {
         serde_json::from_value(encoded).expect("deserialize loop placeholder in a template");
     assert!(matches!(
         decoded,
-        LoopValue::Deferred(LoopDeferredValue::Placeholder(LoopSlot::Value))
+        crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+            LoopSlot::Value
+        ))
     ));
 }
 
@@ -234,14 +237,14 @@ fn merge_with_saved(
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> Value {
-    super::merge_with_saved(
-        desired,
+    crate::test_support::available_value(&super::merge_with_saved(
+        &desired.to_snapshot(),
         saved,
         prior_explicit,
         attr_type,
         defs,
         &crate::differ::exact_comparison_context_for_tests(),
-    )
+    ))
 }
 
 fn pair_list_elements<D, S>(
@@ -251,8 +254,8 @@ fn pair_list_elements<D, S>(
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> Vec<Option<usize>>
 where
-    D: std::borrow::Borrow<Value>,
-    S: std::borrow::Borrow<Value>,
+    D: super::ComparisonItem,
+    S: super::ComparisonItem,
 {
     super::pair_list_elements(
         desired,
@@ -270,8 +273,8 @@ fn pair_list_elements_with_uniqueness<D, S>(
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> Vec<ListElementPairing>
 where
-    D: std::borrow::Borrow<Value>,
-    S: std::borrow::Borrow<Value>,
+    D: super::ComparisonItem,
+    S: super::ComparisonItem,
 {
     super::pair_list_elements_with_uniqueness(
         desired,
@@ -288,9 +291,9 @@ fn similarity_score(
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> usize {
-    super::similarity_score(
-        a,
-        b,
+    super::snapshot_comparison::similarity_score(
+        &a.to_snapshot(),
+        &b.to_snapshot(),
         attr_type,
         defs,
         &crate::differ::exact_comparison_context_for_tests(),
@@ -305,15 +308,21 @@ fn merge_lists(
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> Vec<Value> {
-    super::merge_lists(
-        desired,
-        projected_saved,
-        raw_saved,
+    super::snapshot_comparison::merge_lists(
+        &desired.iter().map(Value::to_snapshot).collect::<Vec<_>>(),
+        &projected_saved
+            .iter()
+            .map(Value::to_snapshot)
+            .collect::<Vec<_>>(),
+        &raw_saved.iter().map(Value::to_snapshot).collect::<Vec<_>>(),
         prior_explicit,
         attr_type,
         defs,
         &crate::differ::exact_comparison_context_for_tests(),
     )
+    .iter()
+    .map(crate::test_support::available_value)
+    .collect()
 }
 
 #[test]
@@ -1467,7 +1476,7 @@ fn merge_with_saved_map_fills_extra_keys() {
 
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &ExplicitFields::Unrecorded,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1502,7 +1511,7 @@ fn merge_with_saved_desired_wins() {
 
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &ExplicitFields::Unrecorded,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1534,7 +1543,7 @@ fn merge_with_saved_list_of_maps() {
 
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &ExplicitFields::Unrecorded,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1557,7 +1566,7 @@ fn merge_with_saved_non_map() {
     let saved = Value::Concrete(ConcreteValue::String("world".into()));
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &ExplicitFields::Unrecorded,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1571,7 +1580,7 @@ fn merge_with_saved_non_map() {
     let saved = Value::Concrete(ConcreteValue::Int(99));
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &ExplicitFields::Unrecorded,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1592,7 +1601,7 @@ fn merge_with_saved_does_not_reinject_authored_removed_key() {
 
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &prior,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1614,7 +1623,7 @@ fn merge_with_saved_reinjects_unauthored_saved_key() {
 
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &prior,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1636,7 +1645,7 @@ fn merge_with_saved_reinjects_saved_key_with_unrecorded_child() {
 
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &prior,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1655,7 +1664,7 @@ fn merge_with_saved_unrecorded_reinjects_all_saved_keys() {
 
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &ExplicitFields::Unrecorded,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1757,7 +1766,7 @@ fn merge_with_saved_applies_authoring_recursively_to_maps_and_lists() {
 
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &prior,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1841,7 +1850,7 @@ fn merge_with_saved_does_not_apply_union_authoring_to_individual_list_elements()
 
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &prior,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -1890,7 +1899,7 @@ fn merge_with_saved_list_elements_drops_only_paired_authored_field_in_both_paths
 
         let merged = merge_with_saved(
             &Value::Concrete(ConcreteValue::List(desired.clone())),
-            SavedValueViews::same(&Value::Concrete(ConcreteValue::List(saved))),
+            SavedValueViews::same(&(Value::Concrete(ConcreteValue::List(saved))).to_snapshot()),
             &prior,
             None,
             crate::schema::empty_defs_for_schema_walks(),
@@ -1980,15 +1989,18 @@ fn merge_with_saved_requires_raw_projected_corroboration_in_both_pairing_paths()
         let raw_saved = Value::Concrete(ConcreteValue::List(raw_saved));
         let merged = merge_with_saved(
             &desired,
-            SavedValueViews::new(&projected_saved, &raw_saved),
+            SavedValueViews::new(&projected_saved.to_snapshot(), &raw_saved.to_snapshot()),
             &ExplicitFields::ListElements { elements },
             None,
             crate::schema::empty_defs_for_schema_walks(),
         );
-        let Value::Concrete(ConcreteValue::List(merged)) = merged else {
+        let crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(merged)) = merged
+        else {
             panic!("expected merged list");
         };
-        let Value::Concrete(ConcreteValue::Map(first)) = &merged[0] else {
+        let crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(first)) =
+            &merged[0]
+        else {
             panic!("expected first merged map");
         };
         assert_eq!(
@@ -2237,6 +2249,7 @@ fn pair_list_elements_struct_secret_field_pairing_is_threshold_independent() {
 
 #[test]
 fn pair_list_elements_secret_hash_pairing_is_threshold_independent() {
+    use crate::resource::{ConcreteValue, DeferredValue, SnapshotValue as Value};
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
     let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
     let serialized = serde_json::to_string("p").expect("string serialization must succeed");
@@ -2270,6 +2283,7 @@ fn pair_list_elements_secret_hash_pairing_is_threshold_independent() {
 
 #[test]
 fn list_element_with_persisted_secret_hash_pairs_uniquely() {
+    use crate::resource::{ConcreteValue, DeferredValue, SnapshotValue as Value};
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
     let desired_secret = Value::Deferred(DeferredValue::Secret(Box::new(string("p"))));
     let serialized = serde_json::to_string("p").expect("string serialization must succeed");
@@ -2551,8 +2565,18 @@ fn enum_pairing_hashes_keep_dotted_strings_literal() {
     let api = Value::Concrete(ConcreteValue::String("json".into()));
     let defs = crate::schema::empty_defs_for_schema_walks();
     let context = crate::differ::exact_comparison_context_for_tests();
-    let dotted_hashes = pairing_hashes(&dotted, Some(&attr_type), defs, &context);
-    let api_hashes = pairing_hashes(&api, Some(&attr_type), defs, &context);
+    let dotted_hashes = super::snapshot_comparison::pairing_hashes(
+        &dotted.to_snapshot(),
+        Some(&attr_type),
+        defs,
+        &context,
+    );
+    let api_hashes = super::snapshot_comparison::pairing_hashes(
+        &api.to_snapshot(),
+        Some(&attr_type),
+        defs,
+        &context,
+    );
 
     assert!(
         dotted_hashes.iter().all(|hash| !api_hashes.contains(hash)),
@@ -2634,7 +2658,7 @@ fn merge_with_saved_malformed_list_elements_length_uses_conservative_full_merge(
 
     let merged = merge_with_saved(
         &desired,
-        SavedValueViews::same(&saved),
+        SavedValueViews::same(&(saved).to_snapshot()),
         &malformed,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -2746,31 +2770,41 @@ fn pair_list_elements_work_grows_at_most_n_log_n() {
     let build = |n: usize, fixture: Fixture| {
         (0..n)
             .map(|index| {
-                Value::Concrete(ConcreteValue::Map(IndexMap::from([
-                    (
-                        "sid".to_string(),
-                        Value::Concrete(ConcreteValue::String(format!("Statement{index}").into())),
-                    ),
-                    (
-                        "effect".to_string(),
-                        Value::Concrete(ConcreteValue::String(match fixture {
-                            Fixture::AllDistinct => format!("Effect{index}").into(),
-                            Fixture::SharedEffect => "Allow".into(),
-                        })),
-                    ),
-                    (
-                        "action".to_string(),
-                        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                            ConcreteValue::String(format!("service:Action{index}").into()),
-                        )])),
-                    ),
-                    (
-                        "resource".to_string(),
-                        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                            ConcreteValue::String(format!("arn:carina:resource/{index}").into()),
-                        )])),
-                    ),
-                ])))
+                crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(
+                    IndexMap::from([
+                        (
+                            "sid".to_string(),
+                            crate::resource::Value::Concrete(
+                                crate::resource::ConcreteValue::String(
+                                    format!("Statement{index}").into(),
+                                ),
+                            ),
+                        ),
+                        (
+                            "effect".to_string(),
+                            crate::resource::Value::Concrete(
+                                crate::resource::ConcreteValue::String(match fixture {
+                                    Fixture::AllDistinct => format!("Effect{index}").into(),
+                                    Fixture::SharedEffect => "Allow".into(),
+                                }),
+                            ),
+                        ),
+                        (
+                            "action".to_string(),
+                            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                                ConcreteValue::String(format!("service:Action{index}").into()),
+                            )])),
+                        ),
+                        (
+                            "resource".to_string(),
+                            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                                ConcreteValue::String(
+                                    format!("arn:carina:resource/{index}").into(),
+                                ),
+                            )])),
+                        ),
+                    ]),
+                ))
             })
             .collect::<Vec<_>>()
     };
@@ -2972,7 +3006,8 @@ fn resource_dependency_bindings_iteration_is_sorted() {
 /// that delete-ordering metadata is also dedup'd and stable (#2228).
 #[test]
 fn state_dependency_bindings_dedup_on_duplicate_insert() {
-    let mut state = State::not_found(ResourceId::with_identity("ec2.Subnet", "my-subnet"));
+    let mut state: crate::resource::State =
+        State::not_found(ResourceId::with_identity("ec2.Subnet", "my-subnet"));
     state
         .dependency_bindings
         .extend_projected(&crate::test_support::persisted([
@@ -4027,9 +4062,9 @@ fn upstream_unknown_wire_tags_remain_stable() {
         r#"{"Unknown":{"UpstreamRef":{"path":{"binding":"network","attribute":"vpc_id"}}}}"#;
     assert_eq!(serde_json::to_string(&export).unwrap(), export_json);
     match serde_json::from_str::<Value>(export_json).unwrap() {
-        Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
-            path: decoded_path,
-        })) => assert_eq!(decoded_path, path),
+        crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(
+            ApplyTimeUnknown::UpstreamExport { path: decoded_path },
+        )) => assert_eq!(decoded_path, path),
         other => panic!("expected UpstreamExport, got {other:?}"),
     }
 
@@ -4044,9 +4079,9 @@ fn upstream_unknown_wire_tags_remain_stable() {
         all_exports_json
     );
     match serde_json::from_str::<Value>(all_exports_json).unwrap() {
-        Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamAllExports {
-            binding,
-        })) => {
+        crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(
+            ApplyTimeUnknown::UpstreamAllExports { binding },
+        )) => {
             assert_eq!(binding.as_str(), "network")
         }
         other => panic!("expected UpstreamAllExports, got {other:?}"),
@@ -4435,4 +4470,20 @@ fn provider_normalization_boundary_strips_then_restores_host_dependencies() {
         resource.attributes.get("normalized"),
         Some(&Value::Concrete(ConcreteValue::Bool(true)))
     );
+}
+
+#[test]
+fn exact_pairing_preserves_hash_container_evidence() {
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String("private".into()),
+    ))));
+    let hash = crate::value::redact_secrets_in_value(&secret).unwrap();
+    let item = SnapshotValue::Concrete(super::ConcreteValue::Map(IndexMap::from([(
+        "token".into(),
+        hash,
+    )])));
+    let (pairs, matched) =
+        super::match_equal_concrete_items(std::slice::from_ref(&item), std::slice::from_ref(&item));
+    assert_eq!(pairs, vec![Some(0)]);
+    assert_eq!(matched, vec![true]);
 }

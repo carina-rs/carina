@@ -6,6 +6,7 @@ pub mod depends_on;
 pub mod typecheck;
 pub mod wait;
 
+use crate::resource::ValueKind;
 use std::collections::HashSet;
 use std::hash::Hash;
 
@@ -934,7 +935,6 @@ fn deferred_value_mismatch<B: BindingAddress>(
             | crate::resource::DeferredValue::ResolvedFunctionCall { .. }
             | crate::resource::DeferredValue::Access(_)
             | crate::resource::DeferredValue::Secret(_)
-            | crate::resource::DeferredValue::RedactedSecret { .. }
             | crate::resource::DeferredValue::Unknown(_)
             | crate::resource::DeferredValue::Placeholder(_),
         ) => check_deferred_access_type(value, target, inference_bindings, schemas, bindings)
@@ -1762,7 +1762,6 @@ fn visit_refs_with_sink_inner<'a, P: PlaceholderKind, B: BindingAddress>(
         | GenericValue::Concrete(crate::resource::ConcreteValue::Bool(_))
         | GenericValue::Concrete(crate::resource::ConcreteValue::Duration(_))
         | GenericValue::Concrete(crate::resource::ConcreteValue::StringList(_))
-        | GenericValue::Deferred(crate::resource::DeferredValue::RedactedSecret { .. })
         | GenericValue::Deferred(crate::resource::DeferredValue::Unknown(_)) => {}
     }
 }
@@ -1858,7 +1857,6 @@ fn visit_computed_accesses_with_sink<'a, B: BindingAddress>(
         | GenericValue::Concrete(crate::resource::ConcreteValue::Bool(_))
         | GenericValue::Concrete(crate::resource::ConcreteValue::Duration(_))
         | GenericValue::Concrete(crate::resource::ConcreteValue::StringList(_))
-        | GenericValue::Deferred(crate::resource::DeferredValue::RedactedSecret { .. })
         | GenericValue::Deferred(crate::resource::DeferredValue::Unknown(_))
         | GenericValue::Deferred(crate::resource::DeferredValue::Placeholder(_)) => {}
     }
@@ -2158,7 +2156,6 @@ fn prove_integer_operand<B: BindingAddress>(
             | crate::resource::DeferredValue::Unavailable { .. }
             | crate::resource::DeferredValue::ResolvedFunctionCall { .. }
             | crate::resource::DeferredValue::Access(_)
-            | crate::resource::DeferredValue::RedactedSecret { .. }
             | crate::resource::DeferredValue::Unknown(_),
         ) => None,
     };
@@ -3481,9 +3478,6 @@ fn validate_user_function_ref_types_inner<
             | crate::resource::Value::Deferred(crate::resource::DeferredValue::BindingRef {
                 ..
             })
-            | crate::resource::Value::Deferred(crate::resource::DeferredValue::RedactedSecret {
-                ..
-            })
             | crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(_))
             | crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(_)) => {}
         }
@@ -4479,7 +4473,6 @@ fn deferred_iterable_shape_for_phase<B: BindingAddress>(
             | crate::resource::DeferredValue::Unavailable { .. }
             | crate::resource::DeferredValue::Access(_)
             | crate::resource::DeferredValue::Secret(_)
-            | crate::resource::DeferredValue::RedactedSecret { .. }
             | crate::resource::DeferredValue::Coalesce { .. }
             | crate::resource::DeferredValue::Unknown(_)
             | crate::resource::DeferredValue::Placeholder(_),
@@ -6335,7 +6328,6 @@ pub fn value_contains_unresolved_ref<P: PlaceholderKind>(value: &GenericValue<P>
         | GenericValue::Deferred(crate::resource::DeferredValue::Unavailable { .. })
         | GenericValue::Deferred(crate::resource::DeferredValue::ResolvedFunctionCall { .. })
         | GenericValue::Deferred(crate::resource::DeferredValue::Access(_))
-        | GenericValue::Deferred(crate::resource::DeferredValue::RedactedSecret { .. })
         | GenericValue::Deferred(crate::resource::DeferredValue::Unknown(_))
         | GenericValue::Deferred(crate::resource::DeferredValue::Placeholder(_)) => true,
         GenericValue::Deferred(crate::resource::DeferredValue::Secret(inner)) => {
@@ -7867,7 +7859,6 @@ impl ModuleCallChecker<'_> {
                             | crate::resource::DeferredValue::ModuleIf(_)
                             | crate::resource::DeferredValue::IntegerArithmetic(_)
                             | crate::resource::DeferredValue::Secret(_)
-                            | crate::resource::DeferredValue::RedactedSecret { .. }
                             | crate::resource::DeferredValue::Unknown(_)
                             | crate::resource::DeferredValue::Placeholder(_),
                         ) => typecheck::value_kind_name(value).to_string(),
@@ -8171,9 +8162,7 @@ fn module_call_value_is_context_free(value: &Value) -> bool {
         ) => false,
         crate::resource::Value::Deferred(crate::resource::DeferredValue::Access(_access)) => false,
         crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(_reason)) => false,
-        crate::resource::Value::Deferred(crate::resource::DeferredValue::RedactedSecret {
-            hash: _hash,
-        }) => false,
+
         crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
             _placeholder,
         )) => false,
@@ -8561,7 +8550,6 @@ fn validate_attribute_params_impl<P: PlaceholderKind, B: BindingAddress>(
                             | crate::resource::DeferredValue::ResolvedFunctionCall { .. }
                             | crate::resource::DeferredValue::Interpolation(_)
                             | crate::resource::DeferredValue::Secret(_)
-                            | crate::resource::DeferredValue::RedactedSecret { .. }
                             | crate::resource::DeferredValue::Unknown(_)
                             | crate::resource::DeferredValue::Coalesce { .. }
                             | crate::resource::DeferredValue::ModuleIf(_)
