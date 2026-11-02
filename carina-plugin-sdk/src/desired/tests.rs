@@ -5,7 +5,7 @@ async fn with_type_checks<T>(
 ) -> T {
     let mut diagnostics = Vec::new();
     let output = carina_core::validation::deferred_types::TypeCheckSession::run_async(
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         producer,
     )
     .await

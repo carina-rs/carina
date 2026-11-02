@@ -10,19 +10,31 @@ mod basic;
 mod extended;
 
 pub(super) fn create_document(content: &str) -> Document {
-    Document::new(content.to_string(), Arc::new(ProviderContext::default()))
+    create_document_with_environment(content, carina_core::EnvironmentSnapshot::empty())
+}
+
+pub(super) fn create_document_with_environment(
+    content: &str,
+    environment: carina_core::EnvironmentSnapshot,
+) -> Document {
+    Document::new(
+        content.to_string(),
+        Arc::new(ProviderContext::new(environment)),
+    )
 }
 
 pub(super) fn create_document_at(content: &str, path: std::path::PathBuf) -> Document {
     Document::new_with_path(
         content.to_string(),
         path,
-        Arc::new(ProviderContext::default()),
+        Arc::new(ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
     )
 }
 
 pub(super) fn test_engine() -> DiagnosticEngine {
-    DiagnosticEngine::without_loaded_provider_schemas()
+    DiagnosticEngine::without_loaded_provider_schemas(carina_core::EnvironmentSnapshot::empty())
 }
 
 fn loaded_test_providers(
@@ -41,6 +53,7 @@ fn loaded_providers_from_factories(
         carina_core::provider::loaded_provider_snapshot_from_factories(
             Arc::new(factories),
             SchemaRegistry::new(),
+            carina_core::EnvironmentSnapshot::empty(),
         ),
     )
 }
@@ -576,7 +589,7 @@ pub(super) fn bare_type_engine() -> DiagnosticEngine {
 }
 
 pub(super) fn test_engine_reversed() -> DiagnosticEngine {
-    DiagnosticEngine::without_loaded_provider_schemas()
+    DiagnosticEngine::without_loaded_provider_schemas(carina_core::EnvironmentSnapshot::empty())
 }
 
 pub(super) fn test_engine_with_nested_structs() -> DiagnosticEngine {

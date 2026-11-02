@@ -135,11 +135,11 @@ impl dyn ProviderTypeCheckContext + '_ {
 /// Sessions can only be borrowed inside a run.
 /// ```compile_fail,E0624
 /// use carina_core::{parser::ProviderContext, validation::deferred_types::TypeCheckSession};
-/// let session = TypeCheckSession::new(&ProviderContext::default());
+/// let session = TypeCheckSession::new(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()));
 /// ```
 /// ```
 /// use carina_core::{parser::ProviderContext, validation::deferred_types::TypeCheckSession};
-/// let result = TypeCheckSession::run(&ProviderContext::default(), |session| {
+/// let result = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
 ///     session.catalog().custom_types_loaded()
 /// });
 /// assert!(!result.publish(&mut Vec::new()));
@@ -147,11 +147,11 @@ impl dyn ProviderTypeCheckContext + '_ {
 ///
 /// ```compile_fail
 /// use carina_core::{parser::ProviderContext, validation::deferred_types::TypeCheckSession};
-/// let escaped = TypeCheckSession::run(&ProviderContext::default(), |session| session);
+/// let escaped = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| session);
 /// ```
 /// ```
 /// use carina_core::{parser::ProviderContext, validation::deferred_types::TypeCheckSession};
-/// let result = TypeCheckSession::run(&ProviderContext::default(), |session| {
+/// let result = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
 ///     session.catalog().custom_types_loaded()
 /// });
 /// assert!(!result.publish(&mut Vec::new()));
@@ -159,11 +159,11 @@ impl dyn ProviderTypeCheckContext + '_ {
 ///
 /// ```compile_fail
 /// use carina_core::{parser::ProviderContext, validation::deferred_types::TypeCheckSession};
-/// let escaped = TypeCheckSession::run(&ProviderContext::default(), |session| session.pending(42));
+/// let escaped = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| session.pending(42));
 /// ```
 /// ```
 /// use carina_core::{parser::ProviderContext, validation::deferred_types::TypeCheckSession};
-/// let result = TypeCheckSession::run(&ProviderContext::default(), |session| {
+/// let result = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
 ///     session.pending(42).publish(&mut Vec::new()).unwrap()
 /// });
 /// assert_eq!(result.publish(&mut Vec::new()), 42);
@@ -173,7 +173,7 @@ impl dyn ProviderTypeCheckContext + '_ {
 /// use carina_core::{parser::{ProviderContext, TypeExpr}, resource::{AuthoredValue, AuthoredConcreteValue}, validation::{deferred_types::TypeCheckSession, typecheck::{check_type_expr_value_providerless, TypecheckInference}}};
 /// let expected = TypeExpr::String;
 /// let value = AuthoredValue::Concrete(AuthoredConcreteValue::String("value".into()));
-/// let escaped = TypeCheckSession::run(&ProviderContext::default(), |session| {
+/// let escaped = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
 ///     check_type_expr_value_providerless(&expected, &value, session.catalog(), TypecheckInference::Unavailable)
 /// });
 /// ```
@@ -181,7 +181,7 @@ impl dyn ProviderTypeCheckContext + '_ {
 /// use carina_core::{parser::{ProviderContext, TypeExpr}, resource::{AuthoredValue, AuthoredConcreteValue}, validation::{deferred_types::TypeCheckSession, typecheck::{check_type_expr_value_providerless, TypecheckInference}}};
 /// let expected = TypeExpr::String;
 /// let value = AuthoredValue::Concrete(AuthoredConcreteValue::String("value".into()));
-/// let result = TypeCheckSession::run(&ProviderContext::default(), |session| {
+/// let result = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
 ///     check_type_expr_value_providerless(&expected, &value, session.catalog(), TypecheckInference::Unavailable)
 ///         .record_deferred(session).unwrap();
 /// });
@@ -190,7 +190,7 @@ impl dyn ProviderTypeCheckContext + '_ {
 ///
 /// ```compile_fail,E0515
 /// use carina_core::{parser::{ProviderContext, parse_type_expr_str}, schema::{CompiledAttributeType, TypeInSchema}, validation::{deferred_types::TypeCheckSession, lift_type_expr}};
-/// let escaped = TypeCheckSession::run(&ProviderContext::default(), |session| {
+/// let escaped = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
 ///     let expected = parse_type_expr_str("Missing", session.catalog()).unwrap();
 ///     let source = lift_type_expr(&expected).unwrap();
 ///     let target = CompiledAttributeType::string();
@@ -199,7 +199,7 @@ impl dyn ProviderTypeCheckContext + '_ {
 /// ```
 /// ```
 /// use carina_core::{parser::{ProviderContext, parse_type_expr_str}, schema::{CompiledAttributeType, TypeInSchema}, validation::{deferred_types::TypeCheckSession, lift_type_expr}};
-/// let result = TypeCheckSession::run(&ProviderContext::default(), |session| {
+/// let result = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
 ///     let expected = parse_type_expr_str("Missing", session.catalog()).unwrap();
 ///     let source = lift_type_expr(&expected).unwrap();
 ///     let target = CompiledAttributeType::string();
@@ -211,7 +211,7 @@ impl dyn ProviderTypeCheckContext + '_ {
 ///
 /// ```
 /// use carina_core::{parser::ProviderContext, validation::deferred_types::TypeCheckSession};
-/// let result = TypeCheckSession::run(&ProviderContext::default(), |_session| 42);
+/// let result = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |_session| 42);
 /// let mut diagnostics = Vec::new();
 /// assert_eq!(result.publish(&mut diagnostics), 42);
 /// assert!(diagnostics.is_empty());
@@ -227,7 +227,7 @@ impl dyn ProviderTypeCheckContext + '_ {
 /// ```
 /// ```
 /// use carina_core::validation::deferred_types::TypeCheckSession;
-/// let result = TypeCheckSession::run(&carina_core::parser::ProviderContext::default(), |session| {
+/// let result = TypeCheckSession::run(&carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
 ///     session.catalog().custom_types_loaded()
 /// });
 /// assert!(!result.publish(&mut Vec::new()));
@@ -236,14 +236,14 @@ impl dyn ProviderTypeCheckContext + '_ {
 /// ```compile_fail,E0277
 /// use carina_core::validation::deferred_types::TypeCheckSession;
 /// use carina_core::parser::ProviderContext;
-/// let result = TypeCheckSession::run(&ProviderContext::default(), |session| {
+/// let result = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
 ///     let duplicate: TypeCheckSession<'_> = Clone::clone(session);
 /// });
 /// ```
 /// ```
 /// use carina_core::validation::deferred_types::TypeCheckSession;
 /// use carina_core::parser::ProviderContext;
-/// let result = TypeCheckSession::run(&ProviderContext::default(), |session| {
+/// let result = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
 ///     let duplicate: ProviderContext = Clone::clone(session.catalog());
 ///     duplicate.custom_types_loaded()
 /// });
@@ -538,23 +538,23 @@ impl ProviderTypeCheckSink for TestTypeCheckSink {
 ///
 /// ```compile_fail,E0599
 /// use carina_core::{parser::ProviderContext, validation::deferred_types::TypeCheckSession};
-/// let result = TypeCheckSession::run(&ProviderContext::default(), |_session| 42);
+/// let result = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |_session| 42);
 /// let (output, _) = result.into_parts();
 /// ```
 /// ```
 /// use carina_core::{parser::ProviderContext, validation::deferred_types::TypeCheckSession};
-/// let result = TypeCheckSession::run(&ProviderContext::default(), |_session| 42);
+/// let result = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |_session| 42);
 /// assert_eq!(result.publish(&mut Vec::new()), 42);
 /// ```
 ///
 /// ```compile_fail,E0599
 /// use carina_core::{parser::ProviderContext, validation::deferred_types::TypeCheckSession};
-/// let result = TypeCheckSession::run(&ProviderContext::default(), |_session| 42);
+/// let result = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |_session| 42);
 /// let output = *result.output();
 /// ```
 /// ```
 /// use carina_core::{parser::ProviderContext, validation::deferred_types::TypeCheckSession};
-/// let result = TypeCheckSession::run(&ProviderContext::default(), |_session| 42);
+/// let result = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |_session| 42);
 /// assert_eq!(result.publish(&mut Vec::new()), 42);
 /// ```
 ///
@@ -565,7 +565,7 @@ impl ProviderTypeCheckSink for TestTypeCheckSink {
 /// ```
 /// use carina_core::validation::deferred_types::ProviderTypeCheckResult;
 /// let result: ProviderTypeCheckResult<Vec<String>> = carina_core::validation::deferred_types::TypeCheckSession::run(
-///     &carina_core::parser::ProviderContext::default(), |_session| Vec::<String>::new(),
+///     &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |_session| Vec::<String>::new(),
 /// );
 /// let mut diagnostics = vec![];
 /// assert!(result.publish(&mut diagnostics).is_empty());
@@ -574,14 +574,14 @@ impl ProviderTypeCheckSink for TestTypeCheckSink {
 /// ```compile_fail,E0624
 /// use carina_core::validation::deferred_types::{TypeCheckSession, ProviderTypeCheckResult};
 /// use carina_core::parser::ProviderContext;
-/// let result = TypeCheckSession::run(&ProviderContext::default(), |session| {
+/// let result = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
 ///     ProviderTypeCheckResult::settle(session, Vec::<String>::new())
 /// });
 /// ```
 /// ```
 /// use carina_core::validation::deferred_types::{TypeCheckSession, ProviderTypeCheckResult};
 /// use carina_core::parser::ProviderContext;
-/// let result: ProviderTypeCheckResult<Vec<String>> = TypeCheckSession::run(&ProviderContext::default(), |_session| {
+/// let result: ProviderTypeCheckResult<Vec<String>> = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |_session| {
 ///     Vec::<String>::new()
 /// });
 /// assert!(result.publish(&mut Vec::new()).is_empty());
@@ -590,14 +590,14 @@ impl ProviderTypeCheckSink for TestTypeCheckSink {
 /// ```compile_fail,E0382
 /// use carina_core::validation::deferred_types::{TypeCheckSession, ProviderTypeCheckResult};
 /// use carina_core::parser::ProviderContext;
-/// let result: ProviderTypeCheckResult<Vec<String>> = TypeCheckSession::run(&ProviderContext::default(), |_session| Vec::new());
+/// let result: ProviderTypeCheckResult<Vec<String>> = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |_session| Vec::new());
 /// drop(result);
 /// let output = result.publish(&mut Vec::new());
 /// ```
 /// ```
 /// use carina_core::validation::deferred_types::{TypeCheckSession, ProviderTypeCheckResult};
 /// use carina_core::parser::ProviderContext;
-/// let result: ProviderTypeCheckResult<Vec<String>> = TypeCheckSession::run(&ProviderContext::default(), |_session| Vec::new());
+/// let result: ProviderTypeCheckResult<Vec<String>> = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |_session| Vec::new());
 /// let output = result.publish(&mut Vec::new());
 /// drop(output);
 /// ```
@@ -677,14 +677,22 @@ mod tests {
 
     #[test]
     fn run_settles_evidence_when_a_producer_returns_early_error() {
-        let checks = TypeCheckSession::run(&ProviderContext::default(), |session| {
-            session.record(
-                &TypeExpr::String,
-                ProviderTypeCheckSite::at_line(Path::new("/project/main.crn"), 4, 2, "early check"),
-            );
-            Err::<(), _>("producer failed")?;
-            Ok(())
-        });
+        let checks = TypeCheckSession::run(
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            |session| {
+                session.record(
+                    &TypeExpr::String,
+                    ProviderTypeCheckSite::at_line(
+                        Path::new("/project/main.crn"),
+                        4,
+                        2,
+                        "early check",
+                    ),
+                );
+                Err::<(), _>("producer failed")?;
+                Ok(())
+            },
+        );
         let mut diagnostics = Vec::new();
         assert_eq!(checks.publish(&mut diagnostics), Err("producer failed"));
         assert!(
@@ -694,52 +702,57 @@ mod tests {
 
     #[test]
     fn settlement_value_producer_retains_all_provider_leaves() {
-        let result = TypeCheckSession::run(&ProviderContext::default(), |context| {
-            let expected = TypeExpr::Struct {
-                fields: vec![
-                    (
-                        "first".into(),
-                        crate::parser::parse_type_expr_str("FirstId", context.catalog()).unwrap(),
-                    ),
-                    (
-                        "second".into(),
-                        crate::parser::parse_type_expr_str("SecondId", context.catalog()).unwrap(),
-                    ),
-                ],
-            };
-            let value = crate::resource::AuthoredValue::Concrete(
-                crate::resource::AuthoredConcreteValue::Map(indexmap::IndexMap::from([
-                    (
-                        "first".into(),
-                        crate::resource::AuthoredValue::Concrete(
-                            crate::resource::AuthoredConcreteValue::String("a".into()),
+        let result = TypeCheckSession::run(
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            |context| {
+                let expected = TypeExpr::Struct {
+                    fields: vec![
+                        (
+                            "first".into(),
+                            crate::parser::parse_type_expr_str("FirstId", context.catalog())
+                                .unwrap(),
                         ),
-                    ),
-                    (
-                        "second".into(),
-                        crate::resource::AuthoredValue::Concrete(
-                            crate::resource::AuthoredConcreteValue::String("b".into()),
+                        (
+                            "second".into(),
+                            crate::parser::parse_type_expr_str("SecondId", context.catalog())
+                                .unwrap(),
                         ),
+                    ],
+                };
+                let value = crate::resource::AuthoredValue::Concrete(
+                    crate::resource::AuthoredConcreteValue::Map(indexmap::IndexMap::from([
+                        (
+                            "first".into(),
+                            crate::resource::AuthoredValue::Concrete(
+                                crate::resource::AuthoredConcreteValue::String("a".into()),
+                            ),
+                        ),
+                        (
+                            "second".into(),
+                            crate::resource::AuthoredValue::Concrete(
+                                crate::resource::AuthoredConcreteValue::String("b".into()),
+                            ),
+                        ),
+                    ])),
+                );
+                super::super::typecheck::check_type_expr_value_providerless(
+                    &expected,
+                    &value,
+                    context.catalog(),
+                    super::super::typecheck::TypecheckInference::Unavailable,
+                )
+                .record_at(
+                    context,
+                    ProviderTypeCheckSite::at_line(
+                        Path::new("/project/main.crn"),
+                        1,
+                        1,
+                        "argument 'ids'",
                     ),
-                ])),
-            );
-            super::super::typecheck::check_type_expr_value_providerless(
-                &expected,
-                &value,
-                context.catalog(),
-                super::super::typecheck::TypecheckInference::Unavailable,
-            )
-            .record_at(
-                context,
-                ProviderTypeCheckSite::at_line(
-                    Path::new("/project/main.crn"),
-                    1,
-                    1,
-                    "argument 'ids'",
-                ),
-            )
-            .unwrap();
-        });
+                )
+                .unwrap();
+            },
+        );
         assert_eq!(result.diagnostics().len(), 2, "{:?}", result.diagnostics());
     }
 
@@ -749,7 +762,11 @@ mod tests {
 
         let result = TypeCheckSession::run(&context, |sink| {
             sink.record(
-                &crate::parser::parse_type_expr_str("Typo", &ProviderContext::default()).unwrap(),
+                &crate::parser::parse_type_expr_str(
+                    "Typo",
+                    &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                )
+                .unwrap(),
                 ProviderTypeCheckSite::at_line(
                     Path::new("/project/main.crn"),
                     3,
@@ -765,18 +782,24 @@ mod tests {
 
     #[test]
     fn sink_deduplicates_authored_sites_without_an_ast_rewalk() {
-        let result = TypeCheckSession::run(&ProviderContext::default(), |sink| {
-            let site = ProviderTypeCheckSite::at_line(
-                Path::new("/project/main.crn"),
-                3,
-                7,
-                "attribute 'x'",
-            );
-            let expected =
-                crate::parser::parse_type_expr_str("Arn", &ProviderContext::default()).unwrap();
-            sink.record(&expected, site.clone());
-            sink.record(&expected, site);
-        });
+        let result = TypeCheckSession::run(
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            |sink| {
+                let site = ProviderTypeCheckSite::at_line(
+                    Path::new("/project/main.crn"),
+                    3,
+                    7,
+                    "attribute 'x'",
+                );
+                let expected = crate::parser::parse_type_expr_str(
+                    "Arn",
+                    &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                )
+                .unwrap();
+                sink.record(&expected, site.clone());
+                sink.record(&expected, site);
+            },
+        );
         assert_eq!(result.diagnostics().len(), 1);
     }
 }
@@ -806,7 +829,7 @@ mod partial_catalog_tests {
         ProviderContext {
             custom_types: loaded
                 .with_failed_providers(std::collections::BTreeSet::from(["broken".into()])),
-            ..Default::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         }
     }
 
@@ -818,7 +841,7 @@ mod partial_catalog_tests {
                 Box::new(|_, _| panic!("unknown declarations must not call validators")),
             )
             .with_failed_providers(Default::default()),
-            ..Default::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         };
         assert!(catalog.custom_types_loaded());
         assert!(!catalog.custom_types.may_defer(None));
@@ -827,7 +850,7 @@ mod partial_catalog_tests {
             let mut parsed = parse_file(
                 "attributes { x: AwsAccountId = '123' }",
                 Path::new("/project/main.crn"),
-                &ProviderContext::default(),
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .unwrap();
             let errors = crate::validation::resolve_file_type_exprs(&mut parsed, session);
@@ -848,7 +871,7 @@ mod partial_catalog_tests {
                 let mut parsed = parse_file(
                     &format!("fn bad(x: ready.Missing) {{ x }}\nfn echo(x: Arn): String {{ 'ok' }}\n{failed_call}exports {{ x = echo('id') }}\n"),
                     Path::new("/project/main.crn"),
-                    &ProviderContext::default(),
+                    &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
                 .unwrap();
                 let errors = crate::validation::resolve_file_type_exprs(&mut parsed, session);
@@ -872,7 +895,7 @@ mod partial_catalog_tests {
             let mut failed = parse_file(
                 "fn echo(x: ready.Missing) { x }",
                 Path::new("/project/bad.crn"),
-                &ProviderContext::default(),
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .unwrap();
             assert_eq!(
@@ -882,7 +905,7 @@ mod partial_catalog_tests {
             let mut other = parse_file(
                 "fn echo(x: Arn): String { 'ok' }\nexports { x = echo('id') }",
                 Path::new("/project/other.crn"),
-                &ProviderContext::default(),
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .unwrap();
             assert!(crate::validation::resolve_file_type_exprs(&mut other, session).is_empty());
@@ -904,7 +927,7 @@ mod partial_catalog_tests {
         let context = ProviderContext {
             custom_types: catalog
                 .with_failed_providers(std::collections::BTreeSet::from(["broken".into()])),
-            ..Default::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         };
 
         assert!(
@@ -912,7 +935,7 @@ mod partial_catalog_tests {
                 let mut parsed = parse_file(
                     "attributes { x: ready.ReadyId = 'ok' }",
                     Path::new("/project/main.crn"),
-                    &ProviderContext::default(),
+                    &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
                 .unwrap();
                 assert!(
@@ -948,7 +971,7 @@ mod partial_catalog_tests {
                 let mut parsed = parse_file(
                     source,
                     Path::new("/project/main.crn"),
-                    &ProviderContext::default(),
+                    &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
                 .unwrap();
                 let errors = crate::validation::resolve_file_type_exprs(&mut parsed, context);
@@ -982,10 +1005,13 @@ mod producer_tests {
         let mut parsed = parse_file(
             "let source = mock.test.resource { name = 'one' }\nfn ignore(x: missing.Widget) { 'ok' }\nattributes { value: String = ignore(source) }\n",
             Path::new("/project/main.crn"),
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         ).unwrap();
-        crate::parser::resolve_resource_refs_with_config(&mut parsed, &ProviderContext::default())
-            .unwrap();
+        crate::parser::resolve_resource_refs_with_config(
+            &mut parsed,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         assert!(
             matches!(
                 parsed.attribute_params[0]
@@ -998,9 +1024,12 @@ mod producer_tests {
             ),
             "a sessionless pass must preserve the annotation and its handle argument"
         );
-        let checks = TypeCheckSession::run(&ProviderContext::default(), |session| {
-            resolve(&mut parsed, session);
-        });
+        let checks = TypeCheckSession::run(
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            |session| {
+                resolve(&mut parsed, session);
+            },
+        );
         let (_, warnings) = warnings(checks);
         assert_eq!(
             warnings.len(),
@@ -1038,7 +1067,7 @@ mod producer_tests {
         std::fs::write(directory.path().join("main.crn"), "let child = use { source = './missing' }\nchild {}\nattributes { id: AwsAccountId = '123' }\n").unwrap();
 
         let (resolution, warnings) = warnings(TypeCheckSession::run(
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |context| {
                 let schemas = crate::schema::SchemaRegistry::new();
                 let loaded = crate::config_loader::load_configuration_with_config(
@@ -1084,7 +1113,7 @@ mod producer_tests {
             .unwrap();
 
             let (resolution, warnings) = warnings(TypeCheckSession::run(
-                &ProviderContext::default(),
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 |context| {
                     let schemas = crate::schema::SchemaRegistry::new();
                     let loaded = crate::config_loader::load_configuration_with_config(
@@ -1125,7 +1154,7 @@ mod producer_tests {
         .unwrap();
 
         let (_, warnings) = warnings(TypeCheckSession::run(
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |context| {
                 let loaded = crate::config_loader::load_configuration_with_config(
                     directory.path(),
@@ -1152,7 +1181,7 @@ mod producer_tests {
     #[test]
     fn settlement_records_unchecked_assignment_at_its_declaration() {
         let (_, warnings) = warnings(TypeCheckSession::run(
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |context| {
                 let mut parsed = parse_file(
                     "arguments { id: AwsAccountId }\nattributes { value: String = id }\n",
@@ -1187,7 +1216,7 @@ mod producer_tests {
     #[test]
     fn settlement_retains_nested_annotation_leaves_and_loaded_retry_is_strict() {
         let (mut parsed, warnings) = warnings(TypeCheckSession::run(
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |context| {
                 let path = Path::new("/project/main.crn");
                 let mut parsed = parse_file(
@@ -1219,7 +1248,7 @@ mod producer_tests {
     fn settlement_keeps_distinct_calls_on_the_same_line() {
         for annotation in ["Arn", "missing.Id"] {
             let (_, warnings) = warnings(TypeCheckSession::run(
-                &ProviderContext::default(),
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 |context| {
                     let mut parsed = parse_file(
                         &format!(
@@ -1272,7 +1301,7 @@ mod round6_session_tests {
                 }),
             )
             .with_failed_providers(std::collections::BTreeSet::from(["aws".into()])),
-            ..Default::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         };
 
         let terminal = TypeCheckSession::run(&catalog, |session| {
@@ -1301,7 +1330,7 @@ mod round6_session_tests {
 
     #[test]
     fn unloaded_sessions_are_independent_even_when_the_catalog_is_shared() {
-        let catalog = ProviderContext::default();
+        let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
 
         assert_eq!(
             TypeCheckSession::run(&catalog, |first| {
@@ -1324,7 +1353,7 @@ mod round6_session_tests {
 
     #[test]
     fn recorded_queries_keep_distinct_sites_and_replace_synthetic_ownership() {
-        let catalog = ProviderContext::default();
+        let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
 
         let terminal = TypeCheckSession::run(&catalog, |session| {
             let expected = crate::parser::parse_type_expr_str("Missing", &catalog).unwrap();

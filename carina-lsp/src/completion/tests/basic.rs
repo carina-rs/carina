@@ -2800,7 +2800,7 @@ fn directives_provider_value_completion_lists_named_instances() {
     // see them either — that's the path we're actually trying to test.
     let parsed = carina_core::config_loader::parse_directory(
         base_path,
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("parse_directory should accept the fixture");
     let parsed_bindings: Vec<&str> = parsed

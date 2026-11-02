@@ -1991,8 +1991,11 @@ mod tests {
             .map(|(import, _forget)| import)
             .expect("the rendered hint must contain both resolution branches");
 
-        crate::parser::parse(import, &crate::parser::ProviderContext::default())
-            .expect("the rendered single-line import form must parse");
+        crate::parser::parse(
+            import,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("the rendered single-line import form must parse");
     }
 
     #[test]

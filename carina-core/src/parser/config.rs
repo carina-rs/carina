@@ -921,8 +921,10 @@ pub type DecryptorFn =
 /// This replaces the global `Mutex`-based decryptor registration and enables
 /// provider-specific validators (e.g., ARN, availability_zone) to be injected
 /// from provider crates while being callable during parsing.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ProviderContext {
+    /// Owned environment for the `env()` built-in function.
+    pub environment: crate::EnvironmentSnapshot,
     /// Optional decryptor for the `decrypt()` built-in function.
     pub decryptor: Option<DecryptorFn>,
     /// The catalog is unloaded, fully loaded, or partial with explicit failed owners.
@@ -935,6 +937,15 @@ pub struct ProviderContext {
 }
 
 impl ProviderContext {
+    pub fn new(environment: crate::EnvironmentSnapshot) -> Self {
+        Self {
+            environment,
+            decryptor: None,
+            custom_types: ProviderCustomTypes::default(),
+            resource_types: HashSet::new(),
+        }
+    }
+
     pub fn custom_types_loaded(&self) -> bool {
         self.custom_types.is_loaded()
     }
@@ -986,7 +997,7 @@ impl ProviderContext {
 /// ```compile_fail
 /// use carina_core::parser::{LoadedProviderContext, ProviderContext};
 ///
-/// let _ = LoadedProviderContext(std::sync::Arc::new(ProviderContext::default()));
+/// let _ = LoadedProviderContext(std::sync::Arc::new(ProviderContext::new(carina_core::EnvironmentSnapshot::empty())));
 /// ```
 #[derive(Clone)]
 pub struct LoadedProviderContext(std::sync::Arc<ProviderContext>);
@@ -1007,6 +1018,7 @@ impl LoadedProviderContext {
     /// Retain catalog authority with the caller's immutable runtime hooks.
     pub fn with_runtime(&self, runtime: &ProviderContext) -> Self {
         let mut catalog = self.as_provider_context().clone();
+        catalog.environment = runtime.environment.clone();
         catalog.decryptor = runtime.decryptor.clone();
         Self::new(catalog)
     }
@@ -1034,7 +1046,7 @@ impl LoadedProviderContext {
                     enum_lookup: Box::new(|_owned| Ok(None)),
                 }),
             },
-            ..ProviderContext::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         })
     }
 
@@ -1066,6 +1078,7 @@ impl std::fmt::Debug for LoadedProviderContext {
 impl std::fmt::Debug for ProviderContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProviderContext")
+            .field("environment", &self.environment)
             .field("decryptor", &self.decryptor.as_ref().map(|_| "..."))
             .field("custom_types", &self.custom_types)
             .field("resource_types", &self.resource_types)

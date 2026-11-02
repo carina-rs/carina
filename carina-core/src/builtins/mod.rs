@@ -235,6 +235,15 @@ pub struct BuiltinFunctionInfo {
 /// Generates both `evaluate_builtin()` (dispatch) and `builtin_functions()` (metadata)
 /// from one definition, ensuring they never get out of sync.
 macro_rules! register_builtins {
+    (@evaluate env, $handler:expr, $lowered:expr) => {
+        $handler(&$lowered).map(EvalValue::from_expanded_value)
+    };
+    (@evaluate $name:ident, $handler:expr, $lowered:expr) => {{
+        let (lowered, contained_secret) = peel_secret_arguments($lowered);
+        $handler(&lowered).map(|value| {
+            EvalValue::from_expanded_value(propagate_secret(value, contained_secret))
+        })
+    }};
     (
         $(
             $name:ident ( $handler:expr, arity: $arity:expr ) {
@@ -364,14 +373,7 @@ macro_rules! register_builtins {
                                     .map_err(|error| format!("{name}: {error}"))
                             })
                             .collect();
-                        let (lowered, contained_secret) = peel_secret_arguments(lowered?);
-                        $handler(&lowered)
-                            .map(|value| {
-                                EvalValue::from_expanded_value(propagate_secret(
-                                    value,
-                                    contained_secret,
-                                ))
-                            })
+                        register_builtins!(@evaluate $name, $handler, lowered?)
                     }
                 )*
                 _ => Err(format!("Unknown built-in function: {name}")),
@@ -413,7 +415,7 @@ register_builtins! {
         description: "Decrypts ciphertext using the configured provider's encryption service (e.g., AWS KMS) and marks the result as secret. Key is optional when embedded in ciphertext.",
         return_type: BuiltinReturnType::Secret,
     },
-    env(env::builtin_env, arity: 1) {
+    env(env::builtin_env_without_config, arity: 1) {
         signature: "env(name: String) -> String",
         description: "Reads an environment variable. Errors if the variable is not set.",
         return_type: BuiltinReturnType::String,
@@ -499,7 +501,7 @@ register_builtins! {
 ///
 /// Merges `new_args` into the closure's captured args. If enough arguments
 /// are now present, evaluates the underlying built-in function (routing
-/// `decrypt` through the config-aware path). Otherwise returns a new
+/// `decrypt` and `env` through the config-aware path). Otherwise returns a new
 /// `EvalValue::Closure` with updated captured args and remaining arity.
 pub(crate) fn apply_closure_with_config<B: BindingAddress>(
     name: &str,
@@ -559,8 +561,8 @@ pub(crate) fn apply_closure_with_config<B: BindingAddress>(
 
 /// Evaluate a built-in function with parser configuration.
 ///
-/// This dispatches `decrypt` to use the decryptor from the config instead of
-/// the global Mutex. All other builtins are delegated to [`evaluate_builtin`].
+/// Dispatch `decrypt` and `env` with their required inputs from the config.
+/// All other builtins are delegated to [`evaluate_builtin`].
 pub(crate) fn evaluate_builtin_with_config<B: BindingAddress>(
     name: &str,
     args: &[EvalValue<B>],
@@ -573,16 +575,27 @@ pub(crate) fn evaluate_builtin_with_config<B: BindingAddress>(
     {
         return Ok(EvalValue::closure(name, args.to_vec(), arity - args.len()));
     }
-    match name {
-        "decrypt" => {
-            // `decrypt` is the only handler that needs the parser config.
-            // It still operates on `&[Value]` so we lower the arguments.
+    match BuiltinFunction::from_name(name) {
+        Some(BuiltinFunction::env) => {
+            let lowered: Result<Vec<Value<NoPlaceholder, B>>, String> = args
+                .iter()
+                .cloned()
+                .map(|argument| {
+                    argument
+                        .into_expanded_value()
+                        .map_err(|error| format!("env: {error}"))
+                })
+                .collect();
+            env::builtin_env(&lowered?, &config.environment).map(EvalValue::from_expanded_value)
+        }
+        Some(BuiltinFunction::decrypt) => {
+            // Config-aware handlers operate on `&[Value]`, so lower arguments.
             let lowered: Result<Vec<Value<NoPlaceholder, B>>, String> = args
                 .iter()
                 .cloned()
                 .map(|arg| {
                     arg.into_expanded_value()
-                        .map_err(|error| format!("decrypt: {error}"))
+                        .map_err(|error| format!("{name}: {error}"))
                 })
                 .collect();
             let (lowered, contained_secret) = peel_secret_arguments(lowered?);
@@ -590,7 +603,26 @@ pub(crate) fn evaluate_builtin_with_config<B: BindingAddress>(
                 EvalValue::from_expanded_value(propagate_secret(value, contained_secret))
             })
         }
-        _ => evaluate_builtin(name, args),
+        Some(
+            BuiltinFunction::cidr_subnet
+            | BuiltinFunction::concat
+            | BuiltinFunction::flatten
+            | BuiltinFunction::join
+            | BuiltinFunction::keys
+            | BuiltinFunction::length
+            | BuiltinFunction::lookup
+            | BuiltinFunction::lower
+            | BuiltinFunction::map
+            | BuiltinFunction::max
+            | BuiltinFunction::min
+            | BuiltinFunction::replace
+            | BuiltinFunction::secret
+            | BuiltinFunction::split
+            | BuiltinFunction::trim
+            | BuiltinFunction::upper
+            | BuiltinFunction::values,
+        )
+        | None => evaluate_builtin(name, args),
     }
 }
 
@@ -812,7 +844,7 @@ mod tests {
                 Ok(format!("plain:{ciphertext}"))
             })),
             resource_types: Default::default(),
-            ..ProviderContext::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         };
         let first =
             evaluate_builtin_with_config_to_value("decrypt", &[string("ciphertext")], &config)

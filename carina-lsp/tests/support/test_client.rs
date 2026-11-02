@@ -58,7 +58,9 @@ impl TestClient {
             let provider_context = ProviderContext {
                 decryptor: None,
                 resource_types: Default::default(),
-                ..ProviderContext::default()
+                ..carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                )
             };
             Backend::new(client, provider_context, factory_builder.clone())
         });

@@ -67,10 +67,14 @@ fn build_module_signature() -> FileSignature {
     let parsed = parse_file(
         input,
         std::path::Path::new("web_tier.crn"),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    FileSignature::from_parsed_file_with_name(&parsed, "web_tier", &ProviderContext::default())
+    FileSignature::from_parsed_file_with_name(
+        &parsed,
+        "web_tier",
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
 }
 
 fn build_root_config_signature() -> FileSignature {
@@ -93,10 +97,14 @@ fn build_root_config_signature() -> FileSignature {
     let parsed = parse_file(
         input,
         std::path::Path::new("main.crn"),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    FileSignature::from_parsed_file_with_name(&parsed, "main", &ProviderContext::default())
+    FileSignature::from_parsed_file_with_name(
+        &parsed,
+        "main",
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
 }
 
 #[test]

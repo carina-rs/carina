@@ -1272,8 +1272,11 @@ let network = network_module {
 }
 "#;
 
-        crate::parser::parse(source, &crate::parser::ProviderContext::default())
-            .expect("the parser silently keeps the last module-call argument");
+        crate::parser::parse(
+            source,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("the parser silently keeps the last module-call argument");
 
         let results = find_duplicate_attrs(source);
         assert_eq!(results.len(), 1, "expected one duplicate: {results:?}");
@@ -1300,8 +1303,11 @@ let network = network_module {
 }
 "#;
 
-        crate::parser::parse(source, &crate::parser::ProviderContext::default())
-            .expect("the parser silently keeps the last dedicated argument member");
+        crate::parser::parse(
+            source,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("the parser silently keeps the last dedicated argument member");
 
         let actual: Vec<_> = find_duplicate_attrs(source)
             .into_iter()
@@ -1338,8 +1344,11 @@ moved {
 }
 "#;
 
-        crate::parser::parse(source, &crate::parser::ProviderContext::default())
-            .expect("the parser silently keeps the last dedicated state member");
+        crate::parser::parse(
+            source,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("the parser silently keeps the last dedicated state member");
 
         let actual: Vec<_> = find_duplicate_attrs(source)
             .into_iter()
@@ -1393,8 +1402,11 @@ let ready = wait source {
 
         for (name, source) in cases {
             assert_duplicate_lint_source_parses(source);
-            let error = crate::parser::parse(source, &crate::parser::ProviderContext::default())
-                .expect_err("the parser must reject duplicate wait members");
+            let error = crate::parser::parse(
+                source,
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .expect_err("the parser must reject duplicate wait members");
             assert!(
                 error.to_string().contains(&format!("duplicate `{name}`")),
                 "unexpected parser error for {name}: {error}"

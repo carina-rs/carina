@@ -11,7 +11,7 @@ for n in names(vpc) {
 }
 "#,
         std::path::Path::new("function_for_iterable.crn"),
-        &ProviderContext::default(),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("the body is evaluable before the Ref annotation is schema-checked");
 

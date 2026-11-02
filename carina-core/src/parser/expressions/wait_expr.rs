@@ -444,7 +444,7 @@ mod tests {
     use crate::parser::preprocess_file;
 
     fn parse_wait_pair(pair: Pair<'_, Rule>) -> Result<WaitBinding, ParseError> {
-        let config = crate::parser::ProviderContext::default();
+        let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let source = std::sync::Arc::new(preprocess_file(pair.as_str())?);
         let ctx = ParseContext::new(&config, std::path::Path::new("wait.crn"), source);
         parse_wait_expr(pair, "cert_issued", &ctx)

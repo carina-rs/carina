@@ -132,11 +132,11 @@ fn parse_loop_fixture(source: &str, file: &str) -> Vec<Resource> {
     let parsed = crate::parser::parse_file(
         source,
         Path::new(file),
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("valid loop fixture");
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_providerless(
                 crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
@@ -146,7 +146,10 @@ fn parse_loop_fixture(source: &str, file: &str) -> Vec<Resource> {
             .expect("loop fixture crosses the module-resolution seam")
         },
     )
-    .into_expanded(&crate::schema::SchemaRegistry::new())
+    .into_expanded(
+        &crate::schema::SchemaRegistry::new(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
     .expect("loop fixture contains no parser placeholders")
     .resources
 }
@@ -1672,11 +1675,11 @@ fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
             let vpc = mock.test.resource { name = "network" }
             mock.test.Consumer { parent = vpc }
         "#,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("the parser must preserve the authored use for typed validation");
     let parsed = crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_providerless(
                 crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
@@ -9136,7 +9139,7 @@ fn nested_loop_rewrite_uses_current_module_prefix_and_is_a_valid_move_target() {
         &format!(
             "moved {{\n  from = mock.ec2.Vpc 'old'\n  to = mock.ec2.Vpc '{expected_target}'\n}}\n"
         ),
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("rendered move target must parse");
     assert!(
@@ -9161,17 +9164,20 @@ fn loop_conflict_suggestion_reserves_sibling_file_value_bindings() {
     .expect("write loop fixture");
     let parsed = crate::config_loader::parse_directory(
         fixture.path(),
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("directory parses");
     let mut parsed = crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_providerless(parsed, fixture.path(), session)
                 .expect("directory fixture crosses the module-resolution seam")
         },
     )
-    .into_expanded(&crate::schema::SchemaRegistry::new())
+    .into_expanded(
+        &crate::schema::SchemaRegistry::new(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
     .expect("directory fixture contains no parser placeholders");
     let registry = loop_identity_registry(false);
 
@@ -9496,7 +9502,7 @@ fn moved_to_rejects_a_legacy_segment_below_a_module_prefix() {
         ResourceId::with_provider_identity("mock", "ec2.Vpc", "net.mock_ec2_vpc_current", None);
     let parsed = crate::parser::parse(
         "moved {\n  from = mock.ec2.Vpc 'old'\n  to = mock.ec2.Vpc 'net._for0[0]'\n}\n",
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("moved block parses");
 
@@ -9516,7 +9522,7 @@ fn import_to_rejects_a_legacy_loop_address_with_the_current_replacement() {
         .to_string();
     let parsed = crate::parser::parse(
         "import {\n  to = mock.ec2.Vpc '_for0[0]'\n  id = 'vpc-existing'\n}\n",
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("import block parses");
 
@@ -9547,7 +9553,7 @@ import {
   id = 'vpc-existing'
 }
 "#,
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("bound discard loop and state blocks parse");
     assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
@@ -9576,7 +9582,7 @@ fn moved_to_allows_bound_map_keys_that_begin_with_underscore() {
             "moved {\n  from = mock.ec2.Vpc 'old-two'\n",
             "  to = mock.ec2.Vpc \"items['a._b']\"\n}\n",
         ),
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("bound map-key move destinations parse");
 
@@ -9596,7 +9602,7 @@ fn moved_to_allows_bound_map_keys_that_begin_with_underscore() {
 fn moved_to_rejects_an_orphaned_legacy_segment_below_a_regular_prefix() {
     let parsed = crate::parser::parse(
         "moved {\n  from = mock.ec2.Vpc 'old'\n  to = mock.ec2.Vpc 'net._for0[0]'\n}\n",
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("moved block parses");
 

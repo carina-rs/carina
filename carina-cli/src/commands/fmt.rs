@@ -7,7 +7,7 @@ use crate::output_style::Colorize;
 use similar::{ChangeTag, TextDiff};
 
 use carina_core::config_loader::{
-    find_crn_files_in_dir, find_crn_files_recursive, load_configuration,
+    find_crn_files_in_dir, find_crn_files_recursive, load_configuration_with_config,
 };
 use carina_core::formatter::{self, FormatConfig};
 use carina_core::parser::{ProviderConfig as GenericProviderConfig, UseStatement};
@@ -110,8 +110,16 @@ struct FormattingDirectoryConfig {
     uses: Vec<UseStatement>,
 }
 
-fn load_formatting_directory_config(directory: &Path) -> FormattingDirectoryConfig {
-    let Some(loaded) = load_configuration(directory).ok() else {
+fn load_formatting_directory_config(
+    directory: &Path,
+    environment: &carina_core::EnvironmentSnapshot,
+) -> FormattingDirectoryConfig {
+    let Some(loaded) = load_configuration_with_config(
+        directory,
+        &carina_core::parser::ProviderContext::new(environment.clone()),
+        &carina_core::schema::SchemaRegistry::new(),
+    )
+    .ok() else {
         return FormattingDirectoryConfig::default();
     };
     let parsed = loaded.parsed.into_parsed();
@@ -119,6 +127,21 @@ fn load_formatting_directory_config(directory: &Path) -> FormattingDirectoryConf
         providers: parsed.providers,
         uses: parsed.uses,
     }
+}
+
+#[cfg(test)]
+#[test]
+fn formatting_discovery_uses_environment_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("main.crn"),
+        "fn version() { env('MODE') }\nprovider mock { version = version() }\n",
+    )
+    .unwrap();
+    let environment = carina_core::EnvironmentSnapshot::new([("MODE".to_string(), "1.0.0".into())]);
+    let config = load_formatting_directory_config(directory.path(), &environment);
+    assert_eq!(config.providers.len(), 1);
+    assert_eq!(config.providers[0].name, "mock");
 }
 
 fn block_names_from_config<F>(
@@ -152,7 +175,8 @@ fn block_names_for_dir<F>(
 where
     F: FnMut(&[ProviderConfig], &Path) -> Result<FormattingProviderLoad, AppError>,
 {
-    let config = load_formatting_directory_config(directory);
+    let config =
+        load_formatting_directory_config(directory, &carina_core::EnvironmentSnapshot::empty());
     block_names_from_config(directory, &config, &mut build_factories)
 }
 
@@ -166,6 +190,7 @@ fn invocation_directory_configs(
     path: &Path,
     files: &[PathBuf],
     recursive: bool,
+    environment: &carina_core::EnvironmentSnapshot,
 ) -> HashMap<PathBuf, FormattingDirectoryConfig> {
     let directories: BTreeSet<PathBuf> = if recursive {
         files
@@ -179,7 +204,7 @@ fn invocation_directory_configs(
     directories
         .into_iter()
         .map(|directory| {
-            let config = load_formatting_directory_config(&directory);
+            let config = load_formatting_directory_config(&directory, environment);
             (directory, config)
         })
         .collect()
@@ -304,13 +329,19 @@ pub fn run_fmt(
     // provider-declaring directory visible to the invocation. The startup cost
     // is intentional: editor and CLI formatting correctness must win over the
     // old schema-free fast path.
-    run_fmt_with_factory_builder(color_mode, path, mode, recursive, |providers, directory| {
-        FormattingProviderLoad::load(runtime, providers, directory)
-    })
+    run_fmt_with_factory_builder(
+        color_mode,
+        runtime.environment(),
+        path,
+        mode,
+        recursive,
+        |providers, directory| FormattingProviderLoad::load(runtime, providers, directory),
+    )
 }
 
 fn run_fmt_with_factory_builder<F>(
     color_mode: crate::output_style::ColorMode,
+    environment: &carina_core::EnvironmentSnapshot,
     path: &Path,
     mode: FmtMode,
     recursive: bool,
@@ -340,7 +371,7 @@ where
 
     let mut needs_formatting = Vec::new();
     let mut errors = Vec::new();
-    let directory_configs = invocation_directory_configs(path, &files, recursive);
+    let directory_configs = invocation_directory_configs(path, &files, recursive, environment);
     let import_map = invocation_import_map(&directory_configs);
     let mut block_names_by_dir: HashMap<PathBuf, Arc<DirectoryBlockNames>> = HashMap::new();
     let mut provider_load_diagnostics = BTreeSet::new();
@@ -621,6 +652,7 @@ mod tests {
 
         let error = run_fmt_with_factory_builder(
             color_mode,
+            &carina_core::EnvironmentSnapshot::empty(),
             &file,
             FmtMode::Write,
             false,
@@ -646,15 +678,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("main.crn"), "provider example {}\n").unwrap();
 
-        let error =
-            run_fmt_with_factory_builder(color_mode, tmp.path(), FmtMode::Write, false, |_, _| {
+        let error = run_fmt_with_factory_builder(
+            color_mode,
+            &carina_core::EnvironmentSnapshot::empty(),
+            tmp.path(),
+            FmtMode::Write,
+            false,
+            |_, _| {
                 Err(AppError::from(
                     carina_provider_resolver::GrantParseError::MissingSeparator {
                         value: "not-a-grant".to_string(),
                     },
                 ))
-            })
-            .expect_err("invalid grant input must fail once provider loading begins");
+            },
+        )
+        .expect_err("invalid grant input must fail once provider loading begins");
 
         assert!(matches!(error, AppError::TrustedLocalGrant(_)));
     }
@@ -739,6 +777,7 @@ let imported = use {{
 
         run_fmt_with_factory_builder(
             color_mode,
+            &carina_core::EnvironmentSnapshot::empty(),
             tmp.path(),
             FmtMode::Write,
             true,
@@ -779,6 +818,7 @@ let imported = use {{
 
         run_fmt_with_factory_builder(
             color_mode,
+            &carina_core::EnvironmentSnapshot::empty(),
             &module,
             FmtMode::Write,
             false,
@@ -828,6 +868,7 @@ let imported = use {{
 
         run_fmt_with_factory_builder(
             color_mode,
+            &carina_core::EnvironmentSnapshot::empty(),
             tmp.path(),
             FmtMode::Write,
             true,

@@ -3,7 +3,7 @@ use crate::cursor::CursorState;
 use crate::error::{AppError, CommandInputError};
 use crate::output_style::ColorMode;
 use crate::wiring::TrustedLocalGrantInputs;
-use carina_core::UserDirs;
+use carina_core::{EnvironmentSnapshot, UserDirs};
 use carina_provider_mock::ConfiguredBuiltinMock;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -48,6 +48,7 @@ pub struct InvocationHooks {
 }
 
 pub struct CommandInputs {
+    pub environment: EnvironmentSnapshot,
     pub builtin_mock: BuiltinMockInputs,
     pub trusted_local_grants: TrustedLocalGrantInputs,
     pub accepted_egress: carina_provider_resolver::AcceptedEgressSources,
@@ -87,6 +88,9 @@ impl CommandRuntime {
     }
     pub fn user_dirs(&self) -> &UserDirs {
         &self.user_dirs
+    }
+    pub fn environment(&self) -> &EnvironmentSnapshot {
+        &self.state.inputs.environment
     }
     pub(crate) fn builtin_mock(&self) -> Result<&ConfiguredBuiltinMock, AppError> {
         self.state.inputs.builtin_mock.resolve()

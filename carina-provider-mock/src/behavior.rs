@@ -1,6 +1,5 @@
 //! Immutable mock controls. Decoding supplied values never reads process state.
-use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -158,11 +157,11 @@ pub struct DecodedMockControls {
     pub behavior: MockBehavior,
 }
 
-/// Decode the historical controls from a supplied map (full CARINA_MOCK_ keys).
+/// Decode the historical controls from the invocation's environment snapshot.
 /// Missing/non-Unicode string controls retain the historical defaults. Paths
 /// preserve native OS strings. Environment capture belongs to the executable.
-pub fn decode_controls(values: &BTreeMap<String, OsString>) -> DecodedMockControls {
-    let raw = |key: &str| values.get(&format!("CARINA_MOCK_{key}"));
+pub fn decode_controls(environment: &carina_core::EnvironmentSnapshot) -> DecodedMockControls {
+    let raw = |key: &str| environment.get(&format!("CARINA_MOCK_{key}"));
     let text = |key: &str| raw(key).and_then(|value| value.to_str()).map(str::to_owned);
     let path = |key: &str| raw(key).map(PathBuf::from);
     let millis = |key: &str| {
@@ -308,10 +307,10 @@ mod tests {
             ("UPDATE_SERVER_LIST_OUT_OF_BAND_KEY", "extra"),
             ("UPDATE_SERVER_LIST_OUT_OF_BAND_VALUE", "yes"),
         ];
-        let values = raw
-            .into_iter()
-            .map(|(key, value)| (format!("CARINA_MOCK_{key}"), value.into()))
-            .collect();
+        let values = carina_core::EnvironmentSnapshot::new(
+            raw.into_iter()
+                .map(|(key, value)| (format!("CARINA_MOCK_{key}"), value.into())),
+        );
         let DecodedMockControls {
             state_file,
             behavior,

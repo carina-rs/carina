@@ -330,7 +330,7 @@ mod tests {
     ) -> Vec<DependsOnDiagnostic> {
         let mut parsed = parsed.clone();
         let report = crate::validation::deferred_types::with_session_for_test(
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| super::super::resolve_file_type_exprs_report(&mut parsed, session, None),
         );
         assert!(
@@ -381,7 +381,7 @@ mod tests {
                     }
                 }
             "#,
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("fixture must parse");
         assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
@@ -614,7 +614,11 @@ mod tests {
                 directives { depends_on = [role] }
             }
         "#;
-        let parsed = parse(src, &ProviderContext::default()).unwrap();
+        let parsed = parse(
+            src,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         let diags = check(&parsed);
         let warnings = diag_messages(&diags, Severity::Warning);
         assert!(
@@ -646,7 +650,11 @@ mod tests {
                 }
             }
         "#;
-        let parsed = crate::parser::parse(src, &crate::parser::ProviderContext::default()).unwrap();
+        let parsed = crate::parser::parse(
+            src,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         let diags = check(&parsed);
         let errors = diag_messages(&diags, Severity::Error);
         assert!(

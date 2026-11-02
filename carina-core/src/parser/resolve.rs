@@ -571,8 +571,11 @@ fn iter_pre_apply_resources_mut<E>(
 
 /// Resolve resource references in a ParsedFile
 /// This replaces ResourceRef values with the actual attribute values from referenced resources
-pub fn resolve_resource_refs(parsed: &mut ParsedFile) -> Result<(), ParseError> {
-    resolve_resource_refs_with_config(parsed, &ProviderContext::default())
+pub fn resolve_resource_refs(
+    parsed: &mut ParsedFile,
+    config: &ProviderContext,
+) -> Result<(), ParseError> {
+    resolve_resource_refs_with_config(parsed, config)
 }
 
 /// Resolve resource references with the given parser configuration.
@@ -2209,7 +2212,7 @@ mod resolve_access_tests {
 let q = mock.test.resource { name = "q-z" }
 let consumer = mock.test.resource { name = q.name[0] }
 "#,
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("parse resource path fixture");
         let authored = parsed.resources[1]
@@ -2222,8 +2225,11 @@ let consumer = mock.test.resource { name = q.name[0] }
                 if path.segments().len() == 1
         ));
 
-        resolve_resource_refs_with_config(&mut parsed, &ProviderContext::default())
-            .expect("resolution keeps validation-owned paths deferred");
+        resolve_resource_refs_with_config(
+            &mut parsed,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("resolution keeps validation-owned paths deferred");
 
         assert_eq!(
             parsed.resources[1].get_attr("name"),
@@ -2240,6 +2246,13 @@ mod unavailable_evaluation_tests {
     const MISSING_ENV: &str = "CARINA_TEST_UNAVAILABLE_EVALUATION_3974";
 
     fn parsed_with_comment(expression: &str) -> ParsedFile {
+        parsed_with_comment_and_config(
+            expression,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+    }
+
+    fn parsed_with_comment_and_config(expression: &str, config: &ProviderContext) -> ParsedFile {
         crate::parser::parse(
             &format!(
                 r#"
@@ -2249,7 +2262,7 @@ let item = mock.test.resource {{
 }}
 "#,
             ),
-            &ProviderContext::default(),
+            config,
         )
         .expect("parse unavailable evaluation fixture")
     }
@@ -2262,12 +2275,12 @@ let item = mock.test.resource {{
 
     #[test]
     fn permissive_resolution_distinguishes_failed_and_pending_builtin_calls() {
-        unsafe {
-            std::env::remove_var(MISSING_ENV);
-        }
         let mut failed = parsed_with_comment(&format!(r#"env("{MISSING_ENV}")"#));
-        resolve_resource_refs_defer_unknown_functions(&mut failed, &ProviderContext::default())
-            .expect("permissive resolution retains a diagnostic value");
+        resolve_resource_refs_defer_unknown_functions(
+            &mut failed,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("permissive resolution retains a diagnostic value");
 
         match comment(&failed) {
             Value::Deferred(DeferredValue::Unavailable {
@@ -2301,11 +2314,14 @@ let item = mock.test.resource {
   comment = upper(origin.identifier)
 }
 "#,
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("parse pending evaluation fixture");
-        resolve_resource_refs_defer_unknown_functions(&mut pending, &ProviderContext::default())
-            .expect("pending call remains deferred");
+        resolve_resource_refs_defer_unknown_functions(
+            &mut pending,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("pending call remains deferred");
         assert!(matches!(
             pending.resources[1].get_attr("comment"),
             Some(Value::Deferred(DeferredValue::FunctionCall {
@@ -2317,15 +2333,18 @@ let item = mock.test.resource {
 
     #[test]
     fn strict_resolution_reports_the_original_unavailable_builtin_error() {
-        unsafe {
-            std::env::remove_var(MISSING_ENV);
-        }
         let mut parsed = parsed_with_comment(&format!(r#"env("{MISSING_ENV}")"#));
-        resolve_resource_refs_defer_unknown_functions(&mut parsed, &ProviderContext::default())
-            .expect("permissive pass");
+        resolve_resource_refs_defer_unknown_functions(
+            &mut parsed,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("permissive pass");
 
-        let error = resolve_resource_refs_with_config(&mut parsed, &ProviderContext::default())
-            .expect_err("strict pass must reject an unavailable unwrapped builtin");
+        let error = resolve_resource_refs_with_config(
+            &mut parsed,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect_err("strict pass must reject an unavailable unwrapped builtin");
         assert!(
             error
                 .to_string()
@@ -2336,12 +2355,12 @@ let item = mock.test.resource {
 
     #[test]
     fn secret_wraps_an_unavailable_value_without_losing_taint() {
-        unsafe {
-            std::env::remove_var(MISSING_ENV);
-        }
         let mut parsed = parsed_with_comment(&format!(r#"secret(env("{MISSING_ENV}"))"#));
-        resolve_resource_refs_defer_unknown_functions(&mut parsed, &ProviderContext::default())
-            .expect("permissive pass");
+        resolve_resource_refs_defer_unknown_functions(
+            &mut parsed,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("permissive pass");
 
         assert!(matches!(
             comment(&parsed),
@@ -2357,12 +2376,13 @@ let item = mock.test.resource {
     fn unavailable_reason_does_not_expose_an_env_derived_variable_name() {
         const NAME_SOURCE: &str = "CARINA_TEST_UNAVAILABLE_NAME_SOURCE_3974";
         const SENSITIVE_NAME: &str = "CARINA_TEST_SENSITIVE_VARIABLE_NAME_3974";
-        unsafe {
-            std::env::set_var(NAME_SOURCE, SENSITIVE_NAME);
-            std::env::remove_var(SENSITIVE_NAME);
-        }
-        let mut parsed = parsed_with_comment(&format!(r#"env(env("{NAME_SOURCE}"))"#));
-        resolve_resource_refs_defer_unknown_functions(&mut parsed, &ProviderContext::default())
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::new([(
+            NAME_SOURCE.to_string(),
+            SENSITIVE_NAME.into(),
+        )]));
+        let mut parsed =
+            parsed_with_comment_and_config(&format!(r#"env(env("{NAME_SOURCE}"))"#), &config);
+        resolve_resource_refs_defer_unknown_functions(&mut parsed, &config)
             .expect("permissive pass");
 
         let Value::Deferred(DeferredValue::Unavailable { reason, .. }) = comment(&parsed) else {
@@ -2376,10 +2396,6 @@ let item = mock.test.resource {
             "environment variable named by a sensitive value is not set"
         );
         assert!(!format!("{reason:?}").contains(SENSITIVE_NAME));
-
-        unsafe {
-            std::env::remove_var(NAME_SOURCE);
-        }
     }
 }
 
@@ -2392,7 +2408,7 @@ mod seed_precedence_tests {
     fn structural_let_stays_out_of_value_model_and_seeds_as_typed_structural() {
         let parsed = crate::parser::parse(
             "let cluster = mock.compute.Instance { name = \"example\" }",
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("parse structural let");
         assert!(
@@ -2465,7 +2481,7 @@ for item in source.arn {
   }
 }
 "#,
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("parse deferred for fixture");
         let crate::parser::DeferredForBody::Resource(template) =
@@ -2478,8 +2494,11 @@ for item in source.arn {
             Some(Value::Deferred(DeferredValue::FunctionCall { name, .. })) if name == "secret"
         ));
 
-        resolve_resource_refs_with_config(&mut parsed, &ProviderContext::default())
-            .expect("resolve deferred template functions");
+        resolve_resource_refs_with_config(
+            &mut parsed,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("resolve deferred template functions");
 
         let crate::parser::DeferredForBody::Resource(template) =
             parsed.parsed_deferred_for_expressions()[0].body()

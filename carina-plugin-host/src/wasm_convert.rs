@@ -5168,6 +5168,7 @@ mod tests {
         let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
             std::sync::Arc::new(Vec::new()),
             schemas.clone(),
+            carina_core::EnvironmentSnapshot::empty(),
         );
         carina_core::validation::deferred_types::with_session_for_test_async(provider_types.provider_context(), async |type_checks| {
         let preparation = carina_core::executor::ProviderPreparationContext::new(

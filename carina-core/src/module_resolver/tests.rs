@@ -46,7 +46,7 @@ fn known(type_expr: TypeExpr) -> TypeExpr {
 fn consumer_type(type_expr: TypeExpr) -> crate::static_type::ConsumerStaticType {
     crate::validation::resolve_consumer_static_type_for_signature(
         &type_expr,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
 }
 
@@ -55,7 +55,7 @@ fn resolve_modules(
     base_dir: &std::path::Path,
 ) -> Result<ModuleResolvedParsedFile, ModuleError> {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             super::resolve_modules_providerless(
                 crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
@@ -159,8 +159,12 @@ impl ModuleResolutionFixture {
     ) -> Result<ModuleResolvedParsedFile, ModuleError> {
         let caller_file = self.root.join(caller_relative);
         let caller = fs::read_to_string(&caller_file).expect("read fixture caller");
-        let parsed = crate::parser::parse_file(&caller, &caller_file, &ProviderContext::default())
-            .expect("fixture caller parses");
+        let parsed = crate::parser::parse_file(
+            &caller,
+            &caller_file,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("fixture caller parses");
         resolve_modules(
             parsed,
             caller_file.parent().expect("caller file has a directory"),
@@ -173,7 +177,7 @@ impl ModuleResolutionFixture {
     ) -> Result<ModuleResolvedParsedFile, ModuleError> {
         let caller_file = self.root.join(caller_relative);
         let caller = fs::read_to_string(&caller_file).expect("read fixture caller");
-        let config = ProviderContext::default();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let parsed = crate::parser::parse_file(&caller, &caller_file, &config)
             .expect("fixture caller parses");
         crate::validation::deferred_types::with_session_for_test(&config, |session| {
@@ -198,7 +202,10 @@ fn module_argument_force_delete_reaches_provider_directives() {
     let expanded = fixture
         .resolve_caller("main.crn")
         .unwrap()
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .unwrap();
     let directives = crate::provider::ProviderDirectives::resolve(
         &expanded.resources[0].directives,
@@ -220,7 +227,10 @@ fn nested_module_directive_expressions_resolve_both_boolean_values() {
         let expanded = fixture
             .resolve_caller("main.crn")
             .unwrap()
-            .into_expanded(&crate::schema::SchemaRegistry::new())
+            .into_expanded(
+                &crate::schema::SchemaRegistry::new(),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
             .unwrap();
         let directives = crate::provider::ProviderDirectives::resolve(
             &expanded.resources[0].directives,
@@ -243,7 +253,10 @@ fn module_directives_resolve_before_deferred_loop_is_saved() {
     let expanded = fixture
         .resolve_caller("main.crn")
         .unwrap()
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .unwrap();
     assert_eq!(expanded.deferred_for_expressions().len(), 1);
     let deferred = expanded.deferred_for_expressions()[0].clone();
@@ -262,7 +275,7 @@ fn module_directives_resolve_before_deferred_loop_is_saved() {
     );
     let restored: crate::parser::SavedDeferredForExpression = serde_json::from_value(json).unwrap();
     let children = crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::parser::expand_deferred_children(
                 &restored,
@@ -291,7 +304,10 @@ fn module_argument_resource_output_cannot_become_a_directive_default() {
         let error = fixture
             .resolve_caller("main.crn")
             .unwrap()
-            .into_expanded(&crate::schema::SchemaRegistry::new())
+            .into_expanded(
+                &crate::schema::SchemaRegistry::new(),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
             .expect_err("resource output must stay deferred");
         let message = error.to_string();
         assert!(
@@ -309,12 +325,15 @@ fn module_loop_directives_are_strictly_resolved_for_each_child() {
     let expanded = fixture
         .resolve_caller("main.crn")
         .unwrap()
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .unwrap();
     let deferred = &expanded.deferred_for_expressions()[0];
     for flag in [true, false] {
         let children = crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 crate::parser::expand_deferred_children(
                     deferred,
@@ -355,7 +374,7 @@ fn module_loop_directives_are_strictly_resolved_for_each_child() {
         ),
     ] {
         let error = crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 crate::parser::expand_deferred_children(
                     deferred,
@@ -396,8 +415,12 @@ let consumer = mock.test.resource {
         "modules/app/iam.crn",
         "let role = mock.test.resource { name = \"role\" }\n",
     );
-    let parsed = crate::parser::parse_file(&caller, &caller_file, &ProviderContext::default())
-        .expect("caller parses");
+    let parsed = crate::parser::parse_file(
+        &caller,
+        &caller_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("caller parses");
     let prefix = instance_prefix_for_call(&parsed.module_calls[0]);
     let expanded = resolve_modules(parsed, &fixture.root).expect("module expands");
     let consumer = expanded
@@ -465,8 +488,12 @@ let disabled = choice { flag = false }
     let caller_file = caller_dir.join("main.crn");
     fs::write(&caller_file, caller).expect("write caller");
 
-    let parsed = crate::parser::parse_file(caller, &caller_file, &ProviderContext::default())
-        .expect("caller parses");
+    let parsed = crate::parser::parse_file(
+        caller,
+        &caller_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("caller parses");
     let parsed = resolve_modules(parsed, &caller_dir).expect("module conditionals expand");
 
     let value = |binding: &str| {
@@ -710,8 +737,12 @@ let disabled = choice { flag = false }
     let caller_file = caller_dir.join("main.crn");
     fs::write(&caller_file, caller).unwrap();
 
-    let parsed = crate::parser::parse_file(caller, &caller_file, &ProviderContext::default())
-        .expect("caller parses");
+    let parsed = crate::parser::parse_file(
+        caller,
+        &caller_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("caller parses");
     let parsed = resolve_modules(parsed, &caller_dir).expect("structural branches expand");
 
     let attribute = |binding: &str| {
@@ -777,8 +808,12 @@ let disabled = choice { flag = false }
     let caller_file = caller_dir.join("main.crn");
     fs::write(&caller_file, caller).unwrap();
 
-    let parsed = crate::parser::parse_file(caller, &caller_file, &ProviderContext::default())
-        .expect("caller parses");
+    let parsed = crate::parser::parse_file(
+        caller,
+        &caller_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("caller parses");
     let parsed = resolve_modules(parsed, &caller_dir).expect("nested conditionals expand");
 
     let output = |binding: &str, name: &str| {
@@ -882,8 +917,12 @@ let disabled = outer { flag = false }
     let caller_file = caller_dir.join("main.crn");
     fs::write(&caller_file, caller).unwrap();
 
-    let parsed = crate::parser::parse_file(caller, &caller_file, &ProviderContext::default())
-        .expect("caller parses");
+    let parsed = crate::parser::parse_file(
+        caller,
+        &caller_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("caller parses");
     let parsed = resolve_modules(parsed, &caller_dir).expect("forwarded conditions expand");
 
     let nested_value = |binding: &str| {
@@ -943,8 +982,12 @@ let disabled = outer { outer_flag = false }
     let caller_file = caller_dir.join("main.crn");
     fs::write(&caller_file, caller).unwrap();
 
-    let parsed = crate::parser::parse_file(caller, &caller_file, &ProviderContext::default())
-        .expect("caller parses");
+    let parsed = crate::parser::parse_file(
+        caller,
+        &caller_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("caller parses");
     let parsed =
         resolve_modules(parsed, &caller_dir).expect("forwarded structural condition expands");
 
@@ -1009,8 +1052,12 @@ let off = middle { other = false }
     let caller_file = caller_dir.join("main.crn");
     fs::write(&caller_file, caller).unwrap();
 
-    let parsed = crate::parser::parse_file(caller, &caller_file, &ProviderContext::default())
-        .expect("caller parses");
+    let parsed = crate::parser::parse_file(
+        caller,
+        &caller_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("caller parses");
     let parsed = resolve_modules(parsed, &caller_dir).expect("forwarded condition expands");
 
     let selected = parsed
@@ -1054,11 +1101,15 @@ let forwarded = inner { flag = flag }
     let outer_file = outer_dir.join("main.crn");
     fs::write(&outer_file, outer_source).unwrap();
 
-    let parsed = crate::parser::parse_file(outer_source, &outer_file, &ProviderContext::default())
-        .expect("standalone outer module parses");
+    let parsed = crate::parser::parse_file(
+        outer_source,
+        &outer_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("standalone outer module parses");
     let parsed = crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed);
     let result = crate::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             super::resolve_modules_with_providerless_diagnostics(
                 &parsed,
@@ -1118,8 +1169,12 @@ let disabled = chooser { flag = false }
     let caller_file = caller_dir.join("main.crn");
     fs::write(&caller_file, caller).unwrap();
 
-    let parsed = crate::parser::parse_file(caller, &caller_file, &ProviderContext::default())
-        .expect("caller parses");
+    let parsed = crate::parser::parse_file(
+        caller,
+        &caller_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("caller parses");
     let parsed = resolve_modules(parsed, &caller_dir).expect("conditional module calls expand");
 
     let value = |binding: &str| {
@@ -1213,7 +1268,7 @@ let enabled = chooser { flag = true caller = shared }
     let caller_file = caller_dir.join("main.crn");
     fs::write(&caller_file, caller).unwrap();
 
-    let mut config = ProviderContext::default();
+    let mut config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     config
         .resource_types
         .insert(("mock".to_string(), "test.resource".to_string()));
@@ -1286,8 +1341,12 @@ let instance = choice {{ flag = {flag} }}
         );
         let caller_file = caller_dir.join("main.crn");
         fs::write(&caller_file, &caller).unwrap();
-        let parsed = crate::parser::parse_file(&caller, &caller_file, &ProviderContext::default())
-            .expect("caller parse");
+        let parsed = crate::parser::parse_file(
+            &caller,
+            &caller_file,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("caller parse");
         resolve_modules(parsed, &caller_dir)
     };
 
@@ -1424,8 +1483,12 @@ let on = choice { flag = true }
     let caller_file = caller_dir.join("main.crn");
     fs::write(&caller_file, caller).unwrap();
 
-    let parsed = crate::parser::parse_file(caller, &caller_file, &ProviderContext::default())
-        .expect("caller parses");
+    let parsed = crate::parser::parse_file(
+        caller,
+        &caller_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("caller parses");
     let parsed = resolve_modules(parsed, &caller_dir)
         .expect("guarded references must be checked after selecting their value branch");
 
@@ -1493,9 +1556,12 @@ let source = mock.test.Thing { ready = true }
 let selected = runtime { flag = source.ready }
 "#;
     let runtime_file = caller_dir.join("runtime.crn");
-    let parsed =
-        crate::parser::parse_file(runtime_caller, &runtime_file, &ProviderContext::default())
-            .expect("runtime caller parses");
+    let parsed = crate::parser::parse_file(
+        runtime_caller,
+        &runtime_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("runtime caller parses");
     let error = resolve_modules(parsed, &caller_dir)
         .expect_err("runtime argument must fail after substitution")
         .to_string();
@@ -1511,9 +1577,12 @@ let non_bool = use { source = "../non_bool" }
 let selected = non_bool { flag = "not-bool" }
 "#;
     let non_bool_file = caller_dir.join("non_bool.crn");
-    let parsed =
-        crate::parser::parse_file(non_bool_caller, &non_bool_file, &ProviderContext::default())
-            .expect("non-bool caller parses");
+    let parsed = crate::parser::parse_file(
+        non_bool_caller,
+        &non_bool_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("non-bool caller parses");
     let error = resolve_modules(parsed, &caller_dir)
         .expect_err("non-Bool argument must fail after substitution")
         .to_string();
@@ -1534,8 +1603,12 @@ arguments { flag: Bool }
 attributes { value = if flag { "yes" } else { "no" } }
 "#;
     fs::write(&source_file, source).unwrap();
-    let parsed = crate::parser::parse_file(source, &source_file, &ProviderContext::default())
-        .expect("standalone module template parses");
+    let parsed = crate::parser::parse_file(
+        source,
+        &source_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("standalone module template parses");
 
     let error = resolve_modules(parsed, root.path())
         .expect_err("the ordinary resolver must not publish an unresolved root template")
@@ -1570,8 +1643,12 @@ let forwarded = choice { flag = flag }
 "#;
     let source_file = outer_dir.join("main.crn");
     fs::write(&source_file, source).unwrap();
-    let parsed = crate::parser::parse_file(source, &source_file, &ProviderContext::default())
-        .expect("standalone forwarding module parses");
+    let parsed = crate::parser::parse_file(
+        source,
+        &source_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("standalone forwarding module parses");
 
     let error = resolve_modules(parsed, &outer_dir)
         .expect_err("a deferred module contribution must fail its publication conversion")
@@ -1615,11 +1692,18 @@ fn resolve_anonymous_loop_module_fixture(
     let root_file = root.path().join("main.crn");
     fs::write(&root_file, root_body).expect("write root body");
 
-    let parsed = crate::parser::parse_file(root_body, &root_file, &ProviderContext::default())
-        .expect("root fixture parses");
+    let parsed = crate::parser::parse_file(
+        root_body,
+        &root_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("root fixture parses");
     let parsed = resolve_modules(parsed, root.path()).expect("module fixture expands");
     parsed
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("expanded module fixture contains no parser placeholders")
 }
 
@@ -1819,11 +1903,18 @@ fn nested_unbound_module_loop_migrates_composed_legacy_address() {
     let root_file = root.path().join("main.crn");
     fs::write(&root_file, root_source).expect("write root fixture");
 
-    let parsed = crate::parser::parse_file(root_source, &root_file, &ProviderContext::default())
-        .expect("root fixture parses");
+    let parsed = crate::parser::parse_file(
+        root_source,
+        &root_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("root fixture parses");
     let parsed = resolve_modules(parsed, root.path()).expect("nested loop module expands");
     let mut parsed = parsed
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("expanded module fixture contains no parser placeholders");
     assert_eq!(
         parsed.resources.len(), // allow: direct — fixture test inspection
@@ -1940,8 +2031,12 @@ fn resolver_error_from_parsed_call_retains_call_identity() {
     let source = "let missing = use { source = './missing' }\nmissing {}\n";
     let base = tempfile::tempdir().expect("temporary module root");
     let source_file = base.path().join("main.crn");
-    let parsed = crate::parser::parse_file(source, &source_file, &ProviderContext::default())
-        .expect("fixture must parse");
+    let parsed = crate::parser::parse_file(
+        source,
+        &source_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("fixture must parse");
     let expected_span = parsed.module_calls[0].source_span();
     assert_eq!(
         (
@@ -1955,7 +2050,7 @@ fn resolver_error_from_parsed_call_retains_call_identity() {
     );
 
     let error = crate::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             resolve_modules_with_config(
                 parsed,
@@ -2267,7 +2362,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
 #[test]
 fn test_expand_anonymous_resource_in_named_module_keeps_identity_absent() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -2312,7 +2407,7 @@ fn test_expand_anonymous_resource_in_named_module_keeps_identity_absent() {
 #[test]
 fn anonymous_module_resource_instantiated_twice_has_distinct_pending_ids() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut resolver = ModuleResolver::new(".", session);
@@ -2355,7 +2450,7 @@ fn anonymous_module_resource_instantiated_twice_has_distinct_pending_ids() {
 #[test]
 fn test_expand_module_call() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -2475,7 +2570,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
 #[test]
 fn test_expand_module_call_preserves_provider_instance_on_id() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -2678,7 +2773,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
 #[test]
 fn test_multiple_module_instances_no_collision() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -2842,7 +2937,7 @@ fn create_module_with_attributes() -> ParsedFile {
 #[test]
 fn test_expand_module_call_creates_composition() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -2909,7 +3004,7 @@ fn test_expand_module_call_creates_composition() {
 #[test]
 fn test_expand_module_call_populates_compositions_slice() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -2953,7 +3048,7 @@ fn test_expand_module_call_populates_compositions_slice() {
 #[test]
 fn test_expand_module_call_populates_expansion_trace_single_level() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -3004,7 +3099,7 @@ fn test_expand_module_call_populates_expansion_trace_single_level() {
 #[test]
 fn test_expand_module_call_records_use_source_path_on_call_site() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -3048,7 +3143,7 @@ fn test_expand_module_call_records_use_source_path_on_call_site() {
 #[test]
 fn test_expand_module_call_call_site_source_path_none_when_unmapped() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -3192,7 +3287,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
     };
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -3275,7 +3370,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
 #[test]
 fn test_expand_module_call_without_binding_still_records_boundary_composition() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -3323,7 +3418,11 @@ let role = awscc.iam.Role {
     fs::write(root_dir.join("main.crn"), root_body).unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        &content,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     resolve_modules(parsed, &root_dir).expect("resolve_modules should succeed")
 }
 
@@ -3491,7 +3590,7 @@ fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
             };
             crate::parser::resolve_resource_refs_defer_unknown_functions(
                 &mut module,
-                &ProviderContext::default(),
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .expect("permissive resolution must retain the failed built-in");
 
@@ -3945,7 +4044,11 @@ thing { name = 'after-edit' }
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        &content,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let mut parsed = resolve_modules(parsed, &root_dir).expect("resolve_modules should succeed");
 
     // Discover the new prefix from the parsed Role.
@@ -4120,7 +4223,7 @@ thing { name = 'unchanged-but-different' }
 #[test]
 fn test_missing_required_argument() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -4147,7 +4250,7 @@ fn test_missing_required_argument() {
 #[test]
 fn test_expand_module_call_uses_dot_path_addressing() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -4188,7 +4291,7 @@ fn test_expand_module_call_uses_dot_path_addressing() {
 #[test]
 fn test_module_dot_path_bindings_and_refs() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -4302,7 +4405,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
     };
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -4370,7 +4473,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
 #[test]
 fn test_module_composition_dot_path_refs() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -4444,7 +4547,7 @@ fn test_substitute_arguments_interpolation() {
 #[test]
 fn test_unknown_argument_rejected() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -4648,7 +4751,7 @@ fn create_module_with_interpolation() -> ParsedFile {
 #[test]
 fn test_expand_module_call_with_interpolation() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -4714,7 +4817,11 @@ fn test_nested_module_two_level() {
     let fixtures_dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nested_modules");
     let content = fs::read_to_string(fixtures_dir.join("root.crn")).unwrap();
-    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        &content,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     let parsed = resolve_modules(parsed, &fixtures_dir).unwrap();
 
@@ -4780,7 +4887,11 @@ mock.test.Consumer {
     .unwrap();
 
     let root = fs::read_to_string(fixture.path().join("main.crn")).unwrap();
-    let parsed = crate::parser::parse(&root, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        &root,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let parsed = resolve_modules(parsed, fixture.path()).expect("expand both module levels");
 
     let consumer = parsed
@@ -4837,7 +4948,11 @@ fn test_nested_module_intra_ref_to_module_call_is_prefixed() {
     let fixtures_dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nested_modules");
     let content = fs::read_to_string(fixtures_dir.join("root.crn")).unwrap();
-    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        &content,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     let parsed = resolve_modules(parsed, &fixtures_dir).unwrap();
 
@@ -4896,7 +5011,11 @@ fn test_nested_module_three_level() {
     let fixtures_dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nested_modules");
     let content = fs::read_to_string(fixtures_dir.join("root_three_level.crn")).unwrap();
-    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        &content,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     let parsed = resolve_modules(parsed, &fixtures_dir).unwrap();
 
@@ -4920,7 +5039,11 @@ fn test_nested_module_cycle_detection() {
     let fixtures_dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nested_modules");
     let content = fs::read_to_string(fixtures_dir.join("root_cycle.crn")).unwrap();
-    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        &content,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     let result = resolve_modules(parsed, &fixtures_dir);
     assert!(
@@ -4938,7 +5061,7 @@ fn test_nested_module_cycle_detection() {
 
 fn expand_module_call_with_cidr_function_argument(cidr: Value) -> ExpandedValue {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -5024,7 +5147,7 @@ fn test_load_module_missing_path_cleans_resolving_set() {
     let _ = fs::create_dir_all(&tmp_dir);
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let mut resolver = ModuleResolver::new(&tmp_dir, session);
 
@@ -5062,7 +5185,7 @@ fn test_load_module_parse_error_cleans_resolving_set() {
     .unwrap();
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let mut resolver = ModuleResolver::new(&tmp_root, session);
 
@@ -5134,7 +5257,7 @@ fn test_load_module_rejects_state_blocks() {
         fs::write(module_dir.join("state.crn"), state_block).expect("module state block");
 
         crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 let mut resolver = ModuleResolver::new(tmp.path(), session);
                 let err = resolver
@@ -5172,7 +5295,7 @@ fn test_load_module_rejects_backend_and_cleans_resolving_set() {
     .expect("module backend");
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let mut resolver = ModuleResolver::new(tmp.path(), session);
             for attempt in 1..=2 {
@@ -5210,7 +5333,7 @@ fn test_load_module_rejects_upstream_state_and_cleans_resolving_set() {
     .expect("module upstream_state");
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let mut resolver = ModuleResolver::new(tmp.path(), session);
             for attempt in 1..=2 {
@@ -5248,7 +5371,7 @@ fn test_load_module_rejects_exports_and_cleans_resolving_set() {
     .expect("module exports");
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let mut resolver = ModuleResolver::new(tmp.path(), session);
             for attempt in 1..=2 {
@@ -5280,7 +5403,7 @@ fn test_load_module_rejects_file_path() {
     fs::write(tmp_root.join("single.crn"), "arguments {\n  x: String\n}\n").unwrap();
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let mut resolver = ModuleResolver::new(&tmp_root, session);
             let err = resolver
@@ -5350,7 +5473,7 @@ fn create_module_with_port_validation() -> ParsedFile {
 #[test]
 fn test_argument_validation_passes_with_valid_value() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -5397,7 +5520,7 @@ fn test_argument_validation_with_resource_reference_is_pending() {
         Some("port must not be empty".to_string()),
     )];
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut resolver = ModuleResolver::new(".", session);
@@ -5451,7 +5574,7 @@ inner {}
 let root = outer { outer_port = producer.port }
 "#,
         std::path::Path::new("/tmp/root.crn"),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("parse distinct inner and outer call identities")
     .module_calls;
@@ -5536,7 +5659,7 @@ let root = outer { outer_port = producer.port }
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut resolver = ModuleResolver::new(".", session);
@@ -5584,7 +5707,7 @@ let root = outer { outer_port = producer.port }
 #[test]
 fn test_argument_validation_passes_with_default_value() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -5610,7 +5733,7 @@ fn test_argument_validation_passes_with_default_value() {
 #[test]
 fn test_argument_validation_fails_with_invalid_value() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -5655,7 +5778,7 @@ fn test_argument_validation_fails_with_invalid_value() {
 #[test]
 fn test_argument_validation_fails_with_negative_value() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -5681,7 +5804,7 @@ fn test_argument_validation_fails_with_negative_value() {
 #[test]
 fn test_argument_validation_fails_too_large() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -5751,7 +5874,7 @@ fn test_argument_validation_no_message_uses_default() {
     };
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -5825,7 +5948,7 @@ fn test_argument_validation_len_with_list() {
     };
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -5929,7 +6052,7 @@ fn test_require_block_passes() {
     };
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -6012,7 +6135,7 @@ fn test_require_block_fails_with_not_expr() {
     };
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -6094,7 +6217,7 @@ fn test_require_block_len_function() {
     };
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -6194,7 +6317,7 @@ fn test_require_block_multiple_constraints() {
     };
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -6257,7 +6380,7 @@ fn test_require_block_multiple_constraints() {
 #[test]
 fn test_argument_type_mismatch_int_for_string() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -6296,7 +6419,7 @@ fn test_argument_type_mismatch_int_for_string() {
 #[test]
 fn test_argument_type_mismatch_string_for_bool() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -6373,7 +6496,7 @@ fn test_argument_type_custom_validator() {
                 }
             }),
         ),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     });
 
     let mut module = create_test_module();
@@ -6466,7 +6589,7 @@ fn test_argument_type_list_of_custom_type() {
                 }
             }),
         ),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     });
 
     let mut module = create_test_module();
@@ -6547,8 +6670,11 @@ fn test_load_module_directory_merges_sibling_files_with_main() {
     )
     .unwrap();
 
-    let parsed = load_module(&tmp_dir)
-        .expect("expected module to load because arguments.crn declares an argument");
+    let parsed = load_module(
+        &tmp_dir,
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("expected module to load because arguments.crn declares an argument");
 
     assert_eq!(
         parsed.arguments.len(),
@@ -6581,7 +6707,11 @@ fn resolve_default_arg_fixture(module_body: &str, root_body: &str) -> ModuleReso
     fs::write(root_dir.join("main.crn"), root_body).unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        &content,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     resolve_modules(parsed, &root_dir).expect("resolve_modules should succeed")
 }
 
@@ -6752,7 +6882,11 @@ let child = selector {
 "#;
     fs::write(root_dir.join("main.crn"), root_body).unwrap();
 
-    let parsed = crate::parser::parse(root_body, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        root_body,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let parsed = resolve_modules(parsed, &root_dir).expect("module postfix accesses must expand");
 
     let selected = parsed
@@ -6810,7 +6944,11 @@ let child = selector { items = ["x", "y"] }
 "#;
     fs::write(root_dir.join("main.crn"), root_body).unwrap();
 
-    let parsed = crate::parser::parse(root_body, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        root_body,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let error = resolve_modules(parsed, &root_dir)
         .expect_err("known module-argument misses must fail during module expansion");
     let message = error.to_string();
@@ -6898,7 +7036,7 @@ let child = selector { vpc = source }
 "#;
     fs::write(root_dir.join("main.crn"), root_body).unwrap();
 
-    let mut context = ProviderContext::default();
+    let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     context
         .resource_types
         .insert(("mock".to_string(), "test.Thing".to_string()));
@@ -6956,7 +7094,7 @@ let child = imported { peer = source }
 "#;
     fs::write(root_dir.join("main.crn"), root_body).unwrap();
 
-    let mut context = ProviderContext::default();
+    let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     context
         .resource_types
         .insert(("mock".to_string(), "test.Thing".to_string()));
@@ -7028,7 +7166,7 @@ let child = imported {
 "#;
     fs::write(root_dir.join("main.crn"), root_body).unwrap();
 
-    let mut context = ProviderContext::default();
+    let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     context
         .resource_types
         .insert(("mock".to_string(), "test.Thing".to_string()));
@@ -7076,7 +7214,7 @@ let child = imported { peer = peer.identifier }
 "#;
     fs::write(root_dir.join("main.crn"), root_body).unwrap();
 
-    let mut context = ProviderContext::default();
+    let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     context
         .resource_types
         .insert(("mock".to_string(), "test.Thing".to_string()));
@@ -7374,7 +7512,11 @@ fn test_load_module_directory_merge_order_is_deterministic() {
     )
     .unwrap();
 
-    let parsed = load_module(&tmp_dir).expect("module should load");
+    let parsed = load_module(
+        &tmp_dir,
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("module should load");
     let names: Vec<&str> = parsed.arguments.iter().map(|a| a.name.as_str()).collect();
     assert_eq!(
         names,
@@ -7455,7 +7597,11 @@ let prod = bootstrap {
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        &content,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     resolve_modules(parsed, &root_dir)
         .expect("list(String) should flow through usecase to inner module");
 }
@@ -7522,7 +7668,11 @@ let prod = outer {}
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        &content,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     resolve_modules(parsed, &root_dir)
         .expect("list(String) via let alias should pass-through to inner module");
 }
@@ -7585,7 +7735,11 @@ let prod = outer {}
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        &content,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     resolve_modules(parsed, &root_dir)
         .expect("map(String) should flow through usecase to inner module");
 }
@@ -7650,7 +7804,11 @@ let prod = outer {
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        &content,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let error = resolve_modules(parsed, &root_dir)
         .expect_err("the checked graph must reject String -> list(String)");
     assert!(
@@ -7720,7 +7878,11 @@ let prod = outer {
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        &content,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let error = resolve_modules(parsed, &root_dir)
         .expect_err("the checked graph must reject Int -> String");
     assert!(
@@ -7752,7 +7914,7 @@ let instance = child { count = source.count + 1 }
 "#;
     fs::write(root_dir.join("main.crn"), root_source).expect("root source");
 
-    let mut config = ProviderContext::default();
+    let mut config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     for resource_type in ["test.Source", "test.Target"] {
         config
             .resource_types
@@ -7863,7 +8025,11 @@ let prod = outer {
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        &content,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let error = resolve_modules(parsed, &root_dir)
         .expect_err("the checked graph must reject list(Int) -> list(String)");
     assert!(
@@ -7907,7 +8073,7 @@ outer {
     )
     .expect("root configuration");
 
-    let mut config = ProviderContext::default();
+    let mut config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     config
         .resource_types
         .insert(("mock".to_string(), "test.resource".to_string()));
@@ -7980,7 +8146,7 @@ let instance = child { source = source }
 "#;
     fs::write(tmp.path().join("main.crn"), root_source).expect("root source");
 
-    let mut config = ProviderContext::default();
+    let mut config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     config
         .resource_types
         .insert(("mock".to_string(), "test.resource".to_string()));
@@ -8037,7 +8203,7 @@ fn ref_typed_module_argument_used_bare_is_rejected_in_module_context() {
         let instance = child { source = source }
         "#;
 
-            let mut config = ProviderContext::default();
+            let mut config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
             config
                 .resource_types
                 .insert(("mock".to_string(), "test.resource".to_string()));
@@ -8154,7 +8320,11 @@ let prod = outer {
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        &content,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     resolve_modules(parsed, &root_dir).expect("3-deep list pass-through should resolve");
 }
 
@@ -8207,7 +8377,7 @@ fn create_module_with_environment_union() -> ParsedFile {
 #[test]
 fn caller_side_typo_against_string_literal_union_is_rejected() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -8245,7 +8415,7 @@ fn caller_side_typo_against_string_literal_union_is_rejected() {
 #[test]
 fn caller_side_value_in_string_literal_union_is_accepted() {
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -8283,11 +8453,11 @@ arguments {
   environment: 'it\'s' | 'b'
 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("module argument type should parse");
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let mut resolver = ModuleResolver::new(".", session);
             resolver
@@ -8296,12 +8466,15 @@ arguments {
 
             let parse_value = |literal: &str| {
                 let source = format!("let value = {literal}\n");
-                crate::parser::parse(&source, &ProviderContext::default())
-                    .expect("argument value should parse")
-                    .variables
-                    .get("value")
-                    .expect("value binding should exist")
-                    .clone()
+                crate::parser::parse(
+                    &source,
+                    &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                )
+                .expect("argument value should parse")
+                .variables
+                .get("value")
+                .expect("value binding should exist")
+                .clone()
             };
             let call = |value| {
                 ModuleCall::test(
@@ -8378,7 +8551,11 @@ let r  = uc { env = 'dev' }
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        &content,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let parsed = resolve_modules(parsed, &root_dir).expect("resolve_modules should succeed");
 
     assert_eq!(
@@ -8439,7 +8616,11 @@ m { foo = 'x' }
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        &content,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let err = resolve_modules(parsed, &root_dir).unwrap_err();
     let msg = format!("{err:?}");
     assert!(
@@ -8525,7 +8706,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     };
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -8644,7 +8825,7 @@ fn module_deferred_template_instantiated_twice_has_distinct_materialized_ids() {
         )));
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut resolver = ModuleResolver::new(".", session);
@@ -8733,7 +8914,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
     };
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -8838,7 +9019,11 @@ let r = registry {
 "#;
     fs::write(root_dir.join("main.crn"), root_body).unwrap();
 
-    let parsed = crate::parser::parse(root_body, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        root_body,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let parsed = resolve_modules(parsed, &root_dir).expect("resolve_modules should succeed");
 
     // carina#3126: the module-internal deferred-for survived the full
@@ -8906,7 +9091,7 @@ let second = for item in source.second {
   mock.test.resource { name = item comment = "second" }
 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("deferred resource loops parse");
 
@@ -8943,7 +9128,7 @@ let resources = for item in itmes {
     fs::write(&source_file, source).expect("write undefined iterable fixture");
     let loaded = crate::config_loader::load_configuration_with_config(
         fixture.path(),
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         &crate::schema::SchemaRegistry::new(),
     )
     .expect("undefined iterable remains deferred until finalization");
@@ -8955,7 +9140,7 @@ let resources = for item in itmes {
     ));
 
     let error = crate::validation::deferred_types::with_session_for_test(
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             super::resolve_modules_with_providerless_config(
                 loaded.parsed,
@@ -8992,12 +9177,12 @@ let second = for item in secnd_items {
   mock.test.resource { name = item }
 }
 "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("both undefined iterables remain deferred until finalization");
 
     let error = crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             super::resolve_modules_providerless(
                 crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
@@ -9075,7 +9260,7 @@ let registry_publish = registry {
 "#;
     fs::write(root_dir.join("main.crn"), root_body).unwrap();
 
-    let config = ProviderContext::default();
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let parsed = crate::parser::parse(root_body, &config).expect("root must parse");
     let parsed = crate::validation::deferred_types::with_session_for_test(&config, |session| {
         resolve_modules_with_config(
@@ -9238,7 +9423,7 @@ let outer = outer_module {}
 "#;
     fs::write(root_dir.join("main.crn"), root_body).unwrap();
 
-    let config = ProviderContext::default();
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let parsed = crate::parser::parse(root_body, &config).expect("root must parse");
     let parsed = crate::validation::deferred_types::with_session_for_test(&config, |session| {
         resolve_modules_with_config(
@@ -9324,7 +9509,7 @@ fn argument_type_list_accepts_resource_ref() {
     }];
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -9368,7 +9553,7 @@ fn argument_type_map_accepts_resource_ref() {
     }];
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -9413,7 +9598,7 @@ fn argument_type_struct_accepts_resource_ref() {
     }];
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut r = ModuleResolver::new(".", session);
@@ -9453,7 +9638,7 @@ fn argument_type_int_accepts_resource_ref_for_later_ref_type_validation() {
     }];
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
                 let mut resolver = ModuleResolver::new(".", session);
@@ -9543,7 +9728,11 @@ let rd = infra_deploy {
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(
+        &content,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
     let result = resolve_modules(parsed, &root_dir);
     assert!(
         result.is_ok(),
@@ -9581,7 +9770,12 @@ fn module_argument_type_error(
     type_expr: TypeExpr,
     value: Value<ParserPlaceholder>,
 ) -> String {
-    module_argument_type_error_with_config(arg_name, type_expr, value, &ProviderContext::default())
+    module_argument_type_error_with_config(
+        arg_name,
+        type_expr,
+        value,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
 }
 
 fn module_argument_type_error_with_config(
@@ -9679,7 +9873,7 @@ fn decrypted_module_argument_is_secret_by_value_type() {
     let plaintext = "hunter2SECRET";
     let config = ProviderContext {
         decryptor: Some(std::sync::Arc::new(move |_, _| Ok(plaintext.to_string()))),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     };
     let value = crate::builtins::evaluate_builtin_with_config_to_value(
         "decrypt",
@@ -9769,7 +9963,7 @@ fn binding_ref_argument_defers_to_binding_index() {
         validations: Vec::new(),
     }];
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let mut resolver = ModuleResolver::new(".", session);
             resolver
@@ -9804,7 +9998,11 @@ fn directory_module_loader_preserves_parameter_diagnostic_sources() {
     .unwrap();
     std::fs::write(&exports_path, "exports {\n  result: String = 'value'\n}\n").unwrap();
 
-    let parsed = load_directory_module(temp.path()).expect("directory module");
+    let parsed = load_directory_module(
+        temp.path(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("directory module");
     let attribute = &parsed.attribute_params[0];
     assert_eq!(attribute.source_file(), attributes_path.as_path());
     assert_eq!(attribute.source_span().start_line(), 2);
@@ -9978,11 +10176,11 @@ fn resolved_module_signature_groups_all_owners_of_a_dotted_annotation() {
                 )
             }),
         ),
-        ..ProviderContext::default()
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     };
     let parsed = crate::parser::parse(
         "arguments {\n  roles: list(aws.iam.Role.Arn)\n}\n",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("module signature fixture must parse");
 
@@ -10004,11 +10202,14 @@ fn resolved_module_signature_groups_all_owners_of_a_dotted_annotation() {
 fn resolved_module_signature_preserves_unresolvable_attribute_type_for_best_effort_snapshot() {
     let parsed = crate::parser::parse(
         "attributes {\n  out: missing.types.Identifier = 'value'\n}\n",
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("module signature fixture must parse");
 
-    let signature = super::signature::resolved_signature(&parsed, &ProviderContext::default());
+    let signature = super::signature::resolved_signature(
+        &parsed,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
     let static_type = signature.attributes["out"]
         .as_ref()
         .expect("declared attribute type");
@@ -10032,7 +10233,7 @@ fn resolved_module_signature_preserves_unresolvable_attribute_type_for_best_effo
 }
 
 fn handle_output_provider_context() -> ProviderContext {
-    let mut context = ProviderContext::default();
+    let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     for resource_type in ["test.Record", "test.Consumer", "test.Target"] {
         context
             .resource_types
@@ -10115,7 +10316,12 @@ fn anonymous_module_handle_output_resolves_after_instance_reconciliation() {
     assert_eq!(edited.compositions[0].instance, *prior_instance);
     assert_eq!(edited.resources[0].id, *prior_record);
 
-    let expanded = edited.into_expanded(&schemas).unwrap();
+    let expanded = edited
+        .into_expanded(
+            &schemas,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
     let graph = crate::resolved_graph::resolve_expanded_graph(expanded.into())
         .expect("anonymous handle output must resolve through the remapped composition");
     let composition = &graph.configuration().compositions[0];
@@ -10180,7 +10386,10 @@ let consumer = mock.test.Consumer {
     )
     .expect("unannotated local and argument handles must forward transitively");
     let parsed = parsed
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("root fixture has no remaining parser placeholders");
 
     let consumer = parsed
@@ -10282,7 +10491,10 @@ let consumer = mock.test.Consumer {
     )
     .expect("mixed local/output handle dependencies expand");
     let parsed = parsed
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("root fixture has no remaining parser placeholders");
     let consumer = parsed
         .resources
@@ -10373,7 +10585,10 @@ let child = consumer_module { peer = source }
     )
     .expect("module wait expands");
     let parsed = parsed
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("root fixture has no remaining parser placeholders");
 
     let wait = parsed
@@ -10460,7 +10675,10 @@ let child = consumer_module { peer = source }
     )
     .expect("module wait expands");
     let parsed = parsed
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("root fixture has no remaining parser placeholders");
     let expected = parsed
         .iter_all_resources()
@@ -10622,7 +10840,10 @@ let child = consumer_module {}
     )
     .expect("module with a wait over a for group expands");
     let parsed = parsed
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("root fixture has no remaining parser placeholders");
 
     let wait = parsed
@@ -10734,7 +10955,10 @@ let reader = mock.test.Consumer { name = consumer.observed_name }
     )
     .expect("P3 modules expand");
     let parsed = parsed
-        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .into_expanded(
+            &crate::schema::SchemaRegistry::new(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
         .expect("root fixture has no remaining parser placeholders");
 
     let expected = parsed

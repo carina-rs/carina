@@ -870,9 +870,10 @@ struct CliTypeCheckSink {
 pub(crate) fn failed_configuration_report<T>(
     path: &Path,
     error: AppError,
+    environment: carina_core::EnvironmentSnapshot,
 ) -> carina_core::validation::deferred_types::ProviderTypeCheckResult<Result<T, AppError>> {
     carina_core::validation::deferred_types::TypeCheckSession::run(
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(environment),
         |session| {
             let mut errors = vec![error.to_string()];
             let files = if path.is_file() {
@@ -2565,6 +2566,7 @@ impl WiringContext {
         let loaded_providers = Arc::new(provider_mod::loaded_provider_snapshot_from_factories(
             Arc::clone(&factories),
             schemas,
+            runtime.environment().clone(),
         ));
         Ok(Self {
             loaded_providers,
@@ -2667,9 +2669,10 @@ impl WiringContext {
         let unavailable = self.unavailable_provider_kinds(providers, load_errors);
         let loaded = self.provider_context();
         carina_core::parser::ProviderContext {
+            environment: self.runtime.environment().clone(),
+            decryptor: None,
             custom_types: loaded.custom_types.with_failed_providers(unavailable),
             resource_types: loaded.resource_types.clone(),
-            ..Default::default()
         }
     }
 
@@ -10358,7 +10361,7 @@ pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
     errors_to_legacy_result(validate_resources_with_ctx(
         &ctx,
         &parsed,
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     ))
 }
 

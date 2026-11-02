@@ -342,31 +342,30 @@ fn classify_apply_input(path: &Path) -> Result<ApplyInput<'_>, error::AppError> 
 /// The per-call body (base64 → `KMS:Decrypt` → UTF-8) lives in
 /// [`carina_cli::kms::decrypt_one`] so an integration test can drive it
 /// with a mock client (#3227).
-fn create_provider_context() -> carina_core::parser::ProviderContext {
+fn create_provider_context(
+    environment: carina_core::EnvironmentSnapshot,
+) -> carina_core::parser::ProviderContext {
     static KMS_CLIENT: tokio::sync::OnceCell<aws_sdk_kms::Client> =
         tokio::sync::OnceCell::const_new();
 
-    carina_core::parser::ProviderContext {
-        decryptor: Some(std::sync::Arc::new(|ciphertext, key| {
-            let ciphertext = ciphertext.to_string();
-            let key = key.map(|k| k.to_string());
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    let client = KMS_CLIENT
-                        .get_or_init(|| async {
-                            let config =
-                                aws_config::load_defaults(aws_config::BehaviorVersion::latest())
-                                    .await;
-                            aws_sdk_kms::Client::new(&config)
-                        })
-                        .await;
-                    carina_cli::kms::decrypt_one(client, &ciphertext, key.as_deref()).await
-                })
+    let mut context = carina_core::parser::ProviderContext::new(environment);
+    context.decryptor = Some(std::sync::Arc::new(|ciphertext, key| {
+        let ciphertext = ciphertext.to_string();
+        let key = key.map(|k| k.to_string());
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let client = KMS_CLIENT
+                    .get_or_init(|| async {
+                        let config =
+                            aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                        aws_sdk_kms::Client::new(&config)
+                    })
+                    .await;
+                carina_cli::kms::decrypt_one(client, &ciphertext, key.as_deref()).await
             })
-        })),
-        resource_types: Default::default(),
-        ..carina_core::parser::ProviderContext::default()
-    }
+        })
+    }));
+    context
 }
 
 #[allow(clippy::result_large_err)]
@@ -401,10 +400,6 @@ async fn main() {
         _ => Default::default(),
     };
 
-    // Create parser configuration with AWS KMS decryptor.
-    // This must happen before any .crn parsing so that decrypt() calls can be evaluated.
-    let provider_context = create_provider_context();
-
     // Command-wide cursor hide (#3158 — rationale in `cursor.rs`). Placed
     // after `Cli::parse()` because that exits the process itself on
     // --help/--version/parse error, so those paths must not hide; and
@@ -435,6 +430,7 @@ async fn main() {
                 Ok(runtime) => runtime,
                 Err(error) => return CommandCompletion::Error(*error),
             };
+            let provider_context = create_provider_context(runtime.environment().clone());
             match run_plan(
                 &runtime,
                 &path,
@@ -469,6 +465,7 @@ async fn main() {
                     let runtime = inputs
                         .runtime(resolve_user_dirs()?)
                         .map_err(|error| *error)?;
+                    let provider_context = create_provider_context(runtime.environment().clone());
                     run_validate(&runtime, &path, json, &provider_context)
                 }
                 Commands::Plan { .. } => unreachable!(),
@@ -482,6 +479,7 @@ async fn main() {
                     let runtime = inputs
                         .runtime(resolve_user_dirs()?)
                         .map_err(|error| *error)?;
+                    let provider_context = create_provider_context(runtime.environment().clone());
                     match classify_apply_input(&path) {
                         Ok(ApplyInput::SavedPlan(plan_path)) => {
                             run_apply_from_plan(
@@ -522,6 +520,7 @@ async fn main() {
                     let runtime = inputs
                         .runtime(resolve_user_dirs()?)
                         .map_err(|error| *error)?;
+                    let provider_context = create_provider_context(runtime.environment().clone());
                     run_destroy(
                         &runtime,
                         &path,
@@ -550,6 +549,7 @@ async fn main() {
                         commands::export::OutputFormat::Human
                     };
                     let path = PathBuf::from(".");
+                    let provider_context = create_provider_context(inputs.environment().clone());
                     commands::export::run_export(
                         color_mode,
                         &path,
@@ -572,14 +572,19 @@ async fn main() {
                         .map_err(|error| *error)?;
                     run_fmt(&runtime, &path, FmtMode::from_flags(check, diff), recursive)
                 }
-                Commands::Module { command } => run_module_command(command, &provider_context),
+                Commands::Module { command } => {
+                    let provider_context = create_provider_context(inputs.environment().clone());
+                    run_module_command(command, &provider_context)
+                }
                 Commands::ForceUnlock { lock_id, path } => {
+                    let provider_context = create_provider_context(inputs.environment().clone());
                     run_force_unlock(color_mode, &lock_id, &path, &provider_context).await
                 }
                 Commands::State { command } => {
                     let runtime = inputs
                         .runtime(resolve_user_dirs()?)
                         .map_err(|error| *error)?;
+                    let provider_context = create_provider_context(runtime.environment().clone());
                     let project_dir = command.project_dir().map(Path::to_path_buf);
                     let result =
                         run_state_command(&runtime, command, &provider_context, shutdown.clone())
@@ -612,6 +617,7 @@ async fn main() {
                     let runtime = inputs
                         .runtime(resolve_user_dirs()?)
                         .map_err(|error| *error)?;
+                    let provider_context = create_provider_context(runtime.environment().clone());
                     run_lint(&runtime, &path, &provider_context)
                 }
                 Commands::Completions { shell } => {
@@ -819,7 +825,7 @@ mod error_format_tests {
             "let source = mock.test.Source { name = \"source\" }\n\
              mock.test.Consumer { name = source }\n",
             std::path::Path::new("test.crn"),
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .expect("binding-use fixture must parse");
         let mut schemas = SchemaRegistry::new();
@@ -832,7 +838,8 @@ mod error_format_tests {
                     .expect("valid fixture schema"),
             );
         }
-        let provider_context = carina_core::parser::ProviderContext::default();
+        let provider_context =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
         let module_signatures = carina_core::module_resolver::ResolvedModuleSignatures::new();
         let context = carina_core::validation::ValidationTypeContext::new_providerless(
             &parsed,
@@ -955,7 +962,7 @@ mod error_format_tests {
         let parsed = carina_core::parser::parse_file(
             import_block,
             std::path::Path::new("rendered_import.crn"),
-            &carina_core::parser::ProviderContext::default(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .expect("rendered import block should parse");
         assert_eq!(parsed.state_blocks.len(), 1);

@@ -650,7 +650,7 @@ pub(crate) fn validate_builtin_custom_type<P: PlaceholderKind, B: BindingAddress
 /// use carina_core::resource::Value;
 ///
 /// fn check(owned: &OwnedTypeIdentity, value: &Value) {
-///     let _ = validate_schema_custom_type(owned, value, &ProviderContext::default());
+///     let _ = validate_schema_custom_type(owned, value, &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()));
 /// }
 /// ```
 pub fn validate_schema_custom_type<P: PlaceholderKind, B: BindingAddress>(

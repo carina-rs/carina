@@ -269,11 +269,11 @@ pub fn parse_file(
 pub fn parse_provider_factory_declarations(
     input: &str,
     source_file: &Path,
+    config: &ProviderContext,
 ) -> Result<Vec<super::ParserProviderConfig>, ParseError> {
     let file = Arc::new(super::preprocess_file(input)?);
     let pairs = file.parse()?;
-    let config = ProviderContext::default();
-    let ctx = ParseContext::new(&config, source_file, Arc::clone(&file));
+    let ctx = ParseContext::new(config, source_file, Arc::clone(&file));
     let mut providers = Vec::new();
     for pair in pairs.filter(|pair| pair.as_rule() == Rule::file) {
         for statement in pair
@@ -1632,17 +1632,22 @@ pub(crate) fn parse_expression_eval_with_mode(
 pub fn parse_file_and_resolve(
     input: &str,
     path: &std::path::Path,
+    config: &ProviderContext,
 ) -> Result<ParsedFile, ParseError> {
-    let mut parsed = parse_file(input, path, &ProviderContext::default())?;
-    resolve_resource_refs(&mut parsed)?;
-    resolve_provider_unresolved_attributes(&mut parsed, &ProviderContext::default())?;
+    let mut parsed = parse_file(input, path, config)?;
+    resolve_resource_refs(&mut parsed, config)?;
+    resolve_provider_unresolved_attributes(&mut parsed, config)?;
     finalize_provider_configs(&mut parsed)?;
     Ok(parsed)
 }
 
 #[cfg(test)]
 pub(crate) fn parse_and_resolve(input: &str) -> Result<ParsedFile, ParseError> {
-    parse_file_and_resolve(input, std::path::Path::new("test.crn"))
+    parse_file_and_resolve(
+        input,
+        std::path::Path::new("test.crn"),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
 }
 
 #[cfg(test)]

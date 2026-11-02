@@ -5,6 +5,44 @@ use carina_core::schema::{
 use tower_lsp::lsp_types::{InsertTextFormat, TextEdit};
 
 #[test]
+fn module_parameter_completion_uses_environment_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("module");
+    std::fs::create_dir(&module).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        "fn version() { env('MODE') }\nprovider mock { version = version() }\narguments { name: String }\n",
+    )
+    .unwrap();
+    let context = ProviderContext::new(carina_core::EnvironmentSnapshot::new([(
+        "MODE".to_string(),
+        "1.0.0".into(),
+    )]));
+    let doc = Document::new_with_path(
+        "let service = use { source = './module' }\nservice {\n  \n}\n".to_string(),
+        directory.path().join("main.crn"),
+        Arc::new(context),
+    );
+    let items =
+        test_provider().complete_for_test(&doc, Position::new(2, 2), Some(directory.path()));
+    assert!(items.iter().any(|item| item.label == "name"), "{items:?}");
+    let snippets = test_provider().top_level_completions(
+        Position::new(0, 0),
+        &doc.text(),
+        Some(directory.path()),
+        doc.provider_context(),
+    );
+    let service = snippets
+        .iter()
+        .find(|item| item.label == "service")
+        .unwrap();
+    assert_eq!(
+        service.insert_text.as_deref(),
+        Some("service {\n  name = ${1}\n}")
+    );
+}
+
+#[test]
 fn availability_zone_completions_use_dynamic_prefix() {
     use carina_core::schema::TypeIdentity;
 
@@ -807,7 +845,7 @@ fn type_based_completion_resolves_ref_typed_source_attribute() {
     let target = PatternAttributeType::string();
     let target_defs = std::collections::BTreeMap::new();
     let completions = carina_core::validation::deferred_types::with_session_for_test(
-        &carina_core::parser::ProviderContext::default(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             provider.value_completions_for_attribute_type(
                 &target,
@@ -1185,6 +1223,7 @@ fn top_level_completion_suggests_upstream_state() {
         },
         "",
         None,
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     );
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
@@ -1209,6 +1248,7 @@ fn top_level_completion_suggests_wait() {
         },
         "",
         None,
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     );
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
@@ -1539,6 +1579,7 @@ fn upstream_state_snippet_on_fresh_line_includes_let() {
         },
         "",
         None,
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     );
     let item = find_completion(&completions, "upstream_state");
     let snippet = item.insert_text.as_deref().unwrap_or("");
@@ -1563,6 +1604,7 @@ fn upstream_state_snippet_after_let_binding_omits_let() {
         },
         text,
         None,
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     );
     let item = find_completion(&completions, "upstream_state");
     let snippet = item.insert_text.as_deref().unwrap_or("");
@@ -1589,6 +1631,7 @@ fn read_snippet_after_let_binding_omits_let() {
         },
         text,
         None,
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     );
     let item = find_completion(&completions, "read");
     let snippet = item.insert_text.as_deref().unwrap_or("");
@@ -1615,6 +1658,7 @@ fn let_use_snippet_after_let_binding_omits_let() {
         },
         text,
         None,
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     );
     let item = find_completion(&completions, "let use");
     let snippet = item.insert_text.as_deref().unwrap_or("");
@@ -1640,6 +1684,7 @@ fn read_snippet_on_fresh_line_includes_let() {
         },
         "",
         None,
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     );
     let item = find_completion(&completions, "read");
     let snippet = item.insert_text.as_deref().unwrap_or("");
@@ -1801,6 +1846,7 @@ fn top_level_snippet(text: &str, label: &str) -> String {
         },
         text,
         None,
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     );
     find_completion(&completions, label)
         .insert_text
@@ -3497,19 +3543,24 @@ fn completion_uses_the_directory_partial_catalog_instead_of_the_document_catalog
     let factories: Arc<Vec<Box<dyn carina_core::provider::ProviderFactory>>> =
         Arc::new(vec![Box::new(StringCatalogFactory)]);
     let schemas = carina_core::provider::collect_schemas(factories.as_slice());
-    let snapshot =
-        carina_core::provider::loaded_provider_snapshot_from_factories(factories, schemas);
+    let snapshot = carina_core::provider::loaded_provider_snapshot_from_factories(
+        factories,
+        schemas,
+        carina_core::EnvironmentSnapshot::empty(),
+    );
     let context = snapshot.provider_context().as_provider_context().clone();
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("main.crn");
     let source = "provider test {}\nprovider broken {}\narguments {\n  candidate: SharedId\n}\ntest.Counter {\n  count = 0\n}\n";
     std::fs::write(&path, source).unwrap();
     let doc = Document::new_with_path(source.into(), path.clone(), Arc::new(context));
-    let engine = crate::diagnostics::DiagnosticEngine::without_loaded_provider_schemas()
-        .with_provider_errors(std::collections::HashMap::from([(
-            "broken".into(),
-            "not initialized".into(),
-        )]));
+    let engine = crate::diagnostics::DiagnosticEngine::without_loaded_provider_schemas(
+        carina_core::EnvironmentSnapshot::empty(),
+    )
+    .with_provider_errors(std::collections::HashMap::from([(
+        "broken".into(),
+        "not initialized".into(),
+    )]));
     let catalog = engine.catalog_for_document(&doc, Some(&path));
     assert!(!catalog.custom_types_loaded());
     let position = Position::new(6, 10);

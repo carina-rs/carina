@@ -5168,7 +5168,11 @@ let renewed = wait cert {
     until = cert.renewal_summary.renewal_status == aws.acm.Certificate.RenewalStatus.bogus
 }
 "#;
-    let parsed = parse(source, &ProviderContext::default()).expect("fixture must parse");
+    let parsed = parse(
+        source,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("fixture must parse");
     let validation = crate::validation::wait::validate_wait_bindings(&parsed, &schemas);
     assert_eq!(validation.len(), 1);
 
@@ -5368,7 +5372,7 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
     )
     .expect("parsed file should be valid");
     let parsed = crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_providerless(
                 crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
@@ -5378,7 +5382,10 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
             .expect("plan fixture crosses the module-resolution seam")
         },
     )
-    .into_expanded(&crate::schema::SchemaRegistry::new())
+    .into_expanded(
+        &crate::schema::SchemaRegistry::new(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
     .expect("plan fixture contains no parser placeholders");
     let provider = HintProvider {
         hints: vec![BindingPattern::Exact("validation_records".to_string())],

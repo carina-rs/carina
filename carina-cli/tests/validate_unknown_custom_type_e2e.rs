@@ -271,6 +271,7 @@ fn validate_and_lsp_reject_custom_value_depends_on_with_same_error() {
             include_generic_arn: false,
         }) as Box<dyn ProviderFactory>]),
         carina_core::schema::SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
     );
     let engine = carina_lsp::diagnostics::DiagnosticEngine::new(
         std::sync::Arc::new(providers),
@@ -280,7 +281,9 @@ fn validate_and_lsp_reject_custom_value_depends_on_with_same_error() {
     let document = carina_lsp::document::Document::new_with_path(
         main.to_string(),
         path.clone(),
-        std::sync::Arc::new(Default::default()),
+        std::sync::Arc::new(carina_core::parser::ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
     );
     let diagnostics = engine.analyze(&document, Some(&path));
     let matching = diagnostics
@@ -312,6 +315,7 @@ fn assert_depends_on_survives_unresolved_argument(
             include_generic_arn: false,
         }) as Box<dyn ProviderFactory>]),
         carina_core::schema::SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
     );
     let engine = carina_lsp::diagnostics::DiagnosticEngine::new(
         std::sync::Arc::new(providers),
@@ -321,7 +325,9 @@ fn assert_depends_on_survives_unresolved_argument(
     let document = carina_lsp::document::Document::new_with_path(
         main,
         path.clone(),
-        std::sync::Arc::new(Default::default()),
+        std::sync::Arc::new(carina_core::parser::ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
     );
     let diagnostics = engine.analyze(&document, Some(&path));
     assert!(

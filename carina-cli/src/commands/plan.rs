@@ -515,7 +515,7 @@ mod provider_scope_evidence_tests {
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers = configs.clone();
         let resolved = carina_core::validation::deferred_types::with_session_for_test(
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
@@ -2930,7 +2930,7 @@ mod schema_fingerprint_tests {
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers = configs;
         let resolved = carina_core::validation::deferred_types::with_session_for_test(
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
@@ -6785,7 +6785,7 @@ mod load_upstream_states_tests {
             &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             dir.path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             UpstreamMissingStatePolicy::Strict,
             ProviderUpstreamScope::All,
         )
@@ -6833,7 +6833,7 @@ mod load_upstream_states_tests {
             &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             dir.path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             UpstreamMissingStatePolicy::Strict,
             ProviderUpstreamScope::All,
         )
@@ -6893,7 +6893,7 @@ mod load_upstream_states_tests {
             &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             temp.path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             UpstreamMissingStatePolicy::Strict,
             ProviderUpstreamScope::ProviderReferences,
         )
@@ -6914,7 +6914,12 @@ mod load_upstream_states_tests {
         let (_temp, downstream, parsed) =
             crate::provider_upstream_test_support::provider_upstream_fixture();
         let mut parsed = parsed
-            .into_expanded(&carina_core::schema::SchemaRegistry::new())
+            .into_expanded(
+                &carina_core::schema::SchemaRegistry::new(),
+                &carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                ),
+            )
             .expect("provider upstream fixture has no parser placeholders");
         parsed.providers[0].attributes.insert(
             "role_arn".to_string(),
@@ -6940,7 +6945,7 @@ mod load_upstream_states_tests {
             &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             &downstream,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             UpstreamMissingStatePolicy::Strict,
             ProviderUpstreamScope::ProviderReferences,
         )
@@ -7004,7 +7009,7 @@ mod load_upstream_states_tests {
             &crate::test_support::TestCommandRuntime::new(),
             &upstream_states,
             base_dir,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &mut HashSet::new(),
             UpstreamMissingStatePolicy::Strict,
         )
@@ -7037,10 +7042,13 @@ mod load_upstream_states_tests {
         let old_backend = carina_core::parser::parse_file(
             r#"backend local { path = "old.state.json" }"#,
             std::path::Path::new("backend.crn"),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .unwrap()
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("backend lock fixture has no parser placeholders")
         .backend
         .unwrap();
@@ -7057,7 +7065,7 @@ mod load_upstream_states_tests {
             &crate::test_support::TestCommandRuntime::new(),
             &upstream_states,
             dir.path().parent().unwrap(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &mut HashSet::new(),
             UpstreamMissingStatePolicy::Strict,
         )
@@ -7107,7 +7115,7 @@ mod load_upstream_states_tests {
             &crate::test_support::TestCommandRuntime::new(),
             &upstream_states,
             dir.path().parent().unwrap(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &mut HashSet::new(),
             UpstreamMissingStatePolicy::Strict,
         )
@@ -7150,7 +7158,7 @@ mod load_upstream_states_tests {
             &crate::test_support::TestCommandRuntime::new(),
             &upstream_states,
             &dir_a,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &mut guard,
             UpstreamMissingStatePolicy::Strict,
         )
@@ -7169,7 +7177,7 @@ mod load_upstream_states_tests {
             &crate::test_support::TestCommandRuntime::new(),
             &upstream_states,
             Path::new("/"),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &mut HashSet::new(),
             UpstreamMissingStatePolicy::Strict,
         )
@@ -7204,7 +7212,7 @@ mod load_upstream_states_tests {
             &crate::test_support::TestCommandRuntime::new(),
             &upstream_states,
             base_dir,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &mut HashSet::new(),
             UpstreamMissingStatePolicy::Strict,
         )
@@ -7244,7 +7252,7 @@ mod load_upstream_states_tests {
             &crate::test_support::TestCommandRuntime::new(),
             &upstream_states,
             base_dir,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &mut HashSet::new(),
             UpstreamMissingStatePolicy::Lenient,
         )
@@ -7322,7 +7330,7 @@ let internal = upstream_state {{ source = '{}' }}"#,
             &crate::test_support::TestCommandRuntime::new(),
             &upstream_states,
             &a_dir,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &mut HashSet::new(),
             UpstreamMissingStatePolicy::Strict,
         )
@@ -7392,7 +7400,7 @@ let back = upstream_state {{ source = '{}' }}"#,
             &crate::test_support::TestCommandRuntime::new(),
             &upstream_states,
             root.path(),
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &mut guard,
             UpstreamMissingStatePolicy::Strict,
         )
@@ -7462,7 +7470,7 @@ exports { region: String = "ap-northeast-1" }"#,
             true,
             false,
             false,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .await
         .expect("run_plan should succeed");
@@ -7476,20 +7484,23 @@ exports { region: String = "ap-northeast-1" }"#,
         // reachable to downstream references.
         let parsed = carina_core::config_loader::load_configuration_with_config(
             &dir_b,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load config")
         .parsed
         .into_parsed()
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .into_expanded(
+            &carina_core::schema::SchemaRegistry::new(),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
         .expect("exports-only fixture has no parser placeholders");
         let mut guard = seed_cycle_guard(&dir_b);
         let bindings = load_upstream_states(
             &runtime,
             &parsed.upstream_states,
             &dir_b,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             &mut guard,
             UpstreamMissingStatePolicy::Strict,
         )
@@ -7572,7 +7583,7 @@ exports { region: String = "ap-northeast-1" }"#,
             true,
             false,
             false,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .await
         .expect("plan must keep unresolved default tags for per-resource normalization");
@@ -7605,7 +7616,9 @@ mod run_plan_out_tests {
             value,
             carina_core::validation::resolve_consumer_static_type_for_signature(
                 &carina_core::parser::TypeExpr::String,
-                &carina_core::parser::ProviderContext::default(),
+                &carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                ),
             ),
             carina_core::parser::ArgumentOrigin::Defaulted,
         )
@@ -7655,7 +7668,7 @@ mod run_plan_out_tests {
             true,
             false,
             false,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .await
         .expect("plan should succeed");
@@ -7699,7 +7712,7 @@ mod run_plan_out_tests {
             true,
             false,
             false,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .await
         .expect_err("an invalid file provider must fail planning")
@@ -7800,7 +7813,7 @@ mod run_plan_out_tests {
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
         let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
@@ -7917,7 +7930,7 @@ mod run_plan_out_tests {
             true,
             false,
             false,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .await
         .expect("plan should resolve provider attributes after name reconciliation");
@@ -7966,7 +7979,7 @@ mod run_plan_out_tests {
             true,
             false,
             false,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .await
         .expect("run_plan should succeed");
@@ -8011,7 +8024,7 @@ mod run_plan_out_tests {
             true,
             false,
             false,
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .await;
 
@@ -8201,7 +8214,7 @@ mod run_plan_out_tests {
         };
 
         let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
@@ -8301,7 +8314,7 @@ mod run_plan_out_tests {
         };
 
         let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
@@ -8371,7 +8384,7 @@ mod run_plan_out_tests {
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
         let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
@@ -8423,7 +8436,7 @@ mod run_plan_out_tests {
         parsed.providers = vec![configured.clone()];
         let parsed = resolve_file_for_test(parsed, tmp.path());
         let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
-            &ProviderContext::default(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,

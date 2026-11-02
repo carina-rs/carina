@@ -272,22 +272,25 @@ mod tests {
             assert_eq!(assignment.clone().require_loaded(), Ok(expected));
             assert_eq!(
                 crate::validation::deferred_types::with_session_for_test(
-                    &crate::parser::ProviderContext::default(),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                     |session| assignment.record_unchecked(session)
                 ),
                 expected
             );
         }
         let unchecked = TypeAssignability::Unchecked(TypeAssignmentDeferral::new(
-            crate::parser::parse_type_expr_str("Arn", &crate::parser::ProviderContext::default())
-                .unwrap(),
+            crate::parser::parse_type_expr_str(
+                "Arn",
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .unwrap(),
         ));
         assert_eq!(
             unchecked.clone().require_loaded(),
             Err(CustomTypeValidationError::ProvidersNotLoaded)
         );
         assert!(crate::validation::deferred_types::with_session_for_test(
-            &crate::parser::ProviderContext::default(),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| unchecked.record_unchecked(session)
         ));
     }

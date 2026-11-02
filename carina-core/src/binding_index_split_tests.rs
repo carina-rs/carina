@@ -42,10 +42,13 @@ fn updating_changed_iterable_defers_missing_element_output() {
             mock.test.Target { name = r.id }
         }
         "#,
-        &ProviderContext::default(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("parse deferred loop")
-    .into_expanded(&crate::schema::SchemaRegistry::new())
+    .into_expanded(
+        &crate::schema::SchemaRegistry::new(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
     .expect("expand parser placeholders");
     let desired_rules = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
         ConcreteValue::Map(IndexMap::from([("name".into(), s("new-rule"))])),
@@ -79,7 +82,7 @@ fn updating_changed_iterable_defers_missing_element_output() {
     );
 
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             parsed.expand_deferred_for_expressions(&bindings.project_iterable_bindings(), session)
         },

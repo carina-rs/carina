@@ -1007,7 +1007,9 @@ mod tests {
         check_type_expr_value_inner(
             expected,
             value,
-            TypecheckProviderContext::for_parser(&ProviderContext::default()),
+            TypecheckProviderContext::for_parser(&ProviderContext::new(
+                crate::EnvironmentSnapshot::empty(),
+            )),
             TypecheckInference::Unavailable,
         )
         .require_provider_schemas()
@@ -1085,7 +1087,7 @@ mod tests {
 
     #[test]
     fn nested_checks_preserve_deferral_without_hiding_sibling_mismatches() {
-        let config = ProviderContext::default();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let unknown = crate::parser::parse_type_expr_str("Count", &config).unwrap();
         let check = |expected: &TypeExpr, value: &Value| {
             check_type_expr_value_providerless(
@@ -1131,8 +1133,11 @@ mod tests {
 
     #[test]
     fn unloaded_declaration_scalar_kind_is_a_typed_outcome() {
-        let annotation =
-            crate::parser::parse_type_expr_str("Count", &ProviderContext::default()).unwrap();
+        let annotation = crate::parser::parse_type_expr_str(
+            "Count",
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         let declaration = super::super::lift_type_expr(&annotation).unwrap();
         assert!(
             matches!(crate::provider::identified_custom_type_scalar_kind(&declaration), Err(unloaded) if unloaded.identity() == &TypeIdentity::bare("Count"))
@@ -1141,7 +1146,7 @@ mod tests {
 
     #[test]
     fn providerless_bare_annotation_defers_literal_validation() {
-        let config = ProviderContext::default();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let expected = crate::parser::parse_type_expr_str("Count", &config).unwrap();
         let value = Value::Concrete(ConcreteValue::Int(3));
         let unloaded = check_type_expr_value_inner(
@@ -1167,7 +1172,7 @@ mod tests {
 
     #[test]
     fn providerless_unloaded_annotation_rejects_non_scalar_values() {
-        let config = ProviderContext::default();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let expected = crate::parser::parse_type_expr_str("AwsAccountId", &config).unwrap();
         for value in [
             Value::Concrete(ConcreteValue::Bool(true)),
@@ -1200,15 +1205,17 @@ mod tests {
 
     #[test]
     fn check_type_expr_value_providerless_with_loaded_catalog_rejects_unloaded_typo() {
-        let expected =
-            crate::parser::parse_type_expr_str("UndeclaredAccountId", &ProviderContext::default())
-                .unwrap();
+        let expected = crate::parser::parse_type_expr_str(
+            "UndeclaredAccountId",
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         let config = ProviderContext {
             custom_types: crate::parser::ProviderCustomTypes::loaded(
                 Default::default(),
                 Box::new(|_, _| panic!("providerless checking must not validate")),
             ),
-            ..ProviderContext::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         };
         let result = check_type_expr_value_providerless(
             &expected,
@@ -1233,8 +1240,11 @@ mod tests {
 
     #[test]
     fn providerless_union_preserves_a_deferred_member() {
-        let unknown =
-            crate::parser::parse_type_expr_str("Count", &ProviderContext::default()).unwrap();
+        let unknown = crate::parser::parse_type_expr_str(
+            "Count",
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
         let expected = TypeExpr::Union(vec![TypeExpr::Bool, unknown]);
         providerless_check(&expected, &Value::Concrete(ConcreteValue::Int(3)))
             .expect("an unresolved union member cannot prove a mismatch");
@@ -1286,7 +1296,7 @@ mod tests {
 
     #[test]
     fn inferred_schema_identity_widening_is_independent_of_catalog_state() {
-        let config = ProviderContext::default();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let variants = |name| {
             let identity = TypeIdentity::from_dotted(name);
             [
@@ -1329,7 +1339,7 @@ mod tests {
     fn unloaded_nominal_type_cannot_be_a_validation_declaration() {
         let annotation = crate::parser::resolve_custom_type_identity(
             &TypeIdentity::bare("Count"),
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap()
         .unwrap();
@@ -1439,7 +1449,7 @@ mod tests {
     fn providerless_unloaded_annotation_defers_while_strict_check_requires_providers() {
         let expected = crate::parser::bare_type_for_test("account_id".to_string());
         let value = string("account-123");
-        let config = ProviderContext::default();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
 
         let unloaded = check_type_expr_value_inner(
             &expected,
@@ -1480,7 +1490,7 @@ mod tests {
 
     fn providerless_check(expected: &TypeExpr, value: &Value) -> Result<(), TypeExprValueError> {
         crate::validation::deferred_types::with_session_for_test(
-            &ProviderContext::default(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 TypecheckProviderContext::for_session(session).check(
                     expected,
@@ -1801,7 +1811,7 @@ mod tests {
                     })
                 }),
             ),
-            ..ProviderContext::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         };
 
         let invalid = string("wrong");
@@ -1895,7 +1905,7 @@ mod tests {
                     Ok(())
                 }),
             ),
-            ..ProviderContext::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         };
         let schema_type = TypeExpr::SchemaType {
             owned: crate::parser::OwnedTypeIdentity::provider(
@@ -1935,7 +1945,7 @@ mod tests {
                     }
                 }),
             ),
-            ..ProviderContext::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         };
 
         for expected in [
@@ -2011,7 +2021,7 @@ mod tests {
                         })
                 }),
             ),
-            ..ProviderContext::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         };
         let ty = |provider: &str| TypeExpr::SchemaType {
             owned: crate::parser::OwnedTypeIdentity::provider(
@@ -2103,7 +2113,7 @@ mod tests {
                     Ok(())
                 }),
             ),
-            ..ProviderContext::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         };
         let value = Value::Concrete(ConcreteValue::String("enabled".into()));
 

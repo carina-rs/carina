@@ -114,7 +114,7 @@ mod tests {
         ProviderContext {
             decryptor: Some(decrypt_fn),
             resource_types: Default::default(),
-            ..ProviderContext::default()
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         }
     }
 
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn decrypt_without_decryptor_returns_error() {
-        let config = ProviderContext::default();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
 
         let args = vec![Value::Concrete(ConcreteValue::String("AQICAHh".into()))];
         let result = evaluate_builtin_with_config("decrypt", &args, &config);
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn decrypt_error_on_no_args() {
-        let config = ProviderContext::default();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let args: Vec<Value> = vec![];
         let result = evaluate_builtin_with_config("decrypt", &args, &config);
         assert!(result.is_err());
@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn decrypt_error_on_too_many_args() {
-        let config = ProviderContext::default();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let args = vec![
             Value::Concrete(ConcreteValue::String("a".into())),
             Value::Concrete(ConcreteValue::String("b".into())),
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn decrypt_error_on_non_string_ciphertext() {
-        let config = ProviderContext::default();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let args = vec![Value::Concrete(ConcreteValue::Int(42))];
         let result = evaluate_builtin_with_config("decrypt", &args, &config);
         assert!(result.is_err());
@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn decrypt_error_on_non_string_key() {
-        let config = ProviderContext::default();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let args = vec![
             Value::Concrete(ConcreteValue::String("cipher".into())),
             Value::Concrete(ConcreteValue::Int(42)),

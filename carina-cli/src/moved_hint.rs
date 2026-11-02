@@ -1051,7 +1051,7 @@ mod tests {
             let parsed = parse_file(
                 &source,
                 Path::new("moved-hint-round-trip.crn"),
-                &ProviderContext::default(),
+                &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             )
             .unwrap_or_else(|error| panic!("rendered block did not parse:\n{block}\n{error}"));
             assert!(

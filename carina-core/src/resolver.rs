@@ -4252,7 +4252,7 @@ mod runtime_provider_type_tests {
             let mut parsed = parse_file(
                 source,
                 std::path::Path::new("/project/functions.crn"),
-                &ProviderContext::default(),
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .unwrap();
             let mut function = parsed.user_functions.remove("f").unwrap();
@@ -4277,7 +4277,7 @@ mod runtime_provider_type_tests {
                         ))
                     }),
                 ),
-                ..Default::default()
+                ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
             };
             let error =
                 crate::validation::deferred_types::with_session_for_test(&loaded, |session| {
@@ -4289,7 +4289,7 @@ mod runtime_provider_type_tests {
                 custom_types: loaded
                     .custom_types
                     .with_failed_providers(std::collections::BTreeSet::from(["broken".into()])),
-                ..Default::default()
+                ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
             };
             let error =
                 crate::validation::deferred_types::with_session_for_test(&partial, |session| {
@@ -4299,7 +4299,7 @@ mod runtime_provider_type_tests {
             assert!(error.to_string().contains("rejected by ready"), "{error}");
 
             let result = crate::validation::deferred_types::TypeCheckSession::run(
-                &ProviderContext::default(),
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 |unloaded| {
                     evaluate_runtime_user_function(&function, &arguments, &bindings, unloaded, 8)
                         .unwrap();

@@ -8709,6 +8709,7 @@ mod tests {
         let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
             Arc::new(Vec::new()),
             schemas.clone(),
+            carina_core::EnvironmentSnapshot::empty(),
         );
         carina_core::validation::deferred_types::with_session_for_test_async(
             provider_types.provider_context(),
@@ -8838,6 +8839,7 @@ mod tests {
         let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
             Arc::new(Vec::new()),
             schemas.clone(),
+            carina_core::EnvironmentSnapshot::empty(),
         );
         carina_core::validation::deferred_types::with_session_for_test_async(
             provider_types.provider_context(),

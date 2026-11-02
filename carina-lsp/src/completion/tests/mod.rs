@@ -23,7 +23,12 @@ impl CompletionProvider {
 }
 
 pub(super) fn create_document(content: &str) -> Document {
-    Document::new(content.to_string(), Arc::new(ProviderContext::default()))
+    Document::new(
+        content.to_string(),
+        Arc::new(ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
+    )
 }
 
 pub(super) fn find_completion<'a>(
@@ -483,6 +488,7 @@ pub(super) fn create_enum_shadow_document(content: &str) -> Document {
     Document::new(
         content.to_string(),
         Arc::new(ProviderContext {
+            environment: carina_core::EnvironmentSnapshot::empty(),
             decryptor: None,
             custom_types,
             resource_types,

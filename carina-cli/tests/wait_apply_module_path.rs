@@ -313,7 +313,7 @@ fn fixture(name: &str) -> PathBuf {
 #[test]
 fn apply_path_propagates_module_wait_binding() {
     let caller = fixture("caller");
-    let provider_context = ProviderContext::default();
+    let provider_context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
 
     // --- exactly run_apply's load+resolve+expand sequence ---
     let loaded = load_configuration_with_config(
@@ -439,7 +439,7 @@ fn apply_path_propagates_module_wait_binding() {
 #[test]
 fn full_validation_accepts_expanded_module_internal_wait_target() {
     let caller = fixture("caller");
-    let provider_context = ProviderContext::default();
+    let provider_context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
     let loaded = load_configuration_with_config(
         &caller,
         &provider_context,
@@ -510,7 +510,7 @@ impl ExecutionObserver for CollectingObserver {
 /// (failure_count, skip_count, failure messages).
 async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>) {
     let caller = fixture("caller");
-    let provider_context = ProviderContext::default();
+    let provider_context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
 
     let loaded = load_configuration_with_config(
         &caller,
