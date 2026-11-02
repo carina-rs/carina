@@ -516,6 +516,8 @@ pub struct StateFile {
     /// expanded-graph classifier can clear them and make the file writable.
     legacy_dependencies: BTreeMap<ResolvedResourceId, LegacyRowDependencies>,
     dependency_encoding: DependencyEncoding,
+    /// Loaded field order; typed values and lifecycle state remain authoritative.
+    wire_order: Option<carina_core::json_field_order::JsonFieldOrder>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -550,7 +552,7 @@ impl Serialize for StateFile {
                 "pre-v21 dependency names require configuration-aware migration before state can be written",
             ));
         }
-        WritableStateFile {
+        let wire = WritableStateFile {
             version: self.version,
             exports_version_marker: self.exports_version_marker,
             serial: self.serial,
@@ -558,8 +560,11 @@ impl Serialize for StateFile {
             carina_version: &self.carina_version,
             resources: &self.resources,
             exports: &self.exports,
+        };
+        match &self.wire_order {
+            Some(order) => order.serialize(&wire, serializer),
+            None => wire.serialize(serializer),
         }
-        .serialize(serializer)
     }
 }
 
@@ -1070,6 +1075,10 @@ impl StateFile {
             .collect();
         let state = Self {
             version: unchecked.version,
+            wire_order: Some(
+                carina_core::json_field_order::JsonFieldOrder::from_json_str(content)
+                    .map_err(StateFileDecodeError::json_at_root)?,
+            ),
             exports_version_marker: CurrentExportsVersion,
             serial: unchecked.serial,
             lineage: unchecked.lineage,
@@ -1152,6 +1161,7 @@ impl StateFile {
             exports: HashMap::new(),
             legacy_dependencies: BTreeMap::new(),
             dependency_encoding: DependencyEncoding::Current,
+            wire_order: None,
         }
     }
 
@@ -1209,6 +1219,7 @@ impl StateFile {
             lineage,
             legacy_dependencies: BTreeMap::new(),
             dependency_encoding: DependencyEncoding::Current,
+            wire_order: None,
             carina_version: env!("CARGO_PKG_VERSION").to_string(),
             resources: Vec::new(),
             exports: HashMap::new(),

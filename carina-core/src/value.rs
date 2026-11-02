@@ -2826,7 +2826,7 @@ fn canonical_secret_template<P: PlaceholderKind>(
         ),
         Value::Deferred(DeferredValue::Placeholder(placeholder)) => tagged(
             "placeholder",
-            serde_json::to_value(placeholder).map_err(|_| {
+            placeholder.secret_hash_material().map_err(|_| {
                 SerializationError::SecretNotAllowed {
                     context: SerializationContext::SecretRedaction,
                 }
@@ -3334,7 +3334,9 @@ impl SecretShapeProjectionMode {
         value: &Value<P>,
         shape: &Value<Q>,
     ) -> Value<P> {
-        if matches!(shape, Value::Deferred(DeferredValue::Secret(_))) {
+        if matches!(shape, Value::Deferred(DeferredValue::Secret(_)))
+            || matches!(shape, Value::Deferred(DeferredValue::Placeholder(leaf)) if leaf.redacted_secret_hash().is_some())
+        {
             return Value::Deferred(DeferredValue::Secret(Box::new(value.clone())));
         }
 
@@ -3363,7 +3365,10 @@ fn project_secret_shape<P: ValueKind, Q: ValueKind>(
     shape: &Value<Q>,
     mode: SecretShapeProjectionMode,
 ) -> Value<P> {
-    if mode.preserves_secret_value() && matches!(value, Value::Deferred(DeferredValue::Secret(_))) {
+    if mode.preserves_secret_value()
+        && (matches!(value, Value::Deferred(DeferredValue::Secret(_)))
+            || matches!(value, Value::Deferred(DeferredValue::Placeholder(leaf)) if leaf.redacted_secret_hash().is_some()))
+    {
         return value.clone();
     }
     if !contains_secret(shape) {
@@ -3769,13 +3774,15 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
             } else {
                 saved_expression.rhs().to_value_at("saved plan.rhs")?
             };
-            saved_expression
-                .clone()
-                .try_map_stage(|value| value.to_value_at("saved plan.arithmetic"))?
-                .rebuild(lhs, rhs)
-                .map(DeferredValue::IntegerArithmetic)
-                .map(Value::Deferred)
-                .map_err(|_| SecretRehydrationError::ShapeMismatch)
+            crate::integer_arithmetic::ValidatedIntegerExpr::from_post_validation(
+                lhs,
+                saved_expression.op(),
+                rhs,
+                saved_expression.operator_span(),
+            )
+            .map(DeferredValue::IntegerArithmetic)
+            .map(Value::Deferred)
+            .map_err(|_| SecretRehydrationError::ShapeMismatch)
         }
         _ => Err(SecretRehydrationError::ShapeMismatch),
     }
@@ -7033,6 +7040,29 @@ mod tests {
             serde_json::Value::String(slot.to_string()),
             "display wording must not determine secret hashes"
         );
+    }
+
+    #[test]
+    fn loop_slot_secret_material_and_saved_plan_wire_keep_distinct_tags() {
+        for (slot, identity, wire_tag) in [
+            (LoopSlot::Key, "Key", "ForKey"),
+            (LoopSlot::Index, "Index", "ForIndex"),
+            (LoopSlot::Value, "Value", "ForValue"),
+        ] {
+            let value = LoopValue::Deferred(LoopDeferredValue::Placeholder(slot));
+            let material = canonical_secret_hash_material(&value).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&material).unwrap(),
+                serde_json::json!({"kind": "placeholder", "value": identity}),
+            );
+            let encoded = serde_json::to_value(&value).unwrap();
+            assert_eq!(encoded, serde_json::json!({"Unknown": wire_tag}));
+            let decoded: LoopValue = serde_json::from_value(encoded).unwrap();
+            assert!(matches!(
+                decoded,
+                LoopValue::Deferred(LoopDeferredValue::Placeholder(decoded)) if decoded == slot
+            ));
+        }
     }
 
     #[test]

@@ -1618,9 +1618,7 @@ impl PersistedAttributes {
 
     /// Return the opaque hash for a top-level persisted secret attribute.
     pub fn redacted_secret_hash(&self, key: &str) -> Option<crate::resource::RedactedSecretHash> {
-        match self.get(key)? {
-            _ => None,
-        }
+        self.encoded.get(key)?.view().redacted_secret_hash()
     }
 
     /// Return ordinary persisted string attributes for identity-prefix

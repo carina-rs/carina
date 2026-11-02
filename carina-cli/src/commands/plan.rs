@@ -1056,12 +1056,32 @@ struct ProviderEvidence {
 /// format 32. Format 29 persists anonymous-loop provenance, typed deferred-loop
 /// targets, and Move origins. Provider evidence is validated both when
 /// recording and when decoding a saved plan.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(into = "PlanFileWire", try_from = "PlanFileWire")]
+#[derive(Debug, Clone)]
 pub struct PlanFile {
     contents: UnresolvedPlanFileContents,
     evidence: ProviderEvidence,
     persisted_directive_changes: Vec<PersistedDirectiveChange>,
+    wire_order: Option<carina_core::json_field_order::JsonFieldOrder>,
+}
+
+impl Serialize for PlanFile {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let wire = PlanFileWire::from(self.clone());
+        match &self.wire_order {
+            Some(order) => order.serialize(&wire, serializer),
+            None => wire.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PlanFile {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut order = carina_core::json_field_order::JsonFieldOrder::default();
+        let wire: PlanFileWire = order.deserialize(deserializer)?;
+        let mut plan = Self::try_from(wire).map_err(serde::de::Error::custom)?;
+        plan.wire_order = Some(order);
+        Ok(plan)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1080,7 +1100,13 @@ impl PlanFile {
         let wire: PlanFileWire = serde_path_to_error::deserialize(&mut deserializer)
             .map_err(PlanFileJsonError::from_path_error)?;
         deserializer.end().map_err(PlanFileJsonError::at_root)?;
-        Self::try_from(wire).map_err(|error| PlanFileDecodeError::ProviderEvidence(Box::new(error)))
+        let mut plan = Self::try_from(wire)
+            .map_err(|error| PlanFileDecodeError::ProviderEvidence(Box::new(error)))?;
+        plan.wire_order = Some(
+            carina_core::json_field_order::JsonFieldOrder::from_json_slice(bytes)
+                .map_err(PlanFileJsonError::at_root)?,
+        );
+        Ok(plan)
     }
 }
 
@@ -1503,6 +1529,7 @@ impl From<PlanFile> for PlanFileWire {
             contents,
             evidence,
             persisted_directive_changes,
+            wire_order: _,
         } = plan_file;
         let PlanFileContents {
             version,
@@ -1635,6 +1662,7 @@ impl TryFrom<PlanFileWire> for PlanFile {
             contents,
             evidence,
             persisted_directive_changes,
+            wire_order: None,
         })
     }
 }
@@ -1711,6 +1739,7 @@ impl PlanFileContents {
             contents: saved.into(),
             evidence,
             persisted_directive_changes,
+            wire_order: None,
         })
     }
 }
@@ -1742,6 +1771,7 @@ impl UnresolvedPlanFileContents {
             contents: self,
             evidence,
             persisted_directive_changes,
+            wire_order: None,
         })
     }
 }
@@ -2158,6 +2188,7 @@ impl PlanFile {
             mut contents,
             evidence,
             persisted_directive_changes,
+            wire_order: _,
         } = self;
         let moved_origins = MovedOrigins::from_unresolved_plan(&contents.plan);
         let planned_removals: HashSet<_> = contents

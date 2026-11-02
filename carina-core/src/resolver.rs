@@ -613,6 +613,71 @@ fn missing_access(error: &ValueAccessError) -> bool {
     )
 }
 
+enum HistoricalSelectionError {
+    Access(ValueAccessError),
+    Resolution(ResolutionError),
+}
+
+/// Resolve ordinary expressions before applying access steps, as for live
+/// bindings. If a hash blocks whole-attribute conversion, select the requested
+/// subtree first so unrelated historical evidence remains opaque.
+fn resolve_historical_selection<P: PlaceholderKind, B: BindingAddress>(
+    attribute: &crate::resource::SnapshotValue<P, B>,
+    path: &crate::resource::AccessPath<B>,
+    bindings: &ResolvedBindings<P, B>,
+    config: RuntimeContext<'_>,
+    policy: AccessMissPolicy,
+    require_fully_resolved: bool,
+) -> Result<Option<Value<P, B>>, HistoricalSelectionError> {
+    let root_path = format!("{}.{}", path.binding(), path.attribute());
+    // Find the first selectable subtree that can cross the checked conversion.
+    // Resolve its live expressions before applying the remaining access steps.
+    // In particular, a hash sibling must not change deferral behavior beneath
+    // an ordinary child selected from the same historical container.
+    let mut selected_segments = 0;
+    let selected = loop {
+        match attribute.select_path(&path.segments()[..selected_segments], &root_path, policy) {
+            Ok(value) => break value,
+            Err(crate::resource::SnapshotSelectionError::UnavailableSecret(_))
+                if selected_segments < path.segments().len() =>
+            {
+                selected_segments += 1;
+            }
+            Err(crate::resource::SnapshotSelectionError::UnavailableSecret(error)) => {
+                return Err(HistoricalSelectionError::Resolution(error.into()));
+            }
+            Err(crate::resource::SnapshotSelectionError::Access(error)) => {
+                return Err(HistoricalSelectionError::Access(error));
+            }
+            Err(crate::resource::SnapshotSelectionError::DeferredMiss(_)) => return Ok(None),
+        }
+    };
+    let mut resolved = resolve_ref_value_inner(&selected, bindings, config)
+        .map_err(HistoricalSelectionError::Resolution)?;
+    if require_fully_resolved && !resolved.is_fully_resolved() {
+        return Ok(None);
+    }
+    for segment in &path.segments()[selected_segments..] {
+        resolved =
+            match crate::resource::apply_value_path_segment(resolved, segment.clone(), 0, policy) {
+                Ok(ValuePathSegmentResult::Resolved(next)) => {
+                    resolve_ref_value_inner(&next, bindings, config)
+                        .map_err(HistoricalSelectionError::Resolution)?
+                }
+                Ok(
+                    ValuePathSegmentResult::Deferred(_) | ValuePathSegmentResult::DeferredMiss(_),
+                ) => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(HistoricalSelectionError::Access(error)),
+            };
+        if require_fully_resolved && !resolved.is_fully_resolved() {
+            return Ok(None);
+        }
+    }
+    Ok(Some(resolved))
+}
+
 fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &ResolvedBindings<P, B>,
@@ -665,33 +730,31 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
                 return Ok(ValueResolution::Unknown(value.clone()));
             }
 
-            let selected = attribute.select_path(
-                path.segments(),
-                &format!("{}.{}", path.binding(), path.attribute()),
+            let selected = resolve_historical_selection(
+                attribute,
+                path,
+                bindings,
+                config,
                 AccessMissPolicy::Error,
+                true,
             );
             let selected = match selected {
-                Ok(value) => value,
-                Err(crate::resource::SnapshotSelectionError::Access(error))
+                Ok(Some(value)) => value,
+                Ok(None) => return Ok(ValueResolution::Unknown(value.clone())),
+                Err(HistoricalSelectionError::Access(error))
                     if missing_access(&error) && absence_is_definitive =>
                 {
                     return Ok(ValueResolution::Absent);
                 }
-                Err(crate::resource::SnapshotSelectionError::Access(error))
-                    if missing_access(&error) =>
-                {
+                Err(HistoricalSelectionError::Access(error)) if missing_access(&error) => {
                     return Ok(ValueResolution::Unknown(value.clone()));
                 }
-                Err(crate::resource::SnapshotSelectionError::DeferredMiss(_)) => {
-                    return Ok(ValueResolution::Unknown(value.clone()));
+                Err(HistoricalSelectionError::Access(error)) => {
+                    return Err(error.format_for_path(&path.to_string()).into());
                 }
-                Err(error) => return Err(error.into()),
+                Err(HistoricalSelectionError::Resolution(error)) => return Err(error),
             };
-            let resolved = resolve_ref_value_inner(&selected, bindings, config)?;
-            if !resolved.is_fully_resolved() {
-                return Ok(ValueResolution::Unknown(value.clone()));
-            }
-            Ok(ValueResolution::Present(resolved))
+            Ok(ValueResolution::Present(selected))
         }
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             let Some(attributes) = bindings.get(binding.as_str()) else {
@@ -1067,19 +1130,21 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                 && let Some(attr_value) = attrs.get(attribute_name)
             {
                 let miss_policy = binding_access_miss_policy(binding_name, bindings);
-                let selected = match attr_value.select_path(
-                    path.segments(),
-                    &format!("{}.{}", path.binding(), path.attribute()),
+                return match resolve_historical_selection(
+                    attr_value,
+                    path,
+                    bindings,
+                    config,
                     miss_policy,
+                    false,
                 ) {
-                    Ok(value) => value,
-                    Err(crate::resource::SnapshotSelectionError::DeferredMiss(_)) => {
-                        return Ok(value.clone());
+                    Ok(Some(selected)) => Ok(selected),
+                    Ok(None) => Ok(value.clone()),
+                    Err(HistoricalSelectionError::Access(error)) => {
+                        Err(error.format_for_path(&path.to_string()).into())
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(HistoricalSelectionError::Resolution(error)) => Err(error),
                 };
-                let resolved = resolve_ref_value_inner(&selected, bindings, config)?;
-                return Ok(resolved);
             }
             // Keep as-is if not found
             Ok(value.clone())
@@ -2659,6 +2724,50 @@ mod tests {
             resolved, ref_value,
             "Secret(ResourceRef) projection must keep the outer ref unchanged"
         );
+    }
+
+    #[test]
+    fn test_resolve_unresolved_secret_projection_with_hashed_sibling_stays_deferred() {
+        use crate::resource::SnapshotValue;
+
+        let hash = crate::value::redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "unrelated secret".into(),
+            ))),
+        )))
+        .unwrap();
+        let pending = Value::Deferred(DeferredValue::Secret(Box::new(Value::root_resource_ref(
+            "missing",
+            "x",
+            vec![],
+        ))));
+        let historical = SnapshotValue::Concrete(crate::resource::ConcreteValue::Map(
+            indexmap::IndexMap::from([
+                ("hash".into(), hash),
+                ("pending".into(), pending.to_snapshot()),
+            ]),
+        ));
+        let mut bindings = ResolvedBindings::default();
+        bindings.set_historical_with_completeness(
+            "h",
+            HashMap::from([("creds".into(), historical)]),
+            crate::binding_index::BindingValueSource::Local,
+            BindingCompleteness::Incomplete,
+        );
+        let reference = Value::Deferred(DeferredValue::ResourceRef {
+            path: crate::resource::AccessPath::root_with_fields_and_subscripts(
+                "h",
+                "creds",
+                vec!["pending".into()],
+                vec![crate::resource::Subscript::Str { key: "k".into() }],
+            ),
+        });
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&reference, &bindings, session),
+        )
+        .unwrap();
+        assert_eq!(resolved, reference);
     }
 
     #[test]

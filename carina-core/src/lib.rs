@@ -30,6 +30,8 @@ pub mod heredoc;
 pub mod hint;
 pub mod identifier;
 pub mod integer_arithmetic;
+#[doc(hidden)]
+pub mod json_field_order;
 pub mod keywords;
 pub mod lint;
 pub mod module;

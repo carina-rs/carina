@@ -224,7 +224,7 @@ impl<P: ValueKind, B: BindingAddress> ValidatedIntegerExpr<P, B> {
         })
     }
 
-    fn from_post_validation(
+    pub(crate) fn from_post_validation(
         lhs: Value<P, B>,
         op: IntegerOp,
         rhs: Value<P, B>,
