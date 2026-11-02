@@ -2872,7 +2872,8 @@ pub fn reject_secret_in_saved_plan_field(
 enum SecretRedactionGuide<'a> {
     Evaluated(&'a Value),
     SecretShape(&'a Value),
-    /// The redacted guide classifies provider/historical plaintext as secret.
+    /// Hashes and live `Secret` wrappers in the snapshot guide classify
+    /// provider/historical plaintext as secret.
     RedactedShape(&'a SnapshotValue),
     /// The source value is authoritative for secret semantics; the redacted
     /// guide supplies only a same-path digest that may be reused.
@@ -2916,6 +2917,7 @@ impl<'a> SecretRedactionGuide<'a> {
         match self {
             Self::Evaluated(Value::Deferred(DeferredValue::Secret(_)))
             | Self::SecretShape(Value::Deferred(DeferredValue::Secret(_)))
+            | Self::RedactedShape(Value::Deferred(DeferredValue::Secret(_)))
             | Self::RedactedShape(Value::Deferred(DeferredValue::Placeholder(
                 SnapshotLeaf::RedactedSecret { .. },
             ))) => true,
@@ -4370,8 +4372,23 @@ pub fn redact_secrets_in_effect<S: Clone>(
         |_, value| redact_secrets_in_value(value),
         redact_deferred_template,
     )?;
-    if let crate::effect::Effect::Update { from, .. } = &mut redacted {
-        **from = redact_secrets_in_state(from)?;
+    match &mut redacted {
+        crate::effect::Effect::Update { from, .. } => {
+            **from = redact_secrets_in_state(from)?;
+        }
+        crate::effect::Effect::ReleaseListKeys { keys, .. } => {
+            *keys = crate::effect::ReleasedListKeys::try_new(
+                keys.iter()
+                    .map(|key| {
+                        redact_snapshot_secrets(key.retained_value()).map(|retained| {
+                            crate::effect::ReleasedListKey::new(key.key(), retained)
+                        })
+                    })
+                    .collect::<Result<_, _>>()?,
+            )
+            .expect("redaction preserves non-empty unique release keys");
+        }
+        _ => {}
     }
     Ok(redacted)
 }
@@ -4477,20 +4494,17 @@ pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
                         *value = redact_using_redacted_shape(value, shape)?;
                     }
                 } else if let Some(guide) = planned_resources.get(&from.id) {
-                    **from = if reusable_resource(&from.id).is_some() {
-                        let attributes = redact_attrs_with_guide(
-                            from.attributes.iter(),
-                            |key, value| match guide.attributes.get(key) {
-                                Some(shape) => redact_using_redacted_shape(value, shape),
-                                None => redact_snapshot_secrets(value),
-                            },
-                        )?;
-                        crate::resource::State {
-                            attributes,
-                            ..from.as_ref().clone()
-                        }
-                    } else {
-                        redact_secrets_in_state(from)?
+                    let attributes =
+                        redact_attrs_with_guide(from.attributes.iter(), |key, value| match guide
+                            .attributes
+                            .get(key)
+                        {
+                            Some(shape) => redact_using_redacted_shape(value, shape),
+                            None => redact_snapshot_secrets(value),
+                        })?;
+                    **from = crate::resource::State {
+                        attributes,
+                        ..from.as_ref().clone()
                     };
                 }
             }
@@ -6937,6 +6951,138 @@ mod tests {
 
     type LoopValue = crate::resource::Value<LoopSlot>;
     type LoopDeferredValue = crate::resource::DeferredValue<LoopSlot>;
+
+    #[test]
+    fn saved_plan_update_from_uses_hash_free_snapshot_secret_shape() {
+        use crate::effect::Effect;
+        use crate::resource::{ExpandedResource as Resource, ResolvedResource, SnapshotState};
+
+        let previous = Value::Concrete(ConcreteValue::String("previous-private-token".into()));
+        let desired = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("desired-private-token".into()),
+        ))));
+        let public = Value::Concrete(ConcreteValue::String("public-value".into()));
+        for (plaintext, secret_shape) in [
+            (previous.clone(), desired.clone()),
+            (
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    ("token".into(), previous.clone()),
+                    ("public".into(), public.clone()),
+                ]))),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    ("token".into(), desired.clone()),
+                    ("public".into(), public.clone()),
+                ]))),
+            ),
+            (
+                Value::Concrete(ConcreteValue::List(vec![previous, public.clone()])),
+                Value::Concrete(ConcreteValue::List(vec![desired, public.clone()])),
+            ),
+        ] {
+            let resource =
+                Resource::new("mock.Secret", "example").with_attribute("settings", secret_shape);
+            let guide = resource.to_snapshot();
+            assert!(!guide.attributes.values().any(contains_redacted_secret));
+            let current = SnapshotState::existing(
+                resource.id.clone(),
+                HashMap::from([
+                    ("settings".into(), plaintext.to_snapshot()),
+                    ("ordinary".into(), public.to_snapshot()),
+                ]),
+            );
+            let planned_resources = HashMap::from([(resource.id.clone(), guide)]);
+            let mut plan = crate::plan::Plan::new();
+            plan.add(Effect::Update {
+                from: Box::new(current),
+                identifier: crate::effect::fixture_applied_identifier("example-id"),
+                to: ResolvedResource::new(resource.with_dependency_phase(())),
+                changed_attributes: vec!["settings".into()],
+            });
+
+            let saved = redact_secrets_in_plan_with_desired_and_historical(
+                &plan,
+                &planned_resources,
+                &HashMap::new(),
+            )
+            .expect("hash-free snapshot guides must preserve their sensitivity shape");
+            let serialized = serde_json::to_string(&saved).expect("serialize redacted saved plan");
+            assert!(
+                !serialized.contains("previous-private-token"),
+                "{serialized}"
+            );
+            assert!(
+                !serialized.contains("desired-private-token"),
+                "{serialized}"
+            );
+            let Effect::Update { from, .. } = &saved.effects()[0] else {
+                panic!("redacted update");
+            };
+            assert!(contains_redacted_secret(&from.attributes["settings"]));
+            assert_eq!(from.attributes["ordinary"], public.to_snapshot());
+        }
+    }
+
+    #[test]
+    fn saved_plan_release_list_keys_redacts_nested_retained_secrets() {
+        use crate::effect::{Effect, ReleasedListKey, ReleasedListKeys};
+        use crate::resource::{ExpandedResource as Resource, ResolvedResourceId};
+
+        let root = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("retained-root-private-token".into()),
+        ))));
+        let nested = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("retained-nested-private-token".into()),
+        ))));
+        let public = Value::Concrete(ConcreteValue::String("retained-public-value".into()));
+        let retained = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "nested".into(),
+                Value::Concrete(ConcreteValue::List(vec![nested])),
+            ),
+            ("public".into(), public.clone()),
+        ])));
+        let existing_hash = redact_secrets_in_value(&root).unwrap();
+        let effect: Effect = Effect::ReleaseListKeys {
+            id: ResolvedResourceId::new(Resource::new("mock.Secret", "example").id),
+            attribute: "settings".into(),
+            key_field: crate::schema::FieldName::declared("name"),
+            keys: ReleasedListKeys::try_new(vec![
+                ReleasedListKey::new("root", root.to_snapshot()),
+                ReleasedListKey::new("nested", retained.to_snapshot()),
+                ReleasedListKey::new("hashed", existing_hash.clone()),
+            ])
+            .unwrap(),
+        };
+
+        let redacted = redact_secrets_in_effect(&effect).expect("redact retained snapshot values");
+        let serialized = serde_json::to_string(&redacted)
+            .expect("every retained secret must be hashed before effect serialization");
+        assert!(!serialized.contains("retained-root-private-token"));
+        assert!(!serialized.contains("retained-nested-private-token"));
+        let Effect::ReleaseListKeys { keys, .. } = &redacted else {
+            panic!("redacted release");
+        };
+        assert_eq!(
+            keys.iter().map(ReleasedListKey::key).collect::<Vec<_>>(),
+            ["root", "nested", "hashed"]
+        );
+        assert!(
+            keys.iter()
+                .all(|key| contains_redacted_secret(key.retained_value()))
+        );
+        assert_eq!(keys[2].retained_value(), &existing_hash);
+        assert_eq!(
+            keys[1].retained_value().get("public"),
+            Some(&public.to_snapshot())
+        );
+
+        let mut plan = crate::plan::Plan::new();
+        plan.add(effect);
+        let saved = redact_secrets_in_plan(&plan).expect("redact retained values in a saved plan");
+        let serialized = serde_json::to_string(&saved).expect("serialize redacted saved plan");
+        assert!(!serialized.contains("retained-root-private-token"));
+        assert!(!serialized.contains("retained-nested-private-token"));
+    }
 
     #[test]
     fn saved_plan_whole_container_secret_rejects_hashes_without_plaintext() {
