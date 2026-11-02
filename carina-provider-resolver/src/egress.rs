@@ -1,8 +1,9 @@
-use carina_core::paths::ResolvedPath;
-use std::collections::BTreeSet;
+use carina_core::paths::{CanonicalPath, DisplayPath, ResolvedPath};
+use std::collections::{BTreeSet, HashSet};
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -22,30 +23,46 @@ pub fn is_wasi_http_import(name: &str) -> bool {
     name.starts_with("wasi:http/")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanonicalSource(CanonicalSourceKind);
+/// A source's opaque identity and its independent consent selector.
+/// Equality and hashing deliberately compare only identity.
+#[derive(Debug, Clone)]
+pub struct CanonicalSource {
+    identity: CanonicalSourceKind,
+    display: String,
+}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum CanonicalSourceKind {
-    File(PathBuf),
+    File(CanonicalPath),
     Remote(carina_core::provider_source::RemoteSourceKey),
 }
 
 impl CanonicalSource {
     pub(crate) fn from_load(load: &VerifiedLoad) -> Self {
-        let kind = match load.identity().source() {
+        match load.identity().source() {
             ProviderLoadSource::LocalFile {
-                path: _,
-                canonical_source,
-                ..
-            } => CanonicalSourceKind::File(canonical_source.clone()),
-            ProviderLoadSource::Remote { source } => CanonicalSourceKind::Remote(source.clone()),
-        };
-        Self(kind)
+                identity, source, ..
+            } => Self::file(identity.clone(), source),
+            ProviderLoadSource::Remote { source } => Self::remote(source.clone()),
+        }
+    }
+
+    fn file(identity: CanonicalPath, source: &DisplayPath) -> Self {
+        Self {
+            identity: CanonicalSourceKind::File(identity),
+            display: format!("file://{source}"),
+        }
+    }
+
+    fn remote(source: carina_core::provider_source::RemoteSourceKey) -> Self {
+        Self {
+            display: source.to_string(),
+            identity: CanonicalSourceKind::Remote(source),
+        }
     }
 
     pub fn is_file(&self) -> bool {
-        match self.0 {
+        match self.identity {
             CanonicalSourceKind::File(_) => true,
             CanonicalSourceKind::Remote(_) => false,
         }
@@ -57,12 +74,16 @@ impl CanonicalSource {
             .ok()?
         {
             carina_core::provider_source::ProviderSource::File(source) => {
-                canonical_project_relative_path(project_dir, Path::new(source.path()))
-                    .ok()
-                    .map(|path| Self(CanonicalSourceKind::File(path)))
+                // Authored file:// paths retain their process-CWD semantics.
+                let display = DisplayPath::new(source.path()).ok()?;
+                let path = project_dir.join_display(&display).ok()?;
+                let display = path
+                    .persisted_path()
+                    .lexical_relative_to(project_dir.persisted_path())?;
+                Some(Self::file(path.identity(), &display))
             }
             carina_core::provider_source::ProviderSource::Remote(source) => {
-                Some(Self(CanonicalSourceKind::Remote(source.source_key())))
+                Some(Self::remote(source.source_key()))
             }
         }
     }
@@ -70,43 +91,22 @@ impl CanonicalSource {
 
 impl fmt::Display for CanonicalSource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0 {
-            CanonicalSourceKind::File(path) => write!(formatter, "file://{}", path.display()),
-            CanonicalSourceKind::Remote(source) => source.fmt(formatter),
-        }
+        formatter.write_str(&self.display)
     }
 }
 
-pub(crate) fn canonical_project_relative_path(
-    project_dir: &ResolvedPath,
-    source_path: &Path,
-) -> io::Result<PathBuf> {
-    // Authored file:// paths retain their existing process-CWD semantics.
-    let label = carina_core::paths::DisplayPath::new(source_path)?;
-    let source = project_dir.join_display(&label)?;
-    canonical_source_relative_to(project_dir, &source)
+impl PartialEq for CanonicalSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
 }
 
-fn canonical_source_relative_to(
-    project_dir: &ResolvedPath,
-    source: &ResolvedPath,
-) -> io::Result<PathBuf> {
-    source
-        .identity()
-        .relative_identity(&project_dir.identity())
-        .map(|path| {
-            if path.is_empty() {
-                PathBuf::from(".")
-            } else {
-                PathBuf::from(path)
-            }
-        })
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "file provider and project directory are on different filesystem roots",
-            )
-        })
+impl Eq for CanonicalSource {}
+
+impl Hash for CanonicalSource {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.identity.hash(state);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -665,7 +665,7 @@ impl Error for EgressConsentError {}
 
 /// Canonical provider sources explicitly accepted for one `carina init` run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AcceptedEgressSources(BTreeSet<String>);
+pub struct AcceptedEgressSources(HashSet<CanonicalSource>);
 
 impl AcceptedEgressSources {
     pub fn parse_os(
@@ -673,7 +673,7 @@ impl AcceptedEgressSources {
         env_value: Option<&OsStr>,
         project_dir: &ResolvedPath,
     ) -> Result<Self, AcceptedEgressSourceError> {
-        let mut sources = BTreeSet::new();
+        let mut sources = HashSet::new();
         for value in cli_values {
             sources.insert(normalize_accepted_source(value, project_dir)?);
         }
@@ -696,7 +696,7 @@ impl AcceptedEgressSources {
 
     pub(crate) fn accepts(&self, source: &CanonicalSource) -> Option<ConsentGiven> {
         self.0
-            .contains(&source.to_string())
+            .contains(source)
             .then_some(ConsentGiven(ConsentGivenKind::AcceptedSource))
     }
 }
@@ -722,25 +722,26 @@ pub(crate) fn prompt_for_explicit_consent(
 fn normalize_accepted_source(
     value: &str,
     project_dir: &ResolvedPath,
-) -> Result<String, AcceptedEgressSourceError> {
+) -> Result<CanonicalSource, AcceptedEgressSourceError> {
     let file_path = value.strip_prefix("file://");
     let path_value = file_path.unwrap_or(value);
     let path = Path::new(path_value);
     if file_path.is_some() || path.is_absolute() {
         // Consent selectors, unlike authored sources, are project-relative.
-        let canonical = if file_path.is_some() && path.is_relative() {
-            project_dir
-                .join(path)
-                .and_then(|source| canonical_source_relative_to(project_dir, &source))
+        let resolved = if file_path.is_some() && path.is_relative() {
+            project_dir.join(path)
         } else {
-            canonical_project_relative_path(project_dir, path)
+            DisplayPath::new(path).and_then(|label| project_dir.join_display(&label))
         }
         .map_err(|source| AcceptedEgressSourceError::Canonicalize {
             value: value.to_string(),
             path: path.to_path_buf(),
             source,
         })?;
-        return Ok(format!("file://{}", canonical.display()));
+        return Ok(CanonicalSource::file(
+            resolved.identity(),
+            resolved.display(),
+        ));
     }
 
     let parsed = value
@@ -751,7 +752,7 @@ fn normalize_accepted_source(
         })?;
     match parsed {
         carina_core::provider_source::ProviderSource::Remote(source) => {
-            Ok(source.source_key().to_string())
+            Ok(CanonicalSource::remote(source.source_key()))
         }
         carina_core::provider_source::ProviderSource::File(_) => {
             unreachable!("file:// sources are handled before ProviderSource parsing")
@@ -833,9 +834,8 @@ mod tests {
     };
 
     use super::{
-        AcceptedEgressSources, CanonicalSource, CanonicalSourceKind, ConsentedEgress,
-        EgressLockRecord, EgressSectionError, ExplicitConsent, LockedEgress,
-        VerifiedEgressDeclaration,
+        AcceptedEgressSources, CanonicalSource, ConsentedEgress, EgressLockRecord,
+        EgressSectionError, ExplicitConsent, LockedEgress, VerifiedEgressDeclaration,
     };
     use crate::user_trust::load_user_verified_identity;
     use crate::verified_artifact::record_test_github_origin_download;
@@ -844,6 +844,14 @@ mod tests {
     };
 
     const VALID_DECLARATION: &[u8] = br#"{"version":1,"hosts":["api.example.com"]}"#;
+
+    fn file_source(project: &carina_core::paths::ResolvedPath, name: &str) -> CanonicalSource {
+        let path = project.join(name).unwrap();
+        CanonicalSource::file(
+            path.identity(),
+            &carina_core::paths::DisplayPath::new(name).unwrap(),
+        )
+    }
 
     fn custom(data: &'static [u8]) -> CustomSection<'static> {
         CustomSection {
@@ -1154,6 +1162,44 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn egress_prompt_uses_authored_alias_while_consent_compares_file_identity() {
+        let cwd = std::env::current_dir().unwrap();
+        let directory = tempfile::tempdir_in(&cwd).unwrap();
+        std::fs::create_dir(directory.path().join("private")).unwrap();
+        let target = directory.path().join("private/provider.wasm");
+        std::fs::write(&target, b"provider").unwrap();
+        std::os::unix::fs::symlink("private/provider.wasm", directory.path().join("alias.wasm"))
+            .unwrap();
+        let project = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
+        let authored = format!(
+            "file://./{}/alias.wasm",
+            directory.path().file_name().unwrap().to_str().unwrap()
+        );
+        let alias = CanonicalSource::from_lock_source(&authored, &project).unwrap();
+        let real =
+            CanonicalSource::from_lock_source(&format!("file://{}", target.display()), &project)
+                .unwrap();
+        assert_eq!(
+            alias, real,
+            "display aliases must share consent by identity"
+        );
+        let consent_source = "file://alias.wasm";
+        assert_eq!(alias.to_string(), consent_source);
+
+        let accepted =
+            AcceptedEgressSources::parse_os(&["file://alias.wasm".into()], None, &project).unwrap();
+        assert!(accepted.accepts(&real).is_some());
+        let mut output = Vec::new();
+        super::prompt_for_explicit_consent(&alias, &mut Cursor::new(b"yes\n"), &mut output)
+            .unwrap()
+            .unwrap();
+        let prompt = String::from_utf8(output).unwrap();
+        assert!(prompt.contains(consent_source), "{prompt}");
+        assert!(!prompt.contains("private/provider.wasm"), "{prompt}");
+    }
+
+    #[test]
     fn accepted_egress_sources_match_canonical_sources_not_configured_names() {
         let accepted = AcceptedEgressSources::parse_os(
             &["Registry.Carina-RS.dev/example/cloudflare".into()],
@@ -1170,7 +1216,7 @@ mod tests {
                 panic!("remote fixture parsed as a file source")
             }
         };
-        let source = CanonicalSource(CanonicalSourceKind::Remote(source_key));
+        let source = CanonicalSource::remote(source_key);
 
         assert!(accepted.accepts(&source).is_some());
         assert!(
@@ -1201,8 +1247,9 @@ mod tests {
             &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
         )
         .unwrap();
-        let first = CanonicalSource(CanonicalSourceKind::File(PathBuf::from("first.wasm")));
-        let second = CanonicalSource(CanonicalSourceKind::File(PathBuf::from("second.wasm")));
+        let project = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
+        let first = file_source(&project, "first.wasm");
+        let second = file_source(&project, "second.wasm");
 
         assert!(accepted.accepts(&first).is_some());
         assert!(accepted.accepts(&second).is_some());
@@ -1218,8 +1265,9 @@ mod tests {
 
     #[test]
     fn explicit_consent_evidence_comes_from_prompt_or_matching_accept_list() {
-        let source = CanonicalSource(CanonicalSourceKind::File(PathBuf::from("first.wasm")));
         let directory = tempfile::tempdir().unwrap();
+        let project = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
+        let source = file_source(&project, "first.wasm");
         let file = directory.path().join("first.wasm");
         std::fs::write(&file, b"provider").unwrap();
         let accepted = AcceptedEgressSources::parse_os(
@@ -1230,7 +1278,7 @@ mod tests {
         .unwrap();
         assert!(accepted.accepts(&source).is_some());
 
-        let other = CanonicalSource(CanonicalSourceKind::File(PathBuf::from("other.wasm")));
+        let other = file_source(&project, "other.wasm");
         assert!(accepted.accepts(&other).is_none());
 
         let mut yes = Cursor::new(b"yes\n");

@@ -369,7 +369,7 @@ mod tests {
             source: carina_provider_resolver::ProviderLoadSource::local_file(
                 &carina_core::paths::ResolvedPath::new("/test-providers/guest-store-test.wasm")
                     .unwrap(),
-                std::path::PathBuf::from("guest-store-test.wasm"),
+                carina_core::paths::DisplayPath::new("guest-store-test.wasm").unwrap(),
             ),
         })
     }

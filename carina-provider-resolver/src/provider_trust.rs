@@ -2,7 +2,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use carina_core::hint::ProjectCommand;
-use carina_core::paths::{PathIdentity, PersistedPath};
+use carina_core::paths::{CanonicalPath, DisplayPath, PersistedPath};
 use carina_core::provider_source::RemoteSourceKey;
 
 use crate::provider_resolver::RegistrySignatureProtection;
@@ -109,8 +109,8 @@ pub enum ProviderLoadSource {
     LocalFile {
         /// Absolute locator recorded when the provider load is identified.
         path: PersistedPath,
-        identity: PathIdentity,
-        canonical_source: PathBuf,
+        identity: CanonicalPath,
+        source: DisplayPath,
     },
     Remote {
         source: RemoteSourceKey,
@@ -118,13 +118,21 @@ pub enum ProviderLoadSource {
 }
 
 impl ProviderLoadSource {
-    pub fn local_file(path: &carina_core::paths::ResolvedPath, canonical_source: PathBuf) -> Self {
-        let identity = PathIdentity::from(path.identity());
+    /// Keep the authored label separate from the pinned file identity.
+    ///
+    /// ```compile_fail,E0308
+    /// use carina_core::paths::ResolvedPath;
+    /// use carina_provider_resolver::ProviderLoadSource;
+    /// let path = ResolvedPath::new(".").unwrap();
+    /// let _ = ProviderLoadSource::local_file(&path, path.identity());
+    /// ```
+    pub fn local_file(path: &carina_core::paths::ResolvedPath, source: DisplayPath) -> Self {
+        let identity = path.identity();
         let path = path.persisted_path().clone();
         Self::LocalFile {
             path,
             identity,
-            canonical_source,
+            source,
         }
     }
 }
@@ -133,17 +141,12 @@ impl PartialEq for ProviderLoadSource {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (
-                Self::LocalFile {
-                    identity,
-                    canonical_source,
-                    ..
-                },
+                Self::LocalFile { identity, .. },
                 Self::LocalFile {
                     identity: other_identity,
-                    canonical_source: other_source,
                     ..
                 },
-            ) => canonical_source == other_source && identity == other_identity,
+            ) => identity == other_identity,
             (
                 Self::Remote { source },
                 Self::Remote {
@@ -225,7 +228,7 @@ impl ProviderLoadIdentity {
                 "/test-providers/{configured_name}.wasm"
             ))
             .unwrap(),
-            PathBuf::from(format!("{configured_name}.wasm")),
+            DisplayPath::new(format!("/test-providers/{configured_name}.wasm")).unwrap(),
         );
         Self {
             configured_name,
@@ -590,7 +593,7 @@ mod tests {
         let source = |path| {
             ProviderLoadSource::local_file(
                 &carina_core::paths::ResolvedPath::new(path).unwrap(),
-                PathBuf::from("real.wasm"),
+                DisplayPath::new("real.wasm").unwrap(),
             )
         };
         let real_source = source(real.clone());
@@ -619,7 +622,7 @@ mod tests {
             ProviderTrust::untrusted(),
             ProviderLoadSource::local_file(
                 &carina_core::paths::ResolvedPath::new("/tmp/aws.wasm").unwrap(),
-                PathBuf::from("aws.wasm"),
+                DisplayPath::new("aws.wasm").unwrap(),
             ),
         )
         .unwrap();

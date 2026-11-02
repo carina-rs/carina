@@ -1339,8 +1339,9 @@ mod verified_revision_artifact {
         project_dir: &ResolvedPath,
     ) -> Result<VerifiedRevisionArtifact, VerifiedArtifactError> {
         let artifact = VerifiedArtifact::from_existing(lock_entry, name, project_dir)?;
-        if project_dir
-            .join(artifact.path().as_path())
+        if artifact
+            .path()
+            .resolve(project_dir)
             .map_err(|error| VerifiedArtifactError::Other(error.to_string()))?
             .identity()
             != cached.path().identity()
@@ -1365,9 +1366,8 @@ mod verified_revision_artifact {
         lock_entry: &crate::provider_resolver::LockEntry<R>,
         name: &str,
     ) -> Result<VerifiedRevisionArtifact, VerifiedArtifactError> {
-        let target = install_lock
-            .project_dir()
-            .join(destination.as_path())
+        let target = destination
+            .resolve(install_lock.project_dir())
             .map_err(|error| VerifiedArtifactError::Other(error.to_string()))?;
         revision_artifact_cache::publish(&target, cached.artifact_id(), || {
             crate::install_lock::install_project_artifact_from_global_cache(
@@ -1422,9 +1422,8 @@ mod verified_revision_artifact {
         name: &str,
         unchanged_revision: bool,
     ) -> Result<PublishedRevisionArtifact, String> {
-        let target = install_lock
-            .project_dir()
-            .join(destination.as_path())
+        let target = destination
+            .resolve(install_lock.project_dir())
             .map_err(|error| error.to_string())?;
         revision_artifact_cache::publish(&target, selected.artifact_id(), || {
             let staged = stage_selected_artifact(install_lock, destination, selected)?;
@@ -1681,8 +1680,8 @@ where
     let wasm_path = WasmArtifactPath::new(cache_path_revision(base_dir, source, &sha), name)?;
     if mode != LockMode::Upgrade
         && let Some((lock_entry, pin)) = artifact_pin.pinned(user_dirs)
-        && let Some(cached) = base_dir
-            .join(wasm_path.as_path())
+        && let Some(cached) = wasm_path
+            .resolve(base_dir)
             .ok()
             .and_then(|path| revision_artifact_cache::read(&path, pin.artifact_id))
     {
@@ -1691,8 +1690,8 @@ where
             match verified_revision_artifact::from_existing(&cached, lock_entry, name, base_dir) {
                 Ok(verified) => verified,
                 Err(VerifiedArtifactError::ChecksumMismatch(mismatch)) => {
-                    let removal = base_dir
-                        .join(wasm_path.as_path())
+                    let removal = wasm_path
+                        .resolve(base_dir)
                         .and_then(|path| revision_artifact_cache::remove(&path));
                     return Err((*mismatch).after_cache_removal(wasm_path.as_path(), removal));
                 }
@@ -1817,8 +1816,8 @@ where
     // Save to global cache
     if let Some(global_wasm) = global_cache_path_revision(user_dirs, source, &sha) {
         install_global_revision_artifact(
-            &base_dir
-                .join(installed_path.as_path())
+            &installed_path
+                .resolve(base_dir)
                 .map_err(|error| error.to_string())?,
             &global_wasm,
             verified.artifact_id(),
@@ -5210,7 +5209,9 @@ sha256 = "{}"
                 },
             )
             .expect_err("an unchanged commit must retain its locked content hash");
-            let remedy = revision_artifact_replacement_remedy(project.path());
+            let remedy = revision_artifact_replacement_remedy(
+                &carina_core::paths::DisplayPath::new(project.path()).unwrap(),
+            );
 
             assert!(error.ends_with(&remedy), "{mode:?}: {error}");
             assert!(!error.contains("refusing to replace"), "{mode:?}: {error}");

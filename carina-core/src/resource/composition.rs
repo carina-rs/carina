@@ -1213,7 +1213,7 @@ impl CompositionSourceIdentityResolver {
 
     /// Authored location of a saved call's file in the current configuration.
     /// A missing file has no known display spelling; diagnostics can instead
-    /// use its portable relative identity if it stays within the source root.
+    /// use a neutral label, never the saved canonical identity.
     pub fn display_source_file(&self, call: &SavedModuleCallId) -> Option<&DisplayPath> {
         self.display_source_files.get(&call.source_file)
     }
@@ -1274,15 +1274,14 @@ impl SavedModuleCallId {
         })
     }
 
-    /// Portable fallback location when the current configuration has no
-    /// authored display path for this saved call. Outside-root identities may
-    /// contain resolved target names, so only report that they are external.
-    pub fn source_root_relative_location(&self) -> String {
+    /// Diagnostic fallback when no authored spelling is known. Both internal
+    /// and external identities may contain private symlink targets.
+    pub fn unmapped_source_location(&self) -> &'static str {
         let SavedSourceFileId::SourceRootRelative(path) = &self.source_file;
         if path.stays_under_root() {
-            format!("<source root>/{}", path.0.display())
+            "<source within source root>"
         } else {
-            "<source outside source root>".to_string()
+            "<source outside source root>"
         }
     }
 
@@ -2124,10 +2123,10 @@ mod tests {
     }
 
     #[test]
-    fn saved_call_fallback_only_displays_identities_contained_by_source_root() {
+    fn saved_call_fallback_never_displays_source_identities() {
         for (path, expected) in [
-            ("main.crn", "<source root>/main.crn"),
-            ("nested/../main.crn", "<source root>/nested/../main.crn"),
+            ("main.crn", "<source within source root>"),
+            ("nested/../main.crn", "<source within source root>"),
             ("../private-target/main.crn", "<source outside source root>"),
             (
                 "nested/../../private-target/main.crn",
@@ -2141,8 +2140,28 @@ mod tests {
                 call_span: crate::parser::SourceSpan::dummy().into(),
                 expansion: SavedCallExpansion::Direct,
             };
-            assert_eq!(call.source_root_relative_location(), expected, "{path}");
+            assert_eq!(call.unmapped_source_location(), expected, "{path}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removed_call_does_not_display_an_in_root_symlink_target() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("modules/private-target")).unwrap();
+        std::fs::write(root.path().join("modules/private-target/main.crn"), "").unwrap();
+        std::os::unix::fs::symlink("private-target", root.path().join("modules/alias")).unwrap();
+        let pinned = crate::paths::ResolvedPath::new(root.path()).unwrap();
+        let mut saved_resolver = CompositionSourceIdentityResolver::new(&pinned).unwrap();
+        let mut path = CompositionCallPath::default();
+        path.root.id =
+            crate::parser::ModuleCallId::test_dummy_in(root.path().join("modules/alias/main.crn"));
+        let saved = saved_resolver.saved_origin_id(&path).unwrap();
+        let current = CompositionSourceIdentityResolver::new(&pinned).unwrap();
+        assert!(current.display_source_file(saved.root()).is_none());
+        let location = saved.root().unmapped_source_location();
+        assert_eq!(location, "<source within source root>");
+        assert!(!location.contains("private-target"));
     }
 
     #[cfg(unix)]

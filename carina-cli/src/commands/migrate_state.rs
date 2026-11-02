@@ -23,8 +23,7 @@ use std::path::Path;
 use crate::output_style::Colorize;
 
 use carina_state::{
-    BackendConfig as StateBackendConfig, BackendDriftStatus, BackendSelection, MigrationBackends,
-    StateFile, anchored_local_path, inspect_backend_drift,
+    BackendDriftStatus, BackendSelection, MigrationBackends, StateFile, inspect_backend_drift,
 };
 #[cfg(test)]
 use carina_state::{BackendLock, LocalBackend};
@@ -225,9 +224,7 @@ pub async fn run_init_migrate_state(
     // (remote → remote in this scope). A failure to delete here is *not*
     // fatal: the migration already committed, so a leftover old file is
     // harmless and the next run is a no-op.
-    let source = if let Some(StateBackendConfig::Local(local_settings)) = backends.source_config() {
-        let path = anchored_local_path(local_settings, project_dir)
-            .map_err(|error| AppError::Config(error.to_string()))?;
+    let source = if let Some(path) = backends.local_source_path() {
         if !path.exists() {
             SourceDisposition::Deleted
         } else {

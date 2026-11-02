@@ -234,7 +234,7 @@ fn directory_validate_rejects_artifact_that_mismatches_lock_sha256() {
         "{rendered}"
     );
     assert!(
-        rendered.contains(&format!("Run `{}` to discard the mismatched copy, then run it again to download a verified one.", carina_core::hint::ProjectCommand::new("init", project.path()))),
+        rendered.contains("Run `carina init` to discard the mismatched copy, then run it again to download a verified one."),
         "{rendered}"
     );
     assert!(

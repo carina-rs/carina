@@ -1,8 +1,8 @@
-use carina_core::paths::ResolvedPath;
+use carina_core::paths::{DisplayPath, ResolvedPath};
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use carina_core::UserDirs;
@@ -866,7 +866,7 @@ pub(crate) struct ChecksumMismatch {
     locked_identity: String,
     expected_sha256: String,
     actual_sha256: String,
-    project_dir: PathBuf,
+    project_dir: DisplayPath,
 }
 
 #[derive(Debug)]
@@ -918,13 +918,13 @@ impl ChecksumMismatch {
             self.locked_identity,
             self.expected_sha256,
             self.actual_sha256,
-            ProjectCommand::new("init", &self.project_dir),
+            ProjectCommand::for_display_path("init", &self.project_dir),
         )
     }
 
     pub(crate) fn after_cache_removal(self, cached_path: &Path, removal: io::Result<()>) -> String {
         let summary = self.summary();
-        let command = ProjectCommand::new("init", &self.project_dir);
+        let command = ProjectCommand::for_display_path("init", &self.project_dir);
         match removal {
             Ok(()) => format!(
                 "{summary} The mismatched cached copy was removed; re-run `{command}` to download it again."
@@ -945,7 +945,7 @@ impl ChecksumMismatch {
             self.expected_sha256,
             self.actual_sha256,
             self.locked_source,
-            ProjectCommand::new("init", &self.project_dir),
+            ProjectCommand::for_display_path("init", &self.project_dir),
         )
     }
 
@@ -962,15 +962,16 @@ impl ChecksumMismatch {
     }
 }
 
-pub(crate) fn revision_artifact_replacement_remedy(project_dir: &Path) -> String {
+pub(crate) fn revision_artifact_replacement_remedy(project_dir: &DisplayPath) -> String {
     format!(
         "Push a new commit (or point `revision` at one), or remove this provider's entry from carina-providers.lock and run `{}` to accept the current build.",
-        ProjectCommand::new("init", project_dir)
+        ProjectCommand::for_display_path("init", project_dir)
     )
 }
 
 pub(crate) struct LockArtifactSelection<'lock, R = RegistryLock> {
-    pub(crate) path: WasmArtifactPath,
+    pub(crate) path: ResolvedPath,
+    published_path: WasmArtifactPath,
     pub(crate) lock_entry: &'lock LockEntry<R>,
     source: RemoteSourceKey,
     locked_identity: String,
@@ -1026,22 +1027,17 @@ impl VerifiedArtifact {
     ) -> Result<Self, VerifiedArtifactError> {
         let LockArtifactSelection {
             path,
+            published_path,
             lock_entry,
             source,
             locked_identity,
             pin,
         } = selection;
-        let project = project_dir.clone();
-        let artifact_display = carina_core::paths::DisplayPath::new(path.as_path())
-            .map_err(|error| VerifiedArtifactError::Other(error.to_string()))?;
-        let bytes_path = project
-            .join_display(&artifact_display)
-            .map_err(|error| VerifiedArtifactError::Other(error.to_string()))?;
         Self::verify_bytes_at(
-            ProviderArtifactBytes::read(&bytes_path).map_err(|error| {
+            ProviderArtifactBytes::read(&path).map_err(|error| {
                 VerifiedArtifactError::Other(format!("Failed to hash WASM binary: {error}"))
             })?,
-            path.clone(),
+            published_path,
             LockArtifactIdentity {
                 lock_entry,
                 source,
@@ -1049,7 +1045,7 @@ impl VerifiedArtifact {
                 pin,
             },
             provider_name,
-            &project,
+            project_dir,
         )
     }
 
@@ -1077,7 +1073,7 @@ impl VerifiedArtifact {
                     locked_identity: locked_identity.to_string(),
                     expected_sha256: lock_entry.sha256.clone(),
                     actual_sha256,
-                    project_dir: PathBuf::from(project_dir.persisted_path().to_string()),
+                    project_dir: project_dir.display().clone(),
                 },
             )));
         }
@@ -1209,7 +1205,8 @@ pub(crate) fn publish_cached<R>(
 ) -> Result<VerifiedArtifact, VerifiedArtifactError> {
     let project_dir = staged.project_dir().clone();
     let LockArtifactSelection {
-        path,
+        path: _,
+        published_path: path,
         lock_entry: _,
         source,
         locked_identity,
@@ -1440,8 +1437,13 @@ pub(crate) fn lock_artifact_selection<'lock, R>(
         }
     };
 
+    let published_path = WasmArtifactPath::new(path, provider_name)?;
+    let path = published_path
+        .resolve(project_dir)
+        .map_err(|error| error.to_string())?;
     Ok(LockArtifactSelection {
-        path: WasmArtifactPath::new(path, provider_name)?,
+        path,
+        published_path,
         lock_entry,
         source: source_key,
         locked_identity,
@@ -1452,6 +1454,7 @@ pub(crate) fn lock_artifact_selection<'lock, R>(
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
+    use std::path::PathBuf;
 
     use super::*;
 
@@ -1700,6 +1703,47 @@ mod tests {
     }
 
     #[test]
+    fn checksum_recovery_hints_retain_the_project_invocation_spelling() {
+        let source = "carina-rs/awscc";
+        let lock: LockEntry = LockEntry {
+            name: "awscc".into(),
+            source: source.into(),
+            kind: LockEntryKind::Version {
+                version: "0.5.0".into(),
+                constraint: None,
+            },
+            sha256: "expected".into(),
+            registry: None,
+        };
+        for (spelling, command) in [
+            (".", "carina init"),
+            ("./infra/../infra", "carina init ./infra/../infra"),
+        ] {
+            let project = ResolvedPath::new(spelling).unwrap();
+            let identity = lock_artifact_selection(&project, &lock, "awscc").unwrap();
+            let error = VerifiedArtifact::verify_bytes_at(
+                ProviderArtifactBytes(Arc::from(&b"tampered"[..])),
+                WasmArtifactPath::new(PathBuf::from("unused.wasm"), "awscc").unwrap(),
+                LockArtifactIdentity {
+                    lock_entry: &lock,
+                    source: identity.source,
+                    locked_identity: &identity.locked_identity,
+                    pin: identity.pin,
+                },
+                "awscc",
+                &project,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("Run `{command}` to discard")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn unchanged_revision_download_error_has_actionable_remedy() {
         let mismatch = ChecksumMismatch {
             provider_name: "aws".into(),
@@ -1707,7 +1751,7 @@ mod tests {
             locked_identity: "abcdef012345".into(),
             expected_sha256: "expected".into(),
             actual_sha256: "actual".into(),
-            project_dir: PathBuf::from("infra/foo"),
+            project_dir: DisplayPath::new("infra/foo").unwrap(),
         };
 
         assert_eq!(
@@ -1724,7 +1768,7 @@ mod tests {
             locked_identity: "1.0.0".into(),
             expected_sha256: "expected".into(),
             actual_sha256: "actual".into(),
-            project_dir: PathBuf::from("infra/foo"),
+            project_dir: DisplayPath::new("infra/foo").unwrap(),
         };
         let cached_path = Path::new("infra/foo/.carina/providers/aws.wasm");
 

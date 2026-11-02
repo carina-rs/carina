@@ -247,6 +247,61 @@ fn symlink_retarget_after_destroy_config_keeps_original_upstream_and_state() {
 }
 
 #[test]
+fn migration_cleanup_cannot_follow_old_state_symlink_to_the_committed_target() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path();
+    fs::write(
+        project.join("main.crn"),
+        "exports { marker: String = \"retained\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("backend.crn"),
+        "backend local { path = \"old.json\" }\n",
+    )
+    .unwrap();
+    symlink("source.json", project.join("old.json")).unwrap();
+    success(&command().arg("init").arg(project).output().unwrap());
+    success(
+        &command()
+            .arg("apply")
+            .arg(project)
+            .arg("--auto-approve")
+            .output()
+            .unwrap(),
+    );
+    let original_state = fs::read(project.join("source.json")).unwrap();
+    fs::write(
+        project.join("backend.crn"),
+        "backend local { path = \"new.json\" }\n",
+    )
+    .unwrap();
+
+    let mut migrate = command();
+    migrate.arg("init").arg(project).arg("--migrate-state");
+    success(&retarget_at_handshake(
+        migrate,
+        "CARINA_TEST_MIGRATE_COMMIT_HANDSHAKE_DIR",
+        &project.join("old.json"),
+        &project.join("new.json"),
+    ));
+
+    assert_eq!(fs::read(project.join("new.json")).unwrap(), original_state);
+    assert!(
+        !project.join("source.json").exists(),
+        "cleanup must remove the pinned source"
+    );
+    assert_eq!(fs::read(project.join("old.json")).unwrap(), original_state);
+    assert!(
+        fs::read_to_string(project.join("carina-backend.lock"))
+            .unwrap()
+            .contains("new.json")
+    );
+    // Reopening the committed backend must still find the migrated state.
+    success(&command().arg("plan").arg(project).output().unwrap());
+}
+
+#[test]
 fn symlink_retarget_during_init_migrate_state_keeps_lock_and_cleanup_in_original_tree() {
     let temp = tempfile::tempdir().unwrap();
     let original = temp.path().join("original");

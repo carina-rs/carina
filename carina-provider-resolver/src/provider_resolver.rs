@@ -4155,12 +4155,9 @@ impl LockFile {
         project_dir: &ResolvedPath,
     ) -> Option<&LockEntry<RegistryLock>> {
         self.provider.iter().find(|entry| {
-            let source_matches = if source.is_file() {
+            let source_matches =
                 crate::CanonicalSource::from_lock_source(&entry.source, project_dir).as_ref()
-                    == Some(source)
-            } else {
-                Self::sources_match(&entry.source, &source.to_string())
-            };
+                    == Some(source);
             source_matches && (source.is_file() || entry.sha256 == sha256)
         })
     }
@@ -4931,6 +4928,11 @@ impl WasmArtifactPath {
     pub fn as_path(&self) -> &Path {
         &self.0
     }
+
+    /// Pin this complete locator without treating it as a project child.
+    pub(crate) fn resolve(&self, project: &ResolvedPath) -> io::Result<ResolvedPath> {
+        project.join_display(&carina_core::paths::DisplayPath::new(&self.0)?)
+    }
 }
 
 /// An installed provider artifact together with the resolution provenance that
@@ -4955,26 +4957,24 @@ pub struct InstalledProvider {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InstalledArtifact {
     LockFile(Box<VerifiedArtifact>),
-    File {
-        path: WasmArtifactPath,
-        bytes: ProviderArtifactBytes,
-        source: FileSource,
-        canonical_source: PathBuf,
-        project_dir: ResolvedPath,
-    },
+    File(Box<InstalledFileArtifact>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstalledFileArtifact {
+    path: WasmArtifactPath,
+    bytes: ProviderArtifactBytes,
+    source: FileSource,
+    source_path: ResolvedPath,
+    consent_source: carina_core::paths::DisplayPath,
+    project_dir: ResolvedPath,
 }
 
 impl InstalledProvider {
     pub fn path(&self) -> &WasmArtifactPath {
         match &self.artifact {
             InstalledArtifact::LockFile(artifact) => artifact.path(),
-            InstalledArtifact::File {
-                path,
-                bytes: _,
-                source: _,
-                canonical_source: _,
-                project_dir: _,
-            } => path,
+            InstalledArtifact::File(artifact) => &artifact.path,
         }
     }
 
@@ -4984,14 +4984,8 @@ impl InstalledProvider {
                 project_dir: PathBuf::from(artifact.project_dir().display().to_string()),
                 pin: artifact.pin().clone(),
             },
-            InstalledArtifact::File {
-                path: _,
-                bytes: _,
-                source,
-                canonical_source: _,
-                project_dir: _,
-            } => ProviderArtifactProvenance::File {
-                source: format!("file://{}", source.path()),
+            InstalledArtifact::File(artifact) => ProviderArtifactProvenance::File {
+                source: format!("file://{}", artifact.source.path()),
             },
         }
     }
@@ -5014,10 +5008,8 @@ impl InstalledProvider {
         project_dir: &ResolvedPath,
     ) -> Result<Self, String> {
         let project_dir = project_dir.clone();
-        let artifact_display = carina_core::paths::DisplayPath::new(path.as_path())
-            .map_err(|error| error.to_string())?;
-        let io_path = project_dir
-            .join_display(&artifact_display)
+        let io_path = path
+            .resolve(&project_dir)
             .map_err(|error| error.to_string())?;
         let bytes = ProviderArtifactBytes::read(&io_path).map_err(|error| {
             format!(
@@ -5025,22 +5017,28 @@ impl InstalledProvider {
                 path.as_path().display()
             )
         })?;
-        let canonical_source =
-            crate::egress::canonical_project_relative_path(&project_dir, Path::new(source.path()))
-                .map_err(|error| {
-                    format!(
-                        "Failed to derive project-relative provider source {}: {error}",
-                        source.path()
-                    )
-                })?;
+        let source_display = carina_core::paths::DisplayPath::new(source.path())
+            .map_err(|error| error.to_string())?;
+        let source_path = project_dir.join_display(&source_display).map_err(|error| {
+            format!("Failed to locate provider source {source_display}: {error}")
+        })?;
+        let consent_source = source_path
+            .persisted_path()
+            .lexical_relative_to(project_dir.persisted_path())
+            .ok_or_else(|| {
+                format!(
+                    "Failed to derive project-relative provider source {source_display}: file provider and project directory are on different filesystem roots"
+                )
+            })?;
         Ok(Self {
-            artifact: InstalledArtifact::File {
+            artifact: InstalledArtifact::File(Box::new(InstalledFileArtifact {
                 path,
                 bytes,
                 source,
-                canonical_source,
+                source_path,
+                consent_source,
                 project_dir,
-            },
+            })),
             provider_name,
         })
     }
@@ -5048,13 +5046,7 @@ impl InstalledProvider {
     fn artifact_bytes(&self) -> ProviderArtifactBytes {
         match &self.artifact {
             InstalledArtifact::LockFile(artifact) => artifact.bytes().clone(),
-            InstalledArtifact::File {
-                path: _,
-                bytes,
-                source: _,
-                canonical_source: _,
-                project_dir: _,
-            } => bytes.clone(),
+            InstalledArtifact::File(artifact) => artifact.bytes.clone(),
         }
     }
 
@@ -5072,31 +5064,24 @@ impl InstalledProvider {
                     source: artifact.source().clone(),
                 },
             ),
-            InstalledArtifact::File {
-                path: _,
-                bytes,
-                source,
-                canonical_source,
-                project_dir,
-            } => {
-                let (trust, notice, path) =
-                    local_provider_trust(source, bytes, project_dir, grants, notice_sink).map_err(
-                        |error| ProviderLoadIdentityError::Absolutize {
-                            path: PathBuf::from(source.path()),
-                            source: error,
-                        },
-                    )?;
+            InstalledArtifact::File(artifact) => {
+                let (trust, notice, _) = local_provider_trust(
+                    &artifact.source,
+                    &artifact.bytes,
+                    &artifact.project_dir,
+                    grants,
+                    notice_sink,
+                )
+                .map_err(|error| ProviderLoadIdentityError::Absolutize {
+                    path: PathBuf::from(artifact.source.path()),
+                    source: error,
+                })?;
                 (
                     trust,
                     notice,
                     ProviderLoadSource::local_file(
-                        &project_dir.join_display(path.display()).map_err(|source| {
-                            ProviderLoadIdentityError::Absolutize {
-                                path: PathBuf::from(path.to_string()),
-                                source,
-                            }
-                        })?,
-                        canonical_source.clone(),
+                        &artifact.source_path,
+                        artifact.consent_source.clone(),
                     ),
                 )
             }
@@ -5122,7 +5107,7 @@ impl InstalledProvider {
             InstalledArtifact::LockFile(artifact) => {
                 LoadedArtifactIdentity::locked(&bytes, artifact.source().clone(), artifact.pin())
             }
-            InstalledArtifact::File { .. } => LoadedArtifactIdentity::file(&bytes),
+            InstalledArtifact::File(_) => LoadedArtifactIdentity::file(&bytes),
         };
         Ok(VerifiedLoad::new(bytes, identity, artifact))
     }
@@ -5187,7 +5172,7 @@ impl InstalledProvider {
             InstalledArtifact::LockFile(artifact) => {
                 LoadedArtifactIdentity::locked(&bytes, artifact.source().clone(), artifact.pin())
             }
-            InstalledArtifact::File { .. } => LoadedArtifactIdentity::file(&bytes),
+            InstalledArtifact::File(_) => LoadedArtifactIdentity::file(&bytes),
         };
         loader(VerifiedLoad::new(bytes, identity, artifact))
             .await
@@ -7974,17 +7959,15 @@ fn obtain_registry_artifact<'lock, H: RegistryHttp>(
     let project_dir = install_lock.project_dir();
     let path = WasmArtifactPath::new(cache_path_wasm(project_dir, source, version), provider_name)
         .map_err(RegistryArtifactError::Invalid)?;
-    let (state, digest) = if project_dir
-        .join(path.as_path())
-        .map_err(|error| RegistryArtifactError::Invalid(error.to_string()))?
-        .exists()
+    let io_path = path
+        .resolve(project_dir)
+        .map_err(|error| RegistryArtifactError::Invalid(error.to_string()))?;
+    let (state, digest) = if io_path.exists()
         && (!ProviderTrust::remote_source_is_allowlisted(source)
             || user_trust_record_exists(user_dirs, expected_shasum, source))
     {
         match hash_and_check(
-            &project_dir
-                .join(path.as_path())
-                .map_err(|error| RegistryArtifactError::Invalid(error.to_string()))?,
+            &io_path,
             expected_shasum,
             &format!("cached {context}"),
             project_dir,
@@ -8729,8 +8712,8 @@ where
         cache_path_github_release(project_dir, &source_key, version),
         name,
     )?;
-    if project_dir
-        .join(wasm_path.as_path())
+    if wasm_path
+        .resolve(project_dir)
         .map_err(|error| error.to_string())?
         .exists()
         && let Some((lock_entry, pin)) = artifact_pin.pinned(user_dirs)
@@ -8833,8 +8816,8 @@ where
     // Save to global cache
     if let Some(global_wasm) = global_cache_path_github_release(user_dirs, &source_key, version) {
         let _ = install_global_artifact_atomically(
-            &project_dir
-                .join(installed_path.as_path())
+            &installed_path
+                .resolve(project_dir)
                 .map_err(|error| error.to_string())?,
             &global_wasm,
         );
@@ -9340,10 +9323,7 @@ pub fn provider_artifact_fingerprint(
                 });
             };
             match select_locked_artifact(base_dir, config, remote_source, &loaded_lock) {
-                Ok(Some(selection)) => base_dir
-                    .join(selection.path.as_path())
-                    .ok()
-                    .and_then(|path| file_metadata_fingerprint(&path)),
+                Ok(Some(selection)) => file_metadata_fingerprint(&selection.path),
                 Ok(None) | Err(FindInstalledProviderError::Other(_)) => None,
                 Err(FindInstalledProviderError::LegacyEntry(error)) => return Err(error),
             }
@@ -9409,11 +9389,7 @@ pub fn find_installed_provider<P: PlaceholderKind, B: BindingAddress>(
     // project already pulled this provider and the current project has no
     // local install yet (issue #2018).
     if let Some(selection) = select_locked_artifact(base_dir, config, remote_source, &lock_file)? {
-        if io_base
-            .join(selection.path.as_path())
-            .map_err(|error| FindInstalledProviderError::Other(error.to_string()))?
-            .exists()
-        {
+        if selection.path.exists() {
             return installed_provider_from_lock(&config.name, selection, &io_base)
                 .map_err(FindInstalledProviderError::Other);
         }
@@ -10329,24 +10305,28 @@ struct ResolvedEgressDeclaration {
     signed: Option<crate::CarinaRsSigned>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct EgressDeclarationKey {
-    source: String,
-    patterns: BTreeSet<crate::HostPattern>,
+    source: crate::CanonicalSource,
+    patterns: Vec<String>,
 }
 
 impl From<&crate::VerifiedEgressDeclaration> for EgressDeclarationKey {
     fn from(declaration: &crate::VerifiedEgressDeclaration) -> Self {
         Self {
-            source: declaration.source().to_string(),
-            patterns: declaration.patterns().clone(),
+            source: declaration.source().clone(),
+            patterns: declaration
+                .patterns()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
         }
     }
 }
 
 #[derive(Default)]
 struct InitializedEgressDeclarations {
-    explicit: BTreeMap<EgressDeclarationKey, crate::ExplicitConsent>,
+    explicit: HashMap<EgressDeclarationKey, crate::ExplicitConsent>,
 }
 
 fn resolved_egress_declaration(
@@ -14176,18 +14156,12 @@ hosts = ["*.com"]
             name: Cow::Borrowed("carina:egress"),
             data: Cow::Borrowed(br#"{"version":1,"hosts":["b.example.com"]}"#),
         });
-        let canonical_source = crate::egress::canonical_project_relative_path(
-            &carina_core::paths::ResolvedPath::new(project_dir).unwrap(),
-            Path::new("project/mock-http.wasm"),
-        )
-        .unwrap();
-        assert_eq!(canonical_source, Path::new("mock-http.wasm"));
         let identity = ProviderLoadIdentity::new(
             "provider-b".into(),
             ProviderTrust::untrusted(),
             ProviderLoadSource::local_file(
                 &ResolvedPath::new("project/mock-http.wasm").unwrap(),
-                canonical_source,
+                carina_core::paths::DisplayPath::new("project/mock-http.wasm").unwrap(),
             ),
         )
         .unwrap();
@@ -25852,6 +25826,47 @@ future_protection_field = "retain-me"
     }
 
     #[test]
+    fn installed_provider_and_fingerprint_accept_a_relative_project_locator() {
+        let cwd = std::env::current_dir().unwrap();
+        let temp = tempfile::tempdir_in(&cwd).unwrap();
+        let directory = temp.path().join("infra");
+        fs::create_dir(&directory).unwrap();
+        let relative = Path::new(temp.path().file_name().unwrap()).join("infra");
+        let project = ResolvedPath::new(&relative).unwrap();
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "0.1.0";
+        let bytes = b"verified installed provider";
+        let artifact = cache_path_wasm(&project, &source_key(source), version);
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, bytes).unwrap();
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "awscc".into(),
+            source: source.into(),
+            kind: LockEntryKind::GithubRelease {
+                version: Version::parse(version).unwrap(),
+                tag: ReleaseTag::from_lock(format!("v{version}")),
+                asset_id: release_asset_id(42),
+                constraint: None,
+            },
+            sha256: sha256_bytes(bytes),
+            registry: None,
+        });
+        lock.save(&provider_lock_path(&directory)).unwrap();
+        let config = provider_config(source, None);
+
+        let installed = find_installed_provider(&project, &config)
+            .expect("a complete cache locator must not be joined to infra again");
+        assert_eq!(installed.path().as_path(), artifact);
+        let fingerprint = provider_artifact_fingerprint(&project, &config).unwrap();
+        assert!(
+            fingerprint.artifact.is_some(),
+            "drift polling must inspect the same artifact"
+        );
+        assert!(fingerprint.lock_file.is_some());
+    }
+
+    #[test]
     fn find_installed_provider_accepts_artifact_that_matches_lock_sha256() {
         let project = tempfile::tempdir().unwrap();
         let source = "github.com/carina-rs/carina-provider-awscc";
@@ -26216,9 +26231,9 @@ future_protection_field = "retain-me"
         assert_eq!(class, ProviderTrustClass::Untrusted);
         assert!(matches!(
             source,
-            crate::ProviderLoadSource::LocalFile { path, canonical_source, .. }
+            crate::ProviderLoadSource::LocalFile { path, source, .. }
                 if path == expected_source_path
-                    && canonical_source == Path::new("local-provider.wasm")
+                    && source == carina_core::paths::DisplayPath::new("local-provider.wasm").unwrap()
         ));
     }
 

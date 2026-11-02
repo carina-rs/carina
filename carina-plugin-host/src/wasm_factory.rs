@@ -1077,11 +1077,7 @@ impl GuestNetwork {
 #[cfg(test)]
 fn test_explicit_egress(declaration: &VerifiedEgressDeclaration) -> LockedEgress {
     let directory = tempfile::tempdir().expect("create egress lock directory");
-    let canonical_source = declaration.source().to_string();
-    let source = canonical_source
-        .strip_prefix("file://")
-        .map(|path| format!("file://{}", directory.path().join(path).display()))
-        .unwrap_or(canonical_source);
+    let source = declaration.source().to_string();
     let sha256 = declaration.sha256().as_str();
     let hosts = declaration
         .patterns()
@@ -1245,11 +1241,7 @@ impl fmt::Display for EgressDenied {
                 | Some(ProviderKind::Aws)
                 | Some(ProviderKind::GitHub)
                 | Some(ProviderKind::Untrusted),
-                ProviderLoadSource::LocalFile {
-                    path: _,
-                    canonical_source: _,
-                    ..
-                }
+                ProviderLoadSource::LocalFile { path: _, .. }
                 | ProviderLoadSource::Remote { source: _ },
                 DestinationDenied::HostNotAllowed
                 | DestinationDenied::MetadataWithheld(_)
@@ -8187,7 +8179,7 @@ mod tests {
             source: ProviderLoadSource::local_file(
                 &carina_core::paths::ResolvedPath::new(format!("/test-providers/{name}.wasm"))
                     .unwrap(),
-                PathBuf::from(format!("{name}.wasm")),
+                carina_core::paths::DisplayPath::new(format!("{name}.wasm")).unwrap(),
             ),
         })
     }
@@ -10547,7 +10539,7 @@ mod tests {
                 source: ProviderLoadSource::local_file(
                     &carina_core::paths::ResolvedPath::new("/opt/providers/mock_http.wasm")
                         .unwrap(),
-                    PathBuf::from("mock_http.wasm"),
+                    carina_core::paths::DisplayPath::new("mock_http.wasm").unwrap(),
                 ),
             }),
             Some(ProviderKind::Untrusted),

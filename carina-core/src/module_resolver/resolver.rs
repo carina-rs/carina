@@ -1136,7 +1136,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         )
         .map_err(|located| match located.source_file {
             Some(path) => ModuleError::ParseInFile {
-                path: crate::utils::normalize_source_path(&path),
+                path,
                 error: located.error,
             },
             None => ModuleError::Parse(*located.error),

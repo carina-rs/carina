@@ -420,7 +420,16 @@ pub struct LoadedConfig {
     /// snapshot may contain folded function calls and must not be used as the
     /// authored reference graph.
     pub unresolved_parsed: UnresolvedConfigSnapshot,
-    pub backend_file: Option<PathBuf>,
+    /// The complete, pinned file that supplied the backend block. Callers
+    /// must use it directly rather than join it to the project again.
+    ///
+    /// ```compile_fail,E0277
+    /// use carina_core::{config_loader::LoadedConfig, paths::ResolvedPath};
+    /// fn target(project: &ResolvedPath, loaded: &LoadedConfig) {
+    ///     let _ = project.join(loaded.backend_file.as_ref().unwrap());
+    /// }
+    /// ```
+    pub backend_file: Option<ResolvedPath>,
     /// Directory-wide declaration collisions. These are non-blocking at the
     /// load boundary so editor callers retain the parsed tree; validation
     /// commands decide whether to treat them as hard errors.
@@ -649,9 +658,9 @@ pub fn load_configuration_with_config(
         let mut merged = empty_parsed();
         let mut unresolved_merged = empty_parsed();
         let mut parse_errors: Vec<String> = Vec::new();
-        let mut backend_file: Option<PathBuf> = None;
+        let mut backend_file: Option<ResolvedPath> = None;
 
-        for (file, resolved) in parsed_files {
+        for ((file, resolved), io_file) in parsed_files.into_iter().zip(files) {
             let mut parsed = resolved.into_inner();
             let mut unresolved = parsed.clone();
             if let Err(e) =
@@ -683,7 +692,7 @@ pub fn load_configuration_with_config(
                     ));
                 } else {
                     merged.backend = Some(backend);
-                    backend_file = Some(file.clone());
+                    backend_file = Some(io_file);
                 }
             }
         }

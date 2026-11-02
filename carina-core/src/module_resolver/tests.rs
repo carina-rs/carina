@@ -1229,6 +1229,38 @@ let disabled = chooser { flag = false }
 
 #[cfg(unix)]
 #[test]
+fn module_parse_error_preserves_symlink_followed_by_parent_components() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    let private = temp.path().join("private");
+    fs::create_dir_all(project.join("bad")).unwrap();
+    fs::create_dir_all(private.join("nested")).unwrap();
+    fs::create_dir(private.join("bad")).unwrap();
+    fs::write(project.join("bad/main.crn"), "arguments {}\n").unwrap();
+    fs::write(private.join("bad/main.crn"), "arguments { broken: }\n").unwrap();
+    std::os::unix::fs::symlink(private.join("nested"), project.join("jump")).unwrap();
+    let source = "let bad = use { source = \"./jump/../bad\" }\nlet instance = bad {}\n";
+    let root_file = project.join("main.crn");
+    fs::write(&root_file, source).unwrap();
+    let parsed = crate::parser::parse_file(
+        source,
+        &root_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let error =
+        resolve_modules(parsed, &project).expect_err("the symlink target contains invalid DSL");
+    let ModuleError::ParseInFile { path, .. } = error.root_cause() else {
+        panic!("expected a located module parse error: {error:?}");
+    };
+    assert_eq!(path, &project.join("jump/../bad/main.crn"));
+    let relative = error.display_relative_to(&project);
+    assert!(relative.contains("jump/../bad/main.crn"), "{relative}");
+    assert!(!relative.contains("private"), "{relative}");
+}
+
+#[cfg(unix)]
+#[test]
 fn nested_module_directory_preserves_symlink_source_path() {
     let temp = tempfile::tempdir().unwrap();
     let real = temp.path().join("real");

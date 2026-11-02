@@ -499,6 +499,50 @@ fn saved_nested_composition_mismatch_preserves_external_symlink_source_path() {
 
 #[cfg(unix)]
 #[test]
+fn saved_removed_nested_composition_hides_in_root_symlink_source_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let checkout = temp.path().join("checkout");
+    let config = write_nested_secret_tree(&checkout);
+    fs::rename(
+        checkout.join("modules/outer"),
+        checkout.join("modules/real"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("real", checkout.join("modules/alias")).unwrap();
+    let source = fs::read_to_string(config.join("main.crn"))
+        .unwrap()
+        .replace("../../modules/outer", "./modules/alias");
+    fs::write(checkout.join("main.crn"), source).unwrap();
+    let inner = checkout.join("modules/inner/main.crn");
+    let source = fs::read_to_string(&inner)
+        .unwrap()
+        .replace("comment = value", "comment = \"public\"");
+    fs::write(&inner, source).unwrap();
+    assert_success(
+        "init in-root symlinked module",
+        &run_in_checkout(&checkout, &["init", "."]),
+    );
+    assert_success(
+        "save in-root symlinked module plan",
+        &run_in_checkout(&checkout, &["plan", "--out", "plan.json", "."]),
+    );
+    let real = checkout.join("modules/real/main.crn");
+    let source = fs::read_to_string(&real).unwrap();
+    fs::write(&real, &source[..source.find("let nested =").unwrap()]).unwrap();
+
+    let apply = run_in_checkout(&checkout, &["apply", "--auto-approve", "plan.json"]);
+    assert!(!apply.status.success());
+    let message = output_text(&apply);
+    assert!(
+        message.contains("<source within source root>:"),
+        "{message}"
+    );
+    assert!(message.contains("composition call id chain"), "{message}");
+    assert!(!message.contains("modules/real"), "{message}");
+}
+
+#[cfg(unix)]
+#[test]
 fn saved_removed_nested_composition_hides_external_source_identity() {
     assert_external_nested_call_diagnostic(true);
 }

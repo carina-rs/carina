@@ -150,6 +150,54 @@ fn replace_provider_file(path: &Path, bytes: &[u8]) {
 }
 
 #[test]
+#[cfg(unix)]
+fn init_egress_consent_and_progress_keep_the_authored_symlink_source() {
+    let scenario = Scenario::new();
+    fs::create_dir(scenario.project.join("private")).unwrap();
+    fs::rename(
+        &scenario.provider_source,
+        scenario.project.join("private/provider.wasm"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("private/provider.wasm", scenario.project.join("alias.wasm"))
+        .unwrap();
+    fs::write(
+        scenario.project.join("providers.crn"),
+        "provider mock_http { source = \"file://./alias.wasm\" }\n",
+    )
+    .unwrap();
+
+    let denied = scenario.carina(&["init", "."]);
+    assert!(!denied.status.success());
+    let message = rendered(&denied);
+    assert!(
+        message.contains("Provider source file://alias.wasm declares these egress hosts:"),
+        "{message}"
+    );
+    assert!(
+        message.contains("provider source file://alias.wasm requires explicit egress consent"),
+        "{message}"
+    );
+    assert!(!message.contains("private/provider.wasm"), "{message}");
+
+    // An explicitly accepted spelling of the same file still authorizes the
+    // authored alias without changing the source printed by init.
+    let accepted = scenario.carina(&[
+        "init",
+        ".",
+        "--accept-egress",
+        "file://private/provider.wasm",
+    ]);
+    assert!(accepted.status.success(), "{}", rendered(&accepted));
+    let message = rendered(&accepted);
+    assert!(
+        message.contains("Provider source file://alias.wasm declares these egress hosts:"),
+        "{message}"
+    );
+    assert!(!message.contains("private/provider.wasm"), "{message}");
+}
+
+#[test]
 fn non_tty_init_requires_the_canonical_source_to_be_accepted() {
     let scenario = Scenario::new();
 

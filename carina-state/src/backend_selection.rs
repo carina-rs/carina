@@ -162,12 +162,12 @@ pub enum MutationBackendSelection {
 /// Backends resolved for one state migration.
 ///
 /// Only the operations required by migration are exposed: read the source,
-/// inspect/write/verify the target, and inspect the source configuration for
-/// post-commit local cleanup.
+/// inspect/write/verify the target, and use the same pinned local source for
+/// post-commit cleanup. The source locator is never resolved a second time.
 pub struct MigrationBackends {
     source: Box<dyn crate::StateBackend>,
     target: Box<dyn crate::StateBackend>,
-    source_config: Option<BackendConfig>,
+    local_source_path: Option<ResolvedPath>,
 }
 
 impl MigrationBackends {
@@ -183,8 +183,8 @@ impl MigrationBackends {
         self.target.write_state(state).await
     }
 
-    pub fn source_config(&self) -> Option<&BackendConfig> {
-        self.source_config.as_ref()
+    pub fn local_source_path(&self) -> Option<&ResolvedPath> {
+        self.local_source_path.as_ref()
     }
 }
 
@@ -321,11 +321,22 @@ impl BackendSelection {
             Self::configured_target(Some(drift.existing.to_state_config()?), project_dir.clone());
         let target =
             Self::configured_target(Some(drift.configured.to_state_config()?), project_dir);
-        let source_config = source.configured_config().cloned();
+        let (source, local_source_path): (Box<dyn crate::StateBackend>, _) = match source.target() {
+            BackendTarget::Configured {
+                config: Some(BackendConfig::Local(settings)),
+                base_dir,
+            } => {
+                let path = crate::backends::anchored_local_path(settings, base_dir)
+                    .map_err(|error| BackendError::Io(error.to_string()))?;
+                let backend = crate::backends::LocalBackend::with_resolved_path(path.clone())?;
+                (Box::new(backend), Some(path))
+            }
+            _ => (crate::backends::create_backend(&source).await?, None),
+        };
         Ok(MigrationBackends {
-            source: crate::backends::create_backend(&source).await?,
+            source,
             target: crate::backends::create_backend(&target).await?,
-            source_config,
+            local_source_path,
         })
     }
 
@@ -576,10 +587,13 @@ mod tests {
 
         let backends = BackendSelection::for_migration(&drift).await.unwrap();
 
-        let Some(BackendConfig::Local(source)) = backends.source_config() else {
+        let Some(source) = backends.local_source_path() else {
             panic!("migration source must be the locked local backend")
         };
-        assert_eq!(source.path(), Some("old.json"));
+        assert_eq!(
+            source.display(),
+            &carina_core::paths::DisplayPath::new(project.path().join("old.json")).unwrap()
+        );
         let loaded_source = backends.read_source_state().await.unwrap().unwrap();
         assert_eq!(loaded_source.into_state().lineage, "locked-old");
         assert!(backends.read_target_state().await.unwrap().is_none());

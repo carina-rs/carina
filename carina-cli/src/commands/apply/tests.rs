@@ -40,6 +40,40 @@ use crate::wiring::{
     resolve_config_block_names_for_test,
 };
 
+#[test]
+fn bootstrap_appends_to_the_loaded_backend_in_a_relative_project() {
+    let cwd = std::env::current_dir().unwrap();
+    let temp = tempfile::tempdir_in(&cwd).unwrap();
+    let directory = temp.path().join("infra");
+    std::fs::create_dir(&directory).unwrap();
+    let authored = "backend local { path = \"state.json\" }\n";
+    std::fs::write(directory.join("backend.crn"), authored).unwrap();
+    std::fs::write(directory.join("main.crn"), "").unwrap();
+    let relative = Path::new(temp.path().file_name().unwrap()).join("infra");
+    let project = ResolvedPath::new(&relative).unwrap();
+    let loaded = load_configuration_with_config(
+        &project,
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        &SchemaRegistry::new(),
+    )
+    .unwrap();
+    let resource = "\n// generated state bucket resource\n";
+    append_bootstrap_resource(loaded.backend_file.as_ref().unwrap(), resource).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(directory.join("backend.crn")).unwrap(),
+        format!("{authored}{resource}")
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.join("main.crn")).unwrap(),
+        ""
+    );
+    assert!(
+        !directory.join(&relative).exists(),
+        "bootstrap must not create an infra/infra tree"
+    );
+}
+
 fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
     carina_core::resource::absolute_binding_address_for_test(name)
 }
@@ -265,11 +299,7 @@ fn mock_http_test_egress(
 ) -> carina_provider_resolver::LockedEgress {
     let declaration = carina_provider_resolver::VerifiedEgressDeclaration::read(load)
         .expect("mock HTTP provider must carry a valid egress declaration");
-    let canonical_source = declaration.source().to_string();
-    let source = canonical_source
-        .strip_prefix("file://")
-        .map(|path| format!("file://{}", lock_dir.join(path).display()))
-        .unwrap_or(canonical_source);
+    let source = declaration.source().to_string();
     let hosts = declaration
         .patterns()
         .iter()
@@ -1899,8 +1929,8 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         "a saved source path injected a terminal escape byte",
     );
     assert!(
-        rendered.contains(r"<source root>/saved\u{1b}[31m.crn"),
-        "the escaped source-root-relative path must be retained in the moved-call diagnostic",
+        rendered.contains("<source within source root>"),
+        "an unmapped saved identity must use a neutral diagnostic label",
     );
 
     std::fs::remove_file(&current_source).expect("remove current composition source");

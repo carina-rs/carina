@@ -1864,28 +1864,13 @@ async fn run_apply_with_observer_factory(
                         .ok_or("Backend does not specify a provider name")?;
 
                     // Append resource definition to backend file
-                    let target_file = backend_file.clone().unwrap_or_else(|| path.to_path_buf());
+                    let target_file = backend_file.as_ref().unwrap_or(project);
 
                     let resource_code = backend
                         .resource_definition(&bucket_name)
                         .ok_or("Backend does not support resource definition generation")?;
 
-                    let target_file = project
-                        .join(&target_file)
-                        .map_err(|error| AppError::Config(error.to_string()))?;
-                    // Read existing content if file exists, then append
-                    let mut content = if target_file.exists() {
-                        target_file.read_to_string().map_err(|e| {
-                            format!("Failed to read {}: {}", target_file.display(), e)
-                        })?
-                    } else {
-                        String::new()
-                    };
-                    content.push_str(&resource_code);
-
-                    target_file
-                        .atomic_replace(content.as_bytes())
-                        .map_err(|e| format!("Failed to write {}: {}", target_file.display(), e))?;
+                    append_bootstrap_resource(target_file, &resource_code)?;
                     println!(
                         "  {} Added resource definition to {}",
                         "✓".green(color_mode),
@@ -2013,6 +1998,24 @@ pub(crate) async fn symlink_retarget_test_barrier(variable: &str) {
     while !directory.join("proceed").exists() && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+}
+
+fn append_bootstrap_resource(
+    target_file: &ResolvedPath,
+    resource_code: &str,
+) -> Result<(), AppError> {
+    let mut content = if target_file.exists() {
+        target_file
+            .read_to_string()
+            .map_err(|e| format!("Failed to read {}: {}", target_file.display(), e))?
+    } else {
+        String::new()
+    };
+    content.push_str(resource_code);
+    target_file
+        .atomic_replace(content.as_bytes())
+        .map_err(|e| format!("Failed to write {}: {}", target_file.display(), e))?;
+    Ok(())
 }
 
 fn reload_apply_configuration_after_bootstrap(
@@ -3323,7 +3326,7 @@ fn rehydrate_desired_plan_file_from_parts(
                             let source_file = composition_source_identities
                                 .display_source_file(call)
                                 .map(ToString::to_string)
-                                .unwrap_or_else(|| call.source_root_relative_location());
+                                .unwrap_or_else(|| call.unmapped_source_location().to_string());
                             format!("{}:{}:{}", source_file.escape_debug(),
                                 call.start_line(), call.start_column())
                         }).collect::<Vec<_>>().join(" -> ");

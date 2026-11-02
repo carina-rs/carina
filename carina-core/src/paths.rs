@@ -88,11 +88,28 @@ impl ResolvedPath {
         display_address: PathBuf,
         persisted: PersistedPath,
     ) -> io::Result<Self> {
+        Self::from_address_after_parent_pin(address, display, display_address, persisted, || {})
+    }
+
+    fn from_address_after_parent_pin(
+        address: &Path,
+        display: DisplayPath,
+        display_address: PathBuf,
+        persisted: PersistedPath,
+        after_parent_pin: impl FnOnce(),
+    ) -> io::Result<Self> {
         let sibling_parent = address
             .parent()
             .map(|parent| pin_io_path(parent, 0))
             .transpose()?;
-        let resolved = pin_io_path(address, 0)?;
+        after_parent_pin();
+        // Resolve the leaf only through the parent we just pinned. Resolving
+        // the complete locator again could follow a retargeted parent alias
+        // and pair one tree's state with another tree's advisory lock.
+        let resolved = match (&sibling_parent, address.components().next_back()) {
+            (Some(parent), Some(leaf)) => pin_io_path(&parent.join(leaf.as_os_str()), 0)?,
+            _ => pin_io_path(address, 0)?,
+        };
         Ok(Self {
             resolved,
             display,
@@ -381,6 +398,14 @@ fn pin_io_path(path: &Path, links: usize) -> io::Result<PathBuf> {
 /// let p = CanonicalPath::new(".").unwrap();
 /// let message = p.display();
 /// ```
+///
+/// Relative identities cannot be converted into diagnostic strings either.
+///
+/// ```compile_fail,E0599
+/// use carina_core::paths::CanonicalPath;
+/// let p = CanonicalPath::new(".").unwrap();
+/// let message: Option<String> = p.relative_identity(&p);
+/// ```
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct CanonicalPath(PathBuf);
@@ -388,10 +413,6 @@ pub struct CanonicalPath(PathBuf);
 impl CanonicalPath {
     pub fn ancestors(&self) -> impl Iterator<Item = Self> + '_ {
         self.0.ancestors().map(|path| Self(path.to_path_buf()))
-    }
-
-    pub fn relative_identity(&self, root: &Self) -> Option<String> {
-        relative_path_from_root(&root.0, &self.0).map(|path| path.display().to_string())
     }
 
     pub fn new(path: impl AsRef<Path>) -> io::Result<Self> {
@@ -668,6 +689,32 @@ impl PersistedPath {
         Self::new(self.0.join(child).0)
     }
 
+    /// Render a relative selector from logical locators, without resolving
+    /// symlinks. Dot and parent components are reduced lexically.
+    pub fn lexical_relative_to(&self, base: &Self) -> Option<DisplayPath> {
+        fn normalize(path: &Path) -> PathBuf {
+            let mut normalized = PathBuf::new();
+            for component in path.components() {
+                match component {
+                    Component::CurDir => {}
+                    Component::ParentDir => {
+                        normalized.pop();
+                    }
+                    component => normalized.push(component.as_os_str()),
+                }
+            }
+            normalized
+        }
+
+        relative_path_from_root(&normalize(&base.0.0), &normalize(&self.0.0)).map(|relative| {
+            DisplayPath(if relative.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                relative
+            })
+        })
+    }
+
     /// Pin the saved locator against the filesystem at the time it is reused.
     pub fn resolve(&self) -> io::Result<ResolvedPath> {
         ResolvedPath::new(&self.0.0)
@@ -769,6 +816,28 @@ fn relative_path_from_root(root: &Path, path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_paths_render_project_relative_selectors_lexically() {
+        for (source, project, expected) in [
+            ("project/mock-http.wasm", "project", "mock-http.wasm"),
+            ("project/./alias.wasm", "./project", "alias.wasm"),
+            ("./alias.wasm", ".", "alias.wasm"),
+            ("project/nested/../alias.wasm", "project", "alias.wasm"),
+            ("project/alias.wasm", "project/nested/..", "alias.wasm"),
+            ("shared/provider.wasm", "project", "../shared/provider.wasm"),
+            ("project/../provider.wasm", "project", "../provider.wasm"),
+            ("project", "project", "."),
+        ] {
+            let source = PersistedPath::new(source).unwrap();
+            let project = PersistedPath::new(project).unwrap();
+            assert_eq!(
+                source.lexical_relative_to(&project).unwrap().to_string(),
+                expected,
+                "source={source}, project={project}"
+            );
+        }
+    }
 
     #[test]
     fn display_path_construction_and_serde_preserve_authored_spelling() {
@@ -1019,6 +1088,56 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_and_lock_share_the_parent_pinned_before_a_symlink_retarget() {
+        for existing_state in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let original = temp.path().join("original");
+            let replacement = temp.path().join("replacement");
+            let current = temp.path().join("current");
+            std::fs::create_dir(&original).unwrap();
+            std::fs::create_dir(&replacement).unwrap();
+            if existing_state {
+                std::fs::write(original.join("carina.state.json"), b"original").unwrap();
+                std::fs::write(replacement.join("carina.state.json"), b"replacement").unwrap();
+            }
+            std::os::unix::fs::symlink(&original, &current).unwrap();
+            let address = current.join("carina.state.json");
+            let state = ResolvedPath::from_address_after_parent_pin(
+                &address,
+                DisplayPath::new(&address).unwrap(),
+                address.clone(),
+                PersistedPath::new(&address).unwrap(),
+                || {
+                    std::fs::remove_file(&current).unwrap();
+                    std::os::unix::fs::symlink(&replacement, &current).unwrap();
+                },
+            )
+            .unwrap();
+            let lock = state.with_extension("lock").unwrap();
+            lock.create_lock(b"owner").unwrap();
+            if existing_state {
+                assert_eq!(state.read().unwrap(), b"original");
+            }
+            state.atomic_replace(b"updated").unwrap();
+            assert_eq!(
+                std::fs::read(original.join("carina.state.json")).unwrap(),
+                b"updated"
+            );
+            assert!(original.join("carina.state.lock").exists());
+            assert!(!replacement.join("carina.state.lock").exists());
+            if existing_state {
+                assert_eq!(
+                    std::fs::read(replacement.join("carina.state.json")).unwrap(),
+                    b"replacement"
+                );
+            } else {
+                assert!(!replacement.join("carina.state.json").exists());
+            }
+        }
     }
 
     #[cfg(unix)]
