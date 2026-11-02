@@ -15,7 +15,7 @@ use carina_core::provider::{
 };
 #[cfg(test)]
 use carina_core::provider::{PatchOp as CorePatchOp, ProviderDirectiveSchema};
-use carina_core::provider_text::ProviderText;
+use carina_core::provider_text::{ProviderString, ProviderText};
 use carina_core::resource::{
     ConcreteValue, DeferredValue, RedactedSecretHash, ResourceId as CoreResourceId,
     ResourceIdentityState, State as CoreState, Value as CoreValue,
@@ -2067,7 +2067,7 @@ pub(crate) fn core_type_identity_to_wit(
 /// Deserialize JSON to (name, display_name, version) tuple from ProviderInfo.
 pub fn json_to_provider_info(
     json: &str,
-) -> Result<(String, ProviderText, ProviderText), serde_json::Error> {
+) -> Result<(String, ProviderText, ProviderString), serde_json::Error> {
     let proto::ProviderInfo {
         name,
         display_name,
@@ -4908,15 +4908,33 @@ mod tests {
                 .unwrap()
                 .contains('\x1b')
         );
-        assert!(
-            !decoded
+        assert_eq!(
+            decoded
                 .detail()
                 .resource_id
                 .as_ref()
                 .unwrap()
-                .provider
-                .contains('\x1b')
+                .as_resource_id()
+                .provider,
+            attack
         );
+    }
+
+    #[test]
+    fn provider_text_provider_version_keeps_valid_long_semver() {
+        let raw = format!("1.2.3+{}", "a".repeat(9000));
+        let json =
+            serde_json::json!({"name": "mock", "display_name": "Mock", "version": raw}).to_string();
+        let (_, _, version) = json_to_provider_info(&json).unwrap();
+        assert_eq!(version.as_str(), raw);
+        let parsed = semver::Version::parse(version.as_str()).unwrap();
+        assert!(
+            semver::VersionReq::parse("^1.2.0")
+                .unwrap()
+                .matches(&parsed)
+        );
+        assert!(version.to_string().contains("… (truncated, "));
+        assert!(version.to_string().len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
     }
 
     #[test]
@@ -4928,7 +4946,12 @@ mod tests {
         .to_string();
         let (_name, display_name, version) = json_to_provider_info(&json).unwrap();
         let version_error = check_protocol_version(&json).unwrap_err();
-        for text in [display_name, version, version_error] {
+        assert_eq!(version.as_str(), raw);
+        for text in [
+            display_name.to_string(),
+            version.to_string(),
+            version_error.to_string(),
+        ] {
             assert!(!text.contains(['\x1b', '\x07']));
             assert!(text.contains("\\u{1b}"));
             assert!(text.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
@@ -5005,7 +5028,11 @@ mod tests {
         assert_eq!(detail.status, Some(503));
         assert_eq!(detail.code.as_deref(), Some("ServiceUnavailable"));
         assert_eq!(detail.request_id.as_deref(), Some("request-123"));
-        let rid = detail.resource_id.as_ref().expect("resource_id preserved");
+        let rid = detail
+            .resource_id
+            .as_ref()
+            .expect("resource_id preserved")
+            .as_resource_id();
         assert_eq!(rid.provider, "aws");
         assert_eq!(rid.resource_type, "s3.Bucket");
         assert_eq!(rid.identity_str().expect("resolved identity"), "my-bucket");
@@ -5063,7 +5090,8 @@ mod tests {
             .detail()
             .resource_id
             .as_deref()
-            .expect("resource id decoded");
+            .expect("resource id decoded")
+            .as_resource_id();
 
         assert_eq!(id.provider, "aws");
         assert_eq!(id.resource_type, "s3.Bucket");

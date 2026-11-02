@@ -198,7 +198,7 @@ pub use compiled_pattern::{
     Compiled, CompiledPattern, Draft, PatternCompileError, PatternCompileErrorSource, PatternForm,
 };
 
-use crate::provider_text::ProviderText;
+use crate::provider_text::{ProviderString, ProviderText};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -288,7 +288,7 @@ impl FieldGroupKind {
 pub enum FieldGroupError {
     #[error("field groups require at least two fields, got {actual}")]
     TooFewFields { actual: usize },
-    #[error("field group contains duplicate field `{name}`")]
+    #[error("field group contains duplicate field `{}`", ProviderText::new(name))]
     DuplicateField { name: String },
 }
 
@@ -377,7 +377,7 @@ impl fmt::Display for RefEncountered {
         write!(
             f,
             "unresolved AttributeType::Ref(\"{}\") has no defs in scope",
-            self.name
+            ProviderText::new(&self.name)
         )
     }
 }
@@ -6501,7 +6501,7 @@ impl DslSpelling {
 
 impl fmt::Display for DslSpelling {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        ProviderText::new(&self.0).fmt(f)
     }
 }
 
@@ -6573,6 +6573,18 @@ pub struct ExpectedEnumVariant {
 }
 
 impl ExpectedEnumVariant {
+    /// Original DSL text for edits and matching. Display is a diagnostic label.
+    pub fn dsl_spelling(&self) -> String {
+        match &self.provider {
+            Some(provider) => std::iter::once(provider.as_str())
+                .chain(self.segments.iter().map(String::as_str))
+                .chain([self.type_name.as_str(), self.value.as_str()])
+                .collect::<Vec<_>>()
+                .join("."),
+            None => self.value.as_str().to_owned(),
+        }
+    }
+
     /// Build the accepted fully-qualified DSL spelling directly from the
     /// structured enum identity. This avoids re-parsing a dotted display name
     /// at the binding/enum disambiguation seam.
@@ -6622,16 +6634,7 @@ impl ExpectedEnumVariant {
 
 impl fmt::Display for ExpectedEnumVariant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.provider {
-            Some(provider) => {
-                write!(f, "{}", provider)?;
-                for seg in &self.segments {
-                    write!(f, ".{}", seg)?;
-                }
-                write!(f, ".{}.{}", self.type_name, self.value)
-            }
-            None => write!(f, "{}", self.value),
-        }
+        ProviderText::new(self.dsl_spelling()).fmt(f)
     }
 }
 
@@ -7133,8 +7136,8 @@ fn contains_union_alternatives_mismatch(error: &TypeError) -> bool {
 /// A lexical binding that shadows an enum member with the same bare spelling.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[error(
-        "`{name}` was interpreted as the `{binding_kind}` binding; if you meant the enum `{}` value, write `{qualified}`",
-        r#enum.kind
+        "`{}` was interpreted as the `{binding_kind}` binding; if you meant the enum `{}` value, write `{qualified}`",
+        ProviderText::new(name), ProviderText::new(&r#enum.kind)
     )]
 pub struct BindingShadowsEnumMemberError {
     pub name: String,
@@ -7156,7 +7159,11 @@ fn format_field_group_violation(path: &FieldPath, group: &FieldGroup) -> String 
 /// Type error
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum TypeError {
-    #[error("Type mismatch: expected {expected}, got {got}")]
+    #[error(
+        "Type mismatch: expected {}, got {}",
+        ProviderText::new(expected),
+        ProviderText::new(got)
+    )]
     TypeMismatch { expected: String, got: String },
 
     #[error(transparent)]
@@ -7164,7 +7171,7 @@ pub enum TypeError {
 
     #[error(
         "{}",
-        format_invalid_enum(value, *value_kind, attribute.as_deref(), type_name.as_deref(), expected)
+        ProviderText::new(format_invalid_enum(value, *value_kind, attribute.as_deref(), type_name.as_deref(), expected))
     )]
     InvalidEnumVariant {
         value: DiagnosticValue,
@@ -7188,18 +7195,18 @@ pub enum TypeError {
 
     #[error(
         "{}",
-        format_pattern_mismatch(value, pattern, attribute.as_deref(), type_name.as_deref())
+        ProviderText::new(format_pattern_mismatch(value, pattern.as_str(), attribute.as_deref(), type_name.as_deref()))
     )]
     PatternMismatch {
         value: DiagnosticValue,
-        pattern: ProviderText,
+        pattern: ProviderString,
         attribute: Option<String>,
         type_name: Option<String>,
     },
 
     #[error(
         "{}",
-        format_length_out_of_range(value, *length, *min, *max, attribute.as_deref(), type_name.as_deref())
+        ProviderText::new(format_length_out_of_range(value, *length, *min, *max, attribute.as_deref(), type_name.as_deref()))
     )]
     LengthOutOfRange {
         value: DiagnosticValue,
@@ -7213,7 +7220,7 @@ pub enum TypeError {
     #[error(
         "Duplicate list element {} at index {index} (first at index {first_index}){}",
         value.render_enum_value(InvalidEnumValueKind::Identifier),
-        attribute.as_ref().map(|name| format!(" for '{name}'")).unwrap_or_default()
+        attribute.as_ref().map(|name| format!(" for '{}'", ProviderText::new(name))).unwrap_or_default()
     )]
     DuplicateListElement {
         value: DiagnosticValue,
@@ -7231,7 +7238,7 @@ pub enum TypeError {
     /// See #2094.
     #[error(
         "{}",
-        format_string_literal_expected_enum(user_typed, attribute.as_deref(), type_name, expected, extra_message.as_deref())
+        ProviderText::new(format_string_literal_expected_enum(user_typed, attribute.as_deref(), type_name, expected, extra_message.as_deref()))
     )]
     StringLiteralExpectedEnum {
         /// The string the user typed between the quotes, or a secret mask.
@@ -7272,22 +7279,25 @@ pub enum TypeError {
         attribute: Option<String>,
     },
 
-    #[error("Required attribute '{name}' is missing")]
+    #[error("Required attribute '{}' is missing", ProviderText::new(name))]
     MissingRequired { name: String },
 
-    #[error("{}", format_field_group_violation(path, group))]
+    #[error("{}", ProviderText::new(format_field_group_violation(path, group)))]
     FieldGroupViolation { path: FieldPath, group: FieldGroup },
 
-    #[error("Attribute '{name}' is populated by the provider and cannot be set")]
+    #[error(
+        "Attribute '{}' is populated by the provider and cannot be set",
+        ProviderText::new(name)
+    )]
     ReadOnlyAttribute { name: String },
 
-    #[error("Unknown attribute '{name}'{}", suggestion.as_ref().map(|s| format!(", did you mean '{}'?", s)).unwrap_or_default())]
+    #[error("Unknown attribute '{}'{}", ProviderText::new(name), suggestion.as_ref().map(|s| format!(", did you mean '{}'?", ProviderText::new(s))).unwrap_or_default())]
     UnknownAttribute {
         name: String,
         suggestion: Option<String>,
     },
 
-    #[error("Unknown field '{field}' in {struct_name}{}", suggestion.as_ref().map(|s| format!(", did you mean '{}'?", s)).unwrap_or_default())]
+    #[error("Unknown field '{}' in {}{}", ProviderText::new(field), ProviderText::new(struct_name), suggestion.as_ref().map(|s| format!(", did you mean '{}'?", ProviderText::new(s))).unwrap_or_default())]
     UnknownStructField {
         struct_name: String,
         field: String,
@@ -7296,7 +7306,7 @@ pub enum TypeError {
 
     #[error(
         "{}",
-        format_union_struct_mismatch(reason, supplied_fields, alternatives)
+        ProviderText::new(format_union_struct_mismatch(reason, supplied_fields, alternatives))
     )]
     UnionStructMismatch {
         /// Classification consumed by the concise renderer.
@@ -7316,19 +7326,22 @@ pub enum TypeError {
     #[error("List item at index {index}: {inner}")]
     ListItemError { index: usize, inner: Box<TypeError> },
 
-    #[error("Map key '{key}': {inner}")]
+    #[error("Map key '{}': {inner}", ProviderText::new(key))]
     MapKeyError { key: String, inner: Box<TypeError> },
 
-    #[error("Map value for key '{key}': {inner}")]
+    #[error("Map value for key '{}': {inner}", ProviderText::new(key))]
     MapValueError { key: String, inner: Box<TypeError> },
 
-    #[error("Struct field '{field}': {inner}")]
+    #[error("Struct field '{}': {inner}", ProviderText::new(field))]
     StructFieldError {
         field: String,
         inner: Box<TypeError>,
     },
 
-    #[error("'{attribute}' cannot use block syntax; use map assignment: {attribute} = {{ ... }}")]
+    #[error(
+        "'{0}' cannot use block syntax; use map assignment: {0} = {{ ... }}",
+        ProviderText::new(attribute)
+    )]
     BlockSyntaxNotAllowed { attribute: String },
 }
 
@@ -8372,16 +8385,23 @@ pub enum SchemaKind {
 pub enum AttributePathTypeError {
     #[error("attribute path cannot be empty")]
     Empty,
-    #[error("unknown top-level attribute `{attribute}`")]
+    #[error("unknown top-level attribute `{}`", ProviderText::new(attribute))]
     UnknownAttribute { attribute: String },
-    #[error("unknown field `{field}` on struct `{struct_name}` after `{parent_path}`")]
+    #[error(
+        "unknown field `{}` on struct `{}` after `{}`",
+        ProviderText::new(field),
+        ProviderText::new(struct_name),
+        ProviderText::new(parent_path)
+    )]
     UnknownStructField {
         parent_path: String,
         field: String,
         struct_name: String,
     },
     #[error(
-        "cannot traverse `{path}` because it has type {type_name}; only struct fields and map values can be traversed"
+        "cannot traverse `{}` because it has type {}; only struct fields and map values can be traversed",
+        ProviderText::new(path),
+        ProviderText::new(type_name)
     )]
     CannotTraverse { path: String, type_name: String },
 }
@@ -8569,18 +8589,28 @@ impl ResourceValidation {
 /// `field_groups[0]` or `defs.Tag.key` as a resource attribute.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SchemaValidationIssueLocation {
-    Attribute(ProviderText),
-    Definition(ProviderText),
+    Attribute(ProviderString),
+    Definition(ProviderString),
     FieldGroup(usize),
     UniqueName,
     DefaultPreventDestroy,
 }
 
 impl SchemaValidationIssueLocation {
+    fn raw_path(&self) -> String {
+        match self {
+            Self::Attribute(path) => path.as_str().to_owned(),
+            Self::Definition(path) => format!("defs.{}", path.as_str()),
+            Self::FieldGroup(index) => format!("field_groups[{index}]"),
+            Self::UniqueName => "unique_name".into(),
+            Self::DefaultPreventDestroy => "default_prevent_destroy".into(),
+        }
+    }
+
     fn with_suffix(&self, suffix: impl fmt::Display) -> Self {
         match self {
-            Self::Attribute(path) => Self::Attribute(format!("{path}{suffix}").into()),
-            Self::Definition(path) => Self::Definition(format!("{path}{suffix}").into()),
+            Self::Attribute(path) => Self::Attribute(format!("{}{suffix}", path.as_str()).into()),
+            Self::Definition(path) => Self::Definition(format!("{}{suffix}", path.as_str()).into()),
             Self::FieldGroup(_) | Self::UniqueName | Self::DefaultPreventDestroy => {
                 unreachable!("schema-level issue locations cannot have type-path descendants")
             }
@@ -8589,7 +8619,7 @@ impl SchemaValidationIssueLocation {
 
     pub fn attribute_path(&self) -> Option<&str> {
         match self {
-            Self::Attribute(path) => Some(path),
+            Self::Attribute(path) => Some(path.as_str()),
             Self::Definition(_)
             | Self::FieldGroup(_)
             | Self::UniqueName
@@ -8601,7 +8631,7 @@ impl SchemaValidationIssueLocation {
 impl fmt::Display for SchemaValidationIssueLocation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Attribute(path) => f.write_str(path),
+            Self::Attribute(path) => write!(f, "{path}"),
             Self::Definition(path) => write!(f, "defs.{path}"),
             Self::FieldGroup(index) => write!(f, "field_groups[{index}]"),
             Self::UniqueName => f.write_str("unique_name"),
@@ -8614,7 +8644,7 @@ impl fmt::Display for SchemaValidationIssueLocation {
 struct SchemaDefinitionIssue {
     pattern_error: Option<PatternCompileError>,
     location: SchemaValidationIssueLocation,
-    path: ProviderText,
+    path: ProviderString,
     message: ProviderText,
 }
 
@@ -8637,7 +8667,7 @@ fn fmt_schema_issues(issues: &[SchemaDefinitionIssue], f: &mut fmt::Formatter<'_
 /// Error returned when a resource-schema draft fails whole-schema validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceSchemaValidationError {
-    resource_type: ProviderText,
+    resource_type: ProviderString,
     issues: Vec<SchemaDefinitionIssue>,
 }
 
@@ -9698,12 +9728,14 @@ impl fmt::Display for ProviderSchemaValidationError {
         match self {
             Self::BuiltinTypeCollision { identity } => write!(
                 formatter,
-                "custom type `{identity}` conflicts with the built-in declaration; use the core types constructor (including its scalar kind and validator) or choose a different identity"
+                "custom type `{identity}` conflicts with the built-in declaration; use the core types constructor (including its scalar kind and validator) or choose a different identity",
+                identity = ProviderText::new(identity.to_string())
             ),
             Self::MissingScalarKind { identity } => {
                 write!(
                     formatter,
-                    "custom type `{identity}` has no scalar bridge kind"
+                    "custom type `{identity}` has no scalar bridge kind",
+                    identity = ProviderText::new(identity.to_string())
                 )
             }
             Self::ConflictingScalarKinds {
@@ -9712,18 +9744,21 @@ impl fmt::Display for ProviderSchemaValidationError {
                 second_kind,
             } => write!(
                 formatter,
-                "custom type `{identity}` is bound to both {first_kind} and {second_kind} within one provider"
+                "custom type `{identity}` is bound to both {first_kind} and {second_kind} within one provider",
+                identity = ProviderText::new(identity.to_string())
             ),
             Self::DanglingReferenceForm { identity } => write!(
                 formatter,
-                "reference form identity `{identity}` is not declared by this provider"
+                "reference form identity `{identity}` is not declared by this provider",
+                identity = ProviderText::new(identity.to_string())
             ),
             Self::NonStringReferenceForm {
                 identity,
                 declaration,
             } => write!(
                 formatter,
-                "reference form identity `{identity}` is declared as {declaration}, not refined String"
+                "reference form identity `{identity}` is declared as {declaration}, not refined String",
+                identity = ProviderText::new(identity.to_string())
             ),
         }
     }
@@ -10095,7 +10130,7 @@ fn push_schema_issue(
 ) {
     issues.push(SchemaDefinitionIssue {
         pattern_error: None,
-        path: location.to_string().into(),
+        path: location.raw_path().into(),
         location: location.clone(),
         message: ProviderText::new(message),
     });
@@ -11865,7 +11900,9 @@ impl fmt::Display for BlockNameConflict {
         write!(
             f,
             "{}: cannot use both '{}' and '{}' (they refer to the same attribute)",
-            self.resource_id, self.alias, self.canonical
+            ProviderText::new(&self.resource_id),
+            ProviderText::new(&self.alias),
+            ProviderText::new(&self.canonical)
         )
     }
 }
@@ -13945,7 +13982,8 @@ impl fmt::Display for SchemaRegistryError {
                 incoming: _incoming,
             } => write!(
                 formatter,
-                "schema owner `{owner}` has conflicting witness-backed reference-form tables"
+                "schema owner `{}` has conflicting witness-backed reference-form tables",
+                ProviderText::new(owner)
             ),
         }
     }

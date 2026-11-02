@@ -34,7 +34,7 @@ impl PatternAttributeType<Draft> {
                         Ok(pattern) => Some(pattern),
                         Err(error) => {
                             issues.push(SchemaDefinitionIssue {
-                                path: location.to_string().into(),
+                                path: location.raw_path().into(),
                                 location,
                                 message: error.to_string().into(),
                                 pattern_error: Some(error),
@@ -58,7 +58,7 @@ impl PatternAttributeType<Draft> {
                         Ok(pattern) => Some(pattern),
                         Err(error) => {
                             issues.push(SchemaDefinitionIssue {
-                                path: location.to_string().into(),
+                                path: location.raw_path().into(),
                                 location,
                                 message: error.to_string().into(),
                                 pattern_error: Some(error),

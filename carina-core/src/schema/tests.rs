@@ -10,6 +10,19 @@ use crate::schema::{
 fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
     crate::resource::RootScope::new().resolve(crate::resource::RelativeBindingName::new(binding))
 }
+
+#[test]
+fn provider_text_schema_location_suffix_preserves_raw_lookup_path() {
+    let raw = "name\x1b[2J";
+    let location = SchemaValidationIssueLocation::Attribute(raw.into()).with_suffix(".child");
+    assert_eq!(location.attribute_path(), Some("name\x1b[2J.child"));
+    assert_eq!(location.to_string(), "name\\u{1b}[2J.child");
+    let raw_path = location.raw_path();
+    assert_eq!(raw_path, "name\x1b[2J.child");
+    let definition = SchemaValidationIssueLocation::Definition(raw.into()).with_suffix(".child");
+    assert_eq!(definition.raw_path(), "defs.name\x1b[2J.child");
+    assert_eq!(definition.to_string(), "defs.name\\u{1b}[2J.child");
+}
 type Value = crate::resource::Value<crate::resource::NoPlaceholder>;
 type ConcreteValue = crate::resource::ConcreteValue<crate::resource::NoPlaceholder>;
 type DeferredValue = crate::resource::DeferredValue<crate::resource::NoPlaceholder>;

@@ -2,7 +2,7 @@
 
 use std::{fmt, ops::Deref};
 
-use crate::provider_text::ProviderText;
+use crate::provider_text::{ProviderString, ProviderText};
 use regex_syntax::ast::{self, Ast};
 
 mod sealed {
@@ -97,7 +97,7 @@ impl Deref for CompiledPattern {
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[error("{diagnostic}")]
 pub struct PatternCompileError {
-    pub pattern: ProviderText,
+    pub pattern: ProviderString,
     /// Typed parser, dialect or regex compiler diagnostic rendered by this error.
     pub reason: PatternCompileErrorSource,
     diagnostic: ProviderText,

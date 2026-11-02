@@ -31,7 +31,7 @@ use carina_provider_protocol::types::{
 use crate::binding_index::SecretPreservingAttributes;
 use crate::effect::PlanOp;
 use crate::parser::{ProviderConfig, StateBlockAddress};
-use crate::provider_text::{ProviderDiagnostic, ProviderText};
+use crate::provider_text::{ProviderDiagnostic, ProviderString, ProviderText};
 pub use crate::resource::ProviderDirectiveSchema;
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, PartialReadMarker, PendingReRead,
@@ -128,13 +128,12 @@ pub struct ErrorDetail {
     pub request_id: Option<ProviderText>,
 }
 
-/// A diagnostic resource id whose components have passed through [`ProviderText`].
-/// It cannot be mutated or used to change a resource's plan/state identity.
-#[derive(Debug, PartialEq, Eq)]
+/// Original resource identity with a sanitized diagnostic header.
+#[derive(PartialEq, Eq)]
 pub struct ProviderErrorResourceId(ResourceId);
 
 impl ProviderErrorResourceId {
-    /// Borrow the sanitized diagnostic id, preserving resource-id comparisons.
+    /// Borrow the original id for identity comparisons and wire encoding.
     pub fn as_resource_id(&self) -> &ResourceId {
         &self.0
     }
@@ -142,42 +141,26 @@ impl ProviderErrorResourceId {
 
 impl From<ResourceId> for ProviderErrorResourceId {
     fn from(id: ResourceId) -> Self {
-        let ResourceId {
-            provider,
-            resource_type,
-            identity,
-            provider_instance,
-        } = id;
-        let identity = match identity {
-            crate::resource::ResourceIdentityState::Pending(pending) => {
-                crate::resource::ResourceIdentityState::Pending(pending)
-            }
-            crate::resource::ResourceIdentityState::Resolved(identity) => {
-                crate::resource::ResourceIdentityState::Resolved(
-                    ProviderText::new(identity.as_str())
-                        .to_string()
-                        .try_into()
-                        .expect("sanitizing a non-empty identity cannot empty it"),
-                )
-            }
-        };
-        Self(ResourceId {
-            provider: ProviderText::new(provider).to_string(),
-            resource_type: ProviderText::new(resource_type).to_string(),
-            identity,
-            provider_instance: provider_instance.map(|name| ProviderText::new(name).to_string()),
-        })
+        Self(id)
     }
 }
 
-impl std::ops::Deref for ProviderErrorResourceId {
-    type Target = ResourceId;
-
-    fn deref(&self) -> &ResourceId {
-        &self.0
+impl std::fmt::Display for ProviderErrorResourceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        ProviderText::new(format!(
+            "{}.{}",
+            self.0.resource_type,
+            self.0.identity_display()
+        ))
+        .fmt(f)
     }
 }
 
+impl std::fmt::Debug for ProviderErrorResourceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.to_string(), f)
+    }
+}
 /// Host-only classification for errors produced by provider lifecycle policy.
 ///
 /// Unlike [`ProviderErrorKind`], this marker never crosses the WIT boundary.
@@ -275,13 +258,7 @@ impl std::fmt::Display for ProviderError {
         // between the structured multi-line render and the single-line
         // cause render so non-AWS errors keep the same shape.
         if let Some(ref id) = detail.resource_id {
-            write!(
-                f,
-                "[{}.{}] {}",
-                id.resource_type,
-                id.identity_display(),
-                detail.context()
-            )?;
+            write!(f, "[{id}] {}", detail.context())?;
         } else {
             write!(f, "{}", detail.context())?;
         }
@@ -498,7 +475,7 @@ impl ProviderError {
             message: message.to_string(),
             resource_id: resource_id
                 .as_deref()
-                .map(|id| crate::protocol_convert::resource_id_to_protocol(id)),
+                .map(|id| crate::protocol_convert::resource_id_to_protocol(id.as_resource_id())),
             cause: cause.as_ref().map(ToString::to_string),
             provider_name: provider_name.as_ref().map(ToString::to_string),
             operation: operation.as_ref().map(ToString::to_string),
@@ -2207,7 +2184,7 @@ pub enum UpdateOutcomeKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PartialReadDiagnostic {
     pub(crate) reason: ProviderText,
-    pub(crate) missing_attributes: Vec<ProviderText>,
+    pub(crate) missing_attributes: Vec<ProviderString>,
 }
 
 /// Validated UTC RFC3339 timestamp used only to describe when a persisted
@@ -4903,7 +4880,7 @@ impl PartialReadDiagnostic {
                 reason: reason.into(),
                 missing_attributes: missing_attributes
                     .into_iter()
-                    .map(ProviderText::new)
+                    .map(ProviderString::from)
                     .collect(),
             })
         }
@@ -4913,7 +4890,7 @@ impl PartialReadDiagnostic {
         &self.reason
     }
 
-    pub fn missing_attributes(&self) -> &[ProviderText] {
+    pub fn missing_attributes(&self) -> &[ProviderString] {
         &self.missing_attributes
     }
 
@@ -4953,7 +4930,7 @@ impl PartialReadDiagnostic {
             PendingReRead::incomplete(self.reason),
             self.missing_attributes
                 .into_iter()
-                .map(|name| name.to_string())
+                .map(ProviderString::into_string)
                 .collect(),
         );
         state

@@ -22,7 +22,7 @@
 //! let _ = config_schema_to_protocol(&draft);
 //! ```
 
-use crate::provider_text::ProviderText;
+use crate::provider_text::{ProviderString, ProviderText};
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
@@ -205,33 +205,39 @@ impl fmt::Display for ProtocolConvertError {
             ),
             Self::OpenEnumWithoutNamespace { identity } => write!(
                 formatter,
-                "open enum `{identity}` has no namespace for the protocol CustomEnum record"
+                "open enum `{identity}` has no namespace for the protocol CustomEnum record",
+                identity = ProviderText::new(identity.to_string())
             ),
             Self::OpenEnumWithAliases { identity } => write!(
                 formatter,
-                "open enum `{identity}` carries DSL aliases that CustomEnum cannot represent"
+                "open enum `{identity}` carries DSL aliases that CustomEnum cannot represent",
+                identity = ProviderText::new(identity.to_string())
             ),
             Self::EmptyCustomEnumNamespace { name } => write!(
                 formatter,
-                "protocol CustomEnum `{name}` must have a non-empty namespace"
+                "protocol CustomEnum `{}` must have a non-empty namespace",
+                ProviderText::new(name)
             ),
             Self::ClosedEnumWithTransform { identity } => write!(
                 formatter,
-                "closed enum `{identity}` carries a DSL transform that StringEnum cannot represent"
+                "closed enum `{identity}` carries a DSL transform that StringEnum cannot represent",
+                identity = ProviderText::new(identity.to_string())
             ),
             Self::ClosedEnumUnsupportedBase {
                 identity,
                 base_kind,
             } => write!(
                 formatter,
-                "closed enum `{identity}` has {base_kind} base metadata that StringEnum cannot represent"
+                "closed enum `{identity}` has {base_kind} base metadata that StringEnum cannot represent",
+                identity = ProviderText::new(identity.to_string())
             ),
             Self::LegacyCustomUnsupportedBase {
                 identity,
                 base_kind,
             } => write!(
                 formatter,
-                "legacy Custom `{identity}` has {base_kind} base metadata that core cannot preserve with the enclosing identity"
+                "legacy Custom `{identity}` has {base_kind} base metadata that core cannot preserve with the enclosing identity",
+                identity = ProviderText::new(identity.to_string())
             ),
             Self::LegacyCustomUnsupportedMetadata {
                 identity,
@@ -239,7 +245,8 @@ impl fmt::Display for ProtocolConvertError {
                 base_kind,
             } => write!(
                 formatter,
-                "legacy Custom `{identity}` carries `{field}` metadata that a {base_kind} base cannot represent"
+                "legacy Custom `{identity}` carries `{field}` metadata that a {base_kind} base cannot represent",
+                identity = ProviderText::new(identity.to_string())
             ),
             Self::Context {
                 context,
@@ -347,8 +354,8 @@ impl ProtocolConvertError {
 pub enum SchemaDecodeError {
     InvalidSchema {
         detail: ProviderText,
-        resource_type: Option<ProviderText>,
-        attribute_path: Vec<ProviderText>,
+        resource_type: Option<ProviderString>,
+        attribute_path: Vec<ProviderString>,
         schema_issue_location: Option<Box<SchemaValidationIssueLocation>>,
         source: Option<Box<dyn Error + Send + Sync>>,
     },
@@ -513,8 +520,9 @@ impl SchemaDecodeError {
                 schema_issue_location,
                 source: _source,
             } => {
-                let path = std::iter::once(ProviderText::new(name))
+                let path = std::iter::once(ProviderString::from(name))
                     .chain(attribute_path.drain(..))
+                    .map(ProviderString::into_string)
                     .collect::<Vec<_>>()
                     .join(".");
                 *schema_issue_location = Some(Box::new(SchemaValidationIssueLocation::Definition(
@@ -554,12 +562,26 @@ impl fmt::Display for SchemaDecodeError {
                 if let Some(resource_type) = resource_type {
                     write!(formatter, "resource '{resource_type}'")?;
                     if !attribute_path.is_empty() {
-                        write!(formatter, " attribute '{}'", attribute_path.join("."))?;
+                        write!(
+                            formatter,
+                            " attribute '{}'",
+                            ProviderText::new(
+                                attribute_path
+                                    .iter()
+                                    .map(ProviderString::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join(".")
+                            )
+                        )?;
                     } else if let Some(attribute_path) = schema_issue_location
                         .as_deref()
                         .and_then(SchemaValidationIssueLocation::attribute_path)
                     {
-                        write!(formatter, " attribute '{attribute_path}'")?;
+                        write!(
+                            formatter,
+                            " attribute '{}'",
+                            ProviderText::new(attribute_path)
+                        )?;
                     }
                     formatter.write_str(": ")?;
                     if let Some(location) = schema_issue_location
@@ -574,13 +596,23 @@ impl fmt::Display for SchemaDecodeError {
                     write!(
                         formatter,
                         "attribute '{}': {}",
-                        attribute_path.join("."),
+                        ProviderText::new(
+                            attribute_path
+                                .iter()
+                                .map(ProviderString::as_str)
+                                .collect::<Vec<_>>()
+                                .join(".")
+                        ),
                         detail
                     )?;
                 }
             }
             Self::DuplicateReferenceForm { identity } => {
-                write!(formatter, "duplicate reference form identity `{identity}`")?;
+                write!(
+                    formatter,
+                    "duplicate reference form identity `{}`",
+                    ProviderText::new(identity.to_string())
+                )?;
             }
             Self::InvalidProviderSchema(error) => error.fmt(formatter)?,
         }
@@ -2668,7 +2700,7 @@ pub fn try_update_outcome_to_protocol(
                     reason: reason.to_string(),
                     missing_attributes: missing_attributes
                         .iter()
-                        .map(ToString::to_string)
+                        .map(|name| name.as_str().to_owned())
                         .collect(),
                 },
             })

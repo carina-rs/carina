@@ -4484,7 +4484,7 @@ impl ResourceState {
                     diagnostic
                         .missing_attributes()
                         .iter()
-                        .map(ToString::to_string)
+                        .map(|name| name.as_str().to_owned())
                         .collect(),
                 )
             })

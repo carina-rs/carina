@@ -7848,6 +7848,54 @@ fn resumed_persisted_create_records_nested_write_only_sent_values() {
 }
 
 #[test]
+fn provider_text_partial_create_writeback_preserves_raw_missing_attribute_keys() {
+    use carina_core::provider::{
+        AppliedIdentifier, AppliedState, CreateAttempt, CreateObservation, ObservedCreate,
+        PartialReadDiagnostic, PendingToken, PersistedAttributes, Sent,
+    };
+
+    for key in ["computed\x1b[2J".to_string(), "x".repeat(9000)] {
+        let resource = Resource::with_provider("mock", "test.Widget", "example", None);
+        let identifier = AppliedIdentifier::new("persisted-id").unwrap();
+        let pending = CreateAttempt::for_test(resource.id.clone())
+            .issued(identifier.clone(), Sent::AllRequestAttributes)
+            .pending(PendingToken::new("persisted-token"), 1)
+            .persist(
+                PersistedAttributes::default(),
+                PersistedAttributes::default(),
+            );
+        let diagnostic =
+            PartialReadDiagnostic::new("incomplete".into(), vec![key.clone()]).unwrap();
+        let label = diagnostic.missing_attributes()[0].to_string();
+        assert!(!label.contains('\x1b'));
+        assert!(label.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
+        assert_ne!(label, key);
+        let created = ObservedCreate::from_in_flight_for_test(
+            pending,
+            identifier,
+            CreateObservation::Observed(
+                AppliedState::new(resource.id.clone(), "persisted-id", HashMap::new()).unwrap(),
+            ),
+        )
+        .with_partial_read_for_test(diagnostic);
+        let row = resource_state_from_observation_for_test(
+            &resolved(&resource),
+            &created,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let row: ResourceState =
+            serde_json::from_str(&serde_json::to_string(&row).unwrap()).unwrap();
+        assert_eq!(
+            row.partial_read().unwrap().missing_attributes(),
+            &BTreeSet::from([key])
+        );
+    }
+}
+
+#[test]
 fn resumed_partial_create_records_exact_missing_attributes() {
     use carina_core::provider::{
         AppliedIdentifier, AppliedState, CreateAttempt, CreateObservation, ObservedCreate,

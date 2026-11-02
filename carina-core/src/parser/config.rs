@@ -400,13 +400,19 @@ pub enum CustomTypeValidationError {
 
 impl std::fmt::Display for CustomTypeValidationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::provider_text::ProviderText;
         match self {
             Self::ProvidersNotLoaded => formatter.write_str("provider custom types are not loaded"),
             Self::Rejected {
                 owner,
                 identity,
                 message,
-            } => write!(formatter, "{owner} rejected `{identity}`: {message}"),
+            } => write!(
+                formatter,
+                "{owner} rejected `{identity}`: {message}",
+                owner = ProviderText::new(owner),
+                identity = ProviderText::new(identity.to_string())
+            ),
             Self::ProviderRejected {
                 owner,
                 identity,
@@ -416,19 +422,36 @@ impl std::fmt::Display for CustomTypeValidationError {
                 if *masked {
                     write!(
                         formatter,
-                        "{owner} rejected `{identity}`: (secret) failed validation"
+                        "{owner} rejected `{identity}`: (secret) failed validation",
+                        owner = ProviderText::new(owner),
+                        identity = ProviderText::new(identity.to_string())
                     )
                 } else {
-                    write!(formatter, "{owner} rejected `{identity}`: {error}")
+                    write!(
+                        formatter,
+                        "{owner} rejected `{identity}`: {error}",
+                        owner = ProviderText::new(owner),
+                        identity = ProviderText::new(identity.to_string())
+                    )
                 }
             }
             Self::InvalidDeclarationValue {
                 owner,
                 identity,
                 error,
-            } => write!(formatter, "{owner} rejected `{identity}`: {error}"),
+            } => write!(
+                formatter,
+                "{owner} rejected `{identity}`: {error}",
+                owner = ProviderText::new(owner),
+                identity = ProviderText::new(identity.to_string())
+            ),
             Self::MissingDeclaration { owner, identity } => {
-                write!(formatter, "{owner} has no declaration for `{identity}`")
+                write!(
+                    formatter,
+                    "{owner} has no declaration for `{identity}`",
+                    owner = ProviderText::new(owner),
+                    identity = ProviderText::new(identity.to_string())
+                )
             }
             Self::ConflictingEnumDefinitions {
                 identity,
@@ -436,7 +459,10 @@ impl std::fmt::Display for CustomTypeValidationError {
                 second_owner,
             } => write!(
                 formatter,
-                "enum `{identity}` has conflicting variants or aliases in owners `{first_owner}` and `{second_owner}`"
+                "enum `{identity}` has conflicting variants or aliases in owners `{first_owner}` and `{second_owner}`",
+                identity = ProviderText::new(identity.to_string()),
+                first_owner = ProviderText::new(first_owner),
+                second_owner = ProviderText::new(second_owner)
             ),
             Self::ConflictingEnumSpelling {
                 identity,
@@ -446,7 +472,12 @@ impl std::fmt::Display for CustomTypeValidationError {
                 second_spelling,
             } => write!(
                 formatter,
-                "enum `{identity}` resolves to `{first_spelling}` for owner `{first_owner}` but `{second_spelling}` for owner `{second_owner}`"
+                "enum `{identity}` resolves to `{first_spelling}` for owner `{first_owner}` but `{second_spelling}` for owner `{second_owner}`",
+                identity = ProviderText::new(identity.to_string()),
+                first_spelling = ProviderText::new(first_spelling),
+                first_owner = ProviderText::new(first_owner),
+                second_spelling = ProviderText::new(second_spelling),
+                second_owner = ProviderText::new(second_owner)
             ),
         }
     }

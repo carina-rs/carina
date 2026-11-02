@@ -23,7 +23,12 @@ pub(crate) fn partial_read_detail_lines(diagnostic: &PartialReadDiagnostic) -> [
     let missing = if diagnostic.missing_attributes().is_empty() {
         "(none)".to_string()
     } else {
-        diagnostic.missing_attributes().join(", ")
+        diagnostic
+            .missing_attributes()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     [
         format!("reason: {}", diagnostic.reason()),
