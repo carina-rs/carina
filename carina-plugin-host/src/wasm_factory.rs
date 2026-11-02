@@ -49,7 +49,7 @@ use carina_core::provider::{
 use carina_core::resource::Resource;
 #[cfg(test)]
 use carina_core::resource::Value;
-use carina_core::resource::{ResourceId, ResourceIdentityState, State};
+use carina_core::resource::{ResourceId, ResourceIdentityState, SnapshotState, State};
 use carina_core::schema::{
     CompletionValue, TypeIdentity, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
     ValidatedResourceSchema,
@@ -7573,18 +7573,18 @@ impl std::error::Error for WasmNormalizerResultCountError {}
 type WitStateAttributeUpdate = (ResourceId, Vec<(String, wit_types::PersistedValue)>);
 
 trait StateValueAccess {
-    fn state_mut(&mut self, id: &ResourceId) -> Option<&mut State>;
+    fn state_mut(&mut self, id: &ResourceId) -> Option<&mut SnapshotState>;
 }
 
 impl StateValueAccess for carina_core::provider::StateTransformMap {
-    fn state_mut(&mut self, id: &ResourceId) -> Option<&mut State> {
+    fn state_mut(&mut self, id: &ResourceId) -> Option<&mut SnapshotState> {
         self.get_mut(id)
     }
 }
 
 #[cfg(test)]
-impl StateValueAccess for HashMap<ResourceId, State> {
-    fn state_mut(&mut self, id: &ResourceId) -> Option<&mut State> {
+impl StateValueAccess for HashMap<ResourceId, SnapshotState> {
+    fn state_mut(&mut self, id: &ResourceId) -> Option<&mut SnapshotState> {
         self.get_mut(id)
     }
 }
@@ -10004,7 +10004,7 @@ mod tests {
             .expect("migration produces a valid digest");
         let attributes = HashMap::from([(
             "comment".to_string(),
-            Value::Deferred(DeferredValue::RedactedSecret { hash }),
+            carina_core::resource::SnapshotValue::redacted(hash),
         )]);
         let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), attributes))]);
         apply_wit_state_attribute_updates(
@@ -10017,8 +10017,9 @@ mod tests {
         )
         .expect("apply normalized state");
 
-        let Some(Value::Deferred(DeferredValue::RedactedSecret { hash })) =
-            states[&id].attributes.get("comment")
+        let Some(Value::Deferred(DeferredValue::Placeholder(
+            carina_core::resource::SnapshotLeaf::RedactedSecret { hash },
+        ))) = states[&id].attributes.get("comment")
         else {
             panic!("normalized legacy marker must remain a typed secret hash")
         };

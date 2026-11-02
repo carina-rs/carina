@@ -23,7 +23,8 @@ use carina_core::provider::{
 use carina_core::resource::{
     ApplyTimeUnknown, ConcreteValue, DataSource, DeferredValue, EnumValueResolver,
     ProviderResource, RawEnumIdentifier, RedactedSecretHash, ResolvedResource, Resource,
-    ResourceId, State, Value, absolute_binding_address_for_test,
+    ResourceId, SnapshotLeaf, SnapshotState, SnapshotValue, State, StateValueLeaf, Value,
+    absolute_binding_address_for_test,
 };
 use carina_core::schema::{CompiledAttributeType as AttributeType, TypeIdentity};
 
@@ -330,16 +331,24 @@ fn root_resource_ref(binding: &str, attribute: &str) -> Value {
         .expect("root resource reference contains no placeholders")
 }
 
-fn create_state_for_writeback(outcome: CreateOutcome) -> State {
+fn create_state_for_writeback(outcome: CreateOutcome) -> SnapshotState {
     let request = AcceptedRequest::create_for_test();
     complete_create_for_writeback(outcome, request).0
 }
 
-fn lifted_saved_attrs(
-    entries: impl IntoIterator<Item = (ResourceId, HashMap<String, Value>)>,
+fn lifted_saved_attrs<P: StateValueLeaf>(
+    entries: impl IntoIterator<Item = (ResourceId, HashMap<String, Value<P>>)>,
 ) -> carina_core::provider::LiftedSavedAttrs {
-    RawSavedAttrs::from_decoded_values_for_test(entries.into_iter().collect())
-        .lift(&carina_core::schema::SchemaRegistry::new())
+    RawSavedAttrs::from_decoded_values_for_test(
+        entries
+            .into_iter()
+            .map(|(id, attributes)| {
+                let state = State::existing(id.clone(), attributes).to_snapshot();
+                (id, state.attributes)
+            })
+            .collect(),
+    )
+    .lift(&carina_core::schema::SchemaRegistry::new())
 }
 
 fn migrate_legacy_state_attribute(
@@ -368,7 +377,7 @@ fn migrate_legacy_state_attribute(
         .expect("migrated test document must retain its attribute")
 }
 
-fn redacted_secret_and_legacy_marker(plaintext: &str) -> (Value, String) {
+fn redacted_secret_and_legacy_marker(plaintext: &str) -> (SnapshotValue, String) {
     let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String(plaintext.into()),
     ))));
@@ -383,10 +392,7 @@ fn redacted_secret_and_legacy_marker(plaintext: &str) -> (Value, String) {
         .to_string();
     let hash: RedactedSecretHash =
         serde_json::from_value(serde_json::json!(digest)).expect("deserialize generated digest");
-    (
-        Value::Deferred(DeferredValue::RedactedSecret { hash }),
-        format!("_secret:{digest}"),
-    )
+    (SnapshotValue::redacted(hash), format!("_secret:{digest}"))
 }
 
 async fn create_request_for_test(resource: Resource) -> CreateRequest {
@@ -442,9 +448,9 @@ where
     }
 }
 
-async fn update_request_for_test(
+async fn update_request_for_test<P: StateValueLeaf>(
     resource: Resource,
-    from: State,
+    from: State<P>,
     changed_attributes: &[String],
 ) -> UpdateRequest {
     let bindings = carina_core::binding_index::ResolvedBindings::default();
@@ -482,7 +488,7 @@ async fn update_request_for_test(
             );
             let request = carina_core::executor::prepare_update_request(
                 resource,
-                from,
+                from.to_snapshot(),
                 changed_attributes,
                 &preparation,
             )
@@ -912,7 +918,7 @@ fn http_probe_body() -> String {
     "x".repeat(16 * 1024)
 }
 
-fn http_probe_outcome(state: &State) -> &str {
+fn http_probe_outcome(state: &SnapshotState) -> &str {
     let Some(Value::Concrete(ConcreteValue::String(outcome))) = state.attributes.get("send_phase")
     else {
         panic!("HTTP probe state must contain a string send_phase attribute");
@@ -6071,9 +6077,10 @@ async fn test_wasm_hydrate_read_state_round_trips_structural_redacted_secret() {
         .to_string();
     let expected_hash = RedactedSecretHash::from_encoded_digest(&digest)
         .expect("parse generated redacted-secret digest");
-    let persisted_secret = Value::Deferred(DeferredValue::RedactedSecret {
-        hash: expected_hash.clone(),
-    });
+    let persisted_secret =
+        Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret {
+            hash: expected_hash.clone(),
+        }));
     let id = ResourceId::with_provider_identity("mock", "test.resource", "secret-state", None);
     let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), HashMap::new()))]);
     let saved_attrs = lifted_saved_attrs([(
@@ -6090,7 +6097,7 @@ async fn test_wasm_hydrate_read_state_round_trips_structural_redacted_secret() {
 
     assert!(matches!(
         states[&id].attributes.get("__mock_hydrated_read_state__"),
-        Some(Value::Deferred(DeferredValue::RedactedSecret { hash: loaded }))
+        Some(Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { hash: loaded })))
             if loaded == &expected_hash
     ));
 }
@@ -6104,7 +6111,7 @@ async fn test_wasm_hydrate_keeps_marker_strings_plain_top_level_and_nested() {
         .await
         .expect("normalizer should initialize");
     let (redacted, marker) = redacted_secret_and_legacy_marker("wasm-marker-collision");
-    let plain = Value::Concrete(ConcreteValue::String(marker.clone().into()));
+    let plain: SnapshotValue = Value::Concrete(ConcreteValue::String(marker.clone().into()));
     let top_plain_id =
         ResourceId::with_provider_identity("mock", "test.resource", "top-plain", None);
     let top_secret_id =
@@ -6215,7 +6222,7 @@ async fn test_wasm_hydrate_read_state_write_only_legacy_secret_plans_no_change()
     .await
     .expect("hydrate write-only legacy secret");
 
-    let Some(Value::Deferred(DeferredValue::RedactedSecret { hash })) =
+    let Some(Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { hash }))) =
         states[&id].attributes.get("__mock_write_only_secret__")
     else {
         panic!("hydrated write-only legacy secret must remain typed")

@@ -417,7 +417,8 @@ mod tests {
                         Value::Concrete(ConcreteValue::String("old".into())),
                     )]),
                 )
-                .with_identifier("widget-id"),
+                .with_identifier("widget-id")
+                .to_snapshot(),
             ),
             to: ResolvedResource::new(
                 (Resource::new("test.Widget", "example")

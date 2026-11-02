@@ -5,8 +5,8 @@ use std::fmt;
 
 use carina_core::effect::PlanOp as CorePlanOp;
 use carina_core::provider::{
-    AppliedState as CoreAppliedState, CreateRequest as CoreCreateRequest,
-    DeleteRequest as CoreDeleteRequest, EmptyAppliedIdentifier,
+    AppliedIdentifier as CoreAppliedIdentifier, AppliedState as CoreAppliedState,
+    CreateRequest as CoreCreateRequest, DeleteRequest as CoreDeleteRequest, EmptyAppliedIdentifier,
     PartialReadDiagnostic as CorePartialReadDiagnostic, PendingCreate as CorePendingCreate,
     ProviderDirectives as CoreProviderDirectives, ProviderError as CoreProviderError,
     ReadOutcome as CoreReadOutcome, ReadRequest as CoreReadRequest, SavedAttrs as CoreSavedAttrs,
@@ -17,7 +17,8 @@ use carina_core::provider::{
 use carina_core::provider::{PatchOp as CorePatchOp, ProviderDirectiveSchema};
 use carina_core::resource::{
     ConcreteValue, DeferredValue, RedactedSecretHash, ResourceId as CoreResourceId,
-    ResourceIdentityState, State as CoreState, Value as CoreValue,
+    ResourceIdentityState, SnapshotLeaf, SnapshotState as CoreSnapshotState,
+    SnapshotValue as CoreSnapshotValue, State as CoreState, Value as CoreValue,
 };
 #[cfg(test)]
 use carina_core::resource::{Directives, Resource as CoreResource};
@@ -402,11 +403,6 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
                 serde_json::to_string(&json).expect("serde_json::Value -> String is infallible");
             Ok(wit::Value::SecretVal(json_str))
         }
-        CoreValue::Deferred(DeferredValue::RedactedSecret { .. }) => {
-            Err(SerializationError::RedactedSecretNotAllowed {
-                context: SerializationContext::WasmBoundary,
-            })
-        }
         CoreValue::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
@@ -442,8 +438,10 @@ fn ordinary_wit_value_into_persisted(
 /// type. Canonical enums still cross as API strings because WIT has no enum
 /// identity variant.
 fn core_to_wit_persisted_value(
-    value: &CoreValue,
+    value: &CoreSnapshotValue,
 ) -> Result<wit::PersistedValue, SerializationError> {
+    use carina_core::resource::SnapshotValue as CoreValue;
+
     match value {
         CoreValue::Concrete(ConcreteValue::List(items)) => {
             let json = items
@@ -471,10 +469,13 @@ fn core_to_wit_persisted_value(
                 context: SerializationContext::WasmBoundary,
             })
         }
-        CoreValue::Deferred(DeferredValue::RedactedSecret { hash }) => Ok(
-            wit::PersistedValue::RedactedSecretVal(hash.encoded_digest()),
-        ),
-        _ => core_to_wit_value(value).and_then(ordinary_wit_value_into_persisted),
+        CoreValue::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { hash })) => {
+            Ok(wit::PersistedValue::RedactedSecretVal(
+                hash.encoded_digest(),
+            ))
+        }
+        _ => core_to_wit_value(&value.to_value_at("persisted state")?)
+            .and_then(ordinary_wit_value_into_persisted),
     }
 }
 
@@ -560,11 +561,17 @@ pub(crate) fn wit_to_core_value(v: &wit::Value) -> Result<CoreValue, WasmValueDe
 
 fn wit_to_core_persisted_value(
     value: &wit::PersistedValue,
-) -> Result<CoreValue, WasmValueDecodeError> {
+) -> Result<CoreSnapshotValue, WasmValueDecodeError> {
+    use carina_core::resource::SnapshotValue as CoreValue;
+
     match value {
         wit::PersistedValue::RedactedSecretVal(digest) => {
             RedactedSecretHash::from_encoded_digest(digest)
-                .map(|hash| CoreValue::Deferred(DeferredValue::RedactedSecret { hash }))
+                .map(|hash| {
+                    CoreValue::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret {
+                        hash,
+                    }))
+                })
                 .ok_or_else(|| {
                     WasmValueDecodeError::new(
                         WitValueVariant::RedactedSecret,
@@ -612,7 +619,7 @@ fn wit_to_core_persisted_value(
         ))),
         wit::PersistedValue::StringListVal(json) => {
             let ordinary = wit::Value::StringListVal(json.clone());
-            wit_to_core_value(&ordinary)
+            wit_to_core_value(&ordinary).map(|value| value.to_snapshot())
         }
     }
 }
@@ -775,18 +782,15 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
         CoreValue::Deferred(DeferredValue::Secret(inner)) => {
             core_value_to_json(inner).map_err(SerializationError::masked_for_secret)
         }
-        CoreValue::Deferred(DeferredValue::RedactedSecret { .. }) => {
-            Err(SerializationError::RedactedSecretNotAllowed {
-                context: SerializationContext::WasmBoundary,
-            })
-        }
         CoreValue::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 
 fn core_persisted_value_to_json(
-    value: &CoreValue,
+    value: &CoreSnapshotValue,
 ) -> Result<serde_json::Value, SerializationError> {
+    use carina_core::resource::SnapshotValue as CoreValue;
+
     match value {
         CoreValue::Concrete(ConcreteValue::List(items)) => items
             .iter()
@@ -805,10 +809,10 @@ fn core_persisted_value_to_json(
                 context: SerializationContext::WasmBoundary,
             })
         }
-        CoreValue::Deferred(DeferredValue::RedactedSecret { hash }) => {
+        CoreValue::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { hash })) => {
             Ok(serde_json::json!({ PERSISTED_SECRET_KEY: hash.encoded_digest() }))
         }
-        _ => core_value_to_json(value),
+        _ => core_value_to_json(&value.to_value_at("persisted state")?),
     }
 }
 
@@ -862,7 +866,9 @@ fn json_to_core_value(
 fn persisted_json_to_core_value(
     value: &serde_json::Value,
     wit_variant: WitValueVariant,
-) -> Result<CoreValue, WasmValueDecodeError> {
+) -> Result<CoreSnapshotValue, WasmValueDecodeError> {
+    use carina_core::resource::SnapshotValue as CoreValue;
+
     match value {
         serde_json::Value::Array(values) => values
             .iter()
@@ -886,7 +892,11 @@ fn persisted_json_to_core_value(
                     ));
                 };
                 return RedactedSecretHash::from_encoded_digest(digest)
-                    .map(|hash| CoreValue::Deferred(DeferredValue::RedactedSecret { hash }))
+                    .map(|hash| {
+                        CoreValue::Deferred(DeferredValue::Placeholder(
+                            SnapshotLeaf::RedactedSecret { hash },
+                        ))
+                    })
                     .ok_or_else(|| {
                         WasmValueDecodeError::new(
                             wit_variant,
@@ -916,7 +926,7 @@ fn persisted_json_to_core_value(
                 .map(ConcreteValue::Map)
                 .map(CoreValue::Concrete)
         }
-        _ => json_to_core_value(value, wit_variant),
+        _ => json_to_core_value(value, wit_variant).map(|value| value.to_snapshot()),
     }
 }
 
@@ -926,7 +936,7 @@ fn core_to_wit_persisted_value_map<'a, M>(
     map: M,
 ) -> Result<Vec<(String, wit::PersistedValue)>, SerializationError>
 where
-    M: IntoIterator<Item = (&'a String, &'a CoreValue)>,
+    M: IntoIterator<Item = (&'a String, &'a CoreSnapshotValue)>,
 {
     map.into_iter()
         .map(|(key, value)| core_to_wit_persisted_value(value).map(|value| (key.clone(), value)))
@@ -968,7 +978,7 @@ pub(crate) fn wit_to_core_value_map(
 /// [`wit_to_core_value_map`].
 pub(crate) fn wit_to_core_persisted_value_map(
     entries: &[(String, wit::PersistedValue)],
-) -> Result<HashMap<String, CoreValue>, WasmValueDecodeError> {
+) -> Result<HashMap<String, CoreSnapshotValue>, WasmValueDecodeError> {
     entries
         .iter()
         .map(|(key, value)| {
@@ -1021,7 +1031,7 @@ fn wit_to_wire_resource_id(id: wit::ResourceId) -> proto::ResourceId {
 // -- State --
 
 pub(crate) fn core_to_wit_persisted_state(
-    state: &CoreState,
+    state: &CoreSnapshotState,
 ) -> Result<wit::PersistedState, SerializationError> {
     Ok(wit::PersistedState {
         identifier: state.identifier.clone(),
@@ -1071,8 +1081,13 @@ fn wit_to_core_applied_persisted_state(
     let operation = AppliedStateOperation::Update;
     let attributes = wit_to_core_persisted_value_map(&attributes)
         .map_err(|source| WasmAppliedStateDecodeError::attributes(operation, id, source))?;
-    CoreAppliedState::new(id.clone(), identifier, attributes)
-        .map_err(|source| WasmAppliedStateDecodeError::identifier(operation, id, source))
+    let identifier = CoreAppliedIdentifier::new(identifier)
+        .map_err(|source| WasmAppliedStateDecodeError::identifier(operation, id, source))?;
+    Ok(CoreAppliedState::from_snapshot_parts(
+        id.clone(),
+        identifier,
+        attributes,
+    ))
 }
 
 pub(crate) fn wit_to_core_read_outcome(
@@ -2709,7 +2724,7 @@ mod tests {
 
     impl std::error::Error for TestOperationError {}
 
-    fn redacted_secret_and_digest(plaintext: &str) -> (CoreValue, String) {
+    fn redacted_secret_and_digest(plaintext: &str) -> (CoreSnapshotValue, String) {
         let secret = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
             ConcreteValue::String(plaintext.into()),
         ))));
@@ -2723,10 +2738,7 @@ mod tests {
             .to_string();
         let hash = RedactedSecretHash::from_encoded_digest(&digest)
             .expect("parse generated redacted-secret digest");
-        (
-            CoreValue::Deferred(DeferredValue::RedactedSecret { hash }),
-            digest,
-        )
+        (CoreSnapshotValue::redacted(hash), digest)
     }
 
     fn proto_string() -> proto::AttributeType {
@@ -3822,12 +3834,10 @@ mod tests {
     #[test]
     fn redacted_saved_plan_secret_is_rejected_at_wasm_boundary() {
         let (value, _) = redacted_secret_and_digest("saved-plan-secret");
-        assert!(matches!(
-            core_to_wit_value(&value),
-            Err(SerializationError::RedactedSecretNotAllowed {
-                context: SerializationContext::WasmBoundary
-            })
-        ));
+        let error = value
+            .to_value_at("desired.token")
+            .expect_err("historical hashes cannot become ordinary WASM inputs");
+        assert_eq!(error.path(), "desired.token");
     }
 
     #[test]
@@ -3953,7 +3963,8 @@ mod tests {
         let nested = CoreValue::Concrete(ConcreteValue::Map(indexmap::indexmap! {
             "mode".to_string() => value,
         }));
-        let wit = core_to_wit_persisted_value(&nested).expect("encode persisted WIT JSON");
+        let wit =
+            core_to_wit_persisted_value(&nested.to_snapshot()).expect("encode persisted WIT JSON");
         let wit::PersistedValue::MapVal(json) = wit else {
             panic!("nested canonical enum must use map-val")
         };
@@ -3981,7 +3992,7 @@ mod tests {
         }));
 
         for value in [secret, nested] {
-            let error = core_to_wit_persisted_value(&value)
+            let error = core_to_wit_persisted_value(&value.to_snapshot())
                 .expect_err("persisted state must contain only redacted secret identity");
             assert!(matches!(
                 error,
@@ -4609,19 +4620,14 @@ mod tests {
     #[tokio::test]
     async fn desired_resource_rejects_redacted_secret_placeholder() {
         let (redacted, _) = redacted_secret_and_digest("desired-secret");
-        let resource = CoreResource::with_provider("aws", "test.Resource", "example", None)
-            .with_attribute("token", redacted);
-
-        assert!(matches!(
-            prepare_conversion_request(resource).await,
-            Err(
-                carina_core::executor::ProviderPreparationError::Serialization(
-                    SerializationError::RedactedSecretNotAllowed {
-                        context: SerializationContext::WasmBoundary
-                    }
-                )
-            )
-        ));
+        let saved: CoreResource<carina_core::resource::ModuleSource, SnapshotLeaf> =
+            CoreResource::with_provider("aws", "test.Resource", "example", None)
+                .to_snapshot()
+                .with_attribute("token", redacted);
+        let error = saved
+            .to_value_resource()
+            .expect_err("a saved hash cannot be restored as a desired resource");
+        assert_eq!(error.path(), format!("{}.token", saved.id));
     }
 
     #[test]
@@ -4641,10 +4647,10 @@ mod tests {
         .expect("persisted state value");
         assert!(matches!(
             state.get("token"),
-            Some(CoreValue::Deferred(DeferredValue::RedactedSecret { hash: loaded }))
-                if CoreValue::Deferred(DeferredValue::RedactedSecret {
+            Some(CoreValue::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { hash: loaded })))
+                if CoreValue::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret {
                     hash: loaded.clone()
-                }) == expected
+                })) == expected
         ));
     }
 
@@ -4709,7 +4715,9 @@ mod tests {
         );
         assert!(matches!(
             values.get("typed"),
-            Some(CoreValue::Deferred(DeferredValue::RedactedSecret { .. }))
+            Some(CoreValue::Deferred(DeferredValue::Placeholder(
+                SnapshotLeaf::RedactedSecret { .. }
+            )))
         ));
         assert_eq!(
             values.get("$secret"),
@@ -4750,12 +4758,10 @@ mod tests {
             [(key, wit::PersistedValue::RedactedSecretVal(value))]
                 if key == "token" && value == &digest
         ));
-        assert!(matches!(
-            core_to_wit_value(state.attributes.get("token").unwrap()),
-            Err(SerializationError::RedactedSecretNotAllowed {
-                context: SerializationContext::WasmBoundary
-            })
-        ));
+        let error = state.attributes["token"]
+            .to_value_at("current.token")
+            .expect_err("persisted hashes cannot become ordinary WASM inputs");
+        assert_eq!(error.path(), "current.token");
     }
 
     #[test]
