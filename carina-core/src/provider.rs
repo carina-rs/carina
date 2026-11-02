@@ -31,6 +31,7 @@ use carina_provider_protocol::types::{
 use crate::binding_index::SecretPreservingAttributes;
 use crate::effect::PlanOp;
 use crate::parser::{ProviderConfig, StateBlockAddress};
+use crate::provider_text::{ProviderDiagnostic, ProviderString, ProviderText};
 pub use crate::resource::ProviderDirectiveSchema;
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, PartialReadMarker, PendingReRead,
@@ -79,22 +80,25 @@ pub(crate) fn fixture_applied_identifier(identifier: impl Into<String>) -> Appli
 ///
 /// ```compile_fail,E0451
 /// use carina_core::provider::ErrorDetail;
+/// use carina_core::provider_text::ProviderDiagnostic;
 ///
 /// let _ = ErrorDetail {
-///     message: String::from("x"),
-///     cause: Some(Box::new(std::io::Error::other("x"))),
+///     message: "x".into(),
+///     cause: Some(ProviderDiagnostic::new(std::io::Error::other("x"))),
 ///     ..ErrorDetail::default()
 /// };
 /// ```
 #[derive(Debug, Default)]
 pub struct ErrorDetail {
     /// Human-readable message.
-    message: String,
+    message: ProviderText,
+    /// Retry policy captured before diagnostic text is escaped or truncated.
+    throttling: ThrottlingClassification,
     /// Resource the error pertains to, if known.
-    pub resource_id: Option<Box<ResourceId>>,
+    pub resource_id: Option<Box<ProviderErrorResourceId>>,
     /// Underlying terminal cause. Flattened to a string when the error crosses
     /// the WIT boundary.
-    cause: Option<Box<dyn std::error::Error + Send + Sync>>,
+    cause: Option<ProviderDiagnostic>,
     /// Host-side policy marker. This is deliberately not transported over the
     /// provider protocol because guests cannot originate host lifecycle state.
     host_cause: Option<HostErrorCause>,
@@ -103,14 +107,14 @@ pub struct ErrorDetail {
     /// where the name is known but no specific resource is in scope.
     /// Display ignores this field; CLI renderers can read it to label
     /// structured output.
-    pub provider_name: Option<String>,
+    pub provider_name: Option<ProviderText>,
     /// Service-qualified cloud-API operation that failed, e.g.
     /// `"iam.ListRoles"`, `"s3.HeadBucket"`. Populating this field —
     /// or any of the sibling `status` / `code` / `request_id`
     /// fields — flips `Display` into the multi-line, labeled render
     /// shape introduced in carina#3242; see
     /// [`ErrorDetail::has_structured_cloud_fields`] for the exact gate.
-    pub operation: Option<String>,
+    pub operation: Option<ProviderText>,
     /// HTTP status code from the cloud-API response, when the error
     /// came from an HTTP-based service call.
     pub status: Option<u16>,
@@ -119,14 +123,71 @@ pub struct ErrorDetail {
     /// share a status (HTTP 403 covers `AccessDenied`,
     /// `InvalidAccessKeyId`, `SignatureDoesNotMatch`, etc.), so both
     /// belong in the rendered output.
-    pub code: Option<String>,
+    code: Option<ProviderText>,
     /// Correlation id from the cloud-API response (AWS
     /// `x-amzn-RequestId`, GCP `X-Goog-Request-Id`, Azure
     /// `x-ms-request-id`, …). Operators paste this into support
     /// tickets so the provider can look up server-side logs.
-    pub request_id: Option<String>,
+    pub request_id: Option<ProviderText>,
 }
 
+#[derive(Debug, Default)]
+struct ThrottlingClassification {
+    message_or_cause: bool,
+    code: bool,
+}
+
+impl ThrottlingClassification {
+    fn from_raw(message: &str, code: Option<&str>, cause: Option<&str>) -> Self {
+        Self {
+            message_or_cause: has_throttling_marker(message)
+                || cause.is_some_and(has_throttling_marker),
+            code: code.is_some_and(has_throttling_marker),
+        }
+    }
+
+    fn is_throttled(&self) -> bool {
+        self.message_or_cause || self.code
+    }
+}
+
+fn has_throttling_marker(text: &str) -> bool {
+    text.contains("ThrottlingException") || text.contains("Rate exceeded")
+}
+
+/// Original resource identity with a sanitized diagnostic header.
+#[derive(PartialEq, Eq)]
+pub struct ProviderErrorResourceId(ResourceId);
+
+impl ProviderErrorResourceId {
+    /// Borrow the original id for identity comparisons and wire encoding.
+    pub fn as_resource_id(&self) -> &ResourceId {
+        &self.0
+    }
+}
+
+impl From<ResourceId> for ProviderErrorResourceId {
+    fn from(id: ResourceId) -> Self {
+        Self(id)
+    }
+}
+
+impl std::fmt::Display for ProviderErrorResourceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        ProviderText::new(format!(
+            "{}.{}",
+            self.0.resource_type,
+            self.0.identity_display()
+        ))
+        .fmt(f)
+    }
+}
+
+impl std::fmt::Debug for ProviderErrorResourceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.to_string(), f)
+    }
+}
 /// Host-only classification for errors produced by provider lifecycle policy.
 ///
 /// Unlike [`ProviderErrorKind`], this marker never crosses the WIT boundary.
@@ -224,13 +285,7 @@ impl std::fmt::Display for ProviderError {
         // between the structured multi-line render and the single-line
         // cause render so non-AWS errors keep the same shape.
         if let Some(ref id) = detail.resource_id {
-            write!(
-                f,
-                "[{}.{}] {}",
-                id.resource_type,
-                id.identity_display(),
-                detail.context()
-            )?;
+            write!(f, "[{id}] {}", detail.context())?;
         } else {
             write!(f, "{}", detail.context())?;
         }
@@ -246,30 +301,10 @@ impl std::fmt::Display for ProviderError {
             return render_structured_cloud_fields(f, detail);
         }
 
-        // In-repo typed causes are terminal diagnostics. External errors may
-        // still carry actionable detail in their source chain, so expand that
-        // chain at this single ProviderError rendering seam.
-        if let Some(cause) = detail.cause() {
-            write!(f, ": {}", ProviderCauseChain(cause))?;
-        }
-        Ok(())
-    }
-}
-
-/// Complete rendering of one typed provider cause.
-///
-/// Errors defined in this workspace follow the terminal rule and therefore
-/// have no source. External errors such as SDK transport/service errors can
-/// keep detail in their source chain; render every such level exactly once.
-struct ProviderCauseChain<'a>(&'a (dyn std::error::Error + Send + Sync + 'static));
-
-impl std::fmt::Display for ProviderCauseChain<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)?;
-        let mut source = self.0.source();
-        while let Some(error) = source {
-            write!(f, ": {error}")?;
-            source = error.source();
+        // Construction captures and sanitizes the complete typed cause chain.
+        // The original typed cause remains available for inspection.
+        if let Some(cause) = &detail.cause {
+            write!(f, ": {cause}")?;
         }
         Ok(())
     }
@@ -307,8 +342,8 @@ fn render_structured_cloud_fields(
     if let Some(ref id) = detail.request_id {
         write!(f, "\n  request_id: {id}")?;
     }
-    if let Some(cause) = detail.cause() {
-        write!(f, "\n  cause: {}", ProviderCauseChain(cause))?;
+    if let Some(cause) = &detail.cause {
+        write!(f, "\n  cause: {cause}")?;
     }
     Ok(())
 }
@@ -368,6 +403,12 @@ impl ProviderError {
             ProviderError::Timeout(_) => ProviderErrorKind::Timeout,
             ProviderError::Internal(_) => ProviderErrorKind::Internal,
         }
+    }
+
+    /// Whether the original message, code or cause identifies throttling.
+    /// Diagnostic escaping, truncation and redaction do not affect retry policy.
+    pub fn is_throttled(&self) -> bool {
+        self.detail().throttling.is_throttled()
     }
 
     /// User-supplied input is invalid.
@@ -446,9 +487,10 @@ impl ProviderError {
     pub fn to_wire(&self) -> WireProviderError {
         let ErrorDetail {
             message,
+            throttling: _throttling,
             resource_id,
             cause,
-            host_cause: _,
+            host_cause: _host_cause,
             provider_name,
             operation,
             status,
@@ -464,18 +506,16 @@ impl ProviderError {
         };
         WireProviderError {
             kind,
-            message: message.clone(),
+            message: message.to_string(),
             resource_id: resource_id
                 .as_deref()
-                .map(crate::protocol_convert::resource_id_to_protocol),
-            cause: cause
-                .as_deref()
-                .map(|cause| ProviderCauseChain(cause).to_string()),
-            provider_name: provider_name.clone(),
-            operation: operation.clone(),
+                .map(|id| crate::protocol_convert::resource_id_to_protocol(id.as_resource_id())),
+            cause: cause.as_ref().map(ToString::to_string),
+            provider_name: provider_name.as_ref().map(ToString::to_string),
+            operation: operation.as_ref().map(ToString::to_string),
             status: *status,
-            code: code.clone(),
-            request_id: request_id.clone(),
+            code: code.as_ref().map(ToString::to_string),
+            request_id: request_id.as_ref().map(ToString::to_string),
         }
     }
 
@@ -483,7 +523,7 @@ impl ProviderError {
     ///
     /// This is the only sanctioned entry point for a wire record containing
     /// both a runtime-built message and flattened cause string. It preserves
-    /// that untrusted data for diagnostics; it does not provide the static
+    /// sanitized text for diagnostics; it does not provide the static
     /// context guarantees of the typed `*_caused_by` constructors.
     pub fn from_wire(error: WireProviderError) -> Self {
         let WireProviderError {
@@ -497,22 +537,23 @@ impl ProviderError {
             code,
             request_id,
         } = error;
-        let resource_id =
-            resource_id.map(|id| Box::new(crate::protocol_convert::protocol_to_resource_id(&id)));
+        let resource_id = resource_id
+            .map(|id| Box::new(crate::protocol_convert::protocol_to_resource_id(&id).into()));
+        let throttling =
+            ThrottlingClassification::from_raw(&message, code.as_deref(), cause.as_deref());
         let detail = Box::new(ErrorDetail {
-            message,
+            message: message.into(),
+            throttling,
             resource_id,
-            cause: cause.map(|cause| {
-                Box::new(FlattenedWireCause(cause)) as Box<dyn std::error::Error + Send + Sync>
-            }),
+            cause: cause.map(|cause| ProviderDiagnostic::new(FlattenedWireCause(cause.into()))),
             // Host lifecycle markers are intentionally not part of the wire
             // record and untrusted guest errors cannot acquire one on decode.
             host_cause: None,
-            provider_name,
-            operation,
+            provider_name: provider_name.map(ProviderText::new),
+            operation: operation.map(ProviderText::new),
             status,
-            code,
-            request_id,
+            code: code.map(ProviderText::new),
+            request_id: request_id.map(ProviderText::new),
         });
         match kind {
             WireProviderErrorKind::InvalidInput => ProviderError::InvalidInput(detail),
@@ -525,7 +566,7 @@ impl ProviderError {
 
     /// Attach a resource id to the inner detail.
     pub fn for_resource(mut self, id: ResourceId) -> Self {
-        self.detail_mut().resource_id = Some(Box::new(id));
+        self.detail_mut().resource_id = Some(Box::new(id.into()));
         self
     }
 
@@ -534,7 +575,7 @@ impl ProviderError {
     /// `create_provider` / provider init failures). Used by the CLI
     /// renderer to label structured account-guard output.
     pub fn for_provider(mut self, provider_name: impl Into<String>) -> Self {
-        self.detail_mut().provider_name = Some(provider_name.into());
+        self.detail_mut().provider_name = Some(ProviderText::new(provider_name));
         self
     }
 
@@ -544,7 +585,7 @@ impl ProviderError {
     /// [`Self::with_request_id`] — flips `Display` into the multi-line
     /// labeled render shape introduced in carina#3242.
     pub fn with_operation(mut self, operation: impl Into<String>) -> Self {
-        self.detail_mut().operation = Some(operation.into());
+        self.detail_mut().operation = Some(ProviderText::new(operation));
         self
     }
 
@@ -557,14 +598,17 @@ impl ProviderError {
     /// Attach the application-level error code from the cloud API
     /// (e.g. `"AccessDenied"`, `"NoSuchBucket"`).
     pub fn with_code(mut self, code: impl Into<String>) -> Self {
-        self.detail_mut().code = Some(code.into());
+        let code = code.into();
+        let detail = self.detail_mut();
+        detail.throttling.code = has_throttling_marker(&code);
+        detail.code = Some(ProviderText::new(code));
         self
     }
 
     /// Attach the correlation id from the cloud-API response so the
     /// operator can paste it into support tickets.
     pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
-        self.detail_mut().request_id = Some(request_id.into());
+        self.detail_mut().request_id = Some(ProviderText::new(request_id));
         self
     }
 
@@ -577,15 +621,17 @@ impl ProviderError {
     /// Replace only diagnostic text while preserving the error variant,
     /// structured metadata, typed cause, and host lifecycle classification.
     pub(crate) fn with_redacted_message(mut self, message: impl Into<String>) -> Self {
-        self.detail_mut().message = message.into();
+        self.detail_mut().message = ProviderText::new(message);
         self
     }
 }
 
 impl ErrorDetail {
     pub fn new(message: impl Into<String>) -> Self {
+        let message = message.into();
         Self {
-            message: message.into(),
+            throttling: ThrottlingClassification::from_raw(&message, None, None),
+            message: ProviderText::new(message),
             ..Self::default()
         }
     }
@@ -594,9 +640,23 @@ impl ErrorDetail {
         context: &'static str,
         cause: impl std::error::Error + Send + Sync + 'static,
     ) -> Self {
+        let mut throttling = ThrottlingClassification::from_raw(context, None, None);
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&cause);
+        while let Some(error) = source {
+            if let Some(diagnostic) = error.downcast_ref::<ProviderDiagnostic>() {
+                source = Some(diagnostic.error());
+                continue;
+            }
+            throttling.message_or_cause |= match error.downcast_ref::<ProviderError>() {
+                Some(error) => error.is_throttled(),
+                None => has_throttling_marker(&error.to_string()),
+            };
+            source = error.source();
+        }
         Self {
-            message: context.to_string(),
-            cause: Some(Box::new(cause)),
+            message: context.into(),
+            throttling,
+            cause: Some(ProviderDiagnostic::new(cause)),
             ..Self::default()
         }
     }
@@ -607,9 +667,15 @@ impl ErrorDetail {
         &self.message
     }
 
+    /// Sanitized application-level code for diagnostics. Set it with
+    /// [`ProviderError::with_code`] so raw-text retry classification stays valid.
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+
     /// Typed source error, when this detail was built by a cause-bearing path.
     pub fn cause(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
-        self.cause.as_deref()
+        self.cause.as_ref().map(ProviderDiagnostic::error)
     }
 
     /// Host-side lifecycle classification, when the host attached one.
@@ -639,7 +705,7 @@ impl ErrorDetail {
 
 /// Synthetic typed source for a flattened cause received over WIT.
 #[derive(Debug)]
-struct FlattenedWireCause(String);
+struct FlattenedWireCause(ProviderText);
 
 impl std::fmt::Display for FlattenedWireCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1089,7 +1155,8 @@ pub enum PatchOp {
 /// current provider value cannot be read.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "resource '{resource}' cannot send attribute '{attribute}' because ignored write-only path '{path}' must be preserved, but its current value cannot be known"
+    "resource '{resource}' cannot send attribute '{attribute}' because ignored write-only path '{path}' must be preserved, but its current value cannot be known",
+    resource = ProviderText::new(resource.to_string()), attribute = ProviderText::new(attribute), path = ProviderText::new(path.to_string())
 )]
 pub struct IgnoredWriteOnlyValueError {
     resource: Box<ResourceId>,
@@ -1427,8 +1494,11 @@ impl std::fmt::Display for PersistedAttributeDecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "persisted attribute {:?} is not valid persisted JSON",
-            self.attribute_key
+            "{}",
+            ProviderText::new(format!(
+                "persisted attribute {:?} is not valid persisted JSON",
+                self.attribute_key
+            ))
         )
     }
 }
@@ -1450,8 +1520,11 @@ impl std::fmt::Display for PersistedWireValueError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "persisted wire attribute {:?} cannot be encoded",
-            self.attribute_key
+            "{}",
+            ProviderText::new(format!(
+                "persisted wire attribute {:?} cannot be encoded",
+                self.attribute_key
+            ))
         )
     }
 }
@@ -2237,8 +2310,8 @@ pub enum UpdateOutcomeKind {
 /// Diagnostic details for a partial post-mutation read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PartialReadDiagnostic {
-    pub(crate) reason: String,
-    pub(crate) missing_attributes: Vec<String>,
+    pub(crate) reason: ProviderString,
+    pub(crate) missing_attributes: Vec<ProviderString>,
 }
 
 /// Validated UTC RFC3339 timestamp used only to describe when a persisted
@@ -2855,17 +2928,17 @@ impl ObservedCreate {
         (self.id, self.identifier, self.observation, self.sent)
     }
 
-    pub(crate) fn post_error_note(&self) -> String {
+    pub(crate) fn post_error_note(&self) -> ProviderText {
         match &self.observation {
             CreateObservation::Observed(_state) => {
-                "resource created; recorded in state, the next apply completes it".to_string()
+                "resource created; recorded in state, the next apply completes it".into()
             }
             CreateObservation::Unobserved(reason) => {
                 let reason = reason.to_string().replace('\n', "\n  ");
                 format!(
                     "{} reported identifier '{}' but the resource could not be observed; recorded in state so the next plan re-checks it\n  reason: {reason}",
                     self.id.provider, self.identifier,
-                )
+                ).into()
             }
         }
     }
@@ -4259,7 +4332,7 @@ impl FinishingCreate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("cannot resume create for {desired}; persisted operation belongs to {persisted}")]
+#[error("cannot resume create for {desired}; persisted operation belongs to {persisted}", desired = ProviderText::new(desired.to_string()), persisted = ProviderText::new(persisted.to_string()))]
 pub struct ResumeRoutingMismatch {
     persisted: Box<ResourceId>,
     desired: Box<ResourceId>,
@@ -4938,17 +5011,26 @@ impl PartialReadDiagnostic {
             None
         } else {
             Some(Self {
-                reason,
-                missing_attributes,
+                reason: reason.into(),
+                missing_attributes: missing_attributes
+                    .into_iter()
+                    .map(ProviderString::from)
+                    .collect(),
             })
         }
     }
 
-    pub fn reason(&self) -> &str {
-        &self.reason
+    /// Bounded diagnostic projection; the original reason also feeds identity data.
+    pub fn reason(&self) -> ProviderText {
+        ProviderText::new(self.reason.as_str())
     }
 
-    pub fn missing_attributes(&self) -> &[String] {
+    /// Original reason for persistence, transport and identity material.
+    pub fn raw_reason(&self) -> &str {
+        self.reason.as_str()
+    }
+
+    pub fn missing_attributes(&self) -> &[ProviderString] {
         &self.missing_attributes
     }
 
@@ -4986,7 +5068,10 @@ impl PartialReadDiagnostic {
     pub fn into_state_for_writeback(self, mut state: SnapshotState) -> SnapshotState {
         state.partial_read = PartialReadMarker::new(
             PendingReRead::incomplete(self.reason),
-            self.missing_attributes.into_iter().collect(),
+            self.missing_attributes
+                .into_iter()
+                .map(ProviderString::into_string)
+                .collect(),
         );
         state
     }
@@ -5494,7 +5579,9 @@ impl std::fmt::Display for DefaultTagEncodingError {
         write!(
             f,
             "key '{}' of provider '{}': {}",
-            self.key, self.provider_name, self.source
+            ProviderText::new(&self.key),
+            ProviderText::new(&self.provider_name),
+            self.source
         )
     }
 }
@@ -6541,7 +6628,7 @@ impl CustomTypeCanonicalizationError {
             | Self::MissingScalarKind { .. }
             | Self::NonFiniteFloat { .. }
             | Self::EnumIdentityMismatch { .. }) => crate::schema::TypeError::ValidationFailed {
-                message: error.to_string(),
+                message: error.to_string().into(),
             },
         }
     }
@@ -7239,7 +7326,7 @@ fn local_custom_validator(
 
 fn custom_validator_bridge_message(error: crate::schema::TypeError) -> String {
     match error {
-        crate::schema::TypeError::ValidationFailed { message } => message,
+        crate::schema::TypeError::ValidationFailed { message } => message.to_string(),
         error => error.to_string(),
     }
 }
@@ -7868,7 +7955,7 @@ fn validate_custom_type_annotation(
                     return Err(CustomTypeValidationError::Rejected {
                         owner: owner.clone(),
                         identity: identity.clone(),
-                        message: "identified declaration has no scalar bridge kind".to_string(),
+                        message: "identified declaration has no scalar bridge kind".into(),
                     });
                 };
                 if let Some((previous_kind, previous)) = &bridge {
@@ -7878,7 +7965,7 @@ fn validate_custom_type_annotation(
                             identity: identity.clone(),
                             message:
                                 "same-identity annotation declarations canonicalize inconsistently"
-                                    .to_string(),
+                                    .into(),
                         });
                     }
                 } else {
@@ -7979,6 +8066,20 @@ impl Provider for Box<dyn Provider> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provider_text_persisted_attribute_error_labels_are_capped_with_safe_sources() {
+        let raw = format!("\x1b[2J\u{9b}{}", "x".repeat(20 * 1024));
+        let error = super::PersistedWireValueError {
+            attribute_key: raw.clone(),
+            error: crate::value::SerializationError::UnresolvedEnumIdentifier {
+                value: raw,
+                context: crate::value::SerializationContext::WasmBoundary,
+            },
+        };
+        assert!(error.to_string().len() <= crate::provider_text::MAX_PROVIDER_TEXT_BYTES);
+        assert!(!crate::executor::render_error_chain(&error).contains(['\x1b', '\u{9b}']));
+    }
+
     use crate::schema::{
         PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
     };
@@ -8968,6 +9069,22 @@ mod tests {
             failure.source().map(ToString::to_string).as_deref(),
             Some("leaf resume failure")
         );
+    }
+
+    #[test]
+    fn provider_text_post_create_note_sanitizes_provider_identifier() {
+        let raw = format!("\x1b]52;c;ZXZpbA==\x07\x1b[2J{}", "x".repeat(20 * 1024));
+        let created = ObservedCreate::from_create_observation(
+            ResourceId::with_provider_identity("test", "widget", "example", None),
+            AppliedIdentifier::new(&raw).unwrap(),
+            CreateObservation::Unobserved(UnobservedReason::NotFound),
+            SentRecord::Request(Sent::AllRequestAttributes),
+        );
+        let note = created.post_error_note();
+        assert!(!note.contains(['\x1b', '\x07']));
+        assert!(note.contains("\\u{1b}"));
+        assert!(note.len() <= crate::provider_text::MAX_PROVIDER_TEXT_BYTES);
+        assert_eq!(created.identifier().as_str(), raw);
     }
 
     #[test]
@@ -10099,7 +10216,7 @@ mod tests {
                 .expect("fixture identifier is non-empty")
         };
         let expected = PendingReRead::new(ReReadReason::Incomplete {
-            detail: "provider returned a partial read".to_string(),
+            detail: "provider returned a partial read".into(),
         });
 
         let created = CreateOutcome::partial_success(
@@ -10563,6 +10680,150 @@ mod tests {
         let err = ProviderError::internal("simple error");
         let display = format!("{}", err);
         assert_eq!(display, "simple error");
+    }
+
+    #[test]
+    fn provider_error_throttling_classifies_raw_wire_message_code_and_cause() {
+        for marker in ["ThrottlingException", "Rate exceeded"] {
+            for prefix in ["x".repeat(9 * 1024), "\x1b".repeat(1500)] {
+                let raw = format!("{prefix} {marker}");
+                for (message, code, cause) in [
+                    (raw.clone(), None, None),
+                    ("request failed".into(), Some(raw.clone()), None),
+                    ("request failed".into(), None, Some(raw.clone())),
+                ] {
+                    let error = ProviderError::from_wire(WireProviderError {
+                        kind: WireProviderErrorKind::ApiError,
+                        message,
+                        resource_id: None,
+                        cause,
+                        provider_name: None,
+                        operation: None,
+                        status: None,
+                        code,
+                        request_id: None,
+                    });
+                    assert!(!error.to_string().contains(marker));
+                    assert!(error.is_throttled(), "missing raw marker {marker}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn provider_error_throttling_classifies_every_native_constructor() {
+        let message_constructors: [fn(String) -> ProviderError; 5] = [
+            ProviderError::invalid_input,
+            ProviderError::api_error,
+            ProviderError::not_found,
+            ProviderError::timeout,
+            ProviderError::internal,
+        ];
+        let cause_constructors: [fn(&'static str, std::io::Error) -> ProviderError; 5] = [
+            ProviderError::invalid_input_caused_by,
+            ProviderError::api_error_caused_by,
+            ProviderError::not_found_caused_by,
+            ProviderError::timeout_caused_by,
+            ProviderError::internal_caused_by,
+        ];
+        for marker in ["ThrottlingException", "Rate exceeded"] {
+            let raw = format!("{} {marker}", "x".repeat(9 * 1024));
+            for construct in message_constructors {
+                let error = construct(raw.clone());
+                assert!(!error.to_string().contains(marker));
+                assert!(error.is_throttled());
+            }
+            for construct in cause_constructors {
+                let error = construct("request failed", std::io::Error::other(raw.clone()));
+                assert!(!error.to_string().contains(marker));
+                assert!(error.is_throttled());
+            }
+        }
+    }
+
+    #[test]
+    fn provider_error_throttling_uses_raw_code_and_preserves_classification_on_redaction() {
+        let raw = format!("{} ThrottlingException", "x".repeat(9 * 1024));
+        let error = ProviderError::api_error("request failed").with_code(raw.clone());
+        assert!(!error.to_string().contains("ThrottlingException"));
+        assert!(error.is_throttled());
+        assert!(!error.with_code("AccessDenied").is_throttled());
+
+        let error = ProviderError::api_error(raw)
+            .with_redacted_message("redacted")
+            .with_code("AccessDenied");
+        assert_eq!(error.detail().context(), "redacted");
+        assert!(error.is_throttled());
+    }
+
+    #[test]
+    fn provider_error_throttling_keeps_existing_case_sensitive_marker_semantics() {
+        for message in [
+            "prefix ThrottlingException suffix",
+            "prefix Rate exceeded suffix",
+        ] {
+            assert!(ProviderError::api_error(message).is_throttled());
+        }
+        for message in [
+            "throttlingexception",
+            "rate exceeded",
+            "Throttling",
+            "TooManyRequests",
+            "RequestLimitExceeded",
+            "SlowDown",
+        ] {
+            assert!(!ProviderError::api_error(message).is_throttled());
+            assert!(
+                !ProviderError::api_error("request failed")
+                    .with_code(message)
+                    .is_throttled()
+            );
+        }
+        assert!(
+            !ProviderError::api_error("request failed")
+                .with_status(429)
+                .is_throttled()
+        );
+    }
+
+    #[test]
+    fn provider_error_throttling_classifies_nested_typed_causes() {
+        #[derive(Debug)]
+        struct ServiceError(std::io::Error);
+
+        impl std::fmt::Display for ServiceError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("service error")
+            }
+        }
+
+        impl std::error::Error for ServiceError {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let raw = format!("{} Rate exceeded", "x".repeat(9 * 1024));
+        let error = ProviderError::api_error_caused_by(
+            "request failed",
+            ServiceError(std::io::Error::other(raw.clone())),
+        );
+        assert!(!error.to_string().contains("Rate exceeded"));
+        assert!(error.is_throttled());
+
+        let nested =
+            ProviderError::internal_caused_by("operation failed", ProviderError::api_error(raw));
+        assert!(!nested.to_string().contains("Rate exceeded"));
+        assert!(nested.is_throttled());
+    }
+
+    #[test]
+    fn provider_error_throttling_inspects_original_diagnostic_cause() {
+        let raw = format!("{} ThrottlingException", "x".repeat(9 * 1024));
+        let diagnostic = ProviderDiagnostic::new(std::io::Error::other(raw));
+        assert!(!diagnostic.to_string().contains("ThrottlingException"));
+        let error = ProviderError::api_error_caused_by("request failed", diagnostic);
+        assert!(error.is_throttled());
     }
 
     #[test]

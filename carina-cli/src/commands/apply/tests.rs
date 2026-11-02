@@ -7617,6 +7617,21 @@ async fn declared_state_bucket_bootstrap_partial_success_seeds_partial_read_stat
 }
 
 #[test]
+fn provider_text_partial_state_bucket_warning_sanitizes_guest_text() {
+    let raw = "\x1b]52;c;ZXZpbA==\x07\x1b[2J";
+    let diagnostic =
+        carina_core::provider::PartialReadDiagnostic::new(raw.into(), vec![raw.into()]).unwrap();
+    let identifier = carina_core::provider_text::ProviderText::new(raw);
+    let rendered = format_partial_state_bucket_create_warning(
+        crate::output_style::ColorMode::Plain,
+        &identifier,
+        &diagnostic,
+    );
+    assert!(!rendered.contains(['\x1b', '\x07']));
+    assert!(rendered.contains("\\u{1b}]52;c;ZXZpbA==\\u{7}\\u{1b}[2J"));
+}
+
+#[test]
 fn partial_state_bucket_warning_color_spans_do_not_cross_newlines() {
     let color_mode = crate::output_style::ColorMode::Ansi;
 
@@ -7625,8 +7640,9 @@ fn partial_state_bucket_warning_color_spans_do_not_cross_newlines() {
         vec!["versioning".to_string()],
     )
     .expect("fixture diagnostic has a missing attribute");
-    let rendered =
-        { format_partial_state_bucket_create_warning(color_mode, "state-bucket", &diagnostic) };
+    let rendered = {
+        format_partial_state_bucket_create_warning(color_mode, &"state-bucket".into(), &diagnostic)
+    };
 
     assert!(
         rendered.contains("\u{1b}["),

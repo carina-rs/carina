@@ -15,6 +15,7 @@ use carina_core::provider::{
 };
 #[cfg(test)]
 use carina_core::provider::{PatchOp as CorePatchOp, ProviderDirectiveSchema};
+use carina_core::provider_text::{ProviderDiagnostic, ProviderString, ProviderText};
 use carina_core::resource::{
     ConcreteValue, DeferredValue, RedactedSecretHash, ResourceId as CoreResourceId,
     ResourceIdentityState, SnapshotLeaf, SnapshotState as CoreSnapshotState,
@@ -52,13 +53,13 @@ use crate::wasm_factory::version_checked_bindings::{WitPlanOp, wit_types as wit}
 /// of panics so callers can attach provider context.
 #[derive(Debug)]
 pub enum SchemaDecodeError {
-    JsonParse(serde_json::Error),
+    JsonParse(ProviderDiagnostic),
     Protocol(carina_core::protocol_convert::SchemaDecodeError),
 }
 
 impl SchemaDecodeError {
     fn schema_json_parse(err: serde_json::Error) -> Self {
-        Self::JsonParse(err)
+        Self::JsonParse(ProviderDiagnostic::new(err))
     }
 
     fn protocol_conversion(err: carina_core::protocol_convert::SchemaDecodeError) -> Self {
@@ -93,7 +94,7 @@ impl std::error::Error for SchemaDecodeError {
 #[derive(Debug)]
 pub struct WasmValueDecodeError {
     wit_variant: WitValueVariant,
-    attribute_path: Vec<String>,
+    attribute_path: Vec<ProviderText>,
     kind: WasmValueDecodeErrorKind,
 }
 
@@ -141,7 +142,7 @@ impl WasmValueDecodeError {
     }
 
     fn prepend_attribute(mut self, name: &str) -> Self {
-        self.attribute_path.insert(0, name.to_string());
+        self.attribute_path.insert(0, name.into());
         self
     }
 }
@@ -150,7 +151,11 @@ impl fmt::Display for WasmValueDecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "failed to decode WIT {}", self.wit_variant)?;
         if !self.attribute_path.is_empty() {
-            write!(f, " attribute '{}'", self.attribute_path.join("."))?;
+            write!(
+                f,
+                " attribute '{}'",
+                ProviderText::new(self.attribute_path.join("."))
+            )?;
         }
         match &self.kind {
             WasmValueDecodeErrorKind::InvalidJson(error) => {
@@ -1914,6 +1919,37 @@ mod reference_tests {
     use carina_core::references::{ReferenceError, ReferenceOutcome};
 
     #[test]
+    fn provider_text_reference_error_decode_sanitizes_every_outcome() {
+        let guest_error = || {
+            wit::ProviderError::NotFound(wit::ErrorDetail {
+                message: "\x1b]52;c;ZXZpbA==\x07\x1b[2J".into(),
+                resource_id: None,
+                cause: None,
+                provider_name: None,
+                operation: None,
+                status: None,
+                code: None,
+                request_id: None,
+            })
+        };
+        let results = decode_reference_results(vec![
+            Ok(wit::ReferenceOutcome::NotFound(guest_error())),
+            Err(wit::ReferenceError::AccessDenied(guest_error())),
+            Err(wit::ReferenceError::Transient(guest_error())),
+            Err(wit::ReferenceError::InvalidReference(guest_error())),
+        ]);
+        for result in results {
+            let rendered = match result {
+                Ok(ReferenceOutcome::NotFound(error)) => error.to_string(),
+                Err(error) => std::error::Error::source(&error).unwrap().to_string(),
+                Ok(ReferenceOutcome::Resolved(_value)) => panic!("expected an error"),
+            };
+            assert!(!rendered.contains(['\x1b', '\x07']));
+            assert!(rendered.contains("\\u{1b}]52;c;ZXZpbA==\\u{7}\\u{1b}[2J"));
+        }
+    }
+
+    #[test]
     fn reference_decode_preserves_positional_results_for_core_validation() {
         for actual in [0, 1, 3] {
             let mut results = Vec::with_capacity(actual);
@@ -1954,7 +1990,7 @@ mod reference_tests {
 pub fn decode_provider_initialization_error(error: proto::ProviderError) -> CoreProviderError {
     let mut error = CoreProviderError::from_wire(error);
     if error.detail().operation.is_none() {
-        error.detail_mut().operation = Some("initialize".to_string());
+        error.detail_mut().operation = Some("initialize".into());
     }
     error
 }
@@ -2048,9 +2084,16 @@ pub(crate) fn core_type_identity_to_wit(
 }
 
 /// Deserialize JSON to (name, display_name, version) tuple from ProviderInfo.
-pub fn json_to_provider_info(json: &str) -> Result<(String, String, String), serde_json::Error> {
-    let info = serde_json::from_str::<proto::ProviderInfo>(json)?;
-    Ok((info.name, info.display_name, info.version))
+pub fn json_to_provider_info(
+    json: &str,
+) -> Result<(String, ProviderText, ProviderString), ProviderDiagnostic> {
+    let proto::ProviderInfo {
+        name,
+        display_name,
+        capabilities: _capabilities,
+        version,
+    } = serde_json::from_str(json).map_err(ProviderDiagnostic::new)?;
+    Ok((name, display_name.into(), version.into()))
 }
 
 /// Reject a provider whose protocol is outside this host's supported range.
@@ -2059,9 +2102,9 @@ pub fn json_to_provider_info(json: &str) -> Result<(String, String, String), ser
 /// the author sets. A provider predating the envelope omits the field ->
 /// deserializes to 0 -> below any host minimum (the carina#3364 class).
 /// carina#3365.
-pub fn check_protocol_version(info_json: &str) -> Result<(), String> {
-    let envelope: proto::ProviderInfoEnvelope =
-        serde_json::from_str(info_json).map_err(|e| format!("invalid provider info: {e}"))?;
+pub fn check_protocol_version(info_json: &str) -> Result<(), ProviderText> {
+    let envelope: proto::ProviderInfoEnvelope = serde_json::from_str(info_json)
+        .map_err(|e| ProviderText::new(format!("invalid provider info: {e}")))?;
     let host = carina_provider_protocol::PROTOCOL_VERSION;
     let min = carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION;
     if envelope.protocol_version < min {
@@ -2069,14 +2112,15 @@ pub fn check_protocol_version(info_json: &str) -> Result<(), String> {
             "provider '{}' was built against protocol version {} but this host \
              requires at least version {}; rebuild the provider against the current carina protocol",
             envelope.info.name, envelope.protocol_version, min
-        ));
+        ).into());
     }
     if envelope.protocol_version > host {
         return Err(format!(
             "provider '{}' was built against protocol version {} but this host \
              supports up to version {}; upgrade carina to load this provider",
             envelope.info.name, envelope.protocol_version, host
-        ));
+        )
+        .into());
     }
     Ok(())
 }
@@ -2091,7 +2135,7 @@ pub fn check_protocol_version(info_json: &str) -> Result<(), String> {
 /// dynamic component API; it never constructs runtime bindings or calls
 /// `initialize`. Keep this compatibility window explicit rather than
 /// weakening the ordinary provider runtime gate above.
-pub fn check_schema_only_protocol_version(info_json: &str) -> Result<(), String> {
+pub fn check_schema_only_protocol_version(info_json: &str) -> Result<(), ProviderText> {
     const LEGACY_SCHEMA_PROTOCOL_VERSION: u32 = 12;
 
     if schema_only_protocol_version(info_json)? == LEGACY_SCHEMA_PROTOCOL_VERSION {
@@ -2101,9 +2145,9 @@ pub fn check_schema_only_protocol_version(info_json: &str) -> Result<(), String>
 }
 
 /// Read the protocol stamp after the schema-only compatibility gate admits it.
-pub(crate) fn schema_only_protocol_version(info_json: &str) -> Result<u32, String> {
-    let envelope: proto::ProviderInfoEnvelope =
-        serde_json::from_str(info_json).map_err(|e| format!("invalid provider info: {e}"))?;
+pub(crate) fn schema_only_protocol_version(info_json: &str) -> Result<u32, ProviderText> {
+    let envelope: proto::ProviderInfoEnvelope = serde_json::from_str(info_json)
+        .map_err(|e| ProviderText::new(format!("invalid provider info: {e}")))?;
     Ok(envelope.protocol_version)
 }
 
@@ -4847,6 +4891,86 @@ mod tests {
     }
 
     #[test]
+    fn provider_error_wit_decode_sanitizes_all_guest_diagnostics() {
+        let attack = "\x1b]52;c;ZXZpbA==\x07 \x1b[2J\r\u{9b}";
+        let error = wit::ProviderError::ApiError(wit::ErrorDetail {
+            message: attack.into(),
+            resource_id: Some(wit::ResourceId {
+                provider: attack.into(),
+                resource_type: attack.into(),
+                identity: attack.into(),
+            }),
+            cause: Some(attack.into()),
+            provider_name: Some(attack.into()),
+            operation: Some(attack.into()),
+            status: Some(403),
+            code: Some(attack.into()),
+            request_id: Some(attack.into()),
+        });
+        let decoded = wit_to_core_provider_error(error);
+        let rendered = decoded.to_string();
+        assert!(!rendered.contains(['\x1b', '\x07', '\r', '\u{9b}']));
+        assert!(rendered.contains("\\u{1b}]52;c;ZXZpbA==\\u{7}"));
+        assert!(rendered.contains("\\u{1b}[2J\\u{d}\\u{9b}"));
+        assert!(
+            !decoded
+                .detail()
+                .provider_name
+                .as_deref()
+                .unwrap()
+                .contains('\x1b')
+        );
+        assert_eq!(
+            decoded
+                .detail()
+                .resource_id
+                .as_ref()
+                .unwrap()
+                .as_resource_id()
+                .provider,
+            attack
+        );
+    }
+
+    #[test]
+    fn provider_text_provider_version_keeps_valid_long_semver() {
+        let raw = format!("1.2.3+{}", "a".repeat(9000));
+        let json =
+            serde_json::json!({"name": "mock", "display_name": "Mock", "version": raw}).to_string();
+        let (_, _, version) = json_to_provider_info(&json).unwrap();
+        assert_eq!(version.as_str(), raw);
+        let parsed = semver::Version::parse(version.as_str()).unwrap();
+        assert!(
+            semver::VersionReq::parse("^1.2.0")
+                .unwrap()
+                .matches(&parsed)
+        );
+        assert!(version.to_string().contains("… (truncated, "));
+        assert!(version.to_string().len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
+    }
+
+    #[test]
+    fn provider_text_metadata_decode_sanitizes_display_fields_and_version_errors() {
+        let raw = format!("\x1b]52;c;ZXZpbA==\x07\x1b[2J{}", "x".repeat(20 * 1024));
+        let json = serde_json::json!({
+            "name": raw, "display_name": raw, "version": raw, "protocol_version": 0
+        })
+        .to_string();
+        let (_name, display_name, version) = json_to_provider_info(&json).unwrap();
+        let version_error = check_protocol_version(&json).unwrap_err();
+        assert_eq!(version.as_str(), raw);
+        for text in [
+            display_name.to_string(),
+            version.to_string(),
+            version_error.to_string(),
+        ] {
+            assert!(!text.contains(['\x1b', '\x07']));
+            assert!(text.contains("\\u{1b}"));
+            assert!(text.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
+        }
+    }
+
+    #[test]
     fn test_provider_error_variant_round_trip_through_wit() {
         // Build host-side core errors of every variant, convert them
         // to the WIT shape, then back. The variant tag must be
@@ -4914,9 +5038,13 @@ mod tests {
         assert_eq!(detail.provider_name.as_deref(), Some("aws"));
         assert_eq!(detail.operation.as_deref(), Some("s3.HeadBucket"));
         assert_eq!(detail.status, Some(503));
-        assert_eq!(detail.code.as_deref(), Some("ServiceUnavailable"));
+        assert_eq!(detail.code(), Some("ServiceUnavailable"));
         assert_eq!(detail.request_id.as_deref(), Some("request-123"));
-        let rid = detail.resource_id.as_ref().expect("resource_id preserved");
+        let rid = detail
+            .resource_id
+            .as_ref()
+            .expect("resource_id preserved")
+            .as_resource_id();
         assert_eq!(rid.provider, "aws");
         assert_eq!(rid.resource_type, "s3.Bucket");
         assert_eq!(rid.identity_str().expect("resolved identity"), "my-bucket");
@@ -4952,7 +5080,7 @@ mod tests {
         let detail = back.detail();
         assert_eq!(detail.operation.as_deref(), Some("iam.ListRoles"));
         assert_eq!(detail.status, Some(403));
-        assert_eq!(detail.code.as_deref(), Some("AccessDenied"));
+        assert_eq!(detail.code(), Some("AccessDenied"));
         assert_eq!(
             detail.request_id.as_deref(),
             Some("997aa923-2aa4-4d2b-8d16-44fd21c81368"),
@@ -4974,7 +5102,8 @@ mod tests {
             .detail()
             .resource_id
             .as_deref()
-            .expect("resource id decoded");
+            .expect("resource id decoded")
+            .as_resource_id();
 
         assert_eq!(id.provider, "aws");
         assert_eq!(id.resource_type, "s3.Bucket");
@@ -6116,6 +6245,16 @@ mod tests {
     }
 
     #[test]
+    fn provider_text_schema_json_error_chain_sanitizes_unknown_guest_variant() {
+        let raw = format!("\x1b[2J\u{9b}{}", "x".repeat(20 * 1024));
+        let input = serde_json::json!({"value": {"type": raw}}).to_string();
+        let error = json_to_attribute_types(&input).unwrap_err();
+        let rendered = render_error_chain(&error);
+        assert!(!rendered.contains(['\x1b', '\u{9b}']));
+        assert!(rendered.contains("truncated,"));
+    }
+
+    #[test]
     fn json_to_attribute_types_rejects_malformed_json() {
         let error = json_to_attribute_types("not json").unwrap_err();
         let rendered = render_error_chain(&error);
@@ -6123,9 +6262,10 @@ mod tests {
         assert!(rendered.contains("expected ident"), "{rendered}");
         assert!(
             std::error::Error::source(&error)
-                .and_then(|source| source.downcast_ref::<serde_json::Error>())
+                .and_then(|source| source.downcast_ref::<ProviderDiagnostic>())
+                .and_then(|source| source.error().downcast_ref::<serde_json::Error>())
                 .is_some(),
-            "JSON parse error must remain reachable through Error::source"
+            "JSON parse error must remain available for typed inspection"
         );
     }
 

@@ -145,6 +145,27 @@ fn convert_markdown_links_to_plain_text(text: &str) -> String {
     result
 }
 
+fn format_hover_display(mut hover: Hover) -> Hover {
+    fn text(value: &mut String) {
+        *value = carina_core::provider_text::ProviderText::new(std::mem::take(value)).to_string();
+    }
+    fn marked(value: &mut tower_lsp::lsp_types::MarkedString) {
+        match value {
+            tower_lsp::lsp_types::MarkedString::String(value) => text(value),
+            tower_lsp::lsp_types::MarkedString::LanguageString(value) => {
+                text(&mut value.language);
+                text(&mut value.value);
+            }
+        }
+    }
+    match &mut hover.contents {
+        HoverContents::Markup(content) => text(&mut content.value),
+        HoverContents::Scalar(content) => marked(content),
+        HoverContents::Array(contents) => contents.iter_mut().for_each(marked),
+    }
+    hover
+}
+
 pub struct HoverProvider {
     schemas: Arc<SchemaRegistry>,
     region_completions: Vec<CompletionValue>,
@@ -186,7 +207,17 @@ impl HoverProvider {
         current_file_name: Option<&str>,
     ) -> Option<Hover> {
         let root = base_path.and_then(|path| carina_core::paths::ResolvedPath::new(path).ok());
-        let base_path = root.as_ref();
+        self.hover_in_context(doc, position, root.as_ref(), current_file_name)
+            .map(format_hover_display)
+    }
+
+    fn hover_in_context(
+        &self,
+        doc: &Document,
+        position: Position,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
+        current_file_name: Option<&str>,
+    ) -> Option<Hover> {
         let word = doc.word_at(position)?;
         let text = doc.text();
         let enclosing_block = enclosing_block(&text, position, &self.resource_type_patterns);
@@ -661,6 +692,42 @@ fn is_in_type_annotation_position(doc: &Document, position: Position, word: &str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provider_text_hover_sanitizes_schema_type_metadata_at_publication() {
+        let raw = format!("Mode\x1b[2J\u{9b}{}", "x".repeat(20 * 1024));
+        let schema = carina_core::schema::PatternResourceSchema::new("test.Widget").attribute(
+            carina_core::schema::PatternAttributeSchema::optional(
+                "mode",
+                carina_core::schema::PatternAttributeType::enum_(
+                    carina_core::schema::TypeIdentity::bare(&raw),
+                    Some(vec!["ready".into()]),
+                    vec![],
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        );
+        let mut schemas = carina_core::schema::SchemaRegistry::new();
+        schemas.insert("", schema.validate().unwrap());
+        let provider = super::HoverProvider::new(std::sync::Arc::new(schemas), vec![]);
+        let doc = crate::document::Document::new(
+            "test.Widget {\n  mode = ready\n}\n".into(),
+            std::sync::Arc::new(carina_core::parser::ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        let hover = provider
+            .hover(&doc, tower_lsp::lsp_types::Position::new(1, 4))
+            .unwrap();
+        let tower_lsp::lsp_types::HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup")
+        };
+        assert!(!content.value.contains(['\x1b', '\u{9b}']));
+        assert!(content.value.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
+        assert!(content.value.contains("truncated,"));
+    }
+
     use super::*;
     use carina_core::parser::ProviderContext;
     use carina_core::schema::{AttributeSchema, AttributeType, StructField};

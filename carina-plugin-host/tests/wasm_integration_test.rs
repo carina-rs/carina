@@ -2692,10 +2692,7 @@ async fn test_wasm_identifierless_read_back_resume_ends_invalid_continuation() {
         error.to_string().contains("requires an identifier"),
         "{error}"
     );
-    assert_eq!(
-        error.detail().code.as_deref(),
-        Some("READ_BACK_WITHOUT_IDENTIFIER")
-    );
+    assert_eq!(error.detail().code(), Some("READ_BACK_WITHOUT_IDENTIFIER"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -6483,7 +6480,11 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
         "intentional mock normalize_desired error"
     );
     assert_eq!(
-        error.detail().resource_id.as_deref(),
+        error
+            .detail()
+            .resource_id
+            .as_deref()
+            .map(|id| id.as_resource_id()),
         Some(&desired_id),
         "the guest resource id must survive the WIT conversion"
     );
@@ -6531,7 +6532,14 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
         error.detail().context(),
         "intentional mock normalize_state error"
     );
-    assert_eq!(error.detail().resource_id.as_deref(), Some(&id));
+    assert_eq!(
+        error
+            .detail()
+            .resource_id
+            .as_deref()
+            .map(|id| id.as_resource_id()),
+        Some(&id)
+    );
     assert_eq!(states, before, "provider normalizer errors must be atomic");
 
     normalizer
@@ -6565,7 +6573,14 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
         error.detail().context(),
         "intentional mock hydrate_read_state error"
     );
-    assert_eq!(error.detail().resource_id.as_deref(), Some(&hydrate_id));
+    assert_eq!(
+        error
+            .detail()
+            .resource_id
+            .as_deref()
+            .map(|id| id.as_resource_id()),
+        Some(&hydrate_id)
+    );
     assert_eq!(
         hydrate_states, hydrate_before,
         "provider hydration errors must be atomic"

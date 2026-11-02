@@ -5547,13 +5547,13 @@ impl PendingReRead {
         Self { reason }
     }
 
-    pub fn incomplete(detail: impl Into<String>) -> Self {
+    pub fn incomplete(detail: impl Into<crate::provider_text::ProviderString>) -> Self {
         Self::new(ReReadReason::Incomplete {
             detail: detail.into(),
         })
     }
 
-    pub fn read_failed(detail: impl Into<String>) -> Self {
+    pub fn read_failed(detail: impl Into<crate::provider_text::ProviderString>) -> Self {
         Self::new(ReReadReason::ReadFailed {
             detail: detail.into(),
         })
@@ -5573,9 +5573,13 @@ impl PendingReRead {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReReadReason {
     /// The provider returned only part of the resource state.
-    Incomplete { detail: String },
+    Incomplete {
+        detail: crate::provider_text::ProviderString,
+    },
     /// The provider read itself returned an error.
-    ReadFailed { detail: String },
+    ReadFailed {
+        detail: crate::provider_text::ProviderString,
+    },
     /// The provider read reported that the newly applied resource was absent.
     NotFound,
 }

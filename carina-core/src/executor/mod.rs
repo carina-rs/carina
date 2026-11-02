@@ -837,8 +837,7 @@ pub fn unresolved_data_source_inputs<S, D>(
 }
 
 fn is_throttling_error(err: &ProviderError) -> bool {
-    let msg = err.to_string();
-    msg.contains("ThrottlingException") || msg.contains("Rate exceeded")
+    err.is_throttled()
 }
 
 /// Read a data source through the provider with the same throttling retry
@@ -923,7 +922,9 @@ impl ReportedError {
     }
 
     pub fn message(message: impl Into<String>) -> Self {
-        Self::new(MessageError(message.into()))
+        Self::new(MessageError(crate::provider_text::ProviderText::new(
+            message,
+        )))
     }
 
     pub fn context(
@@ -935,7 +936,7 @@ impl ReportedError {
 
     pub fn with_context(self, context: impl Into<String>) -> Self {
         Self::new(ContextError {
-            context: context.into(),
+            context: crate::provider_text::ProviderText::new(context),
             source: self,
         })
     }
@@ -973,7 +974,7 @@ pub fn render_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
 }
 
 #[derive(Debug)]
-struct MessageError(String);
+struct MessageError(crate::provider_text::ProviderText);
 
 impl std::fmt::Display for MessageError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -985,7 +986,7 @@ impl std::error::Error for MessageError {}
 
 #[derive(Debug)]
 struct ContextError {
-    context: String,
+    context: crate::provider_text::ProviderText,
     source: ReportedError,
 }
 
@@ -1130,7 +1131,7 @@ impl std::fmt::Display for UnsatisfiedDependency {
 pub enum EffectFailureKind {
     Provider {
         error: ReportedError,
-        note: Option<String>,
+        note: Option<crate::provider_text::ProviderText>,
     },
     Execution {
         error: ReportedError,
@@ -1189,7 +1190,7 @@ impl EffectFailureKind {
 
     pub fn provider_with_note(
         error: impl std::error::Error + Send + Sync + 'static,
-        note: impl Into<String>,
+        note: impl Into<crate::provider_text::ProviderText>,
     ) -> Self {
         Self::Provider {
             error: ReportedError::new(error),

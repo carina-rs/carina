@@ -1465,7 +1465,7 @@ fn unknown_attribute_fallback_has_no_type_pollution() {
     );
     let regions = vec![CompletionValue {
         value: "aws.Region.ap_northeast_1".to_string(),
-        description: "Tokyo".to_string(),
+        description: "Tokyo".into(),
     }];
     let provider = CompletionProvider::new(
         Arc::new(schemas),

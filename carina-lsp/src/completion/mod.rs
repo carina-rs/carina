@@ -109,6 +109,9 @@ impl CompletionProvider {
         let items = terminal.publish(&mut sink);
         if sink.authoritative {
             items
+                .into_iter()
+                .map(values::format_completion_display)
+                .collect()
         } else {
             Vec::new()
         }

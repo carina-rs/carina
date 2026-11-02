@@ -1,5 +1,6 @@
 //! WasmProviderFactory loads a WASM component and implements ProviderFactory.
 
+mod guest_stderr;
 mod guest_store;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -45,6 +46,7 @@ use carina_core::provider::{
     CreateFailureKind, CreateObservation, InFlightCreate, InFlightPersistence, ResumeFailureKind,
     UnobservedReason,
 };
+use carina_core::provider_text::{ProviderDiagnostic, ProviderString, ProviderText};
 #[cfg(test)]
 use carina_core::resource::Resource;
 #[cfg(test)]
@@ -242,10 +244,50 @@ where
     )
 }
 
+/// Capture Wasmtime's complete error chain as a sanitized, bounded diagnostic.
+struct WasmDiagnostic {
+    text: ProviderText,
+}
+
+impl fmt::Debug for WasmDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WasmDiagnostic")
+            .field("text", &self.text)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WasmDiagnostic {
+    fn new(error: wasmtime::Error, inline: bool) -> Self {
+        struct Chain<'a> {
+            error: &'a wasmtime::Error,
+        }
+        impl fmt::Display for Chain<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write_error_chain(f, self.error)
+            }
+        }
+        let text = ProviderText::new(if inline {
+            format!("{error:#}")
+        } else {
+            Chain { error: &error }.to_string()
+        });
+        Self { text }
+    }
+}
+
+impl fmt::Display for WasmDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.text.fmt(f)
+    }
+}
+
+impl std::error::Error for WasmDiagnostic {}
+
 #[derive(Debug)]
 struct WasmGuestCallError {
     context: Option<WasmGuestCallContext>,
-    source: wasmtime::Error,
+    source: WasmDiagnostic,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -266,7 +308,7 @@ impl fmt::Display for WasmGuestCallError {
             }
         }?;
         f.write_str(": ")?;
-        write_error_chain_inline(f, &self.source)
+        self.source.fmt(f)
     }
 }
 
@@ -288,7 +330,7 @@ fn wasm_trap_provider_error(operation: &'static str, error: wasmtime::Error) -> 
             "WASM plugin timed out",
             WasmGuestCallError {
                 context: Some(WasmGuestCallContext::ComputeBudgetExceeded { operation }),
-                source: error,
+                source: WasmDiagnostic::new(error, true),
             },
         )
     } else {
@@ -296,31 +338,11 @@ fn wasm_trap_provider_error(operation: &'static str, error: wasmtime::Error) -> 
             "WASM guest trapped",
             WasmGuestCallError {
                 context: Some(WasmGuestCallContext::Trap { operation }),
-                source: error,
+                source: WasmDiagnostic::new(error, true),
             },
         )
     }
 }
-
-#[derive(Debug)]
-struct ProviderSchemaDecodeDiagnostic(wasm_convert::SchemaDecodeError);
-
-impl fmt::Display for ProviderSchemaDecodeDiagnostic {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut current: &(dyn std::error::Error + 'static) = &self.0;
-        write!(formatter, "{current}")?;
-        while let Some(source) = current.source() {
-            write!(formatter, ": {source}")?;
-            current = source;
-        }
-        Ok(())
-    }
-}
-
-// `WasmProviderLoadError::Metadata` deliberately renders its source and does
-// not expose it again. This adapter follows that policy while retaining every
-// typed schema-decode cause in the one rendered diagnostic.
-impl std::error::Error for ProviderSchemaDecodeDiagnostic {}
 
 fn provider_schema_decode_error(
     provider_name: &str,
@@ -331,7 +353,7 @@ fn provider_schema_decode_error(
         format!(
             "provider '{provider_name}' {provider_version} emitted schema metadata this host cannot decode; the provider revision may predate this host"
         ),
-        ProviderSchemaDecodeDiagnostic(detail),
+        detail,
     )
 }
 
@@ -350,7 +372,7 @@ const AWS_CREDENTIALS_INTERFACE: &str = "carina:provider/aws-credentials";
 
 #[derive(Debug)]
 struct WasiHttpImport {
-    name: String,
+    name: ProviderString,
     version: WasiHttpImportVersion,
 }
 
@@ -363,7 +385,7 @@ enum WasiHttpImportVersion {
 
 #[derive(Debug)]
 struct ComponentImports {
-    names: Vec<String>,
+    names: Vec<ProviderString>,
 }
 
 impl ComponentImports {
@@ -371,15 +393,15 @@ impl ComponentImports {
         let component_type = component.component_type();
         let mut names: Vec<_> = component_type
             .imports(engine)
-            .map(|(name, _)| name.to_string())
+            .map(|(name, _item)| ProviderString::from(name))
             .collect();
         names.sort();
         names.dedup();
         Self { names }
     }
 
-    fn iter(&self) -> impl Iterator<Item = &str> {
-        self.names.iter().map(String::as_str)
+    fn iter(&self) -> impl Iterator<Item = &ProviderString> {
+        self.names.iter()
     }
 
     fn is_empty(&self) -> bool {
@@ -388,6 +410,7 @@ impl ComponentImports {
 
     fn imports_aws_credentials(&self) -> bool {
         self.iter().any(|name| {
+            let name = name.as_str();
             name == AWS_CREDENTIALS_INTERFACE
                 || name
                     .strip_prefix(AWS_CREDENTIALS_INTERFACE)
@@ -409,6 +432,7 @@ impl WasiHttpImports {
         let imports: Vec<_> = component_imports
             .iter()
             .filter_map(|name| {
+                let name = name.as_str();
                 if !carina_provider_resolver::is_wasi_http_import(name) {
                     return None;
                 }
@@ -419,7 +443,7 @@ impl WasiHttpImports {
                     None => WasiHttpImportVersion::Unversioned,
                 };
                 Some(WasiHttpImport {
-                    name: name.to_string(),
+                    name: name.into(),
                     version,
                 })
             })
@@ -497,7 +521,7 @@ enum DualAttemptContext {
     },
     WasiHttpNotImported {
         context: WasiHttpNotImportedContext,
-        basic_failure: wasmtime::Error,
+        basic_failure: WasmDiagnostic,
     },
 }
 
@@ -540,7 +564,7 @@ enum InstantiationContext {
 /// shape; callers cannot construct context-free or fictitious fallback prose.
 #[derive(Debug)]
 pub struct ProviderInstantiationError {
-    primary_failure: wasmtime::Error,
+    primary_failure: WasmDiagnostic,
     context: Box<InstantiationContext>,
 }
 
@@ -558,12 +582,12 @@ impl ProviderInstantiationError {
             ComponentInstantiationContext::WasiHttpNotImported { context } => {
                 DualAttemptContext::WasiHttpNotImported {
                     context,
-                    basic_failure,
+                    basic_failure: WasmDiagnostic::new(basic_failure, false),
                 }
             }
         };
         Self {
-            primary_failure: http_failure,
+            primary_failure: WasmDiagnostic::new(http_failure, false),
             context: Box::new(InstantiationContext::HttpThenBasic { context }),
         }
     }
@@ -575,7 +599,7 @@ impl ProviderInstantiationError {
         failure: wasmtime::Error,
     ) -> Self {
         Self {
-            primary_failure: failure,
+            primary_failure: WasmDiagnostic::new(failure, false),
             context: Box::new(InstantiationContext::SingleAttempt {
                 world,
                 context: ComponentInstantiationContext::from_component(engine, component),
@@ -669,7 +693,7 @@ fn write_single_attempt_context(
 
 impl fmt::Display for ProviderInstantiationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_error_chain(f, &self.primary_failure)?;
+        self.primary_failure.fmt(f)?;
         match self.context.as_ref() {
             InstantiationContext::HttpThenBasic {
                 context: DualAttemptContext::WasiHttpImported { context },
@@ -692,7 +716,7 @@ impl fmt::Display for ProviderInstantiationError {
                     f,
                     "\nSubordinate basic fallback attempt also failed (not the root cause): "
                 )?;
-                write_error_chain(f, basic_failure)
+                basic_failure.fmt(f)
             }
             InstantiationContext::SingleAttempt { world, context } => {
                 match context {
@@ -724,7 +748,7 @@ impl std::error::Error for ProviderInstantiationError {}
 #[derive(Debug)]
 pub enum WasmProviderLoadError {
     /// The exact loaded bytes carried an invalid or missing egress declaration.
-    EgressDeclaration(EgressSectionError),
+    EgressDeclaration(ProviderDiagnostic),
     /// The project lock could not be read while selecting an egress record.
     EgressLock(carina_provider_resolver::LockedEgressLoadError),
     /// The selected lock record did not authorize the exact loaded declaration.
@@ -736,8 +760,8 @@ pub enum WasmProviderLoadError {
     /// The artifact reported a different provider name from the host
     /// configuration that selected it.
     ProviderNameMismatch {
-        configured: String,
-        reported: String,
+        configured: ProviderText,
+        reported: ProviderText,
     },
     /// Host-side AWS credential provisioning failed before guest instantiation.
     AwsCredentials(AwsCredentialError),
@@ -747,11 +771,11 @@ pub enum WasmProviderLoadError {
     AwsCredentialsRequired,
     /// A provider metadata export trapped or returned malformed data.
     Metadata {
-        context: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
+        context: ProviderText,
+        source: ProviderDiagnostic,
     },
     /// Any other engine, component-load, or provider bring-up failure.
-    Other(String),
+    Other(ProviderText),
 }
 
 impl fmt::Display for WasmProviderLoadError {
@@ -787,10 +811,10 @@ impl fmt::Display for WasmProviderLoadError {
 impl std::error::Error for WasmProviderLoadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::EgressDeclaration(source) => source.source(),
             Self::EgressLock(source) => source.source(),
             Self::EgressConsent(source) => source.source(),
-            Self::PrecompiledDeserialization(_)
+            Self::EgressDeclaration(_)
+            | Self::PrecompiledDeserialization(_)
             | Self::Instantiation(_)
             | Self::ProviderNameMismatch { .. }
             | Self::AwsCredentials(_)
@@ -808,8 +832,8 @@ impl WasmProviderLoadError {
         source: impl std::error::Error + Send + Sync + 'static,
     ) -> Self {
         Self::Metadata {
-            context: context.into(),
-            source: Box::new(source),
+            context: ProviderText::new(context),
+            source: ProviderDiagnostic::new(source),
         }
     }
 
@@ -821,7 +845,7 @@ impl WasmProviderLoadError {
         matches!(
             self,
             Self::Metadata { source, .. }
-                if source.downcast_ref::<WasmWallBudgetError>().is_some()
+                if source.error().downcast_ref::<WasmWallBudgetError>().is_some()
         )
     }
 }
@@ -834,7 +858,7 @@ impl From<ProviderInstantiationError> for WasmProviderLoadError {
 
 impl From<EgressSectionError> for WasmProviderLoadError {
     fn from(error: EgressSectionError) -> Self {
-        Self::EgressDeclaration(error)
+        Self::EgressDeclaration(ProviderDiagnostic::new(error))
     }
 }
 
@@ -858,7 +882,13 @@ impl From<AwsCredentialError> for WasmProviderLoadError {
 
 impl From<String> for WasmProviderLoadError {
     fn from(message: String) -> Self {
-        WasmProviderLoadError::Other(message)
+        WasmProviderLoadError::Other(message.into())
+    }
+}
+
+impl From<ProviderText> for WasmProviderLoadError {
+    fn from(message: ProviderText) -> Self {
+        Self::Other(message)
     }
 }
 
@@ -870,7 +900,7 @@ impl From<String> for WasmProviderLoadError {
 #[derive(Debug)]
 pub struct PrecompiledComponentDeserializationError {
     cwasm_path: PathBuf,
-    source: wasmtime::Error,
+    source: WasmDiagnostic,
 }
 
 impl fmt::Display for PrecompiledComponentDeserializationError {
@@ -880,7 +910,7 @@ impl fmt::Display for PrecompiledComponentDeserializationError {
             "Failed to deserialize WASM component from {}: ",
             self.cwasm_path.display()
         )?;
-        write_error_chain(f, &self.source)
+        self.source.fmt(f)
     }
 }
 
@@ -901,7 +931,7 @@ enum WasmProviderInstanceError {
     InitializeCall(wasmtime::Error),
     Initialize(ProviderError),
     InitializeReferenceScope(proto::ReferenceScopeError),
-    ProtocolVersion(String),
+    ProtocolVersion(ProviderText),
 }
 
 type ProviderInstantiationErrorMapper =
@@ -935,7 +965,9 @@ impl WasmProviderInstanceError {
                     error,
                 )
             }
-            WasmProviderInstanceError::ProtocolVersion(message) => ProviderError::internal(message),
+            WasmProviderInstanceError::ProtocolVersion(message) => {
+                ProviderError::internal(message.to_string())
+            }
         }
     }
 }
@@ -1018,16 +1050,6 @@ fn write_error_chain(f: &mut fmt::Formatter<'_>, error: &wasmtime::Error) -> fmt
         } else {
             write!(f, "\n  caused by: {cause}")?;
         }
-    }
-    Ok(())
-}
-
-fn write_error_chain_inline(f: &mut fmt::Formatter<'_>, error: &wasmtime::Error) -> fmt::Result {
-    for (index, cause) in error.chain().enumerate() {
-        if index > 0 {
-            f.write_str(": ")?;
-        }
-        write!(f, "{cause}")?;
     }
     Ok(())
 }
@@ -1251,8 +1273,11 @@ impl fmt::Display for EgressDenied {
                 | DestinationDenied::PrivateAddressDenied(_),
             ) => write!(
                 formatter,
-                "provider '{}' ({}) request to {} was denied: {}",
-                self.label.name, self.label.source, self.destination, self.reason
+                "{}",
+                ProviderText::new(format!(
+                    "provider '{}' ({}) request to {} was denied: {}",
+                    self.label.name, self.label.source, self.destination, self.reason
+                ))
             ),
         }
     }
@@ -1701,18 +1726,11 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
                 )
                 .await
                 .map_err(|_| {
-                    log::warn!(
-                        "WASM plugin HTTP request timed out resolving host {:?}",
-                        host,
-                    );
+                    log::warn!("{}", http_resolution_warning(host, None));
                     ErrorCode::ConnectionTimeout
                 })?
                 .map_err(|error| {
-                    log::warn!(
-                        "WASM plugin HTTP request failed to resolve host {:?}: {}",
-                        host,
-                        error,
-                    );
+                    log::warn!("{}", http_resolution_warning(host, Some(&error)));
                     dns_error_code()
                 })?;
                 Ok::<_, ErrorCode>(ResolvedAddresses::Standard(addresses))
@@ -1792,6 +1810,13 @@ fn trace_http_enabled() -> bool {
     })
 }
 
+fn http_resolution_warning(host: &str, error: Option<&dyn fmt::Display>) -> ProviderText {
+    ProviderText::new(match error {
+        Some(error) => format!("WASM plugin HTTP request failed to resolve host {host:?}: {error}"),
+        None => format!("WASM plugin HTTP request timed out resolving host {host:?}"),
+    })
+}
+
 fn http_trace_line(
     method: &str,
     uri: TraceUri<'_>,
@@ -1799,19 +1824,21 @@ fn http_trace_line(
     handler_ms: u128,
     status: &str,
 ) -> String {
-    format!(
+    ProviderText::new(format!(
         "carina-host-http-trace method={} uri={} queue_ms={} handler_ms={} status={}",
         method, uri, queue_ms, handler_ms, status,
-    )
+    ))
+    .to_string()
 }
 
 fn http_trace_phases_line(method: &str, uri: TraceUri<'_>, phases_ms: [u128; 4]) -> String {
     let [tcp_connect, tls_handshake, http_handshake, send_request] = phases_ms;
-    format!(
+    ProviderText::new(format!(
         "carina-host-http-trace-phases method={} uri={} \
          tcp_connect_ms={} tls_handshake_ms={} http_handshake_ms={} send_request_ms={}",
         method, uri, tcp_connect, tls_handshake, http_handshake, send_request,
-    )
+    ))
+    .to_string()
 }
 
 /// Local copy of `wasmtime_wasi_http::p2::default_send_request_handler` that
@@ -1993,7 +2020,7 @@ enum WasmBindingCreationError {
         operation: &'static str,
         source: WallBudgetExceeded,
     },
-    ProtocolVersion(String),
+    ProtocolVersion(ProviderText),
 }
 
 impl WasmBindingCreationError {
@@ -2014,7 +2041,7 @@ fn map_binding_creation_error<T>(
     instantiation: impl FnOnce(wasmtime::Error) -> T,
     info_call: impl FnOnce(wasmtime::Error) -> T,
     wall_budget_exceeded: impl FnOnce(&'static str, WallBudgetExceeded) -> T,
-    protocol_version: impl FnOnce(String) -> T,
+    protocol_version: impl FnOnce(ProviderText) -> T,
 ) -> T {
     match failure {
         WasmBindingCreationError::Instantiation(error) => instantiation(error),
@@ -3155,7 +3182,7 @@ fn build_sandboxed_wasi_ctx_with(
     mut env_value: impl FnMut(&str) -> Option<String>,
 ) -> WasiCtx {
     let mut builder = WasiCtxBuilder::new();
-    builder.inherit_stderr();
+    builder.stderr(guest_stderr::GuestStderr::new(std::io::stderr()));
     let keys = env_keys_for_capabilities(capabilities);
     for key in &keys {
         if let Some(val) = env_value(key) {
@@ -3294,7 +3321,7 @@ fn info_call_load_error(error: wasmtime::Error) -> WasmProviderLoadError {
         "Failed to call info()",
         WasmGuestCallError {
             context: None,
-            source: error,
+            source: WasmDiagnostic::new(error, true),
         },
     )
 }
@@ -3537,22 +3564,22 @@ enum PoisonReason {
     Trap {
         operation: &'static str,
         trap: Option<wasmtime::Trap>,
-        root_cause: Box<str>,
+        root_cause: ProviderText,
+        root_is_trap: bool,
     },
 }
 
 impl PoisonReason {
     fn from_trap(operation: &'static str, error: &wasmtime::Error) -> Self {
         let root_cause = error.root_cause().to_string();
-        let root_cause = root_cause
-            .lines()
-            .next()
-            .unwrap_or("unknown WASM trap")
-            .into();
+        let root_cause = root_cause.lines().next().unwrap_or("unknown WASM trap");
+        let trap = error.downcast_ref::<wasmtime::Trap>().copied();
+        let root_is_trap = trap.is_some_and(|trap| trap.to_string() == root_cause);
         Self::Trap {
             operation,
-            trap: error.downcast_ref::<wasmtime::Trap>().copied(),
-            root_cause,
+            trap,
+            root_cause: ProviderText::new(root_cause),
+            root_is_trap,
         }
     }
 
@@ -3578,13 +3605,14 @@ impl fmt::Display for PoisonReason {
                 operation,
                 trap,
                 root_cause,
+                root_is_trap,
             } => {
                 write!(
                     f,
                     "WASM provider instance unusable after trap in {operation}: "
                 )?;
                 match trap {
-                    Some(trap) if trap.to_string() == root_cause.as_ref() => trap.fmt(f),
+                    Some(trap) if *root_is_trap => trap.fmt(f),
                     Some(trap) => write!(f, "{trap}: {root_cause}"),
                     None => f.write_str(root_cause),
                 }
@@ -4327,8 +4355,8 @@ pub struct WasmProviderFactory {
     configured: ConfiguredProvider,
     runtime_network: GuestNetwork,
     budget: GuestCallBudget,
-    display_name: String,
-    version: String,
+    display_name: ProviderText,
+    version: ProviderString,
     schema_witness: Arc<ValidatedProviderSchemaWitness>,
     cached_config_completions: ProviderConfigCompletions,
     cached_identity_attributes: Vec<String>,
@@ -4367,25 +4395,12 @@ pub struct WasmProviderFactory {
 /// export, and the kind-less guest store receives no provider credentials.
 pub struct SchemaOnlyWasmProviderFactory {
     name: String,
-    display_name: String,
-    version: String,
+    display_name: ProviderText,
+    version: ProviderString,
     schema_witness: Arc<ValidatedProviderSchemaWitness>,
     cached_config_completions: ProviderConfigCompletions,
     cached_identity_attributes: Vec<String>,
 }
-
-#[derive(Debug)]
-struct WasmMetadataCallError {
-    source: wasmtime::Error,
-}
-
-impl fmt::Display for WasmMetadataCallError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_error_chain(f, &self.source)
-    }
-}
-
-impl std::error::Error for WasmMetadataCallError {}
 
 #[derive(Debug)]
 struct WasmWallBudgetError {
@@ -4435,7 +4450,7 @@ fn metadata_call_error(
         format!(
             "provider '{provider_name}' {provider_version} failed to call metadata export {export}"
         ),
-        WasmMetadataCallError { source },
+        WasmDiagnostic::new(source, false),
     )
 }
 
@@ -4565,7 +4580,7 @@ impl WasmProviderFactory {
         unsafe { Component::deserialize_file(engine, cwasm_path) }.map_err(|e| {
             PrecompiledComponentDeserializationError {
                 cwasm_path: cwasm_path.to_path_buf(),
-                source: e,
+                source: WasmDiagnostic::new(e, false),
             }
         })
     }
@@ -4641,8 +4656,8 @@ impl WasmProviderFactory {
             })?;
         if reported_name != configured.label.name {
             return Err(WasmProviderLoadError::ProviderNameMismatch {
-                configured: configured.label.name.clone(),
-                reported: reported_name,
+                configured: configured.label.name.clone().into(),
+                reported: reported_name.into(),
             });
         }
         let name = configured.label.name.as_str();
@@ -4655,10 +4670,11 @@ impl WasmProviderFactory {
             .map_err(|e| format!("Failed to call schemas(): {e}"))?;
 
         let (cached_config_completions, cached_identity_attributes, provider_config_types) =
-            Self::load_metadata(&live.bindings, &mut live.store, name, &version).await?;
+            Self::load_metadata(&live.bindings, &mut live.store, name, &version.to_string())
+                .await?;
         let schema_witness =
             wasm_convert::json_to_provider_schema(&schemas_json, provider_config_types)
-                .map_err(|error| provider_schema_decode_error(name, &version, error))?;
+                .map_err(|error| provider_schema_decode_error(name, &version.to_string(), error))?;
         let init_instance = RebuildableInstance::new(live, rebuild);
 
         Ok(Self {
@@ -4871,14 +4887,16 @@ impl WasmProviderFactory {
     /// The tempfile path includes the current process ID so that multiple
     /// processes racing to precompile the same component don't clobber each
     /// other's in-progress writes.
-    pub fn precompile(wasm_bytes: &[u8], cwasm_path: &Path) -> Result<(), String> {
+    pub fn precompile(wasm_bytes: &[u8], cwasm_path: &Path) -> Result<(), ProviderText> {
         let config = build_engine_config();
-        let engine = Engine::new(&config).map_err(|e| format!("Engine error: {e}"))?;
+        let engine =
+            Engine::new(&config).map_err(|e| ProviderText::new(format!("Engine error: {e}")))?;
         let serialized = engine
             .precompile_component(wasm_bytes)
-            .map_err(|e| format!("Precompile error: {e}"))?;
+            .map_err(|e| ProviderText::new(format!("Precompile error: {e:#}")))?;
         if let Some(parent) = cwasm_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("Mkdir error: {e}"))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| ProviderText::new(format!("Mkdir error: {e}")))?;
             // Tempfile + atomic rename; preserves any live mmap held by a
             // previously-loaded Component (see doc comment above for why).
             let tmp_path = parent.join(format!(
@@ -4889,10 +4907,13 @@ impl WasmProviderFactory {
                     .unwrap_or("cwasm"),
                 std::process::id()
             ));
-            std::fs::write(&tmp_path, &serialized).map_err(|e| format!("Write error: {e}"))?;
-            std::fs::rename(&tmp_path, cwasm_path).map_err(|e| format!("Rename error: {e}"))?;
+            std::fs::write(&tmp_path, &serialized)
+                .map_err(|e| ProviderText::new(format!("Write error: {e}")))?;
+            std::fs::rename(&tmp_path, cwasm_path)
+                .map_err(|e| ProviderText::new(format!("Rename error: {e}")))?;
         } else {
-            std::fs::write(cwasm_path, &serialized).map_err(|e| format!("Write error: {e}"))?;
+            std::fs::write(cwasm_path, &serialized)
+                .map_err(|e| ProviderText::new(format!("Write error: {e}")))?;
         }
         Ok(())
     }
@@ -5057,8 +5078,8 @@ impl SchemaOnlyWasmProviderFactory {
             })?;
         if reported_name != configured.label.name {
             return Err(WasmProviderLoadError::ProviderNameMismatch {
-                configured: configured.label.name.clone(),
-                reported: reported_name,
+                configured: configured.label.name.clone().into(),
+                reported: reported_name.into(),
             });
         }
         let name = configured.label.name.clone();
@@ -5067,29 +5088,41 @@ impl SchemaOnlyWasmProviderFactory {
             .call(|store| bindings.call_string_export(store, "schemas"))
             .await
             .map_err(|source| wall_budget_load_error("schemas", source))?
-            .map_err(|source| metadata_call_error(&name, &version, "schemas", source))?;
+            .map_err(|source| {
+                metadata_call_error(&name, &version.to_string(), "schemas", source)
+            })?;
         let config_completions_json = store
             .call(|store| bindings.call_string_export(store, "provider-config-completions"))
             .await
             .map_err(|source| wall_budget_load_error("provider-config-completions", source))?
             .map_err(|source| {
-                metadata_call_error(&name, &version, "provider-config-completions", source)
+                metadata_call_error(
+                    &name,
+                    &version.to_string(),
+                    "provider-config-completions",
+                    source,
+                )
             })?;
         let cached_config_completions =
-            decode_config_completions_json(&config_completions_json, &name, &version)?;
+            decode_config_completions_json(&config_completions_json, &name, &version.to_string())?;
         let cached_identity_attributes = store
             .call(|store| bindings.call_identity_attributes(store))
             .await
             .map_err(|source| wall_budget_load_error("identity-attributes", source))?
             .map_err(|source| {
-                metadata_call_error(&name, &version, "identity-attributes", source)
+                metadata_call_error(&name, &version.to_string(), "identity-attributes", source)
             })?;
         let provider_config_types_json = store
             .call(|store| bindings.call_string_export(store, "provider-config-attribute-types"))
             .await
             .map_err(|source| wall_budget_load_error("provider-config-attribute-types", source))?
             .map_err(|source| {
-                metadata_call_error(&name, &version, "provider-config-attribute-types", source)
+                metadata_call_error(
+                    &name,
+                    &version.to_string(),
+                    "provider-config-attribute-types",
+                    source,
+                )
             })?;
         let provider_config_types = wasm_convert::json_to_schema_only_attribute_types(
             &provider_config_types_json,
@@ -5108,7 +5141,7 @@ impl SchemaOnlyWasmProviderFactory {
             provider_config_types,
             protocol_version,
         )
-        .map_err(|error| provider_schema_decode_error(&name, &version, error))?;
+        .map_err(|error| provider_schema_decode_error(&name, &version.to_string(), error))?;
 
         Ok(Self {
             name,
@@ -5121,22 +5154,7 @@ impl SchemaOnlyWasmProviderFactory {
     }
 
     pub fn verify_version(&self, constraint_raw: &str) -> Result<(), String> {
-        let requirement = semver::VersionReq::parse(constraint_raw)
-            .map_err(|error| format!("Invalid version constraint '{constraint_raw}': {error}"))?;
-        let actual = semver::Version::parse(&self.version).map_err(|error| {
-            format!(
-                "Provider '{}' reports invalid version '{}': {error}",
-                self.name, self.version
-            )
-        })?;
-        if requirement.matches(&actual) {
-            Ok(())
-        } else {
-            Err(format!(
-                "Provider '{}' version {actual} does not satisfy constraint '{constraint_raw}'",
-                self.name
-            ))
-        }
+        verify_provider_version(&self.name, &self.version, constraint_raw)
     }
 }
 
@@ -5220,30 +5238,41 @@ impl WasmProviderFactory {
     }
 
     pub fn version(&self) -> &str {
-        &self.version
+        self.version.as_str()
     }
 
     /// Verify that this provider's version satisfies the given constraint.
     pub fn verify_version(&self, constraint_raw: &str) -> Result<(), String> {
-        let req = semver::VersionReq::parse(constraint_raw)
-            .map_err(|e| format!("Invalid version constraint '{}': {}", constraint_raw, e))?;
-        let actual = semver::Version::parse(&self.version).map_err(|e| {
-            format!(
-                "Provider '{}' reports invalid version '{}': {}",
-                self.configured.label.name.as_str(),
-                self.version,
-                e
-            )
-        })?;
-        if !req.matches(&actual) {
-            return Err(format!(
-                "Provider '{}' version {} does not satisfy constraint '{}'",
-                self.configured.label.name.as_str(),
-                actual,
-                constraint_raw
-            ));
-        }
+        verify_provider_version(
+            self.configured.label.name.as_str(),
+            &self.version,
+            constraint_raw,
+        )
+    }
+}
+
+fn verify_provider_version(
+    provider_name: &str,
+    version: &ProviderString,
+    constraint_raw: &str,
+) -> Result<(), String> {
+    let diagnostic = |text| ProviderText::new(text).to_string();
+    let requirement = semver::VersionReq::parse(constraint_raw).map_err(|error| {
+        diagnostic(format!(
+            "Invalid version constraint '{constraint_raw}': {error}"
+        ))
+    })?;
+    let actual = semver::Version::parse(version.as_str()).map_err(|error| {
+        diagnostic(format!(
+            "Provider '{provider_name}' reports invalid version '{version}': {error}"
+        ))
+    })?;
+    if requirement.matches(&actual) {
         Ok(())
+    } else {
+        Err(diagnostic(format!(
+            "Provider '{provider_name}' version {version} does not satisfy constraint '{constraint_raw}'"
+        )))
     }
 }
 
@@ -7513,34 +7542,19 @@ struct WasmNormalizerResultKeysError {
 impl fmt::Display for WasmNormalizerResultKeysError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("returned a mismatched state key set")?;
-        if !self.missing.is_empty() {
-            write!(
-                f,
-                "; missing: {}",
-                self.missing.iter().cloned().collect::<Vec<_>>().join(", ")
-            )?;
-        }
-        if !self.unexpected.is_empty() {
-            write!(
-                f,
-                "; unexpected: {}",
-                self.unexpected
+        for (label, keys) in [
+            ("missing", &self.missing),
+            ("unexpected", &self.unexpected),
+            ("duplicate", &self.duplicates),
+        ] {
+            if !keys.is_empty() {
+                let names = keys
                     .iter()
-                    .cloned()
+                    .map(|key| if key.is_empty() { "\"\"" } else { key.as_str() })
                     .collect::<Vec<_>>()
-                    .join(", ")
-            )?;
-        }
-        if !self.duplicates.is_empty() {
-            write!(
-                f,
-                "; duplicate: {}",
-                self.duplicates
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )?;
+                    .join(", ");
+                write!(f, "; {label}: {}", ProviderText::new(names))?;
+            }
         }
         Ok(())
     }
@@ -7598,19 +7612,24 @@ fn validate_wit_state_result_keys(
         }
     }
     let returned_keys = returned.keys().cloned().collect::<BTreeSet<_>>();
-    let missing = expected_keys.difference(&returned_keys).cloned().collect();
-    let unexpected = returned_keys.difference(&expected_keys).cloned().collect();
-    let error = WasmNormalizerResultKeysError {
-        missing,
-        unexpected,
-        duplicates,
-    };
-    if !error.missing.is_empty() || !error.unexpected.is_empty() || !error.duplicates.is_empty() {
+    let missing = expected_keys
+        .difference(&returned_keys)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let unexpected = returned_keys
+        .difference(&expected_keys)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if !missing.is_empty() || !unexpected.is_empty() || !duplicates.is_empty() {
         return Err(ProviderError::internal_caused_by(
             "WASM provider returned invalid state keys",
             WasmOperationError {
                 operation,
-                source: error,
+                source: WasmNormalizerResultKeysError {
+                    missing,
+                    unexpected,
+                    duplicates,
+                },
             },
         ));
     }
@@ -8075,11 +8094,19 @@ mod tests {
                 }
             });
             assert_eq!(
-                error.detail().resource_id.as_deref(),
+                error
+                    .detail()
+                    .resource_id
+                    .as_deref()
+                    .map(|id| id.as_resource_id()),
                 Some(&resources[1].id)
             );
             assert_ne!(
-                error.detail().resource_id.as_deref(),
+                error
+                    .detail()
+                    .resource_id
+                    .as_deref()
+                    .map(|id| id.as_resource_id()),
                 Some(&resources[0].id)
             );
             assert!(error.detail().cause().is_some());
@@ -9967,7 +9994,11 @@ mod tests {
         assert!(error.to_string().contains("map-val"));
         assert!(error.detail().cause().is_some());
         assert_eq!(
-            error.detail().resource_id.as_deref(),
+            error
+                .detail()
+                .resource_id
+                .as_deref()
+                .map(|id| id.as_resource_id()),
             Some(&second_id),
             "decode errors must identify the state whose attributes were malformed"
         );
@@ -10028,6 +10059,241 @@ mod tests {
             hash.verify(material),
             "the normalizer roundtrip must retain the marker's explicit salt"
         );
+    }
+
+    #[test]
+    fn provider_text_verify_version_uses_raw_metadata_and_safe_error_labels() {
+        let raw = format!("1.2.3+{}", "a".repeat(9000));
+        let json =
+            serde_json::json!({"name": "mock", "display_name": "Mock", "version": raw}).to_string();
+        let (_, _, version) = wasm_convert::json_to_provider_info(&json).unwrap();
+        assert!(verify_provider_version("mock", &version, "^1.2.0").is_ok());
+        let mismatch = verify_provider_version("mock", &version, "^2").unwrap_err();
+        assert!(mismatch.contains("truncated,"));
+        assert!(mismatch.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
+        let invalid = verify_provider_version("mock", &"\x1b[2J".into(), "*").unwrap_err();
+        assert!(!invalid.contains('\x1b'));
+        assert!(invalid.contains("\\u{1b}[2J"));
+    }
+
+    #[test]
+    fn provider_text_component_import_matching_keeps_raw_names_and_versions() {
+        let version = format!("0.2.6+{}", "a".repeat(9000));
+        let name = format!("wasi:http/outgoing-handler@{version}");
+        let imports = ComponentImports {
+            names: vec![name.clone().into()],
+        };
+        assert_eq!(
+            imports.iter().next().map(ProviderString::as_str),
+            Some(name.as_str())
+        );
+        let http = WasiHttpImports::from_component_imports(&imports).unwrap();
+        let WasiHttpImportVersion::Semver(actual) = &http.first.version else {
+            panic!("valid long import version must remain parseable")
+        };
+        assert_eq!(actual, &semver::Version::parse(&version).unwrap());
+        assert!(
+            http.first.name.to_string().len()
+                <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES
+        );
+    }
+
+    #[test]
+    fn provider_text_inline_wasmtime_diagnostics_preserve_chain_format() {
+        for (error, expected) in [
+            (wasmtime::Error::msg("root"), "top: root"),
+            (
+                wasmtime::Error::msg("root\nsecond line")
+                    .context("inner")
+                    .context("outer"),
+                "top: outer: inner: root\nsecond line",
+            ),
+            (
+                wasmtime::Error::new(std::io::Error::other("root")).context("outer\x1b[2J"),
+                "top: outer\\u{1b}[2J: root",
+            ),
+        ] {
+            let error = error.context("top");
+            assert_eq!(WasmDiagnostic::new(error, true).to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn provider_text_poison_reason_sanitizes_rebuild_warning_at_construction() {
+        let raw = format!("\x1b[2J\x07\u{9b}{}", "x".repeat(20 * 1024));
+        let reason = PoisonReason::from_trap("read", &wasmtime::Error::msg(raw));
+        let rendered = reason.to_string();
+        assert!(!rendered.contains(['\x1b', '\x07', '\u{9b}']));
+        assert!(rendered.contains("\\u{1b}[2J\\u{7}\\u{9b}"));
+        assert!(rendered.contains("truncated,"));
+    }
+
+    #[test]
+    fn provider_text_precompile_error_sanitizes_hostile_component_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let component = format!(
+            "(component (type $t (func)) (import \"bad\\1b[2J\\07{}\" (func (type $t))))",
+            "x".repeat(20 * 1024)
+        );
+        let error = WasmProviderFactory::precompile(
+            component.as_bytes(),
+            &directory.path().join("test.cwasm"),
+        )
+        .unwrap_err();
+        let rendered = error.to_string();
+        assert!(!rendered.contains(['\x1b', '\x07']));
+        assert!(rendered.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
+        assert!(rendered.contains("\\u{1b}"));
+    }
+
+    #[test]
+    fn provider_text_http_trace_sanitizes_guest_status_and_method() {
+        let raw = format!("\x1b[2J\x07\u{9b}{}", "x".repeat(20 * 1024));
+        let rendered = http_trace_line(&raw, TraceUri::new("https://example.com"), 0, 0, &raw);
+        assert!(!rendered.contains(['\x1b', '\x07', '\u{9b}']));
+        assert!(rendered.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
+    }
+
+    #[test]
+    fn provider_text_egress_declaration_is_terminal_after_rendering_nested_sources() {
+        #[derive(Debug)]
+        struct Outer {
+            source: std::io::Error,
+        }
+        impl fmt::Display for Outer {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("declaration outer")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.source)
+            }
+        }
+        let error = WasmProviderLoadError::EgressDeclaration(ProviderDiagnostic::new(Outer {
+            source: std::io::Error::other("nested guest \x1b]52;c;ZXZpbA==\x07\x1b[2J"),
+        }));
+        assert!(std::error::Error::source(&error).is_none());
+        let rendered = carina_core::executor::render_error_chain(&error);
+        assert_eq!(rendered.matches("declaration outer").count(), 1);
+        assert_eq!(rendered.matches("nested guest").count(), 1);
+        assert!(!rendered.contains(['\x1b', '\x07']));
+        assert!(rendered.contains("\\u{1b}]52;c;ZXZpbA==\\u{7}\\u{1b}[2J"));
+    }
+
+    #[test]
+    fn provider_text_plugin_load_and_trap_errors_are_sanitized() {
+        let raw = format!("\x1b]52;c;ZXZpbA==\x07\x1b[2J{}", "x".repeat(20 * 1024));
+        let errors = [
+            WasmProviderLoadError::metadata(&raw, std::io::Error::other(raw.clone())),
+            WasmProviderLoadError::Other(raw.clone().into()),
+            WasmProviderLoadError::ProviderNameMismatch {
+                configured: "test".into(),
+                reported: raw.clone().into(),
+            },
+            WasmProviderLoadError::from(EgressSectionError::InvalidPattern {
+                pattern: raw.clone(),
+                source: carina_provider_protocol::HostPattern::parse(&raw).unwrap_err(),
+            }),
+            WasmProviderLoadError::metadata(
+                "metadata call failed",
+                WasmDiagnostic::new(wasmtime::Error::msg(raw.clone()), false),
+            ),
+        ];
+        for error in errors {
+            let rendered = error.to_string();
+            assert!(!rendered.contains(['\x1b', '\x07']));
+            assert!(rendered.contains("\\u{1b}"));
+            assert!(rendered.contains("truncated,"));
+            assert!(std::error::Error::source(&error).is_none());
+        }
+        let trap = wasm_trap_provider_error("read", wasmtime::Error::msg(raw));
+        assert!(!trap.to_string().contains(['\x1b', '\x07']));
+        assert!(
+            trap.detail()
+                .cause()
+                .unwrap()
+                .downcast_ref::<WasmGuestCallError>()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn provider_text_normalization_errors_preserve_sources_and_sanitize_guest_keys() {
+        use carina_provider_protocol::normalization::{NormalizationError, NormalizationErrorKind};
+        let raw = format!("\x1b[2J\x07{}", "x".repeat(20 * 1024));
+        let id = Resource::<ModuleSource>::with_provider("mock", "test.resource", "only", None).id;
+        let source = NormalizationError::new(
+            carina_core::protocol_convert::resource_id_to_protocol(&id),
+            &raw,
+            NormalizationErrorKind::DuplicateKey { key: raw.clone() },
+        )
+        .with_source(std::io::Error::other(raw.clone()));
+        let error = ProviderError::from(source);
+        assert!(!error.to_string().contains(['\x1b', '\x07']));
+        assert!(error.to_string().contains("truncated,"));
+        let source = error
+            .detail()
+            .cause()
+            .unwrap()
+            .downcast_ref::<NormalizationError>()
+            .unwrap();
+        assert!(
+            std::error::Error::source(source)
+                .unwrap()
+                .is::<std::io::Error>()
+        );
+
+        let expected = HashMap::from([("expected".to_string(), id)]);
+        let state = wit_types::PersistedState {
+            identifier: None,
+            attributes: Vec::new(),
+            exists: true,
+        };
+        let error =
+            validate_wit_state_result_keys("normalize_state", &expected, vec![(raw, state)])
+                .unwrap_err();
+        assert!(!error.to_string().contains(['\x1b', '\x07']));
+        assert!(error.to_string().contains("\\u{1b}[2J\\u{7}"));
+    }
+
+    #[test]
+    fn normalizer_result_rejects_empty_unexpected_key() {
+        let id = Resource::<ModuleSource>::with_provider("mock", "test.resource", "only", None).id;
+        let expected = HashMap::from([("expected".to_string(), id)]);
+        let state = wit_types::PersistedState {
+            identifier: None,
+            attributes: Vec::new(),
+            exists: true,
+        };
+        let error = validate_wit_state_result_keys(
+            "normalize_state",
+            &expected,
+            vec![("expected".into(), state.clone()), (String::new(), state)],
+        )
+        .expect_err("an unexpected empty key must not disappear during validation");
+        assert!(error.to_string().contains("unexpected: \"\""));
+    }
+
+    #[test]
+    fn normalizer_result_rejects_duplicate_keys_including_empty() {
+        for key in ["expected", ""] {
+            let id =
+                Resource::<ModuleSource>::with_provider("mock", "test.resource", "only", None).id;
+            let expected = HashMap::from([(key.to_string(), id)]);
+            let state = wit_types::PersistedState {
+                identifier: None,
+                attributes: Vec::new(),
+                exists: true,
+            };
+            let error = validate_wit_state_result_keys(
+                "normalize_state",
+                &expected,
+                vec![(key.into(), state.clone()), (key.into(), state)],
+            )
+            .expect_err("duplicate keys must be rejected before formatting");
+            assert!(error.to_string().contains("duplicate:"));
+        }
     }
 
     #[test]
@@ -10238,14 +10504,12 @@ mod tests {
 
     #[test]
     fn pattern_diagnostics_are_rendered_once_in_provider_load_error() {
-        let detail = wasm_convert::json_to_attribute_types(
-            r#"{
+        let json = r#"{
                 "first":{"type":"String","pattern":"(?=x)"},
                 "second":{"type":"String","pattern":"["}
-            }"#,
-        )
-        .unwrap_err();
-        let diagnostic = ProviderSchemaDecodeDiagnostic(detail);
+            }"#;
+        let detail = wasm_convert::json_to_attribute_types(json).unwrap_err();
+        let diagnostic = ProviderDiagnostic::new(detail);
         let rendered = diagnostic.to_string();
         assert!(std::error::Error::source(&diagnostic).is_none());
         for pattern in ["(?=x)", "["] {
@@ -10261,7 +10525,11 @@ mod tests {
                 "{rendered}"
             );
         }
-        let error = provider_schema_decode_error("bad-provider", "9.9.9", diagnostic.0);
+        let error = provider_schema_decode_error(
+            "bad-provider",
+            "9.9.9",
+            wasm_convert::json_to_attribute_types(json).unwrap_err(),
+        );
         assert_eq!(error.to_string().matches(&rendered).count(), 1);
         assert!(std::error::Error::source(&error).is_none());
     }
@@ -11703,7 +11971,12 @@ mod tests {
                 Ok(_) => panic!("corrupt precompiled component must fail deserialization"),
                 Err(error) => error,
             };
-        let source_chain: Vec<_> = error.source.chain().map(ToString::to_string).collect();
+        let source_chain: Vec<_> = error
+            .source
+            .text
+            .split("\n  caused by: ")
+            .map(ToString::to_string)
+            .collect();
         assert!(
             source_chain.len() >= 2,
             "fixture must produce a genuinely nested Wasmtime error: {source_chain:?}"
@@ -11733,7 +12006,10 @@ mod tests {
         let host_version = semver::Version::parse(WASI_HTTP_HOST_VERSION).unwrap();
         let compatibility = wasi_http_compatibility(&host_version, &imports);
         let error = ProviderInstantiationError {
-            primary_failure: wasmtime::Error::msg("fixture instantiation failure"),
+            primary_failure: WasmDiagnostic::new(
+                wasmtime::Error::msg("fixture instantiation failure"),
+                false,
+            ),
             context: Box::new(InstantiationContext::SingleAttempt {
                 world: InstantiationWorld::HttpEnabled,
                 context: ComponentInstantiationContext::WasiHttpImported {
@@ -12292,7 +12568,7 @@ mod tests {
         assert_eq!(detail.provider_name.as_deref(), Some("awscc"));
         assert_eq!(detail.operation.as_deref(), Some("sts.GetCallerIdentity"));
         assert_eq!(detail.status, Some(403));
-        assert_eq!(detail.code.as_deref(), Some("AccessDenied"));
+        assert_eq!(detail.code(), Some("AccessDenied"));
         assert_eq!(detail.request_id.as_deref(), Some("request-123"));
         assert_eq!(
             mapped.to_string(),
@@ -12873,7 +13149,8 @@ mod tests {
             );
             let source_chain: Vec<_> = instantiation
                 .primary_failure
-                .chain()
+                .text
+                .split("\n  caused by: ")
                 .map(ToString::to_string)
                 .collect();
             assert!(

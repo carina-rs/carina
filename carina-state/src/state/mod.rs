@@ -4507,8 +4507,12 @@ impl ResourceState {
             .partial_read_diagnostic()
             .and_then(|diagnostic| {
                 PartialReadMarker::new(
-                    PendingReRead::incomplete(diagnostic.reason().to_string()),
-                    diagnostic.missing_attributes().iter().cloned().collect(),
+                    PendingReRead::incomplete(diagnostic.raw_reason()),
+                    diagnostic
+                        .missing_attributes()
+                        .iter()
+                        .map(|name| name.as_str().to_owned())
+                        .collect(),
                 )
             })
             .or_else(|| {

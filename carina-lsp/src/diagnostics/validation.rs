@@ -482,7 +482,7 @@ mod tests {
                 name: "provider_value".to_string(),
             },
             TypeError::ValidationFailed {
-                message: "not accepted".to_string(),
+                message: "not accepted".into(),
             },
         );
 

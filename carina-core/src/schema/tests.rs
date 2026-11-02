@@ -10,6 +10,55 @@ use crate::schema::{
 fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
     crate::resource::RootScope::new().resolve(crate::resource::RelativeBindingName::new(binding))
 }
+
+#[test]
+fn provider_text_diagnostic_values_escape_and_cap_duplicate_list_elements() {
+    let raw = format!("\x1b]52;c;ZXZpbA==\x07\x1b[2J{}", "x".repeat(20 * 1024));
+    let value = DiagnosticValue::Plain(raw.clone());
+    for kind in [
+        InvalidEnumValueKind::Identifier,
+        InvalidEnumValueKind::String,
+    ] {
+        let rendered = value.render_enum_value(kind);
+        assert!(!rendered.contains(['\x1b', '\x07']));
+        assert!(rendered.contains("\\u{1b}]52;c;ZXZpbA==\\u{7}\\u{1b}[2J"));
+        assert!(rendered.contains("truncated,"));
+        assert!(rendered.len() <= crate::provider_text::MAX_PROVIDER_TEXT_BYTES);
+    }
+    let error = TypeError::DuplicateListElement {
+        value,
+        index: 1,
+        first_index: 0,
+        attribute: Some("modes".into()),
+    };
+    let rendered = error.to_string();
+    assert!(!rendered.contains(['\x1b', '\x07']));
+    assert!(rendered.contains("\\u{1b}]52;c;ZXZpbA==\\u{7}\\u{1b}[2J"));
+    assert!(rendered.contains("truncated,"));
+    let TypeError::DuplicateListElement {
+        value,
+        index: _,
+        first_index: _,
+        attribute: _,
+    } = error
+    else {
+        unreachable!()
+    };
+    assert_eq!(value.as_plain(), Some(raw.as_str()));
+}
+
+#[test]
+fn provider_text_schema_location_suffix_preserves_raw_lookup_path() {
+    let raw = "name\x1b[2J";
+    let location = SchemaValidationIssueLocation::Attribute(raw.into()).with_suffix(".child");
+    assert_eq!(location.attribute_path(), Some("name\x1b[2J.child"));
+    assert_eq!(location.to_string(), "name\\u{1b}[2J.child");
+    let raw_path = location.raw_path();
+    assert_eq!(raw_path, "name\x1b[2J.child");
+    let definition = SchemaValidationIssueLocation::Definition(raw.into()).with_suffix(".child");
+    assert_eq!(definition.raw_path(), "defs.name\x1b[2J.child");
+    assert_eq!(definition.to_string(), "defs.name\\u{1b}[2J.child");
+}
 type Value = crate::resource::Value<crate::resource::NoPlaceholder>;
 type ConcreteValue = crate::resource::ConcreteValue<crate::resource::NoPlaceholder>;
 type DeferredValue = crate::resource::DeferredValue<crate::resource::NoPlaceholder>;
@@ -68,7 +117,7 @@ fn unique_list_from_protocol(element_type: AttributeType, ordered: bool) -> Attr
     crate::protocol_convert::protocol_to_attribute_type(&wire)
         .unwrap()
         .compile_patterns(
-            SchemaValidationIssueLocation::Attribute("value".to_string()),
+            SchemaValidationIssueLocation::Attribute("value".into()),
             &mut Vec::new(),
         )
         .unwrap()
@@ -1499,7 +1548,7 @@ fn resource_validation_prefixes_nested_group_errors_with_the_struct_path() {
 
 fn attributed_validation_failure(attribute: &str, message: &str) -> TypeError {
     TypeError::ResourceValidationFailed {
-        message: message.to_string(),
+        message: message.into(),
         attribute: Some(attribute.to_string()),
     }
 }
@@ -1763,7 +1812,7 @@ fn rootless_lookup_collects_every_failure_without_a_fake_attribute() {
     ]));
     let lookup = |_declared_type: &AttributeType, _value: &Value| {
         Err(TypeError::ValidationFailed {
-            message: "rejected".to_string(),
+            message: "rejected".into(),
         })
     };
 
@@ -4532,7 +4581,7 @@ fn with_attribute_is_noop_for_variants_that_dont_carry_attribute() {
 #[test]
 fn with_attribute_tags_leaf_validator_failures_for_diagnostics() {
     let tagged = TypeError::ValidationFailed {
-        message: "invalid CIDR".to_string(),
+        message: "invalid CIDR".into(),
     }
     .with_attribute("cidr_block");
 
@@ -4549,7 +4598,7 @@ fn with_attribute_tags_leaf_validator_failures_for_diagnostics() {
 fn custom_constraint_errors_format_type_and_attribute_context() {
     let pattern = TypeError::PatternMismatch {
         value: "it's".into(),
-        pattern: "^[a-z]+$".to_string(),
+        pattern: "^[a-z]+$".into(),
         attribute: None,
         type_name: Some("EntityDescription".to_string()),
     };
@@ -5960,7 +6009,7 @@ fn validate_known_values_defers_constraints_until_values_are_concrete() {
             && matches!(value, Value::Concrete(ConcreteValue::String(value)) if value == "invalid")
         {
             Err(TypeError::ValidationFailed {
-                message: "custom value rejected".to_string(),
+                message: "custom value rejected".into(),
             })
         } else {
             Ok(())
@@ -6171,7 +6220,7 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
     let lookup = |_declared_type: &AttributeType, value: &Value| match value {
         crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(value)) => {
             Err(TypeError::ValidationFailed {
-                message: format!("provider lookup rejected {}", value.expose_plaintext()),
+                message: format!("provider lookup rejected {}", value.expose_plaintext()).into(),
             })
         }
         _ => Ok(()),
@@ -10399,7 +10448,7 @@ fn custom_pattern_rejects_and_accepts_string_values() {
         err,
         TypeError::PatternMismatch {
             value: "ABC".into(),
-            pattern: "^[a-z]+$".to_string(),
+            pattern: "^[a-z]+$".into(),
             attribute: None,
             type_name: None,
         }
@@ -10507,7 +10556,7 @@ fn custom_pattern_and_length_passes_still_run_validator() {
         Some((Some(1), Some(10))),
         validator(|_| {
             Err(TypeError::ValidationFailed {
-                message: "closure rejected".to_string(),
+                message: "closure rejected".into(),
             })
         }),
         None,
@@ -10519,7 +10568,7 @@ fn custom_pattern_and_length_passes_still_run_validator() {
     assert_eq!(
         err,
         TypeError::ValidationFailed {
-            message: "closure rejected".to_string(),
+            message: "closure rejected".into(),
         }
     );
 }
@@ -10546,7 +10595,7 @@ fn custom_pattern_rejects_wafv2_description_parentheses() {
         err,
         TypeError::PatternMismatch {
             value: "Protects the Carina Provider Registry (dev) CloudFront distribution".into(),
-            pattern: pattern.to_string(),
+            pattern: pattern.into(),
             attribute: None,
             type_name: Some("EntityDescription".to_string()),
         }
@@ -10665,7 +10714,7 @@ fn schema_rejects_uncompilable_patterns() {
         let (location, source) = error.pattern_errors().next().expect("typed regex error");
         assert_eq!(
             location,
-            &SchemaValidationIssueLocation::Attribute(path.to_string())
+            &SchemaValidationIssueLocation::Attribute(path.into())
         );
         assert_eq!(source.pattern, pattern);
         assert!(matches!(source.reason, PatternCompileErrorSource::Parse(_)));
@@ -10679,7 +10728,7 @@ fn schema_rejects_uncompilable_patterns() {
             .expect("typed config regex error");
         assert_eq!(
             location,
-            &SchemaValidationIssueLocation::Attribute(path.to_string())
+            &SchemaValidationIssueLocation::Attribute(path.into())
         );
         assert_eq!(source.pattern, pattern);
         assert!(std::error::Error::source(&error).is_none());
@@ -10699,7 +10748,7 @@ fn schema_rejects_uncompilable_patterns() {
         .expect("typed definition regex error");
     assert_eq!(
         location,
-        &SchemaValidationIssueLocation::Definition("Pattern".to_string())
+        &SchemaValidationIssueLocation::Definition("Pattern".into())
     );
     assert_eq!(source.pattern, pattern);
 
@@ -10908,7 +10957,7 @@ fn schema_validate_attr_dispatches_to_custom_pattern_validation() {
         err,
         TypeError::PatternMismatch {
             value: "ABC".into(),
-            pattern: "^[a-z]+$".to_string(),
+            pattern: "^[a-z]+$".into(),
             attribute: None,
             type_name: Some("Slug".to_string()),
         }
@@ -11671,7 +11720,7 @@ mod validate_collect_tests {
             validator(move |_value| {
                 if validator_calls.fetch_add(1, Ordering::SeqCst) < 4 {
                     Err(TypeError::ValidationFailed {
-                        message: "rejected while collecting diagnostics".to_string(),
+                        message: "rejected while collecting diagnostics".into(),
                     })
                 } else {
                     Ok(())
@@ -13064,7 +13113,7 @@ fn schema_validate_ref_alias_cycle_terminates_for_validate_and_collect() {
     };
     let value = Value::Concrete(ConcreteValue::Int(1));
     let expected = TypeError::ValidationFailed {
-        message: "cyclic schema reference `A`".to_string(),
+        message: "cyclic schema reference `A`".into(),
     };
 
     assert_eq!(schema.validate(&value), Err(expected.clone()));
@@ -13191,10 +13240,10 @@ fn tied_scalar_union_reports_every_distinct_failure_in_declaration_order() {
             failures.iter().collect::<Vec<_>>(),
             vec![
                 &TypeError::ValidationFailed {
-                    message: "first scalar alternative failed".to_string(),
+                    message: "first scalar alternative failed".into(),
                 },
                 &TypeError::ValidationFailed {
-                    message: "second scalar alternative failed".to_string(),
+                    message: "second scalar alternative failed".into(),
                 },
             ],
             "{path} changed the tied failure order"
@@ -13533,7 +13582,7 @@ fn duplicate_tied_union_failures_collapse_to_the_verbatim_error() {
     let value = Value::Concrete(ConcreteValue::String("invalid".into()));
     let expected = TypeError::PatternMismatch {
         value: "invalid".into(),
-        pattern: "^Z[A-Z0-9]+$".to_string(),
+        pattern: "^Z[A-Z0-9]+$".into(),
         attribute: None,
         type_name: Some("HostedZoneId".to_string()),
     };
@@ -13557,7 +13606,7 @@ fn unique_best_union_failure_remains_verbatim() {
     let value = Value::Concrete(ConcreteValue::String("invalid".into()));
     let expected = TypeError::PatternMismatch {
         value: "invalid".into(),
-        pattern: "^Z[A-Z0-9]+$".to_string(),
+        pattern: "^Z[A-Z0-9]+$".into(),
         attribute: None,
         type_name: Some("HostedZoneId".to_string()),
     };
@@ -14009,7 +14058,8 @@ fn custom_validator_can_capture_external_state() {
                         "expected region {}, got {}",
                         allowed_region,
                         s.expose_plaintext()
-                    ),
+                    )
+                    .into(),
                 })
             }
             other => Err(TypeError::TypeMismatch {
@@ -14262,8 +14312,7 @@ fn walk_custom_lookup_skips_value_unknown() {
     // `expected vpc_id, got unknown`.
     let always_fail = validator(|_v: &Value| {
         Err(TypeError::ValidationFailed {
-            message: "validator must not run for Value::Deferred(DeferredValue::Unknown)"
-                .to_string(),
+            message: "validator must not run for Value::Deferred(DeferredValue::Unknown)".into(),
         })
     });
     let custom_type = AttributeType::refined_string_with_validator(
@@ -14283,7 +14332,7 @@ fn walk_custom_lookup_skips_value_unknown() {
         Some("vpc_id"),
         &|_, _| {
             Err(TypeError::ValidationFailed {
-                message: "should never be called".to_string(),
+                message: "should never be called".into(),
             })
         },
         crate::schema::empty_defs_for_schema_walks(),
@@ -14383,7 +14432,7 @@ fn resource_schema_custom_lookup_resets_ref_path_after_list_descent() {
             Ok(())
         } else {
             Err(TypeError::ValidationFailed {
-                message: "cyclic_leaf expects a String".to_string(),
+                message: "cyclic_leaf expects a String".into(),
             })
         }
     };
@@ -14427,7 +14476,7 @@ fn union_walk_custom_lookup_succeeds_when_any_member_accepts() {
             Ok(())
         } else {
             Err(TypeError::ValidationFailed {
-                message: format!("{} rejects", id.kind),
+                message: format!("{} rejects", id.kind).into(),
             })
         }
     };
@@ -14462,7 +14511,7 @@ fn union_walk_custom_lookup_emits_smallest_error_set_when_all_fail() {
         let id = crate::provider::identified_custom_type_identity(declared_type)
             .expect("custom union arm must carry its identity");
         Err(TypeError::ValidationFailed {
-            message: format!("{} rejects", id.kind),
+            message: format!("{} rejects", id.kind).into(),
         })
     };
 
@@ -14503,10 +14552,16 @@ fn union_walk_custom_lookup_cidr_accepts_ipv4_when_lookup_routes_correctly() {
             return Ok(());
         };
         match id.kind.as_str() {
-            "Ipv4Cidr" => validate_ipv4_cidr(s.expose_plaintext())
-                .map_err(|message| TypeError::ValidationFailed { message }),
-            "Ipv6Cidr" => validate_ipv6_cidr(s.expose_plaintext())
-                .map_err(|message| TypeError::ValidationFailed { message }),
+            "Ipv4Cidr" => validate_ipv4_cidr(s.expose_plaintext()).map_err(|message| {
+                TypeError::ValidationFailed {
+                    message: message.into(),
+                }
+            }),
+            "Ipv6Cidr" => validate_ipv6_cidr(s.expose_plaintext()).map_err(|message| {
+                TypeError::ValidationFailed {
+                    message: message.into(),
+                }
+            }),
             _ => Ok(()),
         }
     };
@@ -16177,7 +16232,7 @@ fn keyed_partial_update_validation_rejects_an_unknown_key_field() {
     assert_eq!(
         issues,
         vec![(
-            &SchemaValidationIssueLocation::Attribute("settings".to_string()),
+            &SchemaValidationIssueLocation::Attribute("settings".into()),
             "keyed partial-update key `key` is not a field of list element struct `Setting`"
         )]
     );
@@ -16195,7 +16250,7 @@ fn keyed_partial_update_validation_rejects_a_non_struct_list_shape() {
     assert_eq!(
         issues,
         vec![(
-            &SchemaValidationIssueLocation::Attribute("settings".to_string()),
+            &SchemaValidationIssueLocation::Attribute("settings".into()),
             "keyed partial-update attribute must be a list of structs"
         )]
     );
@@ -16210,7 +16265,7 @@ fn keyed_partial_update_validation_rejects_a_non_list_shape() {
     assert_eq!(
         issues,
         vec![(
-            &SchemaValidationIssueLocation::Attribute("settings".to_string()),
+            &SchemaValidationIssueLocation::Attribute("settings".into()),
             "keyed partial-update attribute must be a list of structs"
         )]
     );
@@ -16231,7 +16286,7 @@ fn keyed_partial_update_validation_rejects_a_non_string_key_field() {
     assert_eq!(
         issues,
         vec![(
-            &SchemaValidationIssueLocation::Attribute("settings".to_string()),
+            &SchemaValidationIssueLocation::Attribute("settings".into()),
             "keyed partial-update key field `key` must be a scalar string"
         )]
     );

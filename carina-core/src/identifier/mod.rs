@@ -1717,10 +1717,10 @@ fn deterministic_value_string<P: crate::resource::ValueKind, B: BindingAddress>(
                 }
                 ApplyTimeUnknown::PendingReRead(pending) => match pending.reason() {
                     crate::resource::ReReadReason::Incomplete { detail } => {
-                        format!("Unknown(PendingReRead(Incomplete({detail:?})))")
+                        format!("Unknown(PendingReRead(Incomplete({:?})))", detail.as_str())
                     }
                     crate::resource::ReReadReason::ReadFailed { detail } => {
-                        format!("Unknown(PendingReRead(ReadFailed({detail:?})))")
+                        format!("Unknown(PendingReRead(ReadFailed({:?})))", detail.as_str())
                     }
                     crate::resource::ReReadReason::NotFound => {
                         "Unknown(PendingReRead(NotFound))".to_string()
@@ -3649,7 +3649,7 @@ fn desired_comparable_values<'attribute, S, D, E>(
             Ok(Some(value)) => DesiredCreateOnlyValue::Resolved(value),
             Err(UnresolvedReason::NotComparable) => {
                 tracing::debug!(
-                    attribute,
+                    attribute = %crate::provider_text::ProviderText::new(attribute),
                     reason = "value has no stable comparison form",
                     "stable value is not available for identity comparison"
                 );
@@ -3657,8 +3657,8 @@ fn desired_comparable_values<'attribute, S, D, E>(
             }
             Err(UnresolvedReason::Type(error)) => {
                 tracing::debug!(
-                    attribute,
-                    error = ?error,
+                    attribute = %crate::provider_text::ProviderText::new(attribute),
+                    error = %crate::provider_text::ProviderText::new(error.to_string()),
                     "stable value is not available for identity comparison"
                 );
                 DesiredCreateOnlyValue::Unresolved

@@ -24,8 +24,12 @@ pub enum ProviderWireTarget {
 impl fmt::Display for ProviderWireTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Resource(id) => id.fmt(f),
-            Self::Configuration { provider } => write!(f, "provider {provider} configuration"),
+            Self::Resource(id) => crate::provider_text::ProviderText::new(id.to_string()).fmt(f),
+            Self::Configuration { provider } => write!(
+                f,
+                "provider {} configuration",
+                crate::provider_text::ProviderText::new(provider)
+            ),
         }
     }
 }
@@ -33,12 +37,24 @@ impl fmt::Display for ProviderWireTarget {
 /// A terminal diagnostic: the conversion reason is rendered exactly once.
 ///
 /// Accessors retain the typed reason and path without exposing input values.
-#[derive(Debug)]
 pub struct ProviderWireError {
     target: Box<ProviderWireTarget>,
     attribute: String,
     path: Vec<WirePathSegment>,
     error: Box<ProtocolConvertError>,
+}
+
+impl fmt::Debug for ProviderWireError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderWireError")
+            .field("target", &self.target.to_string())
+            .field("attribute_path", &self.attribute_path())
+            .field(
+                "error",
+                &crate::provider_text::ProviderText::new(self.error.to_string()),
+            )
+            .finish()
+    }
 }
 
 impl ProviderWireError {
@@ -65,7 +81,7 @@ impl ProviderWireError {
         self.error.as_ref()
     }
 
-    pub fn attribute_path(&self) -> String {
+    pub fn attribute_path(&self) -> crate::provider_text::ProviderText {
         fn append_key(path: &mut String, key: &str) {
             let mut chars = key.chars();
             let identifier = chars
@@ -91,7 +107,7 @@ impl ProviderWireError {
             use std::fmt::Write;
             match segment {
                 WirePathSegment::Key(key) => {
-                    append_key(&mut path, key);
+                    append_key(&mut path, key.lookup_key());
                 }
                 WirePathSegment::Index(index) => {
                     let _ = write!(path, "[{index}]");
@@ -99,7 +115,7 @@ impl ProviderWireError {
                 WirePathSegment::Secret => path.push_str("(secret)"),
             }
         }
-        path
+        crate::provider_text::ProviderText::new(path)
     }
 }
 
@@ -315,7 +331,7 @@ fn hide_secret_path(value: &Value, error: ProtocolConvertError) -> ProtocolConve
                 segment: Key(key),
                 error,
             },
-        ) => hide_secret_path(&values[&key], *error).at_value_path(Key(key)),
+        ) => hide_secret_path(&values[key.lookup_key()], *error).at_value_path(Key(key)),
         (_, error) => error,
     }
 }
@@ -419,6 +435,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provider_text_wire_diagnostic_path_sanitizes_c1_and_caps_complete_path() {
+        for raw in ["name\u{9b}".to_string(), "x".repeat(20 * 1024)] {
+            let error = ProviderWireError::new(
+                &ProviderWireTarget::Configuration {
+                    provider: "test".into(),
+                },
+                &raw,
+                ProtocolConvertError::NonFiniteFloat,
+            );
+            let path = error.attribute_path();
+            assert!(!path.contains('\u{9b}'));
+            assert!(path.len() <= crate::provider_text::MAX_PROVIDER_TEXT_BYTES);
+            assert!(
+                format!("{error:?}").len() <= crate::provider_text::MAX_PROVIDER_TEXT_BYTES + 512
+            );
+            assert_eq!(error.attribute(), raw);
+            if raw.contains('\u{9b}') {
+                assert!(path.contains("\\u{9b}"));
+            } else {
+                assert!(path.contains("truncated,"));
+            }
+        }
+    }
+
+    #[test]
     fn wire_error_debug_contains_one_path_and_stores_the_leaf_reason() {
         let error = WireReady::try_new(
             IndexMap::from([(
@@ -444,6 +485,31 @@ mod tests {
             ProtocolConvertError::NonFiniteFloat
         ));
         assert!(error.error.value_path().is_empty());
+    }
+
+    #[test]
+    fn provider_text_wire_path_preserves_map_lookup_and_hides_secret_paths() {
+        let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "\x1b[2J".into(),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::Map(IndexMap::from([(
+                    "private.key".into(),
+                    Value::Concrete(ConcreteValue::Float(f64::NAN)),
+                )])),
+            )))),
+        )])));
+        let error = WireReady::try_new(
+            IndexMap::from([("attr".into(), value)]),
+            ProviderWireTarget::Configuration {
+                provider: "test".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.attribute_path().contains("(secret)"));
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains('\x1b'));
+            assert!(!rendered.contains("private.key"));
+        }
     }
 
     #[test]

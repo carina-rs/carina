@@ -294,6 +294,37 @@ fn pending_reread_identifier_material_has_stable_typed_bytes() {
 }
 
 #[test]
+fn provider_text_pending_reread_identity_material_retains_raw_detail() {
+    let raw = format!("\x1b[2J\x07\u{9b}{}", "x".repeat(20 * 1024));
+    for pending in [
+        PendingReRead::incomplete(raw.clone()),
+        PendingReRead::read_failed(raw.clone()),
+    ] {
+        let rendered = pending.to_string();
+        assert!(!rendered.contains(['\x1b', '\x07', '\u{9b}']));
+        assert!(rendered.contains("truncated,"));
+        let variant = match pending.reason() {
+            ReReadReason::Incomplete { detail } => {
+                assert_eq!(detail.as_str(), raw);
+                "Incomplete"
+            }
+            ReReadReason::ReadFailed { detail } => {
+                assert_eq!(detail.as_str(), raw);
+                "ReadFailed"
+            }
+            ReReadReason::NotFound => unreachable!(),
+        };
+        let value = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(
+            pending,
+        )));
+        assert_eq!(
+            deterministic_value_string(&value),
+            format!("Unknown(PendingReRead({variant}({raw:?})))")
+        );
+    }
+}
+
+#[test]
 fn unavailable_identifier_material_matches_function_call_and_ignores_diagnostics() {
     let unavailable = |argument: &str, reason: &str, source_line: usize| {
         Value::Deferred(DeferredValue::Unavailable {

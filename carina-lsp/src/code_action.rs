@@ -120,14 +120,19 @@ pub(crate) fn enum_diagnostic_data_for_error(error: &TypeError) -> Option<EnumDi
                     // A single authored value produces one kind in practice. If
                     // malformed input disagrees, declaration order wins.
                     for candidate in payload.expected {
-                        let replacement = candidate.to_string();
+                        let replacement = candidate.dsl_spelling();
                         if !replacements.contains(&replacement) {
                             replacements.push(replacement);
                             merged.expected.push(candidate);
                         }
                     }
                 } else {
-                    replacements.extend(payload.expected.iter().map(ToString::to_string));
+                    replacements.extend(
+                        payload
+                            .expected
+                            .iter()
+                            .map(ExpectedEnumVariant::dsl_spelling),
+                    );
                     merged = Some(payload);
                 }
             }
@@ -184,8 +189,8 @@ pub fn code_actions_for_diagnostic(uri: &Url, diag: &Diagnostic) -> Vec<CodeActi
     candidates
         .into_iter()
         .map(|variant| {
-            let new_text = variant.to_string();
-            let title = format!("Replace with `{}`", new_text);
+            let new_text = variant.dsl_spelling();
+            let title = format!("Replace with `{variant}`");
             let edit = TextEdit {
                 range: diag.range,
                 new_text,
@@ -262,6 +267,23 @@ mod tests {
 
     fn dummy_uri() -> Url {
         Url::parse("file:///tmp/main.crn").unwrap()
+    }
+
+    #[test]
+    fn provider_text_enum_quick_fix_preserves_raw_edit_and_sanitizes_title() {
+        for raw in ["value\x1b[2J".to_string(), "a".repeat(9000)] {
+            let variant = ExpectedEnumVariant::from_namespaced(None, "Mode", &raw, false);
+            let diagnostic = diag_with_payload(EnumDiagnosticData::new(
+                EnumDiagnosticKind::BareInvalid,
+                vec![variant],
+            ));
+            let uri = dummy_uri();
+            let actions = code_actions_for_diagnostic(&uri, &diagnostic);
+            assert_eq!(actions.len(), 1);
+            assert!(!actions[0].title.contains('\x1b'));
+            let edit = &actions[0].edit.as_ref().unwrap().changes.as_ref().unwrap()[&uri][0];
+            assert_eq!(edit.new_text, raw);
+        }
     }
 
     #[test]

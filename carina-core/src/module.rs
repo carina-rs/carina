@@ -1363,10 +1363,20 @@ impl ModuleSignature {
     fn format_type_expr(&self, type_expr: &TypeExpr, c: &Colors) -> String {
         match type_expr {
             TypeExpr::Ref(path) => {
-                format!("{}{}{}", c.yellow, path, c.reset)
+                format!(
+                    "{}{}{}",
+                    c.yellow,
+                    crate::provider_text::ProviderText::new(path.to_string()),
+                    c.reset
+                )
             }
             TypeExpr::DottedUnresolved(path) => {
-                format!("{}{}{}", c.green, path, c.reset)
+                format!(
+                    "{}{}{}",
+                    c.green,
+                    crate::provider_text::ProviderText::new(path.to_string()),
+                    c.reset
+                )
             }
             TypeExpr::List(inner) => {
                 format!(
@@ -1393,7 +1403,7 @@ impl ModuleSignature {
                         if i > 0 {
                             out.push_str(", ");
                         }
-                        out.push_str(name);
+                        out.push_str(crate::provider_text::ProviderText::new(name).as_str());
                         out.push_str(": ");
                         out.push_str(&self.format_type_expr(ty, c));
                         out.push_str(c.green);
@@ -1412,7 +1422,12 @@ impl ModuleSignature {
             | TypeExpr::UnloadedSchemaType(_)
             | TypeExpr::SchemaType { .. }
             | TypeExpr::StringLiteral(_)
-            | TypeExpr::Union(_) => format!("{}{}{}", c.green, type_expr, c.reset),
+            | TypeExpr::Union(_) => format!(
+                "{}{}{}",
+                c.green,
+                crate::provider_text::ProviderText::new(type_expr.to_string()),
+                c.reset
+            ),
         }
     }
 
@@ -1538,6 +1553,32 @@ impl ModuleSignature {
 mod tests {
     use super::*;
     use crate::parser::TypeExpr;
+
+    #[test]
+    fn provider_text_module_type_display_sanitizes_metadata_before_styling() {
+        let raw = format!("Type\x1b[2J\u{9b}{}", "x".repeat(20 * 1024));
+        let declaration = crate::schema::CompiledAttributeType::refined_string(
+            Some(crate::schema::TypeIdentity::bare(&raw)),
+            None,
+            None,
+            None,
+        );
+        let ty = TypeExpr::SchemaType {
+            owned: crate::parser::OwnedTypeIdentity::from_schema_declaration("test", &declaration)
+                .unwrap(),
+        };
+        let signature = ModuleSignature {
+            name: "test".into(),
+            requires: vec![],
+            creates: vec![],
+            exposes: vec![],
+            dependency_graph: TypedDependencyGraph::new(),
+        };
+        let rendered = signature.format_type_expr(&ty, &Colors::new(false));
+        assert!(!rendered.contains(['\x1b', '\u{9b}']));
+        assert!(rendered.len() <= crate::provider_text::MAX_PROVIDER_TEXT_BYTES);
+        assert_eq!(ty.to_string(), raw);
+    }
 
     type Value = crate::resource::AuthoredValue;
     type ConcreteValue = crate::resource::AuthoredConcreteValue;

@@ -8,7 +8,7 @@ use carina_core::executor::{ExecutionEvent, ExecutionObserver};
 use carina_core::plan::Plan;
 use carina_core::provider::PartialReadDiagnostic;
 use carina_core::resource::ModuleSource;
-use carina_core::value::format_value_user_facing;
+use carina_core::value::format_attribute_user_facing;
 use carina_core::wait::WaitObservation;
 
 use crate::commands::shared::progress::{
@@ -23,7 +23,12 @@ pub(crate) fn partial_read_detail_lines(diagnostic: &PartialReadDiagnostic) -> [
     let missing = if diagnostic.missing_attributes().is_empty() {
         "(none)".to_string()
     } else {
-        diagnostic.missing_attributes().join(", ")
+        diagnostic
+            .missing_attributes()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     [
         format!("reason: {}", diagnostic.reason()),
@@ -226,7 +231,7 @@ fn format_wait_polling_line(observation: &WaitObservation, elapsed: Duration) ->
 fn format_wait_observed_attr(observation: &WaitObservation) -> String {
     if let Some((attr, value)) = observation.primary() {
         let key = attr.segments().join(".");
-        return format!("{key}={}", format_value_user_facing(value));
+        return format_attribute_user_facing(&key, value);
     }
 
     let mut observed: Vec<_> = observation.last_attrs().iter().collect();
@@ -234,7 +239,7 @@ fn format_wait_observed_attr(observation: &WaitObservation) -> String {
     let Some((key, value)) = observed.first() else {
         return "no observed attributes".to_string();
     };
-    format!("{key}={}", format_value_user_facing(value))
+    format_attribute_user_facing(key, value)
 }
 
 #[cfg(test)]
@@ -610,6 +615,51 @@ mod tests {
 
         backend.emit_heartbeats_at(std::time::Instant::now() + Duration::from_secs(3_600));
         assert_eq!(*output.0.lock().unwrap(), after_interrupted);
+    }
+
+    #[test]
+    fn provider_text_wait_observer_escapes_keys_without_changing_selection() {
+        let raw = "\x1b]52;c;ZXZpbA==\x07\x1b[2J";
+        let target = ResourceId::with_identity("aws.acm.Certificate", "demo");
+        let attrs = HashMap::from([
+            (
+                raw.to_string(),
+                Value::Concrete(ConcreteValue::String("observed".into())),
+            ),
+            (
+                "A".to_string(),
+                Value::Concrete(ConcreteValue::String("second".into())),
+            ),
+        ]);
+        for predicate in [
+            equals_predicate(AttrPath::single(raw), "issued"),
+            equals_predicate(AttrPath::single("missing"), "issued"),
+        ] {
+            let observation = wait_observation(&target, &predicate, &attrs);
+            let line = format_wait_polling_line(&observation, Duration::from_secs(5));
+            assert!(!line.contains(['\x1b', '\x07']));
+            assert!(line.ends_with("\\u{1b}]52;c;ZXZpbA==\\u{7}\\u{1b}[2J=observed"));
+        }
+        assert!(attrs.contains_key(raw));
+    }
+
+    #[test]
+    fn provider_text_wait_observer_escapes_provider_attribute_values() {
+        let raw = "\x1b]52;c;ZXZpbA==\x07\x1b[2J";
+        let target = ResourceId::with_identity("aws.acm.Certificate", "demo");
+        let attrs = HashMap::from([(
+            "status".into(),
+            Value::Concrete(ConcreteValue::String(raw.into())),
+        )]);
+        for predicate in [
+            equals_predicate(AttrPath::single("status"), "issued"),
+            equals_predicate(AttrPath::single("missing"), "issued"),
+        ] {
+            let observation = wait_observation(&target, &predicate, &attrs);
+            let line = format_wait_polling_line(&observation, Duration::from_secs(5));
+            assert!(!line.contains(['\x1b', '\x07']));
+            assert!(line.contains("status=\\u{1b}]52;c;ZXZpbA==\\u{7}\\u{1b}[2J"));
+        }
     }
 
     #[test]
