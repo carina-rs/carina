@@ -591,9 +591,12 @@ mod tests {
             "reason": {"kind": "incomplete", "detail": raw}
         }))
         .unwrap();
-        assert!(
-            matches!(decoded.reason(), ReReadReason::Incomplete { detail } if detail.as_str() == raw && detail.to_string() == "\\u{1b}[2J\\u{7}")
-        );
+        let ReReadReason::Incomplete { detail } = decoded.reason() else {
+            panic!("expected an incomplete re-read reason");
+        };
+        assert_eq!(detail.as_str(), raw);
+        let rendered = detail.to_string();
+        assert_eq!(rendered, "\\u{1b}[2J\\u{7}");
     }
 
     #[test]

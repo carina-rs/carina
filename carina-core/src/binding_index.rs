@@ -1819,7 +1819,7 @@ impl PartialReadBack {
     ) -> Self {
         Self {
             operation,
-            reason: diagnostic.reason().into(),
+            reason: diagnostic.reason(),
             missing_attributes: diagnostic
                 .missing_attributes()
                 .iter()
