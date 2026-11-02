@@ -850,8 +850,7 @@ impl Provider for MockProvider {
                 }
                 ResumeFixture::NoResource => {
                     let (resume, _create_request) = request.into_parts();
-                    Err(resume
-                        .no_resource(ProviderError::not_found("recorded create left no resource")))
+                    Err(resume.no_resource(ProviderError::not_found("recorded create ended")))
                 }
                 ResumeFixture::ResentInFlightWithInvalidSent => {
                     let (resume, _create_request) = request.into_parts();

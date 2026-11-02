@@ -1572,7 +1572,7 @@ impl Provider for MockProvider {
                     let (resume, create_request) = request.into_parts();
                     drop(create_request);
                     return Err(resume.no_resource(ProviderError::not_found(
-                        "builtin mock reports that the recorded create left no resource",
+                        "builtin mock reports that the recorded create ended",
                     )));
                 }
                 ResumeMode::NotCreated => {
