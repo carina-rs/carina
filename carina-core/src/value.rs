@@ -1413,12 +1413,23 @@ pub(crate) fn render_string_text(text: &str) -> RenderedValue {
 pub fn format_value_user_facing<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
 ) -> String {
-    match value {
-        Value::Concrete(ConcreteValue::String(value)) => {
-            crate::provider_text::ProviderText::new(value.expose_plaintext()).to_string()
-        }
+    let rendered = match value {
+        Value::Concrete(ConcreteValue::String(value)) => value.expose_plaintext().to_string(),
         _ => format_value(value),
-    }
+    };
+    crate::provider_text::ProviderText::new(rendered).to_string()
+}
+
+/// Render an observed attribute after raw-key selection, sorting and lookup.
+pub fn format_attribute_user_facing<P: PlaceholderKind, B: BindingAddress>(
+    key: &str,
+    value: &Value<P, B>,
+) -> String {
+    format!(
+        "{}={}",
+        crate::provider_text::ProviderText::new(key),
+        format_value_user_facing(value)
+    )
 }
 
 /// Format a `Value` for display, with an optional key for context
@@ -8286,6 +8297,43 @@ mod tests {
                 format_value(&value),
                 crate::parser::display_string_literal(text)
             );
+        }
+    }
+
+    #[test]
+    fn provider_text_user_facing_enum_and_nested_values_escape_and_cap_final_rendering() {
+        let raw = "\x1b]52;c;ZXZpbA==\x07\x1b[2J";
+        let enumeration = Value::Concrete(ConcreteValue::CanonicalEnum(
+            crate::resource::CanonicalEnumValue::new_for_test(
+                crate::schema::TypeIdentity::bare("Mode"),
+                raw,
+            ),
+        ));
+        let nested = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(IndexMap::from([(
+                "nested".into(),
+                Value::Concrete(ConcreteValue::List(vec![enumeration.clone()])),
+            )])),
+        )]));
+        let oversized = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String(
+                    "x".repeat(1024).into()
+                ));
+                20
+            ]),
+        )]));
+        for value in [enumeration, nested, oversized] {
+            let original = value.clone();
+            let rendered = format_value_user_facing(&value);
+            assert!(!rendered.contains(['\x1b', '\x07']));
+            assert!(rendered.len() <= crate::provider_text::MAX_PROVIDER_TEXT_BYTES);
+            if format_value(&value).contains('\x1b') {
+                assert!(rendered.contains("\\u{1b}]52;c;ZXZpbA==\\u{7}\\u{1b}[2J"));
+            } else {
+                assert!(rendered.contains("truncated,"));
+            }
+            assert_eq!(value, original);
         }
     }
 

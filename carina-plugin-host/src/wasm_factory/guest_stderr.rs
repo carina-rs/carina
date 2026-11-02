@@ -1,21 +1,16 @@
-//! Host-owned stderr for provider guests. Oversized guest lines are forcibly
-//! terminated; subsequent bytes start a new bounded output line.
+//! Host-owned stderr for provider guests. Retain a bounded sanitized prefix
+//! and count the entire discarded tail before emitting one line at its end.
 
 use std::io::{self, Write};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use carina_core::provider_text::{MAX_PROVIDER_TEXT_BYTES, ProviderText};
+use carina_core::provider_text::{MAX_PROVIDER_TEXT_BYTES, ProviderTextBuilder};
 use hyper::body::Bytes;
 use tokio::io::AsyncWrite;
 use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
 use wasmtime_wasi::p2::{OutputStream, Pollable, StreamError, StreamResult};
-
-// A scalar can start just below the byte limit. Permit at most one scalar's
-// lookahead so valid UTF-8 is not replaced just because a forced break falls
-// inside it. Invalid input cannot keep growing this buffer indefinitely.
-const MAX_PENDING_BYTES: usize = MAX_PROVIDER_TEXT_BYTES + char::MAX.len_utf8();
 
 /// All handles for one guest stderr share a buffer and a host-owned sink.
 #[derive(Clone)]
@@ -24,20 +19,22 @@ pub(super) struct GuestStderr {
 }
 
 struct LineBuffer {
-    pending: Vec<u8>,
+    text: ProviderTextBuilder,
+    utf8_tail: Vec<u8>,
+    has_pending: bool,
     sink: Box<dyn Write + Send>,
     failed: bool,
-    just_broke_line: bool,
 }
 
 impl GuestStderr {
     pub(super) fn new(sink: impl Write + Send + 'static) -> Self {
         Self {
             state: Arc::new(Mutex::new(LineBuffer {
-                pending: Vec::with_capacity(MAX_PENDING_BYTES),
+                text: ProviderTextBuilder::default(),
+                utf8_tail: Vec::with_capacity(char::MAX.len_utf8()),
+                has_pending: false,
                 sink: Box::new(sink),
                 failed: false,
-                just_broke_line: false,
             })),
         }
     }
@@ -89,32 +86,51 @@ impl LineBuffer {
         self.ensure_open()?;
         for &byte in bytes {
             if byte == b'\n' {
-                // An automatic break already supplied this delimiter. A
-                // subsequent newline still produces an ordinary empty line.
-                if !self.just_broke_line {
-                    self.emit_line()?;
-                }
-                self.just_broke_line = false;
+                self.emit_line()?;
             } else {
-                self.just_broke_line = false;
-                self.pending.push(byte);
-                if self.pending.len() > MAX_PROVIDER_TEXT_BYTES
-                    && (self.pending.len() == MAX_PENDING_BYTES
-                        || !incomplete_utf8_tail(&self.pending))
-                {
-                    self.emit_line()?;
-                    self.just_broke_line = true;
-                }
+                self.has_pending = true;
+                self.utf8_tail.push(byte);
+                self.decode_utf8_tail();
             }
         }
         Ok(())
     }
 
+    fn decode_utf8_tail(&mut self) {
+        loop {
+            match std::str::from_utf8(&self.utf8_tail) {
+                Ok(text) => {
+                    self.text.push_str(text);
+                    self.utf8_tail.clear();
+                    return;
+                }
+                Err(error) => {
+                    let valid = std::str::from_utf8(&self.utf8_tail[..error.valid_up_to()])
+                        .expect("UTF-8 error identifies a valid prefix");
+                    self.text.push_str(valid);
+                    self.utf8_tail.drain(..error.valid_up_to());
+                    match error.error_len() {
+                        Some(length) => {
+                            self.text.push_str("\u{fffd}");
+                            self.utf8_tail.drain(..length);
+                        }
+                        // At most three bytes can await a scalar's completion.
+                        None => return,
+                    }
+                }
+            }
+        }
+    }
+
     fn emit_line(&mut self) -> io::Result<()> {
-        let text = ProviderText::new(String::from_utf8_lossy(&self.pending).into_owned());
-        self.pending.clear();
-        // The newline is host framing; line content, including any truncation
-        // marker, is capped by ProviderText. No raw guest bytes reach the sink.
+        if !self.utf8_tail.is_empty() {
+            self.text.push_str("\u{fffd}");
+            self.utf8_tail.clear();
+        }
+        let text = std::mem::take(&mut self.text).finish();
+        self.has_pending = false;
+        // The newline is host framing; line content, including the marker for
+        // the entire omitted tail, is capped by the shared sanitizer.
         let result = writeln!(self.sink, "{text}").and_then(|()| self.sink.flush());
         if result.is_err() {
             self.failed = true;
@@ -124,7 +140,7 @@ impl LineBuffer {
 
     fn flush_pending(&mut self) -> io::Result<()> {
         self.ensure_open()?;
-        if self.pending.is_empty() {
+        if !self.has_pending {
             self.flush_sink()
         } else {
             self.emit_line()
@@ -139,16 +155,6 @@ impl LineBuffer {
         }
         result
     }
-}
-
-fn incomplete_utf8_tail(mut bytes: &[u8]) -> bool {
-    while let Err(error) = std::str::from_utf8(bytes) {
-        match error.error_len() {
-            Some(length) => bytes = &bytes[error.valid_up_to() + length..],
-            None => return true,
-        }
-    }
-    false
 }
 
 impl IsTerminal for GuestStderr {
@@ -218,6 +224,7 @@ impl AsyncWrite for GuestStderr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::provider_text::ProviderText;
     use tokio::io::AsyncWriteExt;
 
     #[derive(Clone, Default)]
@@ -252,6 +259,65 @@ mod tests {
     }
 
     #[test]
+    fn guest_stderr_omits_the_entire_oversized_tail_until_newline_or_final_drop() {
+        for terminate_with_newline in [false, true] {
+            let capture = Capture::default();
+            let stderr = GuestStderr::new(capture.clone());
+            let mut stream = stderr.p2_stream();
+            let raw = format!(
+                "\x1b[2J{}\x1b]0;tail\x07",
+                "x".repeat(10 * MAX_PROVIDER_TEXT_BYTES)
+            );
+            write_all(stream.as_mut(), raw.as_bytes());
+            stream.flush().unwrap();
+            assert!(
+                capture.text().is_empty(),
+                "an oversized line must wait for its final omitted-byte count"
+            );
+            if terminate_with_newline {
+                write_all(stream.as_mut(), b"\n");
+            }
+            drop(stream);
+            drop(stderr);
+            let output = capture.text();
+            assert_eq!(output.lines().count(), 1);
+            assert_eq!(output, format!("{}\n", ProviderText::new(raw)));
+            assert!(!output.contains(['\x1b', '\x07']));
+            assert!(output.trim_end_matches('\n').len() <= MAX_PROVIDER_TEXT_BYTES);
+        }
+    }
+
+    #[test]
+    fn guest_stderr_streaming_lossy_utf8_matches_whole_line_decoding() {
+        for oversized in [false, true] {
+            let capture = Capture::default();
+            let stderr = GuestStderr::new(capture.clone());
+            let mut stream = stderr.p2_stream();
+            let mut raw = if oversized {
+                vec![b'x'; MAX_PROVIDER_TEXT_BYTES - 1]
+            } else {
+                Vec::new()
+            };
+            raw.extend_from_slice("🦀".as_bytes());
+            raw.extend_from_slice(b"\xff\xf0\x9f[\x1b]\xc2\x9b");
+            if oversized {
+                raw.extend(vec![b'y'; 3 * MAX_PROVIDER_TEXT_BYTES]);
+            }
+            raw.extend_from_slice(b"\xe2\x82");
+            for byte in &raw {
+                write_all(stream.as_mut(), &[*byte]);
+                assert!(stderr.state.lock().unwrap().utf8_tail.len() < char::MAX.len_utf8());
+            }
+            drop(stream);
+            drop(stderr);
+            assert_eq!(
+                capture.text(),
+                format!("{}\n", ProviderText::new(String::from_utf8_lossy(&raw)))
+            );
+        }
+    }
+
+    #[test]
     fn guest_stderr_streams_sanitized_lines_and_caps_long_lines() {
         let capture = Capture::default();
         let stderr = GuestStderr::new(capture.clone());
@@ -268,15 +334,17 @@ mod tests {
             stream.as_mut(),
             &vec![b'x'; 3 * MAX_PROVIDER_TEXT_BYTES + 17],
         );
-        assert!(
-            capture.text().contains("… (truncated, "),
-            "an overlong line must appear before a newline or drop"
+        assert_eq!(
+            capture.text().lines().count(),
+            1,
+            "the oversized line is still pending"
         );
-        assert!(stderr.state.lock().unwrap().pending.len() <= MAX_PROVIDER_TEXT_BYTES + 3);
+        assert!(stderr.state.lock().unwrap().utf8_tail.len() < char::MAX.len_utf8());
         write_all(stream.as_mut(), b"\n");
         let text = capture.text();
         assert!(!text.as_bytes().contains(&0x1b));
         assert!(!text.as_bytes().contains(&0x07));
+        assert_eq!(text.lines().count(), 2);
         assert!(
             text.lines()
                 .all(|line| line.len() <= MAX_PROVIDER_TEXT_BYTES)
@@ -284,7 +352,7 @@ mod tests {
         for line in text.lines().filter(|line| line.contains("… (truncated, ")) {
             let (prefix, marker) = line.split_once("… (truncated, ").unwrap();
             let omitted: usize = marker.strip_suffix(" bytes)").unwrap().parse().unwrap();
-            assert_eq!(prefix.len() + omitted, MAX_PROVIDER_TEXT_BYTES + 1);
+            assert_eq!(prefix.len() + omitted, 3 * MAX_PROVIDER_TEXT_BYTES + 17);
         }
     }
 
@@ -383,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn guest_stderr_keeps_utf8_at_forced_line_boundaries_and_bounds_invalid_input() {
+    fn guest_stderr_keeps_utf8_at_truncation_boundaries_and_bounds_invalid_input() {
         for suffix in ["あ".as_bytes(), "🦀".as_bytes()] {
             let capture = Capture::default();
             let stderr = GuestStderr::new(capture.clone());
@@ -391,8 +459,10 @@ mod tests {
             write_all(stream.as_mut(), &vec![b'x'; MAX_PROVIDER_TEXT_BYTES - 1]);
             for byte in suffix {
                 write_all(stream.as_mut(), &[*byte]);
-                assert!(stderr.state.lock().unwrap().pending.len() <= MAX_PROVIDER_TEXT_BYTES + 3);
+                assert!(stderr.state.lock().unwrap().utf8_tail.len() < char::MAX.len_utf8());
             }
+            assert!(capture.text().is_empty());
+            write_all(stream.as_mut(), b"\n");
             assert!(capture.text().contains("truncated,"));
             assert!(!capture.text().contains('\u{fffd}'));
         }
@@ -401,8 +471,21 @@ mod tests {
         let stderr = GuestStderr::new(capture.clone());
         let mut stream = stderr.p2_stream();
         write_all(stream.as_mut(), &vec![0xe2; 3 * MAX_PROVIDER_TEXT_BYTES]);
-        assert!(stderr.state.lock().unwrap().pending.len() <= MAX_PROVIDER_TEXT_BYTES + 3);
+        assert!(stderr.state.lock().unwrap().utf8_tail.len() < char::MAX.len_utf8());
+        assert!(capture.text().is_empty());
+        write_all(stream.as_mut(), b"\n");
+        assert_eq!(capture.text().lines().count(), 1);
         assert!(capture.text().contains('\u{fffd}'));
+        assert_eq!(
+            capture.text(),
+            format!(
+                "{}\n",
+                ProviderText::new(String::from_utf8_lossy(&vec![
+                    0xe2;
+                    3 * MAX_PROVIDER_TEXT_BYTES
+                ]))
+            )
+        );
         assert!(
             capture
                 .text()
@@ -412,12 +495,12 @@ mod tests {
     }
 
     #[test]
-    fn guest_stderr_preserves_delimiters_after_forced_breaks_and_escapes_other_controls() {
+    fn guest_stderr_preserves_delimiters_after_truncation_and_escapes_other_controls() {
         let capture = Capture::default();
         let stderr = GuestStderr::new(capture.clone());
         let mut stream = stderr.p2_stream();
         write_all(stream.as_mut(), &vec![b'x'; MAX_PROVIDER_TEXT_BYTES + 1]);
-        assert_eq!(capture.text().lines().count(), 1);
+        assert!(capture.text().is_empty());
         write_all(stream.as_mut(), b"\n\n");
         assert_eq!(capture.text().lines().count(), 2);
         assert_eq!(capture.text().lines().last(), Some(""));

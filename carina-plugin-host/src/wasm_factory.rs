@@ -811,10 +811,10 @@ impl fmt::Display for WasmProviderLoadError {
 impl std::error::Error for WasmProviderLoadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::EgressDeclaration(source) => source.error().source(),
             Self::EgressLock(source) => source.source(),
             Self::EgressConsent(source) => source.source(),
-            Self::PrecompiledDeserialization(_)
+            Self::EgressDeclaration(_)
+            | Self::PrecompiledDeserialization(_)
             | Self::Instantiation(_)
             | Self::ProviderNameMismatch { .. }
             | Self::AwsCredentials(_)
@@ -10105,6 +10105,33 @@ mod tests {
             let error = error.context("top");
             assert_eq!(WasmDiagnostic::new(error, true).to_string(), expected);
         }
+    }
+
+    #[test]
+    fn provider_text_egress_declaration_is_terminal_after_rendering_nested_sources() {
+        #[derive(Debug)]
+        struct Outer {
+            source: std::io::Error,
+        }
+        impl fmt::Display for Outer {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("declaration outer")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.source)
+            }
+        }
+        let error = WasmProviderLoadError::EgressDeclaration(ProviderDiagnostic::new(Outer {
+            source: std::io::Error::other("nested guest \x1b]52;c;ZXZpbA==\x07\x1b[2J"),
+        }));
+        assert!(std::error::Error::source(&error).is_none());
+        let rendered = carina_core::executor::render_error_chain(&error);
+        assert_eq!(rendered.matches("declaration outer").count(), 1);
+        assert_eq!(rendered.matches("nested guest").count(), 1);
+        assert!(!rendered.contains(['\x1b', '\x07']));
+        assert!(rendered.contains("\\u{1b}]52;c;ZXZpbA==\\u{7}\\u{1b}[2J"));
     }
 
     #[test]

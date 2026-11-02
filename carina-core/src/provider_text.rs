@@ -81,46 +81,65 @@ pub struct ProviderText(String);
 
 impl ProviderText {
     pub fn new(text: impl Into<String>) -> Self {
-        let text = text.into();
-        let mut sanitized = String::with_capacity(text.len().min(MAX_PROVIDER_TEXT_BYTES));
-        let mut sanitized_bytes = 0;
-        let mut keeping_prefix = true;
-        let mut append = |c: char| {
-            sanitized_bytes += c.len_utf8();
-            if keeping_prefix && sanitized.len() + c.len_utf8() <= MAX_PROVIDER_TEXT_BYTES {
-                sanitized.push(c);
-            } else {
-                keeping_prefix = false;
-            }
-        };
-        for c in text.chars() {
-            match c {
-                '\0'..='\u{8}' | '\u{b}'..='\u{1f}' | '\u{7f}'..='\u{9f}' => {
-                    c.escape_unicode().for_each(&mut append);
-                }
-                c => append(c),
-            }
-        }
-        if sanitized_bytes > MAX_PROVIDER_TEXT_BYTES {
-            let mut end = sanitized.len();
-            loop {
-                let marker = format!("… (truncated, {} bytes)", sanitized_bytes - end);
-                if end + marker.len() <= MAX_PROVIDER_TEXT_BYTES {
-                    sanitized.truncate(end);
-                    sanitized.push_str(&marker);
-                    break;
-                }
-                end = MAX_PROVIDER_TEXT_BYTES - marker.len();
-                while !sanitized.is_char_boundary(end) {
-                    end -= 1;
-                }
-            }
-        }
-        Self(sanitized)
+        let mut builder = ProviderTextBuilder::default();
+        builder.push_str(&text.into());
+        builder.finish()
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Incremental form of the same sanitizer, retaining only a bounded prefix.
+/// The final marker includes bytes omitted across every supplied chunk.
+#[derive(Default)]
+pub struct ProviderTextBuilder {
+    prefix: String,
+    sanitized_bytes: usize,
+    truncated: bool,
+}
+
+impl ProviderTextBuilder {
+    pub fn push_str(&mut self, text: &str) {
+        for c in text.chars() {
+            match c {
+                '\0'..='\u{8}' | '\u{b}'..='\u{1f}' | '\u{7f}'..='\u{9f}' => {
+                    for escaped in c.escape_unicode() {
+                        self.push_sanitized_char(escaped);
+                    }
+                }
+                c => self.push_sanitized_char(c),
+            }
+        }
+    }
+
+    fn push_sanitized_char(&mut self, c: char) {
+        self.sanitized_bytes = self.sanitized_bytes.saturating_add(c.len_utf8());
+        if !self.truncated && self.prefix.len() + c.len_utf8() <= MAX_PROVIDER_TEXT_BYTES {
+            self.prefix.push(c);
+        } else {
+            self.truncated = true;
+        }
+    }
+
+    pub fn finish(mut self) -> ProviderText {
+        if self.sanitized_bytes > MAX_PROVIDER_TEXT_BYTES {
+            let mut end = self.prefix.len();
+            loop {
+                let marker = format!("… (truncated, {} bytes)", self.sanitized_bytes - end);
+                if end + marker.len() <= MAX_PROVIDER_TEXT_BYTES {
+                    self.prefix.truncate(end);
+                    self.prefix.push_str(&marker);
+                    break;
+                }
+                end = MAX_PROVIDER_TEXT_BYTES - marker.len();
+                while !self.prefix.is_char_boundary(end) {
+                    end -= 1;
+                }
+            }
+        }
+        ProviderText(self.prefix)
     }
 }
 
@@ -235,6 +254,24 @@ impl std::error::Error for ProviderDiagnostic {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_text_builder_bounds_storage_and_counts_the_entire_tail() {
+        let mut builder = ProviderTextBuilder::default();
+        for _ in 0..32 {
+            builder.push_str(&"x".repeat(1024));
+            assert!(builder.prefix.len() <= MAX_PROVIDER_TEXT_BYTES);
+            assert!(builder.prefix.capacity() <= MAX_PROVIDER_TEXT_BYTES);
+        }
+        builder.push_str("\x1b[2J");
+        assert!(builder.prefix.len() <= MAX_PROVIDER_TEXT_BYTES);
+        let text = builder.finish();
+        assert!(text.len() <= MAX_PROVIDER_TEXT_BYTES);
+        assert!(!text.contains('\x1b'));
+        let (prefix, marker) = text.split_once("… (truncated, ").unwrap();
+        let omitted: usize = marker.strip_suffix(" bytes)").unwrap().parse().unwrap();
+        assert_eq!(prefix.len() + omitted, 32 * 1024 + "\\u{1b}[2J".len());
+    }
 
     #[test]
     fn provider_text_escapes_terminal_sequences() {

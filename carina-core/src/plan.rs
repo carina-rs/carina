@@ -359,7 +359,8 @@ impl PlanErrorKind {
                 if let Some(identifier) = current_identifier {
                     write!(
                         f,
-                        ", then add an `import` block with provider identifier `{identifier}` to restore management of the healthy current instance"
+                        ", then add an `import` block with provider identifier `{}` to restore management of the healthy current instance",
+                        crate::provider_text::ProviderText::new(identifier.as_str())
                     )?;
                 }
                 Ok(())
@@ -1421,6 +1422,25 @@ mod tests {
             .strip_prefix(&prefix)
             .expect("ordinary plan errors include their resource address")
             .to_string()
+    }
+
+    #[test]
+    fn provider_text_recovery_hint_preserves_raw_current_identifier() {
+        let raw = "\x1b]52;c;ZXZpbA==\x07\x1b[2J";
+        let id = ResourceId::with_identity("test.Resource", "example");
+        let error = PlanError::require_deposed_provider_identifier(
+            &id,
+            &DeposedKey::new_unique(),
+            "",
+            Some(raw),
+        )
+        .unwrap_err();
+        let rendered = error.display_with_project_dir(Path::new(".")).to_string();
+        assert!(!rendered.contains(['\x1b', '\x07']));
+        assert!(rendered.contains("provider identifier `\\u{1b}]52;c;ZXZpbA==\\u{7}\\u{1b}[2J`"));
+        assert!(
+            matches!(&error.kind, PlanErrorKind::MissingDeposedProviderIdentifier { key: _, current_identifier: Some(identifier) } if identifier.as_str() == raw)
+        );
     }
 
     fn resolved(resource: Resource) -> ResolvedResource {

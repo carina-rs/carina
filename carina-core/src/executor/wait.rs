@@ -27,7 +27,7 @@ use crate::provider::{
 use crate::provider::{ReadOutcome, fixture_read_outcome_for_identifier};
 use crate::resource::{Current, ResolvedResourceId, ResourceId, State, Value};
 use crate::shutdown::{CleanupAwareLoop, CleanupInterrupted, LoopStep};
-use crate::value::format_value_user_facing;
+use crate::value::format_attribute_user_facing;
 use crate::wait::predicate::WaitPredicate;
 use crate::wait::{ManagedWaitTarget, WaitObservation};
 
@@ -236,7 +236,7 @@ fn format_wait_last_attrs(last_attrs: &HashMap<String, Value>) -> String {
         return "no observed attributes".to_string();
     }
     keys.into_iter()
-        .map(|key| format!("{key}={}", format_value_user_facing(&last_attrs[key])))
+        .map(|key| format_attribute_user_facing(key, &last_attrs[key]))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -876,6 +876,27 @@ mod tests {
     use tokio::sync::watch;
 
     const CLEANUP_TEST_BOUND: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn provider_text_wait_last_attrs_escapes_keys_after_raw_sorting_and_lookup() {
+        let raw = "\x1b]52;c;ZXZpbA==\x07\x1b[2J";
+        let attrs = HashMap::from([
+            (
+                raw.to_string(),
+                Value::Concrete(ConcreteValue::String("observed".into())),
+            ),
+            (
+                "A".to_string(),
+                Value::Concrete(ConcreteValue::String("second".into())),
+            ),
+        ]);
+        let rendered = format_wait_last_attrs(&attrs);
+        assert_eq!(
+            rendered,
+            "\\u{1b}]52;c;ZXZpbA==\\u{7}\\u{1b}[2J=observed, A=second"
+        );
+        assert!(attrs.contains_key(raw));
+    }
 
     fn managed_wait_target() -> ManagedWaitTarget {
         ManagedWaitTarget::new(&ResolvedResource::from_id(ResolvedResourceId::new(
