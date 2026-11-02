@@ -53,6 +53,15 @@ impl MidRunStateWriter {
         }
     }
 
+    pub(crate) async fn write_removals(
+        &self,
+        state: &mut StateFile,
+        removed: &carina_state::RemovedRows,
+    ) -> Result<(), AppError> {
+        removed.apply_to(state);
+        self.write_state(state).await
+    }
+
     /// Persist a graph-classified schema migration while the heartbeat owns
     /// the same lock used by later incremental writes.
     pub(crate) async fn write_schema_migration(

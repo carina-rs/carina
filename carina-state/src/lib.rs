@@ -67,7 +67,12 @@ mod backend_selection;
 pub mod backends;
 mod heartbeat;
 pub mod lock;
+mod refresh;
 pub mod state;
+pub use refresh::{
+    PreparedRows, RefreshRows, RefreshTarget, RefreshableCurrent, RefreshableDeposed,
+    RefreshableOrphan, RefreshableOrphans, RemovedRows, ResolvedRemovedClaims,
+};
 
 // Re-export main types for convenience
 pub use backend::{

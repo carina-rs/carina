@@ -2129,7 +2129,15 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
     let result = crate::commands::apply::detect_drift(
         color_mode,
         &[resolved_inner(resource)],
-        &[ReloadedCurrentStateEntry::managed(id, planned)],
+        &[ReloadedCurrentStateEntry::managed(
+            id.clone(),
+            planned.clone(),
+        )],
+        &carina_state::PreparedRows::from_snapshots(
+            [(id, Current::from_state(planned))],
+            &carina_state::ResolvedRemovedClaims::resolve(&[], None),
+        )
+        .refreshable,
         &MovedOrigins::from_plan(&Plan::new()),
         &provider,
         &provider,

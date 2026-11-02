@@ -131,3 +131,40 @@ mod graph_fixtures {
             .remove(0)
     }
 }
+
+#[cfg(test)]
+mod removed_refresh;
+
+#[cfg(test)]
+pub(crate) fn refresh_current(
+    current: carina_core::resource::Current,
+) -> carina_state::RefreshableCurrent {
+    let id = current.id().clone();
+    carina_state::PreparedRows::from_snapshots(
+        [(id.clone(), current)],
+        &carina_state::ResolvedRemovedClaims::resolve(&[], None),
+    )
+    .refreshable
+    .current(&id)
+    .unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn refresh_target(
+    id: &carina_core::resource::ResourceId,
+    identifier: &carina_core::provider::AppliedIdentifier,
+) -> carina_state::RefreshTarget {
+    refresh_current(carina_core::resource::Current::from_state(
+        carina_core::resource::State::existing(id.clone(), std::collections::HashMap::new())
+            .with_identifier(identifier.as_str()),
+    ))
+    .read_target()
+    .unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn empty_state_block_targets() -> crate::wiring::ResolvedStateBlockTargets {
+    crate::wiring::ResolvedStateBlockTargets {
+        removed_from: carina_state::ResolvedRemovedClaims::resolve(&[], None),
+    }
+}

@@ -32,9 +32,9 @@ use carina_core::shutdown::{
 };
 use carina_core::value::format_value;
 use carina_state::{
-    BackendConfig as StateBackendConfig, BackendError, BackendSelection, DeposedInstance,
-    DeposedKey, LoadedOrphans, LocalStateFile, LockInfo, ResourceState, RowBasis, StateBackend,
-    StateFile, StateUrl, load_local_state_file, load_state_from_url,
+    BackendConfig as StateBackendConfig, BackendError, BackendSelection, DeposedKey, LoadedOrphans,
+    LocalStateFile, LockInfo, ResourceState, RowBasis, StateBackend, StateFile, StateUrl,
+    load_local_state_file, load_state_from_url,
 };
 
 use super::{
@@ -1762,7 +1762,7 @@ pub(crate) async fn run_state_refresh_locked(
         return Ok(());
     }
 
-    validated_config.reconcile_for_state_refresh(&state_file);
+    let state_blocks = validated_config.reconcile_for_state_refresh(&state_file);
     let (ctx, parsed) = validated_config.context_and_resources();
 
     let provider_inputs = load_and_resolve_provider_configs(
@@ -1777,9 +1777,11 @@ pub(crate) async fn run_state_refresh_locked(
 
     let expansion_prelude = crate::wiring::DeferredForExpansionPrelude::new_for_state_refresh(
         parsed,
+        &state_blocks.targets.removed_from,
         &state_file,
         ctx.schemas(),
     )?;
+    let prepared_rows = expansion_prelude.prepared_rows().clone();
     let sorted_resources = expansion_prelude.sorted_resources();
 
     // Select provider
@@ -1796,26 +1798,27 @@ pub(crate) async fn run_state_refresh_locked(
     let mut managed_current = HashMap::new();
     let mut managed_reads = Vec::new();
     let mut missing_provider_identifier_ids = HashSet::new();
-    if let Some(state_file) = state_file.as_ref() {
-        for resource in sorted_resources {
-            match state_file.build_state_for_resource(&resource.id) {
-                Current::Present(present) => {
-                    managed_reads.push((resource.id.clone(), present.identifier().clone()));
-                }
-                Current::MissingIdentifier(state) => {
-                    warn_missing_provider_identifier(color_mode, &resource.id);
-                    missing_provider_identifier_ids.insert(resource.id.clone());
-                    managed_current.insert(resource.id.clone(), Current::MissingIdentifier(state));
-                }
-                Current::CreateInFlight(pending) => {
-                    managed_current.insert(resource.id.clone(), Current::CreateInFlight(pending));
-                }
-                Current::CreateOutcomeUnknown(unknown) => {
-                    managed_current
-                        .insert(resource.id.clone(), Current::CreateOutcomeUnknown(unknown));
-                }
-                Current::Absent(_state) => {}
+    for resource in sorted_resources {
+        let Some(loaded) = prepared_rows.refreshable.current(&resource.id) else {
+            continue;
+        };
+        let target = loaded.read_target();
+        match loaded.into_current() {
+            Current::Present(_present) => {
+                managed_reads.push(target.expect("present refreshable current has a read target"));
             }
+            Current::MissingIdentifier(state) => {
+                warn_missing_provider_identifier(color_mode, &resource.id);
+                missing_provider_identifier_ids.insert(resource.id.clone());
+                managed_current.insert(resource.id.clone(), Current::MissingIdentifier(state));
+            }
+            Current::CreateInFlight(pending) => {
+                managed_current.insert(resource.id.clone(), Current::CreateInFlight(pending));
+            }
+            Current::CreateOutcomeUnknown(unknown) => {
+                managed_current.insert(resource.id.clone(), Current::CreateOutcomeUnknown(unknown));
+            }
+            Current::Absent(_state) => {}
         }
     }
     let (managed_states, mut already_refreshed) = refresh_existing_resources_until_cancelled(
@@ -1840,10 +1843,9 @@ pub(crate) async fn run_state_refresh_locked(
     // every hydration/lift stage.
     let pre_expansion_desired_ids: HashSet<ResourceId> =
         sorted_resources.iter().map(|r| r.id.clone()).collect();
-    let loaded_orphans = state_file
-        .as_ref()
-        .map(|sf| sf.build_orphans(&pre_expansion_desired_ids))
-        .unwrap_or_default();
+    let loaded_orphans = prepared_rows
+        .refreshable
+        .build_orphans(&pre_expansion_desired_ids);
     let (refreshed_orphans, refreshed_orphan_ids) = refresh_orphans_until_cancelled(
         #[cfg(test)]
         ctx.runtime(),
@@ -2141,6 +2143,7 @@ pub(crate) async fn run_state_refresh_locked(
     let deposed_summary = refresh_deposed_generations_until_cancelled(
         color_mode,
         &provider,
+        &prepared_rows.refreshable,
         &mut state,
         &resolved_resources,
         ctx.schemas(),
@@ -2153,6 +2156,8 @@ pub(crate) async fn run_state_refresh_locked(
             return Err(AppError::Interrupted);
         }
     }
+
+    prepared_rows.removed.apply_to(&mut state);
 
     // Re-resolve exports using refreshed state
     let skipped_exports = if !parsed.export_params.is_empty() {
@@ -2291,7 +2296,7 @@ fn format_state_refresh_summary(
 async fn refresh_existing_resources_until_cancelled(
     #[cfg(test)] runtime: &crate::runtime::CommandRuntime,
     provider: &dyn Provider,
-    reads: Vec<(ResourceId, AppliedIdentifier)>,
+    reads: Vec<carina_state::RefreshTarget>,
     cancel: &ShutdownToken,
 ) -> Result<(HashMap<ResourceId, Current>, HashSet<ResourceId>), AppError> {
     let mut managed_current = HashMap::new();
@@ -2315,12 +2320,17 @@ async fn refresh_existing_resources_until_cancelled(
         }
 
         while !refresh_cancelled && in_flight.len() < 5 {
-            let Some((id, identifier)) = read_iter.next() else {
+            let Some(target) = read_iter.next() else {
                 break;
             };
             in_flight.push(async move {
+                let id = target.id().clone();
                 let fresh_state = provider
-                    .read(&id, &identifier, carina_core::provider::ReadRequest)
+                    .read(
+                        target.id(),
+                        target.identifier(),
+                        carina_core::provider::ReadRequest,
+                    )
                     .await
                     .map_err(AppError::Provider)?
                     .into_state();
@@ -2392,7 +2402,7 @@ async fn refresh_existing_resources_until_cancelled(
 async fn refresh_orphans_until_cancelled(
     #[cfg(test)] runtime: &crate::runtime::CommandRuntime,
     provider: &dyn Provider,
-    loaded: LoadedOrphans,
+    loaded: carina_state::RefreshableOrphans,
     state_file: Option<&StateFile>,
     schemas: &carina_core::schema::SchemaRegistry,
     cancel: &ShutdownToken,
@@ -2505,15 +2515,7 @@ fn warn_missing_provider_identifier(color_mode: crate::output_style::ColorMode, 
     );
 }
 
-#[derive(Clone)]
-struct DeposedRefreshTarget {
-    row_provider: String,
-    row_resource_type: String,
-    row_identity: ResourceIdentity,
-    row_provider_instance: Option<String>,
-    id: ResolvedResourceId,
-    generation: DeposedInstance,
-}
+type DeposedRefreshTarget = carina_state::RefreshableDeposed;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct DeposedRefreshSummary {
@@ -2526,6 +2528,7 @@ struct DeposedRefreshSummary {
 async fn refresh_deposed_generations_until_cancelled<P>(
     color_mode: crate::output_style::ColorMode,
     provider: &P,
+    refresh_rows: &carina_state::RefreshRows,
     state: &mut carina_state::StateFile,
     desired_resources: &[ResolvedResource],
     schemas: &carina_core::schema::SchemaRegistry,
@@ -2534,7 +2537,7 @@ async fn refresh_deposed_generations_until_cancelled<P>(
 where
     P: Provider + ProviderNormalizer + ?Sized,
 {
-    let targets = collect_deposed_refresh_targets(state);
+    let targets: Vec<_> = refresh_rows.deposed_targets(state).collect();
     let mut summary = DeposedRefreshSummary {
         total_generations: targets.len() as u32,
         removed_generations: 0,
@@ -2553,16 +2556,16 @@ where
             LoopShutdownPhase::Graceful => return Err(AppError::Interrupted),
         }
 
-        let identifier = match AppliedIdentifier::new(target.generation.identifier.as_str()) {
-            Ok(identifier) => identifier,
-            Err(_) => {
+        let read_target = match target.read_target() {
+            Some(target) => target,
+            None => {
                 eprintln!(
                     "{}",
                     format!(
                         "Warning: {} {}: saved deposed generation {} has no provider identifier and was not refreshed; the generation was preserved. Apply a matching `removed` block to abandon it from state.",
-                        target.id,
-                        deposed_state_marker(&target.generation.key, &target.generation.identifier),
-                        target.generation.key,
+                        target.id(),
+                        deposed_state_marker(&target.generation().key, &target.generation().identifier),
+                        target.generation().key,
                     )
                     .yellow(color_mode)
                 );
@@ -2573,8 +2576,8 @@ where
 
         let read_result = match cleanup_wait
             .until_cleanup_priority(provider.read(
-                &target.id,
-                &identifier,
+                read_target.id(),
+                read_target.identifier(),
                 carina_core::provider::ReadRequest,
             ))
             .await
@@ -2596,10 +2599,13 @@ where
                     "{}",
                     format!(
                         "Warning: failed refreshing {}.{} {} {}: {}",
-                        target.row_provider,
-                        target.row_resource_type,
-                        target.row_identity,
-                        deposed_state_marker(&target.generation.key, &target.generation.identifier),
+                        target.row_id().provider,
+                        target.row_id().resource_type,
+                        target.row_id().identity(),
+                        deposed_state_marker(
+                            &target.generation().key,
+                            &target.generation().identifier
+                        ),
                         err
                     )
                     .yellow(color_mode)
@@ -2611,17 +2617,17 @@ where
 
         if !fresh_state.exists {
             state.remove_deposed_generation(
-                &target.row_provider,
-                &target.row_resource_type,
-                target.row_identity.as_str(),
-                &target.generation.key,
+                &target.row_id().provider,
+                &target.row_id().resource_type,
+                target.row_id().identity().as_str(),
+                &target.generation().key,
             );
             summary.removed_generations += 1;
             println!(
                 "  {} \"{}\" {}:",
-                target.id.display_type().cyan(color_mode),
-                target.id.identity_display(),
-                deposed_state_marker(&target.generation.key, &target.generation.identifier)
+                target.id().display_type().cyan(color_mode),
+                target.id().identity_display(),
+                deposed_state_marker(&target.generation().key, &target.generation().identifier)
             );
             println!("    {} resource no longer exists", "-".red(color_mode));
             println!();
@@ -2651,34 +2657,34 @@ where
             .get_for(&masking_resource)
             .map(|schema| schema.schema().as_schema());
         let attributes = target
-            .generation
+            .generation()
             .refreshed_attributes_for_resource_and_schema(
                 &masking_resource,
                 schema,
                 &fresh_state.attributes,
             );
 
-        if attributes.as_persisted() == target.generation.persisted_attributes() {
+        if attributes.as_persisted() == target.generation().persisted_attributes() {
             continue;
         }
         summary.updated_generations += 1;
 
         let updated = target
-            .generation
+            .generation()
             .clone()
             .with_refreshed_attributes(attributes);
         state.upsert_deposed_generation(
-            &target.row_provider,
-            &target.row_resource_type,
-            &target.row_identity,
-            target.row_provider_instance.clone(),
+            &target.row_id().provider,
+            &target.row_id().resource_type,
+            target.row_id().identity(),
+            target.row_id().provider_instance.clone(),
             updated,
         )?;
         println!(
             "  {} \"{}\" {}:",
-            target.id.display_type().cyan(color_mode),
-            target.id.identity_display(),
-            deposed_state_marker(&target.generation.key, &target.generation.identifier)
+            target.id().display_type().cyan(color_mode),
+            target.id().identity_display(),
+            deposed_state_marker(&target.generation().key, &target.generation().identifier)
         );
         println!("    {} attributes refreshed", "~".yellow(color_mode));
         println!();
@@ -2687,47 +2693,21 @@ where
     Ok(summary)
 }
 
-fn collect_deposed_refresh_targets(state: &carina_state::StateFile) -> Vec<DeposedRefreshTarget> {
-    state
-        .resources()
-        .iter()
-        .flat_map(|row| {
-            row.deposed.iter().map(|deposed| {
-                let identity = row.identity.clone();
-                let id = ResolvedResourceId::with_provider_identity(
-                    row.provider.clone(),
-                    row.resource_type.clone(),
-                    identity.clone(),
-                    deposed.provider_instance.clone(),
-                );
-                DeposedRefreshTarget {
-                    row_provider: row.provider.clone(),
-                    row_resource_type: row.resource_type.clone(),
-                    row_identity: identity,
-                    row_provider_instance: row.directives.provider_instance.clone(),
-                    id,
-                    generation: deposed.clone(),
-                }
-            })
-        })
-        .collect()
-}
-
 fn desired_resource_for_deposed<'a>(
     desired_resources: &'a [ResolvedResource],
     target: &DeposedRefreshTarget,
 ) -> Option<&'a ResolvedResource> {
     desired_resources.iter().find(|resource| {
-        resource.id.provider == target.row_provider
-            && resource.id.resource_type == target.row_resource_type
-            && resource.id.identity_str() == Some(target.row_identity.as_str())
-            && resource.id.provider_instance == target.generation.provider_instance
+        resource.id.provider == target.row_id().provider
+            && resource.id.resource_type == target.row_id().resource_type
+            && resource.id.identity_str() == Some(target.row_id().identity().as_str())
+            && resource.id.provider_instance == target.generation().provider_instance
     })
 }
 
 fn synthetic_deposed_resource(target: &DeposedRefreshTarget) -> ResolvedResource {
-    let mut resource = ResolvedResource::from_id(target.id.clone());
-    for (key, value) in target.generation.persisted_attributes().to_values() {
+    let mut resource = ResolvedResource::from_id(target.id().clone());
+    for (key, value) in target.generation().persisted_attributes().to_values() {
         resource.set_attr(key, value);
     }
     resource
@@ -2743,7 +2723,7 @@ async fn normalize_deposed_read_state<P>(
 where
     P: ProviderNormalizer + ?Sized,
 {
-    let mut states = HashMap::from([(target.id.as_inner().clone(), fresh_state.clone())]);
+    let mut states = HashMap::from([(target.id().as_inner().clone(), fresh_state.clone())]);
     let saved_attrs = deposed_saved_attrs(target).lift(schemas);
     carina_core::provider::hydrate_provider_states(
         provider,
@@ -2752,7 +2732,7 @@ where
     )
     .await?;
 
-    if let Some(normalized) = states.remove(target.id.as_inner()) {
+    if let Some(normalized) = states.remove(target.id().as_inner()) {
         *fresh_state = normalized;
     }
     if let Some(schema) = schemas.get_for(resource.as_resource()) {
@@ -2764,8 +2744,8 @@ where
 fn deposed_saved_attrs(target: &DeposedRefreshTarget) -> RawSavedAttrs {
     RawSavedAttrs::from_persisted(
         HashMap::from([(
-            target.id.as_inner().clone(),
-            target.generation.persisted_attributes().clone(),
+            target.id().as_inner().clone(),
+            target.generation().persisted_attributes().clone(),
         )]),
         // Deposed generations predate per-instance nested write-only provenance.
         HashMap::new(),
@@ -4985,7 +4965,12 @@ mod tests {
         let (orphans, already_refreshed) = refresh_orphans_until_cancelled(
             &crate::test_support::TestCommandRuntime::new(),
             &provider,
-            state_file.build_orphans(&desired_ids),
+            carina_state::PreparedRows::from_state(
+                Some(&state_file),
+                &carina_state::ResolvedRemovedClaims::resolve(&[], None),
+            )
+            .refreshable
+            .build_orphans(&desired_ids),
             Some(&state_file),
             &schemas,
             &ShutdownToken::running(),
@@ -4996,6 +4981,10 @@ mod tests {
         let state_file = Some(state_file);
         let expansion_prelude = crate::wiring::DeferredForExpansionPrelude::new_for_state_refresh(
             &parsed,
+            &carina_state::ResolvedRemovedClaims::resolve(
+                &parsed.state_blocks,
+                state_file.as_ref(),
+            ),
             &state_file,
             &schemas,
         )
@@ -5735,6 +5724,11 @@ mod tests {
         let summary = refresh_deposed_generations_until_cancelled(
             color_mode,
             &provider,
+            &carina_state::PreparedRows::from_state(
+                Some(&state),
+                &carina_state::ResolvedRemovedClaims::resolve(&[], None),
+            )
+            .refreshable,
             &mut state,
             &[resolved(desired)],
             &SchemaRegistry::new(),
@@ -5802,6 +5796,11 @@ mod tests {
         let summary = refresh_deposed_generations_until_cancelled(
             color_mode,
             &provider,
+            &carina_state::PreparedRows::from_state(
+                Some(&state),
+                &carina_state::ResolvedRemovedClaims::resolve(&[], None),
+            )
+            .refreshable,
             &mut state,
             &[],
             &SchemaRegistry::new(),
@@ -5869,6 +5868,11 @@ mod tests {
         refresh_deposed_generations_until_cancelled(
             color_mode,
             &provider,
+            &carina_state::PreparedRows::from_state(
+                Some(&state),
+                &carina_state::ResolvedRemovedClaims::resolve(&[], None),
+            )
+            .refreshable,
             &mut state,
             &[resolved(desired)],
             &schemas,
@@ -5937,6 +5941,11 @@ mod tests {
         refresh_deposed_generations_until_cancelled(
             color_mode,
             &provider,
+            &carina_state::PreparedRows::from_state(
+                Some(&state),
+                &carina_state::ResolvedRemovedClaims::resolve(&[], None),
+            )
+            .refreshable,
             &mut state,
             &[resolved(desired)],
             &schemas,
@@ -5991,6 +6000,11 @@ mod tests {
         refresh_deposed_generations_until_cancelled(
             color_mode,
             &provider,
+            &carina_state::PreparedRows::from_state(
+                Some(&state),
+                &carina_state::ResolvedRemovedClaims::resolve(&[], None),
+            )
+            .refreshable,
             &mut state,
             &[resolved(desired)],
             &SchemaRegistry::new(),
@@ -6058,6 +6072,11 @@ mod tests {
         refresh_deposed_generations_until_cancelled(
             color_mode,
             &provider,
+            &carina_state::PreparedRows::from_state(
+                Some(&state),
+                &carina_state::ResolvedRemovedClaims::resolve(&[], None),
+            )
+            .refreshable,
             &mut state,
             &[],
             &schemas,
@@ -6115,6 +6134,11 @@ mod tests {
         let summary = refresh_deposed_generations_until_cancelled(
             color_mode,
             &provider,
+            &carina_state::PreparedRows::from_state(
+                Some(&state),
+                &carina_state::ResolvedRemovedClaims::resolve(&[], None),
+            )
+            .refreshable,
             &mut state,
             &[],
             &SchemaRegistry::new(),
@@ -6187,6 +6211,11 @@ mod tests {
         refresh_deposed_generations_until_cancelled(
             color_mode,
             &provider,
+            &carina_state::PreparedRows::from_state(
+                Some(&state),
+                &carina_state::ResolvedRemovedClaims::resolve(&[], None),
+            )
+            .refreshable,
             &mut state,
             &[],
             &SchemaRegistry::new(),
@@ -6210,6 +6239,11 @@ mod tests {
         refresh_deposed_generations_until_cancelled(
             color_mode,
             &provider,
+            &carina_state::PreparedRows::from_state(
+                Some(&state),
+                &carina_state::ResolvedRemovedClaims::resolve(&[], None),
+            )
+            .refreshable,
             &mut state,
             &[],
             &SchemaRegistry::new(),
@@ -7265,6 +7299,11 @@ mod tests {
         let summary = refresh_deposed_generations_until_cancelled(
             color_mode,
             &provider,
+            &carina_state::PreparedRows::from_state(
+                Some(&state),
+                &carina_state::ResolvedRemovedClaims::resolve(&[], None),
+            )
+            .refreshable,
             &mut state,
             &[],
             &SchemaRegistry::new(),
@@ -7347,6 +7386,11 @@ mod tests {
         let first = refresh_deposed_generations_until_cancelled(
             color_mode,
             &provider,
+            &carina_state::PreparedRows::from_state(
+                Some(&state),
+                &carina_state::ResolvedRemovedClaims::resolve(&[], None),
+            )
+            .refreshable,
             &mut state,
             std::slice::from_ref(&resolved(desired.clone())),
             &schemas,
@@ -7378,6 +7422,11 @@ mod tests {
         let second = refresh_deposed_generations_until_cancelled(
             color_mode,
             &provider,
+            &carina_state::PreparedRows::from_state(
+                Some(&state),
+                &carina_state::ResolvedRemovedClaims::resolve(&[], None),
+            )
+            .refreshable,
             &mut state,
             std::slice::from_ref(&resolved(desired.clone())),
             &schemas,
@@ -7448,6 +7497,11 @@ mod tests {
         refresh_deposed_generations_until_cancelled(
             color_mode,
             &provider,
+            &carina_state::PreparedRows::from_state(
+                Some(&state),
+                &carina_state::ResolvedRemovedClaims::resolve(&[], None),
+            )
+            .refreshable,
             &mut state,
             &[resolved(wrong_instance), resolved(right_instance)],
             &SchemaRegistry::new(),
@@ -7492,6 +7546,11 @@ mod tests {
         let summary = refresh_deposed_generations_until_cancelled(
             color_mode,
             &provider,
+            &carina_state::PreparedRows::from_state(
+                Some(&state),
+                &carina_state::ResolvedRemovedClaims::resolve(&[], None),
+            )
+            .refreshable,
             &mut state,
             &[],
             &SchemaRegistry::new(),

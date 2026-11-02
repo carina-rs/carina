@@ -8,14 +8,12 @@ use carina_core::parser::{
     SavedProviderConfigs,
 };
 use carina_core::plan::SavedPlan;
-use carina_core::provider::{
-    AppliedIdentifier, PersistedAttributes, Provider, ProviderRouter, ReadRequest,
-};
+use carina_core::provider::{PersistedAttributes, Provider, ProviderRouter, ReadRequest};
 use carina_core::resource::{
     Current, DataSource, ResolvedResourceId, Resource, ResourceId, SavedComposition,
     SavedDataSource, SavedModuleSource, SavedResource, State, Value,
 };
-use carina_state::{ResourceState, StateFile};
+use carina_state::{RefreshRows, RefreshableCurrent, ResourceState, StateFile};
 
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
 use crate::commands::plan::{
@@ -81,7 +79,6 @@ struct HistoricalStateVerifier<'a> {
     provider: &'a dyn Provider,
     actual_states: &'a mut HashMap<ResourceId, State>,
     verified_planned_states: &'a mut HashMap<ResourceId, State>,
-    historical_addresses: &'a HistoricalResourceAddresses,
     apply_target: ApplyTarget<'a>,
 }
 
@@ -90,7 +87,7 @@ impl HistoricalStateVerifier<'_> {
         &mut self,
         id: &ResourceId,
         state: &State,
-        provider_identifier: Option<&AppliedIdentifier>,
+        loaded: &RefreshableCurrent,
     ) -> Result<Option<State>, AppError> {
         if !state
             .attributes
@@ -107,15 +104,14 @@ impl HistoricalStateVerifier<'_> {
         // Orphans do not participate in ordinary drift reads. Read them here
         // because their historical secret still needs verification.
         if !self.actual_states.contains_key(id) {
-            let historical_id = self.historical_addresses.origin_for(id);
-            let identifier = provider_identifier.ok_or_else(|| {
+            let target = loaded.read_target().ok_or_else(|| {
                 AppError::Validation(format!(
                     "saved plan resource {id} has no valid provider identifier; create a new plan before applying"
                 ))
             })?;
             let mut actual = self
                 .provider
-                .read(historical_id, identifier, ReadRequest)
+                .read(target.id(), target.identifier(), ReadRequest)
                 .await
                 .map_err(AppError::Provider)?
                 .into_state();
@@ -805,6 +801,12 @@ pub(super) struct ScopeCheckedDesiredPlan {
 }
 
 impl ScopeCheckedDesiredPlan {
+    pub(super) fn refresh_rows(&self) -> &RefreshRows {
+        match &self.plan.plan {
+            DesiredPlanFile::Verified(plan) => plan.plan_file.refresh_rows(),
+            DesiredPlanFile::NeedsHistoricalVerification(plan) => plan.plan_file.refresh_rows(),
+        }
+    }
     pub(super) fn context(&self) -> &WiringContext {
         self.plan.context()
     }
@@ -1000,28 +1002,30 @@ impl DesiredVerifiedPlanFile {
             }
         }
         {
+            let refresh_rows = self.plan_file.refresh_rows().clone();
+            let data_source_refresh_rows = self.plan_file.data_source_refresh_rows().clone();
             let mut verifier = HistoricalStateVerifier {
                 provider,
                 actual_states,
                 verified_planned_states,
-                historical_addresses,
                 apply_target,
             };
             for entry in self.plan_file.current_states_mut() {
                 let ReloadedCurrentStateEntry::Managed { id, current } = entry;
+                let Some(loaded) = refresh_rows.current(historical_addresses.origin_for(id)) else {
+                    continue;
+                };
                 let verified = match current.as_ref() {
                     carina_core::resource::Current::Absent(state) => {
-                        verifier.verify(id, state.state(), None).await?
+                        verifier.verify(id, state.state(), &loaded).await?
                     }
                     carina_core::resource::Current::Present(present) => {
-                        verifier
-                            .verify(id, present.state(), Some(present.identifier()))
-                            .await?
+                        verifier.verify(id, present.state(), &loaded).await?
                     }
                     carina_core::resource::Current::CreateInFlight(_pending) => None,
                     carina_core::resource::Current::CreateOutcomeUnknown(_unknown) => None,
                     carina_core::resource::Current::MissingIdentifier(state) => {
-                        verifier.verify(id, state.state(), None).await?
+                        verifier.verify(id, state.state(), &loaded).await?
                     }
                 };
                 if let Some(verified) = verified
@@ -1032,14 +1036,10 @@ impl DesiredVerifiedPlanFile {
             }
             for saved in self.plan_file.data_source_values_mut() {
                 if let DataSourceValue::Read(state) = &mut saved.value {
-                    let identifier = state
-                        .identifier
-                        .as_deref()
-                        .and_then(|identifier| AppliedIdentifier::new(identifier).ok());
-                    if let Some(verified) = verifier
-                        .verify(&saved.id, state, identifier.as_ref())
-                        .await?
-                    {
+                    let Some(loaded) = data_source_refresh_rows.current(&saved.id) else {
+                        continue;
+                    };
+                    if let Some(verified) = verifier.verify(&saved.id, state, &loaded).await? {
                         **state = verified;
                     }
                 }
@@ -1508,6 +1508,85 @@ mod tests {
             SchemaCheckedPendingPlanFile { plan_file },
             Some(locked_state),
         )
+    }
+
+    #[test]
+    fn saved_move_refresh_keeps_managed_and_data_source_snapshots_separate() {
+        let data_source: DataSource = DataSource::with_provider("mock", "iam.Roles", "old", None);
+        let from = data_source.id.clone();
+        let to = ResourceId::with_provider_identity("mock", "iam.Roles", "new", None);
+        // Saved move snapshots are at the destination, while the locked state
+        // still owns the source. The data-source snapshot stays at the source.
+        let source_row = ResourceState::try_applied(
+            from.resource_type.clone(),
+            from.identity().cloned().expect("move source is resolved"),
+            from.provider.clone(),
+            "managed-id",
+        )
+        .expect("fixture identifier is non-empty");
+        let mut locked_state = StateFile::new();
+        locked_state
+            .upsert_resource(source_row)
+            .expect("test state setup must be valid");
+
+        let mut contents = empty_plan_contents(Vec::new());
+        contents.state_lineage = Some(locked_state.lineage.clone());
+        contents.state_serial = Some(locked_state.serial);
+        let desired = Resource::from_id(to.clone()).into_value_snapshot();
+        contents.sorted_resources.push(desired.clone());
+        contents.unresolved_resources.push(desired);
+        contents
+            .sorted_value_destroy_dependencies
+            .push(Default::default());
+        contents
+            .sorted_explicit_destroy_dependencies
+            .push(Default::default());
+        contents.plan.add(Effect::Move {
+            from: ResolvedResourceId::new(from.clone()),
+            to: ResolvedResourceId::new(to.clone()),
+            origin: None,
+        });
+        contents.current_states.push(CurrentStateEntry::managed(
+            to.clone(),
+            State::existing(to, HashMap::new()).with_identifier("managed-id"),
+        ));
+        contents.data_source_values.push(SavedDataSourceValue {
+            id: from.clone(),
+            value: DataSourceValue::read(
+                State::existing(from.clone(), HashMap::new()).with_identifier("data-source-id"),
+            ),
+        });
+        contents
+            .data_source_origins
+            .push(data_source.clone().into_value_snapshot());
+        contents
+            .data_sources
+            .push(data_source.into_value_snapshot());
+        let plan_file = contents
+            .record_for_test(&builtin_context(), Vec::new())
+            .expect("test plan provider evidence must be valid")
+            .reload_in_flight_from_locked_state(Some(&locked_state))
+            .expect("reload saved move plan")
+            .resolve_with_schemas(&carina_core::schema::SchemaRegistry::new())
+            .expect("resolve saved move plan");
+
+        let managed_target = plan_file
+            .refresh_rows()
+            .current(&from)
+            .expect("moved managed snapshot must remain refreshable")
+            .read_target()
+            .expect("managed snapshot has an identifier");
+        assert_eq!(managed_target.id(), &from);
+        assert_eq!(managed_target.identifier().as_str(), "managed-id");
+
+        let data_source_target = plan_file
+            .data_source_refresh_rows()
+            .current(&from)
+            .expect("data-source snapshot must remain refreshable at the move source")
+            .read_target()
+            .expect("data-source snapshot has an identifier");
+        assert_eq!(data_source_target.id(), &from);
+        assert_eq!(data_source_target.identifier().as_str(), "data-source-id");
     }
 
     #[test]

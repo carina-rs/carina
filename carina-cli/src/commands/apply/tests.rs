@@ -4140,7 +4140,7 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
-        &crate::wiring::ResolvedStateBlockTargets::default(),
+        &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
@@ -6300,7 +6300,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
-        &crate::wiring::ResolvedStateBlockTargets::default(),
+        &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
@@ -6418,7 +6418,7 @@ let nat = mock.ec2.NatGateway {{
         crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
-        &crate::wiring::ResolvedStateBlockTargets::default(),
+        &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
@@ -6478,7 +6478,7 @@ let nat = mock.ec2.NatGateway {{
         crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
-        &crate::wiring::ResolvedStateBlockTargets::default(),
+        &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
@@ -6607,7 +6607,7 @@ let igw = mock.ec2.InternetGateway {{{tags}
         crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
-        &crate::wiring::ResolvedStateBlockTargets::default(),
+        &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
@@ -6750,7 +6750,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
-        &crate::wiring::ResolvedStateBlockTargets::default(),
+        &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
@@ -6832,7 +6832,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
-        &crate::wiring::ResolvedStateBlockTargets::default(),
+        &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
@@ -6908,7 +6908,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
-        &crate::wiring::ResolvedStateBlockTargets::default(),
+        &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
