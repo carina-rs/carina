@@ -23,6 +23,22 @@ use crate::schema::{
     ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
 };
 
+#[test]
+fn preparation_errors_stay_below_clippy_large_error_threshold() {
+    let preparation = size_of::<ProviderPreparationError>();
+    let configuration = size_of::<ProviderConfigPreparationError>();
+    println!("ProviderPreparationError: {preparation} bytes");
+    println!("ProviderConfigPreparationError: {configuration} bytes");
+    assert!(
+        preparation < 128,
+        "ProviderPreparationError is {preparation} bytes"
+    );
+    assert!(
+        configuration < 128,
+        "ProviderConfigPreparationError is {configuration} bytes"
+    );
+}
+
 fn duration(seconds: u64) -> Value {
     Value::Concrete(ConcreteValue::Duration(Duration::from_secs(seconds)))
 }

@@ -494,7 +494,7 @@ impl ProviderReadyDataSource {
 pub enum ProviderPreparationError {
     /// The complete provider input has no wire representation.
     #[error("{0}")]
-    Wire(ProviderWireError),
+    Wire(Box<ProviderWireError>),
     #[error(transparent)]
     TypeSettlement(#[from] crate::validation::deferred_types::ProviderTypeCheckFailure),
     /// An unresolved deferred value survived apply-time reference resolution.
@@ -503,7 +503,7 @@ pub enum ProviderPreparationError {
     /// A known value violates its resource schema or provider validator.
     #[error("{resource}: value constraint failed before provider dispatch: {errors}")]
     ValueConstraint {
-        resource: ResourceId,
+        resource: Box<ResourceId>,
         errors: ProviderValueConstraintErrors,
     },
     /// A pending module argument constraint became decidable and failed.
@@ -512,7 +512,7 @@ pub enum ProviderPreparationError {
     /// Authored lifecycle metadata could not be resolved against the managed
     /// schema before constructing the provider-ready resource.
     #[error(transparent)]
-    ResolvedResource(#[from] crate::resource::ResolvedResourceError),
+    ResolvedResource(Box<crate::resource::ResolvedResourceError>),
     /// The managed resource has no schema to classify write-only attributes.
     #[error("{resource}: no managed schema is registered")]
     MissingManagedSchema { resource: ResourceId },
@@ -527,7 +527,13 @@ pub enum ProviderPreparationError {
 
 impl From<ProviderWireError> for ProviderPreparationError {
     fn from(error: ProviderWireError) -> Self {
-        Self::Wire(error)
+        Self::Wire(Box::new(error))
+    }
+}
+
+impl From<crate::resource::ResolvedResourceError> for ProviderPreparationError {
+    fn from(error: crate::resource::ResolvedResourceError) -> Self {
+        Self::ResolvedResource(Box::new(error))
     }
 }
 
@@ -1044,7 +1050,7 @@ fn validate_known_provider_values(
     schema
         .validate_known_values_with_resolver(attributes, &is_string_literal, resolver)
         .map_err(|errors| ProviderPreparationError::ValueConstraint {
-            resource: id.clone(),
+            resource: Box::new(id.clone()),
             errors: errors.into(),
         })
 }
@@ -1066,7 +1072,7 @@ fn validate_selected_provider_values(
             resolver,
         )
         .map_err(|errors| ProviderPreparationError::ValueConstraint {
-            resource: id.clone(),
+            resource: Box::new(id.clone()),
             errors: errors.into(),
         })
 }
