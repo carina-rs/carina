@@ -56,7 +56,7 @@ pub trait Api {
 // The SDK's trait returns `ProviderError` by value; match its allowance.
 #![allow(clippy::result_large_err)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use carina_plugin_sdk::core::schema::ReferenceForms;
 use carina_plugin_sdk::types::*;
@@ -141,8 +141,8 @@ fn api_error(operation: &str, err: ApiError) -> ProviderError {
 
 // --- attributes -----------------------------------------------------------
 
-fn attributes(widget: &Widget) -> HashMap<String, Value> {
-    HashMap::from([
+fn attributes(widget: &Widget) -> BTreeMap<String, Value> {
+    BTreeMap::from([
         ("name".to_string(), Value::String(widget.name.clone())),
         ("size".to_string(), Value::Int(widget.size)),
     ])

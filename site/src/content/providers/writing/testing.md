@@ -21,6 +21,7 @@ mod tests {
     };
     use carina_plugin_sdk::{PollFinality, PollRequest};
     use std::cell::RefCell;
+    use std::collections::HashMap;
 
     /// An in-memory API that records what the provider asked for.
     #[derive(Default)]
@@ -94,12 +95,12 @@ mod tests {
     fn poll(
         provider: &WidgetProvider<FakeApi>,
         pending: carina_plugin_sdk::protocol::types::PendingCreate<CreateToken>,
-    ) -> WireCreateStep<HashMap<String, Value>, PartialReadDiagnostic, CreateToken> {
+    ) -> WireCreateStep<BTreeMap<String, Value>, PartialReadDiagnostic, CreateToken> {
         carina_plugin_sdk::dispatch_poll_create(
             provider,
             &resource_id(),
             create_request("a", 1),
-            pending.progress.into_identifier(),
+            pending.progress,
             pending.sent,
             pending.token,
             PollRequest { finality: PollFinality::Continue },
@@ -119,7 +120,7 @@ mod tests {
         CreateRequest {
             resource: Resource {
                 id: resource_id(),
-                attributes: HashMap::from([
+                attributes: BTreeMap::from([
                     ("name".to_string(), Value::String(name.into())),
                     ("size".to_string(), Value::Int(size)),
                 ]),
@@ -180,7 +181,7 @@ mod tests {
             &provider,
             &resource_id(),
             create_request("a", 1),
-            pending.progress.into_identifier(),
+            pending.progress,
             pending.sent,
             pending.token,
             PollRequest { finality: PollFinality::Continue },
@@ -190,11 +191,11 @@ mod tests {
             panic!("expected an in-flight verdict")
         };
         match in_flight.pending.token {
-            CreateToken::Starting { client_token } => {
+            CreateToken::Operation(CreateOperation::Starting { client_token }) => {
                 assert_eq!(client_token, "token-1");
             }
-            CreateToken::Operation(operation) => {
-                panic!("expected the starting continuation, got {operation}");
+            unexpected => {
+                panic!("expected the starting continuation, got {unexpected:?}");
             }
         }
     }
@@ -240,7 +241,7 @@ mod tests {
             from: PersistedState {
                 id: resource_id(),
                 identifier: Some("w-a".into()),
-                attributes: HashMap::from([
+                attributes: BTreeMap::from([
                     ("name".to_string(), PersistedValue::String("a".into())),
                     ("size".to_string(), PersistedValue::Int(1)),
                 ]),
