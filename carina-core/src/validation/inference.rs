@@ -997,6 +997,23 @@ pub(super) fn attribute_type_to_type_expr(
     attr_type: &AttributeType,
     schema_owner: &str,
 ) -> TypeExpr {
+    if let AttrTypeKind::String {
+        binding: crate::schema::RefinementBinding::Annotation(witness),
+        ..
+    }
+    | AttrTypeKind::Int {
+        binding: crate::schema::RefinementBinding::Annotation(witness),
+        ..
+    }
+    | AttrTypeKind::Float {
+        binding: crate::schema::RefinementBinding::Annotation(witness),
+        ..
+    } = attr_type.kind()
+    {
+        return TypeExpr::SchemaType {
+            owned: witness.clone(),
+        };
+    }
     let scalar_identity = match attr_type.kind() {
         AttrTypeKind::UnloadedSchemaType(unloaded) => {
             return TypeExpr::UnloadedSchemaType(unloaded.clone());
@@ -1018,7 +1035,7 @@ pub(super) fn attribute_type_to_type_expr(
     };
     if scalar_identity.is_some() {
         return TypeExpr::SchemaType {
-            owned: crate::parser::OwnedTypeIdentity::from_schema_declaration(
+            owned: crate::parser::ResolvedSchemaType::from_schema_declaration(
                 schema_owner,
                 attr_type,
             )
@@ -1059,7 +1076,7 @@ pub(super) fn attribute_type_to_type_expr(
             to_dsl,
             ..
         } if values.is_none() && (validate.is_some() || to_dsl.is_some()) => TypeExpr::SchemaType {
-            owned: crate::parser::OwnedTypeIdentity::from_declaration(
+            owned: crate::parser::ResolvedSchemaType::from_declaration(
                 schema_owner,
                 crate::parser::IdentifiedCustomTypeDeclaration::new(attr_type)
                     .expect("identified enum declaration"),
@@ -1778,7 +1795,8 @@ mod tests {
                 name.to_string(),
                 InferenceBinding::Argument {
                     type_expr: TypeExpr::SchemaType {
-                        owned: crate::parser::OwnedTypeIdentity::provider("test", identity, kind),
+                        owned: crate::parser::OwnedTypeIdentity::provider("test", identity, kind)
+                            .unbounded_witness_for_test(),
                     },
                 },
             )]);
@@ -1839,7 +1857,8 @@ mod tests {
                 "awscc",
                 TypeIdentity::bare("VpcId"),
                 crate::schema::RefinedScalarKind::String,
-            ),
+            )
+            .unbounded_witness_for_test(),
         }
     }
 
@@ -2189,7 +2208,8 @@ mod tests {
                     "aws",
                     TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
                     crate::schema::RefinedScalarKind::String
-                ),
+                )
+                .unbounded_witness_for_test(),
             }
         );
     }

@@ -4,6 +4,144 @@ use carina_core::schema::{
 };
 use tower_lsp::lsp_types::{InsertTextFormat, TextEdit};
 
+struct NamedAnnotationCompletionFactory;
+
+impl ProviderFactory for NamedAnnotationCompletionFactory {
+    fn name(&self) -> &str {
+        "aws"
+    }
+    fn display_name(&self) -> &str {
+        "named annotation completion fixture"
+    }
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
+    }
+    fn validate_config(
+        &self,
+        _: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> carina_core::provider::ProviderResult<()> {
+        Ok(())
+    }
+    fn create_provider(
+        &self,
+        _: Option<&str>,
+        _: &carina_core::provider::ProviderReadyConfig,
+        _: carina_core::provider::InitializeOutcomeMint,
+    ) -> carina_core::provider::BoxFuture<
+        '_,
+        carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
+    > {
+        Box::pin(async { panic!("completion does not initialize providers") })
+    }
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        vec![
+            ResourceSchema::new("iam.Role")
+                .attribute(
+                    AttributeSchema::required("role_name", named_completion_string(64)).build(),
+                )
+                .validate()
+                .unwrap(),
+        ]
+    }
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            Default::default(),
+            Default::default(),
+            vec![],
+        )
+        .unwrap()
+    }
+}
+
+fn named_completion_string(max: u64) -> AttributeType {
+    AttributeType::refined_string(
+        Some(carina_core::schema::TypeIdentity::from_schema_type(
+            "aws", "iam.Role", "Name",
+        )),
+        None,
+        Some((Some(1), Some(max))),
+        None,
+    )
+}
+
+#[test]
+fn named_annotation_completion_retains_bounds_at_schema_and_module_sinks() {
+    let mut supplemental = SchemaRegistry::new();
+    supplemental.insert(
+        "aws",
+        ResourceSchema::new("NameSource")
+            .attribute(
+                AttributeSchema::provider_populated("matching", named_completion_string(64))
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::provider_populated("narrower", named_completion_string(32))
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::provider_populated("wider", named_completion_string(128)).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let snapshot = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(vec![Box::new(NamedAnnotationCompletionFactory)]),
+        supplemental,
+        carina_core::EnvironmentSnapshot::empty(),
+    );
+    let provider = CompletionProvider::new(
+        Arc::new(snapshot.schema_registry().clone()),
+        vec!["aws".into()],
+        vec![],
+        vec![],
+    );
+    let fixture = tempfile::tempdir().unwrap();
+    let child = fixture.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    std::fs::write(
+        child.join("main.crn"),
+        "arguments {\n  x: aws.iam.Role.Name\n}\n",
+    )
+    .unwrap();
+    for target in [
+        "aws.iam.Role {\n  role_name = ",
+        "let child = use { source = './child' }\nlet instance = child {\n  x = ",
+    ] {
+        let source = format!(
+            "arguments {{\n  local: aws.iam.Role.Name\n}}\nlet source = aws.NameSource {{}}\n{target}\n}}\n"
+        );
+        let path = fixture.path().join("main.crn");
+        std::fs::write(&path, &source).unwrap();
+        let doc = Document::new_with_path(
+            source.clone(),
+            path,
+            Arc::new(snapshot.provider_context().as_provider_context().clone()),
+        );
+        let (line, text) = source
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.ends_with("= "))
+            .unwrap();
+        let position = Position::new(line as u32, text.len() as u32);
+        let items = provider.complete_for_test(&doc, position, Some(fixture.path()));
+        let labels = items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            labels.contains(&"local"),
+            "named argument should satisfy its sink: {labels:?}"
+        );
+        assert!(labels.contains(&"source.matching"), "{labels:?}");
+        assert!(labels.contains(&"source.narrower"), "{labels:?}");
+        assert!(
+            !labels.contains(&"source.wider"),
+            "an exact wider source must be excluded: {labels:?}"
+        );
+    }
+}
+
 #[test]
 fn completion_interpolation_after_non_bmp_uses_utf16() {
     let source = "let helper = test.foo.bar { attr = 'value' }\nlet role = test.foo.bar {\n  attr = \"😀 ${hel}\"\n}\n";

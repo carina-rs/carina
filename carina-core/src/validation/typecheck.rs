@@ -724,6 +724,13 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
         TypeExpr::Ref(_) => Mismatch(mismatch(expected, value)),
         TypeExpr::SchemaType { owned } => {
             use crate::schema::RefinedScalarKind;
+            if owned.has_empty_intersection() {
+                return Mismatch(validation_mismatch(
+                    expected,
+                    value,
+                    "empty intersection of scalar constraints".into(),
+                ));
+            }
             let supported = matches!(
                 (owned.scalar_kind(), value),
                 (
@@ -1068,14 +1075,16 @@ mod tests {
                 ])
                 .expect("two annotation owners are non-empty"),
                 crate::schema::RefinedScalarKind::String,
-            ),
+            )
+            .unbounded_witness_for_test(),
         };
         let actual = TypeExpr::SchemaType {
             owned: OwnedTypeIdentity::provider(
                 "aws",
                 identity,
                 crate::schema::RefinedScalarKind::String,
-            ),
+            )
+            .unbounded_witness_for_test(),
         };
 
         assert!(
@@ -1287,7 +1296,8 @@ mod tests {
                     "mock",
                     TypeIdentity::bare("Count"),
                     kind,
-                ),
+                )
+                .unbounded_witness_for_test(),
             };
             assert_eq!(
                 providerless_check(&expected, &value).is_ok(),
@@ -1308,7 +1318,8 @@ mod tests {
                         "awscc",
                         identity.clone(),
                         crate::schema::RefinedScalarKind::String,
-                    ),
+                    )
+                    .unbounded_witness_for_test(),
                 },
                 crate::parser::resolve_custom_type_identity(&identity, &config)
                     .unwrap()
@@ -1330,7 +1341,8 @@ mod tests {
                 "awscc",
                 TypeIdentity::from_dotted(name),
                 crate::schema::RefinedScalarKind::String,
-            ),
+            )
+            .unbounded_witness_for_test(),
         };
         let broad = schema_type("aws.Arn");
         let narrow = schema_type("aws.iam.Role.Arn");
@@ -1435,7 +1447,8 @@ mod tests {
                     "aws",
                     TypeIdentity::from_schema_type("aws", "ec2", "VpcId"),
                     crate::schema::RefinedScalarKind::String,
-                ),
+                )
+                .unbounded_witness_for_test(),
             },
             TypeExpr::Struct {
                 fields: vec![("name".to_string(), TypeExpr::String)],
@@ -1487,7 +1500,8 @@ mod tests {
                 "mock",
                 TypeIdentity::bare("AccountId"),
                 crate::schema::RefinedScalarKind::String,
-            ),
+            )
+            .unbounded_witness_for_test(),
         }
     }
 
@@ -1689,7 +1703,8 @@ mod tests {
                     "aws",
                     TypeIdentity::from_schema_type("aws", "ec2", "VpcId"),
                     crate::schema::RefinedScalarKind::String,
-                ),
+                )
+                .unbounded_witness_for_test(),
             },
             TypeExpr::Struct { fields: Vec::new() },
         ] {
@@ -1740,7 +1755,8 @@ mod tests {
                     "aws",
                     TypeIdentity::from_schema_type("aws", "ec2", "VpcId"),
                     crate::schema::RefinedScalarKind::String,
-                ),
+                )
+                .unbounded_witness_for_test(),
             },
             TypeExpr::Union(vec![
                 TypeExpr::StringLiteral("dev".to_string()),
@@ -1775,7 +1791,8 @@ mod tests {
                 "test",
                 identity.clone(),
                 crate::schema::RefinedScalarKind::String,
-            ),
+            )
+            .unbounded_witness_for_test(),
         };
         let checked_identity = identity.clone();
         let config = ProviderContext {
@@ -1915,7 +1932,8 @@ mod tests {
                 "test",
                 identity,
                 crate::schema::RefinedScalarKind::String,
-            ),
+            )
+            .unbounded_witness_for_test(),
         };
         let value = Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.dsl_value"));
 
@@ -1958,7 +1976,8 @@ mod tests {
                     "test",
                     TypeIdentity::from_schema_type("test", "widget", "PositiveInt"),
                     crate::schema::RefinedScalarKind::Int,
-                ),
+                )
+                .unbounded_witness_for_test(),
             },
         ] {
             check_with_config(&expected, &Value::Concrete(ConcreteValue::Int(1)), &config)
@@ -2031,7 +2050,8 @@ mod tests {
                 provider,
                 identity.clone(),
                 crate::schema::RefinedScalarKind::Int,
-            ),
+            )
+            .unbounded_witness_for_test(),
         };
 
         check_with_config(&ty("one"), &Value::Concrete(ConcreteValue::Int(5)), &config)
@@ -2126,14 +2146,16 @@ mod tests {
                     "bare-provider",
                     bare_identity,
                     crate::schema::RefinedScalarKind::String,
-                ),
+                )
+                .unbounded_witness_for_test(),
             },
             TypeExpr::SchemaType {
                 owned: crate::parser::OwnedTypeIdentity::provider(
                     "test",
                     schema_identity.clone(),
                     crate::schema::RefinedScalarKind::String,
-                ),
+                )
+                .unbounded_witness_for_test(),
             },
         ] {
             check_with_config(&expected, &value, &config)

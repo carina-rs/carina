@@ -65,6 +65,8 @@ pub enum StaticTypeResolutionError {
         first_kind: crate::schema::RefinedScalarKind,
         second_kind: crate::schema::RefinedScalarKind,
     },
+    #[error("cannot resolve declaration of custom type '{name}': {reason}", name = crate::provider_text::ProviderText::new(name), reason = crate::provider_text::ProviderText::new(reason))]
+    MissingDeclaration { name: String, reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]

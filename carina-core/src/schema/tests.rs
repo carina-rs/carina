@@ -9609,7 +9609,8 @@ fn lifted_type_expr_finite_universe_is_reflexive() {
                     "aws",
                     TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id"),
                     crate::schema::RefinedScalarKind::String,
-                ),
+                )
+                .unbounded_witness_for_test(),
             },
         ),
         (

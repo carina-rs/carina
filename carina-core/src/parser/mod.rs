@@ -33,6 +33,7 @@ mod functions;
 mod grammar;
 mod let_binding;
 mod resolve;
+mod scalar_constraints;
 pub(crate) use resolve::resolve_resource_refs_in_session_unsealed;
 pub use resolve::{
     AnalysisResolutionError, finalize_provider_configs_for_analysis,
@@ -112,7 +113,7 @@ pub use config::{
     CustomTypeResolver, CustomTypeValidationError, CustomTypeValidationTarget,
     CustomTypeValidatorFn, DecryptorFn, IdentifiedCustomTypeDeclaration, LoadedProviderContext,
     NonEmptySchemaTypeOwners, OwnedTypeIdentity, ProviderContext, ProviderCustomTypes,
-    SchemaTypeOwner, unavailable_provider_kinds,
+    ResolvedSchemaType, SchemaTypeOwner, unavailable_provider_kinds,
 };
 #[cfg(test)]
 pub(crate) use config::{fixture_custom_type_rejection, fixture_invalid_custom_type_value};
@@ -170,9 +171,7 @@ pub use types::{
     BuiltinTypeName, UnloadedSchemaType, builtin_bare_custom_types, parse_type_expr_str,
     resolve_type_expr_from_schemas,
 };
-pub(crate) use types::{
-    merge_custom_type_candidates, resolve_custom_type_identity, unknown_custom_type_error,
-};
+pub(crate) use types::{resolve_custom_type_identity, unknown_custom_type_error};
 pub(crate) use util::eval_type_name;
 pub use util::{pascal_to_snake, snake_to_pascal};
 

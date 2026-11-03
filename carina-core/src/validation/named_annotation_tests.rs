@@ -1,0 +1,669 @@
+use super::*;
+use crate::provider::{
+    BoxFuture, CanonicalProviderConfigAttributes, InitializeOutcomeMint, LoadedProviderSnapshot,
+    ProviderInitialization, ProviderReadyConfig, ProviderResult,
+};
+use crate::schema::{
+    AttributeSchema, AttributeType as DraftType, RawShape, ResourceSchema, SchemaKind,
+    TypeInSchema, ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+};
+use std::{collections::BTreeMap, sync::Arc};
+
+struct Factory {
+    owner: &'static str,
+    declarations: Vec<DraftType>,
+    config: BTreeMap<String, DraftType>,
+}
+
+impl ProviderFactory for Factory {
+    fn name(&self) -> &str {
+        self.owner
+    }
+    fn display_name(&self) -> &str {
+        self.owner
+    }
+    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+        ValidatedConfigSchema::validate(self.config.clone()).unwrap()
+    }
+    fn validate_config(&self, _: &CanonicalProviderConfigAttributes) -> ProviderResult<()> {
+        Ok(())
+    }
+    fn create_provider(
+        &self,
+        _: Option<&str>,
+        _: &ProviderReadyConfig,
+        _: InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
+        Box::pin(async { panic!("annotation fixtures only validate") })
+    }
+    fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+        let schema = self.declarations.iter().enumerate().fold(
+            ResourceSchema::new("Values"),
+            |schema, (index, declaration)| {
+                schema.attribute(
+                    AttributeSchema::optional(format!("value{index}"), declaration.clone()).build(),
+                )
+            },
+        );
+        vec![schema.validate().unwrap()]
+    }
+    fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
+        ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+            vec![],
+        )
+        .unwrap()
+    }
+}
+
+fn text(value: impl Into<String>) -> Value {
+    Value::Concrete(crate::resource::ConcreteValue::String(value.into().into()))
+}
+fn integer(value: i64) -> Value {
+    Value::Concrete(crate::resource::ConcreteValue::Int(value))
+}
+fn list(values: Vec<Value>) -> Value {
+    Value::Concrete(crate::resource::ConcreteValue::List(values))
+}
+fn map(values: indexmap::IndexMap<String, Value>) -> Value {
+    Value::Concrete(crate::resource::ConcreteValue::Map(values))
+}
+
+fn identity() -> TypeIdentity {
+    TypeIdentity::from_schema_type("aws", "iam.Role", "Name")
+}
+
+fn string(min: u64, max: u64, pattern: Option<&str>) -> DraftType {
+    DraftType::refined_string(
+        Some(identity()),
+        pattern.map(str::to_string),
+        Some((Some(min), Some(max))),
+        None,
+    )
+}
+
+fn snapshot(owners: Vec<(&'static str, Vec<DraftType>)>) -> LoadedProviderSnapshot {
+    snapshot_with_config(owners, BTreeMap::new())
+}
+
+fn snapshot_with_config(
+    owners: Vec<(&'static str, Vec<DraftType>)>,
+    config: BTreeMap<String, DraftType>,
+) -> LoadedProviderSnapshot {
+    let factories = owners
+        .into_iter()
+        .map(|(owner, declarations)| {
+            Box::new(Factory {
+                owner,
+                declarations,
+                config: config.clone(),
+            }) as Box<dyn ProviderFactory>
+        })
+        .collect();
+    crate::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(factories),
+        SchemaRegistry::new(),
+        crate::EnvironmentSnapshot::empty(),
+    )
+}
+
+fn annotation(snapshot: &LoadedProviderSnapshot) -> TypeExpr {
+    let context = snapshot.provider_context().as_provider_context();
+    let ty = crate::parser::parse_type_expr_str(&identity().to_string(), context).unwrap();
+    resolve_type_expr(&ty, context).unwrap()
+}
+
+fn declaration<'a>(
+    snapshot: &'a LoadedProviderSnapshot,
+    owner: &str,
+    index: usize,
+) -> &'a AttributeType {
+    snapshot
+        .schema_registry()
+        .get(owner, "Values", SchemaKind::Resource)
+        .unwrap()
+        .schema()
+        .parts()
+        .attributes[&format!("value{index}")]
+        .attr_type()
+}
+
+fn assign(
+    source: &AttributeType,
+    sink: &AttributeType,
+    snapshot: &LoadedProviderSnapshot,
+    owner: &str,
+) -> bool {
+    let owner = crate::parser::SchemaTypeOwner::Provider(owner.into());
+    source
+        .in_schema(crate::schema::empty_defs_for_schema_walks())
+        .is_assignable_to(
+            sink.in_schema(crate::schema::empty_defs_for_schema_walks())
+                .with_authority(
+                    &snapshot
+                        .provider_context()
+                        .as_provider_context()
+                        .custom_types,
+                    crate::schema::SinkAuthority::Owner(&owner),
+                ),
+        )
+}
+
+#[test]
+fn lifting_preserves_all_string_obligations_in_nested_annotations() {
+    let snapshot = snapshot(vec![("awscc", vec![string(1, 64, Some("^[A-Z]+$"))])]);
+    let ty = annotation(&snapshot);
+    let lifted = lift_type_expr(&ty).unwrap();
+    assert!(matches!(
+        lifted.raw_shape(),
+        RawShape::String {
+            length: Some((Some(1), Some(64))),
+            ..
+        }
+    ));
+    assert!(lifted.validate(&text("VALID")).is_ok());
+    assert!(lifted.validate(&text("invalid")).is_err());
+    assert!(lifted.validate(&text("A".repeat(65))).is_err());
+    let nested = lift_type_expr(&TypeExpr::List(Box::new(TypeExpr::Map(Box::new(ty))))).unwrap();
+    assert!(
+        nested
+            .validate(&list(vec![map(indexmap::IndexMap::from([(
+                "name".into(),
+                text("invalid")
+            )]))]))
+            .is_err()
+    );
+}
+
+#[test]
+fn every_owner_and_every_declaration_contribute_order_independently() {
+    let first = vec![string(1, 64, Some("^A")), string(8, 128, Some("Z$"))];
+    let second = vec![string(4, 80, Some("^[A-Z]+$"))];
+    let a = snapshot(vec![("p", first.clone()), ("q", second.clone())]);
+    let b = snapshot(vec![
+        ("q", second),
+        ("p", first.into_iter().rev().collect()),
+    ]);
+    assert_eq!(annotation(&a), annotation(&b));
+    let lifted = lift_type_expr(&annotation(&a)).unwrap();
+    assert_eq!(
+        inference::attribute_type_to_type_expr(&lifted, "p"),
+        annotation(&a)
+    );
+    assert!(matches!(
+        lifted.raw_shape(),
+        RawShape::String {
+            length: Some((Some(8), Some(64))),
+            ..
+        }
+    ));
+    for (owner, index) in [("p", 0), ("p", 1), ("q", 0)] {
+        assert!(assign(&lifted, declaration(&a, owner, index), &a, owner));
+    }
+    assert!(lifted.validate(&text("AAAAAAAZ")).is_ok());
+    for rejected in ["BAAAAAAZ", "AAAAAAAA", "AaaaaaaZ", "AZ"] {
+        assert!(lifted.validate(&text(rejected)).is_err(), "{rejected}");
+    }
+    let narrower = snapshot(vec![("p", vec![string(10, 32, None)])]);
+    assert!(!assign(
+        &lifted,
+        declaration(&narrower, "p", 0),
+        &narrower,
+        "p"
+    ));
+    let wire = serde_json::to_value(annotation(&a)).unwrap();
+    assert_eq!(wire["SchemaType"]["owned"]["origin"], "Annotation");
+    let restored: TypeExpr = serde_json::from_value(wire).unwrap();
+    assert_eq!(restored, annotation(&a));
+    assert!(
+        lift_type_expr(&restored)
+            .unwrap()
+            .validate(&text("BAAAAAAZ"))
+            .is_err()
+    );
+}
+
+#[test]
+fn numeric_annotation_intersections_preserve_effective_ranges() {
+    for (declarations, expected) in [
+        (
+            vec![
+                DraftType::refined_int(Some(identity()), Some((Some(-2), Some(64)))),
+                DraftType::refined_int(Some(identity()), Some((Some(8), Some(128)))),
+            ],
+            "range 8..=64",
+        ),
+        (
+            vec![
+                DraftType::refined_float(Some(identity()), Some((Some(-0.5), Some(64.5)))),
+                DraftType::refined_float(Some(identity()), Some((Some(8.5), Some(128.5)))),
+            ],
+            "range 8.5..=64.5",
+        ),
+    ] {
+        let a = snapshot(vec![("p", declarations.clone())]);
+        let b = snapshot(vec![("p", declarations.into_iter().rev().collect())]);
+        assert_eq!(annotation(&a), annotation(&b));
+        let lifted = lift_type_expr(&annotation(&a)).unwrap();
+        assert!(assign(&lifted, declaration(&a, "p", 0), &a, "p"));
+        assert!(assign(&lifted, declaration(&a, "p", 1), &a, "p"));
+        assert!(lifted.validate(&integer(16)).is_ok());
+        assert!(lifted.validate(&integer(7)).is_err());
+        assert!(lifted.validate(&integer(65)).is_err());
+        let (_, actual) = TypeInSchema::schemaless(&lifted)
+            .mismatch_type_names(TypeInSchema::schemaless(declaration(&a, "p", 0)));
+        assert!(actual.contains(expected), "{actual}");
+    }
+}
+
+#[test]
+fn nominal_pattern_policy_is_preserved_and_diagnostics_show_each_pattern() {
+    let a = snapshot(vec![("p", vec![string(1, 64, Some("^A"))])]);
+    let b = snapshot(vec![("p", vec![string(1, 64, Some("Z$"))])]);
+    let source = lift_type_expr(&annotation(&a)).unwrap();
+    let sink = declaration(&b, "p", 0);
+    assert!(
+        assign(&source, sink, &b, "p"),
+        "nominal assignment must keep its existing pattern policy"
+    );
+    let (expected, actual) =
+        TypeInSchema::schemaless(&source).mismatch_type_names(TypeInSchema::schemaless(sink));
+    assert!(expected.contains("pattern \"Z$\""), "{expected}");
+    assert!(actual.contains("pattern \"^A\""), "{actual}");
+    let source = AttributeType::refined_string(
+        None,
+        Some(crate::schema::CompiledPattern::try_new("^A").unwrap()),
+        None,
+        None,
+    );
+    let sink = AttributeType::refined_string(
+        None,
+        Some(crate::schema::CompiledPattern::try_new("Z$").unwrap()),
+        None,
+        None,
+    );
+    assert!(!assign(&source, &sink, &b, "p"));
+    let (expected, actual) =
+        TypeInSchema::schemaless(&source).mismatch_type_names(TypeInSchema::schemaless(&sink));
+    assert!(
+        expected.contains("length unbounded, pattern \"Z$\""),
+        "{expected}"
+    );
+    assert!(
+        actual.contains("length unbounded, pattern \"^A\""),
+        "{actual}"
+    );
+}
+
+#[test]
+fn empty_intersections_are_explicit_and_reject_values_and_assignments() {
+    for declarations in [
+        vec![string(1, 4, None), string(8, 12, None)],
+        vec![
+            DraftType::refined_int(Some(identity()), Some((Some(1), Some(4)))),
+            DraftType::refined_int(Some(identity()), Some((Some(8), Some(12)))),
+        ],
+        vec![
+            DraftType::refined_float(Some(identity()), Some((Some(1.0), Some(4.0)))),
+            DraftType::refined_float(Some(identity()), Some((Some(8.0), Some(12.0)))),
+        ],
+    ] {
+        let snapshot = snapshot(vec![("p", declarations)]);
+        let ty = annotation(&snapshot);
+        let lifted = lift_type_expr(&ty).unwrap();
+        assert!(!assign(
+            &lifted,
+            declaration(&snapshot, "p", 0),
+            &snapshot,
+            "p"
+        ));
+        assert!(!assign(
+            declaration(&snapshot, "p", 0),
+            &lifted,
+            &snapshot,
+            "p"
+        ));
+        assert!(!assign(&lifted, &lifted, &snapshot, "p"));
+        let value = match lifted.raw_shape() {
+            RawShape::String { .. } => text("ABC"),
+            _ => integer(3),
+        };
+        assert!(
+            lifted
+                .validate(&value)
+                .unwrap_err()
+                .to_string()
+                .contains("empty intersection")
+        );
+        let wire = serde_json::to_value(&ty).unwrap();
+        assert_eq!(
+            wire["SchemaType"]["owned"]["constraints"]["empty_intersection"],
+            true
+        );
+        let restored: TypeExpr = serde_json::from_value(wire).unwrap();
+        assert_eq!(restored, ty);
+        assert!(
+            lift_type_expr(&restored)
+                .unwrap()
+                .has_empty_scalar_intersection()
+        );
+    }
+}
+
+#[test]
+fn exact_schema_projections_keep_their_declaration_instead_of_sibling_constraints() {
+    let snapshot = snapshot(vec![("p", vec![string(1, 128, None), string(8, 64, None)])]);
+    let source = declaration(&snapshot, "p", 0);
+    let exact = inference::attribute_type_to_type_expr(source, "p");
+    let lifted = lift_type_expr(&exact).unwrap();
+    assert!(matches!(
+        lifted.raw_shape(),
+        RawShape::String {
+            length: Some((Some(1), Some(128))),
+            ..
+        }
+    ));
+    assert_ne!(exact, annotation(&snapshot));
+    assert!(!assign(
+        &lifted,
+        declaration(&snapshot, "p", 1),
+        &snapshot,
+        "p"
+    ));
+    typecheck::check_type_expr_value(
+        &exact,
+        &text("A".repeat(80)),
+        snapshot.provider_context(),
+        typecheck::TypecheckInference::Unavailable,
+    )
+    .require_provider_schemas()
+    .expect("an exact source value must not inherit its narrower sibling's bound");
+    let (expected, actual) = TypeInSchema::schemaless(&lifted)
+        .mismatch_type_names(TypeInSchema::schemaless(declaration(&snapshot, "p", 1)));
+    assert_eq!(expected, "aws.iam.Role.Name (length 8..=64)");
+    assert_eq!(actual, "aws.iam.Role.Name (length 1..=128)");
+    let wire = serde_json::to_value(&exact).unwrap();
+    assert_eq!(wire["SchemaType"]["owned"]["origin"], "Projection");
+    let restored: TypeExpr = serde_json::from_value(wire).unwrap();
+    assert_eq!(restored, exact);
+    typecheck::check_type_expr_value(
+        &restored,
+        &text("A".repeat(80)),
+        snapshot.provider_context(),
+        typecheck::TypecheckInference::Unavailable,
+    )
+    .require_provider_schemas()
+    .expect("serde must retain the exact projection's validation scope");
+}
+
+#[test]
+fn exact_projection_value_validation_keeps_its_callback_without_sibling_callbacks() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let wide_calls = Arc::clone(&calls);
+    let narrow_calls = Arc::clone(&calls);
+    let wide = DraftType::refined_string_with_validator(
+        identity(),
+        None,
+        Some((Some(1), Some(128))),
+        crate::schema::legacy_validator(move |_| {
+            wide_calls.lock().unwrap().push("wide");
+            Ok(())
+        }),
+        None,
+    );
+    let narrow = DraftType::refined_string_with_validator(
+        identity(),
+        None,
+        Some((Some(8), Some(64))),
+        crate::schema::legacy_validator(move |_| {
+            narrow_calls.lock().unwrap().push("narrow");
+            Err("sibling callback rejected".into())
+        }),
+        None,
+    );
+    let snapshot = snapshot(vec![("p", vec![wide, narrow])]);
+    let exact = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 0), "p");
+    let value = text("A".repeat(16));
+    typecheck::check_type_expr_value(
+        &exact,
+        &value,
+        snapshot.provider_context(),
+        typecheck::TypecheckInference::Unavailable,
+    )
+    .require_provider_schemas()
+    .expect("only the exact declaration's callback may validate this source");
+    assert_eq!(*calls.lock().unwrap(), ["wide"]);
+    let error = typecheck::check_type_expr_value(
+        &annotation(&snapshot),
+        &value,
+        snapshot.provider_context(),
+        typecheck::TypecheckInference::Unavailable,
+    )
+    .require_provider_schemas()
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("sibling callback rejected"),
+        "{error}"
+    );
+    assert_eq!(*calls.lock().unwrap(), ["wide", "wide", "narrow"]);
+}
+
+#[test]
+fn config_only_declarations_join_resource_declarations_and_truly_unbounded_types_lift() {
+    let snapshot = snapshot_with_config(
+        vec![("p", vec![string(1, 128, None)])],
+        BTreeMap::from([("config_name".into(), string(8, 64, None))]),
+    );
+    let lifted = lift_type_expr(&annotation(&snapshot)).unwrap();
+    assert!(matches!(
+        lifted.raw_shape(),
+        RawShape::String {
+            length: Some((Some(8), Some(64))),
+            ..
+        }
+    ));
+    let config_only = snapshot_with_config(
+        vec![("p", vec![])],
+        BTreeMap::from([("config_name".into(), string(2, 16, None))]),
+    );
+    assert!(matches!(
+        lift_type_expr(&annotation(&config_only))
+            .unwrap()
+            .raw_shape(),
+        RawShape::String {
+            length: Some((Some(2), Some(16))),
+            ..
+        }
+    ));
+    let unbounded = self::snapshot(vec![(
+        "p",
+        vec![DraftType::refined_string(
+            Some(identity()),
+            None,
+            None,
+            None,
+        )],
+    )]);
+    let ty = annotation(&unbounded);
+    let wire = serde_json::to_value(&ty).unwrap();
+    assert_eq!(
+        wire["SchemaType"]["owned"]["constraints"]["scalar"]["String"]["length"]["min"],
+        "Unbounded"
+    );
+    let restored: TypeExpr = serde_json::from_value(wire).unwrap();
+    assert_eq!(restored, ty);
+    assert!(
+        lift_type_expr(&restored)
+            .unwrap()
+            .validate(&text(""))
+            .is_ok()
+    );
+}
+
+#[test]
+fn annotation_resolution_rejects_missing_owners_and_defers_partial_catalogs() {
+    use crate::parser::{CustomTypeResolver, CustomTypeValidationError, SchemaTypeOwner};
+    let snapshot = snapshot(vec![("p", vec![string(1, 64, None)])]);
+    let context = snapshot.provider_context().as_provider_context();
+    let TypeExpr::SchemaType { owned } = annotation(&snapshot) else {
+        panic!("resolved annotation")
+    };
+    let mut missing = serde_json::to_value(&owned).unwrap();
+    missing["owners"] = serde_json::to_value(crate::parser::NonEmptySchemaTypeOwners::singleton(
+        SchemaTypeOwner::Provider("missing".into()),
+    ))
+    .unwrap();
+    let missing = serde_json::from_value(missing).unwrap();
+    assert!(matches!(
+        context.custom_types.annotation_declaration(&missing),
+        Err(CustomTypeValidationError::MissingDeclaration { .. })
+    ));
+    let mut partial = context.clone();
+    partial.custom_types = context
+        .custom_types
+        .with_failed_providers(std::collections::BTreeSet::from(["p".into()]));
+    let ty = crate::parser::parse_type_expr_str(&identity().to_string(), &partial).unwrap();
+    let resolved = resolve_type_expr(&ty, &partial).unwrap();
+    assert!(matches!(resolved, TypeExpr::UnloadedSchemaType(_)));
+    assert!(matches!(
+        partial.custom_types.annotation_declaration(&owned),
+        Err(CustomTypeValidationError::ProvidersNotLoaded)
+    ));
+    let available = context
+        .custom_types
+        .with_failed_providers(std::collections::BTreeSet::from(["unrelated".into()]));
+    assert_eq!(available.annotation_declaration(&owned).unwrap(), owned);
+}
+
+fn call_findings(
+    source: &str,
+    caller: &LoadedProviderSnapshot,
+    sink: TypeExpr,
+) -> Vec<ModuleCallFinding> {
+    let context = caller.provider_context();
+    let parsed = crate::parser::parse(source, context.as_provider_context()).unwrap();
+    let signatures = std::collections::HashMap::from([(
+        "child".into(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![crate::parser::ConsumerArgumentParameter {
+                name: "x".into(),
+                static_type: StaticType::Known(ConsumerResolvedType::new(sink)),
+                default: None,
+                description: None,
+                validations: vec![],
+            }],
+            attributes: IndexMap::new(),
+            requires: vec![],
+        },
+    )]);
+    let schemas = caller.schema_registry();
+    let report = check_bare_binding_uses(
+        &parsed,
+        &ValidationTypeContext::new(&parsed, schemas, context, &signatures),
+    );
+    let bindings = BindingIndex::from_parsed_with_module_signatures(
+        &parsed,
+        schemas,
+        &signatures,
+        context.as_provider_context(),
+    );
+    deferred_types::with_session_for_test(context, |session| {
+        check_module_calls(ModuleCallCheckInput {
+            authored: &parsed,
+            semantic: Some(&parsed),
+            base_dir: None,
+            imported_signatures: &signatures,
+            provider_context: session,
+            schemas,
+            binding_use_report: &report,
+            bindings: &bindings,
+            reference_checks: ModuleCallReferenceChecks::Enabled,
+        })
+        .unwrap()
+    })
+}
+
+#[test]
+fn module_call_boundaries_check_schema_sources_and_forwarded_caller_arguments() {
+    let callee = snapshot(vec![("p", vec![string(1, 64, None)])]);
+    for width in [32, 64, 128] {
+        let caller = snapshot(vec![("p", vec![string(1, width, None)])]);
+        for source in [
+            "let child = use { source = './child' }\nlet source = p.Values { value0 = 'VALID' }\nlet instance = child { x = source.value0 }\n",
+            "arguments { x: aws.iam.Role.Name }\nlet child = use { source = './child' }\nlet instance = child { x = x }\n",
+        ] {
+            let findings = call_findings(source, &caller, annotation(&callee));
+            if width <= 64 {
+                assert!(findings.is_empty(), "width {width}: {findings:#?}");
+            } else {
+                assert!(
+                    !findings.is_empty(),
+                    "wider same-identity source must fail: {source}"
+                );
+                assert!(
+                    findings.iter().any(|finding| {
+                        let message = finding.message().to_string();
+                        message.contains("expected aws.iam.Role.Name (length 1..=64)")
+                            && message.contains("got aws.iam.Role.Name (length 1..=128)")
+                    }),
+                    "{findings:#?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn module_call_literal_values_obey_the_resolved_witness() {
+    let caller = snapshot(vec![("p", vec![string(1, 128, None)])]);
+    let callee = snapshot(vec![("p", vec![string(1, 64, None)])]);
+    let source = format!(
+        "let child = use {{ source = './child' }}\nlet instance = child {{ x = '{}' }}\n",
+        "A".repeat(65)
+    );
+    let findings = call_findings(&source, &caller, annotation(&callee));
+    assert!(
+        findings.iter().any(|finding| finding
+            .message()
+            .to_string()
+            .contains("length 65 is outside allowed range [1, 64]")),
+        "{findings:#?}"
+    );
+}
+
+#[test]
+fn unbounded_annotation_constraints_admit_explicitly_unbounded_schema_declarations() {
+    for declarations in [
+        vec![
+            DraftType::refined_string(Some(identity()), None, None, None),
+            DraftType::refined_string(Some(identity()), None, Some((None, None)), None),
+        ],
+        vec![
+            DraftType::refined_int(Some(identity()), None),
+            DraftType::refined_int(Some(identity()), Some((None, None))),
+        ],
+        vec![
+            DraftType::refined_float(Some(identity()), None),
+            DraftType::refined_float(Some(identity()), Some((None, None))),
+        ],
+    ] {
+        let snapshot = snapshot(vec![("p", declarations)]);
+        let lifted = lift_type_expr(&annotation(&snapshot)).unwrap();
+        for index in [0, 1] {
+            assert!(assign(
+                &lifted,
+                declaration(&snapshot, "p", index),
+                &snapshot,
+                "p"
+            ));
+            assert!(assign(
+                declaration(&snapshot, "p", index),
+                &lifted,
+                &snapshot,
+                "p"
+            ));
+        }
+    }
+}

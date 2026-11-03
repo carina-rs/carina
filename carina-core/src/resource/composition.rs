@@ -2364,7 +2364,8 @@ mod tests {
                 "aws",
                 crate::schema::TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id"),
                 crate::schema::RefinedScalarKind::String,
-            ),
+            )
+            .unbounded_witness_for_test(),
         };
         let argument: LiveCompositionArgument = LiveCompositionArgument::from_value(
             Value::Deferred(DeferredValue::ResourceRef {

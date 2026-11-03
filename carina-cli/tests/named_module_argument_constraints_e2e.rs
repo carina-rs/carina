@@ -49,6 +49,7 @@ impl ProviderFactory for AwsTestFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .expect("IAM role name schema witness")
     }

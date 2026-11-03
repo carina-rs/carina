@@ -665,13 +665,22 @@ pub fn validate_schema_custom_type<P: PlaceholderKind, B: BindingAddress>(
     value: &GenericValue<P, B>,
     config: &crate::parser::LoadedProviderContext,
 ) -> Result<(), crate::parser::CustomTypeValidationError> {
-    validate_schema_custom_type_with_context(owned, value, config)
+    validate_schema_custom_type_key_with_context(owned, value, config, None)
 }
 
 pub(crate) fn validate_schema_custom_type_with_context<P: PlaceholderKind, B: BindingAddress>(
+    owned: &crate::parser::ResolvedSchemaType,
+    value: &GenericValue<P, B>,
+    config: &ProviderContext,
+) -> Result<(), crate::parser::CustomTypeValidationError> {
+    validate_schema_custom_type_key_with_context(owned, value, config, Some(owned))
+}
+
+fn validate_schema_custom_type_key_with_context<P: PlaceholderKind, B: BindingAddress>(
     owned: &crate::parser::OwnedTypeIdentity,
     value: &GenericValue<P, B>,
     config: &ProviderContext,
+    witness: Option<&crate::parser::ResolvedSchemaType>,
 ) -> Result<(), crate::parser::CustomTypeValidationError> {
     match value {
         GenericValue::Deferred(
@@ -718,10 +727,62 @@ pub(crate) fn validate_schema_custom_type_with_context<P: PlaceholderKind, B: Bi
             unreachable!("deferred values returned before provider validation")
         }
     };
-    config.custom_type_resolver().validate(
-        crate::parser::CustomTypeValidationTarget::Annotation(owned),
-        &value,
-    )
+    if let Some(projection) = witness.and_then(crate::parser::ResolvedSchemaType::projection) {
+        if let Some(declaration) = super::IdentifiedCustomTypeDeclaration::new(projection) {
+            config.custom_type_resolver().validate(
+                super::CustomTypeValidationTarget::Declaration {
+                    owner: owned.provider_names().next().expect("nonempty owners"),
+                    declaration,
+                },
+                &value,
+            )?;
+        } else {
+            projection
+                .validate_identified_scalar_value(&value)
+                .map_err(
+                    |error| super::CustomTypeValidationError::InvalidDeclarationValue {
+                        owner: owned
+                            .provider_names()
+                            .next()
+                            .expect("nonempty owners")
+                            .into(),
+                        identity: owned.identity().clone(),
+                        error: Box::new(error),
+                    },
+                )?;
+        }
+    } else {
+        config
+            .custom_type_resolver()
+            .validate(super::CustomTypeValidationTarget::Annotation(owned), &value)?;
+    }
+    // The resolved witness can cross a catalog boundary (including serde).
+    // Retain its constraints even when the current catalog is less restrictive.
+    // Enum spellings are canonicalized and checked by the catalog above.
+    if let Some(witness) = witness
+        && matches!(
+            value,
+            GenericValue::Concrete(
+                ConcreteValue::String(_) | ConcreteValue::Int(_) | ConcreteValue::Float(_)
+            )
+        )
+    {
+        witness
+            .materialize()
+            .validate_identified_scalar_value(&value)
+            .map_err(
+                |error| crate::parser::CustomTypeValidationError::InvalidDeclarationValue {
+                    owner: owned
+                        .provider_names()
+                        .next()
+                        .expect("nonempty owners")
+                        .into(),
+                    identity: owned.identity().clone(),
+                    error: Box::new(error),
+                },
+            )?;
+    }
+    Ok(())
 }
 
 /// Check that a function argument matches the declared parameter type.
@@ -793,7 +854,8 @@ fn check_fn_arg_type<Source: Clone>(
             let name = match &error {
                     crate::static_type::StaticTypeResolutionError::UnknownCustomType { name }
                     | crate::static_type::StaticTypeResolutionError::UnknownCustomTypeWithSuggestion { name, .. }
-                    | crate::static_type::StaticTypeResolutionError::ConflictingScalarKinds { name, .. } => name,
+                    | crate::static_type::StaticTypeResolutionError::ConflictingScalarKinds { name, .. }
+            | crate::static_type::StaticTypeResolutionError::MissingDeclaration { name, .. } => name,
                 };
             let error = match parameter.type_span {
                 Some(span) => {

@@ -4859,7 +4859,9 @@ mod tests {
         assert_eq!(
             exports["ups"]["out"].static_type,
             UpstreamExportType::Static(ExportStaticType::Inferred(consumer_inferred_type(
-                TypeExpr::List(Box::new(TypeExpr::SchemaType { owned })),
+                TypeExpr::List(Box::new(TypeExpr::SchemaType {
+                    owned: owned.unbounded_witness_for_test()
+                })),
             )))
         );
     }

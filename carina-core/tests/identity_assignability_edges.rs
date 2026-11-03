@@ -1,7 +1,7 @@
 #[path = "support/identity_edges.rs"]
 pub mod identity_edges;
 
-use carina_core::parser::{ProviderCustomTypes, SchemaTypeOwner, TypeExpr};
+use carina_core::parser::{CustomTypeResolver, ProviderCustomTypes, SchemaTypeOwner, TypeExpr};
 use carina_core::schema::{AttributeType, SchemaKind, StructField, TypeInSchema};
 use identity_edges::{identity, snapshot, string};
 
@@ -271,7 +271,7 @@ fn identity_edges_require_every_annotation_owner() {
             .unwrap();
         assert_eq!(owned.owners().iter().len(), 2);
         let sink = carina_core::validation::lift_type_expr(&TypeExpr::SchemaType {
-            owned: owned.clone(),
+            owned: catalog.annotation_declaration(owned).unwrap(),
         })
         .unwrap();
         let schema = loaded
@@ -444,13 +444,13 @@ fn identity_edges_retain_each_annotation_leafs_owner_set() {
                 (
                     "first".into(),
                     TypeExpr::SchemaType {
-                        owned: p_only.clone(),
+                        owned: catalog.annotation_declaration(&p_only).unwrap(),
                     },
                 ),
                 (
                     "second".into(),
                     TypeExpr::List(Box::new(TypeExpr::Map(Box::new(TypeExpr::SchemaType {
-                        owned: second,
+                        owned: catalog.annotation_declaration(&second).unwrap(),
                     })))),
                 ),
             ],

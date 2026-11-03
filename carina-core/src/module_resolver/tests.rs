@@ -6768,7 +6768,9 @@ fn test_argument_type_custom_validator() {
     module.resources.clear();
     module.arguments = vec![ArgumentParameter {
         name: "policy_arn".to_string(),
-        static_type: known(TypeExpr::SchemaType { owned }),
+        static_type: known(TypeExpr::SchemaType {
+            owned: owned.unbounded_witness_for_test(),
+        }),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -6865,7 +6867,9 @@ fn test_argument_type_list_of_custom_type() {
     module.resources.clear();
     module.arguments = vec![ArgumentParameter {
         name: "policy_arns".to_string(),
-        static_type: known(TypeExpr::List(Box::new(TypeExpr::SchemaType { owned }))),
+        static_type: known(TypeExpr::List(Box::new(TypeExpr::SchemaType {
+            owned: owned.unbounded_witness_for_test(),
+        }))),
         default: None,
         description: None,
         validations: Vec::new(),

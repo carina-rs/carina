@@ -263,6 +263,7 @@ impl DeclaredValueSource {
 /// The first source constraint that failed assignment to a sink.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefTypeMismatch {
+    expected: Option<String>,
     actual: String,
     declared: Option<String>,
 }
@@ -277,6 +278,7 @@ pub enum RefTypeAssignabilityError {
 impl RefTypeMismatch {
     pub(crate) fn direct(actual: String) -> Self {
         Self {
+            expected: None,
             actual,
             declared: None,
         }
@@ -284,6 +286,10 @@ impl RefTypeMismatch {
 
     pub fn actual_type_name(&self) -> &str {
         &self.actual
+    }
+
+    pub fn expected_type_name(&self) -> Option<&str> {
+        self.expected.as_deref()
     }
 
     /// Present only when forwarded/inferred evidence failed after the
@@ -444,7 +450,7 @@ impl ResolvedRefType {
         sink: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
         bindings: &BindingIndex<'_, B>,
     ) -> Result<(), RefTypeAssignabilityError> {
-        self.check_assignment(|source| bindings.check_type_assignment(source, sink))
+        self.check_assignment(*sink, |source| bindings.check_type_assignment(source, sink))
     }
 
     /// Inspect an incoming boundary without consuming or recording deferrals.
@@ -464,6 +470,7 @@ impl ResolvedRefType {
 
     pub(crate) fn check_assignment(
         &self,
+        expected: TypeInSchema<'_, crate::schema::Compiled>,
         mut judge: impl FnMut(
             TypeInSchema<'_, crate::schema::Compiled>,
         ) -> Result<bool, crate::parser::CustomTypeValidationError>,
@@ -472,8 +479,10 @@ impl ResolvedRefType {
         if !judge(authoritative)
             .map_err(|reason| RefTypeAssignabilityError::Unchecked(Box::new(reason)))?
         {
+            let (expected, actual) = authoritative.mismatch_type_names(expected);
             return Err(RefTypeAssignabilityError::Mismatch(RefTypeMismatch {
-                actual: authoritative.resolved_type_name(),
+                expected: Some(expected),
+                actual,
                 declared: None,
             }));
         }
@@ -483,8 +492,10 @@ impl ResolvedRefType {
             if !judge(evidence)
                 .map_err(|reason| RefTypeAssignabilityError::Unchecked(Box::new(reason)))?
             {
+                let (expected, actual) = evidence.mismatch_type_names(expected);
                 return Err(RefTypeAssignabilityError::Mismatch(RefTypeMismatch {
-                    actual: evidence.resolved_type_name(),
+                    expected: Some(expected),
+                    actual,
                     declared: self
                         .authoritative
                         .is_declared_composition_attribute()
@@ -1039,6 +1050,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
             // authoritative declaration resolution owns their diagnostic.
             Err(
                 crate::static_type::StaticTypeResolutionError::ConflictingScalarKinds { .. }
+                | crate::static_type::StaticTypeResolutionError::MissingDeclaration { .. }
                 | crate::static_type::StaticTypeResolutionError::UnknownCustomType { .. }
                 | crate::static_type::StaticTypeResolutionError::UnknownCustomTypeWithSuggestion {
                     ..
@@ -4174,7 +4186,8 @@ let vpc = aws.ec2.Vpc {
                         "aws",
                         crate::schema::TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id"),
                         crate::schema::RefinedScalarKind::String,
-                    ),
+                    )
+                    .unbounded_witness_for_test(),
                 }),
             },
             ChainType {
@@ -4189,7 +4202,8 @@ let vpc = aws.ec2.Vpc {
                             "Id",
                         ),
                         crate::schema::RefinedScalarKind::String,
-                    ),
+                    )
+                    .unbounded_witness_for_test(),
                 }),
             },
             ChainType {
@@ -4532,7 +4546,8 @@ let vpc = aws.ec2.Vpc {
                                         "aws", "ec2.Vpc", "Id",
                                     ),
                                     crate::schema::RefinedScalarKind::String,
-                                ),
+                                )
+                                .unbounded_witness_for_test(),
                             },
                         )),
                     ),

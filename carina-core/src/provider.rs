@@ -7758,7 +7758,7 @@ where
                     owner,
                     &declarations[0],
                 )
-                .expect("validated identified declarations have a scalar kind");
+                .expect("admitted identified declaration");
                 declarations_by_identity
                     .entry((identity.clone(), owned.scalar_kind()))
                     .and_modify(|existing| {
@@ -7776,6 +7776,39 @@ impl<F> crate::parser::CustomTypeResolver for FactoryCustomTypeResolver<F>
 where
     F: ProviderFactorySource,
 {
+    fn annotation_declaration(
+        &self,
+        owned: &crate::parser::OwnedTypeIdentity,
+    ) -> Result<crate::parser::ResolvedSchemaType, crate::parser::CustomTypeValidationError> {
+        use crate::parser::{CustomTypeValidationError, ResolvedSchemaType, SchemaTypeOwner};
+        let mut resolved: Option<ResolvedSchemaType> = None;
+        for owner in owned.owners().iter() {
+            let SchemaTypeOwner::Provider(owner) = owner;
+            let missing = || CustomTypeValidationError::MissingDeclaration {
+                owner: owner.clone(),
+                identity: owned.identity().clone(),
+            };
+            let declarations = self
+                .index
+                .get(owner)
+                .and_then(|index| index.declarations.get(owned.identity()))
+                .filter(|declarations| !declarations.is_empty())
+                .ok_or_else(missing)?;
+            for declaration in declarations {
+                let declaration = ResolvedSchemaType::from_schema_declaration(owner, declaration)
+                    .filter(|declaration| declaration.scalar_kind() == owned.scalar_kind())
+                    .ok_or_else(missing)?;
+                resolved = Some(match resolved {
+                    Some(existing) => existing.conjoin(&declaration),
+                    None => declaration,
+                });
+            }
+        }
+        Ok(resolved
+            .expect("nonempty owners and declarations")
+            .into_annotation())
+    }
+
     fn validate<'a>(
         &self,
         target: crate::parser::CustomTypeValidationTarget<'a>,
