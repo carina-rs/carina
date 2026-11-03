@@ -219,12 +219,15 @@ use crate::value::{
 };
 
 mod assignability;
+mod assignability_edges;
 mod fingerprint;
 mod resolved_attr_type;
 mod resolved_union_members;
 mod type_identity;
 
 pub use assignability::{TypeAssignability, TypeAssignmentDeferral};
+pub(crate) use assignability_edges::AssignabilityClosure;
+pub use assignability_edges::AssignabilityEdge;
 pub use carina_provider_protocol::types::{
     DslTransform, ListElements, ReferenceForm, ReferenceTemplate, ReferenceTemplateError,
 };
@@ -9820,6 +9823,25 @@ pub enum ProviderSchemaValidationError {
         identity: TypeIdentity,
         declaration: IdentifiedDeclarationKind,
     },
+    DanglingAssignabilityEndpoint {
+        identity: TypeIdentity,
+    },
+    AssignabilityScalarKindMismatch {
+        source: TypeIdentity,
+        sink: TypeIdentity,
+        source_kind: RefinedScalarKind,
+        sink_kind: RefinedScalarKind,
+    },
+    SelfAssignabilityEdge {
+        identity: TypeIdentity,
+    },
+    DuplicateAssignabilityEdge {
+        source: TypeIdentity,
+        sink: TypeIdentity,
+    },
+    AssignabilityCycle {
+        cycle: Vec<TypeIdentity>,
+    },
 }
 
 impl fmt::Display for ProviderSchemaValidationError {
@@ -9859,13 +9881,51 @@ impl fmt::Display for ProviderSchemaValidationError {
                 "reference form identity `{identity}` is declared as {declaration}, not refined String",
                 identity = ProviderText::new(identity.to_string())
             ),
+            Self::DanglingAssignabilityEndpoint { identity } => write!(
+                formatter,
+                "assignability endpoint `{}` is not declared by this provider",
+                ProviderText::new(identity.to_string())
+            ),
+            Self::AssignabilityScalarKindMismatch {
+                source,
+                sink,
+                source_kind,
+                sink_kind,
+            } => write!(
+                formatter,
+                "assignability edge `{} -> {}` has different scalar kinds: {source_kind} and {sink_kind}",
+                ProviderText::new(source.to_string()),
+                ProviderText::new(sink.to_string())
+            ),
+            Self::SelfAssignabilityEdge { identity } => write!(
+                formatter,
+                "assignability edge for `{}` points to itself",
+                ProviderText::new(identity.to_string())
+            ),
+            Self::DuplicateAssignabilityEdge { source, sink } => write!(
+                formatter,
+                "duplicate assignability edge `{} -> {}`",
+                ProviderText::new(source.to_string()),
+                ProviderText::new(sink.to_string())
+            ),
+            Self::AssignabilityCycle { cycle } => write!(
+                formatter,
+                "assignability cycle: {}",
+                ProviderText::new(
+                    cycle
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" -> ")
+                )
+            ),
         }
     }
 }
 
 impl std::error::Error for ProviderSchemaValidationError {}
 
-/// Resource schemas, provider config, and reference forms admitted together.
+/// Resource schemas, config, reference forms, and assignability edges admitted together.
 ///
 /// The fields are private so no consumer can pair a provider's resource
 /// schemas with a separately sourced config or reference-form table.
@@ -9874,13 +9934,35 @@ pub struct ValidatedProviderSchemaWitness {
     resources: Vec<ValidatedResourceSchema>,
     config: ValidatedConfigSchema,
     reference_forms: ReferenceForms,
+    assignability_edges: Vec<AssignabilityEdge>,
+    assignability_closure: AssignabilityClosure,
+}
+
+/// Exhaustive borrowed projection used at the protocol boundary.
+pub(crate) struct ProviderSchemaWitnessParts<'a> {
+    pub resources: &'a [ValidatedResourceSchema],
+    pub config: &'a ValidatedConfigSchema,
+    pub reference_forms: &'a ReferenceForms,
+    pub assignability_edges: &'a [AssignabilityEdge],
+    pub assignability_closure: &'a AssignabilityClosure,
 }
 
 impl ValidatedProviderSchemaWitness {
+    /// Admit a provider that declares no assignability edges.
     pub fn new(
         resources: Vec<ValidatedResourceSchema>,
         config: ValidatedConfigSchema,
         reference_forms: ReferenceForms,
+    ) -> Result<Self, ProviderSchemaValidationError> {
+        Self::with_assignability_edges(resources, config, reference_forms, Vec::new())
+    }
+
+    /// Admit provider schemas and validate their explicit assignability edges.
+    pub fn with_assignability_edges(
+        resources: Vec<ValidatedResourceSchema>,
+        config: ValidatedConfigSchema,
+        reference_forms: ReferenceForms,
+        assignability_edges: Vec<AssignabilityEdge>,
     ) -> Result<Self, ProviderSchemaValidationError> {
         let declarations = identified_declarations_from_witnesses(&resources, &config);
         let mut scalar_kinds = BTreeMap::<TypeIdentity, RefinedScalarKind>::new();
@@ -9937,10 +10019,14 @@ impl ValidatedProviderSchemaWitness {
             }
         }
 
+        let assignability_closure =
+            AssignabilityClosure::validate(&assignability_edges, &scalar_kinds)?;
         Ok(Self {
             resources,
             config,
             reference_forms,
+            assignability_edges,
+            assignability_closure,
         })
     }
 
@@ -9954,6 +10040,31 @@ impl ValidatedProviderSchemaWitness {
 
     pub fn reference_forms(&self) -> &ReferenceForms {
         &self.reference_forms
+    }
+
+    pub fn assignability_edges(&self) -> &[AssignabilityEdge] {
+        &self.assignability_edges
+    }
+
+    pub(crate) fn assignability_closure(&self) -> &AssignabilityClosure {
+        &self.assignability_closure
+    }
+
+    pub(crate) fn parts(&self) -> ProviderSchemaWitnessParts<'_> {
+        let Self {
+            resources,
+            config,
+            reference_forms,
+            assignability_edges,
+            assignability_closure,
+        } = self;
+        ProviderSchemaWitnessParts {
+            resources,
+            config,
+            reference_forms,
+            assignability_edges,
+            assignability_closure,
+        }
     }
 
     pub(crate) fn identified_declarations(&self) -> Vec<(TypeIdentity, CompiledAttributeType)> {

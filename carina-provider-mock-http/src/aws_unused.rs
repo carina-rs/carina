@@ -54,6 +54,10 @@ impl CarinaProvider for MockHttpAwsUnusedProvider {
         BTreeMap::new()
     }
 
+    fn assignability_edges(&self) -> Vec<carina_plugin_sdk::core::schema::AssignabilityEdge> {
+        Vec::new()
+    }
+
     fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
         ValidatedConfigSchema::validate(BTreeMap::new())
             .expect("empty mock AWS provider config schema must be valid")

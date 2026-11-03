@@ -12,18 +12,19 @@ The host and the provider talk through a versioned protocol. `carina-provider-pr
 Every time Carina starts a provider, for `validate`, `plan`, `apply` or any other command that uses it, it checks that version first and refuses to go further if it is out of range. `carina init` only downloads and records the provider without starting it, so a mismatch shows up at the first command after `init`:
 
 ```text
-provider 'hello' was built against protocol version 19 but this host requires at least version 20; rebuild the provider against the current carina protocol
+provider 'hello' was built against protocol version 20 but this host requires at least version 21; rebuild the provider against the current carina protocol
 ```
 
 ```text
-provider 'hello' was built against protocol version 21 but this host supports up to version 20; upgrade carina to load this provider
+provider 'hello' was built against protocol version 22 but this host supports up to version 21; upgrade carina to load this provider
 ```
 
 Since v0.5.0, the first release that checks the version, every release has set the minimum equal to the protocol version it speaks, so a provider has to be built for exactly the protocol version of the Carina that loads it:
 
 | Carina release | Protocol version | Oldest provider protocol it loads |
 |----------------|------------------|-----------------------------------|
-| Next release after v0.9.0 (unreleased) | 20 | 20 |
+| Next release after v0.9.0 (unreleased) | 21 | 21 |
+| Development snapshot after v0.9.0 (unreleased) | 20 | 20 |
 | Development snapshot after v0.9.0 (unreleased) | 19 | 19 |
 | Development snapshot after v0.9.0 (unreleased) | 18 | 18 |
 | Development snapshot after v0.9.0 (unreleased) | 17 | 17 |
@@ -37,7 +38,9 @@ Since v0.5.0, the first release that checks the version, every release has set t
 | v0.6.0 | 10 | 10 |
 | v0.5.0 | 10 | 10 |
 
-Only protocol 20 is current. Protocols 14 through 19 were development snapshots, and their changes remain part of protocol 20:
+Only protocol 21 is current. Its schema envelope requires `assignability_edges`, even when empty, and SDK providers must implement `CarinaProvider::assignability_edges`. Both endpoints must be declared by that provider with the same scalar kind; self edges, duplicates, and cycles are rejected. Each provider's transitive closure is retained separately. This stage stores the edges without changing assignment checks. Providers built for protocol 20 or earlier must rebuild against the current SDK.
+
+Protocols 14 through 20 were development snapshots, and their changes remain part of protocol 21:
 
 | Development protocol | Change |
 |----------------------|--------|
@@ -49,7 +52,7 @@ Only protocol 20 is current. Protocols 14 through 19 were development snapshots,
 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
 | 14 | Host-resolved AWS credentials through the typed AWS world. |
 
-Protocol 17 introduced the required list element policy. The host checks unique lists during validation, planning, and LSP diagnostics, using canonical element values. Protocol 19 added per-leaf desired normalization. Protocol 20 renames create-outcome verdicts without changing their handling; providers built for protocol 19 or earlier must rebuild against the current SDK.
+Protocol 17 introduced the required list element policy. The host checks unique lists during validation, planning, and LSP diagnostics, using canonical element values. Protocol 19 added per-leaf desired normalization. Protocol 20 renamed create-outcome verdicts without changing their handling.
 
 Protocol 18 adds string-valued reference schema leaves and the initialized provider's `resolve-references` export. Reference validation stays offline; resolution runs when preparing planning comparisons. That snapshot required providers built for protocol 17 or earlier to rebuild against the SDK supplying those WIT bindings.
 

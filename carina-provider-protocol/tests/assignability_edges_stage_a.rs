@@ -4,6 +4,32 @@
 use carina_provider_protocol::types::ProviderSchemaEnvelope;
 
 #[test]
+fn assignability_edges_constructor_rejects_self_edges() {
+    assert!(
+        carina_provider_protocol::types::AssignabilityEdgeDeclaration::new(
+            "semantic.Bucket.Name",
+            "semantic.Bucket.Name",
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn assignability_edges_deserialization_cannot_bypass_constructor_validation() {
+    assert!(
+        serde_json::from_value::<ProviderSchemaEnvelope>(serde_json::json!({
+            "resources": [],
+            "reference_forms": [],
+            "assignability_edges": [{
+                "source": "semantic.Bucket.Name",
+                "sink": "semantic.Bucket.Name",
+            }],
+        }))
+        .is_err()
+    );
+}
+
+#[test]
 fn assignability_edges_field_is_required_even_when_empty() {
     let error = serde_json::from_value::<ProviderSchemaEnvelope>(serde_json::json!({
         "resources": [],

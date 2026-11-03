@@ -7664,6 +7664,7 @@ fn enum_definition_signature(attribute_type: &AttributeType) -> Option<EnumDefin
 struct OwnerCustomTypeIndex {
     factory_index: usize,
     declarations: BTreeMap<TypeIdentity, Vec<AttributeType>>,
+    assignability_closure: crate::schema::AssignabilityClosure,
 }
 
 struct ProviderFactorySchemaSnapshot {
@@ -7824,6 +7825,13 @@ where
     fn known_custom_types(&self) -> BTreeSet<crate::parser::OwnedTypeIdentity> {
         FactoryCustomTypeResolver::known_custom_types(self)
     }
+
+    fn assignability_closures(&self) -> BTreeMap<String, crate::schema::AssignabilityClosure> {
+        self.index
+            .iter()
+            .map(|(owner, index)| (owner.clone(), index.assignability_closure.clone()))
+            .collect()
+    }
 }
 
 fn build_owner_custom_type_index(
@@ -7842,6 +7850,7 @@ fn build_owner_custom_type_index(
                 OwnerCustomTypeIndex {
                     factory_index,
                     declarations,
+                    assignability_closure: factory.witness.assignability_closure().clone(),
                 },
             )
         })
@@ -8173,15 +8182,14 @@ mod tests {
                 })
                 .validate()
                 .unwrap();
-            let witness = ValidatedProviderSchemaWitness::new(
+            let witness = ValidatedProviderSchemaWitness::with_assignability_edges(
                 vec![resource],
                 ValidatedConfigSchema::default(),
                 ReferenceForms::new(),
                 edges
                     .iter()
-                    .map(|(source, sink)| AssignabilityEdge {
-                        source: identity(source),
-                        sink: identity(sink),
+                    .map(|(source, sink)| {
+                        AssignabilityEdge::new(identity(source), identity(sink)).unwrap()
                     })
                     .collect(),
             )
@@ -8253,6 +8261,25 @@ mod tests {
             }
             assert!(!catalog.reachable("first", &identity("B"), &identity("C")));
             assert!(!catalog.reachable("second", &identity("A"), &identity("B")));
+        }
+
+        #[test]
+        fn reachability_is_unavailable_for_failed_owners() {
+            let loaded = snapshot(vec![
+                factory("first", &[("A", "B")], Arc::default()),
+                factory("second", &[("B", "C")], Arc::default()),
+            ]);
+            let catalog = loaded
+                .provider_context()
+                .custom_types
+                .with_failed_providers(std::collections::BTreeSet::from(["first".to_string()]));
+            assert!(!catalog.reachable("first", &identity("A"), &identity("B")));
+            assert!(catalog.reachable("second", &identity("B"), &identity("C")));
+            assert!(!crate::parser::ProviderCustomTypes::default().reachable(
+                "first",
+                &identity("A"),
+                &identity("B"),
+            ));
         }
 
         #[test]

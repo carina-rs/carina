@@ -39,22 +39,37 @@ mod assignability_edges_stage_a {
     }
 
     fn edge(source: &str, sink: &str) -> AssignabilityEdge {
-        AssignabilityEdge {
-            source: identity(source),
-            sink: identity(sink),
-        }
+        AssignabilityEdge::new(identity(source), identity(sink)).unwrap()
     }
 
     fn witness(
         declarations: &[AttributeType],
         edges: Vec<AssignabilityEdge>,
     ) -> Result<ValidatedProviderSchemaWitness, ProviderSchemaValidationError> {
-        ValidatedProviderSchemaWitness::new(
+        ValidatedProviderSchemaWitness::with_assignability_edges(
             vec![resource(declarations)],
             ValidatedConfigSchema::default(),
             ReferenceForms::new(),
             edges,
         )
+    }
+
+    #[test]
+    fn original_constructor_declares_no_assignability_edges() {
+        let admitted = ValidatedProviderSchemaWitness::new(
+            vec![resource(&[string("NewName"), string("Name")])],
+            ValidatedConfigSchema::default(),
+            ReferenceForms::new(),
+        )
+        .unwrap();
+        assert!(admitted.assignability_edges().is_empty());
+        for (source, sink) in [("NewName", "Name"), ("Name", "NewName")] {
+            assert!(
+                !admitted
+                    .assignability_closure()
+                    .reachable(&identity(source), &identity(sink))
+            );
+        }
     }
 
     #[test]
@@ -72,7 +87,7 @@ mod assignability_edges_stage_a {
         ]))
         .unwrap();
         let edges = vec![edge("NewName", "Name")];
-        let admitted = ValidatedProviderSchemaWitness::new(
+        let admitted = ValidatedProviderSchemaWitness::with_assignability_edges(
             Vec::new(),
             config,
             ReferenceForms::new(),
@@ -85,7 +100,7 @@ mod assignability_edges_stage_a {
     #[test]
     fn accepts_resource_to_config_edge_with_the_same_scalar_kind() {
         let edges = vec![edge("NewName", "Name")];
-        let admitted = ValidatedProviderSchemaWitness::new(
+        let admitted = ValidatedProviderSchemaWitness::with_assignability_edges(
             vec![resource(&[string("NewName")])],
             ValidatedConfigSchema::validate(std::collections::BTreeMap::from([(
                 "target".into(),
@@ -175,8 +190,24 @@ mod assignability_edges_stage_a {
     }
 
     #[test]
+    fn cycle_diagnostic_excludes_incoming_nodes() {
+        let error = witness(
+            &[string("A"), string("B"), string("C")],
+            vec![edge("A", "B"), edge("B", "C"), edge("C", "B")],
+        )
+        .unwrap_err();
+        let ProviderSchemaValidationError::AssignabilityCycle { cycle } = error else {
+            panic!("expected a typed cycle error, got {error:?}");
+        };
+        assert_eq!(
+            cycle.into_iter().collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([identity("B"), identity("C")]),
+        );
+    }
+
+    #[test]
     fn rejects_trivial_self_edge() {
-        let error = witness(&[string("Name")], vec![edge("Name", "Name")]).unwrap_err();
+        let error = AssignabilityEdge::new(identity("Name"), identity("Name")).unwrap_err();
         assert!(matches!(
             error,
             ProviderSchemaValidationError::SelfAssignabilityEdge { identity: actual }

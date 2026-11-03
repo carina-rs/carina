@@ -8014,16 +8014,10 @@ mod tests {
                 .validate()
                 .unwrap();
             let edges = vec![
-                AssignabilityEdge {
-                    source: identity("A"),
-                    sink: identity("B"),
-                },
-                AssignabilityEdge {
-                    source: identity("B"),
-                    sink: identity("C"),
-                },
+                AssignabilityEdge::new(identity("A"), identity("B")).unwrap(),
+                AssignabilityEdge::new(identity("B"), identity("C")).unwrap(),
             ];
-            let guest = ValidatedProviderSchemaWitness::new(
+            let guest = ValidatedProviderSchemaWitness::with_assignability_edges(
                 vec![resource],
                 ValidatedConfigSchema::default(),
                 ReferenceForms::new(),

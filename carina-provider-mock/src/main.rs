@@ -859,6 +859,10 @@ impl CarinaProvider for MockProcessProvider {
         BTreeMap::new()
     }
 
+    fn assignability_edges(&self) -> Vec<carina_plugin_sdk::core::schema::AssignabilityEdge> {
+        Vec::new()
+    }
+
     fn provider_config_attribute_types(&self) -> CoreValidatedConfigSchema {
         CoreValidatedConfigSchema::validate(BTreeMap::from([
             ("reference_table".into(), CoreAttributeType::string()),

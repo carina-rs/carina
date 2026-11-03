@@ -2220,8 +2220,8 @@ pub(crate) fn json_to_schema_only_attribute_types(
 }
 
 /// Decode v12 resource-schema JSON into the current aggregate witness used only
-/// by the read-only migration checker. V12 had no reference-form declarations,
-/// so the compatibility envelope supplies an empty collection.
+/// by the read-only migration checker. V12 had no reference forms or
+/// assignability declarations, so the adapter supplies empty collections.
 pub(crate) fn json_to_schema_only_provider_schema(
     json: &str,
     config: CoreValidatedConfigSchema,
@@ -2237,6 +2237,7 @@ pub(crate) fn json_to_schema_only_provider_schema(
     let envelope = serde_json::json!({
         "resources": resources,
         "reference_forms": [],
+        "assignability_edges": [],
     });
     let envelope =
         serde_json::to_string(&envelope).map_err(SchemaDecodeError::schema_json_parse)?;

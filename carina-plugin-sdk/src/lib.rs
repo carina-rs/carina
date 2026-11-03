@@ -78,7 +78,8 @@ pub fn parse_resource_id_string(key: &str) -> carina_provider_protocol::types::R
 }
 
 use carina_core::schema::{
-    ReferenceForms, ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+    AssignabilityEdge, ReferenceForms, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
+    ValidatedResourceSchema,
 };
 use carina_provider_protocol::types::{
     AppliedIdentifier, AppliedState, CompletionValue, CreateRequest, DeleteRequest, PersistedState,
@@ -87,7 +88,7 @@ use carina_provider_protocol::types::{
 };
 use std::collections::{BTreeMap, HashMap};
 
-/// Failure while projecting validated SDK schemas onto version-20 JSON.
+/// Failure while projecting validated SDK schemas onto version-21 JSON.
 #[derive(Debug)]
 pub enum SchemaSerializationError {
     Convert(carina_core::protocol_convert::ProtocolConvertError),
@@ -166,7 +167,13 @@ impl ProviderSchemaCache {
         let resources = provider.schemas();
         let config = provider.provider_config_attribute_types();
         let reference_forms = provider.reference_forms();
-        let witness = ValidatedProviderSchemaWitness::new(resources, config, reference_forms)?;
+        let assignability_edges = provider.assignability_edges();
+        let witness = ValidatedProviderSchemaWitness::with_assignability_edges(
+            resources,
+            config,
+            reference_forms,
+            assignability_edges,
+        )?;
         let custom_type_dispatch =
             carina_core::provider::CustomTypeDispatchTable::from_provider_schema(&witness);
         Ok(Self {
@@ -190,7 +197,7 @@ impl ProviderSchemaCache {
 
 /// Dispatch one identity bridge call through the cached table.
 ///
-/// The validated provider schemas determine the scalar kind. The version-20
+/// The validated provider schemas determine the scalar kind. The version-21
 /// guest ABI deliberately carries only the identity and canonical text.
 pub fn dispatch_custom_type_validation(
     cache: &ProviderSchemaCache,
@@ -1205,6 +1212,11 @@ pub trait CarinaProvider {
     /// any schema metadata is emitted.
     fn reference_forms(&self) -> ReferenceForms;
 
+    /// Return provider-wide directional identity edges. Return an explicit
+    /// empty collection when no edges are declared. Both endpoints must be
+    /// declared by this provider's resource or config schemas.
+    fn assignability_edges(&self) -> Vec<AssignabilityEdge>;
+
     /// Resolve comparison-only leaves in this initialized provider instance.
     /// Results are positional. Unsupported identities fail individually.
     fn resolve_references(
@@ -1824,14 +1836,8 @@ mod tests {
             TestProvider {
                 resources: vec![schema],
                 edges: vec![
-                    AssignabilityEdge {
-                        source: identity("A"),
-                        sink: identity("B"),
-                    },
-                    AssignabilityEdge {
-                        source: identity("B"),
-                        sink: identity("C"),
-                    },
+                    AssignabilityEdge::new(identity("A"), identity("B")).unwrap(),
+                    AssignabilityEdge::new(identity("B"), identity("C")).unwrap(),
                 ],
                 ..Default::default()
             }

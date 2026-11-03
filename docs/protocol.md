@@ -1,9 +1,10 @@
 # Provider protocol versions
 
-The current protocol and minimum supported provider protocol are both **20**.
+The current protocol and minimum supported provider protocol are both **21**.
 
 | Protocol version | Minimum provider protocol | Change |
 |------------------|---------------------------|--------|
+| 21 | 21 | Required provider-wide identity assignability declarations in the schema envelope. |
 | 20 | 20 | Create-outcome names describe cloud knowledge; identifier-bearing payloads are `create-identified` and `resume-identified`. |
 | 19 | 19 | Per-leaf desired normalization with scoped, exactly-once deferred handles. |
 | 18 | 18 | Typed reference schema leaves and batched plan-time reference resolution. |
@@ -11,6 +12,24 @@ The current protocol and minimum supported provider protocol are both **20**.
 | 16 | 16 | Required identity mode field; declared identity hashing and nested create-only diffing. |
 | 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
 | 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
+
+## Version 21
+
+Protocol v21 requires `assignability_edges` in `ProviderSchemaEnvelope`, including
+an empty array when no edges are declared. Each entry has dotted `source` and
+`sink` identities and declares a directional relation owned by that provider.
+The SDK's `CarinaProvider::assignability_edges` method is required; return an
+empty vector when the provider declares none.
+
+The aggregate schema witness admits both endpoints only when its resource or
+config schemas declare them with the same scalar kind. Self edges, duplicate
+edges, and cycles are rejected. Transitive closure is computed separately per
+provider; paths never combine different providers' declarations. This stage
+stores and transports the declarations without changing assignment checks.
+
+`PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION` are both 21. Hosts and
+providers must rebuild together. The read-only protocol-v12 migration adapter
+supplies an empty edge array for released metadata.
 
 ## Version 20
 
@@ -29,7 +48,7 @@ sent. `no-resource` means no cloud resource remains, even if one existed earlier
 
 This is a rename with revised failure messages. Verdict handling, state and
 saved-plan tags, and state and plan versions are unchanged. Hosts and providers
-must both use protocol v20; providers built for earlier versions must rebuild.
+had to use protocol v20 for that snapshot; earlier providers required a rebuild.
 
 ## Version 19
 
@@ -220,7 +239,7 @@ not a create-only change. Adding an element with an authored create-only leaf
 is a create-only change and therefore replaces the resource.
 
 The WIT world is unchanged in v16; the incompatible representation is in the
-schema JSON records. These requirements remain in protocol v20.
+schema JSON records. These requirements remain in protocol v21.
 
 ## Version 15
 
