@@ -12,8 +12,13 @@ Carina treats infrastructure operations as data. Instead of immediately creating
 | **Create** | Provision a new resource |
 | **Update** | Modify an existing resource in place |
 | **Delete** | Remove a resource |
-| **Replace** | Delete and recreate a resource (when a create-only property changes) |
 | **Read** | Query an existing resource without managing it (data source) |
+| **Import** | Adopt an existing cloud resource into state (`import` block) |
+| **Remove** | Drop a resource from state without deleting it in the cloud (`removed` block) |
+| **Move** | Rename a resource in state without destroying and recreating it (`moved` block) |
+| **Wait** | Poll a managed resource until a condition holds before its dependents run (`wait` expression); not stored in state |
+
+There is no separate Replace effect. When a create-only property changes, the plan holds a **Delete** and a **Create** for the same resource, and `carina plan` shows the pair as one "replace" line.
 
 Effects are values you can inspect before anything is executed. Running `carina plan` produces a Plan; running `carina apply` executes it.
 
@@ -22,7 +27,7 @@ Effects are values you can inspect before anything is executed. Running `carina 
 The workflow is always:
 
 1. **Init** -- `carina init` installs the provider plugins the configuration declares
-2. **Validate** -- `carina validate` checks syntax and schema without cloud access
+2. **Validate** -- `carina validate` checks syntax and schema without provider API calls; configurations that evaluate `decrypt()` also call AWS KMS
 3. **Plan** -- `carina plan` computes the diff between desired state (`.crn` files) and current state
 4. **Apply** -- `carina apply` executes the plan
 
@@ -90,13 +95,14 @@ list is also create-only. When a schema declares no identity paths, Carina uses
 configured top-level create-only values as the compatibility fallback.
 
 Two anonymous resources of the same type and provider route cannot have equal
-declared identity values; use `let` to name at least one of them. Every declared
-identity value must be available as written material or an authored expression
-at plan time. Carina canonicalizes a written value and hashes references and
+declared identity values; use `let` to name at least one of them. Required
+identity paths need a stable value or authored expression at plan time.
+Carina canonicalizes a written value and hashes references and
 composite expressions over references and literals by their authored spelling,
-so `"/zones/${zone.id}"` has a stable address before the zone exists. An absent
-value or an expression containing an unknown or unavailable leaf cannot produce
-an anonymous address; write the value or give the resource a name with `let`.
+so `"/zones/${zone.id}"` has a stable address before the zone exists. An omitted
+`identity_when_present` path contributes a distinct absent marker. A written
+unknown or unavailable value, or an expression containing one, cannot produce
+an anonymous address; write a stable value or give the resource a name with `let`.
 
 When a provider first adds identity declarations, an existing state row may
 still have the address produced by the older create-only rule, including one

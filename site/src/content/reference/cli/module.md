@@ -30,7 +30,7 @@ carina module info [OPTIONS] <PATH>
 
 #### Output Format
 
-When the directory declares an `arguments` or `attributes` block, it is shown as a module signature:
+When the directory declares at least one argument or exported attribute, it is shown as a module signature:
 
 - **Module name** -- derived from the module's directory name
 - **ARGUMENTS** -- parameters declared in the `arguments` block, with type, default or `(required)`, and description
@@ -58,7 +58,7 @@ Module: web_tier
   instance_id: awscc.ec2.Instance
 ```
 
-Otherwise the directory is treated as a root configuration and the output shows `File: <name>` with `IMPORTS` and `CREATES` sections.
+Otherwise the directory is treated as a root configuration and the output shows `File: <name>` with `IMPORTS` and `CREATES` sections. Empty `arguments {}` / `attributes {}` blocks alone still produce root-configuration output.
 
 ### `list`
 

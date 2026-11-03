@@ -30,7 +30,7 @@ Make sure the `carina-lsp` binary is in your `PATH`.
 
 ### Provider schemas
 
-Resource types, attributes, and schema-based diagnostics come from the provider plugins installed in the configuration directory. The LSP loads the plugins that `carina init` installed under `.carina/providers/`; it does not download them itself. Run `carina init` in the directory first. Until then the LSP reports the missing provider as a diagnostic, and it picks the plugin up once it is installed, without restarting the editor.
+Resource types, attributes, and schema-based diagnostics come from the configured provider plugins. For registry/GitHub providers, run `carina init` in the configuration directory so the LSP can load the installed artifact under `.carina/providers/`; it does not download providers itself. Until then the LSP reports the missing provider as a diagnostic, and it picks the plugin up once it is installed, without restarting the editor. For `file://` providers, the LSP loads the source component directly and watches that source for changes.
 
 ## VS Code setup
 
@@ -49,7 +49,7 @@ Then reload the VS Code window and open a `.crn` file. The extension launches `c
 }
 ```
 
-The extension also provides syntax highlighting and turns on format-on-save for `.crn` files. Install it with `code --install-extension`, not by copying `editors/vscode/` into `~/.vscode/extensions/`: a copied directory lacks its npm dependencies and the language client silently fails to start.
+The extension also provides syntax highlighting and turns on format-on-save for `.crn` files. Install the packaged `.vsix` with `code --install-extension`, not by copying `editors/vscode/` into `~/.vscode/extensions/`: if client dependencies are missing, the extension reports an error and the language server does not start.
 
 For TextMate, `editors/carina.tmbundle` provides the same syntax highlighting.
 
@@ -119,7 +119,7 @@ Hover over a resource attribute to see its documentation, including the expected
 
 The LSP offers quick fixes for selected diagnostics. Open the code-actions menu (in VS Code: light-bulb / `Ctrl+.`) on a diagnostic to apply one.
 
-- **Insert canonical enum identifier** -- when an attribute's value does not match any variant of its enum type, the LSP offers one code action per candidate that replaces the offending value with the canonical namespaced identifier (e.g. `aws.s3.Bucket.VersioningStatus.enabled`). Both bare-identifier mismatches and quoted string literals are supported.
+- **Insert canonical enum identifier** -- when an attribute's value does not match any variant of its enum type, the LSP offers one code action per candidate that replaces the offending value with the canonical namespaced identifier (e.g. `aws.s3.BucketVersioning.VersioningStatus.enabled`). Both bare-identifier mismatches and quoted string literals are supported.
 
 ## Semantic tokens
 

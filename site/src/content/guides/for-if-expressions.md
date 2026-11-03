@@ -112,15 +112,15 @@ let vpc = awscc.ec2.Vpc {
 }
 
 let subnets = for (i, az) in ['ap-northeast-1a', 'ap-northeast-1c'] {
-  let cidr = cidr_subnet('10.0.0.0/16', 8, i)
+  let name = "subnet-${az}"
 
   awscc.ec2.Subnet {
     vpc_id            = vpc.vpc_id
-    cidr_block        = cidr
+    cidr_block        = cidr_subnet('10.0.0.0/16', 8, i)
     availability_zone = az
 
     tags = {
-      Name = "subnet-${az}"
+      Name = name
     }
   }
 }

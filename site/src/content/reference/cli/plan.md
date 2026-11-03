@@ -66,10 +66,10 @@ carina apply plan.json
 ```
 
 If the configured backend differs from `carina-backend.lock`, `plan`
-prints a backend-drift warning, reads state from the locked old backend,
-and includes a migration-pending note before the plan summary. A saved
-plan produced in this state records the locked backend that supplied the
-state; run `carina init --migrate-state` before applying.
+prints a backend-drift warning to stderr and reads state from the locked old
+backend. In ordinary text output, the migration-pending note follows the plan
+summary. A saved plan produced in this state records the locked backend that
+supplied the state; run `carina init --migrate-state` before applying.
 
 ### `--detailed-exitcode`
 
@@ -77,17 +77,17 @@ Change the exit code behavior:
 
 | Exit code | Meaning |
 |-----------|---------|
-| `0` | No changes needed |
+| `0` | No mutating execution-plan effects; export/directive-only changes may still exist |
 | `1` | Error occurred |
-| `2` | Changes are present (only with `--detailed-exitcode`) |
+| `2` | Mutating execution-plan effects are present (only with `--detailed-exitcode`) |
 
-This is useful in CI pipelines to detect whether changes exist without parsing output.
+This is useful in CI pipelines to detect mutating execution-plan effects without parsing output.
 
 ### `--refresh <BOOL>`
 
 Refresh managed-resource state from the cloud provider before planning. Defaults to `true`.
 
-When set to `false`, Carina uses cached state for managed resources and prints a warning. Data sources are queries rather than managed objects, so Carina always reads them regardless of this flag. The plan may not reflect the actual managed infrastructure.
+When set to `false`, Carina uses cached state for managed resources and prints a warning. Data-source reads are independent of this flag: available inputs are queried, while reads depending on new or unresolved resources are deferred to apply. The plan may not reflect the actual managed infrastructure.
 
 ```bash
 carina plan --refresh=false
@@ -147,7 +147,7 @@ planning starts.
 The image is meant for reviewing a plan where the text output is hard to scan,
 such as a pull request:
 
-- Each changed resource is a card colored by its effect (create, update,
+- Each changed resource is a card colored by its action (create, update,
   replace, delete, and so on). Update cards list the names of the changed
   attributes; replace cards list the attributes that force the replacement.
 - Cards are laid out left to right in apply order. Cards in the same column
@@ -159,7 +159,7 @@ such as a pull request:
   appear only when they connect two changed resources. A module call with no
   changes is collapsed into a single card.
 - Resources inside a module call are grouped in a box labelled with the call.
-- The header shows per-effect counts, with replace and destroy counts in bold,
+- The header shows per-action counts, with replace and destroy counts in bold,
   and the state lineage and serial the plan was computed against.
 
 The image never contains attribute values, so it can be shared without
@@ -254,7 +254,7 @@ carina plan --image-theme dark --image plan-dark.png
 
 ### `--check-iam`
 
-Before showing the plan, check whether the AWS caller identity (the role that will run `apply`) has the IAM actions the providers declare for the planned effects. Carina uses `iam:SimulatePrincipalPolicy`, and falls back to reading the role's policies (`iam:GetRolePolicy`, `iam:ListAttachedRolePolicies`) when simulation is denied. Missing actions are reported per effect as warnings; the plan does not fail. If the caller identity or its policies cannot be read, the check is skipped with a warning.
+Before showing the plan, check whether the AWS identity from the host's default credential chain has the IAM actions the providers declare for the planned effects. Provider-instance `assume_role` identities are not selected by this check, so its caller may differ from the identity executing `apply`. Carina uses `iam:SimulatePrincipalPolicy`, and falls back to reading the role's policies (`iam:GetRolePolicy`, `iam:ListAttachedRolePolicies`) when simulation is denied. Missing actions are reported per effect as warnings; the plan does not fail. If the caller identity or its policies cannot be read, the check is skipped with a warning.
 
 ### `--strict-iam`
 
@@ -300,16 +300,17 @@ carina plan --detailed-exitcode
 
 ## Output Format
 
-The plan output shows each resource with its effect type:
+The plan output shows each resource with the action Carina will take:
 
 - **Create** (`+`) -- new resource to be created
 - **Update** (`~`) -- existing resource with attribute changes
 - **Delete** (`-`) -- resource to be removed
-- **Replace** (`+/-`) -- resource that must be destroyed and recreated
+- **Replace** (`+/-`) -- resource that must be destroyed and recreated; the plan
+  holds a Delete and a Create for it, shown together as one line
 - **Release** (`!`) -- an omitted key is no longer authored by the configuration,
   but the remote value is left unchanged because the API does not reset omitted keys
 
-A summary line shows the total count of each effect type. Releases have their own
+A summary line shows the total count of each action. Releases have their own
 `to release` count; a plan containing only releases is not reported as "No changes."
 
 ## Keyed partial-update list releases

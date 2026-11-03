@@ -16,7 +16,7 @@ A strongly typed infrastructure management tool written in Rust.
 
 - **Custom DSL**: Simple, expressive syntax for defining infrastructure
 - **Effects as Values**: Side effects are represented as data structures, not immediately executed
-- **Strong Typing**: Catch configuration errors at parse time with schema validation
+- **Strong Typing**: Catch configuration errors during validation against provider schemas
 - **Data Sources**: Reference existing infrastructure without managing its lifecycle
 - **Provider Architecture**: Extensible provider system for multi-cloud support
 - **Modules**: Reusable infrastructure components with typed inputs/outputs
@@ -256,7 +256,7 @@ Modules enable reusable infrastructure components with typed arguments and attri
 
 ```hcl
 arguments {
-  vpc_id: aws.ec2.Vpc {
+  vpc_id: aws.ec2.Vpc.Id {
     description = 'The VPC to deploy resources into'
   }
   environment: String {
@@ -266,7 +266,7 @@ arguments {
 }
 
 attributes {
-  security_group_id: aws.ec2.SecurityGroup = web_sg.group_id
+  security_group_id: aws.ec2.SecurityGroup.Id = web_sg.group_id
 }
 
 let web_sg = aws.ec2.SecurityGroup {
@@ -301,7 +301,7 @@ Module: web_tier
 
 === ARGUMENTS ===
 
-  vpc_id: aws.ec2.Vpc  (required)
+  vpc_id: aws.ec2.Vpc.Id  (required)
     The VPC to deploy resources into
   environment: String  (required)
     Deployment environment name
@@ -313,7 +313,7 @@ Module: web_tier
 
 === ATTRIBUTES ===
 
-  security_group_id: aws.ec2.SecurityGroup
+  security_group_id: aws.ec2.SecurityGroup.Id
 ```
 
 ## Architecture
@@ -427,7 +427,7 @@ $ carina fmt --diff
 
 ### Destroy
 
-Remove all resources defined in a configuration:
+Destroy managed resources, including orphans recorded in state, subject to resource protection:
 
 ```bash
 $ carina destroy
@@ -499,9 +499,11 @@ backend s3 {
 ```
 
 The state file tracks:
+
 - Resource states and attributes
 - Serial number for change detection
-- Locking to prevent concurrent modifications
+
+The backend uses a separate lock file or object to prevent concurrent modifications.
 
 ## Development
 

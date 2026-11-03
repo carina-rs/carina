@@ -303,7 +303,7 @@ The component is at `target/wasm32-wasip2/release/carina-provider-hello.wasm`.
 
 ## Use it from a configuration
 
-In a separate directory, create `main.crn` and point a `provider` block at the component with a `file://` URL. The path must be absolute. With no `backend` block, state goes to `carina.state.json` in that directory.
+In a separate directory, create `main.crn` and point a `provider` block at the component with a `file://` URL. Use an absolute path so the configuration works from any invocation directory. With no `backend` block, state goes to `carina.state.json` in that directory.
 
 ```crn
 provider hello {
@@ -325,7 +325,7 @@ carina apply
 
 `carina plan` shows the greeting to be created, with `message` as `(known after apply)`. After `apply`, another `plan` reports no changes, because `read` returns the same attributes. Change `name` to `'carina'` and `plan` shows the greeting must be replaced, because `name` is create-only. `carina destroy` deletes it.
 
-`carina init` installs the component into `.carina/providers/` (as a hard link when it can, otherwise a copy) and records its checksum in `carina-providers.lock`. Later commands use that copy, so after you rebuild the provider, run `carina init` again to pick up the new build and update the checksum. For an HTTP provider, that init also reads the new egress declaration: an unchanged declaration carries consent forward without a prompt, while a changed declaration shows the diff and asks again.
+`carina init` installs an atomic copy of the component under `.carina/providers/` and records its checksum in `carina-providers.lock`. Later commands use that copy, so after you rebuild the provider, run `carina init` again to pick up the new build and update the checksum. For an HTTP provider, that init also reads the new egress declaration: an unchanged declaration carries consent forward without a prompt, while a changed declaration shows the diff and asks again.
 
 ## Use it from GitHub
 

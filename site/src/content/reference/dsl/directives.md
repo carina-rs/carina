@@ -98,9 +98,9 @@ each element when the loop expands:
 ```crn
 arguments { flags: list(Bool) }
 
-for index, flag in flags {
+for (index, flag) in flags {
   mock.test.resource {
-    name = 'resource-${index}'
+    name = "resource-${index}"
     directives { prevent_destroy = flag }
   }
 }

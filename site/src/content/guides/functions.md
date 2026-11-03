@@ -36,7 +36,7 @@ awscc.ec2.Vpc {
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `length` | `length(list \| map \| String) -> Int` | Returns element/character count |
+| `length` | `length(list \| map \| String) -> Int` | Returns the element count for lists/maps, or UTF-8 byte count for strings |
 | `concat` | `concat(items, base_list) -> list(Any)` | Appends items to a list |
 | `flatten` | `flatten(list) -> list(Any)` | Flattens nested lists by one level |
 | `keys` | `keys(map) -> list(String)` | Returns map keys as a sorted list |
@@ -93,7 +93,7 @@ let vpcs = for (i, env) in ['dev', 'stg'] {
 |----------|-----------|-------------|
 | `env` | `env(name) -> String` | Reads an environment variable; diagnostics never display its contents |
 | `secret` | `secret(value) -> Secret` | Marks a value as secret (stored as hash in state) |
-| `decrypt` | `decrypt(ciphertext, key?) -> Secret` | Decrypts using the provider's encryption service; the result is automatically masked and hashed in state |
+| `decrypt` | `decrypt(ciphertext, key?) -> Secret` | Decrypts base64 ciphertext with host-side AWS KMS; returns a masked secret stored as a hash in state |
 
 ## User-defined functions
 

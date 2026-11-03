@@ -347,7 +347,6 @@ a:hover { color: var(--accent-high); }
 
   /* ----- Footer ----- */
   --footer-divider:          var(--cyan-600);
-  --footer-quote-color:      var(--fg3);
   --footer-meta-color:       var(--fg4);
 
   /* ----- Hero / landing ----- */

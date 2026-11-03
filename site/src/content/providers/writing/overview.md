@@ -153,7 +153,7 @@ Cloud metadata addresses are withheld from every provider kind. The host may use
 
 ## Protocol version
 
-The provider protocol is versioned. The current development version is 21, and the host also requires at least 21. The SDK records the version it was built with in the provider's `info` response, so you do not set it yourself. Carina v0.9.0, v0.8.0, and v0.7.1 all speak version 12; versions after 12 are development-only until the next release. Protocol 21 requires provider-wide identity assignability declarations in the schema envelope and the SDK's `assignability_edges` method, including explicit empty collections. Providers built for earlier development versions must be rebuilt.
+The provider protocol is versioned. The current development version is 21, and the host also requires at least 21. The SDK records the version it was built with in the provider's `info` response, so you do not set it yourself. Carina v0.10.0 speaks version 19; v0.7.0 through v0.9.0 speak version 12. Protocol 21 requires provider-wide identity assignability declarations in the schema envelope and the SDK's `assignability_edges` method, including explicit empty collections. Providers built for protocol 20 or earlier must be rebuilt for this main checkout.
 
 When the versions do not match, the host refuses to load the provider and tells you which side to update: rebuild the provider against the current SDK, or upgrade Carina. [docs/protocol.md](https://github.com/carina-rs/carina/blob/main/docs/protocol.md) records what each version changed, and [Versioning and Compatibility](/providers/writing/versioning/) explains what to do when the version changes.
 

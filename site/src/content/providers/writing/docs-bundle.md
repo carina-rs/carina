@@ -32,6 +32,7 @@ The registry checks every rule when a version is published and refuses a bundle 
 | Files | `index.md` at the root, plus `resources/<slug>.md` and `data-sources/<slug>.md`; nothing else |
 | Slugs | `[a-z0-9][a-z0-9_]*`, at most 128 bytes |
 | Content | UTF-8 Markdown (GitHub Flavored), nested at most 64 levels deep |
+| Titles | Resource and data-source pages must start on line 1 with `# <DSL name>`, where the name matches `[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+` and is at most 128 bytes; `index.md` has no title requirement |
 | Sizes | At most 16 MiB compressed, 4096 entries, 256 KiB per file, 64 MiB of files in total, 80 MiB decompressed |
 
 The tar format has a few more rules: a directory entry declares size 0, paths longer than `ustar` allows need `pax` rather than GNU long names, pax global headers are not allowed, each pax extended header is at most 64 KiB, and only zero bytes may follow the end-of-archive marker. The script below produces compliant entries.

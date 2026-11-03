@@ -2,7 +2,7 @@
 title: validate
 ---
 
-Validate the configuration file without communicating with cloud providers. This checks syntax, type correctness, resource schema compliance, and module resolution.
+Validate configuration syntax, types, schemas, and module resolution without provider resource operations. Configurations using `decrypt()` can still contact AWS KMS during expression evaluation.
 
 ## Usage
 
@@ -17,8 +17,8 @@ carina validate [PATH]
 1. **Syntax** -- Parses all `.crn` files using the Carina grammar. Reports line and column for parse errors.
 2. **Resource types** -- Validates that resource types exist in the provider schema (e.g., `aws.s3.Bucket`).
 3. **Attribute types** -- Checks that attribute values match the expected types defined in the resource schema.
-4. **Module resolution** -- Resolves `import` statements and validates module arguments.
-5. **Unused bindings** -- Warns about `let` bindings that are never referenced. These can be replaced with anonymous resources. A binding named as the `to` of an `import` or `moved` block counts as referenced, since those blocks match the resource by its binding.
+4. **Module resolution** -- Resolves `let module_name = use { source = "..." }` module declarations and validates module-call arguments.
+5. **Unused bindings** -- Warns about unused resource bindings that can safely become anonymous resources. Ordinary value bindings and bindings required for structural expressions or stable resource identities are excluded. A binding named as the `to` of an `import` or `moved` block counts as referenced, since those blocks match the resource by its binding.
 6. **Duplicate attributes** -- Warns when the same attribute key appears multiple times in a resource block. The last value wins, but this is likely unintentional.
 
 ## Output
@@ -38,20 +38,22 @@ Validating...
 <!-- derived-from ../../../../../notes/specs/2026-05-17-for-loop-same-config-read-iterable-design.md -->
 
 When a `for` loop iterates a value that is not known until plan/apply
-time (for example a provider-computed attribute such as
-`cert.domain_validation_options`), the loop body is enumerated as a
+time (for example `for opt in cert.domain_validation_options` over a
+provider-computed list), the loop body is enumerated as a
 single **deferred placeholder** entry rather than expanded:
 
 ```
 ✓ 2 resources validated successfully.
   • aws.acm.Certificate.cert
-  • aws.route53.RecordSet._domain_validation_options[?] (deferred: for _, opt in cert.domain_validation_options @ records.crn:1)
+  • aws.route53.RecordSet.<pending> (deferred for at records.crn:5)
 ```
 
-The `[?]` marks an address the planner will assign once the iterable
-resolves, and the `(deferred: <for header> @ <file>:<line>)` suffix
-identifies the loop (`<file>` is the path as passed to
-`carina validate`; shortened to a basename above for readability). These entries are **not** resolvable resource
+Anonymous loop bodies use `<pending> (deferred for at <file>:<line>)`, as above.
+Bound loops use `<binding>[?] (deferred: <for header> @ <file>:<line>)`;
+`[?]` marks an address the planner will assign once the iterable resolves.
+`<file>` is the configuration-relative source filename (with a basename fallback),
+such as `records.crn`; `<line>` identifies the loop in that file. Both forms are
+placeholders. These entries are **not** resolvable resource
 addresses -- they describe a loop body, not a single resource. The
 count includes one entry per deferred loop (its element count is
 unknowable at validate time). The same entries appear in the

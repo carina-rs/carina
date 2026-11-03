@@ -152,7 +152,7 @@ awscc.cloudfront.Distribution {
 
 Omitting `directives.provider` keeps the resource on the kind's default instance. The default instance is identified by the absence of a binding name; it is not surfaced as a completion candidate at the value position of `directives { provider = | }` for the same reason.
 
-State files persist the routing decision on each resource's identifier (the `provider_instance` field on `ResourceId` / `Directives`, written in state v3 and later). Existing state files written before named-instance support continue to load: the field defaults to `null` and serialises back out only when non-null.
+State files persist the routing decision on each resource's identifier (the `provider_instance` field on `ResourceId` / `Directives`). Existing state files written before named-instance support continue to load: the field defaults to `null` and serialises back out only when non-null.
 
 ## Resource Blocks
 
@@ -172,7 +172,7 @@ awscc.ec2.Vpc {
 }
 ```
 
-If the schema declares identity paths, Carina generates the resource's state identity from only those values; paths may name top-level attributes or nested struct fields whose leaf is a scalar or enum. Other create-only values can force replacement without changing the address. Written values are schema-canonicalized. References and composite expressions over references and literals are hashed by their deterministic authored spelling, so their addresses stay stable after apply-time resolution; generated names hash a separately typed prefix. An absent value or an expression containing an unknown or unavailable leaf is an error: write the value or bind the resource with `let`. A schema with no declared identity falls back to configured top-level create-only attributes and, when none are configured, to the resource's other attributes. Multiple resources using that attribute-derived fallback are rejected as ambiguous. Equal declared identity values, including equal expression spellings plus equal written values, are also rejected.
+If the schema declares identity paths, Carina generates the resource's state identity from only those values; paths may name top-level attributes or nested struct fields whose leaf is a scalar or enum. Other create-only values can force replacement without changing the address. Written values are schema-canonicalized. References and composite expressions over references and literals are hashed by their deterministic authored spelling, so their addresses stay stable after apply-time resolution; generated names hash a separately typed prefix. A missing required identity value or a written expression containing an unknown or unavailable leaf is an error: write the value or bind the resource with `let`. An omitted optional `identity_when_present()` value contributes an absence marker. A schema with no declared identity falls back to configured top-level create-only attributes and, when none are configured, to the resource's other attributes. Multiple resources using that attribute-derived fallback are rejected as ambiguous. Equal declared identity values, including equal expression spellings plus equal written values, are also rejected.
 
 ### Named Resources (Let Bindings)
 
@@ -230,8 +230,13 @@ The returned value can be referenced like any other bound resource:
 let identity = read aws.sts.CallerIdentity {}
 
 awscc.ec2.IpamPool {
+  address_family = ipv4
+  ipam_scope_id = 'ipam-scope-0123456789abcdef0'
   source_resource = {
     resource_owner = identity.account_id
+    resource_id = 'vpc-0123456789abcdef0'
+    resource_region = 'ap-northeast-1'
+    resource_type = 'vpc'
   }
 }
 ```
@@ -278,7 +283,7 @@ awscc.ec2.Ipam {
 
 ### Local Bindings Inside Blocks
 
-Use `let` inside a resource block to create block-scoped variables. These are evaluated during parsing but are not sent to the provider:
+Use `let` inside a resource block to create block-scoped variables. These bindings are substituted into attributes, and their expressions may remain deferred until their inputs resolve. The local names are not sent as provider attributes:
 
 ```crn
 awscc.ec2.Vpc {
@@ -361,6 +366,7 @@ let network = upstream_state {
 }
 
 awscc.ec2.SecurityGroup {
+  group_description = 'Example security group'
   vpc_id = network.vpc_id
 }
 ```
@@ -374,7 +380,7 @@ Carina has four constructs for pulling data or declarations in from outside the 
 | Construct | When | What | From |
 |---|---|---|---|
 | `let m = use { source = '...' }` | parse time | DSL source (a module) | local directory |
-| `let x = read <type> { }` | plan time | current cloud state | Cloud API (data source) |
+| `let x = read <type> { }` | plan time when inputs are known; otherwise apply time | current cloud state | Cloud API (data source) |
 | `import { to = ..., id = ... }` | apply time | an existing cloud resource, adopted into state | Cloud API + state backend |
 | `let x = upstream_state { source = '...' }` | plan time | another Carina project's `exports` | state backend |
 

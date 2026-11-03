@@ -5,7 +5,7 @@ description: "How a Carina provider declares its resource types: the schema buil
 
 A provider describes every resource type it manages with a schema: the attributes, their types, which ones the configuration sets and which ones the provider fills in, and the rules a value must follow. The host uses the schema to check a configuration before anything reaches the provider, to compute plans, to drive the editor's completion and diagnostics, and to store state.
 
-This page shows how to write schemas with the builder API in `carina-plugin-sdk`. Every Rust example on it is compiled and run as a doctest of `carina-plugin-sdk`, so the examples always match the SDK on the carina `main` branch. [Your First Provider](/providers/writing/getting-started/) uses the same builders for its complete example.
+This page shows how to write schemas with the builder API in `carina-plugin-sdk`. The runnable Rust examples and compile-fail checks are covered by SDK doctests. Ignored signature fragments are illustrative. [Your First Provider](/providers/writing/getting-started/) uses the same builders for its complete example.
 
 The schema types live in `carina_core::schema`. The SDK re-exports `carina_core` as `carina_plugin_sdk::core`, so a provider depends only on `carina-plugin-sdk`.
 
@@ -109,9 +109,9 @@ reference forms are inert: the host does not expand short names through them.
 
 `{name}` describes the unqualified form: one bare segment containing no `:` or
 `/`. During semantic comparison the host expands only that bare form through
-the `long` template. Strings containing `:` or `/` are qualified or path forms
-and compare exactly as written; a qualified value therefore never compares
-equal to a bare name.
+the `long` template. A bare name compares equal to its matching long reference
+in the available scope; other qualified or path forms compare exactly as
+written.
 
 What the attributes declare:
 
@@ -374,7 +374,7 @@ assert!(schema.effective_attribute("api_key").unwrap().is_write_only());
 assert!(schema.as_schema().write_only_bearing("webhook"));
 ```
 
-Write-only describes what the read API returns, not whether a value is secret. The host compares a write-only value against the value it recorded in state when the provider accepted it, because the read result never contains it. An unchanged write-only value therefore never causes an update on its own, and a changed one does. When an update happens for any reason, the host also re-sends every write-only value of the resource as a `Reassert` patch operation, because many APIs drop values a request leaves out. See [Implementing Operations](/providers/writing/implementing-operations/) for how a provider handles `Reassert`.
+Write-only describes what the read API returns, not whether a value is secret. The host compares a write-only value against the value it recorded in state when the provider accepted it, because the read result never contains it. An unchanged write-only value therefore never causes an update on its own, and a changed one does. When another change causes an update, the host also re-sends unchanged desired, updatable write-only or write-only-bearing attributes as `Reassert` patch operations, unless already patched or wholly ignored, because many APIs drop values a request leaves out. See [Implementing Operations](/providers/writing/implementing-operations/) for how a provider handles `Reassert`.
 
 `validate()` rejects write-only on any path below a provider-populated value and inside a union, where the host could not track which member the value belongs to. For the same projection reason, it rejects create-only fields below union members.
 
@@ -523,9 +523,10 @@ let schema = ResourceSchema::new("organizations.Account")
     .expect("the schema is valid");
 ```
 
-Carina then rejects deletion and replacement unless the user sets
-`prevent_destroy` to a value that resolves to `false`, for example
-`directives { prevent_destroy = false }`. Resource schemas are
+Ordinary deletion and replacement require the user to set `prevent_destroy`
+explicitly to a value that resolves to `false`, for example
+`directives { prevent_destroy = false }`. `carina destroy --force` can override
+destruction protection. Resource schemas are
 unprotected by default, so use this builder only where deletion has unusually
 severe consequences. The required boolean is transported in protocol-v21
 schema JSON; an older provider that omits it fails during schema loading.

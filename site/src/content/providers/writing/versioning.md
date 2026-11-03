@@ -23,9 +23,9 @@ Since v0.5.0, the first release that checks the version, every release has set t
 
 | Carina release | Protocol version | Oldest provider protocol it loads |
 |----------------|------------------|-----------------------------------|
-| Next release after v0.9.0 (unreleased) | 21 | 21 |
-| Development snapshot after v0.9.0 (unreleased) | 20 | 20 |
-| Development snapshot after v0.9.0 (unreleased) | 19 | 19 |
+| Main after v0.10.0 (unreleased) | 21 | 21 |
+| Development snapshot after v0.10.0 (unreleased) | 20 | 20 |
+| v0.10.0 | 19 | 19 |
 | Development snapshot after v0.9.0 (unreleased) | 18 | 18 |
 | Development snapshot after v0.9.0 (unreleased) | 17 | 17 |
 | Development snapshot after v0.9.0 (unreleased) | 16 | 16 |
@@ -38,13 +38,13 @@ Since v0.5.0, the first release that checks the version, every release has set t
 | v0.6.0 | 10 | 10 |
 | v0.5.0 | 10 | 10 |
 
-Only protocol 21 is current. Its schema envelope requires `assignability_edges`, even when empty, and SDK providers must implement `CarinaProvider::assignability_edges`. Both endpoints must be declared by that provider as scalar String, Int, or Float identities with the same scalar kind. Enum, Reference, and core built-in identities cannot be endpoints; self edges, duplicates, and cycles are rejected. Each provider's transitive closure is retained separately, so paths never combine different providers' declarations. Providers built for protocol 20 or earlier must rebuild against the current SDK.
+Protocol 21 is current on main; Carina v0.10.0 uses protocol 19. Its schema envelope requires `assignability_edges`, even when empty, and SDK providers must implement `CarinaProvider::assignability_edges`. Both endpoints must be declared by that provider as scalar String, Int, or Float identities with the same scalar kind. Enum, Reference, and core built-in identities cannot be endpoints; self edges, duplicates, and cycles are rejected. Each provider's transitive closure is retained separately, so paths never combine different providers' declarations. Providers built for protocol 20 or earlier must rebuild against the current SDK.
 
 Assignment first checks structural identity. When identities differ, a provider attribute uses its sink owner's edges. Type annotations and module boundaries require a path declared by every owner of the sink identity. The existing length and range checks still apply, and sink validators still run on values during validation, planning, and apply.
 
-Protocols 14 through 20 were development snapshots, and their changes remain part of protocol 21:
+Protocols 14 through 20 came before protocol 21, and their changes remain part of it:
 
-| Development protocol | Change |
+| Protocol | Change |
 |----------------------|--------|
 | 20 | Create-outcome names describe cloud knowledge: `not-created`, `identifier-reported`, `no-resource`, and `unchanged`; identifier-bearing records are `create-identified` and `resume-identified`. |
 | 19 | Desired normalization uses structural trees with per-leaf, exactly-once deferred handles; CRUD encoding is unchanged. |
