@@ -249,12 +249,17 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             .display()
             .to_string();
         let contextualize_access_error = |error: ArgumentSubstitutionError| {
-            let ArgumentSubstitutionError {
-                source_file,
-                line,
-                message,
-                parse_error,
-            } = error;
+            let (
+                location,
+                ArgumentSubstitutionDetails {
+                    source_file,
+                    line,
+                    message,
+                    parse_error,
+                },
+            ) = error
+                .into_diagnostic(call.id().module_name_location())
+                .into_parts();
             if let Some(error) = parse_error {
                 return ModuleError::Parse(*error);
             }
@@ -275,7 +280,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     })
                     .unwrap_or_else(|| call_source_path.clone()),
                 line,
-                message,
+                diagnostic: crate::parser::Located::new(location, message),
             }
         };
 
@@ -1457,35 +1462,49 @@ fn resolve_directive_dependencies(
 {
     use crate::parser::UnexpandedDependencyOperand as Operand;
     let mut resolved = dependencies.try_filter_map(|index, operand| {
-        let operand = match operand {
-            Operand::Handle(handle) => {
-                match resolver.resolve_structural_argument(handle.structural())? {
-                    ScopedStructuralArgument::Handle(handle) => Operand::Handle(
-                        handle
-                            .resource_handle()
-                            .expect("resource capability retains its type across scope resolution"),
-                    ),
-                    ScopedStructuralArgument::Forwarded(_) => return Ok(None),
+        (|| {
+            let operand = match operand {
+                Operand::Handle(handle) => {
+                    match resolver.resolve_structural_argument(handle.structural())? {
+                        ScopedStructuralArgument::Handle(handle) => {
+                            Operand::Handle(handle.resource_handle().expect(
+                                "resource capability retains its type across scope resolution",
+                            ))
+                        }
+                        ScopedStructuralArgument::Forwarded(_) => return Ok(None),
+                    }
                 }
-            }
-            Operand::BareBinding(binding) => {
-                let Some(binding) = resolver.resolve_dependency_binding_at(
-                    binding,
-                    "depends_on",
-                    diagnostic_sources.get_owned(index),
-                )?
-                else {
-                    return Ok(None);
-                };
-                Operand::BareBinding(binding)
-            }
-            Operand::AttributeSelection { binding, attribute } => Operand::AttributeSelection {
-                binding: resolver
-                    .resolve_declared_binding_at(binding, diagnostic_sources.get_owned(index))?,
-                attribute: attribute.clone(),
-            },
-        };
-        Ok(Some(operand))
+                Operand::BareBinding(binding) => {
+                    let Some(binding) = resolver.resolve_dependency_binding_at(
+                        binding,
+                        "depends_on",
+                        diagnostic_sources.get_owned(index),
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    Operand::BareBinding(binding)
+                }
+                Operand::AttributeSelection { binding, attribute } => Operand::AttributeSelection {
+                    binding: resolver.resolve_declared_binding_at(
+                        binding,
+                        diagnostic_sources.get_owned(index),
+                    )?,
+                    attribute: attribute.clone(),
+                },
+            };
+            Ok(Some(operand))
+        })()
+        .map_err(|error| {
+            ArgumentSubstitutionError::Authored(crate::parser::Located::new(
+                dependencies
+                    .locations()
+                    .get(index)
+                    .expect("parser-owned dependency provenance")
+                    .clone(),
+                Box::new(error),
+            ))
+        })
     })?;
     let mut origins = Vec::new();
     for path in dependencies.reference_origins() {
@@ -1904,7 +1923,7 @@ impl ModuleScopeResolver<'_> {
                 StructuralOperandRef::Handle {
                     handle,
                     access_base: _,
-                } => Err(ArgumentSubstitutionError {
+                } => Err(ArgumentSubstitutionError::Evaluation {
                     source_file: Some(self.arguments.caller_source_file.to_path_buf()),
                     line: argument.source_line(self.arguments.default_line),
                     message: format!(
@@ -1916,7 +1935,7 @@ impl ModuleScopeResolver<'_> {
                     ),
                     parse_error: None,
                 }),
-                StructuralOperandRef::Value(_) => Err(ArgumentSubstitutionError {
+                StructuralOperandRef::Value(_) => Err(ArgumentSubstitutionError::Evaluation {
                     source_file: Some(self.arguments.caller_source_file.to_path_buf()),
                     line: argument.source_line(self.arguments.default_line),
                     message: format!(
@@ -2002,7 +2021,7 @@ impl ModuleScopeResolver<'_> {
                     handle,
                     access_base: _,
                 } => Ok(ScopedStructuralArgument::Handle(handle.clone())),
-                StructuralOperandRef::Value(_) => Err(ArgumentSubstitutionError {
+                StructuralOperandRef::Value(_) => Err(ArgumentSubstitutionError::Evaluation {
                     source_file: Some(self.arguments.caller_source_file.to_path_buf()),
                     line: argument.source_line(self.arguments.default_line),
                     message: format!(
@@ -2035,17 +2054,19 @@ impl ModuleScopeResolver<'_> {
     > {
         match self.resolve_structural_argument(handle)? {
             ScopedStructuralArgument::Handle(handle) => Ok(handle),
-            ScopedStructuralArgument::Forwarded(argument) => Err(ArgumentSubstitutionError {
-                source_file: Some(self.arguments.caller_source_file.to_path_buf()),
-                line: self.arguments.default_line,
-                message: format!(
-                    "unresolved forwarded module parameter '{}'",
-                    argument
-                        .pending_parameter()
-                        .expect("forwarded argument retains its parameter")
-                ),
-                parse_error: None,
-            }),
+            ScopedStructuralArgument::Forwarded(argument) => {
+                Err(ArgumentSubstitutionError::Evaluation {
+                    source_file: Some(self.arguments.caller_source_file.to_path_buf()),
+                    line: self.arguments.default_line,
+                    message: format!(
+                        "unresolved forwarded module parameter '{}'",
+                        argument
+                            .pending_parameter()
+                            .expect("forwarded argument retains its parameter")
+                    ),
+                    parse_error: None,
+                })
+            }
         }
     }
 
@@ -2059,7 +2080,7 @@ impl ModuleScopeResolver<'_> {
         diagnostic_source: Option<(Option<std::path::PathBuf>, usize)>,
     ) -> ArgumentSubstitutionError {
         let (source_file, line) = diagnostic_source.unwrap_or((None, self.arguments.default_line));
-        ArgumentSubstitutionError {
+        ArgumentSubstitutionError::Evaluation {
             source_file,
             line,
             message: format!(
@@ -2111,7 +2132,7 @@ fn select_deferred_module_ifs(
         let condition = resolve_plain_module_value(deferred.condition().value(), resolver)
             .map_err(|error| error.with_source_file(deferred.condition().source_file()))?;
         let decision = decide_expanded_if_condition(&condition).map_err(|message| {
-            ArgumentSubstitutionError {
+            ArgumentSubstitutionError::Evaluation {
                 source_file: Some(deferred.condition().source_file().to_path_buf()),
                 line: deferred.condition().source_line(),
                 message,
@@ -2549,7 +2570,7 @@ fn bind_constraint_expression(
         ArgumentSubstitutionError,
     > {
         let Some(resolved_argument) = arguments.arguments.get(argument) else {
-            return Err(ArgumentSubstitutionError {
+            return Err(ArgumentSubstitutionError::Evaluation {
                 source_file: Some(source_file.to_path_buf()),
                 line,
                 message: format!("unknown module argument '{argument}'"),
@@ -2559,7 +2580,7 @@ fn bind_constraint_expression(
         let substitution =
             resolved_argument
                 .substitution(argument, position)
-                .map_err(|message| ArgumentSubstitutionError {
+                .map_err(|message| ArgumentSubstitutionError::Evaluation {
                     source_file: Some(source_file.to_path_buf()),
                     line,
                     message,
@@ -2569,7 +2590,7 @@ fn bind_constraint_expression(
         for step in path {
             value = apply_value_path_segment(value, step.clone(), line, AccessMissPolicy::Error)
                 .and_then(ValuePathSegmentResult::into_value)
-                .map_err(|error| ArgumentSubstitutionError {
+                .map_err(|error| ArgumentSubstitutionError::Evaluation {
                     source_file: Some(source_file.to_path_buf()),
                     line,
                     message: error.to_string(),
@@ -2609,7 +2630,7 @@ fn bind_constraint_expression(
             }
         }
         ValidateExpr::BoundArgument { argument, .. } => {
-            return Err(ArgumentSubstitutionError {
+            return Err(ArgumentSubstitutionError::Evaluation {
                 source_file: Some(source_file.to_path_buf()),
                 line,
                 message: format!(
@@ -2893,7 +2914,7 @@ fn select_expanded_module_ifs(
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             let condition = select_expanded_module_ifs(deferred.condition().value())?;
             match decide_expanded_if_condition(&condition).map_err(|message| {
-                ArgumentSubstitutionError {
+                ArgumentSubstitutionError::Evaluation {
                     source_file: Some(deferred.condition().source_file().to_path_buf()),
                     line: deferred.condition().source_line(),
                     message,
@@ -2937,7 +2958,7 @@ fn select_expanded_module_ifs(
             let rhs = select_expanded_module_ifs(expression.rhs())?;
             expression
                 .evaluate_with_operands(lhs, rhs)
-                .map_err(|error| ArgumentSubstitutionError {
+                .map_err(|error| ArgumentSubstitutionError::Evaluation {
                     source_file: None,
                     line: expression.operator_span().line().unwrap_or(0),
                     message: error.to_string(),
@@ -3006,7 +3027,7 @@ fn select_expanded_module_ifs(
                 select_expanded_module_ifs(access.base())?,
                 AccessMissPolicy::Error,
             )
-            .map_err(|error| ArgumentSubstitutionError {
+            .map_err(|error| ArgumentSubstitutionError::Evaluation {
                 source_file: None,
                 line: access.source_line(),
                 message: error.to_string(),
@@ -3086,7 +3107,7 @@ fn evaluate_expanded_module_functions(
             let rhs = evaluate_expanded_module_functions(expression.rhs(), config)?;
             expression
                 .evaluate_with_operands(lhs, rhs)
-                .map_err(|error| ArgumentSubstitutionError {
+                .map_err(|error| ArgumentSubstitutionError::Evaluation {
                     source_file: None,
                     line: expression.operator_span().line().unwrap_or(0),
                     message: error.to_string(),
@@ -3132,14 +3153,14 @@ fn evaluate_expanded_module_functions(
                     &eval_args,
                     config.catalog(),
                 )
-                .map_err(|message| ArgumentSubstitutionError {
+                .map_err(|message| ArgumentSubstitutionError::Evaluation {
                     source_file: None,
                     line: source_line.get().unwrap_or(0),
                     message,
                     parse_error: None,
                 })?
                 .into_value()
-                .map_err(|error| ArgumentSubstitutionError {
+                .map_err(|error| ArgumentSubstitutionError::Evaluation {
                     source_file: None,
                     line: source_line.get().unwrap_or(0),
                     message: error.to_string(),
@@ -3192,7 +3213,7 @@ fn evaluate_expanded_module_functions(
                 evaluate_expanded_module_functions(access.base(), config)?,
                 crate::resource::AccessMissPolicy::Error,
             )
-            .map_err(|error| ArgumentSubstitutionError {
+            .map_err(|error| ArgumentSubstitutionError::Evaluation {
                 source_file: None,
                 line: access.source_line(),
                 message: error.to_string(),
@@ -3229,7 +3250,7 @@ fn function_substitution_error(
     error: crate::parser::ParseError,
     fallback_line: usize,
 ) -> ArgumentSubstitutionError {
-    ArgumentSubstitutionError {
+    ArgumentSubstitutionError::Evaluation {
         source_file: error.source_file().map(std::path::Path::to_path_buf),
         line: fallback_line,
         message: error.to_string(),
@@ -3823,7 +3844,7 @@ fn check_composition_argument_type<P: crate::resource::PlaceholderKind, B: Bindi
         declared_type,
         config.as_provider_context(),
     )
-    .map_err(|error| ArgumentSubstitutionError {
+    .map_err(|error| ArgumentSubstitutionError::Evaluation {
         source_file: None,
         line,
         message: error.to_string(),
@@ -3835,7 +3856,7 @@ fn check_composition_argument_type<P: crate::resource::PlaceholderKind, B: Bindi
 
     if let StructuralOperandRef::Handle { handle, .. } = argument.operand_ref() {
         if let Err(error) = crate::validation::check_handle_sink(handle, &resolved_parameter) {
-            return Err(ArgumentSubstitutionError {
+            return Err(ArgumentSubstitutionError::Evaluation {
                 source_file: None,
                 line,
                 message: format!("parameter '{parameter}': {error}"),
@@ -3851,7 +3872,7 @@ fn check_composition_argument_type<P: crate::resource::PlaceholderKind, B: Bindi
             argument.value(),
             crate::validation::typecheck::TypecheckInference::Unavailable,
         )
-        .map_err(|mismatch| ArgumentSubstitutionError {
+        .map_err(|mismatch| ArgumentSubstitutionError::Evaluation {
             source_file: None,
             line,
             message: format!("parameter '{parameter}': {mismatch}"),
@@ -4030,7 +4051,18 @@ fn expand_parsed_deferred_for_expression(
 }
 
 #[derive(Debug)]
-pub(super) struct ArgumentSubstitutionError {
+pub(super) enum ArgumentSubstitutionError {
+    Evaluation {
+        source_file: Option<std::path::PathBuf>,
+        line: usize,
+        message: String,
+        parse_error: Option<Box<ParseError>>,
+    },
+    Authored(crate::parser::Located<Box<ArgumentSubstitutionError>>),
+}
+
+#[derive(Debug)]
+struct ArgumentSubstitutionDetails {
     source_file: Option<std::path::PathBuf>,
     line: usize,
     message: String,
@@ -4038,6 +4070,35 @@ pub(super) struct ArgumentSubstitutionError {
 }
 
 impl ArgumentSubstitutionError {
+    // Evaluation errors become analysis diagnostics after their owning syntax
+    // is known. An operand's authored location takes precedence over an
+    // enclosing call; locations never come from legacy file/line metadata.
+    fn into_diagnostic(
+        self,
+        owner: &crate::parser::DeclarationLocation,
+    ) -> crate::parser::Located<ArgumentSubstitutionDetails> {
+        match self {
+            Self::Evaluation {
+                source_file,
+                line,
+                message,
+                parse_error,
+            } => crate::parser::Located::new(
+                owner.clone(),
+                ArgumentSubstitutionDetails {
+                    source_file,
+                    line,
+                    message,
+                    parse_error,
+                },
+            ),
+            Self::Authored(finding) => {
+                let (location, error) = finding.into_parts();
+                error.into_diagnostic(&location)
+            }
+        }
+    }
+
     fn with_optional_source_file(self, source_file: Option<&std::path::Path>) -> Self {
         match source_file {
             Some(source_file) => self.with_source_file(source_file),
@@ -4045,19 +4106,33 @@ impl ArgumentSubstitutionError {
         }
     }
 
-    fn with_source_file(mut self, source_file: &std::path::Path) -> Self {
-        if self.source_file.is_none() {
-            self.source_file = Some(source_file.to_path_buf());
+    fn with_source_file(self, file: &std::path::Path) -> Self {
+        match self {
+            Self::Evaluation {
+                source_file,
+                line,
+                message,
+                parse_error,
+            } => Self::Evaluation {
+                source_file: source_file.or_else(|| Some(file.to_path_buf())),
+                line,
+                message,
+                parse_error: parse_error.map(|error| {
+                    Box::new(if error.source_file().is_some() {
+                        *error
+                    } else {
+                        error.in_file(file.to_path_buf())
+                    })
+                }),
+            },
+            Self::Authored(finding) => {
+                let (location, error) = finding.into_parts();
+                Self::Authored(crate::parser::Located::new(
+                    location,
+                    Box::new(error.with_source_file(file)),
+                ))
+            }
         }
-        if let Some(error) = self.parse_error.take() {
-            let error = *error;
-            self.parse_error = Some(Box::new(if error.source_file().is_some() {
-                error
-            } else {
-                error.in_file(source_file.to_path_buf())
-            }));
-        }
-        self
     }
 }
 
@@ -4116,7 +4191,7 @@ fn select_authored_module_ifs_for_test(
     Ok(match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             match crate::parser::decide_if_condition(deferred.condition().value(), config.catalog())
-                .map_err(|error| ArgumentSubstitutionError {
+                .map_err(|error| ArgumentSubstitutionError::Evaluation {
                     source_file: Some(deferred.condition().source_file().to_path_buf()),
                     line: deferred.condition().source_line(),
                     message: error.to_string(),
@@ -4352,7 +4427,7 @@ fn substitute_module_if_paths_in_secret<B: BindingAddress>(
                 substitute_module_if_paths_in_secret(access.base(), arguments, position)?,
                 AccessMissPolicy::Error,
             )
-            .map_err(|error| ArgumentSubstitutionError {
+            .map_err(|error| ArgumentSubstitutionError::Evaluation {
                 source_file: None,
                 line: access.source_line(),
                 message: error.to_string(),
@@ -4378,7 +4453,7 @@ fn substitute_module_if_paths_in_secret<B: BindingAddress>(
                 substitute_module_if_paths_in_secret(expression.lhs(), arguments, position)?,
                 substitute_module_if_paths_in_secret(expression.rhs(), arguments, position)?,
             )
-            .map_err(|error| ArgumentSubstitutionError {
+            .map_err(|error| ArgumentSubstitutionError::Evaluation {
                 source_file: None,
                 line: expression
                     .operator_span()
@@ -4458,7 +4533,7 @@ fn substitute_arguments_with_position<B: BindingAddress>(
                 StructuralOperandRef::Handle { .. }
                     if matches!(position, ArgumentSubstitutionPosition::Value) =>
                 {
-                    return Err(ArgumentSubstitutionError {
+                    return Err(ArgumentSubstitutionError::Evaluation {
                         source_file,
                         line,
                         message: BareStructuralHandle {
@@ -4503,7 +4578,7 @@ fn substitute_arguments_with_position<B: BindingAddress>(
             let source_line = argument.source_line(arguments.default_line);
             argument
                 .substitution(binding.as_str(), ArgumentSubstitutionPosition::Value)
-                .map_err(|message| ArgumentSubstitutionError {
+                .map_err(|message| ArgumentSubstitutionError::Evaluation {
                     source_file: None,
                     line: source_line,
                     message,
@@ -4519,7 +4594,7 @@ fn substitute_arguments_with_position<B: BindingAddress>(
             let source_line = argument.source_line(arguments.default_line);
             let substitution = argument
                 .substitution(path.binding(), ArgumentSubstitutionPosition::AccessBase)
-                .map_err(|message| ArgumentSubstitutionError {
+                .map_err(|message| ArgumentSubstitutionError::Evaluation {
                     source_file: None,
                     line: source_line,
                     message,
@@ -4534,7 +4609,7 @@ fn substitute_arguments_with_position<B: BindingAddress>(
                 AccessMissPolicy::Error,
             )
             .and_then(ValuePathSegmentResult::into_value)
-            .map_err(|error| ArgumentSubstitutionError {
+            .map_err(|error| ArgumentSubstitutionError::Evaluation {
                 source_file: None,
                 line: source_line,
                 message: error.to_string(),
@@ -4548,12 +4623,15 @@ fn substitute_arguments_with_position<B: BindingAddress>(
                     AccessMissPolicy::Error,
                 )
                 .and_then(ValuePathSegmentResult::into_value)
-                .map_err(|error| ArgumentSubstitutionError {
+                .map_err(|error| ArgumentSubstitutionError::Evaluation {
                     source_file: None,
                     line: source_line,
                     message: error.to_string(),
                     parse_error: None,
                 })?;
+            }
+            if let Some(locations) = path.reference_locations() {
+                substituted = substituted.with_reference_locations(locations);
             }
             substituted
         }
@@ -4589,7 +4667,7 @@ fn substitute_arguments_with_position<B: BindingAddress>(
             )?;
             expression
                 .evaluate_with_operands(lhs, rhs)
-                .map_err(|error| ArgumentSubstitutionError {
+                .map_err(|error| ArgumentSubstitutionError::Evaluation {
                     source_file: None,
                     line: expression
                         .operator_span()
@@ -4693,7 +4771,7 @@ fn substitute_arguments_with_position<B: BindingAddress>(
             )?;
             access
                 .rebuild_with_base(substituted_base, crate::resource::AccessMissPolicy::Error)
-                .map_err(|error| ArgumentSubstitutionError {
+                .map_err(|error| ArgumentSubstitutionError::Evaluation {
                     source_file: None,
                     line: access.source_line(),
                     message: error.to_string(),
@@ -4803,7 +4881,7 @@ fn substitute_arguments_with_position<B: BindingAddress>(
                 ),
             ) => (None, arguments.default_line),
         };
-        return Err(ArgumentSubstitutionError {
+        return Err(ArgumentSubstitutionError::Evaluation {
             source_file,
             line,
             message: error.to_string(),

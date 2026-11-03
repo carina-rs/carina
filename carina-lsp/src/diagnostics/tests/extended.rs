@@ -15255,6 +15255,18 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() 
                 .collect::<Vec<_>>();
             panic!("missing resolver error: {rendered:#?}")
         });
+    let sibling_doc =
+        create_document_at("let unrelated = 'unrelated'\n", module.join("sibling.crn"));
+    let sibling_diagnostics = engine.with_run_for_test(|run| {
+        run.module_resolver_error_diagnostics(
+            &sibling_doc,
+            &carina_core::parser::AnalysisTree::try_from_file(merged.directory.parsed.parsed())
+                .unwrap(),
+            error,
+            &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
+        )
+    });
+    assert!(sibling_diagnostics.is_empty(), "{sibling_diagnostics:#?}");
     let module_doc = crate::document::Document::new_with_path(
         module_source.to_string(),
         module_path.clone(),
@@ -15277,6 +15289,11 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() 
         .unwrap_or_else(|| panic!("missing module-file diagnostic: {diagnostics:#?}"));
 
     assert_eq!(diagnostic.range.start.line, 4, "{diagnostic:#?}");
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(4, 29), Position::new(4, 36)),
+        "{diagnostic:#?}",
+    );
     assert!(
         diagnostic
             .message

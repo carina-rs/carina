@@ -4173,6 +4173,30 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
         }
     }
 
+    /// Preserve an authored reference occurrence after substituting its base.
+    /// Only the selected reference changes; references inside a selected
+    /// container retain their own provenance.
+    pub(crate) fn with_reference_locations(
+        mut self,
+        locations: &crate::parser::ReferenceLocations,
+    ) -> Self {
+        match &mut self {
+            Value::Deferred(DeferredValue::ResourceRef { path }) => {
+                path.set_reference_locations(locations.clone());
+            }
+            Value::Deferred(DeferredValue::Access(access)) => {
+                access.set_access_locations(crate::parser::AccessLocations::Reference(
+                    locations.clone(),
+                ));
+            }
+            Value::Deferred(DeferredValue::Secret(inner)) => {
+                **inner = inner.clone().with_reference_locations(locations);
+            }
+            _ => {}
+        }
+        self
+    }
+
     /// Attach authored display context to a valid deferred access. This does
     /// not expose or mutate the access operands; construction and rebuilding
     /// still go through [`apply_value_path_segment`].

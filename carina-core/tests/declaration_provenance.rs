@@ -524,3 +524,66 @@ fn element_provenance_survives_module_expansion_and_deferred_phase_changes() {
         .unwrap();
     assert_location(output.location(), &child_path, child, "output");
 }
+
+#[test]
+fn module_argument_forwarding_preserves_reference_occurrences() {
+    let root = tempfile::tempdir().unwrap();
+    for directory in ["outer", "inner"] {
+        std::fs::create_dir(root.path().join(directory)).unwrap();
+    }
+    let caller = "let outer = use { source = './outer' }\nlet target = mock.test.Resource {}\nlet instance = outer { supplied = target }\n";
+    let outer = "arguments { supplied: mock.test.Resource }\nlet inner = use { source = '../inner' }\nlet nested = inner { supplied = supplied }\n";
+    let inner = "arguments { supplied: mock.test.Resource }\n";
+    let outputs = "attributes {\n  direct = supplied.status\n  repeated = [supplied.status, supplied.status]\n  postfix = (supplied.status)[0]\n  interpolated = \"${supplied.status}\"\n}\n";
+    for (name, source) in [
+        ("main.crn", caller),
+        ("outer/main.crn", outer),
+        ("inner/main.crn", inner),
+        ("inner/sibling.crn", outputs),
+    ] {
+        std::fs::write(root.path().join(name), source).unwrap();
+    }
+    let mut config = context();
+    config
+        .resource_types
+        .insert(("mock".into(), "test.Resource".into()));
+    let path = ResolvedPath::new(root.path()).unwrap();
+    let expanded = TypeCheckSession::run(&config, |session| {
+        let parsed = parse_directory(&path, session.catalog()).unwrap();
+        resolve_modules_providerless(parsed, &path, session).unwrap()
+    })
+    .publish(&mut NoTypeErrors)
+    .into_expanded(&carina_core::schema::SchemaRegistry::new(), &config)
+    .unwrap();
+    let tree = AnalysisTree::try_from_file(&expanded).expect("forwarded reference provenance");
+    let composition = tree
+        .resources()
+        .find(|item| item.binding() == Some("instance.nested"))
+        .unwrap();
+    let references = composition.references();
+    assert_eq!(references.len(), 5);
+    let output_path = root.path().join("outer/../inner/sibling.crn");
+    for (reference, expression) in references.iter().zip([
+        "supplied.status",
+        "supplied.status",
+        "supplied.status",
+        "(supplied.status)[0]",
+        "supplied.status",
+    ]) {
+        let location = reference.location();
+        assert_eq!(reference.path().binding(), "target");
+        assert_eq!(reference.path().attribute(), "status");
+        assert_eq!(location.file().path(), output_path);
+        assert_eq!(
+            &outputs[location.span().start_byte()..location.span().end_byte()],
+            expression,
+        );
+        let prefix = reference.prefix_location();
+        assert_eq!(prefix.file().path(), output_path);
+        assert_eq!(
+            &outputs[prefix.span().start_byte()..prefix.span().end_byte()],
+            "supplied.status",
+        );
+    }
+    assert_ne!(references[1].location(), references[2].location());
+}

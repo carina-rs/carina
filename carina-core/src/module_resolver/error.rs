@@ -102,12 +102,21 @@ pub enum ModuleError {
         message: String,
     },
 
-    #[error("module '{module}' ({source_path}) at line {line}: {message}")]
+    /// Expansion diagnostics require a parser-owned location immediately.
+    ///
+    /// ```compile_fail,E0308
+    /// use carina_core::module_resolver::ModuleError;
+    /// let _ = ModuleError::ArgumentValueAccess {
+    ///     module: "child".into(), source_path: "sibling.crn".into(), line: 1,
+    ///     diagnostic: None,
+    /// };
+    /// ```
+    #[error("module '{module}' ({source_path}) at line {line}: {}", .diagnostic.detail())]
     ArgumentValueAccess {
         module: String,
         source_path: String,
         line: usize,
-        message: String,
+        diagnostic: crate::parser::Located<String>,
     },
 
     #[error(
@@ -335,7 +344,7 @@ impl ModuleError {
                 module: _,
                 source_path: _,
                 line: _,
-                message: _,
+                diagnostic: _,
             }
             | Self::DroppedConditionalBinding {
                 binding: _,
@@ -454,10 +463,11 @@ impl ModuleError {
                 module,
                 source_path,
                 line,
-                message,
+                diagnostic,
             } => format!(
-                "module '{module}' ({}) at line {line}: {message}",
+                "module '{module}' ({}) at line {line}: {}",
                 display_source_path_relative_to(Path::new(source_path), root),
+                diagnostic.detail(),
             ),
             Self::DroppedConditionalBinding {
                 binding,

@@ -168,12 +168,22 @@ impl ResidualModuleResolutionError {
             ResidualModuleResolutionDiagnostic::Constraint { origin } => Some(origin),
             _ => None,
         };
-        tree.module_calls().filter(|call| match self.call_source() {
+        let mut findings: Vec<_> = tree.module_calls().filter(|call| match self.call_source() {
             ModuleErrorCallSource::Failing(identity) => identity == call.id(),
             ModuleErrorCallSource::Owners(owners) => owners.iter().any(|identity| identity == call.id()),
             ModuleErrorCallSource::Unavailable => false,
         }).filter(|call| !matches!(constraint_origin, Some(ConstraintOrigin::LiveCall(identity)) if identity == call.id()))
-            .map(|call| crate::parser::Located::new(call.id().module_name_location().clone(), self)).collect()
+            .map(|call| crate::parser::Located::new(call.id().module_name_location().clone(), self)).collect();
+        if let ModuleError::ArgumentValueAccess { diagnostic, .. } = self.0.root_cause() {
+            // Keep the authored module operand as well as its caller anchors.
+            // In the operand's own file it replaces any broader call anchor.
+            findings.retain(|finding| finding.location().file() != diagnostic.location().file());
+            findings.insert(
+                0,
+                crate::parser::Located::new(diagnostic.location().clone(), self),
+            );
+        }
+        findings
     }
 
     pub fn is_constraint(&self) -> bool {
@@ -195,7 +205,7 @@ impl ResidualModuleResolutionError {
                 module: _module,
                 source_path,
                 line,
-                message: _message,
+                diagnostic: _diagnostic,
             } => Some(ResidualModuleResolutionDiagnostic::ArgumentValueAccess {
                 source_path,
                 line: *line,
@@ -331,7 +341,7 @@ impl ResidualModuleResolutionError {
                 module: _,
                 source_path: _,
                 line: _,
-                message: _,
+                diagnostic: _,
             } => false,
             ModuleError::DroppedConditionalBinding {
                 binding: _,
@@ -525,7 +535,7 @@ fn without_covered_reference_type_members(
             module: _,
             source_path: _,
             line: _,
-            message: _,
+            diagnostic: _,
         }
         | ModuleError::DroppedConditionalBinding {
             binding: _,
