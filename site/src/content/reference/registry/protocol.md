@@ -697,7 +697,7 @@ carina-provider-aws-v0.3.0-docs.tar.gz
     ami.md                 # one page per data source
 ```
 
-A docs bundle is valid only if all of the following hold. The registry checks every rule at publish (§7) and refuses an invalid bundle rather than repairing it.
+A docs bundle is valid only if all of the following hold. The registry checks every rule at publish (§7) and refuses an invalid bundle rather than repairing it. Its validator and renderer are published as [carina-docs-bundle](https://github.com/carina-rs/carina-docs-bundle), whose `check` command applies these rules to a local archive.
 
 - It is exactly one gzip member holding a POSIX tar archive (`ustar` or `pax`), and nothing but zero bytes follows the tar end-of-archive marker.
 - Every entry is a regular file or a directory. Symbolic links, hard links, device files, FIFOs and GNU long-name or long-link entries (`././@LongLink`) are invalid; a provider whose paths exceed the `ustar` limit writes `pax` (`tar --format=pax`). pax global headers (`g`) are invalid. pax extended headers (`x`) are metadata, not entries, and do not count toward the entry limit; each is at most 64 KiB; every rule here, including path normalization and the size limits, applies to an entry's effective `path` and `size`, which are the pax values when given.
