@@ -818,7 +818,7 @@ let zone = hosted_zone {
 }
 
 #[test]
-fn declared_string_output_preserves_forwarded_log_group_arn_evidence() {
+fn declared_string_output_accepts_forwarded_log_group_arn_at_identityless_sink() {
     let fixture = Fixture::module(
         &[
             ("attributes.crn", "attributes {\n  x: String = lg.arn\n}\n"),
@@ -885,7 +885,7 @@ let zone = aws.route53.HostedZone {
 }
 
 #[test]
-fn nested_declared_string_outputs_accumulate_forwarded_evidence() {
+fn nested_declared_string_outputs_accept_forwarded_arn_at_identityless_sink() {
     let temp = tempfile::tempdir().expect("tempdir");
     let inner = temp.path().join("inner");
     let outer = temp.path().join("outer");

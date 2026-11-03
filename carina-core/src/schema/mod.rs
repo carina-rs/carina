@@ -4407,10 +4407,7 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     ///     pattern/length/range is a value constraint, enforced when the
     ///     concrete value is known (carina#3805). Rules 4–6 make the same
     ///     leaf decision recursively inside List/Map/Struct, and rules 2–3
-    ///     preserve their normal all/any Union semantics. For String only,
-    ///     rule 8 also accepts identity-bearing sources into identity-less
-    ///     sinks, with the same value checks at plan or before provider
-    ///     dispatch at apply.
+    ///     preserve their normal all/any Union semantics.
     /// 11. Otherwise: same primitive type names.
     ///
     /// # Conservative pattern/length policy
@@ -4423,13 +4420,6 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     /// as unbounded). Thus a source whose own pattern differs, whose range is
     /// wider, or whose other refinement evidence does not establish the
     /// sink's constraint is rejected.
-    ///
-    /// An identity-bearing String source is assignable to an identity-less
-    /// String sink regardless of the source's pattern/length. This exception
-    /// is limited to identity-less sinks; rule 7's identity and length
-    /// comparisons and rule 8's identity-less refined-source evidence
-    /// comparisons are unchanged. The sink's constraints are checked on the
-    /// value when known at plan or before provider dispatch at apply (#3805).
     ///
     /// A completely unrefined source is intentionally different: it makes
     /// no refinement claim that can conflict with the sink. Rule 10 accepts
