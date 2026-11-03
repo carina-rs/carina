@@ -88,7 +88,7 @@ The examples below are the files in [`docs/registry/static-registry-example/mini
 |---|---|---|
 | `versions` | yes | Every published version, newest first by semver precedence |
 | `versions[].version` | yes | The semantic version. A version with a pre-release component (`0.0.0-main.12.1.gabc123`) is a pre-release; anything else is stable |
-| `versions[].protocols` | yes | Provider protocol versions the binary speaks; `["1"]` today |
+| `versions[].protocols` | yes | Registry protocol metadata; these example files use `["1"]`. The CLI ignores this field and checks `info.protocol_version` when loading the component (20 on `main`) |
 | `versions[].yanked` | optional | `true` withdraws the version from new resolutions (see "Yanking a version") |
 
 Never remove a version from the listing. A lock that pins it would stop resolving; withdraw it with `yanked` instead (protocol §9).
@@ -206,7 +206,7 @@ Two fields are sticky per version rather than per provider. Once a client has se
 
 ### `sequence` is a counter
 
-Increase `sequence` whenever the versions in the listing or their `yanked` flags change, and never reuse or lower a value. Re-serving the same versions with renewed `generated_at` and `valid_until` keeps the same `sequence`. Increase it in small steps, as a counter: the client also refuses a `sequence` that jumps implausibly far ahead of the one it last saw (protocol §2 "Fast-forward guard"; the current CLI refuses jumps of more than 1,000,000), so a timestamp is not a usable `sequence`.
+Increase `sequence` whenever the versions in the listing or their `yanked` flags change, and never reuse or lower a value. Re-serving the same versions with renewed `generated_at` and `valid_until` keeps the same `sequence`. Increase it in small steps, as a counter: the current CLI refuses jumps of more than 1,000,000 from the successful-resolution reference point (protocol §2 "Fast-forward guard"); failed-resolution observations do not advance that point. A timestamp is therefore not a usable `sequence`.
 
 ### `valid_until` must be renewed before it passes
 

@@ -7,14 +7,14 @@ description: "The Carina Provider Registry Protocol: the HTTP JSON API a Carina 
 
 The Carina Provider Registry Protocol is an HTTP JSON API for provider discovery, version resolution, and download URL retrieval.
 
-In addition to the API, the registry hosts a web UI for provider documentation. `registry.carina-rs.dev` provides a single place for searching providers, browsing their docs, and inspecting version information.
+In addition to the API, the registry hosts a web UI for provider documentation. `registry.carina-rs.dev` provides a directory for browsing providers, reading their docs, and inspecting versions.
 
 The protocol is modeled after the Terraform Registry Protocol, but is significantly simplified because Carina providers are WASM binaries only (no per-platform builds).
 
 ## Design Principles
 
 - **WASM-only**: no concept of os/arch
-- **Metadata + documentation**: the registry is responsible for metadata, discovery, and provider documentation; binaries are hosted on each provider repo's GitHub Releases
+- **Metadata + documentation**: the registry is responsible for metadata, discovery, and provider documentation; stable binaries are served from its by-digest store, and pre-release binaries from their publisher origin, usually GitHub Releases
 - **Backward compatible**: the existing `github.com/owner/repo` source format continues to be supported
 - **Gradual migration**: direct GitHub source references continue to work alongside the registry
 
@@ -113,7 +113,7 @@ Unlike Terraform, there is no `platforms` field (WASM is platform-independent).
 
 ### Freshness — anti-rollback / anti-freeze
 
-The per-version `download` response (§3) is signed and content-addressed, so an individual artifact cannot be forged. But the **versions listing itself is a collection** that asserts *which versions exist*, and a stale or hostile registry/mirror can serve an old listing that **hides a newer (patched) version**, pinning a client to a known-vulnerable-but-authentic one. Per-artifact integrity cannot detect this (every entry it serves is genuine). The `sequence` + `valid_until` fields are the minimal defense (the TUF *timestamp* role without an external witness):
+When present, the per-version artifact signature (§3) authenticates its digest; the `download` metadata is not itself signed. The **versions listing itself is a collection** that asserts *which versions exist*, and a stale or hostile registry/mirror can serve an old listing that **hides a newer (patched) version**, pinning a client to a known-vulnerable-but-authentic one. Per-artifact integrity cannot detect this (every entry it serves is genuine). The `sequence` + `valid_until` fields are the minimal defense (the TUF *timestamp* role without an external witness):
 
 - **Anti-rollback.** The client MUST persist accepted `sequence` observations per `(host, namespace/name)` in `carina-providers.lock`, but acceptance alone MUST NOT establish or advance a reference point. A successful resolution using a listing — including an existing lock-pin re-check — MUST establish or advance a reference point from its observation. That point alone is the rollback floor; lower values MUST be rejected.
 - **Anti-freeze.** The client MUST treat a listing whose `valid_until` is in the past as stale and fail (or, where a degraded mode is acceptable, warn loudly) rather than silently trust it. This bounds how long an attacker can replay a frozen view.
@@ -302,7 +302,8 @@ Identical shape to §3 `Get Provider Version`, plus the `version` the revision r
   "protocols": ["1"],
   "filename": "carina-provider-aws-v0.5.0.wasm",
   "download_url": "https://github.com/carina-rs/carina-provider-aws/releases/download/v0.5.0/carina-provider-aws-v0.5.0.wasm",
-  "shasum": "5f9c7aa76b7c34d722fc9123208e26b22d60440cb47150dd04733b9b94f4541a"
+  "shasum": "5f9c7aa76b7c34d722fc9123208e26b22d60440cb47150dd04733b9b94f4541a",
+  "shasum_authored_by": "registry"
 }
 ```
 
@@ -382,7 +383,7 @@ Residual: namespace ownership and tombstoning are **per-registry-local** (the ho
 
 Publishing a version is authenticated with **keyless OIDC trusted publishing** — there is no long-lived publish credential anywhere to phish or exfiltrate. The CI that builds the provider presents a short-lived OIDC token; the registry verifies it against a pre-registered trusted-publisher policy for `(namespace, name)` (the issuer, owner id, signing requirement and allowed download hosts are per namespace; the repository and trusted publishers are per provider) and mints an internal, short-lived, scoped grant.
 
-This is **issuer-agnostic.** GitHub Actions (`token.actions.githubusercontent.com`) is the first supported issuer; the trust policy is a per-namespace `{allowed-issuer, claim-mapping}`, so adding GitLab CI / a self-hosted IdP / a private Fulcio is configuration, not a redesign.
+The current implementation supports GitHub Actions claims (`token.actions.githubusercontent.com`). Other CI issuers require a claim adapter and matching verification support.
 
 ### Request
 
@@ -503,7 +504,7 @@ artifact bundle; otherwise only without docs.
    - **reject** any token minted from a `pull_request` / `pull_request_target` context
 2. Fetch `candidate_download_url`, compute the SHA256 over the observed bytes (authoritative `shasum`, §3); reject any payload-supplied hash. The fetch MUST be SSRF-guarded (host/scheme allow-list; deny IMDS/link-local/internal ranges; bounded redirects; size/time/decompression caps).
 3. Verify the artifact signature (§3) before emitting. When `docs` is present, fetch the docs bundle the same SSRF-guarded way, compute its SHA256, validate it against "Documentation source: the docs bundle" below, and verify its signature (above) before emitting anything for the version. Retain the archive bytes in the registry's by-digest store and emit that copy's URL as §3 `docs.download_url`, never the publisher's origin URL; record the artifact and docs bundles as the version's signature pair, then write the pair's docs bundle, when present, at the path §3 `docs.signature.bundle_url` names ("Recorded signature pair" above). Render every docs page in memory before the first write, so a rendering failure rejects the publish like any other docs failure. Write the archive and `docs.sigstore.json` before the §3 object that points at them, and the rendered pages, docs version list and provider directory after it; a same-content retry re-emits the pages, the version list and the provider directory, so a publish interrupted after the §3 write is completed by retrying it.
-4. Reject if `(namespace, name, version)` already exists (immutability, §9).
+4. Reject conflicting republishes of `(namespace, name, version)` (immutability, §9); accept a same-content idempotent retry and complete any unfinished writes.
 5. Mint a ≤15-minute scoped grant; store no long-lived credential.
 
 The trusted-publisher policy store is a high-value target: it SHOULD be append-only/audited, mutated under two-person review, with the grant-minting key in an HSM/KMS, because whoever can change it can authorize any workflow to publish under a namespace.
@@ -570,56 +571,24 @@ Nor would keeping the promise remedy the cases it was written for. Deletion does
 
 ## API Call Flow
 
-A client resolves and downloads a provider with three registry calls, then fetches the binary directly from the release host. Solid arrows are requests; dashed arrows are responses.
+A client fetches discovery, the version listing and download metadata, then fetches the artifact from `download_url` and, when signed, its Sigstore bundle from `signature.bundle_url`. Stable artifact URLs point to the registry's by-digest store; pre-release artifact URLs point to the publisher's origin. Solid arrows are requests; dashed arrows are responses.
 
-<img src="/images/registry-api-call-flow.svg" alt="Sequence diagram: the client requests /.well-known/carina.json, the version list and the download endpoint from the registry, then downloads the WASM binary from download_url on GitHub Releases" width="780" height="488" style="width:100%;height:auto">
+<img src="/images/registry-api-call-flow.svg" alt="Sequence diagram: the client requests discovery, the version list and download metadata from the registry, then downloads the WASM binary from download_url (the registry by-digest store for stable versions, the publisher origin for pre-releases) and, when signed, the Sigstore bundle" width="780" height="588" style="width:100%;height:auto">
 
 ## Provider Metadata (Registry-side)
 
-Metadata that the registry holds for each provider. In the initial implementation, this is managed as JSON files.
+The registry stores provider policy, owner bindings, immutable version metadata and listing state in DynamoDB. It derives the protocol's static read-plane JSON objects from these records.
 
-```plaintext
-providers/
-  carina-rs/
-    aws.json
-    awscc.json
-```
-
-**Example `aws.json`:**
-
-```json
-{
-  "namespace": "carina-rs",
-  "name": "aws",
-  "source": "github.com/carina-rs/carina-provider-aws",
-  "versions": [
-    {
-      "version": "0.3.0",
-      "protocols": ["1"],
-      "shasum": "5f9c7aa76b7c34d722fc9123208e26b22d60440cb47150dd04733b9b94f4541a"
-    },
-    {
-      "version": "0.2.0",
-      "protocols": ["1"],
-      "shasum": "abc123..."
-    }
-  ]
-}
-```
-
-| Field | Type | Description |
-|---|---|---|
-| `namespace` | string | Provider namespace (typically the GitHub org name) |
-| `name` | string | Short name of the provider |
-| `source` | string | Source URL of the GitHub repository |
-| `versions` | array | Array of version entries |
-| `versions[].version` | string | Semantic version |
-| `versions[].protocols` | string[] | Provider Protocol versions |
-| `versions[].shasum` | string | SHA256 of the WASM binary |
+| Record | Contents |
+|---|---|
+| Provider policy | Namespace issuer, signing requirement and allowed download hosts; per-provider repository and trusted publishers |
+| Owner binding | `(namespace, name)`, stable owner ID and binding time |
+| Version metadata | `(namespace, name, version)`, artifact SHA256, download URL, filename, protocol metadata, publish time and grant ID; optional docs SHA256 and stable-release origin URL |
+| Listing state | Provider version-set digest and sequence counter |
 
 ## Carina Configuration Integration
 
-Provider references in `.crn` files after the registry is introduced:
+Choose one source form for each provider in a `.crn` configuration:
 
 ```hcl
 # Via the registry (new form)
@@ -627,13 +596,17 @@ provider aws {
   source  = "carina-rs/aws"
   version = "~0.3.0"
 }
+```
 
+```hcl
 # Direct GitHub (existing form, still supported)
 provider aws {
   source  = "github.com/carina-rs/carina-provider-aws"
   version = "~0.3.0"
 }
+```
 
+```hcl
 # Custom registry
 provider custom {
   source  = "registry.example.com/myorg/custom"
@@ -744,7 +717,6 @@ The following are out of scope for the initial implementation but may be conside
 - **Authentication**: token-based authentication for **read** access to private providers (the **publish** side is now normative in §7; this item is now only about read-side per-host auth)
 - **Search API**: `GET /v1/providers?q=aws` for provider search
 - **Publish API**: ~~an API for automatically registering providers from CI~~ — now normative in §7
-- **Provider signing**: ~~signature verification of provider binaries~~ — now normative in §3 (the `signature` block + client-verification MUST); what remains deferred is the implementation
 - **Mirrors/Proxy**: mirror registries for network-restricted environments (their trust model is now normative in §6; what remains deferred is the operational deployment)
 - **Third-party provider registration**: a flow for registering third-party providers (e.g. an opt-in watch list combined with scheduled polling of their GitHub Releases)
 - **SHA resolution on §4**: §4 specifies the full surface, while the current implementation serves branch and tag keys. SHA resolution remains out of scope and can be added later without breaking clients

@@ -23,8 +23,8 @@ Since v0.5.0, the first release that checks the version, every release has set t
 
 | Carina release | Protocol version | Oldest provider protocol it loads |
 |----------------|------------------|-----------------------------------|
-| Next release after v0.9.0 (unreleased) | 20 | 20 |
-| Development snapshot after v0.9.0 (unreleased) | 19 | 19 |
+| Main after v0.10.0 (unreleased) | 20 | 20 |
+| v0.10.0 | 19 | 19 |
 | Development snapshot after v0.9.0 (unreleased) | 18 | 18 |
 | Development snapshot after v0.9.0 (unreleased) | 17 | 17 |
 | Development snapshot after v0.9.0 (unreleased) | 16 | 16 |
@@ -37,9 +37,9 @@ Since v0.5.0, the first release that checks the version, every release has set t
 | v0.6.0 | 10 | 10 |
 | v0.5.0 | 10 | 10 |
 
-Only protocol 20 is current. Protocols 14 through 19 were development snapshots, and their changes remain part of protocol 20:
+Protocol 20 is current on main; Carina v0.10.0 uses protocol 19. Protocols 14 through 18 were development snapshots, and their changes remain part of protocols 19 and 20:
 
-| Development protocol | Change |
+| Protocol | Change |
 |----------------------|--------|
 | 20 | Create-outcome names describe cloud knowledge: `not-created`, `identifier-reported`, `no-resource`, and `unchanged`; identifier-bearing records are `create-identified` and `resume-identified`. |
 | 19 | Desired normalization uses structural trees with per-leaf, exactly-once deferred handles; CRUD encoding is unchanged. |
