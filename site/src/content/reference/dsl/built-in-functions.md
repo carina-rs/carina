@@ -3,7 +3,7 @@ title: Built-in Functions
 description: Complete reference for all built-in functions available in the Carina DSL.
 ---
 
-Carina provides built-in functions for string manipulation, list operations, map operations, networking, and security. All built-in functions support [partial application](/reference/dsl/expressions/#partial-application) when called with fewer arguments than expected.
+Carina provides built-in functions for string manipulation, list operations, map operations, networking, and security. Built-ins with multiple required arguments support [partial application](/reference/dsl/expressions/#partial-application) when called with at least one argument but fewer than their required arity.
 
 ## String Functions
 
@@ -79,7 +79,7 @@ split('::', 'a::b::c')   # => ['a', 'b', 'c']
 Joins list elements into a string using a separator. Elements must be scalars (strings, numbers, bools, enum values, or durations); if any element is secret, the result is secret.
 
 ```
-join(separator: String, list: list(String)) -> String
+join(separator: String, list: list(Any)) -> String
 ```
 
 ```crn
@@ -312,9 +312,7 @@ secret(value: Any) -> Secret
 ```
 
 ```crn
-awscc.rds.DbInstance {
-  master_user_password = secret(env('DB_PASSWORD'))
-}
+let password = secret(env('DB_PASSWORD'))
 ```
 
 ### `decrypt`
@@ -332,10 +330,8 @@ let password = decrypt('AQICAHh...')
 # Explicit key
 let password = decrypt('AQICAHh...', 'alias/my-key')
 
-# The decrypted result is already secret
-awscc.rds.DbInstance {
-  master_user_password = decrypt('AQICAHh...')
-}
+# The decrypted result is already secret (ciphertext is a placeholder)
+let decrypted_password = decrypt('AQICAHh...')
 ```
 
 The result is automatically masked as `(secret)` in plans, and providers receive the plaintext. Wrapping it in `secret()` is harmless but unnecessary.

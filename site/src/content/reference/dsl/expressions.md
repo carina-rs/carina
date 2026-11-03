@@ -75,11 +75,11 @@ let vpcs = for name, cidr in cidrs {
 
 ```crn
 let networks = for name, cidr in cidrs {
-  let subnet_cidr = cidr_subnet(cidr, 8, 1)
+  let subnet_bits = 8
 
   network {
     cidr_block  = cidr
-    subnet_cidr = subnet_cidr
+    subnet_cidr = cidr_subnet(cidr, subnet_bits, 1)
     az          = 'ap-northeast-1a'
   }
 }
@@ -234,7 +234,7 @@ Access on a value that is already known is evaluated immediately. Access whose b
 
 ## Coalesce Operator (`??`)
 
-`ref ?? default` uses the referenced value when it exists and `default` when it is absent. The left side must be a reference or access chain (`up.accounts`, `vpc.tags`); both sides are type-checked, so a default of the wrong type is rejected by `validate`.
+`ref ?? default` uses the referenced value when it exists and `default` when it is absent. The left side may be a value expression (`up.accounts`, `vpc.tags`, or a literal); both sides are type-checked, so a default of the wrong type is rejected by `validate`. A known concrete value is returned immediately, while unresolved references retain fallback behavior.
 
 ```crn
 let orgs = upstream_state {
@@ -340,7 +340,7 @@ let name = join('-', ['prod', 'web', 'vpc'])
 
 ### Partial Application
 
-When a built-in function is called with fewer arguments than it expects, it returns a closure that captures the provided arguments. The closure waits for the remaining arguments before executing.
+A built-in with multiple required arguments returns a closure when called with at least one argument but fewer than its required arity. The closure captures the provided arguments and waits for the remaining arguments before executing. Zero-argument calls fail; a pipe such as `value |> upper()` supplies the piped argument.
 
 ```crn
 # split expects 2 args: split(separator, string)
