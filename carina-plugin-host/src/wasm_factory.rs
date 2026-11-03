@@ -7992,6 +7992,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
 mod tests {
     mod assignability_edges_stage_a {
         use super::*;
+        use carina_core::parser::SchemaTypeOwner;
         use carina_core::schema::{
             AssignabilityEdge, AttributeSchema, AttributeType, ReferenceForms, ResourceSchema,
             SchemaRegistry,
@@ -8047,10 +8048,15 @@ mod tests {
                 carina_core::EnvironmentSnapshot::empty(),
             );
             let catalog = &loaded.provider_context().custom_types;
-            assert!(catalog.reachable("host-owner", &identity("A"), &identity("B")));
-            assert!(catalog.reachable("host-owner", &identity("A"), &identity("C")));
-            assert!(!catalog.reachable("host-owner", &identity("C"), &identity("A")));
-            assert!(!catalog.reachable("semantic", &identity("A"), &identity("C")));
+            let owner = SchemaTypeOwner::Provider("host-owner".into());
+            assert!(catalog.reachable(&owner, &identity("A"), &identity("B")));
+            assert!(catalog.reachable(&owner, &identity("A"), &identity("C")));
+            assert!(!catalog.reachable(&owner, &identity("C"), &identity("A")));
+            assert!(!catalog.reachable(
+                &SchemaTypeOwner::Provider("semantic".into()),
+                &identity("A"),
+                &identity("C"),
+            ));
         }
     }
 

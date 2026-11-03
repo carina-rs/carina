@@ -733,7 +733,9 @@ pub trait CustomTypeResolver: Send + Sync {
 /// indexed schema snapshot as its validation implementation.
 pub(crate) trait ProviderCustomTypeSource: CustomTypeResolver + 'static {
     fn known_custom_types(&self) -> BTreeSet<OwnedTypeIdentity>;
-    fn assignability_closures(&self) -> BTreeMap<String, crate::schema::AssignabilityClosure>;
+    fn assignability_closures(
+        &self,
+    ) -> BTreeMap<SchemaTypeOwner, crate::schema::AssignabilityClosure>;
 }
 
 impl<F> CustomTypeResolver for F
@@ -781,7 +783,7 @@ enum ProviderCustomTypeState {
         known: BTreeSet<OwnedTypeIdentity>,
         resolver: CustomTypeValidatorFn,
         enum_lookup: CustomTypeEnumLookupFn,
-        assignability_closures: BTreeMap<String, crate::schema::AssignabilityClosure>,
+        assignability_closures: BTreeMap<SchemaTypeOwner, crate::schema::AssignabilityClosure>,
     },
 }
 
@@ -887,13 +889,21 @@ impl ProviderCustomTypes {
 
     /// Whether this owner declared a nonempty path from `source` to `sink`.
     /// Paths never compose declarations belonging to different owners.
-    pub fn reachable(&self, owner: &str, source: &TypeIdentity, sink: &TypeIdentity) -> bool {
+    pub fn reachable(
+        &self,
+        owner: &SchemaTypeOwner,
+        source: &TypeIdentity,
+        sink: &TypeIdentity,
+    ) -> bool {
         match self.state.as_ref() {
             ProviderCustomTypeState::Unloaded => false,
             ProviderCustomTypeState::Partial {
                 loaded,
                 failed_providers,
-            } => !failed_providers.contains(owner) && loaded.reachable(owner, source, sink),
+            } => {
+                let SchemaTypeOwner::Provider(provider) = owner;
+                !failed_providers.contains(provider) && loaded.reachable(owner, source, sink)
+            }
             ProviderCustomTypeState::Loaded {
                 known: _known,
                 resolver: _resolver,
@@ -903,6 +913,18 @@ impl ProviderCustomTypes {
                 .get(owner)
                 .is_some_and(|closure| closure.reachable(source, sink)),
         }
+    }
+
+    /// Whether every owner declared a nonempty path from `source` to `sink`.
+    pub fn reachable_for_all(
+        &self,
+        owners: &NonEmptySchemaTypeOwners,
+        source: &TypeIdentity,
+        sink: &TypeIdentity,
+    ) -> bool {
+        owners
+            .iter()
+            .all(|owner| self.reachable(owner, source, sink))
     }
 }
 

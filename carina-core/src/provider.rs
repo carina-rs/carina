@@ -7826,10 +7826,17 @@ where
         FactoryCustomTypeResolver::known_custom_types(self)
     }
 
-    fn assignability_closures(&self) -> BTreeMap<String, crate::schema::AssignabilityClosure> {
+    fn assignability_closures(
+        &self,
+    ) -> BTreeMap<crate::parser::SchemaTypeOwner, crate::schema::AssignabilityClosure> {
         self.index
             .iter()
-            .map(|(owner, index)| (owner.clone(), index.assignability_closure.clone()))
+            .map(|(owner, index)| {
+                (
+                    crate::parser::SchemaTypeOwner::Provider(owner.clone()),
+                    index.assignability_closure.clone(),
+                )
+            })
             .collect()
     }
 }
@@ -8115,6 +8122,7 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         };
 
+        use crate::parser::SchemaTypeOwner;
         use crate::provider::{
             BoxFuture, CanonicalProviderConfigAttributes, InitializeOutcomeMint, ProviderError,
             ProviderFactory, ProviderInitialization, ProviderReadyConfig, ProviderResult,
@@ -8128,6 +8136,10 @@ mod tests {
 
         fn identity(kind: &str) -> TypeIdentity {
             TypeIdentity::new(Some("semantic"), ["Bucket"], kind)
+        }
+
+        fn owner(name: &str) -> SchemaTypeOwner {
+            SchemaTypeOwner::Provider(name.to_string())
         }
 
         fn string(kind: &str) -> AttributeType {
@@ -8220,12 +8232,12 @@ mod tests {
                 Arc::clone(&captures),
             )]);
             let catalog = &loaded.provider_context().custom_types;
-            assert!(catalog.reachable("actual-owner", &identity("A"), &identity("B")));
+            assert!(catalog.reachable(&owner("actual-owner"), &identity("A"), &identity("B")));
             assert!(
-                !catalog.reachable("semantic", &identity("A"), &identity("B")),
+                !catalog.reachable(&owner("semantic"), &identity("A"), &identity("B")),
                 "TypeIdentity::provider is not the declaration owner"
             );
-            assert!(!catalog.reachable("actual-owner", &identity("B"), &identity("A")));
+            assert!(!catalog.reachable(&owner("actual-owner"), &identity("B"), &identity("A")));
             assert_eq!(captures.load(Ordering::SeqCst), 1);
         }
 
@@ -8237,12 +8249,12 @@ mod tests {
                 Arc::default(),
             )]);
             let catalog = &loaded.provider_context().custom_types;
-            assert!(catalog.reachable("owner", &identity("A"), &identity("B")));
-            assert!(catalog.reachable("owner", &identity("B"), &identity("C")));
-            assert!(catalog.reachable("owner", &identity("A"), &identity("C")));
-            assert!(!catalog.reachable("owner", &identity("C"), &identity("A")));
-            assert!(!catalog.reachable("owner", &identity("A"), &identity("Unrelated")));
-            assert!(!catalog.reachable("missing-owner", &identity("A"), &identity("C")));
+            assert!(catalog.reachable(&owner("owner"), &identity("A"), &identity("B")));
+            assert!(catalog.reachable(&owner("owner"), &identity("B"), &identity("C")));
+            assert!(catalog.reachable(&owner("owner"), &identity("A"), &identity("C")));
+            assert!(!catalog.reachable(&owner("owner"), &identity("C"), &identity("A")));
+            assert!(!catalog.reachable(&owner("owner"), &identity("A"), &identity("Unrelated")));
+            assert!(!catalog.reachable(&owner("missing-owner"), &identity("A"), &identity("C")));
         }
 
         #[test]
@@ -8254,13 +8266,60 @@ mod tests {
                 factory("second", &[("B", "C")], Arc::default()),
             ]);
             let catalog = &loaded.provider_context().custom_types;
-            assert!(catalog.reachable("first", &identity("A"), &identity("B")));
-            assert!(catalog.reachable("second", &identity("B"), &identity("C")));
-            for owner in ["first", "second"] {
-                assert!(!catalog.reachable(owner, &identity("A"), &identity("C")));
+            assert!(catalog.reachable(&owner("first"), &identity("A"), &identity("B")));
+            assert!(catalog.reachable(&owner("second"), &identity("B"), &identity("C")));
+            for name in ["first", "second"] {
+                assert!(!catalog.reachable(&owner(name), &identity("A"), &identity("C")));
             }
-            assert!(!catalog.reachable("first", &identity("B"), &identity("C")));
-            assert!(!catalog.reachable("second", &identity("A"), &identity("B")));
+            assert!(!catalog.reachable(&owner("first"), &identity("B"), &identity("C")));
+            assert!(!catalog.reachable(&owner("second"), &identity("A"), &identity("B")));
+        }
+
+        #[test]
+        fn reachability_for_all_rejects_an_edge_missing_from_one_co_owner() {
+            let loaded = snapshot(vec![
+                factory("first", &[("A", "B")], Arc::default()),
+                factory("second", &[], Arc::default()),
+            ]);
+            let catalog = &loaded.provider_context().custom_types;
+            let sink = catalog
+                .known()
+                .iter()
+                .find(|owned| owned.identity() == &identity("B"))
+                .unwrap();
+            assert_eq!(sink.owners().iter().len(), 2);
+            assert!(catalog.reachable(&owner("first"), &identity("A"), sink.identity()));
+            assert!(!catalog.reachable(&owner("second"), &identity("A"), sink.identity()));
+            assert!(!catalog.reachable_for_all(sink.owners(), &identity("A"), sink.identity()));
+        }
+
+        #[test]
+        fn reachability_for_all_accepts_an_edge_declared_by_both_co_owners() {
+            let loaded = snapshot(vec![
+                factory("first", &[("A", "B")], Arc::default()),
+                factory("second", &[("A", "B")], Arc::default()),
+            ]);
+            let catalog = &loaded.provider_context().custom_types;
+            let sink = catalog
+                .known()
+                .iter()
+                .find(|owned| owned.identity() == &identity("B"))
+                .unwrap();
+            assert_eq!(sink.owners().iter().len(), 2);
+            assert!(catalog.reachable_for_all(sink.owners(), &identity("A"), sink.identity()));
+            assert!(!catalog.reachable_for_all(sink.owners(), sink.identity(), &identity("A")));
+            assert!(
+                !catalog
+                    .with_failed_providers(std::collections::BTreeSet::from(["second".to_string()]))
+                    .reachable_for_all(sink.owners(), &identity("A"), sink.identity())
+            );
+            assert!(
+                !crate::parser::ProviderCustomTypes::default().reachable_for_all(
+                    sink.owners(),
+                    &identity("A"),
+                    sink.identity(),
+                )
+            );
         }
 
         #[test]
@@ -8273,10 +8332,10 @@ mod tests {
                 .provider_context()
                 .custom_types
                 .with_failed_providers(std::collections::BTreeSet::from(["first".to_string()]));
-            assert!(!catalog.reachable("first", &identity("A"), &identity("B")));
-            assert!(catalog.reachable("second", &identity("B"), &identity("C")));
+            assert!(!catalog.reachable(&owner("first"), &identity("A"), &identity("B")));
+            assert!(catalog.reachable(&owner("second"), &identity("B"), &identity("C")));
             assert!(!crate::parser::ProviderCustomTypes::default().reachable(
-                "first",
+                &owner("first"),
                 &identity("A"),
                 &identity("B"),
             ));
@@ -8286,7 +8345,7 @@ mod tests {
         fn stage_a_stores_edges_without_changing_assignability_judgement() {
             let loaded = snapshot(vec![factory("owner", &[("A", "B")], Arc::default())]);
             assert!(loaded.provider_context().custom_types.reachable(
-                "owner",
+                &owner("owner"),
                 &identity("A"),
                 &identity("B")
             ));

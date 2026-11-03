@@ -1925,10 +1925,15 @@ mod tests {
                 carina_core::EnvironmentSnapshot::empty(),
             );
             let catalog = &loaded.provider_context().custom_types;
-            assert!(catalog.reachable("sdk-owner", &identity("A"), &identity("B")));
-            assert!(catalog.reachable("sdk-owner", &identity("A"), &identity("C")));
-            assert!(!catalog.reachable("sdk-owner", &identity("C"), &identity("A")));
-            assert!(!catalog.reachable("semantic", &identity("A"), &identity("C")));
+            let owner = carina_core::parser::SchemaTypeOwner::Provider("sdk-owner".into());
+            assert!(catalog.reachable(&owner, &identity("A"), &identity("B")));
+            assert!(catalog.reachable(&owner, &identity("A"), &identity("C")));
+            assert!(!catalog.reachable(&owner, &identity("C"), &identity("A")));
+            assert!(!catalog.reachable(
+                &carina_core::parser::SchemaTypeOwner::Provider("semantic".into()),
+                &identity("A"),
+                &identity("C"),
+            ));
             assert_eq!(provider.assignability_edge_calls.get(), 1);
         }
     }
