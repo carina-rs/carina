@@ -1418,19 +1418,16 @@ impl DiagnosticRun<'_> {
                         continue;
                     };
                     let type_expr = &resolved_type;
-                    let authority = match semantic_view {
-                        SemanticView::Standalone(file)
-                        | SemanticView::DirectoryParsed { merged: file } => *file,
-                        SemanticView::DirectoryUnavailable => parsed,
-                    };
-                    let report = authority
-                        .judged()
-                        .expect("loaded attribute report")
-                        .report();
-                    let expression = record_for(attr_param)
-                        .value_location()
-                        .and_then(|location| report.expression(location))
-                        .unwrap_or(report.unknown());
+                    let expression = semantic_view
+                        .lookup(attr_param)
+                        .unwrap_or(attr_param)
+                        .judgement();
+                    if expression.static_type().is_ok()
+                        && carina_core::parser::retained::admit_expression(expression, type_expr)
+                            .is_err()
+                    {
+                        continue;
+                    }
                     let type_error = match self.provider_context.loaded_context() {
                         Some(provider_context) => typecheck::check_type_expr_value(
                             type_expr,
@@ -1565,6 +1562,17 @@ impl DiagnosticRun<'_> {
         });
 
         for param in &parsed.export_params {
+            let judged_param = semantic_view.lookup(param).unwrap_or(param);
+            if judged_param.static_type.as_ref().is_some_and(|sink| {
+                judged_param.judgement().static_type().is_ok()
+                    && carina_core::parser::retained::admit_expression(
+                        judged_param.judgement(),
+                        sink,
+                    )
+                    .is_err()
+            }) {
+                continue;
+            }
             if param.static_type.as_ref().is_some_and(|ty| {
                 carina_core::validation::resolve_type_expr(ty, self.provider_context.catalog())
                     .is_err()
@@ -1639,7 +1647,8 @@ impl DiagnosticRun<'_> {
         tree: &carina_core::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
     ) -> Vec<Diagnostic>
     where
-        D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+        D: Clone
+            + carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
         let mut diagnostics = Vec::new();
         let inferred_export_params = if let Some(loaded_providers) = &self.loaded_providers {
@@ -1721,12 +1730,16 @@ impl DiagnosticRun<'_> {
         >,
     ) -> carina_core::validation::inference::SchemaCheckedExportParams<B>
     where
-        D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+        D: Clone
+            + carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
         carina_core::validation::inference::infer_export_params(
-            parsed.judged().expect("loader-owned expression report"),
-            &self.schemas,
-            self.provider_context.catalog(),
+            carina_core::config_loader::load_buffer_configuration(
+                parsed,
+                &self.schemas,
+                self.provider_context.catalog(),
+            )
+            .judged(),
         )
     }
 

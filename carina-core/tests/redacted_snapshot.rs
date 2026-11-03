@@ -306,15 +306,14 @@ fn snapshot_state_typecheck_uses_checked_conversion() {
     let ordinary = resolve_historical_field("name").unwrap();
     let context = ProviderContext::new(carina_core::EnvironmentSnapshot::new([]));
     let parsed = carina_core::parser::parse_file(
-        &format!(
-            "let ordinary = {}",
-            carina_core::value::format_value(&ordinary)
-        ),
+        "let ordinary = 'ordinary'",
         std::path::Path::new("test.crn"),
         &context,
     )
     .unwrap();
-    let report = parsed.judged().unwrap();
+    let schemas = carina_core::schema::SchemaRegistry::new();
+    let loaded = carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &context);
+    let report = loaded.judged();
     let expression = report
         .report()
         .binding(&carina_core::resource::RelativeBindingName::new("ordinary"))

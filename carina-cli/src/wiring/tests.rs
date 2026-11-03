@@ -11581,11 +11581,14 @@ fn module_checker_and_provider_wrappers_accept_empty_input() {
     assert!(errors.is_empty(), "provider_region: got {errors:?}");
 
     let module_signatures = carina_core::module_resolver::ResolvedModuleSignatures::new();
-    let binding_use_report = carina_core::validation::check_bare_binding_uses(
+    let configuration = carina_core::config_loader::load_buffer_configuration(
         &authored,
+        ctx.schemas(),
+        provider_ctx.as_provider_context(),
+    );
+    let binding_use_report = carina_core::validation::check_bare_binding_uses(
         &carina_core::validation::ValidationTypeContext::new(
-            authored.judged().expect("loader-owned expression report"),
-            ctx.schemas(),
+            configuration.judged(),
             provider_ctx,
             &module_signatures,
         ),

@@ -894,13 +894,17 @@ mod error_format_tests {
         let provider_context =
             carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
         let module_signatures = carina_core::module_resolver::ResolvedModuleSignatures::new();
-        let context = carina_core::validation::ValidationTypeContext::new_providerless(
-            parsed.judged().expect("loader-owned expression report"),
+        let configuration = carina_core::config_loader::load_buffer_configuration(
+            &parsed,
             &schemas,
+            &provider_context,
+        );
+        let context = carina_core::validation::ValidationTypeContext::new_providerless(
+            configuration.judged(),
             &provider_context,
             &module_signatures,
         );
-        let finding = carina_core::validation::check_bare_binding_uses(&parsed, &context)
+        let finding = carina_core::validation::check_bare_binding_uses(&context)
             .into_findings()
             .into_iter()
             .next()

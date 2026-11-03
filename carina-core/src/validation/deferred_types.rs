@@ -204,7 +204,9 @@ impl dyn ProviderTypeCheckContext + '_ {
 /// let value = AuthoredValue::Concrete(AuthoredConcreteValue::String("value".into()));
 /// let catalog = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
 /// let parsed = carina_core::parser::parse_file("let value = 'value'", std::path::Path::new("test.crn"), &catalog).unwrap();
-/// let report = parsed.judged().unwrap();
+/// let schemas = carina_core::schema::SchemaRegistry::new();
+/// let loaded = carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+/// let report = loaded.judged();
 /// let expression = report.report().binding(&carina_core::resource::RelativeBindingName::new("value")).unwrap();
 /// let escaped = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
 ///     check_type_expr_value_providerless(&expected, &value, session.catalog(), TypecheckInference::Judged(expression))
@@ -216,7 +218,9 @@ impl dyn ProviderTypeCheckContext + '_ {
 /// let value = AuthoredValue::Concrete(AuthoredConcreteValue::String("value".into()));
 /// let catalog = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
 /// let parsed = carina_core::parser::parse_file("let value = 'value'", std::path::Path::new("test.crn"), &catalog).unwrap();
-/// let report = parsed.judged().unwrap();
+/// let schemas = carina_core::schema::SchemaRegistry::new();
+/// let loaded = carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+/// let report = loaded.judged();
 /// let expression = report.report().binding(&carina_core::resource::RelativeBindingName::new("value")).unwrap();
 /// let result = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
 ///     check_type_expr_value_providerless(&expected, &value, session.catalog(), TypecheckInference::Judged(expression))
@@ -827,7 +831,9 @@ mod tests {
                     &expected,
                     &value,
                     context.catalog(),
-                    super::super::typecheck::TypecheckInference::Unavailable,
+                    super::super::typecheck::TypecheckInference::Judged(
+                        &crate::parser::retained::missing_judgement_for_test(),
+                    ),
                 )
                 .record_at(
                     context,

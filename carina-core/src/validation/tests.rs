@@ -83,7 +83,7 @@ fn reviewed_module_instances_retain_substituted_judgements() {
         )
     })
     .unwrap();
-    let report = graph.judged().unwrap().report();
+    let report = graph.expression_report();
     let scope = RootScope::new();
     let literal = report
         .module_attribute(
@@ -113,25 +113,16 @@ fn reviewed_validation_views_borrow_the_produced_report() {
     let schemas = SchemaRegistry::new();
     let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
-    let first = ValidationTypeContext::new_providerless(
-        parsed.judged().unwrap(),
-        &schemas,
-        &config,
-        &signatures,
-    );
-    let second = ValidationTypeContext::new_providerless(
-        parsed.judged().unwrap(),
-        &schemas,
-        &config,
-        &signatures,
-    );
+    let judged = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config);
+    let first = ValidationTypeContext::new_providerless(judged.judged(), &config, &signatures);
+    let second = ValidationTypeContext::new_providerless(judged.judged(), &config, &signatures);
     assert!(std::ptr::eq(
         first.expression_report,
         second.expression_report
     ));
     assert!(std::ptr::eq(
         first.expression_report,
-        parsed.judged().unwrap().report()
+        judged.judged().report()
     ));
     assert_eq!(first.expression_report.findings().len(), 1);
 }
@@ -195,9 +186,7 @@ fn reviewed_deferred_directive_consumes_judged_iterable_type() {
     .unwrap();
     let site = graph.deferred_for_sites().next().unwrap();
     let expression = graph
-        .judged()
-        .unwrap()
-        .report()
+        .expression_report()
         .expression(site.iterable_location.unwrap());
     assert_eq!(
         expression.map(|expression| expression.static_type()),
@@ -441,7 +430,9 @@ fn rendered_typecheck_result(
         type_expr,
         value,
         typecheck::TypecheckProviderContext::for_parser(config),
-        typecheck::TypecheckInference::Unavailable,
+        typecheck::TypecheckInference::Judged(
+            &crate::parser::retained::missing_judgement_for_test(),
+        ),
     )
     .require_provider_schemas()
     .err()
@@ -730,15 +721,16 @@ fn module_call_findings_for_test(
         provider_context.as_provider_context(),
     );
     let parsed = &fixture;
-    let binding_use_report = check_bare_binding_uses(
-        parsed,
-        &ValidationTypeContext::new(
-            parsed.judged().expect("loader-owned expression report"),
+    let binding_use_report = check_bare_binding_uses(&ValidationTypeContext::new(
+        crate::config_loader::load_buffer_configuration(
+            &parsed,
             &schemas,
-            provider_context,
-            signatures,
-        ),
-    );
+            provider_context.as_provider_context(),
+        )
+        .judged(),
+        provider_context,
+        signatures,
+    ));
     let bindings = BindingIndex::from_parsed_with_module_signatures(
         parsed,
         &schemas,
@@ -1566,15 +1558,16 @@ fn refined_int_module_argument_report(annotation: &str, sink: TypeExpr) -> Bindi
             requires: Vec::new(),
         },
     )]);
-    check_bare_binding_uses(
-        &parsed,
-        &ValidationTypeContext::new(
-            parsed.judged().expect("loader-owned expression report"),
+    check_bare_binding_uses(&ValidationTypeContext::new(
+        crate::config_loader::load_buffer_configuration(
+            &parsed,
             &schemas,
-            &provider_context,
-            &signatures,
-        ),
-    )
+            &provider_context.as_provider_context(),
+        )
+        .judged(),
+        &provider_context,
+        &signatures,
+    ))
 }
 
 #[test]
@@ -1898,7 +1891,9 @@ fn unloaded_schema_nominals_defer_values_and_resolve_when_catalog_loads() {
         &ty,
         &value,
         typecheck::TypecheckProviderContext::for_parser(&context),
-        typecheck::TypecheckInference::Unavailable,
+        typecheck::TypecheckInference::Judged(
+            &crate::parser::retained::missing_judgement_for_test(),
+        ),
     )
     .require_provider_schemas()
     .unwrap_err();
@@ -2422,13 +2417,14 @@ fn binding_use_finding_display_is_context_only_and_error_is_its_source() {
     let schemas = SchemaRegistry::new();
     let provider_context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let module_signatures = crate::module_resolver::ResolvedModuleSignatures::new();
+    let judged_configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &provider_context);
     let context = ValidationTypeContext::new_providerless(
-        parsed.judged().expect("loader-owned expression report"),
-        &schemas,
+        judged_configuration.judged(),
         &provider_context,
         &module_signatures,
     );
-    let report = check_bare_binding_uses(&parsed, &context);
+    let report = check_bare_binding_uses(&context);
     let finding = report.findings().first().expect("binding-use finding");
     let detail = finding.error.to_string();
 
@@ -2473,15 +2469,16 @@ fn binding_diagnostics_preserve_symlink_parent_source_spelling() {
             .unwrap();
     let schemas = function_ref_schema();
     let signatures = crate::module_resolver::ResolvedModuleSignatures::new();
-    let report = check_bare_binding_uses(
-        &parsed,
-        &ValidationTypeContext::new(
-            parsed.judged().expect("loader-owned expression report"),
+    let report = check_bare_binding_uses(&ValidationTypeContext::new(
+        crate::config_loader::load_buffer_configuration(
+            &parsed,
             &schemas,
-            &provider,
-            &signatures,
-        ),
-    );
+            &provider.as_provider_context(),
+        )
+        .judged(),
+        &provider,
+        &signatures,
+    ));
     assert_eq!(report.findings().len(), 1, "{report:?}");
     let finding = &report.findings()[0];
     assert_eq!(finding.use_site.source_file.path(), path);
@@ -2551,14 +2548,18 @@ let generated = for item in items {
     let schemas = function_ref_schema();
     let module_signatures = crate::module_resolver::ResolvedModuleSignatures::new();
     let provider_context = LoadedProviderContext::empty_for_test();
-    let context = ValidationTypeContext::new(
-        parsed.judged().expect("loader-owned expression report"),
+    let judged_configuration = crate::config_loader::load_buffer_configuration(
+        &parsed,
         &schemas,
+        &provider_context.as_provider_context(),
+    );
+    let context = ValidationTypeContext::new(
+        judged_configuration.judged(),
         &provider_context,
         &module_signatures,
     );
 
-    let report = check_bare_binding_uses(&parsed, &context);
+    let report = check_bare_binding_uses(&context);
     assert!(
         !report.is_ready(),
         "expected typed sink mismatch: {report:#?}"
@@ -4370,7 +4371,9 @@ fn bare_builtin_custom_types_report_scalar_kind_mismatches() {
             typecheck::TypecheckProviderContext::for_parser(&ProviderContext::new(
                 crate::EnvironmentSnapshot::empty(),
             )),
-            typecheck::TypecheckInference::Unavailable,
+            typecheck::TypecheckInference::Judged(
+                &crate::parser::retained::missing_judgement_for_test(),
+            ),
         )
         .require_provider_schemas()
         .expect_err("the declared scalar kind must be checked before its validator");
@@ -5263,15 +5266,11 @@ fn check_module_calls_providerless_defers_unloaded_bare_count_argument() {
         },
     )]);
     let schemas = SchemaRegistry::new();
-    let report = check_bare_binding_uses(
-        &parsed,
-        &ValidationTypeContext::new_providerless(
-            parsed.judged().expect("loader-owned expression report"),
-            &schemas,
-            &config,
-            &signatures,
-        ),
-    );
+    let report = check_bare_binding_uses(&ValidationTypeContext::new_providerless(
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config).judged(),
+        &config,
+        &signatures,
+    ));
     let bindings =
         BindingIndex::from_parsed_with_module_signatures(&parsed, &schemas, &signatures, &config);
     let findings = crate::validation::deferred_types::with_session_for_test(&config, |session| {
@@ -5297,20 +5296,10 @@ fn check_module_calls_rejects_custom_type() {
 
     let config = context_with_iam_policy_arn_validator();
 
-    let mut args = HashMap::new();
-    args.insert(
-        "managed_policy_arns".to_string(),
-        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::String("aaaa".into()),
-        )])),
-    );
-
-    let mut parsed = empty_parsed();
-    parsed.module_calls = vec![ModuleCall::test(
-        "github".to_string(),
-        None,
-        module_arguments(args),
-    )];
+    let parsed = crate::parser::parse_and_resolve(
+        "let github = use { source = './github' }\ngithub { managed_policy_arns = ['aaaa'] }",
+    )
+    .unwrap();
 
     let mut imported_modules = HashMap::new();
     imported_modules.insert(
@@ -5342,15 +5331,10 @@ fn check_module_calls_rejects_custom_type() {
 fn check_module_calls_rejects_literal_union_mismatch() {
     use crate::parser::ArgumentParameter;
 
-    let mut parsed = empty_parsed();
-    parsed.module_calls = vec![ModuleCall::test(
-        "web_tier".to_string(),
-        None,
-        module_arguments([(
-            "environment".to_string(),
-            Value::Concrete(ConcreteValue::String("production".into())),
-        )]),
-    )];
+    let parsed = crate::parser::parse_and_resolve(
+        "let web_tier = use { source = './web' }\nweb_tier { environment = 'production' }",
+    )
+    .unwrap();
     let imported_modules = HashMap::from([(
         "web_tier".to_string(),
         crate::module_resolver::ResolvedModuleSignature {
@@ -5508,15 +5492,16 @@ fn check_module_calls_reports_nested_file_type_resolution_errors() {
         &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
         &provider_context,
     );
-    let binding_use_report = check_bare_binding_uses(
-        &parsed,
-        &ValidationTypeContext::new(
-            parsed.judged().expect("loader-owned expression report"),
+    let binding_use_report = check_bare_binding_uses(&ValidationTypeContext::new(
+        crate::config_loader::load_buffer_configuration(
+            &parsed,
             &schemas,
-            &provider_context,
-            &signatures,
-        ),
-    );
+            &provider_context.as_provider_context(),
+        )
+        .judged(),
+        &provider_context,
+        &signatures,
+    ));
     let bindings = BindingIndex::from_parsed_with_module_signatures(
         &parsed,
         &schemas,
@@ -5793,15 +5778,16 @@ child { values = [vpc] }
         },
     )]);
     let schemas = SchemaRegistry::new();
-    let report = check_bare_binding_uses(
-        &parsed,
-        &ValidationTypeContext::new_providerless(
-            parsed.judged().expect("loader-owned expression report"),
+    let report = check_bare_binding_uses(&ValidationTypeContext::new_providerless(
+        crate::config_loader::load_buffer_configuration(
+            &parsed,
             &schemas,
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-            &signatures,
-        ),
-    );
+        )
+        .judged(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        &signatures,
+    ));
     assert!(!report.is_ready(), "fixture must produce a binding finding");
 
     let findings = check_expanded_module_calls::<crate::resource::ParserPlaceholder>(
@@ -5854,15 +5840,16 @@ let child = child_module { value = forwarded }
             requires: Vec::new(),
         },
     )]);
-    let report = check_bare_binding_uses(
-        &parsed,
-        &ValidationTypeContext::new_providerless(
-            parsed.judged().expect("loader-owned expression report"),
+    let report = check_bare_binding_uses(&ValidationTypeContext::new_providerless(
+        crate::config_loader::load_buffer_configuration(
+            &parsed,
             &schemas,
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-            &signatures,
-        ),
-    );
+        )
+        .judged(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        &signatures,
+    ));
     assert_eq!(report.findings().len(), 1, "unexpected report: {report:#?}");
     assert!(matches!(
         report.findings()[0].error,
@@ -6013,12 +6000,10 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
         ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     });
     let authored = || Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.dsl_value"));
-    let mut module_parsed = empty_parsed();
-    module_parsed.module_calls = vec![ModuleCall::test(
-        "child",
-        None,
-        HashMap::from([("mode".to_string(), ModuleArgument::new(authored()))]),
-    )];
+    let module_parsed = crate::parser::parse_and_resolve(
+        "let child = use { source = './child' }\nchild { mode = test.widget.Mode.dsl_value }",
+    )
+    .unwrap();
     let imported_modules = HashMap::from([(
         "child".to_string(),
         crate::module_resolver::ResolvedModuleSignature {
@@ -10310,4 +10295,61 @@ fn parser_test_location(path: &std::path::Path) -> crate::parser::DeclarationLoc
     .declarations()[0]
         .location()
         .clone()
+}
+
+fn round1_missing_inventory_fixture(
+    rhs: &str,
+) -> (ParsedFile, crate::module_resolver::ResolvedModuleSignatures) {
+    let provider = LoadedProviderContext::empty_for_test();
+    let mut parsed = crate::parser::parse_and_resolve(&format!("let src = mock.test.Source {{}}\nlet n = \"${{src.name}}\"\nlet template = use {{ source = './child' }}\nlet child = template {{ x = {rhs} }}")).unwrap();
+    *parsed.parser_binding_metadata.syntax.expressions_mut() =
+        crate::parser::retained::Expressions::default();
+    let signatures = HashMap::from([(
+        "template".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![crate::parser::ArgumentParameter {
+                name: "x".to_string(),
+                static_type: resolve_consumer_static_type_for_signature(
+                    &TypeExpr::Int,
+                    provider.as_provider_context(),
+                ),
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+    (parsed, signatures)
+}
+
+#[test]
+fn round1_module_argument_fallback_requires_authored_evidence() {
+    let (parsed, signatures) = round1_missing_inventory_fixture("\"${src.name}\"");
+    let findings = module_call_findings_for_test(
+        &parsed,
+        &signatures,
+        &LoadedProviderContext::empty_for_test(),
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.kind() == ModuleCallFindingKind::ValueType),
+        "an authored argument used pending evidence: {findings:?}"
+    );
+}
+
+#[test]
+fn round1_bare_typeexpr_sink_requires_authored_evidence() {
+    let (parsed, signatures) = round1_missing_inventory_fixture("n");
+    let provider = LoadedProviderContext::empty_for_test();
+    let loaded = crate::config_loader::load_buffer_configuration(
+        &parsed,
+        &SchemaRegistry::new(),
+        provider.as_provider_context(),
+    );
+    let context = ValidationTypeContext::new(loaded.judged(), &provider, &signatures);
+    let report = check_bare_binding_uses(&context);
+    assert!(!report.is_ready(), "a TypeExpr sink used pending evidence");
 }

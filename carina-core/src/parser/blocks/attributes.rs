@@ -274,9 +274,9 @@ pub(in crate::parser) fn parse_attributes_block(
                 source_file,
             );
             let mut param_inner = param.into_inner();
-            let name = next_pair(&mut param_inner, "parameter name", "attributes block")?
-                .as_str()
-                .to_string();
+            let name_pair = next_pair(&mut param_inner, "parameter name", "attributes block")?;
+            let name_location = ctx.declaration_location(&name_pair);
+            let name = name_pair.as_str().to_string();
 
             // Check whether the next inner pair is a type_expr or an expression
             let next = next_pair(
@@ -284,6 +284,7 @@ pub(in crate::parser) fn parse_attributes_block(
                 "type or expression",
                 "attributes parameter",
             )?;
+            let value_location;
             let (type_expr, value) = if next.as_rule() == Rule::type_expr {
                 // Has explicit type annotation: name: type = expr
                 source_location = ctx.declaration_location(&next);
@@ -294,21 +295,27 @@ pub(in crate::parser) fn parse_attributes_block(
                     Some(preprocessed_file),
                 )?);
                 let expr = next_pair(&mut param_inner, "value expression", "attributes parameter")?;
+                value_location = ctx.declaration_location(&expr);
                 let value = Some(parse_boundary_expression(expr, ctx)?);
                 (type_expr, value)
             } else {
                 // No type annotation: name = expr
+                value_location = ctx.declaration_location(&next);
                 let value = Some(parse_boundary_expression(next, ctx)?);
                 (None, value)
             };
 
-            attribute_params.push(AttributeParameter::new_in_source(
-                name,
-                type_expr,
-                value,
-                source_span,
-                source_location,
-            ));
+            attribute_params.push(
+                AttributeParameter::new_in_source(
+                    name,
+                    type_expr,
+                    value,
+                    source_span,
+                    source_location,
+                )
+                .with_value_location(value_location)
+                .with_name_location(name_location),
+            );
         }
     }
 
@@ -333,11 +340,12 @@ pub(in crate::parser) fn parse_exports_block(
                 source_file,
             );
             let mut param_inner = param.into_inner();
-            let name = next_pair(&mut param_inner, "parameter name", "exports block")?
-                .as_str()
-                .to_string();
+            let name_pair = next_pair(&mut param_inner, "parameter name", "exports block")?;
+            let name_location = ctx.declaration_location(&name_pair);
+            let name = name_pair.as_str().to_string();
 
             let next = next_pair(&mut param_inner, "type or expression", "exports parameter")?;
+            let value_location;
             let (type_expr, value) = if next.as_rule() == Rule::type_expr {
                 source_location = ctx.declaration_location(&next);
                 let type_expr = Some(parse_type_expr(
@@ -347,20 +355,26 @@ pub(in crate::parser) fn parse_exports_block(
                     Some(preprocessed_file),
                 )?);
                 let expr = next_pair(&mut param_inner, "value expression", "exports parameter")?;
+                value_location = ctx.declaration_location(&expr);
                 let value = Some(parse_boundary_expression(expr, ctx)?);
                 (type_expr, value)
             } else {
+                value_location = ctx.declaration_location(&next);
                 let value = Some(parse_boundary_expression(next, ctx)?);
                 (None, value)
             };
 
-            export_params.push(ExportParameter::new_in_source(
-                name,
-                type_expr,
-                value,
-                source_span,
-                source_location,
-            ));
+            export_params.push(
+                ExportParameter::new_in_source(
+                    name,
+                    type_expr,
+                    value,
+                    source_span,
+                    source_location,
+                )
+                .with_value_location(value_location)
+                .with_name_location(name_location),
+            );
         }
     }
 

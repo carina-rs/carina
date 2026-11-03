@@ -372,14 +372,15 @@ impl<E> RootDirectoryParse<E> {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub fn from_parsed_for_test(mut parsed: File<E>) -> Self {
-        if parsed.judged().is_err() {
-            crate::parser::retained::judge_configuration(
-                &mut parsed,
-                &SchemaRegistry::new(),
-                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-            );
-        }
+    pub fn from_parsed_for_test(mut parsed: File<E>) -> Self
+    where
+        E: crate::parser::ExportParamLike,
+    {
+        crate::parser::retained::judge_configuration(
+            &mut parsed,
+            &SchemaRegistry::new(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
         Self::new(parsed)
     }
 }
@@ -497,24 +498,59 @@ pub struct LoadedConfig {
 
 /// A source buffer loaded for analysis with the caller's available schemas.
 /// Its file and report are produced together, just like a directory load.
-pub struct BufferConfiguration {
-    parsed: ParsedFile,
+pub struct BufferConfiguration<
+    E = crate::parser::ParsedExportParam,
+    D = crate::parser::ParsedDeferredForPhase<
+        crate::resource::ParserPlaceholder,
+        crate::resource::RelativeBindingName,
+    >,
+    B: crate::resource::BindingAddress = crate::resource::RelativeBindingName,
+> {
+    judged: crate::parser::retained::JudgedFile<E, D, B>,
 }
 
-impl BufferConfiguration {
-    pub fn parsed(&self) -> &ParsedFile {
-        &self.parsed
+impl<E, D, B: crate::resource::BindingAddress> BufferConfiguration<E, D, B> {
+    pub fn parsed(
+        &self,
+    ) -> &crate::parser::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+        B,
+    > {
+        self.judged.file()
+    }
+    pub fn judged(&self) -> &crate::parser::retained::JudgedFile<E, D, B> {
+        &self.judged
     }
 }
 
-pub fn load_buffer_configuration(
-    parsed: &ParsedFile,
+pub fn load_buffer_configuration<
+    E: Clone + crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B>,
+    D: Clone,
+    B: crate::resource::BindingAddress,
+>(
+    parsed: &crate::parser::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+        B,
+    >,
     schemas: &SchemaRegistry,
     config: &ProviderContext,
-) -> BufferConfiguration {
-    let mut parsed = parsed.clone();
-    crate::parser::retained::judge_configuration(&mut parsed, schemas, config);
-    BufferConfiguration { parsed }
+) -> BufferConfiguration<E, D, B>
+where
+    D: crate::parser::DeferredForPhaseTraversal<
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            B,
+        >,
+{
+    BufferConfiguration {
+        judged: crate::parser::retained::JudgedFile::new(parsed.clone(), schemas, config),
+    }
 }
 
 impl LoadedConfig {
@@ -1163,6 +1199,11 @@ fn parse_directory_with_overrides_impl(
     // surface the error as a diagnostic; CLI commands run both checks through
     // the shared validation pipeline.
     crate::parser::retained::judge_configuration(&mut merged, schemas, config);
+    if !preserve_failed_user_calls
+        && let Some(error) = merged.expression_report().first_function_error()
+    {
+        return Err(DirectoryParseFailure::from_parse_error(error));
+    }
     Ok(DirectoryParseResult {
         parsed: RootDirectoryParse::new(merged),
         authored_bindings,

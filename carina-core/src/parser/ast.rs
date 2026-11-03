@@ -2896,6 +2896,34 @@ pub struct AttributeParameter<
 }
 
 impl<P: ValueKind, B: BindingAddress> AttributeParameter<TypeExpr, P, B> {
+    pub(crate) fn with_name_location(mut self, location: super::DeclarationLocation) -> Self {
+        self.source.name_location = location;
+        self
+    }
+    pub fn name_location(&self) -> &super::DeclarationLocation {
+        &self.source.name_location
+    }
+
+    pub(crate) fn with_value_location(mut self, location: super::DeclarationLocation) -> Self {
+        self.source.value_location = Some(location);
+        self
+    }
+    pub fn value_location(&self) -> Option<&super::DeclarationLocation> {
+        self.source.value_location.as_ref()
+    }
+    pub fn judgement(&self) -> &super::retained::JudgedExpr {
+        &self.source.judgement
+    }
+    pub(crate) fn attach_judgement(&mut self, report: &super::retained::ExpressionReport<B>) {
+        self.source.judgement = self
+            .source
+            .value_location
+            .as_ref()
+            .and_then(|location| report.expression(location))
+            .unwrap_or(report.unknown())
+            .clone();
+    }
+
     pub fn type_check_location(&self) -> &super::DeclarationLocation {
         &self.source.location
     }
@@ -3000,6 +3028,24 @@ pub struct ParsedExportParam<
 }
 
 impl<P: ValueKind, B: BindingAddress> ParsedExportParam<P, B> {
+    pub(crate) fn with_name_location(mut self, location: super::DeclarationLocation) -> Self {
+        self.source.name_location = location;
+        self
+    }
+    pub fn name_location(&self) -> &super::DeclarationLocation {
+        &self.source.name_location
+    }
+
+    pub(crate) fn with_value_location(mut self, location: super::DeclarationLocation) -> Self {
+        self.source.value_location = Some(location);
+        self
+    }
+    pub fn value_location(&self) -> Option<&super::DeclarationLocation> {
+        self.source.value_location.as_ref()
+    }
+    pub fn judgement(&self) -> &super::retained::JudgedExpr {
+        &self.source.judgement
+    }
     pub fn type_check_location(&self) -> &super::DeclarationLocation {
         &self.source.location
     }
@@ -3088,6 +3134,9 @@ pub trait ExportParamLike<P: ValueKind = ParserPlaceholder, B: BindingAddress = 
     fn type_expr_opt(&self) -> Option<&TypeExpr>;
     fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr>;
     fn inference_failed(&self) -> bool;
+    fn value_location(&self) -> Option<&super::DeclarationLocation>;
+    fn judgement(&self) -> &super::retained::JudgedExpr;
+    fn attach_judgement(&mut self, report: &super::retained::ExpressionReport<B>);
     /// Authored export location retained across parser and inference phases.
     fn source_location(&self) -> Option<(&std::path::Path, SourceSpan)> {
         None
@@ -3097,6 +3146,21 @@ pub trait ExportParamLike<P: ValueKind = ParserPlaceholder, B: BindingAddress = 
 impl<P: ValueKind + PartialEq, B: BindingAddress> ExportParamLike<P, B>
     for ParsedExportParam<P, B>
 {
+    fn value_location(&self) -> Option<&super::DeclarationLocation> {
+        self.source.value_location.as_ref()
+    }
+    fn judgement(&self) -> &super::retained::JudgedExpr {
+        &self.source.judgement
+    }
+    fn attach_judgement(&mut self, report: &super::retained::ExpressionReport<B>) {
+        self.source.judgement = self
+            .source
+            .value_location
+            .as_ref()
+            .and_then(|location| report.expression(location))
+            .unwrap_or(report.unknown())
+            .clone();
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -3903,6 +3967,7 @@ pub enum BareBindingKind {
 /// lookup. This data is parser-only and never enters [`Value`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BareBindingUse {
+    pub(crate) expression_instance: super::retained::ExpressionInstance,
     pub(in crate::parser) location: super::DeclarationLocation,
     pub source_file: SourceFileId,
     pub scope: BindingScopeId,
@@ -3975,6 +4040,12 @@ impl From<&BindingUseOwner> for BindingUseOwnerKey {
 }
 
 impl<B: BindingAddress> ParsedBindingUses<B> {
+    pub(crate) fn in_instance(&mut self, scope: &crate::resource::ModuleInstanceScope) {
+        for record in &mut self.records {
+            record.authored.expression_instance =
+                super::retained::ExpressionInstance::for_scope(scope);
+        }
+    }
     pub(crate) fn record(
         &mut self,
         authored: BareBindingUse,
@@ -4692,6 +4763,9 @@ pub(crate) struct DeclarationSource {
     pub(crate) file: PathBuf,
     pub(crate) span: SourceSpan,
     location: super::DeclarationLocation,
+    value_location: Option<super::DeclarationLocation>,
+    name_location: super::DeclarationLocation,
+    judgement: super::retained::JudgedExpr,
 }
 
 #[cfg(test)]
@@ -4709,7 +4783,10 @@ impl DeclarationSource {
         Self {
             file: location.file().path().to_path_buf(),
             span,
+            name_location: location.clone(),
             location,
+            value_location: None,
+            judgement: super::retained::missing_judgement(),
         }
     }
 }
@@ -5793,6 +5870,9 @@ impl<P: ValueKind + PartialEq, B: BindingAddress> PartialEq for InferredExportPa
 }
 
 impl<P: ValueKind, B: BindingAddress> InferredExportParam<P, B> {
+    pub fn name_location(&self) -> &super::DeclarationLocation {
+        &self.source.name_location
+    }
     pub(crate) fn from_parsed(
         parameter: &ParsedExportParam<P, B>,
         static_type: ExportStaticType,
@@ -5835,6 +5915,21 @@ impl<P: ValueKind, B: BindingAddress> InferredExportParam<P, B> {
 impl<P: ValueKind + PartialEq, B: BindingAddress> ExportParamLike<P, B>
     for InferredExportParam<P, B>
 {
+    fn value_location(&self) -> Option<&super::DeclarationLocation> {
+        self.source.value_location.as_ref()
+    }
+    fn judgement(&self) -> &super::retained::JudgedExpr {
+        &self.source.judgement
+    }
+    fn attach_judgement(&mut self, report: &super::retained::ExpressionReport<B>) {
+        self.source.judgement = self
+            .source
+            .value_location
+            .as_ref()
+            .and_then(|location| report.expression(location))
+            .unwrap_or(report.unknown())
+            .clone();
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -7533,7 +7628,7 @@ where
             .iter()
             .map(|argument| (argument.name.as_str(), &argument.static_type))
             .collect();
-        let report = self.judged().ok().map(|judged| judged.report());
+        let report = self.expression_report();
         let mut seen = HashSet::new();
         self.iter_all_resources()
             .flat_map(|resource| {
@@ -7571,7 +7666,7 @@ where
                             Some(resource.directives()),
                             crate::schema::SchemaKind::Resource,
                             true,
-                            report
+                            Some(report)
                                 .and_then(|report| {
                                     self.deferred_for_sites()
                                         .find(|site| std::ptr::eq(site.iterable, iterable))
@@ -8388,11 +8483,7 @@ impl<E: IntoExpandedExportParam<AbsoluteBindingAddress>>
             return Err(crate::resource::DirectiveResolutionErrors::new(directive_errors).into());
         }
         self.validate_expansion_boundary(ParserPlaceholderBoundary::ExpandedFile)?;
-        let directive_report = self
-            .judged()
-            .expect("expansion requires a judged configuration")
-            .report()
-            .clone();
+        let directive_report = self.expression_report().clone();
 
         let File {
             providers,

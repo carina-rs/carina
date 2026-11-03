@@ -845,12 +845,10 @@ fn check_fn_arg_type<Source: Clone>(
     let type_expr = resolved_type.as_type_expr();
 
     let provider_context = ctx.typecheck_provider_context();
-    let check = crate::validation::typecheck::check_type_expr_value_with_context(
-        &type_expr,
-        value,
-        provider_context,
-        crate::validation::typecheck::TypecheckInference::Unavailable,
-    );
+    let Some(resolved) = crate::validation::typecheck::ResolvedConstraintValue::new(value) else {
+        return Ok(FunctionArgumentTypeCheck::AwaitingRuntimeValue);
+    };
+    let check = provider_context.check_resolved_constraints(&type_expr, &resolved);
     let result = finish_function_type_check(check, provider_context, site)
         .map_err(|mismatch| function_argument_type_error(fn_name, param_name, mismatch))?;
     if result == FunctionArgumentTypeCheck::Complete
@@ -1096,12 +1094,10 @@ fn check_fn_return_type(
     value: &Value,
     config: crate::validation::typecheck::TypecheckProviderContext<'_>,
 ) -> Result<FunctionArgumentTypeCheck, ParseError> {
-    let check = crate::validation::typecheck::check_type_expr_value_with_context(
-        type_expr,
-        value,
-        config,
-        crate::validation::typecheck::TypecheckInference::Unavailable,
-    );
+    let Some(resolved) = crate::validation::typecheck::ResolvedConstraintValue::new(value) else {
+        return Ok(FunctionArgumentTypeCheck::AwaitingRuntimeValue);
+    };
+    let check = config.check_resolved_constraints(type_expr, &resolved);
     let result = finish_function_type_check(check, config, None)
         .map_err(|mismatch| function_return_type_error(fn_name, mismatch))?;
     if result == FunctionArgumentTypeCheck::Complete

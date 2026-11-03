@@ -922,8 +922,7 @@ pub(crate) type ValidationProviderCatalog<'a> =
 pub(crate) trait ValidationProviderCatalogExt {
     fn type_context<'a, E, D, B: BindingAddress>(
         &'a self,
-        file: &'a carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
-        schemas: &'a SchemaRegistry,
+        file: &'a carina_core::parser::retained::JudgedFile<E, D, B>,
         signatures: &'a carina_core::module_resolver::ResolvedModuleSignatures,
     ) -> validation::ValidationTypeContext<'a, B>
     where
@@ -933,19 +932,13 @@ pub(crate) trait ValidationProviderCatalogExt {
 impl ValidationProviderCatalogExt for ValidationProviderCatalog<'_> {
     fn type_context<'a, E, D, B: BindingAddress>(
         &'a self,
-        file: &'a carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
-        schemas: &'a SchemaRegistry,
+        file: &'a carina_core::parser::retained::JudgedFile<E, D, B>,
         signatures: &'a carina_core::module_resolver::ResolvedModuleSignatures,
     ) -> validation::ValidationTypeContext<'a, B>
     where
         D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        validation::ValidationTypeContext::in_session(
-            file.judged().expect("loader-owned expression report"),
-            schemas,
-            self,
-            signatures,
-        )
+        validation::ValidationTypeContext::in_session(file, self, signatures)
     }
 }
 
@@ -4521,10 +4514,12 @@ pub(crate) fn validate_module_internal_ref_types(
     for module in module_walk.iter() {
         let mut parsed = module.loaded().parsed.clone();
         let prefix = module.diagnostic_label();
-        let expression_report = parsed
-            .judged()
-            .expect("loader-owned expression report")
-            .report();
+        let configuration = carina_core::config_loader::load_buffer_configuration(
+            &parsed,
+            ctx.schemas(),
+            config.catalog(),
+        );
+        let expression_report = configuration.judged().report();
         errors.extend(
             expression_report
                 .findings()

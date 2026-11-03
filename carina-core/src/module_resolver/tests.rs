@@ -8471,13 +8471,17 @@ fn ref_typed_module_argument_used_bare_is_rejected_in_module_context() {
             .expect("module expansion retains the typed pending use for validation");
             let schemas = crate::schema::SchemaRegistry::new();
             let signatures = crate::module_resolver::ResolvedModuleSignatures::new();
-            let context = crate::validation::ValidationTypeContext::in_session(
-                parsed.judged().expect("loader-owned expression report"),
+            let judged_configuration = crate::config_loader::load_buffer_configuration(
+                &parsed,
                 &schemas,
+                session.catalog(),
+            );
+            let context = crate::validation::ValidationTypeContext::in_session(
+                judged_configuration.judged(),
                 session,
                 &signatures,
             );
-            let report = crate::validation::check_expanded_bare_binding_uses(&parsed, &context);
+            let report = crate::validation::check_expanded_bare_binding_uses(&context);
             let finding = report
                 .findings()
                 .iter()

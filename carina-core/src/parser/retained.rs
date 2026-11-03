@@ -13,17 +13,47 @@ use indexmap::IndexMap;
 use pest::iterators::{Pair, Pairs};
 use std::{collections::HashMap, path::Path, sync::Arc};
 
+/// The expansion scope is part of expression identity, even when two module
+/// instances originate at the same authored source location.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub(crate) enum ExpressionInstance {
+    #[default]
+    Root,
+    Module(Arc<str>),
+}
+
+impl ExpressionInstance {
+    pub(crate) fn for_scope(scope: &crate::resource::ModuleInstanceScope) -> Self {
+        Self::Module(Arc::from(scope.key()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ExpressionLocation {
+    instance: ExpressionInstance,
+    authored: DeclarationLocation,
+}
+
+impl ExpressionLocation {
+    fn new(instance: ExpressionInstance, authored: &DeclarationLocation) -> Self {
+        Self {
+            instance,
+            authored: authored.clone(),
+        }
+    }
+}
+
 /// An expression retains its complete authored root and provisional payload.
 /// Neither field nor a constructor from a reduced `Value` is public.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::parser::retained::ExprValue;
 /// use carina_core::resource::{AuthoredValue, Value, ConcreteValue};
 /// let reduced: AuthoredValue = Value::Concrete(ConcreteValue::String("selected".into()));
 /// let expression: ExprValue = reduced.into();
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carina_core::{parser::retained::ExprValue, resource::AuthoredValue};
 /// fn discard_authorship(expression: ExprValue) -> AuthoredValue { expression.into_value() }
 /// ```
@@ -41,7 +71,7 @@ enum Projection<P: ValueKind, B: BindingAddress> {
 
 #[derive(Debug, Clone, PartialEq)]
 struct AuthoredExpr<P: ValueKind, B: BindingAddress> {
-    location: DeclarationLocation,
+    location: ExpressionLocation,
     kind: ExprKind<B>,
     children: Vec<ExprValue<P, B>>,
 }
@@ -61,6 +91,8 @@ enum ExprKind<B: BindingAddress> {
     Interpolation,
     Coalesce,
     Call(String),
+    Function(Option<TypeExpr>),
+    Sequence,
     Access(PathSegment),
     Integer {
         op: crate::integer_arithmetic::IntegerOp,
@@ -86,10 +118,21 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
     }
 
     pub fn location(&self) -> &DeclarationLocation {
-        &self.authored.location
+        &self.authored.location.authored
     }
 
-    fn map_bindings<C: BindingAddress>(self, map: &mut impl FnMut(B) -> C) -> ExprValue<P, C> {
+    fn map_bindings<C: BindingAddress>(
+        self,
+        map: &mut impl FnMut(B) -> C,
+        memo: &mut HashMap<usize, Arc<AuthoredExpr<P, C>>>,
+    ) -> ExprValue<P, C> {
+        let id = Arc::as_ptr(&self.authored) as usize;
+        if let Some(authored) = memo.get(&id) {
+            return ExprValue {
+                authored: authored.clone(),
+                payload: Projection::Pending,
+            };
+        }
         let authored = Arc::unwrap_or_clone(self.authored);
         let kind = match authored.kind {
             ExprKind::Binding(binding) => ExprKind::Binding(map(binding)),
@@ -109,6 +152,8 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
             ExprKind::Interpolation => ExprKind::Interpolation,
             ExprKind::Coalesce => ExprKind::Coalesce,
             ExprKind::Call(name) => ExprKind::Call(name),
+            ExprKind::Function(ty) => ExprKind::Function(ty),
+            ExprKind::Sequence => ExprKind::Sequence,
             ExprKind::Access(step) => ExprKind::Access(step),
             ExprKind::Integer { op, location } => ExprKind::Integer { op, location },
             ExprKind::Alias => ExprKind::Alias,
@@ -125,16 +170,18 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
             ExprKind::Sink(name) => ExprKind::Sink(name),
             ExprKind::Pending => ExprKind::Pending,
         };
+        let authored = Arc::new(AuthoredExpr {
+            location: authored.location,
+            kind,
+            children: authored
+                .children
+                .into_iter()
+                .map(|child| child.map_bindings(map, memo))
+                .collect(),
+        });
+        memo.insert(id, authored.clone());
         ExprValue {
-            authored: Arc::new(AuthoredExpr {
-                location: authored.location,
-                kind,
-                children: authored
-                    .children
-                    .into_iter()
-                    .map(|child| child.map_bindings(map))
-                    .collect(),
-            }),
+            authored,
             // A parser projection is never binding-phase authority. The next
             // phase attaches its own projection without changing the root.
             payload: Projection::Pending,
@@ -187,21 +234,22 @@ pub(in crate::parser) fn evaluate_sink(
 ///
 /// Configuration validation requires a loader-owned judgement.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use carina_core::{parser::{ParsedFile, ProviderContext}, schema::SchemaRegistry,
 ///     module_resolver::ResolvedModuleSignatures, validation::ValidationTypeContext};
 /// let raw = ParsedFile::default();
-/// let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+/// let config = ProviderContext::new(carina_core::EnvironmentSnapshot::new([]));
 /// let schemas = SchemaRegistry::new();
 /// let signatures = ResolvedModuleSignatures::default();
-/// let unchecked = ValidationTypeContext::new_providerless(&raw, &schemas, &config, &signatures);
+/// let unchecked = ValidationTypeContext::new_providerless(&raw, &config, &signatures);
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct Expressions<B: BindingAddress = RelativeBindingName> {
     roots: Vec<ExprValue<ParserPlaceholder, B>>,
     definitions: IndexMap<B, ExprValue<ParserPlaceholder, B>>,
-    report: Option<Arc<ExpressionReport<B>>>,
+    report: Arc<ExpressionReport<B>>,
     arguments: HashMap<B, JudgedExpr>,
+    instance: ExpressionInstance,
 }
 
 impl<B: BindingAddress> Default for Expressions<B> {
@@ -209,8 +257,9 @@ impl<B: BindingAddress> Default for Expressions<B> {
         Self {
             roots: Vec::new(),
             definitions: IndexMap::new(),
-            report: None,
+            report: Arc::new(ExpressionReport::empty()),
             arguments: HashMap::new(),
+            instance: ExpressionInstance::Root,
         }
     }
 }
@@ -227,32 +276,31 @@ impl<B: BindingAddress> Expressions<B> {
         self.roots.extend(other.roots);
         self.definitions.extend(other.definitions);
         self.arguments.extend(other.arguments);
-        self.report = match (self.report.take(), other.report) {
-            (Some(left), Some(right)) => Some(Arc::new(left.merged(&right))),
-            _ => None,
-        };
+        Arc::make_mut(&mut self.report).extend(Arc::unwrap_or_clone(other.report));
     }
 
     pub(super) fn map_bindings<C: BindingAddress>(
         self,
         map: &mut impl FnMut(B) -> C,
     ) -> Expressions<C> {
+        let mut memo = HashMap::new();
         Expressions {
+            instance: self.instance,
             arguments: self
                 .arguments
                 .into_iter()
                 .map(|(name, expression)| (map(name), expression))
                 .collect(),
-            report: self.report.map(|report| Arc::new(report.map_bindings(map))),
+            report: Arc::new(self.report.map_bindings(map)),
             roots: self
                 .roots
                 .into_iter()
-                .map(|root| root.map_bindings(map))
+                .map(|root| root.map_bindings(map, &mut memo))
                 .collect(),
             definitions: self
                 .definitions
                 .into_iter()
-                .map(|(name, expression)| (map(name), expression.map_bindings(map)))
+                .map(|(name, expression)| (map(name), expression.map_bindings(map, &mut memo)))
                 .collect(),
         }
     }
@@ -268,25 +316,79 @@ impl<B: BindingAddress> Expressions<B> {
         }
     }
 
-    pub(crate) fn bind_arguments(&mut self, arguments: impl IntoIterator<Item = (B, JudgedExpr)>) {
+    pub(crate) fn bind_arguments(
+        &mut self,
+        scope: &crate::resource::ModuleInstanceScope,
+        arguments: impl IntoIterator<Item = (B, JudgedExpr)>,
+    ) {
+        self.instance = ExpressionInstance::for_scope(scope);
+        fn qualify<P: ValueKind, B: BindingAddress>(
+            expression: &mut ExprValue<P, B>,
+            instance: &ExpressionInstance,
+            memo: &mut HashMap<usize, Arc<AuthoredExpr<P, B>>>,
+        ) {
+            let id = Arc::as_ptr(&expression.authored) as usize;
+            if let Some(authored) = memo.get(&id) {
+                expression.authored = authored.clone();
+                return;
+            }
+            let mut authored = (*expression.authored).clone();
+            authored.location.instance = instance.clone();
+            for child in &mut authored.children {
+                qualify(child, instance, memo);
+            }
+            let authored = Arc::new(authored);
+            memo.insert(id, authored.clone());
+            expression.authored = authored;
+        }
+        let mut memo = HashMap::new();
+        for root in &mut self.roots {
+            qualify(root, &self.instance, &mut memo);
+        }
+        for root in self.definitions.values_mut() {
+            qualify(root, &self.instance, &mut memo);
+        }
         self.arguments.extend(arguments);
-        self.report = None;
+        self.report = Arc::new(ExpressionReport::empty());
     }
 }
 
-/// A configuration together with the report produced at its load/expansion
-/// boundary. Raw, caller-built files cannot supply this validation input.
-pub struct JudgedFile<'a, E, D, B: BindingAddress = RelativeBindingName> {
-    file: &'a super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
-    report: &'a ExpressionReport<B>,
+/// A schema-judged configuration owns its file, report, and schema registry.
+/// Parsing alone cannot construct this type. Consumers borrow this bundle so
+/// neither the file nor the schemas can be replaced independently.
+#[derive(Debug, Clone)]
+pub struct JudgedFile<E, D, B: BindingAddress = RelativeBindingName> {
+    file: super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    schemas: Arc<crate::schema::SchemaRegistry>,
 }
 
-impl<'a, E, D, B: BindingAddress> JudgedFile<'a, E, D, B> {
-    pub fn file(&self) -> &'a super::File<E, ParserPlaceholder, ParserPlaceholder, D, B> {
+impl<E, D, B: BindingAddress> JudgedFile<E, D, B> {
+    pub fn file(&self) -> &super::File<E, ParserPlaceholder, ParserPlaceholder, D, B> {
+        &self.file
+    }
+    pub fn report(&self) -> &ExpressionReport<B> {
+        self.file.expression_report()
+    }
+    pub fn schemas(&self) -> &crate::schema::SchemaRegistry {
+        &self.schemas
+    }
+    pub(crate) fn into_file(self) -> super::File<E, ParserPlaceholder, ParserPlaceholder, D, B> {
         self.file
     }
-    pub fn report(&self) -> &'a ExpressionReport<B> {
-        self.report
+}
+
+impl<E: super::ExportParamLike<ParserPlaceholder, B>, D, B: BindingAddress> JudgedFile<E, D, B>
+where
+    D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    pub(crate) fn new(
+        mut file: super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+        schemas: &crate::schema::SchemaRegistry,
+        config: &super::ProviderContext,
+    ) -> Self {
+        let schemas = Arc::new(schemas.clone());
+        judge_configuration(&mut file, &schemas, config);
+        Self { file, schemas }
     }
 }
 
@@ -295,36 +397,75 @@ impl<'a, E, D, B: BindingAddress> JudgedFile<'a, E, D, B> {
 pub struct UnjudgedConfiguration;
 
 impl<E, D, B: BindingAddress> super::File<E, ParserPlaceholder, ParserPlaceholder, D, B> {
-    pub fn judged(&self) -> Result<JudgedFile<'_, E, D, B>, UnjudgedConfiguration> {
-        let report = self
-            .parser_binding_metadata
-            .syntax()
-            .expressions()
-            .report
-            .as_deref()
-            .ok_or(UnjudgedConfiguration)?;
-        Ok(JudgedFile { file: self, report })
+    pub(crate) fn expression_report(&self) -> &ExpressionReport<B> {
+        &self.parser_binding_metadata.syntax().expressions().report
     }
 }
 
-/// Only producers attach judgement evidence. Downstream code borrows it using
-/// `File::judged`; it never runs the judge as a validation convention.
-pub(crate) fn judge_configuration<E, D, B: BindingAddress>(
+pub(crate) struct ParserExpressionReport<B: BindingAddress>(ExpressionReport<B>);
+
+pub(crate) fn judge_parser_configuration(
+    file: &mut super::ParsedFile,
+    config: &super::ProviderContext,
+) -> ParserExpressionReport<RelativeBindingName> {
+    let report = ParserExpressionReport(judge_expressions(
+        file,
+        &crate::schema::SchemaRegistry::new(),
+        config,
+    ));
+    for parameter in &mut file.export_params {
+        super::ExportParamLike::attach_judgement(parameter, &report.0);
+    }
+    for parameter in &mut file.attribute_params {
+        parameter.attach_judgement(&report.0);
+    }
+    file.parser_binding_metadata.syntax.expressions_mut().report = Arc::new(report.0.clone());
+    report
+}
+impl<B: BindingAddress> ParserExpressionReport<B> {
+    pub(crate) fn first_function_error(&self) -> Option<super::ParseError> {
+        self.0.first_function_error()
+    }
+}
+
+pub(crate) fn judge_configuration<
+    E: super::ExportParamLike<ParserPlaceholder, B>,
+    D,
+    B: BindingAddress,
+>(
     file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     schemas: &crate::schema::SchemaRegistry,
     config: &super::ProviderContext,
 ) where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    let report = judge_expressions(file, schemas, config);
-    file.parser_binding_metadata.syntax.expressions_mut().report = Some(Arc::new(report));
+    let mut report = judge_expressions(file, schemas, config);
+    for parameter in &file.export_params {
+        if let (Some(sink), Some(location)) =
+            (parameter.type_expr_opt(), parameter.value_location())
+        {
+            report.admit_sink(location, sink);
+        }
+    }
+    for parameter in &file.attribute_params {
+        if let (Some(sink), Some(location)) = (&parameter.static_type, parameter.value_location()) {
+            report.admit_sink(location, sink);
+        }
+    }
+    for parameter in &mut file.export_params {
+        parameter.attach_judgement(&report);
+    }
+    for parameter in &mut file.attribute_params {
+        parameter.attach_judgement(&report);
+    }
+    file.parser_binding_metadata.syntax.expressions_mut().report = Arc::new(report);
 }
 
 pub(crate) fn attach_report<E, D, B: BindingAddress>(
     file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     report: ExpressionReport<B>,
 ) {
-    file.parser_binding_metadata.syntax.expressions_mut().report = Some(Arc::new(report));
+    file.parser_binding_metadata.syntax.expressions_mut().report = Arc::new(report);
 }
 
 impl Expressions {
@@ -367,7 +508,10 @@ fn node(
 ) -> ExprValue {
     ExprValue {
         authored: Arc::new(AuthoredExpr {
-            location: DeclarationLocation::expression_node(pair, file, source),
+            location: ExpressionLocation::new(
+                ExpressionInstance::Root,
+                &DeclarationLocation::expression_node(pair, file, source),
+            ),
             kind,
             children,
         }),
@@ -696,7 +840,18 @@ fn compile(
                 .collect();
             node(&pair, ExprKind::Map(keys), children, file, source)
         }
+        Rule::fn_body => node(&pair, ExprKind::Sequence, children(), file, source),
         Rule::fn_def => {
+            let return_type = pair
+                .clone()
+                .into_inner()
+                .find(|part| part.as_rule() == Rule::type_expr)
+                .and_then(|annotation| {
+                    super::parse_type_expr_str(
+                        annotation.as_str(),
+                        &super::ProviderContext::new(crate::EnvironmentSnapshot::new([])),
+                    )
+                });
             let mut scope = scope.clone();
             for parameter in pair
                 .clone()
@@ -724,7 +879,13 @@ fn compile(
                 .filter(|part| part.as_rule() == Rule::fn_body)
                 .map(|body| compile(body, file, source, &scope))
                 .collect();
-            node(&pair, ExprKind::Pending, children, file, source)
+            node(
+                &pair,
+                ExprKind::Function(return_type),
+                children,
+                file,
+                source,
+            )
         }
         Rule::for_expr => {
             let mut parts = pair.clone().into_inner();
@@ -738,8 +899,8 @@ fn compile(
                     continue;
                 }
                 let kind = match (pattern.as_rule(), index) {
-                    (Rule::for_indexed_binding, 0) => ExprKind::Scalar(TypeExpr::Int),
-                    (Rule::for_map_binding, 0) => ExprKind::Scalar(TypeExpr::String),
+                    (Rule::for_indexed_binding, 0) => ExprKind::Parameter(TypeExpr::Int),
+                    (Rule::for_map_binding, 0) => ExprKind::Parameter(TypeExpr::String),
                     _ => ExprKind::Element,
                 };
                 scope.insert(
@@ -830,10 +991,15 @@ fn access_step(pair: Pair<'_, Rule>) -> Option<PathSegment> {
 use judgement::judge_expressions;
 #[cfg(test)]
 pub(crate) use judgement::judge_expressions;
+pub(in crate::parser) use judgement::pending as missing_judgement;
 pub use judgement::{
     CollectionKind, ExpressionAdmission, ExpressionReport, JudgedExpr, admit_expression,
 };
 pub(crate) use judgement::{EmptyCoalesceDefault, coalesce_type};
+#[cfg(test)]
+pub(crate) fn missing_judgement_for_test() -> JudgedExpr {
+    judgement::pending()
+}
 
 // Constructors for judgement evidence are confined to this module. In
 // particular, the syntax compiler and provisional evaluators cannot mint it.
@@ -893,21 +1059,22 @@ mod judgement {
     struct ExprJudgement {
         ty: Result<TypeExpr, InferenceIssue>,
         kind: InferredKind,
-        concrete: bool,
     }
 
     /// Admission evidence, constructible only by the recursive judge.
     ///
-    /// ```compile_fail
+    /// ```compile_fail,E0451
     /// use carina_core::parser::retained::JudgedExpr;
-    /// let forged = JudgedExpr { judgement: todo!() };
+    /// let forged = JudgedExpr { origin: None, judgement: todo!(), concrete: false, coalesce: None, elements: Default::default(), fields: Default::default() };
     /// ```
     #[derive(Debug, Clone, PartialEq)]
     pub struct JudgedExpr {
-        judgement: ExprJudgement,
-        coalesce: Option<Box<[JudgedExpr; 2]>>,
-        elements: Vec<JudgedExpr>,
-        fields: IndexMap<String, JudgedExpr>,
+        origin: Option<ExpressionLocation>,
+        pub(crate) concrete: bool,
+        judgement: Arc<ExprJudgement>,
+        coalesce: Option<Arc<[JudgedExpr; 2]>>,
+        elements: Arc<Vec<JudgedExpr>>,
+        fields: Arc<IndexMap<String, JudgedExpr>>,
     }
 
     impl JudgedExpr {
@@ -930,14 +1097,6 @@ mod judgement {
                 _ => None,
             }
         }
-        pub(crate) fn after_substitution<P: crate::resource::PlaceholderKind, B: BindingAddress>(
-            &self,
-            value: &Value<P, B>,
-        ) -> Self {
-            let mut expression = self.clone();
-            expression.judgement.concrete = value.is_fully_resolved();
-            expression
-        }
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -955,7 +1114,7 @@ mod judgement {
 
     /// Static admission requires the judge's evidence, never a projection.
     ///
-    /// ```compile_fail
+    /// ```compile_fail,E0308
     /// use carina_core::{parser::{TypeExpr, retained::admit_expression}, resource::{Value, ConcreteValue}};
     /// let reduced = Value::<carina_core::resource::ParserPlaceholder, carina_core::resource::RelativeBindingName>::Concrete(ConcreteValue::String("selected".into()));
     /// admit_expression(&reduced, &TypeExpr::String);
@@ -970,9 +1129,7 @@ mod judgement {
                 InferenceIssue::NotInferable(_) => Ok(ExpressionAdmission::Pending),
             };
         }
-        if expression.judgement.kind == InferredKind::StringConstruction
-            && !expression.judgement.concrete
-        {
+        if expression.judgement.kind == InferredKind::StringConstruction && !expression.concrete {
             return if admit_deferred_interpolation(expression, sink) {
                 Ok(ExpressionAdmission::DeferredInterpolation)
             } else {
@@ -986,59 +1143,92 @@ mod judgement {
         Ok(ExpressionAdmission::ValueCheck)
     }
 
-    /// The sole policy switch for deferred interpolation. Placeholder (b)
-    /// admits string construction; resolved values still undergo constraints.
+    /// Deferred interpolation may fill String and named string sinks. Once
+    /// it resolves, the resulting value must satisfy the sink's constraints.
     fn admit_deferred_interpolation(expression: &JudgedExpr, sink: &TypeExpr) -> bool {
-        const ADMIT_NAMED_STRING: bool = true;
         expression.static_type().is_ok()
             && expression.judgement.kind == InferredKind::StringConstruction
-            && !expression.judgement.concrete
+            && !expression.concrete
             && (matches!(sink, TypeExpr::String)
-                || (ADMIT_NAMED_STRING
-                    && (sink.is_string_shaped() || matches!(sink, TypeExpr::Ref(_))))
+                || sink.is_string_shaped()
+                || matches!(sink, TypeExpr::Ref(_))
                 || matches!(sink, TypeExpr::Union(members) if members.iter().any(|member| admit_deferred_interpolation(expression, member))))
     }
 
     #[derive(Debug, Clone, PartialEq)]
     pub struct ExpressionReport<B: BindingAddress = RelativeBindingName> {
-        bindings: HashMap<B, JudgedExpr>,
-        expressions: HashMap<DeclarationLocation, JudgedExpr>,
-        findings: Vec<Located<InferenceError>>,
-        operands: HashMap<DeclarationLocation, [JudgedExpr; 2]>,
+        bindings: Arc<HashMap<B, JudgedExpr>>,
+        expressions: Arc<HashMap<ExpressionLocation, JudgedExpr>>,
+        findings: Arc<Vec<Located<InferenceError>>>,
+        function_errors: Arc<Vec<Located<InferenceError>>>,
+        operands: Arc<HashMap<ExpressionLocation, [JudgedExpr; 2]>>,
         unknown: JudgedExpr,
-        module_attributes: HashMap<(B, String), JudgedExpr>,
-        resource_reports: HashMap<crate::resource::ResourceId, Arc<ExpressionReport<B>>>,
-        parameters: HashMap<String, JudgedExpr>,
+        module_attributes: Arc<HashMap<(B, String), JudgedExpr>>,
+        resource_reports: Arc<HashMap<crate::resource::ResourceId, Arc<ExpressionReport<B>>>>,
+        parameters: Arc<HashMap<String, JudgedExpr>>,
+        instance: ExpressionInstance,
+        authored: bool,
     }
 
     impl<B: BindingAddress> ExpressionReport<B> {
-        pub(super) fn merged(&self, other: &Self) -> Self {
-            let mut report = self.clone();
-            report.bindings.extend(other.bindings.clone());
-            report.expressions.extend(other.expressions.clone());
-            report.findings.extend(other.findings.clone());
-            report.operands.extend(other.operands.clone());
-            report
-                .module_attributes
-                .extend(other.module_attributes.clone());
-            report
-                .resource_reports
-                .extend(other.resource_reports.clone());
-            report.parameters.extend(other.parameters.clone());
-            report
+        pub(super) fn empty() -> Self {
+            Self {
+                bindings: Arc::default(),
+                expressions: Arc::default(),
+                findings: Arc::default(),
+                function_errors: Arc::default(),
+                operands: Arc::default(),
+                unknown: pending(),
+                module_attributes: Arc::default(),
+                resource_reports: Arc::default(),
+                parameters: Arc::default(),
+                instance: ExpressionInstance::Root,
+                authored: false,
+            }
+        }
+        pub(super) fn extend(&mut self, other: Self) {
+            Arc::make_mut(&mut self.bindings).extend(Arc::unwrap_or_clone(other.bindings));
+            Arc::make_mut(&mut self.expressions).extend(Arc::unwrap_or_clone(other.expressions));
+            Arc::make_mut(&mut self.findings).extend(Arc::unwrap_or_clone(other.findings));
+            Arc::make_mut(&mut self.function_errors)
+                .extend(Arc::unwrap_or_clone(other.function_errors));
+            Arc::make_mut(&mut self.operands).extend(Arc::unwrap_or_clone(other.operands));
+            Arc::make_mut(&mut self.module_attributes)
+                .extend(Arc::unwrap_or_clone(other.module_attributes));
+            Arc::make_mut(&mut self.resource_reports)
+                .extend(Arc::unwrap_or_clone(other.resource_reports));
+            Arc::make_mut(&mut self.parameters).extend(Arc::unwrap_or_clone(other.parameters));
         }
         pub(super) fn map_bindings<C: BindingAddress>(
             &self,
             map: &mut impl FnMut(B) -> C,
         ) -> ExpressionReport<C> {
+            let mut mapped = HashMap::new();
+            let resource_reports = self
+                .resource_reports
+                .iter()
+                .map(|(id, report)| {
+                    let key = Arc::as_ptr(report) as usize;
+                    let report = mapped
+                        .entry(key)
+                        .or_insert_with(|| Arc::new(report.map_bindings(map)))
+                        .clone();
+                    (id.clone(), report)
+                })
+                .collect::<HashMap<_, _>>()
+                .into();
             ExpressionReport {
+                instance: self.instance.clone(),
+                authored: self.authored,
                 bindings: self
                     .bindings
                     .iter()
                     .map(|(name, expression)| (map(name.clone()), expression.clone()))
-                    .collect(),
+                    .collect::<HashMap<_, _>>()
+                    .into(),
                 expressions: self.expressions.clone(),
                 findings: self.findings.clone(),
+                function_errors: self.function_errors.clone(),
                 operands: self.operands.clone(),
                 unknown: self.unknown.clone(),
                 module_attributes: self
@@ -1050,20 +1240,64 @@ mod judgement {
                             expression.clone(),
                         )
                     })
-                    .collect(),
-                resource_reports: self
-                    .resource_reports
-                    .iter()
-                    .map(|(id, report)| (id.clone(), Arc::new(report.map_bindings(map))))
-                    .collect(),
+                    .collect::<HashMap<_, _>>()
+                    .into(),
+                resource_reports,
                 parameters: self.parameters.clone(),
             }
+        }
+        pub(super) fn admit_sink(&mut self, location: &DeclarationLocation, sink: &TypeExpr) {
+            if let Some(expression) = self.expression(location)
+                && expression.static_type().is_ok()
+                && let Err(error) = admit_expression(expression, sink)
+                && !self
+                    .findings
+                    .iter()
+                    .any(|finding| finding.location() == location && finding.detail() == &error)
+            {
+                Arc::make_mut(&mut self.findings).push(Located::new(location.clone(), error));
+            }
+        }
+        pub(crate) fn has_authored_judgement(&self) -> bool {
+            self.authored
         }
         pub fn binding(&self, name: &B) -> Option<&JudgedExpr> {
             self.bindings.get(name)
         }
+        #[cfg(test)]
+        pub(crate) fn types_at_for_test(&self, location: &DeclarationLocation) -> Vec<TypeExpr> {
+            self.expressions
+                .iter()
+                .filter(|(key, _)| &key.authored == location)
+                .filter_map(|(_, expr)| expr.static_type().ok().cloned())
+                .collect()
+        }
         pub fn expression(&self, location: &DeclarationLocation) -> Option<&JudgedExpr> {
-            self.expressions.get(location)
+            self.expression_in(&self.instance, location)
+        }
+        pub(crate) fn expression_in(
+            &self,
+            instance: &ExpressionInstance,
+            location: &DeclarationLocation,
+        ) -> Option<&JudgedExpr> {
+            self.expressions
+                .get(&ExpressionLocation::new(instance.clone(), location))
+        }
+        pub(crate) fn require_expression_in(
+            &self,
+            instance: &ExpressionInstance,
+            location: &DeclarationLocation,
+        ) -> Result<&JudgedExpr, InferenceError> {
+            self.expression_in(instance, location)
+                .ok_or_else(|| InferenceError::UnknownType {
+                    reason: "authored expression has no judgement".to_string(),
+                })
+        }
+        pub(crate) fn require_expression(
+            &self,
+            location: &DeclarationLocation,
+        ) -> Result<&JudgedExpr, InferenceError> {
+            self.require_expression_in(&self.instance, location)
         }
         pub fn unknown(&self) -> &JudgedExpr {
             &self.unknown
@@ -1079,7 +1313,11 @@ mod judgement {
                 .get(&(binding.clone(), name.to_string()))
         }
         pub(crate) fn locations(&self) -> HashMap<DeclarationLocation, JudgedExpr> {
-            self.expressions.clone()
+            self.expressions
+                .iter()
+                .filter(|(key, _)| key.instance == self.instance)
+                .map(|(key, value)| (key.authored.clone(), value.clone()))
+                .collect()
         }
         pub(crate) fn parameter(&self, name: &str) -> Option<&JudgedExpr> {
             self.parameters.get(name)
@@ -1097,22 +1335,25 @@ mod judgement {
                             .detail()
                             .value_location()
                             .and_then(|location| self.expression(location))
+                            .cloned()
                     {
-                        self.module_attributes.insert(
+                        Arc::make_mut(&mut self.module_attributes).insert(
                             (binding.clone(), declaration.detail().name().to_string()),
                             expression.clone(),
                         );
                     }
                 }
             }
-            let snapshot = Arc::new(self.clone());
+            let mut snapshot = self.clone();
+            snapshot.resource_reports = Arc::default();
+            let snapshot = Arc::new(snapshot);
             for id in file
                 .resources
                 .iter()
                 .map(|resource| &resource.id)
                 .chain(file.data_sources.iter().map(|source| &source.id))
             {
-                self.resource_reports.insert(id.clone(), snapshot.clone());
+                Arc::make_mut(&mut self.resource_reports).insert(id.clone(), snapshot.clone());
             }
         }
         pub fn operand(
@@ -1125,7 +1366,7 @@ mod judgement {
                 crate::integer_arithmetic::IntegerOperandSide::Right => 1,
             };
             self.operands
-                .get(location)
+                .get(&ExpressionLocation::new(self.instance.clone(), location))
                 .map(|operands| &operands[index])
                 .unwrap_or(&self.unknown)
         }
@@ -1140,6 +1381,15 @@ mod judgement {
         }
         pub fn findings(&self) -> &[Located<InferenceError>] {
             &self.findings
+        }
+        pub(crate) fn first_function_error(&self) -> Option<super::super::ParseError> {
+            self.function_errors.first().map(|finding| {
+                super::super::ParseError::InvalidExpression {
+                    line: finding.location().span().start_line(),
+                    message: finding.detail().to_string(),
+                }
+                .at(finding.location())
+            })
         }
         pub fn first_error(&self) -> Option<super::super::ParseError> {
             self.findings.first().map(|finding| {
@@ -1162,20 +1412,44 @@ mod judgement {
     {
         let expressions = file.parser_binding_metadata.syntax().expressions();
         let bindings = inference::bindings_from_parsed(file);
+        fn index<'a, B: BindingAddress>(
+            expression: &'a ExprValue<ParserPlaceholder, B>,
+            authored: &mut HashMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
+            visited: &mut std::collections::HashSet<usize>,
+        ) {
+            if !visited.insert(Arc::as_ptr(&expression.authored) as usize) {
+                return;
+            }
+            authored
+                .entry(expression.authored.location.clone())
+                .or_insert(expression);
+            for child in &expression.authored.children {
+                index(child, authored, visited);
+            }
+        }
+        let mut authored = HashMap::new();
+        let mut visited = std::collections::HashSet::new();
+        for expression in expressions
+            .roots
+            .iter()
+            .chain(expressions.definitions.values())
+        {
+            index(expression, &mut authored, &mut visited);
+        }
         let mut judge = Judge {
+            authored,
             expressions,
             bindings: &bindings,
+            functions: &file.user_functions,
             schemas,
             config,
             memo: HashMap::new(),
             by_location: HashMap::new(),
             visiting: Vec::new(),
             findings: Vec::new(),
+            function_errors: Vec::new(),
             operands: HashMap::new(),
-            module_attributes: expressions
-                .report
-                .as_deref()
-                .map(|report| &report.module_attributes),
+            module_attributes: Some(&expressions.report.module_attributes),
         };
         let mut judged_bindings = HashMap::new();
         for (name, expression) in &expressions.definitions {
@@ -1184,22 +1458,31 @@ mod judgement {
         for expression in &expressions.roots {
             judge.judge(expression);
         }
-        ExpressionReport {
-            bindings: judged_bindings,
-            expressions: judge.by_location,
-            findings: judge.findings,
-            operands: judge.operands,
+        let module_attributes = expressions
+            .report
+            .module_attributes
+            .iter()
+            .map(|(key, evidence)| {
+                let refreshed = evidence
+                    .origin
+                    .as_ref()
+                    .and_then(|origin| judge.by_location.get(origin))
+                    .unwrap_or(evidence)
+                    .clone();
+                (key.clone(), refreshed)
+            })
+            .collect();
+        let mut report = ExpressionReport {
+            instance: expressions.instance.clone(),
+            authored: true,
+            bindings: Arc::new(judged_bindings),
+            expressions: Arc::new(judge.by_location),
+            findings: Arc::new(judge.findings),
+            function_errors: Arc::new(judge.function_errors),
+            operands: Arc::new(judge.operands),
             unknown: pending(),
-            module_attributes: expressions
-                .report
-                .as_deref()
-                .map(|report| report.module_attributes.clone())
-                .unwrap_or_default(),
-            resource_reports: expressions
-                .report
-                .as_deref()
-                .map(|report| report.resource_reports.clone())
-                .unwrap_or_default(),
+            module_attributes: Arc::new(module_attributes),
+            resource_reports: Arc::default(),
             parameters: file
                 .arguments
                 .iter()
@@ -1207,31 +1490,49 @@ mod judgement {
                     (
                         argument.name.clone(),
                         JudgedExpr {
-                            judgement: ExprJudgement {
+                            origin: None,
+                            judgement: Arc::new(ExprJudgement {
                                 ty: Ok(argument.static_type.clone()),
                                 kind: InferredKind::Ordinary,
-                                concrete: false,
-                            },
+                            }),
+                            concrete: false,
                             coalesce: None,
-                            elements: Vec::new(),
-                            fields: IndexMap::new(),
+                            elements: Arc::default(),
+                            fields: Arc::default(),
                         },
                     )
                 })
-                .collect(),
+                .collect::<HashMap<_, _>>()
+                .into(),
+        };
+        let mut snapshots = HashMap::new();
+        for (id, previous) in expressions.report.resource_reports.iter() {
+            let snapshot = snapshots
+                .entry(previous.instance.clone())
+                .or_insert_with(|| {
+                    let mut snapshot = report.clone();
+                    snapshot.instance = previous.instance.clone();
+                    snapshot.resource_reports = Arc::default();
+                    Arc::new(snapshot)
+                });
+            Arc::make_mut(&mut report.resource_reports).insert(id.clone(), snapshot.clone());
         }
+        report
     }
 
     struct Judge<'a, B: BindingAddress> {
+        authored: HashMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
         expressions: &'a Expressions<B>,
         bindings: &'a InferenceBindings<ParserPlaceholder, B>,
+        functions: &'a HashMap<String, super::super::UserFunction<B>>,
         schemas: &'a crate::schema::SchemaRegistry,
         config: &'a super::super::ProviderContext,
         memo: HashMap<usize, JudgedExpr>,
-        by_location: HashMap<DeclarationLocation, JudgedExpr>,
+        by_location: HashMap<ExpressionLocation, JudgedExpr>,
         visiting: Vec<usize>,
         findings: Vec<Located<InferenceError>>,
-        operands: HashMap<DeclarationLocation, [JudgedExpr; 2]>,
+        function_errors: Vec<Located<InferenceError>>,
+        operands: HashMap<ExpressionLocation, [JudgedExpr; 2]>,
         module_attributes: Option<&'a HashMap<(B, String), JudgedExpr>>,
     }
 
@@ -1254,24 +1555,80 @@ mod judgement {
                 .map(|child| self.judge(child))
                 .collect::<Vec<_>>();
             let mut result = self.infer(expression, &children);
+            result.origin = Some(root.location.clone());
             if let Projection::Value(value) = &expression.payload {
-                result.judgement.concrete = value.is_fully_resolved();
+                result.concrete = value.is_fully_resolved();
             }
-            if let Some(failed) = children.iter().find(|child| {
-                matches!(
-                    child.judgement.ty,
-                    Err(InferenceIssue::Failed(
-                        InferenceError::IncompatibleCoalesceTypes { .. }
-                    ))
-                )
-            }) {
-                result.judgement.ty = failed.judgement.ty.clone();
+            if let Some(failed) = children
+                .iter()
+                .find(|child| matches!(child.judgement.ty, Err(InferenceIssue::Failed(_))))
+            {
+                Arc::make_mut(&mut result.judgement).ty = failed.judgement.ty.clone();
+            }
+            if !matches!(root.kind, ExprKind::Coalesce)
+                && let Err(InferenceIssue::Failed(error)) = result.static_type()
+                && !children
+                    .iter()
+                    .any(|child| child.static_type() == Err(&InferenceIssue::Failed(error.clone())))
+            {
+                let location = match error {
+                    InferenceError::InvalidIntegerArithmeticOperand { operator_span, .. } => {
+                        operator_span.location().unwrap_or(&root.location.authored)
+                    }
+                    _ => &root.location.authored,
+                }
+                .clone();
+                self.push_finding(location, error.clone());
             }
             self.visiting.pop();
             self.memo.insert(id, result.clone());
             self.by_location
                 .insert(root.location.clone(), result.clone());
             result
+        }
+
+        fn refresh_argument(&mut self, evidence: &JudgedExpr) -> JudgedExpr {
+            let Some(authored) = evidence
+                .origin
+                .as_ref()
+                .and_then(|origin| self.authored.get(origin))
+                .copied()
+            else {
+                return evidence.clone();
+            };
+            let mut result = self.judge(authored);
+            result.concrete = evidence.concrete;
+            result
+        }
+        fn check_function_sink(
+            &mut self,
+            expression: &JudgedExpr,
+            sink: &TypeExpr,
+            location: &DeclarationLocation,
+        ) {
+            if expression.static_type().is_ok()
+                && let Err(error) = crate::validation::typecheck::admit_function_expression(
+                    expression,
+                    sink,
+                    self.config,
+                )
+            {
+                let finding = Located::new(location.clone(), error);
+                if !self.function_errors.contains(&finding) {
+                    self.function_errors.push(finding.clone());
+                }
+                self.push_finding(finding.location().clone(), finding.detail().clone());
+            }
+        }
+
+        fn push_finding(&mut self, location: DeclarationLocation, error: InferenceError) {
+            if !self
+                .findings
+                .iter()
+                .any(|finding| finding.location() == &location && finding.detail() == &error)
+            {
+                self.findings.push(Located::new(location, error));
+            }
         }
 
         fn infer(
@@ -1281,18 +1638,19 @@ mod judgement {
         ) -> JudgedExpr {
             let root = &expression.authored;
             let ordinary = |ty, concrete| JudgedExpr {
+                origin: None,
+                concrete,
                 coalesce: None,
-                elements: Vec::new(),
-                fields: IndexMap::new(),
-                judgement: ExprJudgement {
+                elements: Arc::default(),
+                fields: Arc::default(),
+                judgement: Arc::new(ExprJudgement {
                     ty,
-                    concrete,
                     kind: InferredKind::Ordinary,
-                },
+                }),
             };
             let child_type = |index: usize| {
                 children.get(index).map_or_else(
-                    || pending().judgement.ty,
+                    || pending().judgement.ty.clone(),
                     |child| child.judgement.ty.clone(),
                 )
             };
@@ -1301,7 +1659,7 @@ mod judgement {
                 ExprKind::Parameter(ty) => ordinary(Ok(ty.clone()), false),
                 ExprKind::Binding(name) => {
                     if let Some(argument) = self.expressions.arguments.get(name) {
-                        argument.clone()
+                        self.refresh_argument(argument)
                     } else if let Some(definition) = self.expressions.definitions.get(name) {
                         self.judge(definition)
                     } else if let Some(InferenceBinding::Argument { type_expr }) =
@@ -1323,6 +1681,7 @@ mod judgement {
                     .chain(segments.iter().cloned())
                     .collect::<Vec<_>>();
                     if let Some(argument) = self.expressions.arguments.get(binding) {
+                        let argument = self.refresh_argument(argument);
                         return ordinary(
                             argument
                                 .static_type()
@@ -1340,12 +1699,13 @@ mod judgement {
                                         ),
                                     )
                                 }),
-                            argument.judgement.concrete,
+                            argument.concrete,
                         );
                     }
                     if let Some(attribute) = self.module_attributes.and_then(|attributes| {
                         attributes.get(&(binding.clone(), attribute.clone()))
                     }) {
+                        let attribute = self.refresh_argument(attribute);
                         return ordinary(
                             attribute
                                 .static_type()
@@ -1367,7 +1727,7 @@ mod judgement {
                                         )
                                     }
                                 }),
-                            attribute.judgement.concrete,
+                            attribute.concrete,
                         );
                     }
                     if let Some(InferenceBinding::Virtual { attributes }) =
@@ -1411,7 +1771,7 @@ mod judgement {
                     } else if let Some(definition) = self.expressions.definitions.get(binding) {
                         let base = self.judge(definition);
                         ordinary(
-                            base.judgement.ty.and_then(|ty| {
+                            base.judgement.ty.clone().and_then(|ty| {
                                 let mut current = ty;
                                 for step in &steps {
                                     current = crate::validation::narrow_type_expr(
@@ -1428,21 +1788,22 @@ mod judgement {
                                 }
                                 Ok(current)
                             }),
-                            base.judgement.concrete,
+                            base.concrete,
                         )
                     } else {
                         ordinary(Ok(TypeExpr::String), true)
                     }
                 }
                 ExprKind::Interpolation => JudgedExpr {
+                    origin: None,
+                    concrete: children.iter().all(|child| child.concrete),
                     coalesce: None,
-                    elements: Vec::new(),
-                    fields: IndexMap::new(),
-                    judgement: ExprJudgement {
+                    elements: Arc::default(),
+                    fields: Arc::default(),
+                    judgement: Arc::new(ExprJudgement {
                         ty: Ok(TypeExpr::String),
                         kind: InferredKind::StringConstruction,
-                        concrete: children.iter().all(|child| child.judgement.concrete),
-                    },
+                    }),
                 },
                 ExprKind::Coalesce => {
                     let left = child_type(0);
@@ -1468,8 +1829,8 @@ mod judgement {
                         }
                     }
                     let mut result = children.first().cloned().unwrap_or_else(pending);
-                    result.judgement.ty = ty;
-                    result.coalesce = Some(Box::new([children[0].clone(), children[1].clone()]));
+                    Arc::make_mut(&mut result.judgement).ty = ty;
+                    result.coalesce = Some(Arc::new([children[0].clone(), children[1].clone()]));
                     result
                 }
                 ExprKind::List | ExprKind::Map(_) => {
@@ -1490,20 +1851,21 @@ mod judgement {
                                 TypeExpr::Map(Box::new(first))
                             })
                         }),
-                        None => Err(InferenceError::UnknownType { reason: "empty collection has no inferable element type".to_string() }.into()),
+                        None => Err(InferenceIssue::NotInferable(NotInferableReason::MissingValue)),
                     };
-                    let mut result =
-                        ordinary(ty, children.iter().all(|child| child.judgement.concrete));
-                    result.judgement.kind = if matches!(root.kind, ExprKind::List) {
-                        InferredKind::List
-                    } else {
-                        InferredKind::Map
-                    };
+                    let mut result = ordinary(ty, children.iter().all(|child| child.concrete));
+                    Arc::make_mut(&mut result.judgement).kind =
+                        if matches!(root.kind, ExprKind::List) {
+                            InferredKind::List
+                        } else {
+                            InferredKind::Map
+                        };
                     match &root.kind {
-                        ExprKind::List => result.elements = children.to_vec(),
+                        ExprKind::List => result.elements = Arc::new(children.to_vec()),
                         ExprKind::Map(keys) => {
-                            result.fields =
-                                keys.iter().cloned().zip(children.iter().cloned()).collect()
+                            result.fields = Arc::new(
+                                keys.iter().cloned().zip(children.iter().cloned()).collect(),
+                            )
                         }
                         _ => unreachable!("collection judgement"),
                     }
@@ -1512,7 +1874,50 @@ mod judgement {
                 ExprKind::Call(name) if name == "secret" => {
                     children.first().cloned().unwrap_or_else(pending)
                 }
+                ExprKind::Function(return_type) => {
+                    let body = children.last().cloned().unwrap_or_else(pending);
+                    if let Some(sink) = return_type {
+                        self.check_function_sink(
+                            &body,
+                            sink,
+                            root.children.last().unwrap().location(),
+                        );
+                    }
+                    pending()
+                }
+                ExprKind::Sequence => children.last().cloned().unwrap_or_else(pending),
                 ExprKind::Call(name) => {
+                    if name == "lookup"
+                        && let Some(first) = children.first()
+                    {
+                        match first.static_type() {
+                            Ok(TypeExpr::Map(inner)) => {
+                                return ordinary(
+                                    Ok(*inner.clone()),
+                                    children.iter().all(|child| child.concrete),
+                                );
+                            }
+                            Ok(actual) => {
+                                return ordinary(
+                                    Err(InferenceError::UnknownType {
+                                        reason: format!("lookup expects a map, got {actual}"),
+                                    }
+                                    .into()),
+                                    false,
+                                );
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    if let Some(function) = self.functions.get(name) {
+                        for ((parameter, child), authored) in
+                            function.params.iter().zip(children).zip(&root.children)
+                        {
+                            if let Some(sink) = &parameter.param_type {
+                                self.check_function_sink(child, sink, authored.location());
+                            }
+                        }
+                    }
                     if let Some(InferenceBinding::UserFunction {
                         return_type: Some(ty),
                     }) = self.bindings.get(name)
@@ -1534,14 +1939,10 @@ mod judgement {
                             | crate::builtins::BuiltinReturnType::Any => None,
                         });
                     ordinary(
-                        ty.ok_or_else(|| {
-                            InferenceIssue::Failed(InferenceError::UnknownType {
-                                reason: format!(
-                                    "built-in `{name}` return type depends on arguments"
-                                ),
-                            })
-                        }),
-                        children.iter().all(|child| child.judgement.concrete),
+                        ty.ok_or(InferenceIssue::NotInferable(
+                            NotInferableReason::MissingValue,
+                        )),
+                        children.iter().all(|child| child.concrete),
                     )
                 }
                 ExprKind::Access(step) => ordinary(
@@ -1559,13 +1960,14 @@ mod judgement {
                             .into()
                         })
                     }),
-                    children
-                        .first()
-                        .is_some_and(|child| child.judgement.concrete),
+                    children.first().is_some_and(|child| child.concrete),
                 ),
                 ExprKind::Integer { op, location } => {
                     let operands = [children[0].clone(), children[1].clone()];
-                    self.operands.insert(location.clone(), operands.clone());
+                    self.operands.insert(
+                        ExpressionLocation::new(root.location.instance.clone(), location),
+                        operands.clone(),
+                    );
                     ordinary(
                         inference::judge_integer_operands(
                             *op,
@@ -1574,14 +1976,14 @@ mod judgement {
                             self.schemas,
                             self.config,
                         ),
-                        children.iter().all(|child| child.judgement.concrete),
+                        children.iter().all(|child| child.concrete),
                     )
                 }
                 ExprKind::Alias => children.first().cloned().unwrap_or_else(pending),
                 ExprKind::Element => ordinary(
                     child_type(0).and_then(|ty| match ty {
                         TypeExpr::List(inner) | TypeExpr::Map(inner) => Ok(*inner),
-                        _ => pending().judgement.ty,
+                        _ => pending().judgement.ty.clone(),
                     }),
                     false,
                 ),
@@ -1629,14 +2031,10 @@ mod judgement {
                                 Err(error)
                                     if judged.judgement.kind
                                         == InferredKind::StringConstruction
-                                        && !judged.judgement.concrete
-                                        && !matches!(
-                                            error,
-                                            InferenceError::IncompatibleCoalesceTypes { .. }
-                                        ) =>
+                                        && !judged.concrete
+                                        && judged.static_type().is_ok() =>
                                 {
-                                    self.findings
-                                        .push(Located::new(value.location().clone(), error));
+                                    self.push_finding(value.location().clone(), error);
                                 }
                                 Ok(
                                     ExpressionAdmission::ValueCheck
@@ -1654,18 +2052,19 @@ mod judgement {
         }
     }
 
-    fn pending() -> JudgedExpr {
+    pub(crate) fn pending() -> JudgedExpr {
         JudgedExpr {
+            origin: None,
+            concrete: false,
             coalesce: None,
-            elements: Vec::new(),
-            fields: IndexMap::new(),
-            judgement: ExprJudgement {
+            elements: Arc::default(),
+            fields: Arc::default(),
+            judgement: Arc::new(ExprJudgement {
                 ty: Err(InferenceIssue::NotInferable(
                     NotInferableReason::MissingValue,
                 )),
                 kind: InferredKind::Ordinary,
-                concrete: false,
-            },
+            }),
         }
     }
 }

@@ -174,14 +174,7 @@ fn substituted_integer_operator_keeps_its_file_when_coordinates_coincide() {
         .unwrap();
     let bindings =
         carina_core::binding_index::BindingIndex::from_parsed(&consumer, &engine.schemas, &catalog);
-    let findings = tree.integer_arithmetic_findings(
-        resource,
-        "enabled",
-        schema,
-        &carina_core::validation::inference::bindings_from_parsed(&consumer),
-        &engine.schemas,
-        &bindings,
-    );
+    let findings = tree.integer_arithmetic_findings(resource, "enabled", schema, &bindings);
     assert_eq!(findings.len(), 1, "{findings:?}");
     let finding = &findings[0];
     assert_eq!(finding.location().file().path(), sibling);

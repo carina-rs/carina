@@ -1263,7 +1263,7 @@ fn infer_function_call<P: PlaceholderKind, B: BindingAddress>(
 /// Phase transition (#2360 stage 2): attach declared/inferred origin and any
 /// typed unchecked reason to every export.
 pub fn apply_inference<D, B: BindingAddress>(
-    mut parsed: crate::parser::File<
+    parsed: crate::parser::File<
         crate::parser::ParsedExportParam<crate::resource::ParserPlaceholder, B>,
         crate::resource::ParserPlaceholder,
         crate::resource::ParserPlaceholder,
@@ -1286,18 +1286,13 @@ where
             B,
         >,
 {
-    crate::parser::retained::judge_configuration(&mut parsed, schemas, provider_context);
-    let inferred_exports = infer_export_params(
-        parsed.judged().expect("inference producer judgement"),
-        schemas,
-        provider_context,
-    )
-    .into_parameters();
+    let judged = crate::parser::retained::JudgedFile::new(parsed, schemas, provider_context);
+    let inferred_exports = infer_export_params(&judged).into_parameters();
     // Single phase-axis surface (carina#3126): only `export_params`
     // changes phase; every other field moves through `map_export_params`
     // so a new `File<E>` field cannot be silently dropped on the
     // parser→inferred relabel.
-    parsed.map_export_params(|_| inferred_exports)
+    judged.into_file().map_export_params(|_| inferred_exports)
 }
 
 /// Export parameters inferred with a caller-supplied schema registry.
@@ -1320,21 +1315,13 @@ impl<B: BindingAddress> SchemaCheckedExportParams<B> {
     }
 }
 
-/// Borrowing variant of [`apply_inference`] that returns just the
-/// inferred export parameters. The full
-/// `InferredFile` reconstruction in `apply_inference` clones every
-/// non-export field; consumers that only need the export-side typecheck
-/// (LSP diagnostics, in particular) should use this instead to avoid
-/// the per-keystroke deep-clone.
+/// Infer export types from a schema-judged configuration without cloning its file.
 pub fn infer_export_params<D, B: BindingAddress>(
-    judged: crate::parser::retained::JudgedFile<
-        '_,
+    judged: &crate::parser::retained::JudgedFile<
         crate::parser::ParsedExportParam<crate::resource::ParserPlaceholder, B>,
         D,
         B,
     >,
-    schemas: &SchemaRegistry,
-    provider_context: &crate::parser::ProviderContext,
 ) -> SchemaCheckedExportParams<B>
 where
     D: crate::parser::DeferredForPhaseTraversal<
@@ -1363,47 +1350,16 @@ where
                     None => ExportStaticType::Inferred(StaticType::Unchecked(
                         InferredUncheckedReason::NotInferable(NotInferableReason::MissingValue),
                     )),
-                    Some(crate::parser::BoundaryExpression::Value(value)) => {
-                        let declaration = parsed
-                            .parser_binding_metadata
-                            .syntax()
-                            .declarations()
-                            .iter()
-                            .find(|declaration| {
-                                declaration.detail().kind()
-                                    == crate::config_loader::DeclarationKind::Export
-                                    && declaration.detail().name() == parameter.name
-                                    && declaration.location().file()
-                                        == parameter.type_check_location().file()
-                                    && parameter.type_check_location().span().start_byte()
-                                        <= declaration.location().span().start_byte()
-                                    && declaration.location().span().end_byte()
-                                        <= parameter.type_check_location().span().end_byte()
-                            });
-                        let inferred = declaration
-                            .and_then(|declaration| declaration.detail().value_location())
+                    Some(crate::parser::BoundaryExpression::Value(_value)) => {
+                        let inferred = parameter
+                            .value_location()
                             .and_then(|location| report.expression(location))
                             .map(|expression| {
                                 expression.static_type().cloned().map_err(Clone::clone)
                             })
-                            .unwrap_or_else(|| {
-                                #[cfg(test)]
-                                {
-                                    if declaration.is_none() {
-                                        return infer_type_from_value(
-                                            value,
-                                            &bindings_from_parsed(parsed),
-                                            schemas,
-                                            provider_context,
-                                        );
-                                    }
-                                }
-                                #[cfg(not(test))]
-                                let _ = (value, schemas, provider_context);
-                                Err(InferenceIssue::NotInferable(
-                                    NotInferableReason::MissingValue,
-                                ))
-                            });
+                            .unwrap_or(Err(InferenceIssue::NotInferable(
+                                NotInferableReason::MissingValue,
+                            )));
                         match inferred {
                             Ok(type_expr) => {
                                 ExportStaticType::Inferred(StaticType::Known(type_expr))
@@ -1435,7 +1391,6 @@ where
 #[derive(Debug, Clone)]
 pub struct ExportParamsInferredWithLoadedProviderSchemas<B: BindingAddress = RelativeBindingName> {
     inferred: SchemaCheckedExportParams<B>,
-    declarations: Vec<crate::parser::Located<crate::parser::DeclarationRecord>>,
 }
 
 impl<B: BindingAddress> ExportParamsInferredWithLoadedProviderSchemas<B> {
@@ -1448,7 +1403,6 @@ impl<B: BindingAddress> ExportParamsInferredWithLoadedProviderSchemas<B> {
     pub fn checked_exports(&self) -> ExportsInferredWithLoadedProviderSchemas<'_, B> {
         ExportsInferredWithLoadedProviderSchemas {
             parameters: self.parameters(),
-            declarations: self.declarations.clone(),
         }
     }
 
@@ -1478,19 +1432,19 @@ pub fn infer_export_params_with_loaded_provider_schemas<D, B: BindingAddress>(
     provider_context: &crate::parser::ProviderContext,
 ) -> ExportParamsInferredWithLoadedProviderSchemas<B>
 where
-    D: crate::parser::DeferredForPhaseTraversal<
+    D: Clone
+        + crate::parser::DeferredForPhaseTraversal<
             crate::resource::ParserPlaceholder,
             crate::resource::ParserPlaceholder,
             B,
         >,
 {
     ExportParamsInferredWithLoadedProviderSchemas {
-        declarations: tree.syntax().declarations().to_vec(),
-        inferred: infer_export_params(
-            tree.file().judged().expect("loaded configuration report"),
+        inferred: infer_export_params(&crate::parser::retained::JudgedFile::new(
+            tree.file().clone(),
             schemas.schemas(),
             provider_context,
-        ),
+        )),
     }
 }
 
@@ -1510,7 +1464,6 @@ impl std::fmt::Display for AttachedInferenceFailure<'_> {
 #[derive(Debug, Clone)]
 pub struct ExportsInferredWithLoadedProviderSchemas<'a, B: BindingAddress = RelativeBindingName> {
     parameters: &'a [crate::parser::InferredExportParam<crate::resource::ParserPlaceholder, B>],
-    declarations: Vec<crate::parser::Located<crate::parser::DeclarationRecord>>,
 }
 
 pub fn attached_inference_failures<'a, B: BindingAddress>(
@@ -1527,27 +1480,13 @@ pub fn attached_inference_failures<'a, B: BindingAddress>(
             )) => None,
             ExportStaticType::Inferred(StaticType::Unchecked(
                 InferredUncheckedReason::InferenceFailed(error),
-            )) => {
-                let declaration = checked
-                    .declarations
-                    .iter()
-                    .find(|declaration| {
-                        declaration.kind() == crate::config_loader::DeclarationKind::Export
-                            && declaration.name() == parameter.name
-                            && declaration.location().file().path() == parameter.source_file()
-                            && parameter
-                                .source_span()
-                                .contains(declaration.location().span())
-                    })
-                    .expect("every inferred export has a parser-owned name location");
-                Some(crate::parser::Located::new(
-                    declaration.location().clone(),
-                    AttachedInferenceFailure {
-                        name: &parameter.name,
-                        error,
-                    },
-                ))
-            }
+            )) => Some(crate::parser::Located::new(
+                parameter.name_location().clone(),
+                AttachedInferenceFailure {
+                    name: &parameter.name,
+                    error,
+                },
+            )),
         })
 }
 
@@ -1573,15 +1512,8 @@ where
         >,
 {
     crate::parser::retained::judge_configuration(parsed, schemas.schemas(), provider_context);
-    let declarations = crate::parser::AnalysisTree::try_from_file(parsed)?
-        .syntax()
-        .declarations()
-        .to_vec();
-    let report = parsed
-        .judged()
-        .expect("loaded-schema export inference requires judgement")
-        .report()
-        .clone();
+    drop(crate::parser::AnalysisTree::try_from_file(parsed)?);
+    let report = parsed.expression_report().clone();
 
     for parameter in &mut parsed.export_params {
         let retry = match &parameter.static_type {
@@ -1607,26 +1539,12 @@ where
         if !retry {
             continue;
         }
-        let Some(value) = &parameter.value else {
+        let Some(_value) = &parameter.value else {
             continue;
         };
 
-        let _ = (value, schemas, provider_context);
-        let expression = parsed
-            .parser_binding_metadata
-            .syntax()
-            .declarations()
-            .iter()
-            .find(|declaration| {
-                declaration.detail().kind() == crate::config_loader::DeclarationKind::Export
-                    && declaration.detail().name() == parameter.name
-                    && declaration.location().file() == parameter.type_check_location().file()
-                    && parameter.type_check_location().span().start_byte()
-                        <= declaration.location().span().start_byte()
-                    && declaration.location().span().end_byte()
-                        <= parameter.type_check_location().span().end_byte()
-            })
-            .and_then(|declaration| declaration.detail().value_location())
+        let expression = parameter
+            .value_location()
             .and_then(|location| report.expression(location))
             .unwrap_or(report.unknown());
         match expression.static_type().cloned().map_err(Clone::clone) {
@@ -1642,7 +1560,6 @@ where
 
     Ok(ExportsInferredWithLoadedProviderSchemas {
         parameters: &parsed.export_params,
-        declarations,
     })
 }
 
@@ -1715,7 +1632,7 @@ mod tests {
             crate::parser::AnalysisTreeErrorKind::MissingResourceProvenance { .. }
         ));
     }
-    use crate::parser::{ModuleCall, ProviderContext};
+    use crate::parser::ProviderContext;
     use crate::resource::{
         AuthoredAccessPath as AccessPath, AuthoredConcreteValue as ConcreteValue,
         AuthoredDeferredValue as DeferredValue, AuthoredInterpolationPart as InterpolationPart,
@@ -2792,21 +2709,10 @@ mod tests {
 
     #[test]
     fn apply_inference_fills_inferable_export_with_inferred_type() {
-        let mut parsed = crate::parser::ParsedFile::default();
-        let res = crate::resource::Resource::with_provider("awscc", "ec2.Vpc", "main", None)
-            .with_binding("main");
-        parsed.resources.push(res); // allow: direct — fixture test inspection
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "vpc_id".to_string(),
-                None,
-                Some(Value::resource_ref(
-                    "main".to_string(),
-                    "vpc_id".to_string(),
-                    vec![],
-                )),
-            ));
+        let parsed = crate::parser::parse_and_resolve(
+            "let main = awscc.ec2.Vpc {}\nexports { vpc_id = main.vpc_id }",
+        )
+        .unwrap();
 
         let inferred = apply_inference(
             parsed,
@@ -2824,18 +2730,7 @@ mod tests {
     fn apply_inference_attaches_failure_to_inferred_export() {
         use crate::static_type::{ExportStaticType, InferredUncheckedReason, StaticType};
 
-        let mut parsed = crate::parser::ParsedFile::default();
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "zone_id".to_string(),
-                None,
-                Some(Value::Deferred(DeferredValue::FunctionCall {
-                    name: crate::builtins::BuiltinFunction::lookup,
-                    args: vec![],
-                    source_line: (0).into(),
-                })),
-            ));
+        let parsed = crate::parser::parse_and_resolve("arguments { entries: String }\nexports { zone_id = lookup(entries, 'key', 'fallback') }").unwrap();
 
         let inferred = apply_inference(
             parsed,
@@ -2855,21 +2750,10 @@ mod tests {
     fn apply_inference_preserves_declared_and_inferred_origins() {
         use crate::static_type::{ExportStaticType, StaticType};
 
-        let mut parsed = crate::parser::ParsedFile::default();
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "declared".to_string(),
-                Some(TypeExpr::String),
-                Some(Value::Concrete(ConcreteValue::String("declared".into()))),
-            ));
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "inferred".to_string(),
-                None,
-                Some(Value::Concrete(ConcreteValue::String("inferred".into()))),
-            ));
+        let parsed = crate::parser::parse_and_resolve(
+            "exports { declared: String = 'declared' inferred = 'inferred' }",
+        )
+        .unwrap();
 
         let inferred = apply_inference(
             parsed,
@@ -2954,48 +2838,13 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
 
     #[test]
     fn apply_inference_keeps_not_inferable_reasons_distinct() {
-        use crate::parser::UpstreamState;
         use crate::static_type::{
             ExportStaticType, InferredUncheckedReason, NotInferableReason, StaticType,
         };
 
-        let mut parsed = crate::parser::ParsedFile::default();
-        parsed.upstream_states.push(UpstreamState {
-            binding: "upstream".into(),
-            source: std::path::PathBuf::from("../upstream"),
-        });
-        let resource = crate::resource::Resource::with_provider("awscc", "ec2.Vpc", "main", None)
-            .with_binding("main");
-        parsed.resources.push(resource); // allow: direct — fixture test inspection
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "missing".to_string(),
-                None,
-                None,
-            ));
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "upstream".to_string(),
-                None,
-                Some(Value::resource_ref(
-                    "upstream".to_string(),
-                    "value".to_string(),
-                    vec![],
-                )),
-            ));
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "schema".to_string(),
-                None,
-                Some(Value::resource_ref(
-                    "main".to_string(),
-                    "vpc_id".to_string(),
-                    vec![],
-                )),
-            ));
+        let mut parsed = crate::parser::parse_and_resolve("let upstream = upstream_state { source = '../upstream' }\nlet main = awscc.ec2.Vpc {}\nexports { missing = 'removed' upstream = upstream.value schema = main.vpc_id }").unwrap();
+        // A removed export value retains its parser-owned declaration identity.
+        parsed.export_params[0].value = None;
 
         let inferred = apply_inference(
             parsed,
@@ -3112,14 +2961,8 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
 
     #[test]
     fn apply_inference_preserves_explicit_annotation() {
-        let mut parsed = crate::parser::ParsedFile::default();
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "vpc_id".to_string(),
-                Some(crate::parser::bare_type_for_test("vpc_id".to_string())),
-                Some(Value::Concrete(ConcreteValue::String("vpc-abc".into()))),
-            ));
+        let parsed =
+            crate::parser::parse_and_resolve("exports { vpc_id: VpcId = 'vpc-abc' }").unwrap();
 
         let inferred = apply_inference(
             parsed,
@@ -3147,74 +2990,27 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
         // the `Virtual` binding (which post-expansion exposes the
         // module's attribute set), and surfaced a misleading
         // "unknown binding" diagnostic.
-        let mut parsed = crate::parser::ParsedFile::default();
-        // Concrete role resource with prefixed binding (post-expansion shape).
-        let role = crate::resource::Resource::with_provider(
-            "awscc",
-            "ec2.Vpc",
-            "github_actions_carina.role",
-            None,
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("child")).unwrap();
+        std::fs::write(
+            directory.path().join("child/main.crn"),
+            "let role = awscc.ec2.Vpc {}\nattributes { role_id = role.vpc_id }",
         )
-        .with_binding("github_actions_carina.role");
-        parsed.resources.push(role); // allow: direct — fixture test inspection
-        // Virtual resource that exposes the module's attributes.
-        // `vpc_id` here stands in for the module-exposed attribute that
-        // points at the inner role's schema attribute. carina#3181:
-        // compositions are a distinct typestate in `compositions`.
-        let mut virt_attrs: indexmap::IndexMap<
-            String,
-            crate::resource::AuthoredLiveCompositionAttribute,
-        > = indexmap::IndexMap::new();
-        virt_attrs.insert(
-            "role_id".to_string(),
-            crate::resource::AuthoredLiveCompositionAttribute::from_value(
-                Value::resource_ref(
-                    "github_actions_carina.role".to_string(),
-                    "vpc_id".to_string(),
-                    vec![],
-                ),
-                None,
-            ),
-        );
-        let virt: crate::resource::AuthoredLiveComposition = crate::resource::LiveComposition {
-            id: crate::resource::ResolvedResourceId::new(
-                crate::resource::ResourceId::with_identity("_virtual", "github_actions_carina"),
-            ),
-            signature: crate::resource::LiveCompositionSignature {
-                arguments: indexmap::IndexMap::new(),
-                attributes: virt_attrs,
-                pending_constraints: Vec::new(),
-            },
-            binding: Some("github_actions_carina".into()),
-            dependency_bindings: Default::default(),
-            module_name: "github_module".to_string(),
-            instance: "github_actions_carina".to_string(),
-            call_path: crate::resource::AuthoredCompositionCallPath::direct(
-                crate::resource::AuthoredCompositionCall {
-                    id: crate::parser::ModuleCallId::test_dummy_in("inference.crn"),
-                    module_name: "github_module".to_string(),
-                    binding: Some("github_actions_carina".into()),
-                    instance: "github_actions_carina".to_string(),
-                    module_source: None,
-                    module_directory: None,
-                    loop_origin: None,
-                },
-            ),
-            quoted_string_attrs: std::collections::HashSet::new(),
-            declaration: Default::default(),
-        };
-        parsed.compositions.push(virt); // allow: direct — fixture test inspection
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "role_id".to_string(),
-                None,
-                Some(Value::resource_ref(
-                    "github_actions_carina".to_string(),
-                    "role_id".to_string(),
-                    vec![],
-                )),
-            ));
+        .unwrap();
+        std::fs::write(directory.path().join("main.crn"), "let github_module = use { source = './child' }\nlet github_actions_carina = github_module {}\nexports { role_id = github_actions_carina.role_id }").unwrap();
+        let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
+        let parsed =
+            crate::validation::deferred_types::with_session_for_test(&context, |session| {
+                crate::module_resolver::resolve_modules_with_providerless_config(
+                    parsed,
+                    &path,
+                    session,
+                    &schemas_with_vpc(),
+                )
+            })
+            .unwrap();
 
         let inferred = apply_inference(
             parsed,
@@ -3240,23 +3036,7 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
         // without a noisy `unknown binding` error. A post-expansion consumer
         // such as the LSP can run inference against the `Virtual` arm exercised
         // by the sibling test above; the CLI retry remains report-only.
-        let mut parsed = crate::parser::ParsedFile::default();
-        parsed.module_calls.push(ModuleCall::test(
-            "github_module".to_string(),
-            Some("github_actions_carina".to_string()),
-            std::collections::HashMap::new(),
-        ));
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "role_arn".to_string(),
-                None,
-                Some(Value::resource_ref(
-                    "github_actions_carina".to_string(),
-                    "role_arn".to_string(),
-                    vec![],
-                )),
-            ));
+        let parsed = crate::parser::parse_and_resolve("let github_module = use { source = './child' }\nlet github_actions_carina = github_module {}\nexports { role_arn = github_actions_carina.role_arn }").unwrap();
 
         let inferred = apply_inference(
             parsed,
@@ -3278,14 +3058,9 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
         // Export with no value and no annotation: nothing to infer from
         // → a typed non-failure reason (the value-less shape is the
         // parser-tombstoned state, not an inference failure).
-        let mut parsed = crate::parser::ParsedFile::default();
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "vpc_id".to_string(),
-                None,
-                None,
-            ));
+        let mut parsed =
+            crate::parser::parse_and_resolve("exports { vpc_id = 'removed' }").unwrap();
+        parsed.export_params[0].value = None;
 
         let inferred = apply_inference(
             parsed,

@@ -426,9 +426,12 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
                     // inferable without schemas and must never be advertised
                     // as value-shaped upstream exports.
                     let inferred = crate::validation::inference::infer_export_params(
-                        parsed.judged().expect("upstream expansion report"),
-                        &empty_schemas,
-                        config.catalog(),
+                        crate::config_loader::load_buffer_configuration(
+                            &parsed,
+                            &empty_schemas,
+                            config.catalog(),
+                        )
+                        .judged(),
                     );
                     if let Err(boundary_errors) =
                         crate::validation::validate_export_handle_boundaries(inferred.parameters())

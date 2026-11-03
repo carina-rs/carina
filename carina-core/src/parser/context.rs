@@ -846,6 +846,7 @@ impl<'a> ExpressionMode<'a> {
             ParseBindingRef::Unbound => return None,
         };
         let authored = BareBindingUse {
+            expression_instance: super::retained::ExpressionInstance::Root,
             location: super::DeclarationLocation::from_pair(
                 token,
                 sink.preprocessed_file,

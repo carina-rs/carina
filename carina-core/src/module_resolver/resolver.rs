@@ -700,10 +700,13 @@ mod diagnostic_status_tests {
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |provider_context| {
                 let binding_use_report = crate::validation::check_bare_binding_uses(
-                    &parsed,
                     &crate::validation::ValidationTypeContext::new_providerless(
-                        parsed.judged().expect("loader-owned expression report"),
-                        &schemas,
+                        crate::config_loader::load_buffer_configuration(
+                            &parsed,
+                            &schemas,
+                            provider_context.catalog(),
+                        )
+                        .judged(),
                         provider_context.catalog(),
                         &signatures,
                     ),
@@ -1084,15 +1087,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             &imported_modules,
             &bindings,
         )
-        .map(|()| {
-            RefCheckWitness(
-                parsed
-                    .judged()
-                    .expect("module reference checks require judgement")
-                    .report()
-                    .locations(),
-            )
-        })
+        .map(|()| RefCheckWitness(parsed.expression_report().locations()))
         .map_err(ModuleError::ReferenceType)
     }
 
@@ -1291,12 +1286,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             self.schemas,
             self.session.catalog(),
         );
-        if let Some(error) = merged
-            .judged()
-            .expect("module loader judgement")
-            .report()
-            .first_error()
-        {
+        if let Some(error) = merged.expression_report().first_error() {
             return Err(ModuleError::Parse(error));
         }
         Ok(merged)
@@ -1627,12 +1617,7 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
         mut resolver: ModuleResolver<'cfg, StrictTypeResolution>,
     ) -> Result<Self, ModuleError> {
         StrictTypeResolution::resolve_file_type_exprs(parsed, resolver.session)?;
-        if let Some(error) = parsed
-            .judged()
-            .expect("directory loader judgement")
-            .report()
-            .first_error()
-        {
+        if let Some(error) = parsed.expression_report().first_error() {
             return Err(ModuleError::Parse(error));
         }
         resolver
