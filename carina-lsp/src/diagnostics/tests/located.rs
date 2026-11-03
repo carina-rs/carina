@@ -349,10 +349,26 @@ fn enum_uses_parser_value() {
 }
 
 #[test]
-fn unknown_attribute_uses_parser_key() {
+fn unknown_attribute_uses_parser_assignment() {
     assert_resource_location(
         "mock.test.Thing { typo = true }",
         "Unknown attribute",
+        &[("typo = true", 0)],
+    );
+}
+
+#[test]
+fn multiline_unknown_attribute_keeps_the_precise_parser_key() {
+    let directory = Directory::new(&[
+        ("main.crn", "provider mock {}\n"),
+        (
+            "sibling.crn",
+            "let decoy = '😀 typo'\nmock.test.Thing {\n  typo = [\n    'value'\n  ]\n}\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &resource_location_schema_engine(),
+        "Unknown attribute 'typo'",
         &[("typo", 1)],
     );
 }
@@ -386,12 +402,7 @@ fn degraded_duplicates_keep_only_buffer_findings() {
     ]);
     let engine = test_engine();
     directory.assert_ranges(&engine, "main.crn", "duplicate binding", &[]);
-    directory.assert_ranges(
-        &engine,
-        "sibling.crn",
-        "duplicate binding",
-        &[("same", 0), ("same", 1)],
-    );
+    directory.assert_ranges(&engine, "sibling.crn", "duplicate binding", &[("same", 1)]);
 }
 
 #[test]
@@ -753,7 +764,7 @@ fn unreadable_sibling_keeps_buffer_duplicates() {
         "sibling.crn",
         source,
         "duplicate export",
-        &[("repeated", 0), ("repeated", 1)],
+        &[("repeated", 0)],
     );
 }
 
@@ -785,7 +796,7 @@ fn resource_refs_ignore_decoys_and_keep_each_occurrence() {
     directory.assert_sibling_owner(
         &test_engine_with_wait_target(),
         "Unknown attribute 'statu'",
-        &[("cert.statu", 1), ("cert.statu", 2)],
+        &[("statu", 1), ("statu", 2)],
     );
 }
 
@@ -1462,7 +1473,7 @@ fn remaining_inference_failure_owns_inline_export_name() {
 }
 
 #[test]
-fn remaining_duplicate_declarations_keep_every_same_file_occurrence() {
+fn remaining_duplicate_bindings_keep_last_occurrence_per_file() {
     let directory = Directory::new(&[
         ("main.crn", MAIN),
         (
@@ -1470,11 +1481,7 @@ fn remaining_duplicate_declarations_keep_every_same_file_occurrence() {
             "let same = '😀'\nlet same = 'second'\nlet same = 'third'\n",
         ),
     ]);
-    directory.assert_sibling_owner(
-        &test_engine(),
-        "same'",
-        &[("same", 0), ("same", 1), ("same", 2)],
-    );
+    directory.assert_sibling_owner(&test_engine(), "same'", &[("same", 2)]);
 }
 
 #[test]
@@ -1488,7 +1495,7 @@ fn remaining_duplicate_declarations_keep_occurrences_across_files() {
         ("exports.crn", "exports { same = 'third' }\n"),
     ]);
     let engine = test_engine();
-    directory.assert_sibling_owner(&engine, "same'", &[("same", 0), ("same", 1)]);
+    directory.assert_sibling_owner(&engine, "same'", &[("same", 0)]);
     directory.assert_ranges(&engine, "exports.crn", "same'", &[("same", 0)]);
 }
 
@@ -1552,43 +1559,49 @@ fn upstream_field_utf16_columns_after_heredoc_and_astral_literal() {
 
 #[test]
 fn remaining_duplicate_inventory_covers_all_declaration_kinds() {
-    for (source, name, message) in [
+    for (source, name, message, occurrence) in [
         (
             "let repeated = 'a'\nlet repeated = 'b'\n",
             "repeated",
             "duplicate binding",
+            1,
         ),
         (
             "arguments { repeated: String repeated: String }\n",
             "repeated",
             "duplicate argument",
+            0,
         ),
         (
             "attributes { repeated = 'a' repeated = 'b' }\n",
             "repeated",
             "duplicate module attribute",
+            0,
         ),
         (
             "exports { repeated = 'a' repeated = 'b' }\n",
             "repeated",
             "duplicate export",
+            0,
         ),
         (
             "fn repeated() { 'a' }\nfn repeated() { 'b' }\n",
             "repeated",
             "duplicate function",
+            0,
         ),
         (
             "provider mock {}\nprovider mock {}\n",
             "mock",
             "duplicate provider kind",
+            0,
         ),
     ] {
         let directory = Directory::new(&[("main.crn", MAIN), ("sibling.crn", source)]);
         directory.assert_sibling_owner(
             &test_engine_with_wait_target(),
             message,
-            &[(name, 0), (name, 1)],
+            &[(name, occurrence)],
         );
     }
 }
@@ -1612,7 +1625,7 @@ fn remaining_duplicate_inventory_honors_unsaved_override() {
         "sibling.crn",
         "let note = '😀'\nlet repeated = 'a'\nlet repeated = 'b'\n",
         "duplicate binding",
-        &[("repeated", 0), ("repeated", 1)],
+        &[("repeated", 1)],
     );
 }
 

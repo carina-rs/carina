@@ -263,7 +263,7 @@ pub(crate) fn parse_postfix_eval_with_mode(
             path.set_reference_locations(
                 path.reference_locations()
                     .expect("checked reference provenance")
-                    .with_occurrence(ctx.declaration_location(&syntax)),
+                    .with_access(ctx.access_locations(&syntax)),
             );
         }
     }
@@ -434,11 +434,10 @@ pub(crate) fn parse_primary_eval_with_mode(
                 path.set_reference_locations(locations);
             }
         } else if syntax.as_rule() == Rule::subscripted_id {
-            let occurrence = ctx.declaration_location(&syntax);
             path.set_reference_locations(
                 path.reference_locations()
                     .expect("checked reference provenance")
-                    .with_occurrence(occurrence),
+                    .with_access(ctx.access_locations(&syntax)),
             );
         }
     }

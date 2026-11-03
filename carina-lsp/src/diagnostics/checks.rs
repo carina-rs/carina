@@ -1788,6 +1788,9 @@ impl DiagnosticRun<'_> {
         for resource in tree.resources() {
             for value in resource.attributes().values() {
                 value.visit_resource_refs_with_usage(&mut |path, usage| {
+                    let reference = tree.reference_for_path(path);
+                    let mut location =
+                        reference.attribute_location(path.binding(), path.attribute());
                     let message = match binding_index.ref_type(path) {
                         RefType::UnknownAttribute(error)
                             if carina_core::validation::suppress_coalesce_existence_error(
@@ -1804,6 +1807,8 @@ impl DiagnosticRun<'_> {
                         }) => {
                             let diagnostic_binding = binding;
                             let diagnostic_attribute = attribute;
+                            location = reference
+                                .attribute_location(&diagnostic_binding, &diagnostic_attribute);
                             let known_attrs: Vec<&str> =
                                 known_attributes.iter().map(String::as_str).collect();
                             let suggestion =
@@ -1823,6 +1828,8 @@ impl DiagnosticRun<'_> {
                         }) => {
                             let diagnostic_binding = binding;
                             let diagnostic_attribute = attribute;
+                            location = reference
+                                .attribute_location(&diagnostic_binding, &diagnostic_attribute);
                             let known_attrs: Vec<&str> =
                                 known_attributes.iter().map(String::as_str).collect();
                             let suffix = suggest_similar_name(&diagnostic_attribute, &known_attrs)
@@ -1839,10 +1846,7 @@ impl DiagnosticRun<'_> {
                         }
                     };
 
-                    let finding = carina_core::parser::Located::new(
-                        tree.reference_for_path(path).location().clone(),
-                        message,
-                    );
+                    let finding = carina_core::parser::Located::new(location.clone(), message);
                     if let Some(diagnostic) = render_merged(
                         doc,
                         &finding,

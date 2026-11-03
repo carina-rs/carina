@@ -118,10 +118,25 @@ impl DuplicateDeclaration {
         }
     }
 
-    /// One finding for each parser-owned declaration occurrence in this group.
+    /// One finding per contributing file, retaining the existing anchor occurrence.
     pub fn diagnostics(&self) -> impl Iterator<Item = parser::Located<&Self>> {
-        self.occurrences
-            .iter()
+        let mut by_file = IndexMap::<_, &DeclarationOccurrence>::new();
+        for occurrence in &self.occurrences {
+            by_file
+                .entry(&occurrence.file)
+                .and_modify(|anchor| {
+                    // The former binding-span index retained the last let;
+                    // declaration-block, function and provider checks used the first.
+                    if anchor.kind == DeclarationKind::Binding
+                        && occurrence.kind == DeclarationKind::Binding
+                    {
+                        *anchor = occurrence;
+                    }
+                })
+                .or_insert(occurrence);
+        }
+        by_file
+            .into_values()
             .map(move |occurrence| parser::Located::new(occurrence.location.clone(), self))
     }
 

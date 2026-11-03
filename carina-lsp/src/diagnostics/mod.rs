@@ -119,10 +119,18 @@ fn render_analysis_resolution_error(
 }
 
 fn parser_span_range(doc: &Document, span: SourceSpan) -> Option<Range> {
-    let text = doc.text();
+    // SourceSpan records parser-owned Unicode-scalar columns. Convert those
+    // columns to UTF-16, including when a source view uses multibyte whitespace.
+    let position = |line: usize, column: usize| {
+        let line = u32::try_from(line.checked_sub(1)?).ok()?;
+        let column = column.checked_sub(1)?;
+        let text = doc.line_at(line)?;
+        (column <= text.chars().count())
+            .then(|| Position::new(line, position::char_offset_to_utf16_offset(&text, column)))
+    };
     Some(Range {
-        start: position::byte_offset_to_position(&text, span.start_byte())?,
-        end: position::byte_offset_to_position(&text, span.end_byte())?,
+        start: position(span.start_line(), span.start_column())?,
+        end: position(span.end_line(), span.end_column())?,
     })
 }
 
@@ -1906,7 +1914,19 @@ impl DiagnosticRun<'_> {
                                 .attribute_name()
                                 .filter(|name| resource_attributes.contains_key(*name))
                                 .map_or(rref.type_location(), |name| {
-                                    rref.attribute_key_location(name)
+                                    let assignment = rref.attribute_assignment_location(name);
+                                    let span = assignment.span();
+                                    if matches!(
+                                        error,
+                                        carina_core::schema::TypeError::UnknownAttribute { .. }
+                                    ) && span.start_line() == span.end_line()
+                                    {
+                                        assignment
+                                    } else {
+                                        // Multiline containers retain the precise key instead
+                                        // of widening beyond main's single-line anchor.
+                                        rref.attribute_key_location(name)
+                                    }
                                 });
                             let finding =
                                 carina_core::parser::Located::new(location.clone(), error);

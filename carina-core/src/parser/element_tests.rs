@@ -242,7 +242,40 @@ fn reference_occurrences_and_prefixes_preserve_interpolation_postfix_and_heredoc
         refs.iter()
             .all(|reference| reference.location().file().path() == Path::new("sibling.crn"))
     );
+    for (reference, attribute) in refs.iter().zip(["name", "name", "name", "123"]) {
+        let location = reference.attribute_location("target.items", attribute);
+        assert_eq!(location.file().path(), Path::new("sibling.crn"));
+        assert_eq!(slice(source, location), attribute);
+        assert!(reference.location().span().contains(location.span()));
+    }
     Ok(())
+}
+
+#[test]
+fn assignment_and_repeated_reference_fields_retain_distinct_syntax_locations() {
+    let source = "let target = mock.test.Resource {}\nlet holder = mock.test.Resource {\n  tag_list = \"日本語\"   \n  repeated = target.missing.missing\n}\n";
+    let parsed = parse_file(source, Path::new("sibling.crn"), &context()).unwrap();
+    let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+    let holder = tree
+        .resources()
+        .find(|resource| resource.binding() == Some("holder"))
+        .unwrap();
+    assert_eq!(
+        slice(source, holder.attribute_key_location("tag_list")),
+        "tag_list"
+    );
+    assert_eq!(
+        slice(source, holder.attribute_assignment_location("tag_list")),
+        "tag_list = \"日本語\""
+    );
+    let reference = &holder.references()[0];
+    let first = reference.attribute_location("target", "missing");
+    let second = reference.attribute_location("target.missing", "missing");
+    assert_eq!(slice(source, first), "missing");
+    assert_eq!(slice(source, second), "missing");
+    assert_eq!(second.span().start_byte(), first.span().end_byte() + 1);
+    assert_eq!(first.file().path(), Path::new("sibling.crn"));
+    assert_eq!(second.file(), first.file());
 }
 
 #[test]

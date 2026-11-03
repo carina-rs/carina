@@ -447,8 +447,12 @@ let found = wait lookup {
         )
         .expect("fixture must parse");
 
+        let details = validate_wait_bindings(&AnalysisTree::try_from_file(&parsed)?, &schemas)
+            .into_iter()
+            .map(|diagnostic| diagnostic.into_parts().1)
+            .collect::<Vec<_>>();
         assert_eq!(
-            validate_wait_bindings(&AnalysisTree::try_from_file(&parsed)?, &schemas).into_iter().map(|diagnostic| diagnostic.into_parts().1).collect::<Vec<_>>(),
+            details,
             vec![WaitDiagnostic {
                 message: "wait `found`: target binding `lookup` is a data source; wait targets must be managed resources".to_string(),
                 binding_name: "found".to_string(),

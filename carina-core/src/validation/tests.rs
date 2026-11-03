@@ -2561,16 +2561,19 @@ fn unknown_binding_reference_reports_error() {
         .expect("schema fixture must be valid"),
     );
 
-    let parsed = crate::parser::parse(
+    let mut parsed = crate::parser::parse(
         "let subnet = awscc.ec2.Subnet { vpc_id = vpc.vpc_id }\n",
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("reference fixture must parse");
 
+    // Preserve main's fixture identity while obtaining provenance from parsing.
+    parsed.resources[0].id.set_identity("web-subnet".into());
+
     let result = validate_resource_ref_types_for_test(&parsed, &schemas);
     assert_eq!(
         result.unwrap_err(),
-        "awscc.ec2.Subnet.subnet: unknown binding 'vpc' in reference vpc.vpc_id"
+        "awscc.ec2.Subnet.web-subnet: unknown binding 'vpc' in reference vpc.vpc_id"
     );
 }
 
@@ -2596,15 +2599,19 @@ fn unknown_attribute_reference_reports_error() {
         .expect("schema fixture must be valid"),
     );
 
-    let parsed = crate::parser::parse(
+    let mut parsed = crate::parser::parse(
         "let vpc = awscc.ec2.Vpc { cidr_block = '10.0.0.0/16' }\nlet subnet = awscc.ec2.Subnet { vpc_id = vpc.nonexistent_attr }\n",
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     ).expect("reference fixture must parse");
 
+    // Binding names and resource identities need not be the same.
+    parsed.resources[0].id.set_identity("main-vpc".into());
+    parsed.resources[1].id.set_identity("web-subnet".into());
+
     let result = validate_resource_ref_types_for_test(&parsed, &schemas);
     assert_eq!(
         result.unwrap_err(),
-        "awscc.ec2.Subnet.subnet: unknown attribute 'nonexistent_attr' on 'vpc' in reference vpc.nonexistent_attr"
+        "awscc.ec2.Subnet.web-subnet: unknown attribute 'nonexistent_attr' on 'vpc' in reference vpc.nonexistent_attr"
     );
 }
 
@@ -9162,9 +9169,16 @@ fn file_type_resolution_parser_error_coverage_ignores_rendered_wording() {
 
     assert_eq!(report.diagnostics().len(), 1);
     assert!(report.covered_parser_error());
+    let diagnostic = &report.diagnostics()[0];
+    assert_eq!(diagnostic.location().file().path(), source_file);
+    let span = diagnostic.location().span();
     assert_eq!(
-        report.diagnostics()[0].detail().to_string(),
-        "argument 'bad_arg': unknown custom type 'TotallyMadeUpType'",
+        &source[span.start_byte()..span.end_byte()],
+        "TotallyMadeUpType"
+    );
+    assert_eq!(
+        diagnostic.to_string(),
+        "arguments.crn:2:12: argument 'bad_arg': unknown custom type 'TotallyMadeUpType'",
     );
 }
 

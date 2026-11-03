@@ -46,9 +46,10 @@ fn wait_resolves_target_and_depends_on_across_sibling_files() {
             .collect::<Vec<_>>(),
         ["validation_record"]
     );
+    let dependencies = wait.depends_on.iter().cloned().collect::<Vec<_>>();
     assert!(matches!(
-        wait.depends_on.iter().next(),
-        Some(carina_core::parser::UnexpandedDependencyOperand::Handle(handle))
+        dependencies.as_slice(),
+        [carina_core::parser::UnexpandedDependencyOperand::Handle(handle)]
             if handle.resource_type() == &carina_core::parser::ResourceTypePath::new("aws", "route53.RecordSet")
     ));
     assert_eq!(wait.until_predicate.root, "cert");

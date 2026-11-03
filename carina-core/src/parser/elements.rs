@@ -9,6 +9,7 @@ use std::{path::Path, sync::Arc};
 pub struct AttributeKeyLocation {
     path: Vec<super::AttributePathSegment>,
     location: DeclarationLocation,
+    assignment: DeclarationLocation,
     block: bool,
 }
 
@@ -21,6 +22,9 @@ impl AttributeKeyLocation {
     }
     pub fn location(&self) -> &DeclarationLocation {
         &self.location
+    }
+    pub(crate) fn assignment_location(&self) -> &DeclarationLocation {
+        &self.assignment
     }
 }
 
@@ -157,6 +161,9 @@ impl ElementLocations {
                     declaration.name().to_string(),
                 )],
                 location: declaration.location().clone(),
+                // A synthetic composition attribute is owned by its authored
+                // module declaration, rather than a provider assignment.
+                assignment: declaration.location().clone(),
                 block: false,
             })
             .collect();
@@ -308,6 +315,7 @@ fn collect_keys(
                 out.keys.push(AttributeKeyLocation {
                     path: path.clone(),
                     location: DeclarationLocation::from_pair(&key_pair, file, source),
+                    assignment: DeclarationLocation::from_pair(&syntax, file, source),
                     block: is_block,
                 });
                 if is_block {
@@ -508,12 +516,20 @@ pub(in crate::parser) fn function_type_annotations(
     type_annotations
 }
 
-/// Both anchors of one authored access occurrence. The prefix is the grammar's
-/// `binding.field` token, while occurrence includes every field/index/postfix.
+/// Locations of one authored access occurrence: individual field tokens, the
+/// `binding.field` prefix, and the complete field/index/postfix expression.
+///
+/// Field provenance can only be captured by the parser's syntax constructor:
+///
+/// ```compile_fail,E0624
+/// use carina_core::parser::ReferenceLocations;
+/// let _ = ReferenceLocations::from_pair;
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ReferenceLocations {
     occurrence: DeclarationLocation,
     prefix: DeclarationLocation,
+    fields: Arc<[Located<String>]>,
 }
 impl ReferenceLocations {
     pub fn occurrence(&self) -> &DeclarationLocation {
@@ -521,6 +537,27 @@ impl ReferenceLocations {
     }
     pub fn prefix(&self) -> &DeclarationLocation {
         &self.prefix
+    }
+    pub(crate) fn attribute_location(
+        &self,
+        binding: &str,
+        attribute: &str,
+    ) -> &DeclarationLocation {
+        let path = format!("{binding}.{attribute}");
+        self.fields
+            .iter()
+            .find(|field| field.detail() == &path)
+            .or_else(|| {
+                // Expansion can rename the binding while retaining the authored
+                // field. Select that grammar token, rather than searching text.
+                self.fields
+                    .iter()
+                    .rev()
+                    .find(|field| field.detail().rsplit('.').next() == Some(attribute))
+            })
+            // A computed/aliased access may have no authored token for the
+            // resolved field. Its complete authored occurrence still owns it.
+            .map_or(&self.occurrence, Located::location)
     }
     pub(in crate::parser) fn from_pair(
         pair: &Pair<'_, Rule>,
@@ -535,15 +572,79 @@ impl ReferenceLocations {
         } else {
             DeclarationLocation::reference_prefix_from_pair(pair, file, source)
         };
+        let mut fields = Vec::new();
+        collect_reference_fields(pair, &mut None, &mut fields, file, source);
         Self {
             occurrence: DeclarationLocation::from_pair(pair, file, source),
             prefix,
+            fields: fields.into(),
         }
     }
     pub(crate) fn with_occurrence(&self, occurrence: DeclarationLocation) -> Self {
         Self {
             occurrence,
             prefix: self.prefix.clone(),
+            fields: Arc::clone(&self.fields),
+        }
+    }
+    pub(in crate::parser) fn with_access(&self, access: AccessLocations) -> Self {
+        match access {
+            AccessLocations::Reference(locations) => Self {
+                occurrence: locations.occurrence,
+                prefix: self.prefix.clone(),
+                fields: locations.fields,
+            },
+            AccessLocations::Selection(occurrence) => self.with_occurrence(occurrence),
+        }
+    }
+}
+
+// Follow the selected value's syntax, excluding references in function
+// arguments, literal containers and indices. Every field is a grammar pair.
+fn collect_reference_fields(
+    pair: &Pair<'_, Rule>,
+    path: &mut Option<String>,
+    fields: &mut Vec<Located<String>>,
+    file: &PreprocessedFile,
+    source: &Path,
+) {
+    match pair.as_rule() {
+        Rule::function_call | Rule::list | Rule::map | Rule::string | Rule::index_access => {}
+        Rule::identifier => *path = Some(pair.as_str().to_string()),
+        Rule::reference_field | Rule::field_access => {
+            let token = if pair.as_rule() == Rule::field_access {
+                pair.clone()
+                    .into_inner()
+                    .next()
+                    .expect("field grammar has a name")
+            } else {
+                pair.clone()
+            };
+            let name = token.as_str();
+            let selected = match path {
+                Some(parent) => format!("{parent}.{name}"),
+                None => name.to_string(),
+            };
+            fields.push(Located::new(
+                DeclarationLocation::from_pair(&token, file, source),
+                selected.clone(),
+            ));
+            *path = Some(selected);
+        }
+        Rule::namespaced_id
+        | Rule::reference_prefix
+        | Rule::variable_ref
+        | Rule::postfix_expr
+        | Rule::subscripted_id
+        | Rule::for_iterable => {
+            for child in pair.clone().into_inner() {
+                collect_reference_fields(&child, path, fields, file, source);
+            }
+        }
+        _ => {
+            if let Some(child) = pair.clone().into_inner().next() {
+                collect_reference_fields(&child, path, fields, file, source);
+            }
         }
     }
 }

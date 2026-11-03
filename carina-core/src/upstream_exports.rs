@@ -3773,15 +3773,17 @@ mod tests {
     #[test]
     fn list_field_access_keeps_the_dedicated_upstream_shape_diagnostic()
     -> Result<(), crate::parser::AnalysisTreeError> {
-        let parsed = parse_project_with_provider(
+        let source = concat!(
+            "provider test {\n  source = 'x/y'\n  version = '0.1'\n  region = 'ap-northeast-1'\n}\n",
             r#"
                 let orgs = upstream_state { source = "../organizations" }
                 let consumer = test.r.res {
                     name = orgs.names.foo
                 }
             "#,
-            "test",
         );
+        let source_file = Path::new("main.crn");
+        let parsed = crate::parser::parse_file(source, source_file, &ctx()).unwrap();
         let exports = mk_typed_exports(&[(
             "orgs",
             &[("names", TypeExpr::List(Box::new(TypeExpr::String)))],
@@ -3800,9 +3802,12 @@ mod tests {
             &exports,
         );
         assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].location().file().path(), source_file);
+        let span = errors[0].location().span();
+        assert_eq!(&source[span.start_byte()..span.end_byte()], "orgs.names");
         assert_eq!(
-            errors[0].detail().to_string(),
-            "test.r.res.consumer attribute `name`: upstream_state `orgs.names` is declared as `list(String)` but `.foo` reads it as a struct; iterate the list with `for x in orgs.names` to access elements"
+            errors[0].to_string(),
+            "main.crn:9:28: test.r.res.consumer attribute `name`: upstream_state `orgs.names` is declared as `list(String)` but `.foo` reads it as a struct; iterate the list with `for x in orgs.names` to access elements"
         );
         Ok(())
     }

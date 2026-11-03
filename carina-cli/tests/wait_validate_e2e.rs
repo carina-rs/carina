@@ -569,8 +569,12 @@ fn validate_rejects_data_source_wait_target_from_sibling_file() {
     ]);
 
     let diagnostics = cli_validate(&fixture);
+    let expected = format!(
+        "{}:1:18: wait `found`: target binding `lookup` is a data source; wait targets must be managed resources",
+        fixture.path().join("main.crn").display(),
+    );
     assert!(
-        diagnostics.iter().any(|diagnostic| diagnostic.contains("main.crn:1:18: wait `found`: target binding `lookup` is a data source; wait targets must be managed resources")),
+        diagnostics.iter().any(|diagnostic| diagnostic == &expected),
         "validate must reject a sibling data source as a wait target; got: {diagnostics:?}"
     );
 }

@@ -97,6 +97,7 @@ impl DeclarationLocation {
                 | Rule::for_iterable
                 | Rule::namespaced_id
                 | Rule::reference_prefix
+                | Rule::reference_field
                 | Rule::variable_ref
                 | Rule::postfix_expr
                 | Rule::subscripted_id
@@ -114,6 +115,9 @@ impl DeclarationLocation {
                 | Rule::resource_address
                 | Rule::function_call
                 | Rule::nested_block
+                | Rule::attribute
+                | Rule::map_entry
+                | Rule::module_call_arg
                 | Rule::add_op
                 | Rule::multiplicative_op
         ));
@@ -489,7 +493,7 @@ pub struct AnalysisResourceRef<
     resource: ResourceRef<'a, ModuleSource, P, T, D, B>,
     in_project_walk: bool,
     location: &'a DeclarationLocation,
-    attribute_locations: std::collections::HashMap<String, &'a DeclarationLocation>,
+    attribute_locations: std::collections::HashMap<String, &'a super::AttributeKeyLocation>,
     attribute_keys: &'a [super::AttributeKeyLocation],
     attribute_values: &'a [super::elements::AttributeValueLocation],
     type_location: &'a DeclarationLocation,
@@ -748,6 +752,9 @@ impl<B: BindingAddress> AnalysisReference<B> {
     pub fn prefix_location(&self) -> &DeclarationLocation {
         self.locations.prefix()
     }
+    pub fn attribute_location(&self, binding: &str, attribute: &str) -> &DeclarationLocation {
+        self.locations.attribute_location(binding, attribute)
+    }
 }
 
 /// One operand occurrence; order and duplicates are preserved.
@@ -818,7 +825,7 @@ fn required_element(
 }
 
 type AttributeProvenance<'a, B> = (
-    std::collections::HashMap<String, &'a DeclarationLocation>,
+    std::collections::HashMap<String, &'a super::AttributeKeyLocation>,
     Vec<AnalysisReference<B>>,
 );
 
@@ -845,8 +852,7 @@ fn attribute_provenance<'a, P: ValueKind, B: BindingAddress>(
                     declaration: location.clone(),
                     element: format!("attribute key {key}"),
                 })
-            })?
-            .location();
+            })?;
         if !provenance.elements().attribute_values.iter().any(|value| {
             matches!(value.path.first(), Some(super::AttributePathSegment::Attribute(name)) if name == key)
         }) {
@@ -1053,7 +1059,11 @@ where
     }
 
     pub fn attribute_key_location(&self, name: &str) -> &'a DeclarationLocation {
-        self.attribute_locations[name]
+        self.attribute_locations[name].location()
+    }
+
+    pub fn attribute_assignment_location(&self, name: &str) -> &'a DeclarationLocation {
+        self.attribute_locations[name].assignment_location()
     }
 
     pub fn attribute_block_keys<'s>(
@@ -1250,7 +1260,12 @@ where
         self.attributes()
             .into_owned()
             .into_iter()
-            .map(|(key, value)| Located::new(self.attribute_locations[&key].clone(), (key, value)))
+            .map(|(key, value)| {
+                Located::new(
+                    self.attribute_locations[&key].location().clone(),
+                    (key, value),
+                )
+            })
             .collect()
     }
 
