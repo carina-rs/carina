@@ -13,8 +13,8 @@ use carina_core::paths::{CanonicalPath, ResolvedPath};
 use carina_core::provider_text::ProviderText;
 use carina_core::resource::EnumValueResolver;
 use carina_core::schema::{
-    CompiledAttributeType as AttributeType, EffectiveType, SchemaRegistry, Shape, TypeIdentity,
-    TypeInSchema,
+    AssignmentSink, CompiledAttributeType as AttributeType, EffectiveType, SchemaRegistry, Shape,
+    TypeIdentity, TypeInSchema,
 };
 use carina_core::static_type::{
     ConsumerExportStaticType, ConsumerInferredUncheckedReason, InferenceError, NotInferableReason,
@@ -82,19 +82,14 @@ impl<'a> StructuralTypeForCompletion<&'a TypeExpr> {
 impl StructuralTypeForCompletion<TypeExpr> {
     fn is_candidate_for_target(
         &self,
-        target: &AttributeType,
-        target_defs: &std::collections::BTreeMap<String, AttributeType>,
+        target: AssignmentSink<'_, carina_core::schema::Compiled>,
         schemas: &SchemaRegistry,
         provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> bool {
         match self {
-            Self::Known(type_expr) => type_expr_source_is_assignable_to(
-                type_expr,
-                target,
-                target_defs,
-                schemas,
-                provider_ctx,
-            ),
+            Self::Known(type_expr) => {
+                type_expr_source_is_assignable_to(type_expr, target, schemas, provider_ctx)
+            }
             Self::Unnameable(_type_expr) => true,
         }
     }
@@ -143,19 +138,14 @@ impl<'a> UpstreamCompletionStaticType<'a> {
     /// eligible completion candidates without comparing their authored form.
     fn is_candidate_for_target(
         self,
-        target: &AttributeType,
-        target_defs: &std::collections::BTreeMap<String, AttributeType>,
+        target: AssignmentSink<'_, carina_core::schema::Compiled>,
         schemas: &SchemaRegistry,
         provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> bool {
         match self {
-            Self::Known(type_expr) => type_expr_source_is_assignable_to(
-                type_expr,
-                target,
-                target_defs,
-                schemas,
-                provider_ctx,
-            ),
+            Self::Known(type_expr) => {
+                type_expr_source_is_assignable_to(type_expr, target, schemas, provider_ctx)
+            }
             Self::DeclaredUnnameable(_reason) | Self::InferredUnnameable(_reason) => true,
             Self::NotInferable(_reason) => false,
             Self::InferenceFailed(_error) => false,
@@ -230,8 +220,7 @@ impl<'a> UpstreamCompletionStaticType<'a> {
 /// scalar evidence remains unchecked while nominal mismatches are decidable.
 fn type_expr_source_is_assignable_to(
     source: &TypeExpr,
-    sink: &AttributeType,
-    sink_defs: &std::collections::BTreeMap<String, AttributeType>,
+    sink: AssignmentSink<'_, carina_core::schema::Compiled>,
     schemas: &SchemaRegistry,
     provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
 ) -> bool {
@@ -245,7 +234,7 @@ fn type_expr_source_is_assignable_to(
     let Some(source) = carina_core::validation::lift_type_expr(&source) else {
         return true;
     };
-    let assignment = TypeInSchema::schemaless(&source).assignment_to(sink.in_schema(sink_defs));
+    let assignment = TypeInSchema::schemaless(&source).assignment_to(sink);
     if provider_ctx.catalog().custom_types_loaded() {
         // Completion has no diagnostic channel; missing loaded evidence must
         // exclude the candidate rather than suggest an unproven assignment.
@@ -443,9 +432,9 @@ impl CompletionProvider {
                 // class as carina#3349.
                 if let Some(bn) = attr.block_name()
                     && matches!(
-                        schema.as_schema().shape_of(attr.field_type()),
+                        schema.schema().as_schema().shape_of(attr.field_type()),
                         Shape::List { element_type: inner, .. } if matches!(
-                            schema.as_schema().shape_of(inner),
+                            schema.schema().as_schema().shape_of(inner),
                             Shape::Struct { .. }
                         )
                     )
@@ -497,6 +486,7 @@ impl CompletionProvider {
                 attr_name,
             } => self.lookup_schema(resource_type).and_then(|schema| {
                 schema
+                    .schema()
                     .as_schema()
                     .attributes()
                     .get(attr_name)
@@ -562,13 +552,17 @@ impl CompletionProvider {
                         continue;
                     }
                     if let Some(binding_schema) = self.lookup_schema(binding_resource_type) {
-                        for binding_attr in binding_schema.as_schema().attributes().values() {
+                        for binding_attr in
+                            binding_schema.schema().as_schema().attributes().values()
+                        {
                             if binding_schema
+                                .schema()
                                 .as_schema()
                                 .type_in_schema(binding_attr.attr_type())
-                                .is_assignable_to(
-                                    schema.as_schema().type_in_schema(attr_schema.attr_type()),
-                                )
+                                .is_assignable_to(schema.assignment_sink(
+                                    attr_schema.attr_type(),
+                                    &provider_ctx.catalog().custom_types,
+                                ))
                             {
                                 let full_ref = format!("{}.{}", binding_name, binding_attr.name());
                                 completions.push(CompletionItem {
@@ -606,8 +600,10 @@ impl CompletionProvider {
                 for (export_name, entry) in exports {
                     let completion_type = structural_type_for_completion(entry);
                     if !completion_type.is_candidate_for_target(
-                        attr_schema.attr_type(),
-                        schema.as_schema().defs(),
+                        schema.assignment_sink(
+                            attr_schema.attr_type(),
+                            &provider_ctx.catalog().custom_types,
+                        ),
                         &self.schemas,
                         provider_ctx,
                     ) {
@@ -635,8 +631,11 @@ impl CompletionProvider {
         // Both are used by the arguments filter just below and the
         // for-binding filter further down; `defs` stays paired with the
         // target while directional assignability resolves any schema `Ref`.
-        let target_attr_type = schema_target.map(|(_, _, attribute)| attribute.attr_type());
-        let target_defs = schema_target.map(|(_, schema, _)| schema.as_schema().defs());
+        let assignment_sink = schema_target.map(|(_, schema, attribute)| {
+            schema.assignment_sink(attribute.attr_type(), &provider_ctx.catalog().custom_types)
+        });
+        let target_attr_type = assignment_sink.map(AssignmentSink::as_type);
+        let target_defs = assignment_sink.map(AssignmentSink::defs);
 
         // In-scope bare identifiers: `let` bindings + `arguments {}`
         // parameters (#2624 / #2642). When the target attribute's
@@ -692,8 +691,7 @@ impl CompletionProvider {
                     };
                     type_expr_source_is_assignable_to(
                         arg_type_expr,
-                        attr_type,
-                        target_defs,
+                        assignment_sink.expect("a known attribute has an owner-bound sink"),
                         &self.schemas,
                         provider_ctx,
                     )
@@ -709,11 +707,9 @@ impl CompletionProvider {
         // no schema for the target attribute) falls back to an
         // unconditional suggest so the user still gets autocomplete on
         // the bare name.
-        let attr_type_for_for_filter = target_attr_type;
         let for_bindings = super::top_level::extract_for_bindings_in_scope(text, position);
         for binding in &for_bindings {
-            if let Some(attr_type) = attr_type_for_for_filter
-                && let Some(target_defs) = target_defs
+            if let Some(target) = assignment_sink
                 && let Some(element_type) = infer_for_binding_type(
                     binding,
                     &upstream_sources,
@@ -722,12 +718,7 @@ impl CompletionProvider {
                     &mut exports_cache,
                     provider_ctx,
                 )
-                && !element_type.is_candidate_for_target(
-                    attr_type,
-                    target_defs,
-                    &self.schemas,
-                    provider_ctx,
-                )
+                && !element_type.is_candidate_for_target(target, &self.schemas, provider_ctx)
             {
                 continue;
             }
@@ -747,7 +738,10 @@ impl CompletionProvider {
             // (cyclic-CFN case) also gets the snippet (same bug class as
             // carina#3349).
             if matches!(
-                schema.as_schema().shape_of(attr_schema.attr_type()),
+                schema
+                    .schema()
+                    .as_schema()
+                    .shape_of(attr_schema.attr_type()),
                 Shape::Struct { .. }
             ) {
                 completions.push(CompletionItem {
@@ -864,7 +858,7 @@ impl CompletionProvider {
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
         if let Some(schema) = self.lookup_schema(binding_resource_type) {
-            for attr in schema.as_schema().attributes().values() {
+            for attr in schema.schema().as_schema().attributes().values() {
                 let full_ref = format!("{}.{}", binding_name, attr.name());
                 completions.push(CompletionItem {
                     label: full_ref.clone(),
@@ -1800,35 +1794,23 @@ impl CompletionProvider {
         let Some(annotation) = parse_exports_type_text(type_expr_text, provider_ctx) else {
             return Vec::new();
         };
+        let sink = annotation.assignment_sink(&provider_ctx.catalog().custom_types);
         let effective = if in_nested {
-            match annotation.shape_ref_free() {
-                Ok(Shape::UnloadedSchemaType(_)) => return Vec::new(),
-                Ok(
-                    Shape::List {
-                        element_type: inner,
-                        ..
-                    }
-                    | Shape::Map { value: inner, .. },
-                ) => inner.clone(),
-                // Inside `{ ... }` of a non-collection annotation we
-                // don't know what the user means — fall silent.
-                Ok(_) | Err(_) => return Vec::new(),
-            }
+            let Some(element) = sink.collection_element() else {
+                return Vec::new();
+            };
+            element
         } else {
-            annotation
+            sink
         };
 
-        let mut items = Self::builtin_function_completions_for_type(&effective);
+        let mut items = Self::builtin_function_completions_for_type(effective.as_type());
         // `parse_exports_type_text` currently constructs only inline types and
         // cannot produce `AttributeType::Ref`, so a schema-less context is
         // sound here. Any future schema-derived annotation branch must carry
         // its owning defs with it; silently yielding zero completions would
         // regress the carina#2120 class.
-        items.extend(self.resource_ref_completions_for_type(
-            TypeInSchema::schemaless(&effective),
-            text,
-            base_path,
-        ));
+        items.extend(self.resource_ref_completions_for_type(effective, text, base_path));
         items
     }
 
@@ -1856,29 +1838,23 @@ impl CompletionProvider {
     ///    `upstream_state` exports.
     pub(super) fn value_completions_for_attribute_type(
         &self,
-        attr_type: &AttributeType,
-        attr_defs: &std::collections::BTreeMap<String, AttributeType>,
+        target: AssignmentSink<'_, carina_core::schema::Compiled>,
         text: &str,
         base_path: Option<&carina_core::paths::ResolvedPath>,
         provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
+        let attr_type = target.as_type();
         let mut items = self.completions_for_type(attr_type, None);
         items.extend(Self::builtin_function_completions_for_type(attr_type));
-        items.extend(self.resource_ref_completions_for_type(
-            attr_type.in_schema(attr_defs),
-            text,
-            base_path,
-        ));
+        items.extend(self.resource_ref_completions_for_type(target, text, base_path));
         items.extend(self.module_call_binding_ref_completions_for_type(
-            attr_type,
-            attr_defs,
+            target,
             text,
             base_path,
             provider_ctx,
         ));
         items.extend(self.upstream_state_ref_completions_for_type(
-            attr_type,
-            attr_defs,
+            target,
             text,
             base_path,
             provider_ctx,
@@ -1896,8 +1872,7 @@ impl CompletionProvider {
     /// wouldn't see `<upstream>.oidc_provider_arn` after `=` (#2621).
     fn upstream_state_ref_completions_for_type(
         &self,
-        target: &AttributeType,
-        target_defs: &std::collections::BTreeMap<String, AttributeType>,
+        target: AssignmentSink<'_, carina_core::schema::Compiled>,
         text: &str,
         base_path: Option<&carina_core::paths::ResolvedPath>,
         provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
@@ -1921,12 +1896,7 @@ impl CompletionProvider {
             );
             for (export_name, entry) in exports {
                 let completion_type = structural_type_for_completion(entry);
-                if !completion_type.is_candidate_for_target(
-                    target,
-                    target_defs,
-                    &self.schemas,
-                    provider_ctx,
-                ) {
+                if !completion_type.is_candidate_for_target(target, &self.schemas, provider_ctx) {
                     continue;
                 }
                 let full_ref = format!("{}.{}", binding, export_name);
@@ -1954,7 +1924,7 @@ impl CompletionProvider {
     /// (see #2043 follow-up).
     pub(super) fn resource_ref_completions_for_type(
         &self,
-        target: TypeInSchema<'_, carina_core::schema::Compiled>,
+        target: AssignmentSink<'_, carina_core::schema::Compiled>,
         text: &str,
         base_path: Option<&carina_core::paths::ResolvedPath>,
     ) -> Vec<CompletionItem> {
@@ -1968,8 +1938,8 @@ impl CompletionProvider {
             let Some(schema) = self.lookup_schema(&resource_type) else {
                 continue;
             };
-            for attr in schema.as_schema().attributes().values() {
-                let source_type = schema.as_schema().type_in_schema(attr.attr_type());
+            for attr in schema.schema().as_schema().attributes().values() {
+                let source_type = schema.schema().as_schema().type_in_schema(attr.attr_type());
                 if !source_type.is_assignable_to(target) {
                     continue;
                 }
@@ -2000,8 +1970,7 @@ impl CompletionProvider {
     /// value position keeps its pre-#2621 surface untouched. See #2621.
     fn module_call_binding_ref_completions_for_type(
         &self,
-        target: &AttributeType,
-        target_defs: &std::collections::BTreeMap<String, AttributeType>,
+        target: AssignmentSink<'_, carina_core::schema::Compiled>,
         text: &str,
         base_path: Option<&carina_core::paths::ResolvedPath>,
         provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
@@ -2036,7 +2005,6 @@ impl CompletionProvider {
                 if !type_expr_source_is_assignable_to(
                     export_ty,
                     target,
-                    target_defs,
                     &self.schemas,
                     provider_ctx,
                 ) {
@@ -2627,7 +2595,7 @@ fn return_type_fits(
 fn parse_exports_type_text(
     text: &str,
     provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
-) -> Option<AttributeType> {
+) -> Option<carina_core::validation::LiftedType> {
     let parsed = carina_core::parser::parse_type_expr_str(text, provider_ctx.catalog())?;
     let resolved =
         carina_core::validation::resolve_type_expr(&parsed, provider_ctx.catalog()).ok()?;
@@ -2765,7 +2733,6 @@ mod return_type_fits_tests {
         };
         // Module loading preserves authored Simple syntax until resolution.
         let source = carina_core::parser::parse_type_expr_str("KmsKeyArn", &context).unwrap();
-        let defs = std::collections::BTreeMap::new();
         let schemas = SchemaRegistry::new();
         assert!(
             carina_core::validation::deferred_types::with_session_for_test(
@@ -2774,22 +2741,7 @@ mod return_type_fits_tests {
                 ),
                 |session| type_expr_source_is_assignable_to(
                     &source,
-                    &nominal("KmsKeyArn"),
-                    &defs,
-                    &schemas,
-                    session
-                )
-            )
-        );
-        assert!(
-            !carina_core::validation::deferred_types::with_session_for_test(
-                &carina_core::parser::ProviderContext::new(
-                    carina_core::EnvironmentSnapshot::empty()
-                ),
-                |session| type_expr_source_is_assignable_to(
-                    &source,
-                    &nominal("Arn"),
-                    &defs,
+                    nominal("KmsKeyArn").assignment_sink(&session.catalog().custom_types),
                     &schemas,
                     session
                 )
@@ -2802,8 +2754,22 @@ mod return_type_fits_tests {
                 ),
                 |session| type_expr_source_is_assignable_to(
                     &source,
-                    &AttributeType::string(),
-                    &defs,
+                    nominal("Arn").assignment_sink(&session.catalog().custom_types),
+                    &schemas,
+                    session
+                )
+            )
+        );
+        assert!(
+            carina_core::validation::deferred_types::with_session_for_test(
+                &carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty()
+                ),
+                |session| type_expr_source_is_assignable_to(
+                    &source,
+                    carina_core::validation::lift_type_expr(&TypeExpr::String)
+                        .unwrap()
+                        .assignment_sink(&session.catalog().custom_types),
                     &schemas,
                     session
                 )
@@ -2816,8 +2782,7 @@ mod return_type_fits_tests {
                 ),
                 |session| type_expr_source_is_assignable_to(
                     &source,
-                    &nominal("PositiveInt"),
-                    &defs,
+                    nominal("PositiveInt").assignment_sink(&session.catalog().custom_types),
                     &schemas,
                     session
                 )
@@ -2830,8 +2795,7 @@ mod return_type_fits_tests {
                 ),
                 |session| type_expr_source_is_assignable_to(
                     &TypeExpr::String,
-                    &nominal("KmsKeyArn"),
-                    &defs,
+                    nominal("KmsKeyArn").assignment_sink(&session.catalog().custom_types),
                     &schemas,
                     session
                 )

@@ -47,8 +47,8 @@ impl AssignabilityClosure {
         for pair in ordered.windows(2) {
             if pair[0] == pair[1] {
                 return Err(ProviderSchemaValidationError::DuplicateAssignabilityEdge {
-                    source: pair[0].source.clone(),
-                    sink: pair[0].sink.clone(),
+                    source: Box::new(pair[0].source.clone()),
+                    sink: Box::new(pair[0].sink.clone()),
                 });
             }
         }
@@ -68,8 +68,8 @@ impl AssignabilityClosure {
             if source_kind != sink_kind {
                 return Err(
                     ProviderSchemaValidationError::AssignabilityScalarKindMismatch {
-                        source: source.clone(),
-                        sink: sink.clone(),
+                        source: Box::new(source.clone()),
+                        sink: Box::new(sink.clone()),
                         source_kind,
                         sink_kind,
                     },

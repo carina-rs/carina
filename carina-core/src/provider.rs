@@ -6102,7 +6102,7 @@ impl From<&ResourceId> for ResolvedComparisonKey {
 
 #[derive(Debug, Clone)]
 struct ResolvedComparisonData {
-    owner: String,
+    owner: crate::parser::SchemaTypeOwner,
     schema: ValidatedResourceSchema,
     reference_forms: crate::schema::ReferenceForms,
     scope: ReferenceScope,
@@ -6420,7 +6420,7 @@ impl ProviderRouter {
             entries.insert(
                 key,
                 ResolvedComparisonData {
-                    owner: owner_schema.owner().to_string(),
+                    owner: owner_schema.schema_type_owner().clone(),
                     schema: owner_schema.schema().clone(),
                     reference_forms: owner_schema.reference_forms().clone(),
                     scope: provider.reference_scope().clone(),
@@ -7826,6 +7826,24 @@ where
         FactoryCustomTypeResolver::known_custom_types(self)
     }
 
+    fn declarations(
+        &self,
+        owner: &crate::parser::SchemaTypeOwner,
+        identity: &TypeIdentity,
+    ) -> Result<Vec<AttributeType>, crate::parser::CustomTypeValidationError> {
+        let crate::parser::SchemaTypeOwner::Provider(owner) = owner;
+        self.index
+            .get(owner)
+            .and_then(|index| index.declarations.get(identity))
+            .cloned()
+            .ok_or_else(
+                || crate::parser::CustomTypeValidationError::MissingDeclaration {
+                    owner: owner.clone(),
+                    identity: identity.clone(),
+                },
+            )
+    }
+
     fn assignability_closures(
         &self,
     ) -> BTreeMap<crate::parser::SchemaTypeOwner, crate::schema::AssignabilityClosure> {
@@ -8342,7 +8360,112 @@ mod tests {
         }
 
         #[test]
-        fn stage_a_stores_edges_without_changing_assignability_judgement() {
+        fn declaration_lookup_preserves_each_owners_scalar_constraints() {
+            let factory = |owner, maximum| {
+                let schema = ResourceSchema::new("test.Bucket")
+                    .attribute(
+                        AttributeSchema::optional(
+                            "text",
+                            AttributeType::refined_string(
+                                Some(identity("Text")),
+                                Some(format!("^{owner}-")),
+                                Some((Some(1), Some(maximum))),
+                                None,
+                            ),
+                        )
+                        .build(),
+                    )
+                    .attribute(
+                        AttributeSchema::optional(
+                            "count",
+                            AttributeType::refined_int(
+                                Some(identity("Count")),
+                                Some((Some(1), Some(maximum as i64))),
+                            ),
+                        )
+                        .build(),
+                    )
+                    .attribute(
+                        AttributeSchema::optional(
+                            "ratio",
+                            AttributeType::refined_float(
+                                Some(identity("Ratio")),
+                                Some((Some(1.0), Some(maximum as f64))),
+                            ),
+                        )
+                        .build(),
+                    )
+                    .validate()
+                    .unwrap();
+                Box::new(EdgeFactory {
+                    owner,
+                    witness: ValidatedProviderSchemaWitness::new(
+                        vec![schema],
+                        ValidatedConfigSchema::default(),
+                        ReferenceForms::new(),
+                    )
+                    .unwrap(),
+                    captures: Arc::default(),
+                }) as Box<dyn ProviderFactory>
+            };
+            let loaded = snapshot(vec![factory("first", 10), factory("second", 20)]);
+            let catalog = &loaded.provider_context().custom_types;
+            let owned = catalog
+                .known()
+                .iter()
+                .find(|owned| owned.identity() == &identity("Text"))
+                .unwrap();
+            assert_eq!(owned.owners().iter().len(), 2);
+            for (name, maximum) in [("first", 10), ("second", 20)] {
+                let owner = owner(name);
+                let declarations = catalog.declarations(&owner, owned.identity()).unwrap();
+                assert_eq!(declarations.len(), 1);
+                let crate::schema::AttrTypeKind::String {
+                    pattern, length, ..
+                } = &declarations[0].kind
+                else {
+                    panic!("expected the owner's string declaration");
+                };
+                assert_eq!(pattern.as_ref().unwrap().as_str(), format!("^{name}-"));
+                assert_eq!(*length, Some((Some(1), Some(maximum))));
+                let count = catalog.declarations(&owner, &identity("Count")).unwrap();
+                assert!(matches!(
+                    count[0].kind,
+                    crate::schema::AttrTypeKind::Int { range: Some((Some(1), Some(end))), .. }
+                        if end == maximum as i64
+                ));
+                let ratio = catalog.declarations(&owner, &identity("Ratio")).unwrap();
+                assert!(matches!(
+                    ratio[0].kind,
+                    crate::schema::AttrTypeKind::Float { range: Some((Some(1.0), Some(end))), .. }
+                        if end == maximum as f64
+                ));
+            }
+            let partial =
+                catalog.with_failed_providers(std::collections::BTreeSet::from(["first".into()]));
+            assert!(matches!(
+                partial.declarations(&owner("first"), owned.identity()),
+                Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded)
+            ));
+            assert!(
+                partial
+                    .declarations(&owner("second"), owned.identity())
+                    .is_ok()
+            );
+            assert!(matches!(
+                catalog.declarations(&owner("missing"), owned.identity()),
+                Err(crate::parser::CustomTypeValidationError::MissingDeclaration { .. })
+            ));
+            assert!(matches!(
+                crate::parser::ProviderCustomTypes::default()
+                    .declarations(&owner("first"), owned.identity()),
+                Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded)
+            ));
+        }
+
+        #[test]
+        fn stage_b_judgement_consults_the_stored_edges() {
+            let sink_owner = owner("owner");
             let loaded = snapshot(vec![factory("owner", &[("A", "B")], Arc::default())]);
             assert!(loaded.provider_context().custom_types.reachable(
                 &owner("owner"),
@@ -8351,18 +8474,24 @@ mod tests {
             ));
             let source = string("A");
             let sink = string("B");
-            assert!(
-                !TypeInSchema::schemaless(&source)
-                    .is_assignable_to(TypeInSchema::schemaless(&sink))
-            );
-            assert!(
-                !TypeInSchema::schemaless(&sink)
-                    .is_assignable_to(TypeInSchema::schemaless(&source))
-            );
-            assert!(
-                TypeInSchema::schemaless(&source)
-                    .is_assignable_to(TypeInSchema::schemaless(&source))
-            );
+            assert!(TypeInSchema::schemaless(&source).is_assignable_to(
+                (TypeInSchema::schemaless(&sink)).with_authority(
+                    &loaded.provider_context().custom_types,
+                    crate::schema::SinkAuthority::Owner(&sink_owner)
+                )
+            ));
+            assert!(!TypeInSchema::schemaless(&sink).is_assignable_to(
+                (TypeInSchema::schemaless(&source)).with_authority(
+                    &loaded.provider_context().custom_types,
+                    crate::schema::SinkAuthority::Owner(&sink_owner)
+                )
+            ));
+            assert!(TypeInSchema::schemaless(&source).is_assignable_to(
+                (TypeInSchema::schemaless(&source)).with_authority(
+                    &loaded.provider_context().custom_types,
+                    crate::schema::SinkAuthority::Owner(&sink_owner)
+                )
+            ));
         }
     }
 

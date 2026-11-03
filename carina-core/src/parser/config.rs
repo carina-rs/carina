@@ -705,6 +705,12 @@ type CustomTypeEnumLookupFn = Box<
         + Sync,
 >;
 
+type CustomTypeDeclarationLookupFn = Box<
+    dyn Fn(&SchemaTypeOwner, &TypeIdentity) -> Result<Vec<AttributeType>, CustomTypeValidationError>
+        + Send
+        + Sync,
+>;
+
 /// Owner-aware custom-type validation capability.
 ///
 /// Both the factory-backed resolver and [`ProviderCustomTypes`] implement this
@@ -733,6 +739,11 @@ pub trait CustomTypeResolver: Send + Sync {
 /// indexed schema snapshot as its validation implementation.
 pub(crate) trait ProviderCustomTypeSource: CustomTypeResolver + 'static {
     fn known_custom_types(&self) -> BTreeSet<OwnedTypeIdentity>;
+    fn declarations(
+        &self,
+        owner: &SchemaTypeOwner,
+        identity: &TypeIdentity,
+    ) -> Result<Vec<AttributeType>, CustomTypeValidationError>;
     fn assignability_closures(
         &self,
     ) -> BTreeMap<SchemaTypeOwner, crate::schema::AssignabilityClosure>;
@@ -783,6 +794,7 @@ enum ProviderCustomTypeState {
         known: BTreeSet<OwnedTypeIdentity>,
         resolver: CustomTypeValidatorFn,
         enum_lookup: CustomTypeEnumLookupFn,
+        declaration_lookup: CustomTypeDeclarationLookupFn,
         assignability_closures: BTreeMap<SchemaTypeOwner, crate::schema::AssignabilityClosure>,
     },
 }
@@ -803,12 +815,18 @@ impl ProviderCustomTypes {
         known: HashSet<OwnedTypeIdentity>,
         resolver: CustomTypeValidatorFn,
     ) -> Self {
+        let assignability_closures = known
+            .iter()
+            .flat_map(|owned| owned.owners().iter().cloned())
+            .map(|owner| (owner, crate::schema::AssignabilityClosure::default()))
+            .collect();
         Self {
             state: std::sync::Arc::new(ProviderCustomTypeState::Loaded {
                 known: known.into_iter().collect(),
                 resolver,
                 enum_lookup: Box::new(|_| Ok(None)),
-                assignability_closures: BTreeMap::new(),
+                declaration_lookup: Box::new(|_, _| Ok(Vec::new())),
+                assignability_closures,
             }),
         }
     }
@@ -818,11 +836,15 @@ impl ProviderCustomTypes {
         let assignability_closures = source.assignability_closures();
         let source = std::sync::Arc::new(source);
         let validation_source = std::sync::Arc::clone(&source);
+        let declaration_source = std::sync::Arc::clone(&source);
         Self {
             state: std::sync::Arc::new(ProviderCustomTypeState::Loaded {
                 known,
                 resolver: Box::new(move |target, value| validation_source.validate(target, value)),
                 enum_lookup: Box::new(move |owned| source.enum_declaration(owned)),
+                declaration_lookup: Box::new(move |owner, identity| {
+                    declaration_source.declarations(owner, identity)
+                }),
                 assignability_closures,
             }),
         }
@@ -865,6 +887,7 @@ impl ProviderCustomTypes {
                 known: _known,
                 resolver: _resolver,
                 enum_lookup: _enum_lookup,
+                declaration_lookup: _,
                 assignability_closures: _assignability_closures,
             }
         )
@@ -882,8 +905,32 @@ impl ProviderCustomTypes {
                 known,
                 resolver: _resolver,
                 enum_lookup: _enum_lookup,
+                declaration_lookup: _,
                 assignability_closures: _assignability_closures,
             } => known,
+        }
+    }
+
+    /// Whether this snapshot contains the owner's complete edge declaration,
+    /// including an explicitly empty declaration. A missing owner is not an
+    /// assertion that it declared no edges.
+    pub(crate) fn assignability_edges_available(&self, owner: &SchemaTypeOwner) -> bool {
+        match self.state.as_ref() {
+            ProviderCustomTypeState::Unloaded => false,
+            ProviderCustomTypeState::Partial {
+                loaded,
+                failed_providers,
+            } => {
+                let SchemaTypeOwner::Provider(provider) = owner;
+                !failed_providers.contains(provider) && loaded.assignability_edges_available(owner)
+            }
+            ProviderCustomTypeState::Loaded {
+                known: _,
+                resolver: _,
+                enum_lookup: _,
+                declaration_lookup: _,
+                assignability_closures,
+            } => assignability_closures.contains_key(owner),
         }
     }
 
@@ -908,6 +955,7 @@ impl ProviderCustomTypes {
                 known: _known,
                 resolver: _resolver,
                 enum_lookup: _enum_lookup,
+                declaration_lookup: _,
                 assignability_closures,
             } => assignability_closures
                 .get(owner)
@@ -925,6 +973,37 @@ impl ProviderCustomTypes {
         owners
             .iter()
             .all(|owner| self.reachable(owner, source, sink))
+    }
+
+    /// Exact declarations for one owner and identity, including all declared
+    /// length, pattern, and range constraints. Annotation constraint comparison
+    /// can request these separately for every owner retained on its scalar leaf.
+    #[allow(
+        dead_code,
+        reason = "Reserved for annotation constraint checks in #4248"
+    )]
+    pub(crate) fn declarations(
+        &self,
+        owner: &SchemaTypeOwner,
+        identity: &TypeIdentity,
+    ) -> Result<Vec<AttributeType>, CustomTypeValidationError> {
+        match self.state.as_ref() {
+            ProviderCustomTypeState::Unloaded => Err(CustomTypeValidationError::ProvidersNotLoaded),
+            ProviderCustomTypeState::Partial {
+                loaded,
+                failed_providers,
+            } => {
+                let SchemaTypeOwner::Provider(provider) = owner;
+                if failed_providers.contains(provider) {
+                    Err(CustomTypeValidationError::ProvidersNotLoaded)
+                } else {
+                    loaded.declarations(owner, identity)
+                }
+            }
+            ProviderCustomTypeState::Loaded {
+                declaration_lookup, ..
+            } => declaration_lookup(owner, identity),
+        }
     }
 }
 
@@ -957,6 +1036,7 @@ impl CustomTypeResolver for ProviderCustomTypes {
                 known: _known,
                 resolver,
                 enum_lookup: _enum_lookup,
+                declaration_lookup: _,
                 assignability_closures: _assignability_closures,
             } => resolver(target, value),
             ProviderCustomTypeState::Unloaded => Err(CustomTypeValidationError::ProvidersNotLoaded),
@@ -985,6 +1065,7 @@ impl CustomTypeResolver for ProviderCustomTypes {
                 known: _known,
                 resolver: _resolver,
                 enum_lookup,
+                declaration_lookup: _,
                 assignability_closures: _assignability_closures,
             } => enum_lookup(owned),
             ProviderCustomTypeState::Unloaded => Err(CustomTypeValidationError::ProvidersNotLoaded),
@@ -1126,6 +1207,7 @@ impl LoadedProviderContext {
                     known: BTreeSet::new(),
                     resolver: Box::new(|_target, _value| Ok(())),
                     enum_lookup: Box::new(|_owned| Ok(None)),
+                    declaration_lookup: Box::new(|_, _| Ok(Vec::new())),
                     assignability_closures: BTreeMap::new(),
                 }),
             },
@@ -1185,6 +1267,7 @@ impl std::fmt::Debug for ProviderCustomTypes {
                 known,
                 resolver: _resolver,
                 enum_lookup: _enum_lookup,
+                declaration_lookup: _,
                 assignability_closures: _assignability_closures,
             } => formatter
                 .debug_struct("Loaded")

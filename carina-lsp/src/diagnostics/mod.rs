@@ -21,7 +21,7 @@ use carina_core::resource::{
     AbsoluteBindingAddress, BindingAddress, ConcreteValue, DeferredValue, ParserPlaceholder,
     RelativeBindingName, Value as GenericValue,
 };
-use carina_core::schema::{SchemaRegistry, TypeError, TypeInSchema};
+use carina_core::schema::{SchemaRegistry, TypeError};
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
@@ -317,7 +317,7 @@ impl ExpandedDiagnosticValidationInputs<'_> {
         &self,
         resource_id: &carina_core::resource::ResourceId,
         attribute: &str,
-        expected: TypeInSchema<'_, carina_core::schema::Compiled>,
+        expected: carina_core::schema::AssignmentSink<'_, carina_core::schema::Compiled>,
         schemas: &SchemaRegistry,
     ) -> Option<Result<(), carina_core::validation::DeferredAccessTypeError>> {
         let resource = self
@@ -1439,7 +1439,7 @@ impl DiagnosticRun<'_> {
                             let arithmetic_findings = tree.integer_arithmetic_findings(
                                 rref,
                                 attr_name,
-                                effective_type.clone(),
+                                validated_schema,
                                 &inference_bindings,
                                 &self.schemas,
                                 &binding_index,
@@ -1591,7 +1591,10 @@ impl DiagnosticRun<'_> {
                                         .or_else(|| {
                                             carina_core::validation::check_deferred_access_type(
                                                 value,
-                                                schema.type_in_schema(attr_schema.attr_type()),
+                                                validated_schema.assignment_sink(
+                                                    attr_schema.attr_type(),
+                                                    &self.provider_context.catalog().custom_types,
+                                                ),
                                                 &inference_bindings,
                                                 &self.schemas,
                                                 &binding_index,
@@ -1612,14 +1615,20 @@ impl DiagnosticRun<'_> {
                                         inputs.check_resource_access(
                                             resource_id,
                                             attr_name,
-                                            schema.type_in_schema(attr_schema.attr_type()),
+                                            validated_schema.assignment_sink(
+                                                attr_schema.attr_type(),
+                                                &self.provider_context.catalog().custom_types,
+                                            ),
                                             &self.schemas,
                                         )
                                     })
                                     .unwrap_or_else(|| {
                                         carina_core::validation::check_deferred_access_type(
                                             value,
-                                            schema.type_in_schema(attr_schema.attr_type()),
+                                            validated_schema.assignment_sink(
+                                                attr_schema.attr_type(),
+                                                &self.provider_context.catalog().custom_types,
+                                            ),
                                             &inference_bindings,
                                             &self.schemas,
                                             &binding_index,
@@ -1630,7 +1639,10 @@ impl DiagnosticRun<'_> {
                                 (_, Value::Deferred(DeferredValue::BindingRef { binding })) => {
                                     check_resource_ref_type_mismatch(
                                         &binding_index,
-                                        schema.type_in_schema(attr_schema.attr_type()),
+                                        validated_schema.assignment_sink(
+                                            attr_schema.attr_type(),
+                                            &self.provider_context.catalog().custom_types,
+                                        ),
                                         binding.into(),
                                     )
                                 }
@@ -1646,7 +1658,10 @@ impl DiagnosticRun<'_> {
                                     .and_then(|path| {
                                         check_resource_ref_type_mismatch(
                                             &binding_index,
-                                            schema.type_in_schema(attr_schema.attr_type()),
+                                            validated_schema.assignment_sink(
+                                                attr_schema.attr_type(),
+                                                &self.provider_context.catalog().custom_types,
+                                            ),
                                             (&path).into(),
                                         )
                                     }),
@@ -2409,7 +2424,7 @@ fn decorate_schema_diagnostic(diagnostic: &mut Diagnostic, error: &carina_core::
 /// cannot be resolved (unknown bindings are not flagged here).
 fn check_resource_ref_type_mismatch(
     binding_index: &carina_core::binding_index::BindingIndex<'_, RelativeBindingName>,
-    expected: TypeInSchema<'_, carina_core::schema::Compiled>,
+    expected: carina_core::schema::AssignmentSink<'_, carina_core::schema::Compiled>,
     path: carina_core::resource::ReferencePathRef<'_, RelativeBindingName>,
 ) -> Option<String> {
     let carina_core::binding_index::RefType::Typed(source) = binding_index.ref_type(path) else {

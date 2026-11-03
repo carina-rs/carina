@@ -1,3 +1,6 @@
+static TEST_OWNER: std::sync::LazyLock<crate::parser::SchemaTypeOwner> =
+    std::sync::LazyLock::new(|| crate::parser::SchemaTypeOwner::Provider("test".into()));
+
 use super::*;
 use super::{
     CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
@@ -158,7 +161,7 @@ mod assignability_edges_stage_a {
             ProviderSchemaValidationError::AssignabilityScalarKindMismatch {
                 source, sink, source_kind: RefinedScalarKind::String,
                 sink_kind: RefinedScalarKind::Int,
-            } if source == identity("NewName") && sink == identity("Count")
+            } if *source == identity("NewName") && *sink == identity("Count")
         ));
     }
 
@@ -226,7 +229,7 @@ mod assignability_edges_stage_a {
             assert!(matches!(
                 error,
                 ProviderSchemaValidationError::DuplicateAssignabilityEdge { source, sink }
-                    if source == identity("A") && sink == identity("B")
+                    if *source == identity("A") && *sink == identity("B")
             ));
         }
     }
@@ -8969,11 +8972,19 @@ fn assignable_with_defs(
 ) -> bool {
     source
         .in_schema(source_defs)
-        .is_assignable_to(sink.in_schema(sink_defs))
+        .is_assignable_to((sink.in_schema(sink_defs)).with_authority(
+            crate::schema::assignment_catalog_without_edges_for_test(),
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+        ))
 }
 
 fn assignable(source: &AttributeType, sink: &AttributeType) -> bool {
-    TypeInSchema::schemaless(source).is_assignable_to(TypeInSchema::schemaless(sink))
+    TypeInSchema::schemaless(source).is_assignable_to(
+        (TypeInSchema::schemaless(sink)).with_authority(
+            crate::schema::assignment_catalog_without_edges_for_test(),
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+        ),
+    )
 }
 
 #[derive(Clone)]
@@ -10780,12 +10791,22 @@ fn declared_string_outputs_preserve_incompatible_anonymous_refined_evidence() {
         assert_eq!(resolved.display_type_name(), "String");
         assert!(
             resolved
-                .is_assignable_to_sink(TypeInSchema::schemaless(&evidence), &bindings)
+                .is_assignable_to_sink(
+                    (TypeInSchema::schemaless(&evidence)).with_authority(
+                        crate::schema::assignment_catalog_without_edges_for_test(),
+                        crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+                    ),
+                    &bindings
+                )
                 .is_ok()
         );
-        let Err(RefTypeAssignabilityError::Mismatch(mismatch)) =
-            resolved.is_assignable_to_sink(TypeInSchema::schemaless(&sink), &bindings)
-        else {
+        let Err(RefTypeAssignabilityError::Mismatch(mismatch)) = resolved.is_assignable_to_sink(
+            (TypeInSchema::schemaless(&sink)).with_authority(
+                crate::schema::assignment_catalog_without_edges_for_test(),
+                crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+            ),
+            &bindings,
+        ) else {
             panic!("rule 8 must reject the forwarded evidence after each String boundary");
         };
         assert_eq!(mismatch.actual_type_name(), "String(len: 1..=1024)");

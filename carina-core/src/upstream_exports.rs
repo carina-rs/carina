@@ -2870,7 +2870,39 @@ mod tests {
             None,
         );
         let schemas = schema_with_attr("name", arn);
-        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
+        let catalog = crate::parser::ProviderContext {
+            custom_types: crate::parser::ProviderCustomTypes::loaded(
+                ["Arn", "KmsKeyArn"]
+                    .into_iter()
+                    .map(|kind| {
+                        crate::parser::OwnedTypeIdentity::provider(
+                            "test",
+                            TypeIdentity::bare(kind),
+                            crate::schema::RefinedScalarKind::String,
+                        )
+                    })
+                    .collect(),
+                Box::new(|_target, _value| Ok(())),
+            ),
+            ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
+        };
+        let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+        let bindings = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures(&parsed, &schemas, &exports, &signatures, &catalog);
+        let errs = crate::validation::validate_resource_ref_types(
+            &parsed,
+            &schemas,
+            &std::collections::HashSet::new(),
+            &bindings,
+        )
+        .err()
+        .map(|error| {
+            error
+                .to_string()
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
         assert_eq!(
             errs.len(),
             1,

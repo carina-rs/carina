@@ -218,21 +218,21 @@ impl dyn ProviderTypeCheckContext + '_ {
 /// ```
 ///
 /// ```compile_fail,E0515
-/// use carina_core::{parser::{ProviderContext, parse_type_expr_str}, schema::{CompiledAttributeType, TypeInSchema}, validation::{deferred_types::TypeCheckSession, lift_type_expr}};
+/// use carina_core::{parser::{ProviderContext, parse_type_expr_str}, schema::TypeInSchema, validation::{deferred_types::TypeCheckSession, lift_type_expr}};
 /// let escaped = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
 ///     let expected = parse_type_expr_str("Missing", session.catalog()).unwrap();
 ///     let source = lift_type_expr(&expected).unwrap();
-///     let target = CompiledAttributeType::string();
-///     TypeInSchema::schemaless(&source).assignment_to(TypeInSchema::schemaless(&target))
+///     let target = lift_type_expr(&carina_core::parser::TypeExpr::String).unwrap();
+///     TypeInSchema::schemaless(&source).assignment_to(target.assignment_sink(&session.catalog().custom_types))
 /// });
 /// ```
 /// ```
-/// use carina_core::{parser::{ProviderContext, parse_type_expr_str}, schema::{CompiledAttributeType, TypeInSchema}, validation::{deferred_types::TypeCheckSession, lift_type_expr}};
+/// use carina_core::{parser::{ProviderContext, parse_type_expr_str}, schema::TypeInSchema, validation::{deferred_types::TypeCheckSession, lift_type_expr}};
 /// let result = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
 ///     let expected = parse_type_expr_str("Missing", session.catalog()).unwrap();
 ///     let source = lift_type_expr(&expected).unwrap();
-///     let target = CompiledAttributeType::string();
-///     TypeInSchema::schemaless(&source).assignment_to(TypeInSchema::schemaless(&target))
+///     let target = lift_type_expr(&carina_core::parser::TypeExpr::String).unwrap();
+///     TypeInSchema::schemaless(&source).assignment_to(target.assignment_sink(&session.catalog().custom_types))
 ///         .record_unchecked(session)
 /// });
 /// assert!(result.publish(&mut Vec::new()));
@@ -1294,6 +1294,7 @@ mod producer_tests {
 
     #[test]
     fn settlement_records_unchecked_assignment_at_its_declaration() {
+        let owner = crate::parser::SchemaTypeOwner::Provider("test".into());
         let (_, warnings) = warnings(TypeCheckSession::run(
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |context| {
@@ -1316,6 +1317,10 @@ mod producer_tests {
                     .is_assignable_to_sink(
                         crate::schema::TypeInSchema::schemaless(
                             &crate::schema::CompiledAttributeType::string(),
+                        )
+                        .with_authority(
+                            &context.catalog().custom_types,
+                            crate::schema::SinkAuthority::Owner(&owner),
                         ),
                         &bindings,
                     )

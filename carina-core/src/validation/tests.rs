@@ -1,3 +1,6 @@
+static TEST_OWNER: std::sync::LazyLock<crate::parser::SchemaTypeOwner> =
+    std::sync::LazyLock::new(|| crate::parser::SchemaTypeOwner::Provider("test".into()));
+
 use super::*;
 use crate::parser::{
     ArgumentOrigin, LoadedProviderContext, ModuleArgument, ParsedFile, ProviderContext,
@@ -492,7 +495,10 @@ fn loaded_catalog_rejects_undeclared_bare_integer_operand_type() {
     let sink = AttributeType::int();
     let error = check_deferred_access_type(
         &value,
-        crate::schema::TypeInSchema::schemaless(&sink),
+        crate::schema::TypeInSchema::schemaless(&sink).with_authority(
+            crate::schema::assignment_catalog_without_edges_for_test(),
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+        ),
         &bindings,
         &schemas,
         &index,
@@ -990,7 +996,12 @@ fn lifted_source_is_assignable_to_schema(
     let (context, _) = string_refinement_fixture();
     let resolved = resolve_type_expr(type_expr, &context).expect("fixture annotation must resolve");
     let source = lift_type_expr(&resolved).expect("fixture declaration must lift");
-    crate::schema::TypeInSchema::schemaless(&source).is_assignable_to(sink.in_schema(sink_defs))
+    crate::schema::TypeInSchema::schemaless(&source).is_assignable_to(
+        (sink.in_schema(sink_defs)).with_authority(
+            crate::schema::assignment_catalog_without_edges_for_test(),
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+        ),
+    )
 }
 
 /// Directional test adapter for the opposite boundary role: a schema
@@ -1003,9 +1014,12 @@ fn schema_source_is_assignable_to_lifted_sink(
     let (context, _) = string_refinement_fixture();
     let resolved = resolve_type_expr(type_expr, &context).expect("fixture annotation must resolve");
     let sink = lift_type_expr(&resolved).expect("fixture declaration must lift");
-    source
-        .in_schema(source_defs)
-        .is_assignable_to(crate::schema::TypeInSchema::schemaless(&sink))
+    source.in_schema(source_defs).is_assignable_to(
+        (crate::schema::TypeInSchema::schemaless(&sink)).with_authority(
+            crate::schema::assignment_catalog_without_edges_for_test(),
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+        ),
+    )
 }
 
 fn loaded_context_for_test(mut context: ProviderContext) -> LoadedProviderContext {
@@ -1236,8 +1250,12 @@ fn lift_schema_type_preserves_int_kind_without_registry() {
         lift_type_expr(&type_expr).expect("an identified Int must lift without a schema registry");
     let expected = AttributeType::refined_int(Some(identity), None);
     assert!(
-        crate::schema::TypeInSchema::schemaless(&lifted)
-            .is_assignable_to(crate::schema::TypeInSchema::schemaless(&expected))
+        crate::schema::TypeInSchema::schemaless(&lifted).is_assignable_to(
+            (crate::schema::TypeInSchema::schemaless(&expected)).with_authority(
+                crate::schema::assignment_catalog_without_edges_for_test(),
+                crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+            )
+        )
     );
     assert!(matches!(
         lifted.raw_shape(),
@@ -1258,17 +1276,35 @@ fn lift_unloaded_schema_nominals_preserves_identity_without_guessing_kind() {
     let same = lift_type_expr(&same).unwrap();
     let different = lift_type_expr(&different).unwrap();
     let source = crate::schema::TypeInSchema::schemaless(&source);
-    assert!(source.is_assignable_to(crate::schema::TypeInSchema::schemaless(&same)));
+    assert!(source.is_assignable_to(
+        (crate::schema::TypeInSchema::schemaless(&same)).with_authority(
+            crate::schema::assignment_catalog_without_edges_for_test(),
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+        )
+    ));
     assert_eq!(
-        source.assignment_to(crate::schema::TypeInSchema::schemaless(&different)),
+        source.assignment_to(
+            (crate::schema::TypeInSchema::schemaless(&different)).with_authority(
+                crate::schema::assignment_catalog_without_edges_for_test(),
+                crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+            )
+        ),
         crate::schema::TypeAssignability::Mismatch
     );
     for sink in [AttributeType::string(), AttributeType::int()] {
         assert_eq!(
-            crate::schema::TypeInSchema::schemaless(&sink).assignment_to(source),
+            crate::schema::TypeInSchema::schemaless(&sink).assignment_to((source).with_authority(
+                crate::schema::assignment_catalog_without_edges_for_test(),
+                crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+            )),
             crate::schema::TypeAssignability::Mismatch
         );
-        let assignment = source.assignment_to(crate::schema::TypeInSchema::schemaless(&sink));
+        let assignment = source.assignment_to(
+            (crate::schema::TypeInSchema::schemaless(&sink)).with_authority(
+                crate::schema::assignment_catalog_without_edges_for_test(),
+                crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+            ),
+        );
         assert_eq!(
             assignment,
             crate::schema::TypeAssignability::Unchecked(
@@ -1315,7 +1351,12 @@ fn unloaded_schema_nominals_compare_whole_identity_and_round_trip() {
         (TypeIdentity::bare("Arn"), true),
     ] {
         let sink = lift_type_expr(&nominal(identity)).unwrap();
-        let result = source.assignment_to(crate::schema::TypeInSchema::schemaless(&sink));
+        let result = source.assignment_to(
+            (crate::schema::TypeInSchema::schemaless(&sink)).with_authority(
+                crate::schema::assignment_catalog_without_edges_for_test(),
+                crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+            ),
+        );
         assert_eq!(
             result,
             if assignable {
@@ -1348,22 +1389,52 @@ fn unloaded_schema_nominals_use_identity_relation_with_loaded_types() {
     ] {
         let loaded = TypeInSchema::schemaless(&loaded);
         assert_eq!(
-            unloaded.assignment_to(loaded),
+            unloaded.assignment_to((loaded).with_authority(
+                crate::schema::assignment_catalog_without_edges_for_test(),
+                crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+            )),
             TypeAssignability::Assignable
         );
         assert_eq!(
-            loaded.assignment_to(unloaded),
+            loaded.assignment_to((unloaded).with_authority(
+                crate::schema::assignment_catalog_without_edges_for_test(),
+                crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+            )),
             TypeAssignability::Assignable
         );
     }
     let wider = AttributeType::refined_string(Some(TypeIdentity::bare("Arn")), None, None, None);
     let wider = TypeInSchema::schemaless(&wider);
-    assert_eq!(unloaded.assignment_to(wider), TypeAssignability::Assignable);
-    assert_eq!(wider.assignment_to(unloaded), TypeAssignability::Mismatch);
+    assert_eq!(
+        unloaded.assignment_to((wider).with_authority(
+            crate::schema::assignment_catalog_without_edges_for_test(),
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+        )),
+        TypeAssignability::Assignable
+    );
+    assert_eq!(
+        wider.assignment_to((unloaded).with_authority(
+            crate::schema::assignment_catalog_without_edges_for_test(),
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+        )),
+        TypeAssignability::Mismatch
+    );
     let other = AttributeType::refined_int(Some(TypeIdentity::bare("Count")), None);
     let other = TypeInSchema::schemaless(&other);
-    assert_eq!(unloaded.assignment_to(other), TypeAssignability::Mismatch);
-    assert_eq!(other.assignment_to(unloaded), TypeAssignability::Mismatch);
+    assert_eq!(
+        unloaded.assignment_to((other).with_authority(
+            crate::schema::assignment_catalog_without_edges_for_test(),
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+        )),
+        TypeAssignability::Mismatch
+    );
+    assert_eq!(
+        other.assignment_to((unloaded).with_authority(
+            crate::schema::assignment_catalog_without_edges_for_test(),
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+        )),
+        TypeAssignability::Mismatch
+    );
 
     let nominal = crate::parser::resolve_custom_type_identity(
         &TypeIdentity::new(Some("test"), ["Counter"], "PositiveInt"),
@@ -1377,10 +1448,19 @@ fn unloaded_schema_nominals_use_identity_relation_with_loaded_types() {
         crate::schema::builtin_type_registry()[&TypeIdentity::bare("PositiveInt")].clone();
     let builtin = TypeInSchema::schemaless(&builtin);
     assert_eq!(
-        unloaded.assignment_to(builtin),
+        unloaded.assignment_to((builtin).with_authority(
+            crate::schema::assignment_catalog_without_edges_for_test(),
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+        )),
         TypeAssignability::Assignable
     );
-    assert_eq!(builtin.assignment_to(unloaded), TypeAssignability::Mismatch);
+    assert_eq!(
+        builtin.assignment_to((unloaded).with_authority(
+            crate::schema::assignment_catalog_without_edges_for_test(),
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+        )),
+        TypeAssignability::Mismatch
+    );
 }
 
 #[test]
@@ -1468,8 +1548,12 @@ fn lift_type_expr_preserves_every_builtin_scalar_kind() {
             crate::schema::RefinedScalarKind::Float => AttributeType::float(),
         };
         assert!(
-            crate::schema::TypeInSchema::schemaless(&lifted)
-                .is_assignable_to(crate::schema::TypeInSchema::schemaless(&expected)),
+            crate::schema::TypeInSchema::schemaless(&lifted).is_assignable_to(
+                (crate::schema::TypeInSchema::schemaless(&expected)).with_authority(
+                    crate::schema::assignment_catalog_without_edges_for_test(),
+                    crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+                )
+            ),
             "{identity} must lift to its constructor's {kind} scalar kind"
         );
     }
@@ -1525,8 +1609,12 @@ fn lift_type_expr_recurses_and_only_unknown_remains_unchecked() {
         AttributeType::int(),
     ])));
     assert!(
-        crate::schema::TypeInSchema::schemaless(&lifted)
-            .is_assignable_to(crate::schema::TypeInSchema::schemaless(&expected))
+        crate::schema::TypeInSchema::schemaless(&lifted).is_assignable_to(
+            (crate::schema::TypeInSchema::schemaless(&expected)).with_authority(
+                crate::schema::assignment_catalog_without_edges_for_test(),
+                crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+            )
+        )
     );
 
     let resource_ref =
@@ -1535,12 +1623,18 @@ fn lift_type_expr_recurses_and_only_unknown_remains_unchecked() {
         .expect("resolved resource paths lift to typed handles");
     assert!(
         !crate::schema::TypeInSchema::schemaless(&handle).is_assignable_to(
-            crate::schema::TypeInSchema::schemaless(&AttributeType::string())
+            (crate::schema::TypeInSchema::schemaless(&AttributeType::string())).with_authority(
+                crate::schema::assignment_catalog_without_edges_for_test(),
+                crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+            )
         )
     );
     assert!(
         !crate::schema::TypeInSchema::schemaless(&handle).is_assignable_to(
-            crate::schema::TypeInSchema::schemaless(&AttributeType::int())
+            (crate::schema::TypeInSchema::schemaless(&AttributeType::int())).with_authority(
+                crate::schema::assignment_catalog_without_edges_for_test(),
+                crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+            )
         )
     );
     assert!(
@@ -1551,7 +1645,10 @@ fn lift_type_expr_recurses_and_only_unknown_remains_unchecked() {
         .expect("string literals lift to a closed string set");
     assert!(
         crate::schema::TypeInSchema::schemaless(&literal).is_assignable_to(
-            crate::schema::TypeInSchema::schemaless(&AttributeType::string())
+            (crate::schema::TypeInSchema::schemaless(&AttributeType::string())).with_authority(
+                crate::schema::assignment_catalog_without_edges_for_test(),
+                crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+            )
         )
     );
 }
@@ -5832,12 +5929,8 @@ fn post_expansion_composition_argument_schema_types_use_directional_relation() {
     let mut parsed = empty_parsed();
     parsed.compositions.extend([source, consumer]);
     let parsed = parsed.resolve_root(&RootScope::new());
-    let (_context, schemas) = string_refinement_fixture();
-    let bindings = crate::binding_index::BindingIndex::from_parsed(
-        &parsed,
-        &schemas,
-        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-    );
+    let (context, schemas) = string_refinement_fixture();
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas, &context);
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
     let err = errors
         .iter()
@@ -6243,11 +6336,19 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
     parsed
         .resources
         .push(Resource::with_provider("aws", "ec2.SecurityGroup", "web", None).with_binding("web"));
-    let bindings = crate::binding_index::BindingIndex::from_parsed(
-        &parsed,
-        &schemas,
-        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-    );
+    let context = context_with_accepting_custom_type_resolver(HashSet::from([
+        crate::parser::OwnedTypeIdentity::provider(
+            "aws",
+            TypeIdentity::from_schema_type("aws", "ec2.Subnet", "Id"),
+            crate::schema::RefinedScalarKind::String,
+        ),
+        crate::parser::OwnedTypeIdentity::provider(
+            "aws",
+            TypeIdentity::from_schema_type("aws", "ec2.SecurityGroup", "Id"),
+            crate::schema::RefinedScalarKind::String,
+        ),
+    ]));
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas, &context);
 
     let call = ModuleCall::test(
         "consumer".to_string(),
@@ -9609,7 +9710,10 @@ fn deferred_loop_placeholder_access_checks_after_materialization() {
     assert_eq!(
         check_deferred_access_type(
             &pending,
-            crate::schema::TypeInSchema::schemaless(&expected),
+            crate::schema::TypeInSchema::schemaless(&expected).with_authority(
+                crate::schema::assignment_catalog_without_edges_for_test(),
+                crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+            ),
             &inference,
             &schemas,
             &index
@@ -9632,7 +9736,10 @@ fn deferred_loop_placeholder_access_checks_after_materialization() {
         .unwrap();
         let result = check_deferred_access_type(
             &materialized,
-            crate::schema::TypeInSchema::schemaless(&expected),
+            crate::schema::TypeInSchema::schemaless(&expected).with_authority(
+                crate::schema::assignment_catalog_without_edges_for_test(),
+                crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+            ),
             &inference,
             &schemas,
             &index,

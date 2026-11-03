@@ -217,6 +217,82 @@ pub struct ResolvedRefType {
     evidence: Vec<ResolvedTypeConstraint>,
 }
 
+/// A declared value retains its original reference evidence by construction.
+/// This view is created after path narrowing and has no narrowing/erasure API.
+/// Every later sink judges both the declaration and the original source using
+/// that sink's catalog and authority.
+pub(crate) struct DeclaredValueSource {
+    original: ResolvedRefType,
+    declaration: crate::validation::LiftedType,
+}
+
+pub(crate) enum DeclaredValueAssignment {
+    Assignable,
+    Rejected(RefTypeAssignabilityError),
+    /// The incoming module boundary rejects this source before a later sink.
+    /// Its existing call-boundary diagnostic owns the failure.
+    IncomingBoundaryMismatch,
+}
+
+impl DeclaredValueAssignment {
+    pub(crate) fn from_result(result: Result<(), RefTypeAssignabilityError>) -> Self {
+        match result {
+            Ok(()) => Self::Assignable,
+            Err(error) => Self::Rejected(error),
+        }
+    }
+}
+
+impl DeclaredValueSource {
+    pub(crate) fn assignment_to_sink<B: BindingAddress>(
+        &self,
+        sink: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
+        bindings: &BindingIndex<'_, B>,
+    ) -> DeclaredValueAssignment {
+        // Judge the original at every sink, regardless of the declaration.
+        let original = self.original.is_assignable_to_sink(sink, bindings);
+        let declaration = TypeInSchema::schemaless(&self.declaration);
+        match bindings.check_type_assignment(declaration, sink) {
+            Err(error) => {
+                return DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Unchecked(
+                    Box::new(error),
+                ));
+            }
+            Ok(false) => {
+                return DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Mismatch(
+                    RefTypeMismatch {
+                        actual: declaration.resolved_type_name(),
+                        declared: None,
+                    },
+                ));
+            }
+            Ok(true) => {}
+        }
+        match original {
+            Ok(()) => DeclaredValueAssignment::Assignable,
+            Err(error @ RefTypeAssignabilityError::Mismatch(_)) => {
+                let incoming = self
+                    .declaration
+                    .assignment_sink(&bindings.provider_context().custom_types);
+                match self.original.is_assignable_to_sink(incoming, bindings) {
+                    Ok(()) => DeclaredValueAssignment::Rejected(error),
+                    Err(RefTypeAssignabilityError::Mismatch(_)) => {
+                        DeclaredValueAssignment::IncomingBoundaryMismatch
+                    }
+                    Err(RefTypeAssignabilityError::Unchecked(error)) => {
+                        DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Unchecked(
+                            error,
+                        ))
+                    }
+                }
+            }
+            Err(error @ RefTypeAssignabilityError::Unchecked(_)) => {
+                DeclaredValueAssignment::Rejected(error)
+            }
+        }
+    }
+}
+
 /// The first source constraint that failed assignment to a sink.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefTypeMismatch {
@@ -251,12 +327,14 @@ impl RefTypeMismatch {
 }
 
 impl ResolvedRefType {
-    /// A lexical value declaration is authoritative independently of the
-    /// caller expression later substituted for that value.
-    pub(crate) fn from_value_declaration<B: BindingAddress>(
+    /// Retain the original source at a declared value boundary. Every later
+    /// sink checks both the declaration and the original source with its own
+    /// authority, so an earlier provider's edge cannot be forwarded as proof.
+    pub(crate) fn with_value_declaration<B: BindingAddress>(
+        self,
         type_expr: &crate::parser::TypeExpr,
         bindings: &BindingIndex<'_, B>,
-    ) -> Option<Self> {
+    ) -> Option<DeclaredValueSource> {
         fn is_value_constraint(type_expr: &crate::parser::TypeExpr) -> bool {
             use crate::parser::TypeExpr;
 
@@ -284,9 +362,12 @@ impl ResolvedRefType {
         if !is_value_constraint(type_expr) {
             return None;
         }
-        bindings
-            .lift_declared_type(type_expr)
-            .map(|attr_type| Self::new(attr_type, BTreeMap::new()))
+        let resolved = bindings.resolve_declared_type(type_expr).ok()?;
+        let declaration = crate::validation::lift_type_expr(&resolved)?;
+        Some(DeclaredValueSource {
+            original: self,
+            declaration,
+        })
     }
 
     fn new(attr_type: AttributeType, defs: BTreeMap<String, AttributeType>) -> Self {
@@ -386,7 +467,7 @@ impl ResolvedRefType {
     /// diagnostics.
     pub fn is_assignable_to_sink<B: BindingAddress>(
         &self,
-        sink: TypeInSchema<'_, crate::schema::Compiled>,
+        sink: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
         bindings: &BindingIndex<'_, B>,
     ) -> Result<(), RefTypeAssignabilityError> {
         let authoritative = self.authoritative.constraint().type_in_schema();
@@ -935,7 +1016,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
     pub fn check_type_assignment(
         &self,
         source: TypeInSchema<'_, crate::schema::Compiled>,
-        sink: TypeInSchema<'_, crate::schema::Compiled>,
+        sink: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
     ) -> Result<bool, crate::parser::CustomTypeValidationError> {
         let assignment = source.assignment_to(sink);
         if self.provider_context.custom_types_loaded() {
@@ -950,7 +1031,8 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
 
     fn lift_declared_type(&self, ty: &crate::parser::TypeExpr) -> Option<AttributeType> {
         match self.resolve_declared_type(ty) {
-            Ok(resolved) => crate::validation::lift_type_expr(&resolved),
+            Ok(resolved) => crate::validation::lift_type_expr(&resolved)
+                .map(crate::validation::LiftedType::into_attribute_type),
             // Conflicting declarations cannot supply a sound constraint;
             // authoritative declaration resolution owns their diagnostic.
             Err(
@@ -3218,6 +3300,9 @@ impl<'a> IterableBindings<'a> {
 
 #[cfg(test)]
 mod tests {
+    static TEST_OWNER: std::sync::LazyLock<crate::parser::SchemaTypeOwner> =
+        std::sync::LazyLock::new(|| crate::parser::SchemaTypeOwner::Provider("test".into()));
+
     use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
     #[test]
     fn value_declaration_resolves_the_catalog_scalar_kind_before_lifting() {
@@ -3240,17 +3325,31 @@ mod tests {
             ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         };
         let index = BindingIndex::from_parsed(&parsed, &schemas, &provider_context);
-        let source = ResolvedRefType::from_value_declaration(&declaration, &index).unwrap();
+        let source = ResolvedRefType::new(AttributeType::int(), BTreeMap::new())
+            .with_value_declaration(&declaration, &index)
+            .unwrap();
         assert!(
-            source
-                .is_assignable_to_sink(TypeInSchema::schemaless(&AttributeType::int()), &index)
-                .is_ok(),
+            matches!(
+                source.assignment_to_sink(
+                    (TypeInSchema::schemaless(&AttributeType::int())).with_authority(
+                        crate::schema::assignment_catalog_without_edges_for_test(),
+                        crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+                    ),
+                    &index
+                ),
+                DeclaredValueAssignment::Assignable
+            ),
             "the declaration must resolve to an Int before it becomes authoritative"
         );
         assert!(matches!(
-            source
-                .is_assignable_to_sink(TypeInSchema::schemaless(&AttributeType::string()), &index),
-            Err(RefTypeAssignabilityError::Mismatch(_))
+            source.assignment_to_sink(
+                (TypeInSchema::schemaless(&AttributeType::string())).with_authority(
+                    crate::schema::assignment_catalog_without_edges_for_test(),
+                    crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+                ),
+                &index
+            ),
+            DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Mismatch(_))
         ));
     }
 
@@ -3281,14 +3380,20 @@ mod tests {
                 assert_eq!(
                     strict.check_type_assignment(
                         TypeInSchema::schemaless(&source),
-                        TypeInSchema::schemaless(&sink)
+                        (TypeInSchema::schemaless(&sink)).with_authority(
+                            crate::schema::assignment_catalog_without_edges_for_test(),
+                            crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+                        )
                     ),
                     Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded)
                 );
                 assert_eq!(
                     bootstrap.check_type_assignment(
                         TypeInSchema::schemaless(&source),
-                        TypeInSchema::schemaless(&sink)
+                        (TypeInSchema::schemaless(&sink)).with_authority(
+                            crate::schema::assignment_catalog_without_edges_for_test(),
+                            crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+                        )
                     ),
                     Ok(true)
                 );
@@ -3318,12 +3423,16 @@ mod tests {
             TypeExpr::Union(vec![TypeExpr::String, handle]),
         ] {
             assert!(
-                super::ResolvedRefType::from_value_declaration(&declaration, &index).is_none(),
+                super::ResolvedRefType::new(AttributeType::int(), BTreeMap::new())
+                    .with_value_declaration(&declaration, &index)
+                    .is_none(),
                 "a legacy handle annotation must not erase substituted value evidence: {declaration:?}",
             );
         }
         assert!(
-            super::ResolvedRefType::from_value_declaration(&TypeExpr::String, &index).is_some()
+            super::ResolvedRefType::new(AttributeType::string(), BTreeMap::new())
+                .with_value_declaration(&TypeExpr::String, &index)
+                .is_some()
         );
     }
 
@@ -3552,12 +3661,24 @@ let existing = read aws.ec2.Vpc {
         assert_eq!(count.display_type_name(), "Int");
         assert!(
             count
-                .is_assignable_to_sink(TypeInSchema::schemaless(&AttributeType::int()), &index)
+                .is_assignable_to_sink(
+                    (TypeInSchema::schemaless(&AttributeType::int())).with_authority(
+                        crate::schema::assignment_catalog_without_edges_for_test(),
+                        crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+                    ),
+                    &index
+                )
                 .is_ok()
         );
         assert!(
             count
-                .is_assignable_to_sink(TypeInSchema::schemaless(&AttributeType::string()), &index)
+                .is_assignable_to_sink(
+                    (TypeInSchema::schemaless(&AttributeType::string())).with_authority(
+                        crate::schema::assignment_catalog_without_edges_for_test(),
+                        crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+                    ),
+                    &index
+                )
                 .is_err()
         );
 
@@ -4070,17 +4191,31 @@ let vpc = aws.ec2.Vpc {
                 for sink in &universe {
                     let accepted = chain
                         .is_assignable_to_sink(
-                            TypeInSchema::schemaless(&compiled.parts()[sink.name]),
+                            (TypeInSchema::schemaless(&compiled.parts()[sink.name]))
+                                .with_authority(
+                                    crate::schema::assignment_catalog_without_edges_for_test(),
+                                    crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+                                ),
                             &index,
                         )
                         .is_ok();
                     let actual_accepts = TypeInSchema::schemaless(&compiled.parts()[actual.name])
-                        .is_assignable_to(TypeInSchema::schemaless(&compiled.parts()[sink.name]));
+                        .is_assignable_to(
+                            (TypeInSchema::schemaless(&compiled.parts()[sink.name]))
+                                .with_authority(
+                                    crate::schema::assignment_catalog_without_edges_for_test(),
+                                    crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+                                ),
+                        );
                     let declared_accepts =
                         TypeInSchema::schemaless(&compiled.parts()[declared.name])
-                            .is_assignable_to(TypeInSchema::schemaless(
-                                &compiled.parts()[sink.name],
-                            ));
+                            .is_assignable_to(
+                                (TypeInSchema::schemaless(&compiled.parts()[sink.name]))
+                                    .with_authority(
+                                        crate::schema::assignment_catalog_without_edges_for_test(),
+                                        crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+                                    ),
+                            );
                     assert!(
                         !accepted || (actual_accepts && declared_accepts),
                         "checker accepted {} ->(declared {})→ {}, but direct constraints were actual={} declared={}",
@@ -4180,19 +4315,31 @@ let vpc = aws.ec2.Vpc {
         .expect("literal union must be liftable");
 
         assert!(
-            vpc.is_assignable_to_sink(TypeInSchema::schemaless(&same), &index)
-                .is_ok(),
+            vpc.is_assignable_to_sink(
+                (TypeInSchema::schemaless(&same)).with_authority(
+                    crate::schema::assignment_catalog_without_edges_for_test(),
+                    crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+                ),
+                &index
+            )
+            .is_ok(),
             "a matching resource handle must satisfy the boundary"
         );
         for rejected in [
             AttributeType::string(),
             AttributeType::int(),
-            different,
-            literal_union,
+            different.into_attribute_type(),
+            literal_union.into_attribute_type(),
         ] {
             assert!(
-                vpc.is_assignable_to_sink(TypeInSchema::schemaless(&rejected), &index)
-                    .is_err(),
+                vpc.is_assignable_to_sink(
+                    (TypeInSchema::schemaless(&rejected)).with_authority(
+                        crate::schema::assignment_catalog_without_edges_for_test(),
+                        crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+                    ),
+                    &index
+                )
+                .is_err(),
                 "resource handles must not flow into value or different-handle sinks"
             );
         }

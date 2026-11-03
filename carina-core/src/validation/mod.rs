@@ -58,8 +58,39 @@ use crate::static_type::{
 /// Built-ins retain their constructor declaration. Provider identities carry
 /// the scalar kind established when the schema type was constructed.
 /// Unloaded schema types retain nominal evidence for directional identity
-/// checks; scalar-dependent comparisons remain `Unchecked(ProvidersNotLoaded)`.
-pub fn lift_type_expr(type_expr: &TypeExpr) -> Option<AttributeType> {
+/// checks; missing scalar or edge evidence remains `Unchecked(ProvidersNotLoaded)`.
+/// Each identified leaf retains its owners. Use [`LiftedType::assignment_sink`]
+/// to bind the catalog when this declaration is a sink.
+pub struct LiftedType {
+    attr: AttributeType,
+}
+
+impl LiftedType {
+    pub fn assignment_sink<'a>(
+        &'a self,
+        catalog: &'a crate::parser::ProviderCustomTypes,
+    ) -> crate::schema::AssignmentSink<'a, crate::schema::Compiled> {
+        crate::schema::AssignmentSink::annotation(self, catalog)
+    }
+
+    pub fn into_attribute_type(self) -> AttributeType {
+        self.attr
+    }
+}
+
+impl std::ops::Deref for LiftedType {
+    type Target = AttributeType;
+    fn deref(&self) -> &Self::Target {
+        &self.attr
+    }
+}
+
+/// Lift a resolved declaration while preserving every identified leaf's owners.
+pub fn lift_type_expr(type_expr: &TypeExpr) -> Option<LiftedType> {
+    lift_attribute_type(type_expr).map(|attr| LiftedType { attr })
+}
+
+fn lift_attribute_type(type_expr: &TypeExpr) -> Option<AttributeType> {
     use crate::schema::CompiledStructField as StructField;
 
     match type_expr {
@@ -75,17 +106,32 @@ pub fn lift_type_expr(type_expr: &TypeExpr) -> Option<AttributeType> {
         TypeExpr::UnloadedSchemaType(unloaded) => Some(AttributeType {
             kind: crate::schema::AttrTypeKind::UnloadedSchemaType(unloaded.clone()),
         }),
-        TypeExpr::SchemaType { owned } => Some(
-            owned
-                .scalar_kind()
-                .identified_type(owned.identity().clone()),
-        ),
-        TypeExpr::List(inner) => lift_type_expr(inner).map(AttributeType::list),
-        TypeExpr::Map(inner) => lift_type_expr(inner).map(AttributeType::map),
+        TypeExpr::SchemaType { owned } => {
+            let binding = crate::schema::RefinementBinding::Annotation(owned.clone());
+            let kind = match owned.scalar_kind() {
+                crate::schema::RefinedScalarKind::String => crate::schema::AttrTypeKind::String {
+                    binding,
+                    pattern: None,
+                    length: None,
+                    to_dsl: None,
+                },
+                crate::schema::RefinedScalarKind::Int => crate::schema::AttrTypeKind::Int {
+                    binding,
+                    range: None,
+                },
+                crate::schema::RefinedScalarKind::Float => crate::schema::AttrTypeKind::Float {
+                    binding,
+                    range: None,
+                },
+            };
+            Some(AttributeType { kind })
+        }
+        TypeExpr::List(inner) => lift_attribute_type(inner).map(AttributeType::list),
+        TypeExpr::Map(inner) => lift_attribute_type(inner).map(AttributeType::map),
         TypeExpr::Struct { fields } => fields
             .iter()
             .map(|(name, field_type)| {
-                lift_type_expr(field_type)
+                lift_attribute_type(field_type)
                     .map(|field_type| StructField::optional(name.clone(), field_type).build())
             })
             .collect::<Option<Vec<_>>>()
@@ -112,8 +158,8 @@ pub fn lift_type_expr(type_expr: &TypeExpr) -> Option<AttributeType> {
                         | TypeExpr::Map(_)
                         | TypeExpr::Ref(_)
                         | TypeExpr::DottedUnresolved(_)
-                        | TypeExpr::SchemaType { .. }
-                        | TypeExpr::Struct { .. }
+                        | TypeExpr::SchemaType { owned: _ }
+                        | TypeExpr::Struct { fields: _ }
                         | TypeExpr::Union(_) => None,
                     })
                     .collect(),
@@ -121,7 +167,7 @@ pub fn lift_type_expr(type_expr: &TypeExpr) -> Option<AttributeType> {
         }
         TypeExpr::Union(members) => members
             .iter()
-            .map(lift_type_expr)
+            .map(lift_attribute_type)
             .collect::<Option<Vec<_>>>()
             .filter(|members| !members.is_empty())
             .map(AttributeType::union),
@@ -129,7 +175,7 @@ pub fn lift_type_expr(type_expr: &TypeExpr) -> Option<AttributeType> {
             path.provider.clone(),
             path.resource_type.clone(),
         )),
-        TypeExpr::DottedUnresolved(_path) => None,
+        TypeExpr::DottedUnresolved(_) => None,
     }
 }
 
@@ -149,16 +195,21 @@ pub(crate) enum RefSink<'a> {
         attr_type: &'a AttributeType,
         defs: &'a std::collections::BTreeMap<String, AttributeType>,
         ancestry: crate::schema::FieldAncestry,
+        owner: &'a crate::parser::SchemaTypeOwner,
     },
     String,
 }
 
 impl<'a> RefSink<'a> {
-    fn from_effective_type(effective: crate::schema::EffectiveType<'a>) -> Self {
+    fn from_effective_type(
+        effective: crate::schema::EffectiveType<'a>,
+        owner: &'a crate::parser::SchemaTypeOwner,
+    ) -> Self {
         Self::EffectiveType {
             attr_type: effective.as_type(),
             defs: effective.defs(),
             ancestry: effective.ancestry(),
+            owner,
         }
     }
 
@@ -166,7 +217,12 @@ impl<'a> RefSink<'a> {
         match self {
             Self::TypeExpr(type_expr) => Some(type_expr),
             Self::String => Some(&STRING_REF_SINK),
-            Self::EffectiveType { .. } => None,
+            Self::EffectiveType {
+                attr_type: _,
+                defs: _,
+                ancestry: _,
+                owner: _,
+            } => None,
         }
     }
 
@@ -186,8 +242,8 @@ impl<'a> RefSink<'a> {
                     | TypeExpr::Map(_)
                     | TypeExpr::Ref(_)
                     | TypeExpr::DottedUnresolved(_)
-                    | TypeExpr::SchemaType { .. }
-                    | TypeExpr::Struct { .. }
+                    | TypeExpr::SchemaType { owned: _ }
+                    | TypeExpr::Struct { fields: _ }
                     | TypeExpr::StringLiteral(_)
                     | TypeExpr::Union(_) => None,
                 }))
@@ -197,24 +253,61 @@ impl<'a> RefSink<'a> {
                 attr_type,
                 defs,
                 ancestry,
+                owner,
             } => match attr_type.shape_with_defs(defs) {
                 Shape::UnloadedSchemaType(_) => None,
                 Shape::List {
                     element_type: inner,
-                    ..
+                    ordered: _,
+                    constraints: _,
                 } => Some(Self::EffectiveType {
                     attr_type: inner,
                     defs,
                     ancestry,
+                    owner,
                 }),
                 Shape::Union => {
                     unique_union_list_element(attr_type, defs).map(|inner| Self::EffectiveType {
                         attr_type: inner,
                         defs,
                         ancestry,
+                        owner,
                     })
                 }
-                _ => None,
+                Shape::String {
+                    identity: _,
+                    pattern: _,
+                    length: _,
+                    validate: _,
+                    to_dsl: _,
+                }
+                | Shape::Reference {
+                    identity: _,
+                    pattern: _,
+                    length: _,
+                }
+                | Shape::Int {
+                    identity: _,
+                    range: _,
+                    validate: _,
+                }
+                | Shape::Float {
+                    identity: _,
+                    range: _,
+                    validate: _,
+                }
+                | Shape::Enum {
+                    identity: _,
+                    base: _,
+                    values: _,
+                    dsl_aliases: _,
+                    validate: _,
+                    to_dsl: _,
+                }
+                | Shape::Map { key: _, value: _ }
+                | Shape::Struct { name: _ }
+                | Shape::Bool
+                | Shape::Duration => None,
             },
             Self::TypeExpr(
                 TypeExpr::String
@@ -227,8 +320,8 @@ impl<'a> RefSink<'a> {
                 | TypeExpr::Map(_)
                 | TypeExpr::Ref(_)
                 | TypeExpr::DottedUnresolved(_)
-                | TypeExpr::SchemaType { .. }
-                | TypeExpr::Struct { .. }
+                | TypeExpr::SchemaType { owned: _ }
+                | TypeExpr::Struct { fields: _ }
                 | TypeExpr::StringLiteral(_),
             )
             | Self::String => None,
@@ -242,24 +335,29 @@ impl<'a> RefSink<'a> {
                 .iter()
                 .find(|(name, _)| name == key)
                 .map(|(_, field_type)| Self::TypeExpr(field_type)),
-            Self::TypeExpr(TypeExpr::Union(members)) => exactly_one(
-                members
-                    .iter()
-                    .filter(|member| matches!(member, TypeExpr::Map(_) | TypeExpr::Struct { .. })),
-            )
-            .and_then(|member| Self::TypeExpr(member).map_entry(key)),
+            Self::TypeExpr(TypeExpr::Union(members)) => {
+                exactly_one(members.iter().filter(|member| {
+                    matches!(member, TypeExpr::Map(_) | TypeExpr::Struct { fields: _ })
+                }))
+                .and_then(|member| Self::TypeExpr(member).map_entry(key))
+            }
             Self::EffectiveType {
                 attr_type,
                 defs,
                 ancestry,
+                owner,
             } => match attr_type.shape_with_defs(defs) {
                 Shape::UnloadedSchemaType(_) => None,
-                Shape::Map { value: inner, .. } => Some(Self::EffectiveType {
+                Shape::Map {
+                    value: inner,
+                    key: _,
+                } => Some(Self::EffectiveType {
                     attr_type: inner,
                     defs,
                     ancestry,
+                    owner,
                 }),
-                Shape::Struct { .. } => {
+                Shape::Struct { name: _ } => {
                     let fields = crate::schema::struct_fields_with_defs(attr_type, defs)
                         .expect("Shape::Struct must expose struct fields internally");
                     crate::schema::struct_field_for_key(fields, key, ancestry).map(|field| {
@@ -267,6 +365,7 @@ impl<'a> RefSink<'a> {
                             attr_type: &field.field_type,
                             defs,
                             ancestry: ancestry.descend(field),
+                            owner,
                         }
                     })
                 }
@@ -275,10 +374,47 @@ impl<'a> RefSink<'a> {
                         attr_type: member,
                         defs,
                         ancestry,
+                        owner,
                     }
                     .map_entry(key)
                 }),
-                _ => None,
+                Shape::String {
+                    identity: _,
+                    pattern: _,
+                    length: _,
+                    validate: _,
+                    to_dsl: _,
+                }
+                | Shape::Reference {
+                    identity: _,
+                    pattern: _,
+                    length: _,
+                }
+                | Shape::Int {
+                    identity: _,
+                    range: _,
+                    validate: _,
+                }
+                | Shape::Float {
+                    identity: _,
+                    range: _,
+                    validate: _,
+                }
+                | Shape::Enum {
+                    identity: _,
+                    base: _,
+                    values: _,
+                    dsl_aliases: _,
+                    validate: _,
+                    to_dsl: _,
+                }
+                | Shape::List {
+                    element_type: _,
+                    ordered: _,
+                    constraints: _,
+                }
+                | Shape::Bool
+                | Shape::Duration => None,
             },
             Self::TypeExpr(
                 TypeExpr::String
@@ -291,7 +427,7 @@ impl<'a> RefSink<'a> {
                 | TypeExpr::List(_)
                 | TypeExpr::Ref(_)
                 | TypeExpr::DottedUnresolved(_)
-                | TypeExpr::SchemaType { .. }
+                | TypeExpr::SchemaType { owned: _ }
                 | TypeExpr::StringLiteral(_),
             )
             | Self::String => None,
@@ -407,10 +543,17 @@ impl std::fmt::Display for BindingResolutionError {
 // renderer. Structured consumers use `type_error()` or match the public enum.
 impl std::error::Error for BindingResolutionError {}
 
+#[derive(Clone, Copy)]
+enum EnumSinkAuthority<'a> {
+    Owner(&'a crate::parser::SchemaTypeOwner),
+    Annotation(&'a TypeExpr),
+}
+
 struct ExpectedEnumTarget<'a> {
     attr_type: &'a AttributeType,
     defs: &'a std::collections::BTreeMap<String, AttributeType>,
     ancestry: FieldAncestry,
+    authority: EnumSinkAuthority<'a>,
 }
 
 /// Typed inputs shared by CLI and LSP while consuming parser-authored bare
@@ -659,53 +802,70 @@ impl BindingUseReport {
 fn binding_value_assignable_to_enum<B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     declared_type: Option<&TypeExpr>,
-    config: &ProviderContext,
+    provider_context: typecheck::TypecheckProviderContext<'_>,
     target: &ExpectedEnumTarget<'_>,
     resolver: &EnumValueResolver<'_, crate::schema::Compiled>,
     identity: &TypeIdentity,
 ) -> Result<(), BindingResolutionError> {
+    let config = provider_context.as_provider_context();
+    let scalar_kind = crate::parser::IdentifiedCustomTypeDeclaration::new(
+        target
+            .attr_type
+            .resolve_refs_with_defs(target.defs)
+            .as_attr(),
+    )
+    .expect("an enum target has an admitted scalar declaration")
+    .scalar_kind();
+    let identity_assignable = |source: &AttributeType| -> Result<bool, BindingResolutionError> {
+        let target_type = scalar_kind.identified_type(identity.clone());
+        let lifted;
+        let sink = match target.authority {
+            EnumSinkAuthority::Owner(owner) => target_type
+                .in_schema(crate::schema::empty_defs_for_schema_walks())
+                .with_authority(
+                    &config.custom_types,
+                    crate::schema::SinkAuthority::Owner(owner),
+                ),
+            EnumSinkAuthority::Annotation(expected) => {
+                lifted = lift_type_expr(expected).expect("a resolved enum annotation lifts");
+                lifted.assignment_sink(&config.custom_types)
+            }
+        };
+        let assignment = crate::schema::TypeInSchema::schemaless(source).assignment_to(sink);
+        if config.custom_types_loaded() {
+            assignment
+                .require_loaded()
+                .map_err(|error| BindingResolutionError::CustomType(Box::new(error)))
+        } else {
+            match provider_context.session() {
+                Some(session) => Ok(assignment.record_unchecked(session)),
+                None => assignment
+                    .require_loaded()
+                    .map_err(|error| BindingResolutionError::CustomType(Box::new(error))),
+            }
+        }
+    };
     if let Some(declared_type) = declared_type {
         let resolved = resolve_type_expr(declared_type, config)
             .map_err(BindingResolutionError::TypeResolution)?;
-        match resolved {
-            TypeExpr::UnloadedSchemaType(unloaded)
-                if unloaded.identity().assignable_to(identity) =>
-            {
+        if matches!(
+            &resolved,
+            TypeExpr::UnloadedSchemaType(_) | TypeExpr::SchemaType { owned: _ }
+        ) {
+            let source = lift_type_expr(&resolved).expect("nominal enum evidence lifts");
+            if identity_assignable(&source)? {
                 return Ok(());
-            }
-            TypeExpr::SchemaType { owned }
-                if owned.identity().same_type(identity)
-                    && owned.identity().assignable_to(identity) =>
-            {
-                return Ok(());
-            }
-            other @ (TypeExpr::String
-            | TypeExpr::Bool
-            | TypeExpr::Int
-            | TypeExpr::Float
-            | TypeExpr::Duration
-            | TypeExpr::Simple(_)
-            | TypeExpr::UnloadedSchemaType(_)
-            | TypeExpr::List(_)
-            | TypeExpr::Map(_)
-            | TypeExpr::Ref(_)
-            | TypeExpr::DottedUnresolved(_)
-            | TypeExpr::SchemaType { .. }
-            | TypeExpr::Struct { .. }
-            | TypeExpr::StringLiteral(_)
-            | TypeExpr::Union(_)) => {
-                return Err(BindingResolutionError::Type(TypeError::TypeMismatch {
-                    expected: identity.to_string(),
-                    got: other.to_string(),
-                }));
             }
         }
+        return Err(BindingResolutionError::Type(TypeError::TypeMismatch {
+            expected: identity.to_string(),
+            got: resolved.to_string(),
+        }));
     }
     match value {
         GenericValue::Concrete(crate::resource::ConcreteValue::CanonicalEnum(canonical)) => {
-            if !canonical.identity().same_type(identity)
-                || !canonical.identity().assignable_to(identity)
-            {
+            let source = scalar_kind.identified_type(canonical.identity().clone());
+            if !identity_assignable(&source)? {
                 return Err(BindingResolutionError::Type(TypeError::TypeMismatch {
                     expected: identity.to_string(),
                     got: canonical.identity().to_string(),
@@ -720,7 +880,48 @@ fn binding_value_assignable_to_enum<B: BindingAddress>(
             .resolve_raw(raw)
             .map(|_| ())
             .map_err(BindingResolutionError::Type),
-        _ => crate::schema::validate_attr_with_defs_and_ancestry(
+        GenericValue::Concrete(
+            crate::resource::ConcreteValue::String(_)
+            | crate::resource::ConcreteValue::Int(_)
+            | crate::resource::ConcreteValue::Float(_)
+            | crate::resource::ConcreteValue::Bool(_)
+            | crate::resource::ConcreteValue::Duration(_)
+            | crate::resource::ConcreteValue::List(_)
+            | crate::resource::ConcreteValue::StringList(_)
+            | crate::resource::ConcreteValue::Map(_),
+        )
+        | GenericValue::Deferred(
+            crate::resource::DeferredValue::ModuleIf(_)
+            | crate::resource::DeferredValue::ResourceRef { path: _ }
+            | crate::resource::DeferredValue::BindingRef { binding: _ }
+            | crate::resource::DeferredValue::Coalesce {
+                value: _,
+                default: _,
+            }
+            | crate::resource::DeferredValue::IntegerArithmetic(_)
+            | crate::resource::DeferredValue::Interpolation(_)
+            | crate::resource::DeferredValue::FunctionCall {
+                name: _,
+                args: _,
+                source_line: _,
+            }
+            | crate::resource::DeferredValue::Unavailable {
+                name: _,
+                args: _,
+                reason: _,
+                source_line: _,
+            }
+            | crate::resource::DeferredValue::ResolvedFunctionCall {
+                function: _,
+                functions: _,
+                args: _,
+                source_line: _,
+            }
+            | crate::resource::DeferredValue::Access(_)
+            | crate::resource::DeferredValue::Secret(_)
+            | crate::resource::DeferredValue::Unknown(_)
+            | crate::resource::DeferredValue::Placeholder(_),
+        ) => crate::schema::validate_attr_with_defs_and_ancestry(
             target.attr_type,
             value,
             target.defs,
@@ -763,6 +964,7 @@ fn enum_target_from_sink<'a>(sink: RefSink<'a>) -> Option<ExpectedEnumTarget<'a>
             attr_type,
             defs,
             ancestry,
+            owner,
         } if EnumValueResolver::with_defs(attr_type, defs)
             .enum_identity()
             .is_some() =>
@@ -771,9 +973,17 @@ fn enum_target_from_sink<'a>(sink: RefSink<'a>) -> Option<ExpectedEnumTarget<'a>
                 attr_type,
                 defs,
                 ancestry,
+                authority: EnumSinkAuthority::Owner(owner),
             })
         }
-        RefSink::EffectiveType { .. } | RefSink::TypeExpr(_) | RefSink::String => None,
+        RefSink::EffectiveType {
+            attr_type: _,
+            defs: _,
+            ancestry: _,
+            owner: _,
+        }
+        | RefSink::TypeExpr(_)
+        | RefSink::String => None,
     }
 }
 
@@ -793,13 +1003,19 @@ fn declared_value_assignable_to_sink(
         return Ok(());
     };
     let source = crate::schema::TypeInSchema::schemaless(&source);
-    let string_sink = AttributeType::string();
+    let string_sink = lift_type_expr(&TypeExpr::String).expect("built-in String lifts");
     let lifted_sink;
     let target = match sink {
         RefSink::EffectiveType {
-            attr_type, defs, ..
-        } => attr_type.in_schema(defs),
-        RefSink::String => crate::schema::TypeInSchema::schemaless(&string_sink),
+            attr_type,
+            defs,
+            ancestry: _,
+            owner,
+        } => attr_type.in_schema(defs).with_authority(
+            &config.custom_types,
+            crate::schema::SinkAuthority::Owner(owner),
+        ),
+        RefSink::String => string_sink.assignment_sink(&config.custom_types),
         RefSink::TypeExpr(type_expr) => {
             let resolved = resolve_type_expr(type_expr, config)
                 .and_then(|resolved| {
@@ -810,7 +1026,7 @@ fn declared_value_assignable_to_sink(
                 return Ok(());
             };
             lifted_sink = lifted;
-            crate::schema::TypeInSchema::schemaless(&lifted_sink)
+            lifted_sink.assignment_sink(&config.custom_types)
         }
     };
     let assignment = source.assignment_to(target);
@@ -849,31 +1065,46 @@ fn declared_value_assignable_to_sink(
     )))
 }
 
+struct ValueSource<'a, B: BindingAddress> {
+    value: &'a GenericValue<ParserPlaceholder, B>,
+    declared_type: Option<&'a TypeExpr>,
+}
+
 fn reference_value_mismatch<B: BindingAddress>(
     reference: ReferencePathRef<'_, B>,
-    target: crate::schema::TypeInSchema<'_, crate::schema::Compiled>,
+    declared_type: Option<&TypeExpr>,
+    target: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
     bindings: &BindingIndex<'_, B>,
     diagnostic_path: &impl Fn(ReferencePathRef<'_, B>) -> ModuleCallDiagnosticPath,
 ) -> Option<BindingResolutionError> {
     match bindings.ref_type(reference) {
         RefType::Typed(source) => {
-            source
-                .is_assignable_to_sink(target, bindings)
-                .err()
-                .map(|error| match error {
-                    RefTypeAssignabilityError::Mismatch(mismatch) => {
-                        BindingResolutionError::ReferenceType(Box::new(BindingReferenceTypeError {
-                            expected: target.resolved_type_name(),
-                            actual: mismatch.actual_type_name().to_string(),
-                            declared: mismatch.declared_type_name().map(str::to_string),
-                            path: diagnostic_path(reference),
-                            declared_constraint: false,
-                        }))
-                    }
-                    RefTypeAssignabilityError::Unchecked(reason) => {
-                        BindingResolutionError::CustomType(reason)
-                    }
-                })
+            let checked = match declared_type
+                .and_then(|declared| source.clone().with_value_declaration(declared, bindings))
+            {
+                Some(source) => source.assignment_to_sink(target, bindings),
+                None => crate::binding_index::DeclaredValueAssignment::from_result(
+                    source.is_assignable_to_sink(target, bindings),
+                ),
+            };
+            match checked {
+                crate::binding_index::DeclaredValueAssignment::Assignable
+                | crate::binding_index::DeclaredValueAssignment::IncomingBoundaryMismatch => None,
+                crate::binding_index::DeclaredValueAssignment::Rejected(
+                    RefTypeAssignabilityError::Mismatch(mismatch),
+                ) => Some(BindingResolutionError::ReferenceType(Box::new(
+                    BindingReferenceTypeError {
+                        expected: target.resolved_type_name(),
+                        actual: mismatch.actual_type_name().to_string(),
+                        declared: mismatch.declared_type_name().map(str::to_string),
+                        path: diagnostic_path(reference),
+                        declared_constraint: false,
+                    },
+                ))),
+                crate::binding_index::DeclaredValueAssignment::Rejected(
+                    RefTypeAssignabilityError::Unchecked(reason),
+                ) => Some(BindingResolutionError::CustomType(reason)),
+            }
         }
         RefType::Unchecked => None,
         RefType::UnknownBinding { binding, attribute } => {
@@ -893,19 +1124,23 @@ fn reference_value_mismatch<B: BindingAddress>(
 }
 
 fn deferred_value_mismatch<B: BindingAddress>(
-    value: &GenericValue<ParserPlaceholder, B>,
-    target: crate::schema::TypeInSchema<'_, crate::schema::Compiled>,
+    source: ValueSource<'_, B>,
+    target: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
     inference_bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
     schemas: &SchemaRegistry,
     bindings: &BindingIndex<'_, B>,
     authored_binding: &str,
     diagnostic_path: &impl Fn(ReferencePathRef<'_, B>) -> ModuleCallDiagnosticPath,
 ) -> Option<BindingResolutionError> {
+    let value = source.value;
     match value {
         GenericValue::Deferred(crate::resource::DeferredValue::ModuleIf(deferred)) => {
             deferred.values()[1..].iter().find_map(|branch| {
                 deferred_value_mismatch(
-                    branch,
+                    ValueSource {
+                        value: branch,
+                        declared_type: source.declared_type,
+                    },
                     target,
                     inference_bindings,
                     schemas,
@@ -918,6 +1153,7 @@ fn deferred_value_mismatch<B: BindingAddress>(
         GenericValue::Deferred(crate::resource::DeferredValue::ResourceRef { path }) => {
             reference_value_mismatch(
                 ReferencePathRef::Access(path),
+                source.declared_type,
                 target,
                 bindings,
                 diagnostic_path,
@@ -926,18 +1162,36 @@ fn deferred_value_mismatch<B: BindingAddress>(
         GenericValue::Deferred(crate::resource::DeferredValue::BindingRef { binding }) => {
             reference_value_mismatch(
                 ReferencePathRef::Binding(binding),
+                source.declared_type,
                 target,
                 bindings,
                 diagnostic_path,
             )
         }
         GenericValue::Deferred(
-            crate::resource::DeferredValue::Coalesce { .. }
+            crate::resource::DeferredValue::Coalesce {
+                value: _,
+                default: _,
+            }
             | crate::resource::DeferredValue::IntegerArithmetic(_)
             | crate::resource::DeferredValue::Interpolation(_)
-            | crate::resource::DeferredValue::FunctionCall { .. }
-            | crate::resource::DeferredValue::Unavailable { .. }
-            | crate::resource::DeferredValue::ResolvedFunctionCall { .. }
+            | crate::resource::DeferredValue::FunctionCall {
+                name: _,
+                args: _,
+                source_line: _,
+            }
+            | crate::resource::DeferredValue::Unavailable {
+                name: _,
+                args: _,
+                reason: _,
+                source_line: _,
+            }
+            | crate::resource::DeferredValue::ResolvedFunctionCall {
+                function: _,
+                functions: _,
+                args: _,
+                source_line: _,
+            }
             | crate::resource::DeferredValue::Access(_)
             | crate::resource::DeferredValue::Secret(_)
             | crate::resource::DeferredValue::Unknown(_)
@@ -987,17 +1241,26 @@ fn deferred_value_mismatch<B: BindingAddress>(
 fn precheck_value_source<B: BindingAddress>(
     use_site: &crate::parser::BareBindingUse,
     value: &GenericValue<ParserPlaceholder, B>,
+    declared_type: Option<&TypeExpr>,
     sink: RefSink<'_>,
     context: &ValidationTypeContext<'_, B>,
     diagnostic_path: &impl Fn(ReferencePathRef<'_, B>) -> ModuleCallDiagnosticPath,
 ) -> Option<BindingResolutionError> {
-    let string_sink = AttributeType::string();
+    let string_sink = lift_type_expr(&TypeExpr::String).expect("built-in String lifts");
     let lifted_sink;
     let target = match sink {
         RefSink::EffectiveType {
-            attr_type, defs, ..
-        } => attr_type.in_schema(defs),
-        RefSink::String => crate::schema::TypeInSchema::schemaless(&string_sink),
+            attr_type,
+            defs,
+            ancestry: _,
+            owner,
+        } => attr_type.in_schema(defs).with_authority(
+            &context.raw_provider_context().custom_types,
+            crate::schema::SinkAuthority::Owner(owner),
+        ),
+        RefSink::String => {
+            string_sink.assignment_sink(&context.raw_provider_context().custom_types)
+        }
         RefSink::TypeExpr(type_expr) => {
             let resolved = match context.scope_bindings.resolve_declared_type(type_expr) {
                 Ok(resolved) => resolved,
@@ -1005,11 +1268,14 @@ fn precheck_value_source<B: BindingAddress>(
             };
             let lifted = lift_type_expr(&resolved)?;
             lifted_sink = lifted;
-            crate::schema::TypeInSchema::schemaless(&lifted_sink)
+            lifted_sink.assignment_sink(&context.raw_provider_context().custom_types)
         }
     };
     deferred_value_mismatch(
-        value,
+        ValueSource {
+            value,
+            declared_type,
+        },
         target,
         &context.inference_bindings,
         context.schemas,
@@ -1027,10 +1293,21 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
     context: &ValidationTypeContext<'_, B>,
     diagnostic_path: &impl Fn(ReferencePathRef<'_, B>) -> ModuleCallDiagnosticPath,
 ) -> Result<(), BindingResolutionError> {
-    let prechecked = declared_type
-        .is_none()
-        .then(|| precheck_value_source(use_site, value, sink, context, diagnostic_path))
-        .flatten();
+    let mut prechecked = precheck_value_source(
+        use_site,
+        value,
+        declared_type,
+        sink,
+        context,
+        diagnostic_path,
+    );
+    if let Some(BindingResolutionError::ReferenceType(error)) = &mut prechecked {
+        error.declared_constraint = declared_type.is_some()
+            && matches!(
+                sink,
+                RefSink::TypeExpr(TypeExpr::Union(_) | TypeExpr::StringLiteral(_))
+            );
+    }
 
     if let Some(target) = enum_target_from_sink(sink) {
         let resolver = EnumValueResolver::with_defs(target.attr_type, target.defs);
@@ -1042,7 +1319,7 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
             None => binding_value_assignable_to_enum(
                 value,
                 declared_type,
-                context.raw_provider_context(),
+                context.provider_context,
                 &target,
                 &resolver,
                 &identity,
@@ -1069,6 +1346,7 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
             attr_type,
             defs,
             ancestry,
+            owner: _,
         } => crate::schema::validate_attr_with_defs_and_ancestry(attr_type, value, defs, ancestry)
             .map_err(BindingResolutionError::Type),
         RefSink::String => crate::schema::validate_attr_with_defs_and_ancestry(
@@ -1109,14 +1387,12 @@ fn resource_sink<
         .find(|resource| resource.id() == address.resource_id())
     {
         Some(ResourceRef::LiveComposition(_)) => return None,
-        Some(ResourceRef::DataSource(data_source)) => {
-            schemas.get_for_data_source(data_source)?.schema()
-        }
-        Some(ResourceRef::Resource(resource)) => schemas.get_for(resource)?.schema(),
+        Some(ResourceRef::DataSource(data_source)) => schemas.get_for_data_source(data_source)?,
+        Some(ResourceRef::Resource(resource)) => schemas.get_for(resource)?,
         Some(ResourceRef::Deferred {
             resource,
             deferred: _deferred,
-        }) => schemas.get_for(resource.as_resource())?.schema(),
+        }) => schemas.get_for(resource.as_resource())?,
         None => return None,
     };
     let mut segments = path.segments().iter();
@@ -1125,8 +1401,10 @@ fn resource_sink<
     };
     let mut sink = RefSink::from_effective_type(
         schema
+            .schema()
             .effective_attribute_by_authored_name(root)?
             .value_type(),
+        schema.schema_type_owner(),
     );
     for segment in segments {
         sink = match segment {
@@ -1221,7 +1499,7 @@ fn descend_module_type_expr(
         | TypeExpr::UnloadedSchemaType(_)
         | TypeExpr::Ref(_)
         | TypeExpr::DottedUnresolved(_)
-        | TypeExpr::SchemaType { .. }
+        | TypeExpr::SchemaType { owned: _ }
         | TypeExpr::StringLiteral(_) => None,
     }
 }
@@ -1259,8 +1537,8 @@ fn resolve_module_argument_path_type(
         | TypeExpr::List(_)
         | TypeExpr::Map(_)
         | TypeExpr::DottedUnresolved(_)
-        | TypeExpr::SchemaType { .. }
-        | TypeExpr::Struct { .. }
+        | TypeExpr::SchemaType { owned: _ }
+        | TypeExpr::Struct { fields: _ }
         | TypeExpr::StringLiteral(_)
         | TypeExpr::Union(_)) => ResolvedParameterType::Value(value),
     }))
@@ -1304,6 +1582,7 @@ fn resolve_record_against_module<B: BindingAddress>(
                     attr_type: declaration,
                     defs: crate::schema::empty_defs_for_schema_walks(),
                     ancestry: FieldAncestry::WRITABLE,
+                    authority: EnumSinkAuthority::Annotation(&expected),
                 };
                 let resolver = EnumValueResolver::with_defs(target.attr_type, target.defs);
                 let identity = resolver
@@ -1312,7 +1591,7 @@ fn resolve_record_against_module<B: BindingAddress>(
                 return binding_value_assignable_to_enum(
                     value,
                     declared_type.as_deref(),
-                    context.raw_provider_context(),
+                    context.provider_context,
                     &target,
                     &resolver,
                     &identity,
@@ -1340,6 +1619,7 @@ fn resolve_record_against_module<B: BindingAddress>(
                         attr_type: declaration,
                         defs: crate::schema::empty_defs_for_schema_walks(),
                         ancestry: FieldAncestry::WRITABLE,
+                        authority: EnumSinkAuthority::Annotation(&expected),
                     },
                     existing,
                 )),
@@ -1946,7 +2226,7 @@ impl std::fmt::Display for IntegerArithmeticTypeFinding {
 /// and known result mismatches are errors.
 pub fn check_deferred_access_type<B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
-    expected: crate::schema::TypeInSchema<'_, crate::schema::Compiled>,
+    expected: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
     bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
     schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
@@ -2091,8 +2371,8 @@ fn prove_integer_operand<B: BindingAddress>(
     schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
 ) -> Result<(), DeferredAccessTypeError> {
-    let integer = AttributeType::int();
-    let integer_sink = crate::schema::TypeInSchema::schemaless(&integer);
+    let integer = lift_type_expr(&TypeExpr::Int).expect("built-in Int lifts");
+    let integer_sink = integer.assignment_sink(&binding_index.provider_context().custom_types);
     let reference_type = match value {
         GenericValue::Deferred(crate::resource::DeferredValue::ResourceRef { path }) => {
             Some(binding_index.postfix_ref_type(path))
@@ -2215,8 +2495,14 @@ fn check_integer_result_sink<B: BindingAddress>(
     let actual = crate::schema::TypeInSchema::schemaless(&integer);
     let expected = match sink {
         Some(RefSink::EffectiveType {
-            attr_type, defs, ..
-        }) => attr_type.in_schema(defs),
+            attr_type,
+            defs,
+            ancestry: _,
+            owner,
+        }) => attr_type.in_schema(defs).with_authority(
+            &binding_index.provider_context().custom_types,
+            crate::schema::SinkAuthority::Owner(owner),
+        ),
         Some(RefSink::TypeExpr(type_expr)) => {
             let resolved = binding_index
                 .resolve_declared_type(type_expr)
@@ -2235,7 +2521,10 @@ fn check_integer_result_sink<B: BindingAddress>(
                 return Ok(());
             };
             if binding_index
-                .check_type_assignment(actual, crate::schema::TypeInSchema::schemaless(&expected))
+                .check_type_assignment(
+                    actual,
+                    expected.assignment_sink(&binding_index.provider_context().custom_types),
+                )
                 .map_err(unchecked_assignment_error)?
             {
                 return Ok(());
@@ -2338,13 +2627,24 @@ where
             B,
         >,
         name: &str,
-        sink: crate::schema::EffectiveType<'_>,
+        schema: crate::schema::OwnerBoundResourceSchema<'_>,
         bindings: &crate::validation::inference::InferenceBindings<ParserPlaceholder, B>,
         schemas: &crate::schema::SchemaRegistry,
         binding_index: &crate::binding_index::BindingIndex<'_, B>,
     ) -> Vec<crate::parser::Located<crate::validation::IntegerArithmeticTypeFinding>> {
         let attributes = resource.attributes();
-        check_integer_arithmetic_types(&attributes[name], sink, bindings, schemas, binding_index)
+        let sink = schema
+            .effective_attribute_by_authored_name(name)
+            .expect("a checked attribute has an effective sink")
+            .value_type();
+        check_integer_arithmetic_types(
+            &attributes[name],
+            sink,
+            schema.schema_type_owner(),
+            bindings,
+            schemas,
+            binding_index,
+        )
     }
 }
 
@@ -2355,13 +2655,14 @@ where
 fn check_integer_arithmetic_types<B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     sink: crate::schema::EffectiveType<'_>,
+    owner: &crate::parser::SchemaTypeOwner,
     bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
     schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
 ) -> Vec<crate::parser::Located<IntegerArithmeticTypeFinding>> {
     check_integer_arithmetic_types_with_sink(
         value,
-        Some(RefSink::from_effective_type(sink)),
+        Some(RefSink::from_effective_type(sink, owner)),
         bindings,
         schemas,
         binding_index,
@@ -3118,7 +3419,7 @@ fn composition_ref_error_kind<B: BindingAddress>(
                 Err(error) => return Some(ModuleCallRefErrorKind::DeclarationResolution(error)),
             };
             let sink = lift_type_expr(&declared)?;
-            let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
+            let sink_type = sink.assignment_sink(&bindings.provider_context().custom_types);
             source
                 .is_assignable_to_sink(sink_type, bindings)
                 .err()
@@ -3244,7 +3545,7 @@ mod user_function_refs {
             return Ok(None);
         };
         let source = crate::schema::TypeInSchema::schemaless(&source);
-        let sink = crate::schema::TypeInSchema::schemaless(&sink);
+        let sink = sink.assignment_sink(&bindings.provider_context().custom_types);
         let assignable = bindings
             .check_type_assignment(source, sink)
             .map_err(|error| error.to_string())?;
@@ -4210,15 +4511,16 @@ pub fn validate_resource_ref_types<
 
 /// Recover the lexical type of a bare value that became an entire reference
 /// attribute during expansion. The runtime reference stays absolute; only its
-/// module-body type source comes from the declaration checked before expansion.
+/// module-body type retains the declaration and the original source together.
 fn module_resource_ref_declaration<'a, E, D, B: BindingAddress>(
     parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     resource_id: &crate::resource::ResourceId,
     attribute: &str,
     value: &GenericValue<ParserPlaceholder, B>,
     bindings: &BindingIndex<'_, B>,
-) -> Option<(&'a str, ResolvedRefType)> {
-    let GenericValue::Deferred(crate::resource::DeferredValue::ResourceRef { path: _path }) = value
+) -> Option<(&'a str, crate::binding_index::DeclaredValueSource)> {
+    let GenericValue::Deferred(crate::resource::DeferredValue::ResourceRef { path: source_path }) =
+        value
     else {
         return None;
     };
@@ -4248,7 +4550,8 @@ fn module_resource_ref_declaration<'a, E, D, B: BindingAddress>(
                 if source.as_ref() != value {
                     return None;
                 }
-                let source = ResolvedRefType::from_value_declaration(declared_type.as_deref()?, bindings)?;
+                let RefType::Typed(source) = bindings.ref_type(source_path) else { return None; };
+                let source = source.with_value_declaration(declared_type.as_deref()?, bindings)?;
                 Some((record.authored.name.as_str(), source))
             }
             crate::parser::BareBindingSource::Structural(_handle) => None,
@@ -4305,8 +4608,10 @@ fn validate_resource_ref_types_inner<
                 let effective_sink = validated_schema
                     .effective_attribute_by_authored_name(attr_name)
                     .map(|attribute| attribute.value_type());
-                let sink = effective_sink.clone().map(RefSink::from_effective_type);
-                let string_sink = AttributeType::string();
+                let sink = effective_sink.clone().map(|effective| {
+                    RefSink::from_effective_type(effective, validated_schema.schema_type_owner())
+                });
+                let string_sink = lift_type_expr(&TypeExpr::String).expect("built-in String lifts");
                 visit_refs_with_sink(
                     attr_value,
                     sink,
@@ -4333,10 +4638,6 @@ fn validate_resource_ref_types_inner<
                             ));
                             return;
                         }
-                        let source = declared_source
-                            .as_ref()
-                            .map(|(_name, declared)| declared)
-                            .unwrap_or(&source);
                         if matches!(
                             reference,
                             ReferencePathRef::Access(path) if !path.segments().is_empty()
@@ -4347,19 +4648,35 @@ fn validate_resource_ref_types_inner<
                         }
                         let Some(sink_type) = (match sink {
                             Some(RefSink::EffectiveType {
-                                attr_type, defs, ..
-                            }) => Some(attr_type.in_schema(defs)),
-                            Some(RefSink::String) => {
-                                Some(crate::schema::TypeInSchema::schemaless(&string_sink))
-                            }
+                                attr_type,
+                                defs,
+                                ancestry: _,
+                                owner,
+                            }) => Some(attr_type.in_schema(defs).with_authority(
+                                &bindings.provider_context().custom_types,
+                                crate::schema::SinkAuthority::Owner(owner),
+                            )),
+                            Some(RefSink::String) => Some(
+                                string_sink
+                                    .assignment_sink(&bindings.provider_context().custom_types),
+                            ),
                             Some(RefSink::TypeExpr(_)) | None => None,
                         }) else {
                             return;
                         };
-                        let mismatch = match source.is_assignable_to_sink(sink_type, bindings) {
-                            Ok(()) => return,
-                            Err(RefTypeAssignabilityError::Mismatch(mismatch)) => mismatch,
-                            Err(RefTypeAssignabilityError::Unchecked(reason)) => {
+                        let checked = match declared_source.as_ref() {
+                            Some((_name, declared)) => {
+                                declared.assignment_to_sink(sink_type, bindings)
+                            }
+                            None => crate::binding_index::DeclaredValueAssignment::from_result(
+                                source.is_assignable_to_sink(sink_type, bindings),
+                            ),
+                        };
+                        let mismatch = match checked {
+                            crate::binding_index::DeclaredValueAssignment::Assignable
+                            | crate::binding_index::DeclaredValueAssignment::IncomingBoundaryMismatch => return,
+                            crate::binding_index::DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Mismatch(mismatch)) => mismatch,
+                            crate::binding_index::DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Unchecked(reason)) => {
                                 all_errors.push(format!("{resource_location}: {reason}"));
                                 return;
                             }
@@ -4384,63 +4701,54 @@ fn validate_resource_ref_types_inner<
                             _
                         ))
                     ) {
-                        // The shared arithmetic walk below owns these nodes so CLI
-                        // and LSP receive the same error selection and span.
                         return;
                     }
                     let sink_type = match sink {
                         Some(RefSink::EffectiveType {
-                            attr_type, defs, ..
-                        }) => attr_type.in_schema(defs),
+                            attr_type,
+                            defs,
+                            ancestry: _,
+                            owner,
+                        }) => attr_type.in_schema(defs).with_authority(
+                            &bindings.provider_context().custom_types,
+                            crate::schema::SinkAuthority::Owner(owner),
+                        ),
                         Some(RefSink::String) => {
-                            crate::schema::TypeInSchema::schemaless(&string_sink)
+                            string_sink.assignment_sink(&bindings.provider_context().custom_types)
                         }
                         Some(RefSink::TypeExpr(_)) | None => return,
                     };
                     let checked = match declared_source.as_ref() {
-                        Some((name, declared)) => declared
-                            .is_assignable_to_sink(sink_type, bindings)
-                            .map_err(|error| match error {
-                                RefTypeAssignabilityError::Mismatch(mismatch) => {
-                                    DeferredAccessTypeError::TypeMismatch {
-                                        expected: sink_type.resolved_type_name(),
-                                        actual: mismatch.actual_type_name().to_string(),
-                                        origin: format!("from {name}"),
-                                    }
-                                }
-                                RefTypeAssignabilityError::Unchecked(reason) => {
-                                    unchecked_assignment_error(reason)
-                                }
+                        Some((name, declared)) => match declared.assignment_to_sink(sink_type, bindings) {
+                            crate::binding_index::DeclaredValueAssignment::Assignable
+                            | crate::binding_index::DeclaredValueAssignment::IncomingBoundaryMismatch => Ok(()),
+                            crate::binding_index::DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Mismatch(mismatch)) => Err(DeferredAccessTypeError::TypeMismatch {
+                                expected: sink_type.resolved_type_name(), actual: mismatch.actual_type_name().to_string(), origin: format!("from {name}"),
                             }),
-                        None => check_deferred_access_type(
-                            access,
-                            sink_type,
-                            &inference_bindings,
-                            registry,
-                            bindings,
-                        ),
+                            crate::binding_index::DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Unchecked(reason)) => Err(unchecked_assignment_error(reason)),
+                        },
+                        None => check_deferred_access_type(access, sink_type, &inference_bindings, registry, bindings),
                     };
                     match checked {
                         Ok(()) => {}
                         Err(DeferredAccessTypeError::InvalidAccess { error }) => {
-                            all_errors.push(format!("{}: {}", resource_location, error));
+                            all_errors.push(format!("{}: {}", resource_location, error))
                         }
                         Err(DeferredAccessTypeError::TypeMismatch {
                             expected,
                             actual,
                             origin,
-                        }) => {
-                            all_errors.push(format!(
-                                "{}: cannot assign {} to '{}': expected {}, got {} ({})",
-                                resource_location, actual, attr_name, expected, actual, origin,
-                            ));
-                        }
+                        }) => all_errors.push(format!(
+                            "{}: cannot assign {} to '{}': expected {}, got {} ({})",
+                            resource_location, actual, attr_name, expected, actual, origin,
+                        )),
                     }
                 });
                 if let Some(effective_sink) = effective_sink {
                     for finding in check_integer_arithmetic_types(
                         attr_value,
                         effective_sink,
+                        validated_schema.schema_type_owner(),
                         &inference_bindings,
                         registry,
                         bindings,
@@ -5019,7 +5327,7 @@ fn check_attribute_param_ref<B: BindingAddress>(
             let Some(sink) = lift_type_expr(&resolved) else {
                 return;
             };
-            let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
+            let sink_type = sink.assignment_sink(&bindings.provider_context().custom_types);
             let mismatch = match source.is_assignable_to_sink(sink_type, bindings) {
                 Ok(()) => return,
                 Err(RefTypeAssignabilityError::Mismatch(mismatch)) => mismatch,
@@ -5286,7 +5594,7 @@ fn check_export_ref<B: BindingAddress>(
             let Some(sink) = lift_type_expr(&resolved) else {
                 return;
             };
-            let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
+            let sink_type = sink.assignment_sink(&bindings.provider_context().custom_types);
             let mismatch = match source.is_assignable_to_sink(sink_type, bindings) {
                 Ok(()) => return,
                 Err(RefTypeAssignabilityError::Mismatch(mismatch)) => mismatch,
@@ -5750,14 +6058,7 @@ pub(crate) fn check_handle_sink<B: crate::resource::BindingAddress>(
     };
     let actual = actual_handle.resource_type();
 
-    let source =
-        AttributeType::resource_handle(actual.provider.clone(), actual.resource_type.clone());
-    let sink =
-        AttributeType::resource_handle(expected.provider.clone(), expected.resource_type.clone());
-    if source
-        .in_schema(crate::schema::empty_defs_for_schema_walks())
-        .is_assignable_to(crate::schema::TypeInSchema::schemaless(&sink))
-    {
+    if actual == expected {
         Ok(())
     } else {
         Err(HandleSinkError {

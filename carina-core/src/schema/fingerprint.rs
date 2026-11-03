@@ -708,10 +708,11 @@ mod tests {
             },
         )]);
 
-        let without = OwnerBoundResourceSchema::new("aws", &schema, &empty).semantic_fingerprint();
-        let with = OwnerBoundResourceSchema::new("aws", &schema, &first).semantic_fingerprint();
+        let owner = crate::parser::SchemaTypeOwner::Provider("aws".into());
+        let without = OwnerBoundResourceSchema::new(&owner, &schema, &empty).semantic_fingerprint();
+        let with = OwnerBoundResourceSchema::new(&owner, &schema, &first).semantic_fingerprint();
         let changed =
-            OwnerBoundResourceSchema::new("aws", &schema, &changed).semantic_fingerprint();
+            OwnerBoundResourceSchema::new(&owner, &schema, &changed).semantic_fingerprint();
 
         assert_ne!(without, with, "adding a form must change the fingerprint");
         assert_ne!(with, changed, "changing a form must change the fingerprint");
