@@ -33,6 +33,7 @@ impl AssignabilityEdge {
 /// Transitive closure of one admitted provider's explicit edges.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AssignabilityClosure {
+    declared_edges: Vec<AssignabilityEdge>,
     sinks: BTreeMap<TypeIdentity, BTreeSet<TypeIdentity>>,
 }
 
@@ -55,7 +56,7 @@ impl AssignabilityClosure {
         }
 
         let mut adjacency = BTreeMap::<TypeIdentity, BTreeSet<TypeIdentity>>::new();
-        for edge in ordered {
+        for &edge in &ordered {
             let AssignabilityEdge { source, sink } = edge;
             let kind = |identity: &TypeIdentity| {
                 scalar_kinds.get(identity).copied().ok_or_else(|| {
@@ -82,7 +83,10 @@ impl AssignabilityClosure {
                 .insert(sink.clone());
         }
 
-        let mut closure = Self::default();
+        let mut closure = Self {
+            declared_edges: ordered.into_iter().cloned().collect(),
+            sinks: BTreeMap::new(),
+        };
         for source in adjacency.keys() {
             let mut reached = BTreeSet::new();
             let mut parents = BTreeMap::<&TypeIdentity, &TypeIdentity>::new();
@@ -113,6 +117,10 @@ impl AssignabilityClosure {
             closure.sinks.insert(source.clone(), reached);
         }
         Ok(closure)
+    }
+
+    pub(super) fn declared_edges(&self) -> &[AssignabilityEdge] {
+        &self.declared_edges
     }
 
     pub(crate) fn reachable(&self, source: &TypeIdentity, sink: &TypeIdentity) -> bool {

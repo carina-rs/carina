@@ -6105,6 +6105,7 @@ struct ResolvedComparisonData {
     owner: crate::parser::SchemaTypeOwner,
     schema: ValidatedResourceSchema,
     reference_forms: crate::schema::ReferenceForms,
+    assignability_edges: Vec<crate::schema::AssignabilityEdge>,
     scope: ReferenceScope,
 }
 
@@ -6131,6 +6132,7 @@ impl ResolvedComparisonTable {
             &data.owner,
             &data.schema,
             &data.reference_forms,
+            &data.assignability_edges,
         );
         Ok(ResolvedComparison {
             owner_schema,
@@ -6423,6 +6425,7 @@ impl ProviderRouter {
                     owner: owner_schema.schema_type_owner().clone(),
                     schema: owner_schema.schema().clone(),
                     reference_forms: owner_schema.reference_forms().clone(),
+                    assignability_edges: owner_schema.assignability_edges().to_vec(),
                     scope: provider.reference_scope().clone(),
                 },
             );

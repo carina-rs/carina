@@ -5,6 +5,89 @@ use carina_core::parser::{ProviderCustomTypes, SchemaTypeOwner, TypeExpr};
 use carina_core::schema::{AttributeType, SchemaKind, StructField, TypeInSchema};
 use identity_edges::{identity, snapshot, string};
 
+fn schema_fingerprints(edges: Vec<carina_core::schema::AssignabilityEdge>) -> Vec<String> {
+    use carina_core::provider::ProviderFactory;
+    use carina_core::schema::{SchemaRegistry, ValidatedProviderSchemaWitness};
+
+    let witness = ValidatedProviderSchemaWitness::with_assignability_edges(
+        identity_edges::EdgeFactory {
+            owner: "mock",
+            edges: false,
+        }
+        .schemas(),
+        Default::default(),
+        Default::default(),
+        edges,
+    )
+    .unwrap();
+    let mut registry = SchemaRegistry::new();
+    registry.insert_provider_witness("mock", &witness).unwrap();
+    [
+        ("Bucket", SchemaKind::Resource),
+        ("Lookup", SchemaKind::DataSource),
+    ]
+    .into_iter()
+    .map(|(resource, kind)| {
+        registry
+            .get("mock", resource, kind)
+            .unwrap()
+            .semantic_fingerprint()
+    })
+    .collect()
+}
+
+fn fingerprint_edge(source: &str, sink: &str) -> carina_core::schema::AssignabilityEdge {
+    carina_core::schema::AssignabilityEdge::new(identity(source), identity(sink)).unwrap()
+}
+
+#[test]
+fn owner_assignability_edges_change_schema_fingerprints() {
+    let without = schema_fingerprints(vec![]);
+    let forward = schema_fingerprints(vec![fingerprint_edge("NewName", "Name")]);
+    let reverse = schema_fingerprints(vec![fingerprint_edge("Name", "NewName")]);
+    for index in 0..without.len() {
+        assert_ne!(
+            without[index], forward[index],
+            "adding an owner edge must change the fingerprint"
+        );
+        assert_ne!(
+            forward[index], reverse[index],
+            "changing an owner edge must change the fingerprint"
+        );
+    }
+}
+
+#[test]
+fn owner_assignability_edge_order_does_not_change_schema_fingerprints() {
+    assert_eq!(
+        schema_fingerprints(vec![
+            fingerprint_edge("NewName", "Name"),
+            fingerprint_edge("A", "B")
+        ]),
+        schema_fingerprints(vec![
+            fingerprint_edge("A", "B"),
+            fingerprint_edge("NewName", "Name")
+        ]),
+    );
+}
+
+#[test]
+fn owner_declared_edges_change_fingerprints_even_when_reachability_is_equal() {
+    let transitive =
+        schema_fingerprints(vec![fingerprint_edge("A", "B"), fingerprint_edge("B", "C")]);
+    let explicit = schema_fingerprints(vec![
+        fingerprint_edge("A", "B"),
+        fingerprint_edge("B", "C"),
+        fingerprint_edge("A", "C"),
+    ]);
+    for index in 0..transitive.len() {
+        assert_ne!(
+            transitive[index], explicit[index],
+            "fingerprints must include declared edges"
+        );
+    }
+}
+
 static P_OWNER: std::sync::LazyLock<SchemaTypeOwner> =
     std::sync::LazyLock::new(|| SchemaTypeOwner::Provider("p".into()));
 static Q_OWNER: std::sync::LazyLock<SchemaTypeOwner> =

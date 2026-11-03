@@ -165,13 +165,20 @@ impl Scenario {
 fn identity_edges_validate_forward_and_reject_reverse_and_unrelated() {
     let errors = Scenario::new("bucket = producer.new_name", "mock").validate();
     assert!(errors.is_empty(), "{errors:#?}");
-    for attributes in [
-        "new_bucket = producer.old_name",
-        "bucket = producer.unrelated",
+    for (attributes, mismatch) in [
+        (
+            "new_bucket = producer.old_name",
+            "expected mock.Bucket.NewName, got mock.Bucket.Name",
+        ),
+        (
+            "bucket = producer.unrelated",
+            "expected mock.Bucket.Name, got mock.Bucket.Other",
+        ),
     ] {
         let errors = Scenario::new(attributes, "mock").validate();
+        assert_eq!(errors.len(), 1, "{errors:#?}");
         assert!(
-            errors.iter().any(|error| error.contains("cannot assign")),
+            errors[0].contains("cannot assign") && errors[0].contains(mismatch),
             "{errors:#?}"
         );
     }
@@ -179,10 +186,10 @@ fn identity_edges_validate_forward_and_reject_reverse_and_unrelated() {
 #[test]
 fn identity_edges_do_not_use_a_co_owners_edge_at_another_factorys_attribute() {
     let errors = Scenario::new("bucket = producer.new_name", "other").validate();
+    assert_eq!(errors.len(), 1, "{errors:#?}");
     assert!(
-        errors
-            .iter()
-            .any(|error| error.contains("cannot assign") && error.contains("NewName")),
+        errors[0].contains("cannot assign")
+            && errors[0].contains("expected mock.Bucket.Name, got mock.Bucket.NewName"),
         "{errors:#?}"
     );
 }
@@ -480,25 +487,47 @@ fn identity_edges_apply_checks_unknown_value_before_consumer_create() {
 
 #[test]
 fn identity_edges_use_the_data_source_input_owner() {
-    for (owner, attribute, source, accepted) in [
-        ("mock", "bucket", "new_name", true),
-        ("mock", "new_bucket", "old_name", false),
-        ("other", "bucket", "new_name", false),
+    for (owner, attribute, source, mismatch) in [
+        ("mock", "bucket", "new_name", None),
+        (
+            "mock",
+            "new_bucket",
+            "old_name",
+            Some("expected mock.Bucket.NewName, got mock.Bucket.Name"),
+        ),
+        (
+            "mock",
+            "bucket",
+            "unrelated",
+            Some("expected mock.Bucket.Name, got mock.Bucket.Other"),
+        ),
+        (
+            "other",
+            "bucket",
+            "new_name",
+            Some("expected mock.Bucket.Name, got mock.Bucket.NewName"),
+        ),
     ] {
         let scenario = Scenario::new("", owner);
+        let required_bucket = if attribute == "new_bucket" {
+            "bucket = producer.old_name\n"
+        } else {
+            ""
+        };
         fs::write(
             scenario.project.path().join("consumer.crn"),
-            format!("let consumer = read {owner}.Lookup {{ {attribute} = producer.{source} }}\n"),
+            format!("let consumer = read {owner}.Lookup {{ {required_bucket}{attribute} = producer.{source} }}\n"),
         )
         .unwrap();
         let errors = scenario.validate();
-        if accepted {
-            assert!(errors.is_empty(), "{errors:#?}");
-        } else {
+        if let Some(mismatch) = mismatch {
+            assert_eq!(errors.len(), 1, "{errors:#?}");
             assert!(
-                errors.iter().any(|error| error.contains("cannot assign")),
+                errors[0].contains("cannot assign") && errors[0].contains(mismatch),
                 "{errors:#?}"
             );
+        } else {
+            assert!(errors.is_empty(), "{errors:#?}");
         }
     }
 }

@@ -14367,6 +14367,7 @@ pub struct OwnerBoundResourceSchema<'a> {
     owner: &'a SchemaTypeOwner,
     schema: &'a ValidatedResourceSchema,
     reference_forms: &'a ReferenceForms,
+    assignability_edges: &'a [AssignabilityEdge],
 }
 
 impl<'a> OwnerBoundResourceSchema<'a> {
@@ -14374,11 +14375,13 @@ impl<'a> OwnerBoundResourceSchema<'a> {
         owner: &'a SchemaTypeOwner,
         schema: &'a ValidatedResourceSchema,
         reference_forms: &'a ReferenceForms,
+        assignability_edges: &'a [AssignabilityEdge],
     ) -> Self {
         Self {
             owner,
             schema,
             reference_forms,
+            assignability_edges,
         }
     }
 
@@ -14422,6 +14425,11 @@ impl<'a> OwnerBoundResourceSchema<'a> {
     /// owner. Forms are provider-wide rather than per resource occurrence.
     pub fn reference_forms(self) -> &'a ReferenceForms {
         self.reference_forms
+    }
+
+    /// Return the explicit edges declared by this schema's provider owner.
+    pub fn assignability_edges(self) -> &'a [AssignabilityEdge] {
+        self.assignability_edges
     }
 
     /// Validate authored resource values with custom-type routing derived from
@@ -14722,7 +14730,12 @@ impl SchemaRegistry {
                     .reference_forms
                     .get(provider)
                     .expect("every admitted schema owner has a reference-form table");
-                OwnerBoundResourceSchema::new(owner, schema, reference_forms)
+                let assignability_edges = self
+                    .assignability_closures
+                    .get(owner)
+                    .expect("every admitted schema owner has an assignability closure")
+                    .declared_edges();
+                OwnerBoundResourceSchema::new(owner, schema, reference_forms, assignability_edges)
             })
     }
 

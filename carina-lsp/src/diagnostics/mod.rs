@@ -2174,9 +2174,14 @@ impl DiagnosticEngine {
                 .ok()
                 .and_then(|directory| self.directory_catalog(doc, &directory))
                 .unwrap_or_else(|| {
-                    carina_core::parser::ProviderContext::new(
-                        doc.provider_context().environment.clone(),
-                    )
+                    // Editing a resource must not discard already loaded provider
+                    // authority. Until declarations parse again, retain the last
+                    // loaded snapshot, including its provider-load failures.
+                    let mut catalog = (*self.provider_context).clone();
+                    catalog.custom_types = catalog
+                        .custom_types
+                        .with_failed_providers(self.provider_errors.keys().cloned().collect());
+                    catalog
                 }),
             None => (*self.provider_context).clone(),
         };
