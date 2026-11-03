@@ -40,11 +40,11 @@ Provider-block settings remain separate. In particular, `region` and each block'
 
 ## Commands that need credentials
 
-Schema-only operations such as `validate`, `fmt`, and LSP diagnostics do not resolve AWS credentials. Runtime loading for `plan`, `apply`, and `destroy` checks credentials before starting the first AWS guest, so a missing or expired source fails before an API operation begins.
+`fmt`, LSP diagnostics, and ordinary schema validation do not resolve AWS credentials. CLI `validate` needs KMS credentials when the configuration evaluates `decrypt()`. Runtime loading for `plan`, `apply`, and `destroy` checks credentials before starting the first AWS guest, so a missing or expired source fails before an API operation begins.
 
 When no source is found, the error suggests `AWS_PROFILE`, `aws sso login`, or the static environment keys. In CI, provide the same environment or workload credential source that an AWS SDK application would use. Do not copy profile files or credentials into a provider component.
 
-Local provider builds also need an explicit AWS trust grant; see [`--trust-local-provider`](/reference/cli/global-options/#trust-local-provider-pathkind). The grant authorizes the typed credential import but does not expose metadata endpoints.
+Local provider builds also need an explicit AWS trust grant; see [`--trust-local-provider`](/reference/cli/global-options/#--trust-local-provider-pathkind). The grant authorizes the typed credential import but does not expose metadata endpoints.
 
 ## KMS reference planning permissions
 

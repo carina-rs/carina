@@ -27,7 +27,7 @@ Effects are values you can inspect before anything is executed. Running `carina 
 The workflow is always:
 
 1. **Init** -- `carina init` installs the provider plugins the configuration declares
-2. **Validate** -- `carina validate` checks syntax and schema without cloud access
+2. **Validate** -- `carina validate` checks syntax and schema without provider API calls; configurations that evaluate `decrypt()` also call AWS KMS
 3. **Plan** -- `carina plan` computes the diff between desired state (`.crn` files) and current state
 4. **Apply** -- `carina apply` executes the plan
 
@@ -95,13 +95,14 @@ list is also create-only. When a schema declares no identity paths, Carina uses
 configured top-level create-only values as the compatibility fallback.
 
 Two anonymous resources of the same type and provider route cannot have equal
-declared identity values; use `let` to name at least one of them. Every declared
-identity value must be available as written material or an authored expression
-at plan time. Carina canonicalizes a written value and hashes references and
+declared identity values; use `let` to name at least one of them. Required
+identity paths need a stable value or authored expression at plan time.
+Carina canonicalizes a written value and hashes references and
 composite expressions over references and literals by their authored spelling,
-so `"/zones/${zone.id}"` has a stable address before the zone exists. An absent
-value or an expression containing an unknown or unavailable leaf cannot produce
-an anonymous address; write the value or give the resource a name with `let`.
+so `"/zones/${zone.id}"` has a stable address before the zone exists. An omitted
+`identity_when_present` path contributes a distinct absent marker. A written
+unknown or unavailable value, or an expression containing one, cannot produce
+an anonymous address; write a stable value or give the resource a name with `let`.
 
 When a provider first adds identity declarations, an existing state row may
 still have the address produced by the older create-only rule, including one
