@@ -134,15 +134,13 @@ A consumer can declare a resource-typed argument and use it for ordering:
 # modules/consumer/arguments.crn
 arguments {
   validation_record: aws.route53.RecordSet
+  certificate: aws.acm.Certificate
 }
 
 # modules/consumer/main.crn
-aws.acm.CertificateValidation {
-  # ...
-
-  directives {
-    depends_on = [validation_record]
-  }
+let ready = wait certificate {
+  until = certificate.status == aws.acm.Certificate.Status.issued
+  depends_on = [validation_record]
 }
 ```
 
