@@ -4394,7 +4394,13 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     ///    rejected both ways (populated providers differ). Closes carina#3218.
     /// 8. Custom→Custom where at least one side has `identity: None`: check
     ///    pattern (literal equality) and length containment (source ⊆ sink),
-    ///    then recurse on base. For both-identified pairs, see rule 7.
+    ///    then recurse on base. Exception: an identity-bearing String, Int, or
+    ///    Float source is assignable to an identity-less sink of the same
+    ///    primitive kind, and an identity-bearing Int source is also assignable
+    ///    to an identity-less Float sink, regardless of the source's own
+    ///    pattern/length/range. The sink's value constraints are checked when known
+    ///    at plan or before provider dispatch at apply (carina#3805). Rule 7
+    ///    and rule 8's identity-less refined-source comparisons are unchanged.
     /// 9. Custom source → non-Custom sink: recurse on `source.base`.
     /// 10. A plain, unrefined primitive source → refined sink is split by
     ///     the sink's identity. An identified sink (including every Enum) is
@@ -4408,8 +4414,8 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     ///
     /// # Conservative pattern/length policy
     ///
-    /// Rule 8 remains evidence-preserving for a source that carries any
-    /// refinement of its own. A populated sink pattern requires literal
+    /// Rule 8 remains evidence-preserving for an identity-less refined
+    /// String source. A populated sink pattern requires literal
     /// string equality; regex-language containment is not inferred. A sink
     /// length range requires the source range to be a subset (`sink.min ≤
     /// source.min` and `source.max ≤ sink.max`, with absent bounds treated
@@ -4423,10 +4429,11 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     /// leaves the sink's pattern/length value check to carina#3805. It never
     /// supplies evidence for an identified custom type or Enum.
     ///
-    /// **Do not loosen rule 8's evidence comparisons.** Accepting a wider or
-    /// differently refined source would re-introduce the silent-false-positive
-    /// class that #2218 closed. Rule 10's no-evidence exception is limited to
-    /// identity-less sinks and does not weaken those comparisons.
+    /// **Do not loosen rule 8's identity-less refined-source evidence
+    /// comparisons.** Accepting a wider or differently refined identity-less
+    /// source would re-introduce the silent-false-positive class that #2218
+    /// closed. Both exceptions above are limited to identity-less sinks and
+    /// do not weaken those comparisons.
     pub fn is_assignable_to(self, sink: TypeInSchema<'_, R>) -> bool {
         matches!(self.assignment_to(sink), TypeAssignability::Assignable)
     }
@@ -4717,6 +4724,16 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 },
                 String { binding, .. },
             ) if binding.identity().is_some() => false,
+            // An identified String may flow into an identity-less String
+            // sink. Check the sink's value constraints when known at plan or
+            // before provider dispatch at apply (#3805, #4230).
+            (
+                String { binding, .. },
+                String {
+                    binding: RefinementBinding::MetadataOnly(None),
+                    ..
+                },
+            ) if binding.identity().is_some() => true,
             (
                 Int {
                     binding: RefinementBinding::MetadataOnly(None),
@@ -4731,9 +4748,25 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 },
                 Float { binding, .. },
             ) if binding.identity().is_some() => false,
+            // Identified numerics defer same-kind identity-less sink ranges
+            // to the resolved value, like identified Strings (#3805, #4230).
+            (
+                Int { binding, .. },
+                Int {
+                    binding: RefinementBinding::MetadataOnly(None),
+                    ..
+                },
+            )
+            | (
+                Float { binding, .. },
+                Float {
+                    binding: RefinementBinding::MetadataOnly(None),
+                    ..
+                },
+            ) if binding.identity().is_some() => true,
             // Numeric widening is directional: an Int source may flow into
             // a Float sink, matching concrete-value validation. Preserve
-            // identity and range evidence when either side carries it.
+            // sink identity and identity-less source range evidence.
             (
                 Int {
                     binding: source_binding,
@@ -4753,7 +4786,9 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 {
                     return false;
                 }
-                if source_range.is_none() && sink_binding.identity().is_none() {
+                if (source_binding.identity().is_some() || source_range.is_none())
+                    && sink_binding.identity().is_none()
+                {
                     return true;
                 }
                 i64_range_assignable_to_f64(source_range.as_ref(), sink_range.as_ref())

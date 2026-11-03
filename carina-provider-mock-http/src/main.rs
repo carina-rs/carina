@@ -143,7 +143,9 @@ impl CarinaProvider for MockHttpProvider {
     ) -> Result<CreateStep<Self::CreateToken>, CreateVerdict<Self::CreateToken>> {
         let probe =
             PreparedCreate::prepare(request, attempt, ProbeKind::HttpWorld).map_err(|error| {
-                error.untracked(|message| Self::error(id, ProviderErrorKind::InvalidInput, message))
+                error.not_created(|message| {
+                    Self::error(id, ProviderErrorKind::InvalidInput, message)
+                })
             })?;
         let behavior = probe
             .attributes()
@@ -166,16 +168,16 @@ impl CarinaProvider for MockHttpProvider {
             Some("pending_nan_after_send") => {
                 return Ok(probe.pending(f64::NAN, 1));
             }
-            Some("untracked_after_send") => {
-                return Err(probe.untracked(Self::error(
+            Some("not_created_after_send") => {
+                return Err(probe.not_created(Self::error(
                     id,
                     ProviderErrorKind::ApiError,
-                    "provider declared untracked after send",
+                    "provider declared not_created after send",
                 )));
             }
             None | Some("normal") => {}
             Some(unsupported) => {
-                return Err(probe.untracked(Self::error(
+                return Err(probe.not_created(Self::error(
                     id,
                     ProviderErrorKind::InvalidInput,
                     format!("unsupported create behavior {unsupported}"),

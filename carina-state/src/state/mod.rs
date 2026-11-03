@@ -11,10 +11,10 @@ use carina_core::parser::StateBlockAddress;
 use carina_core::plan::ReplacementPreviousAttributesForStateWriteback;
 pub use carina_core::provider::PreviousSecretHashAuthority;
 use carina_core::provider::{
-    AppliedIdentifier, CreateObservation, EmptyAppliedIdentifier, InFlightCreate,
-    InFlightPersistence, NestedWriteOnlyRecord, ObservedCreate, PersistedAttributes,
-    PersistedAttributesError, RawSavedAttrs, Sent, SentDesiredAttributes, SentRecord,
-    StateRowInFlightCreate, StateRowUnknownCreateOutcome, StateTransformMap, UnknownCreateOutcome,
+    AppliedIdentifier, CreateObservation, EmptyAppliedIdentifier, IdentifiedCreate, InFlightCreate,
+    InFlightPersistence, NestedWriteOnlyRecord, PersistedAttributes, PersistedAttributesError,
+    RawSavedAttrs, Sent, SentDesiredAttributes, SentRecord, StateRowInFlightCreate,
+    StateRowUnknownCreateOutcome, StateTransformMap, UnknownCreateOutcome,
     merge_previous_secret_hashes_into_provider_value, previous_hash,
 };
 use carina_core::resolved_graph::{
@@ -4440,21 +4440,21 @@ impl ResourceState {
     /// establishes the current desired resource as the authoring baseline.
     pub fn from_observation<S: Clone, R: ReferenceEquality>(
         resource: &ResolvedResource<S>,
-        created: &ObservedCreate,
+        identified: &IdentifiedCreate,
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
         preferred_hashes: Option<&PersistedAttributes>,
         comparison: &ComparisonContext<'_, R>,
     ) -> Result<Self, ResourceStateEncodingError> {
-        let applied_desired = created
+        let applied_desired = identified
             .resolved_desired_attributes()
             .map(|attributes| resource_with_secret_shape_union(resource, attributes))
             .transpose()?;
         let writeback_resource = applied_desired.as_ref().unwrap_or(resource);
-        let sent_desired = created.sent_desired_attributes_for(writeback_resource);
+        let sent_desired = identified.sent_desired_attributes_for(writeback_resource);
         let previous = existing.and_then(ResourceState::persisted_attributes);
         let no_observed_values = HashMap::new();
-        let (observed_values, pending_reread) = match created.observation() {
+        let (observed_values, pending_reread) = match identified.observation() {
             CreateObservation::Observed(state) => (state.attributes(), None),
             CreateObservation::Unobserved(carina_core::provider::UnobservedReason::NotFound) => {
                 (&no_observed_values, Some(PendingReRead::not_found()))
@@ -4474,7 +4474,7 @@ impl ResourceState {
             previous,
         )?;
 
-        let (sent_values, sent_write_only) = match created.sent() {
+        let (sent_values, sent_write_only) = match identified.sent() {
             SentRecord::Request(sent) => {
                 let sent_values = Self::selected_sent_attributes(
                     writeback_resource,
@@ -4503,7 +4503,7 @@ impl ResourceState {
             preferred_hashes,
         )?;
         let (attributes, write_only_attributes) = selected.finish()?;
-        let partial_read = created
+        let partial_read = identified
             .partial_read_diagnostic()
             .and_then(|diagnostic| {
                 PartialReadMarker::new(
@@ -4548,7 +4548,7 @@ impl ResourceState {
             resource.id.provider.clone(),
         );
         row.current = CurrentInstance::Applied {
-            identifier: created.identifier().clone(),
+            identifier: identified.identifier().clone(),
             attributes,
             write_only_attributes,
             nested_write_only,

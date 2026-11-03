@@ -643,7 +643,7 @@ impl Error for SchemaDecodeError {
     }
 }
 
-/// Convert a validated resource schema into its version-19 protocol record.
+/// Convert a validated resource schema into its version-20 protocol record.
 pub fn resource_schema_to_protocol(
     schema: &ValidatedResourceSchema,
 ) -> Result<protocol::ResourceSchema, ProtocolConvertError> {
@@ -661,7 +661,7 @@ pub fn resource_schema_to_protocol(
         default_wait_interval,
         defs,
     } = schema.parts();
-    // Protocol v19 has no resource wait-default fields. These are host-side
+    // Protocol v20 has no resource wait-default fields. These are host-side
     // execution policy, not provider metadata; projection intentionally omits
     // them and round-trip tests pin that one-way behavior.
     let _v18_omits_host_wait_defaults = (default_wait_timeout, default_wait_interval);
@@ -730,7 +730,7 @@ fn protocol_to_type_identity(identity: &str) -> TypeIdentity {
     TypeIdentity::from_dotted(identity)
 }
 
-/// Project one aggregate provider-schema witness onto the version-19 envelope.
+/// Project one aggregate provider-schema witness onto the version-20 envelope.
 pub fn provider_schema_to_protocol(
     witness: &ValidatedProviderSchemaWitness,
 ) -> Result<protocol::ProviderSchemaEnvelope, ProtocolConvertError> {
@@ -756,7 +756,7 @@ pub fn provider_schema_to_protocol(
     })
 }
 
-/// Decode the version-19 provider-schema envelope and jointly admit resource,
+/// Decode the version-20 provider-schema envelope and jointly admit resource,
 /// config, and reference-form declarations.
 pub fn protocol_to_provider_schema_witness(
     envelope: &protocol::ProviderSchemaEnvelope,
@@ -818,7 +818,7 @@ pub fn attribute_schema_to_protocol(
         identity_mode,
         deferred_populate,
     } = attribute.parts();
-    // Protocol v19 has no completion field. Completions are an in-process
+    // Protocol v20 has no completion field. Completions are an in-process
     // authoring aid, so JSON metadata projection intentionally omits them.
     let _v18_omits_host_completions = completions;
     let (required, read_only) = input_mode_to_protocol(declared_input_mode);
@@ -2296,7 +2296,7 @@ pub fn protocol_to_core_persisted_value_map(
 }
 
 /// Encode a core resource id. Provider-instance routing is host-local and the
-/// version-19 protocol deliberately has no corresponding field.
+/// version-20 protocol deliberately has no corresponding field.
 pub fn resource_id_to_protocol(id: &ResourceId) -> protocol::ResourceId {
     let ResourceId {
         provider,
@@ -2315,7 +2315,7 @@ pub fn resource_id_to_protocol(id: &ResourceId) -> protocol::ResourceId {
     }
 }
 
-/// Decode a version-19 resource id. The wire's empty identity is the pending
+/// Decode a version-20 resource id. The wire's empty identity is the pending
 /// sentinel, and provider-instance routing cannot be reconstructed.
 pub fn protocol_to_resource_id(id: &protocol::ResourceId) -> ResourceId {
     let protocol::ResourceId {

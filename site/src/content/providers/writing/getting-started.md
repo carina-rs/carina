@@ -184,7 +184,7 @@ impl CarinaProvider for HelloProvider {
         let name = match request.resource.attributes.get("name") {
             Some(Value::String(name)) if !name.is_empty() => name.clone(),
             _ => {
-                return Err(attempt.untracked(error(
+                return Err(attempt.not_created(error(
                     ProviderErrorKind::InvalidInput,
                     "name must be a non-empty string",
                 )));

@@ -2544,13 +2544,13 @@ impl PendingCreate {
     }
 
     /// Preserve an issued pending create and end an identifier-less pending
-    /// create when the provider reports that it can no longer track it.
+    /// create when the provider reports that it was not created.
     /// Consuming the witness makes the two outcomes mutually exclusive.
-    pub fn untracked(self, error: ProviderError) -> CreateFailure {
+    pub fn not_created(self, error: ProviderError) -> CreateFailure {
         if self.identifier().is_some() {
             InFlightCreate::from_pending(self).into_create_failure(error)
         } else {
-            CreateFailure::from_kind(CreateFailureKind::Untracked(error))
+            CreateFailure::from_kind(CreateFailureKind::NoResource(error))
         }
     }
 
@@ -2618,8 +2618,8 @@ pub struct PollAttempt {
 }
 
 impl PollAttempt {
-    pub fn untracked(self, error: ProviderError) -> CreateFailure {
-        CreateFailure::from_kind(CreateFailureKind::Untracked(error))
+    pub fn not_created(self, error: ProviderError) -> CreateFailure {
+        CreateFailure::from_kind(CreateFailureKind::NoResource(error))
     }
 
     pub fn issued(self, identifier: AppliedIdentifier) -> IssuedCreate {
@@ -2804,9 +2804,9 @@ impl std::fmt::Display for UnobservedReason {
     }
 }
 
-/// Core-classified create observation plus the accepted create's sent values.
+/// A provider-reported identifier, its observation, and the accepted create's sent values.
 #[derive(Debug)]
-pub struct ObservedCreate {
+pub struct IdentifiedCreate {
     id: ResourceId,
     identifier: AppliedIdentifier,
     observation: CreateObservation,
@@ -2815,7 +2815,7 @@ pub struct ObservedCreate {
     resolved_desired_attributes: Option<SecretPreservingAttributes>,
 }
 
-impl ObservedCreate {
+impl IdentifiedCreate {
     fn new(
         id: ResourceId,
         identifier: AppliedIdentifier,
@@ -2859,7 +2859,7 @@ impl ObservedCreate {
         identifier: AppliedIdentifier,
         observation: CreateObservation,
     ) -> Self {
-        observed_from_resume(pending, identifier, observation)
+        identified_from_resume(pending, identifier, observation)
     }
 
     pub fn id(&self) -> &ResourceId {
@@ -3487,7 +3487,7 @@ struct CreateCallCancellationReporter {
 /// The only two states a dropped started guest create can report.
 #[derive(Debug)]
 pub(crate) enum CancelledCreateReport {
-    Untracked,
+    NotCreated,
     OutcomeUnknown(UnknownCreateOutcome),
 }
 
@@ -3649,7 +3649,7 @@ impl GuestCallFailure {
             .take()
             .expect("a guest call failure owns its inner state");
         match egress {
-            CallEgress::None(_no_egress) => attempt.untracked(error),
+            CallEgress::None(_no_egress) => attempt.not_created(error),
             CallEgress::Sent(sent) => attempt.outcome_unknown(sent, error),
         }
     }
@@ -3664,7 +3664,7 @@ fn report_cancelled_guest_create(attempt: CreateAttempt, may_have_dispatched: bo
     let report = if may_have_dispatched {
         CancelledCreateReport::OutcomeUnknown(UnknownCreateOutcome::new(id, started_at))
     } else {
-        CancelledCreateReport::Untracked
+        CancelledCreateReport::NotCreated
     };
     let _send_result = cancellation.sender.send(report);
 }
@@ -3672,15 +3672,21 @@ fn report_cancelled_guest_create(attempt: CreateAttempt, may_have_dispatched: bo
 /// Inspectable classification carried by an opaque [`CreateFailure`].
 #[derive(Debug)]
 pub enum CreateFailureKind {
-    Untracked(ProviderError),
+    /// No cloud resource remains. A `not-created` verdict means nothing was
+    /// created: no request left the provider, or the cloud rejected it without
+    /// creating anything.
+    NoResource(ProviderError),
+    /// A request may have reached the cloud, with no identifier or continuation available.
     OutcomeUnknown {
         unknown: UnknownCreateOutcome,
         error: ProviderError,
     },
-    Created {
-        created: ObservedCreate,
+    /// The provider reported an identifier; resource existence may be unobserved.
+    IdentifierReported {
+        identified: IdentifiedCreate,
         error: ProviderError,
     },
+    /// A resumable continuation is available, with an optional cloud identifier.
     InFlight {
         pending: InFlightCreate,
         error: ProviderError,
@@ -3690,14 +3696,13 @@ pub enum CreateFailureKind {
 /// Failure from an initial create, classified by what can safely be retained.
 ///
 /// The wrapper is intentionally opaque: provider implementations can obtain
-/// an `Untracked` failure only by consuming the executor-minted
-/// [`CreateAttempt`]. Constructing the public inspection enum is not enough to
-/// return a failure.
+/// a `NoResource` failure only by consuming a core-minted create witness.
+/// Constructing the public inspection enum is not enough to return a failure.
 ///
 /// ```compile_fail
 /// use carina_core::provider::{CreateFailure, CreateFailureKind, ProviderError};
 ///
-/// let kind = CreateFailureKind::Untracked(ProviderError::internal("lost"));
+/// let kind = CreateFailureKind::NoResource(ProviderError::internal("lost"));
 /// let _failure = CreateFailure(kind);
 /// ```
 #[derive(Debug)]
@@ -3706,17 +3711,17 @@ pub struct CreateFailure(Box<CreateFailureKind>);
 impl std::fmt::Display for CreateFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.kind() {
-            CreateFailureKind::Untracked(_error) => {
-                f.write_str("create failed before it could be tracked")
+            CreateFailureKind::NoResource(_error) => {
+                f.write_str("create failed and left no resource")
             }
             CreateFailureKind::OutcomeUnknown {
                 unknown: _unknown,
                 error: _error,
             } => f.write_str("create outcome is unknown after a request left the provider"),
-            CreateFailureKind::Created {
-                created: _created,
+            CreateFailureKind::IdentifierReported {
+                identified: _identified,
                 error: _error,
-            } => f.write_str("create reached the provider but did not complete"),
+            } => f.write_str("the provider reported an identifier but the create did not complete"),
             CreateFailureKind::InFlight {
                 pending: _pending,
                 error: _error,
@@ -3728,13 +3733,13 @@ impl std::fmt::Display for CreateFailure {
 impl std::error::Error for CreateFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self.kind() {
-            CreateFailureKind::Untracked(error) => Some(error),
+            CreateFailureKind::NoResource(error) => Some(error),
             CreateFailureKind::OutcomeUnknown {
                 unknown: _unknown,
                 error,
             } => Some(error),
-            CreateFailureKind::Created {
-                created: _created,
+            CreateFailureKind::IdentifierReported {
+                identified: _identified,
                 error,
             } => Some(error),
             CreateFailureKind::InFlight {
@@ -3760,13 +3765,13 @@ impl CreateFailure {
 
     pub fn provider_error(&self) -> &ProviderError {
         match self.kind() {
-            CreateFailureKind::Untracked(error) => error,
+            CreateFailureKind::NoResource(error) => error,
             CreateFailureKind::OutcomeUnknown {
                 unknown: _unknown,
                 error,
             } => error,
-            CreateFailureKind::Created {
-                created: _created,
+            CreateFailureKind::IdentifierReported {
+                identified: _identified,
                 error,
             } => error,
             CreateFailureKind::InFlight {
@@ -3776,16 +3781,16 @@ impl CreateFailure {
         }
     }
 
-    pub(crate) fn created(created: ObservedCreate, error: ProviderError) -> Self {
-        Self::from_kind(CreateFailureKind::Created { created, error })
+    pub(crate) fn identifier_reported(identified: IdentifiedCreate, error: ProviderError) -> Self {
+        Self::from_kind(CreateFailureKind::IdentifierReported { identified, error })
     }
 
     pub(crate) fn in_flight(pending: InFlightCreate, error: ProviderError) -> Self {
         Self::from_kind(CreateFailureKind::InFlight { pending, error })
     }
 
-    pub(crate) fn untracked_at_dispatch(error: ProviderError) -> Self {
-        Self::from_kind(CreateFailureKind::Untracked(error))
+    pub(crate) fn not_created_at_dispatch(error: ProviderError) -> Self {
+        Self::from_kind(CreateFailureKind::NoResource(error))
     }
 
     pub(crate) fn outcome_unknown_at_dispatch(
@@ -3815,25 +3820,25 @@ pub struct ResumeOutcome {
 
 /// A resumed create that completed with an applied state.
 ///
-/// The wrapped [`ObservedCreate`] is private so callers cannot put an
-/// unobserved created failure in the successful `Resumed` arm.
+/// The wrapped [`IdentifiedCreate`] is private so callers cannot put an
+/// unobserved identifier-reported failure in the successful `Resumed` arm.
 ///
 /// ```compile_fail
-/// use carina_core::provider::{CompletedResume, ObservedCreate};
+/// use carina_core::provider::{CompletedResume, IdentifiedCreate};
 ///
-/// fn forge(created: ObservedCreate) -> CompletedResume {
-///     CompletedResume(created)
+/// fn forge(identified: IdentifiedCreate) -> CompletedResume {
+///     CompletedResume(identified)
 /// }
 /// ```
 #[derive(Debug)]
-pub struct CompletedResume(ObservedCreate);
+pub struct CompletedResume(IdentifiedCreate);
 
 impl CompletedResume {
     fn new(pending: InFlightCreate, identifier: AppliedIdentifier, state: AppliedState) -> Self {
         let (_state_id, _observed_identifier, attributes) = state.into_parts();
         let state =
             AppliedState::from_snapshot_parts(pending.id().clone(), identifier.clone(), attributes);
-        Self(observed_from_resume(
+        Self(identified_from_resume(
             pending,
             identifier,
             CreateObservation::Observed(state),
@@ -3859,7 +3864,7 @@ impl CompletedResume {
         Self(self.0.with_resolved_desired_attributes(attributes))
     }
 
-    pub(crate) fn into_observed_create(self) -> ObservedCreate {
+    pub(crate) fn into_identified_create(self) -> IdentifiedCreate {
         self.0
     }
 }
@@ -3923,7 +3928,7 @@ impl PartialResume {
     pub(crate) fn into_parts(
         self,
     ) -> (
-        ObservedCreate,
+        IdentifiedCreate,
         SnapshotState,
         PartialReadDiagnostic,
         ReadBackEnd,
@@ -3934,7 +3939,7 @@ impl PartialResume {
             read_back_end,
         } = self;
         let created = completed
-            .into_observed_create()
+            .into_identified_create()
             .with_partial_read(diagnostic.clone());
         let state = created.observed_state();
         (created, state, diagnostic, read_back_end)
@@ -4006,11 +4011,16 @@ impl ResumeOutcome {
 /// Inspectable classification carried by an opaque [`ResumeFailure`].
 #[derive(Debug)]
 pub enum ResumeFailureKind {
-    Ended(ProviderError),
-    Created {
-        created: ObservedCreate,
+    /// No cloud resource remains. A `not-created` verdict means nothing was
+    /// created: no request left the provider, or the cloud rejected it without
+    /// creating anything.
+    NoResource(ProviderError),
+    /// The provider reported an identifier; resource existence may be unobserved.
+    IdentifierReported {
+        identified: IdentifiedCreate,
         error: ProviderError,
     },
+    /// A resumable continuation is available, with an optional cloud identifier.
     InFlight {
         pending: InFlightCreate,
         error: ProviderError,
@@ -4020,12 +4030,12 @@ pub enum ResumeFailureKind {
 /// Failure from resuming a persisted create.
 ///
 /// Like [`CreateFailure`], this is opaque so an ordinary provider cannot
-/// synthesize an `Ended` verdict by naming an enum variant.
+/// synthesize a `NoResource` verdict by naming an enum variant.
 ///
 /// ```compile_fail
 /// use carina_core::provider::{ProviderError, ResumeFailure, ResumeFailureKind};
 ///
-/// let kind = ResumeFailureKind::Ended(ProviderError::internal("lost"));
+/// let kind = ResumeFailureKind::NoResource(ProviderError::internal("lost"));
 /// let _failure = ResumeFailure(kind);
 /// ```
 #[derive(Debug)]
@@ -4034,13 +4044,13 @@ pub struct ResumeFailure(Box<ResumeFailureKind>);
 impl std::fmt::Display for ResumeFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.kind() {
-            ResumeFailureKind::Ended(_error) => {
-                f.write_str("resumed create ended without a resource")
-            }
-            ResumeFailureKind::Created {
-                created: _created,
+            ResumeFailureKind::NoResource(_error) => f.write_str("resumed create left no resource"),
+            ResumeFailureKind::IdentifierReported {
+                identified: _identified,
                 error: _error,
-            } => f.write_str("resumed create reached the provider but did not complete"),
+            } => f.write_str(
+                "the provider reported an identifier but the resumed create did not complete",
+            ),
             ResumeFailureKind::InFlight {
                 pending: _pending,
                 error: _error,
@@ -4052,9 +4062,9 @@ impl std::fmt::Display for ResumeFailure {
 impl std::error::Error for ResumeFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self.kind() {
-            ResumeFailureKind::Ended(error) => Some(error),
-            ResumeFailureKind::Created {
-                created: _created,
+            ResumeFailureKind::NoResource(error) => Some(error),
+            ResumeFailureKind::IdentifierReported {
+                identified: _identified,
                 error,
             } => Some(error),
             ResumeFailureKind::InFlight {
@@ -4080,9 +4090,9 @@ impl ResumeFailure {
 
     pub fn provider_error(&self) -> &ProviderError {
         match self.kind() {
-            ResumeFailureKind::Ended(error) => error,
-            ResumeFailureKind::Created {
-                created: _created,
+            ResumeFailureKind::NoResource(error) => error,
+            ResumeFailureKind::IdentifierReported {
+                identified: _identified,
                 error,
             } => error,
             ResumeFailureKind::InFlight {
@@ -4092,12 +4102,12 @@ impl ResumeFailure {
         }
     }
 
-    pub(crate) fn ended_from_verdict(error: ProviderError) -> Self {
-        Self::from_kind(ResumeFailureKind::Ended(error))
+    pub(crate) fn no_resource_from_verdict(error: ProviderError) -> Self {
+        Self::from_kind(ResumeFailureKind::NoResource(error))
     }
 
-    pub(crate) fn created(created: ObservedCreate, error: ProviderError) -> Self {
-        Self::from_kind(ResumeFailureKind::Created { created, error })
+    pub(crate) fn identifier_reported(identified: IdentifiedCreate, error: ProviderError) -> Self {
+        Self::from_kind(ResumeFailureKind::IdentifierReported { identified, error })
     }
 
     pub(crate) fn in_flight(pending: InFlightCreate, error: ProviderError) -> Self {
@@ -4122,7 +4132,7 @@ impl ResumeFailure {
 ///     error: ProviderError,
 /// ) -> CreateFailure {
 ///     let _issued = attempt.issued(identifier, Sent::AllRequestAttributes);
-///     CreateAttempt::new(ResourceId::new("p", "t", "n")).0.untracked(error)
+///     CreateAttempt::new(ResourceId::new("p", "t", "n")).0.not_created(error)
 /// }
 /// ```
 #[derive(Debug)]
@@ -4152,8 +4162,8 @@ impl CreateAttempt {
         Self::new(id).0
     }
 
-    pub fn untracked(self, error: ProviderError) -> CreateFailure {
-        CreateFailure::from_kind(CreateFailureKind::Untracked(error))
+    pub fn not_created(self, error: ProviderError) -> CreateFailure {
+        CreateFailure::from_kind(CreateFailureKind::NoResource(error))
     }
 
     pub fn outcome_unknown(self, _sent: EgressSent, error: ProviderError) -> CreateFailure {
@@ -4271,9 +4281,13 @@ impl IssuedCreate {
         })
     }
 
-    pub fn failed(self, observation: Observation, error: ProviderError) -> CreateFailure {
-        CreateFailure::from_kind(CreateFailureKind::Created {
-            created: ObservedCreate::new(
+    pub fn identifier_reported(
+        self,
+        observation: Observation,
+        error: ProviderError,
+    ) -> CreateFailure {
+        CreateFailure::from_kind(CreateFailureKind::IdentifierReported {
+            identified: IdentifiedCreate::new(
                 self.id,
                 self.identifier,
                 observation,
@@ -4283,8 +4297,8 @@ impl IssuedCreate {
         })
     }
 
-    pub fn discarded(self, error: ProviderError) -> CreateFailure {
-        CreateFailure::from_kind(CreateFailureKind::Untracked(error))
+    pub fn no_resource(self, error: ProviderError) -> CreateFailure {
+        CreateFailure::from_kind(CreateFailureKind::NoResource(error))
     }
 }
 
@@ -4314,9 +4328,13 @@ impl FinishingCreate {
         })
     }
 
-    pub fn failed(self, observation: Observation, error: ProviderError) -> CreateFailure {
-        CreateFailure::from_kind(CreateFailureKind::Created {
-            created: ObservedCreate::new(
+    pub fn identifier_reported(
+        self,
+        observation: Observation,
+        error: ProviderError,
+    ) -> CreateFailure {
+        CreateFailure::from_kind(CreateFailureKind::IdentifierReported {
+            identified: IdentifiedCreate::new(
                 self.id,
                 self.identifier,
                 observation,
@@ -4326,8 +4344,8 @@ impl FinishingCreate {
         })
     }
 
-    pub fn discarded(self, error: ProviderError) -> CreateFailure {
-        CreateFailure::from_kind(CreateFailureKind::Untracked(error))
+    pub fn no_resource(self, error: ProviderError) -> CreateFailure {
+        CreateFailure::from_kind(CreateFailureKind::NoResource(error))
     }
 }
 
@@ -4394,17 +4412,17 @@ impl Resume {
         }
     }
 
-    pub fn untracked(self, error: ProviderError) -> ResumeFailure {
+    pub fn not_created(self, error: ProviderError) -> ResumeFailure {
         match self {
-            Self::Unissued(attempt) => attempt.untracked(error),
-            Self::Issued(resumed) => resumed.untracked(error),
+            Self::Unissued(attempt) => attempt.not_created(error),
+            Self::Issued(resumed) => resumed.not_created(error),
         }
     }
 
-    pub fn discarded(self, error: ProviderError) -> ResumeFailure {
+    pub fn no_resource(self, error: ProviderError) -> ResumeFailure {
         match self {
-            Self::Unissued(attempt) => attempt.discarded(error),
-            Self::Issued(resumed) => resumed.discarded(error),
+            Self::Unissued(attempt) => attempt.no_resource(error),
+            Self::Issued(resumed) => resumed.no_resource(error),
         }
     }
 }
@@ -4448,12 +4466,12 @@ impl ResumeAttempt {
         self.pending.into_resume_failure(error)
     }
 
-    pub fn untracked(self, error: ProviderError) -> ResumeFailure {
-        ResumeFailure::ended_from_verdict(error)
+    pub fn not_created(self, error: ProviderError) -> ResumeFailure {
+        ResumeFailure::no_resource_from_verdict(error)
     }
 
-    pub fn discarded(self, error: ProviderError) -> ResumeFailure {
-        ResumeFailure::ended_from_verdict(error)
+    pub fn no_resource(self, error: ProviderError) -> ResumeFailure {
+        ResumeFailure::no_resource_from_verdict(error)
     }
 
     pub fn resend(self) -> ResentCreateAttempt {
@@ -4529,22 +4547,26 @@ impl ResumedCreate {
         ))
     }
 
-    pub fn failed(self, observation: Observation, error: ProviderError) -> ResumeFailure {
+    pub fn identifier_reported(
+        self,
+        observation: Observation,
+        error: ProviderError,
+    ) -> ResumeFailure {
         let sent = self.pending.sent();
-        let created = ObservedCreate::new(self.pending.id, self.identifier, observation, sent);
-        ResumeFailure::created(created, error)
+        let identified = IdentifiedCreate::new(self.pending.id, self.identifier, observation, sent);
+        ResumeFailure::identifier_reported(identified, error)
     }
 
     pub fn preserve(self, error: ProviderError) -> ResumeFailure {
         self.pending.into_resume_failure(error)
     }
 
-    pub fn untracked(self, error: ProviderError) -> ResumeFailure {
+    pub fn not_created(self, error: ProviderError) -> ResumeFailure {
         self.preserve(error)
     }
 
-    pub fn discarded(self, error: ProviderError) -> ResumeFailure {
-        ResumeFailure::ended_from_verdict(error)
+    pub fn no_resource(self, error: ProviderError) -> ResumeFailure {
+        ResumeFailure::no_resource_from_verdict(error)
     }
 }
 
@@ -4573,26 +4595,30 @@ impl FinishingResume {
         ))
     }
 
-    pub fn failed(self, observation: Observation, error: ProviderError) -> ResumeFailure {
+    pub fn identifier_reported(
+        self,
+        observation: Observation,
+        error: ProviderError,
+    ) -> ResumeFailure {
         let sent = self.pending.sent();
-        ResumeFailure::created(
-            ObservedCreate::new(self.pending.id, self.identifier, observation, sent),
+        ResumeFailure::identifier_reported(
+            IdentifiedCreate::new(self.pending.id, self.identifier, observation, sent),
             error,
         )
     }
 
-    pub fn discarded(self, error: ProviderError) -> ResumeFailure {
-        ResumeFailure::ended_from_verdict(error)
+    pub fn no_resource(self, error: ProviderError) -> ResumeFailure {
+        ResumeFailure::no_resource_from_verdict(error)
     }
 }
 
-fn observed_from_resume(
+fn identified_from_resume(
     pending: InFlightCreate,
     identifier: AppliedIdentifier,
     observation: CreateObservation,
-) -> ObservedCreate {
+) -> IdentifiedCreate {
     let sent = pending.sent();
-    ObservedCreate::from_create_observation(pending.id, identifier, observation, sent)
+    IdentifiedCreate::from_create_observation(pending.id, identifier, observation, sent)
 }
 
 impl ResumeCreateRequest {
@@ -4665,8 +4691,8 @@ impl ResentCreateAttempt {
         self.previous.into_resume_failure(error)
     }
 
-    pub fn untracked(self, error: ProviderError) -> ResumeFailure {
-        ResumeFailure::ended_from_verdict(error)
+    pub fn not_created(self, error: ProviderError) -> ResumeFailure {
+        ResumeFailure::no_resource_from_verdict(error)
     }
 
     pub fn issued(self, identifier: AppliedIdentifier, sent: Sent) -> ResentIssuedCreate {
@@ -4731,21 +4757,25 @@ impl ResentIssuedCreate {
         ResumeOutcome::resent(self.0.partial(attributes, diagnostic))
     }
 
-    pub fn failed(self, observation: Observation, error: ProviderError) -> ResumeFailure {
+    pub fn identifier_reported(
+        self,
+        observation: Observation,
+        error: ProviderError,
+    ) -> ResumeFailure {
         let IssuedCreate {
             id,
             identifier,
             sent,
             started_at: _started_at,
         } = self.0;
-        ResumeFailure::created(
-            ObservedCreate::new(id, identifier, observation, SentRecord::Request(sent)),
+        ResumeFailure::identifier_reported(
+            IdentifiedCreate::new(id, identifier, observation, SentRecord::Request(sent)),
             error,
         )
     }
 
-    pub fn discarded(self, error: ProviderError) -> ResumeFailure {
-        ResumeFailure::ended_from_verdict(error)
+    pub fn no_resource(self, error: ProviderError) -> ResumeFailure {
+        ResumeFailure::no_resource_from_verdict(error)
     }
 }
 
@@ -4765,20 +4795,24 @@ impl ResentFinishingCreate {
         ResumeOutcome::resent(self.0.partial(attributes, diagnostic))
     }
 
-    pub fn failed(self, observation: Observation, error: ProviderError) -> ResumeFailure {
+    pub fn identifier_reported(
+        self,
+        observation: Observation,
+        error: ProviderError,
+    ) -> ResumeFailure {
         let FinishingCreate {
             id,
             identifier,
             sent,
         } = self.0;
-        ResumeFailure::created(
-            ObservedCreate::new(id, identifier, observation, SentRecord::Request(sent)),
+        ResumeFailure::identifier_reported(
+            IdentifiedCreate::new(id, identifier, observation, SentRecord::Request(sent)),
             error,
         )
     }
 
-    pub fn discarded(self, error: ProviderError) -> ResumeFailure {
-        ResumeFailure::ended_from_verdict(error)
+    pub fn no_resource(self, error: ProviderError) -> ResumeFailure {
+        ResumeFailure::no_resource_from_verdict(error)
     }
 }
 
@@ -4825,11 +4859,11 @@ impl ResentPendingCreate {
         InFlightCreate::from_pending(self.0).into_resume_failure(error)
     }
 
-    pub fn untracked(self, error: ProviderError) -> ResumeFailure {
+    pub fn not_created(self, error: ProviderError) -> ResumeFailure {
         if self.0.identifier().is_some() {
             InFlightCreate::from_pending(self.0).into_resume_failure(error)
         } else {
-            ResumeFailure::ended_from_verdict(error)
+            ResumeFailure::no_resource_from_verdict(error)
         }
     }
 }
@@ -4844,9 +4878,9 @@ pub enum ResentPoll {
 pub struct ResentPollAttempt(PollAttempt);
 
 impl ResentPollAttempt {
-    pub fn untracked(self, error: ProviderError) -> ResumeFailure {
+    pub fn not_created(self, error: ProviderError) -> ResumeFailure {
         let _attempt = self.0;
-        ResumeFailure::ended_from_verdict(error)
+        ResumeFailure::no_resource_from_verdict(error)
     }
 
     pub fn issued(self, identifier: AppliedIdentifier) -> ResentIssuedCreate {
@@ -6465,7 +6499,7 @@ impl Provider for ProviderRouter {
     ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
         match self.get_provider_or_error(id) {
             Ok(provider) => provider.create(id, request, attempt),
-            Err(error) => Box::pin(async move { Err(attempt.untracked(error)) }),
+            Err(error) => Box::pin(async move { Err(attempt.not_created(error)) }),
         }
     }
 
@@ -8928,12 +8962,9 @@ mod tests {
         let id = ResourceId::with_provider_identity("test", "widget", "example", None);
         let failure = CreateAttempt::new(id)
             .0
-            .untracked(ProviderError::api_error("leaf create failure"));
+            .not_created(ProviderError::api_error("leaf create failure"));
 
-        assert_eq!(
-            failure.to_string(),
-            "create failed before it could be tracked"
-        );
+        assert_eq!(failure.to_string(), "create failed and left no resource");
         assert_eq!(
             failure.source().map(ToString::to_string).as_deref(),
             Some("leaf create failure")
@@ -8953,14 +8984,14 @@ mod tests {
             .classify();
 
         let CreateFailureKind::OutcomeUnknown { unknown, error } = failure.into_kind() else {
-            panic!("a sent guest call must not be classified as untracked")
+            panic!("a sent guest call must not be classified as not_created")
         };
         assert_eq!(unknown.id(), &id);
         assert_eq!(error.to_string(), "guest trapped");
     }
 
     #[tokio::test]
-    async fn guest_create_failure_without_egress_is_untracked() {
+    async fn guest_create_failure_without_egress_is_not_created() {
         let id = ResourceId::with_provider_identity("test", "widget", "example", None);
         let failure = CreateAttempt::new(id)
             .0
@@ -8970,8 +9001,8 @@ mod tests {
             .await
             .classify();
 
-        let CreateFailureKind::Untracked(error) = failure.into_kind() else {
-            panic!("a guest call with no dispatched request must remain untracked")
+        let CreateFailureKind::NoResource(error) = failure.into_kind() else {
+            panic!("a guest call with no dispatched request must remain not_created")
         };
         assert_eq!(error.to_string(), "guest trapped");
     }
@@ -8999,7 +9030,7 @@ mod tests {
         drop(pending);
 
         let failure = classification.await.expect("classification task");
-        let CreateFailureKind::Untracked(error) = failure.into_kind() else {
+        let CreateFailureKind::NoResource(error) = failure.into_kind() else {
             panic!("a host-denied pending request must not count as egress")
         };
         assert_eq!(error.to_string(), "malformed guest result");
@@ -9050,7 +9081,7 @@ mod tests {
         drop(attempt.start_guest_call());
         assert!(matches!(
             receiver.drain().as_slice(),
-            [CancelledCreateReport::Untracked]
+            [CancelledCreateReport::NotCreated]
         ));
     }
 
@@ -9058,13 +9089,11 @@ mod tests {
     fn classified_resume_failure_display_is_context_only() {
         use std::error::Error as _;
 
-        let failure =
-            ResumeFailure::ended_from_verdict(ProviderError::not_found("leaf resume failure"));
+        let failure = ResumeFailure::no_resource_from_verdict(ProviderError::not_found(
+            "leaf resume failure",
+        ));
 
-        assert_eq!(
-            failure.to_string(),
-            "resumed create ended without a resource"
-        );
+        assert_eq!(failure.to_string(), "resumed create left no resource");
         assert_eq!(
             failure.source().map(ToString::to_string).as_deref(),
             Some("leaf resume failure")
@@ -9074,23 +9103,23 @@ mod tests {
     #[test]
     fn provider_text_post_create_note_sanitizes_provider_identifier() {
         let raw = format!("\x1b]52;c;ZXZpbA==\x07\x1b[2J{}", "x".repeat(20 * 1024));
-        let created = ObservedCreate::from_create_observation(
+        let identified = IdentifiedCreate::from_create_observation(
             ResourceId::with_provider_identity("test", "widget", "example", None),
             AppliedIdentifier::new(&raw).unwrap(),
             CreateObservation::Unobserved(UnobservedReason::NotFound),
             SentRecord::Request(Sent::AllRequestAttributes),
         );
-        let note = created.post_error_note();
+        let note = identified.post_error_note();
         assert!(!note.contains(['\x1b', '\x07']));
         assert!(note.contains("\\u{1b}"));
         assert!(note.len() <= crate::provider_text::MAX_PROVIDER_TEXT_BYTES);
-        assert_eq!(created.identifier().as_str(), raw);
+        assert_eq!(identified.identifier().as_str(), raw);
     }
 
     #[test]
-    fn created_failure_post_error_note_indents_multiline_reason() {
+    fn create_identified_post_error_note_indents_multiline_reason() {
         let id = ResourceId::with_provider_identity("test", "widget", "example", None);
-        let created = ObservedCreate::from_create_observation(
+        let identified = IdentifiedCreate::from_create_observation(
             id,
             AppliedIdentifier::new("widget-id").expect("fixture identifier is non-empty"),
             CreateObservation::Unobserved(UnobservedReason::ReadFailed(ProviderError::api_error(
@@ -9100,7 +9129,7 @@ mod tests {
         );
 
         assert_eq!(
-            created.post_error_note(),
+            identified.post_error_note(),
             "test reported identifier 'widget-id' but the resource could not be observed; recorded in state so the next plan re-checks it\n  reason: read failed\n  request id: req-123\n  retry later"
         );
     }
@@ -10444,7 +10473,7 @@ mod tests {
             attempt: CreateAttempt,
         ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
             Box::pin(
-                async move { Err(attempt.untracked(ProviderError::internal("not supported"))) },
+                async move { Err(attempt.not_created(ProviderError::internal("not supported"))) },
             )
         }
 
@@ -12113,7 +12142,7 @@ mod tests {
             attempt: CreateAttempt,
         ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
             Box::pin(
-                async move { Err(attempt.untracked(ProviderError::internal("not supported"))) },
+                async move { Err(attempt.not_created(ProviderError::internal("not supported"))) },
             )
         }
 

@@ -111,8 +111,8 @@ pub struct PrepareError {
 }
 
 impl PrepareError {
-    pub fn untracked<T>(self, error: impl FnOnce(String) -> ProviderError) -> CreateVerdict<T> {
-        self.attempt.untracked(error(self.message))
+    pub fn not_created<T>(self, error: impl FnOnce(String) -> ProviderError) -> CreateVerdict<T> {
+        self.attempt.not_created(error(self.message))
     }
 }
 
@@ -197,8 +197,8 @@ impl ProbedCreate {
             .pending::<T>(token, Sent::AllRequestAttributes, poll_after_secs)
     }
 
-    pub fn untracked<T>(self, error: ProviderError) -> CreateVerdict<T> {
-        self.attempt.untracked(error)
+    pub fn not_created<T>(self, error: ProviderError) -> CreateVerdict<T> {
+        self.attempt.not_created(error)
     }
 
     pub fn succeeded<T>(self) -> CreateStep<T> {

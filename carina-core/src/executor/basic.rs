@@ -736,7 +736,7 @@ pub(super) fn process_basic_result<S: Clone>(
             });
             exec.accumulator.insert_published(
                 resource_id,
-                Applied::Observed(std::sync::Arc::new(completed.into_observed_create())),
+                Applied::Observed(std::sync::Arc::new(completed.into_identified_create())),
                 &state,
             );
             BasicEffectCompletion::Succeeded
@@ -946,7 +946,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     }
                 }
                 Err(failure) => match failure.into_kind() {
-                    CreateFailureKind::Untracked(error) => BasicEffectResult::Failure {
+                    CreateFailureKind::NoResource(error) => BasicEffectResult::Failure {
                         failure: EffectFailureKind::provider(error),
                         refresh: None,
                     },
@@ -960,15 +960,15 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                             applied: Applied::CreateOutcomeUnknown(unknown),
                         }
                     }
-                    CreateFailureKind::Created { created, error } => {
-                        let created =
-                            created.with_resolved_desired_attributes(resolved_attrs.clone());
-                        let note = created.post_error_note();
+                    CreateFailureKind::IdentifierReported { identified, error } => {
+                        let identified =
+                            identified.with_resolved_desired_attributes(resolved_attrs.clone());
+                        let note = identified.post_error_note();
                         BasicEffectResult::ClassifiedFailure {
                             failure: EffectFailureKind::provider_with_note(error, note),
                             recovery: None,
                             resource_id: resource.id.clone(),
-                            applied: Applied::Observed(created.into()),
+                            applied: Applied::Observed(identified.into()),
                         }
                     }
                     CreateFailureKind::InFlight { pending, error } => {
@@ -1088,21 +1088,21 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     }
                 }
                 Err(failure) => match failure.into_kind() {
-                    ResumeFailureKind::Ended(error) => BasicEffectResult::ClassifiedFailure {
+                    ResumeFailureKind::NoResource(error) => BasicEffectResult::ClassifiedFailure {
                         failure: EffectFailureKind::provider(error),
                         recovery: None,
                         resource_id: resource.id.clone(),
                         applied: Applied::CreateEnded,
                     },
-                    ResumeFailureKind::Created { created, error } => {
-                        let created =
-                            created.with_resolved_desired_attributes(resolved_attrs.clone());
-                        let note = created.post_error_note();
+                    ResumeFailureKind::IdentifierReported { identified, error } => {
+                        let identified =
+                            identified.with_resolved_desired_attributes(resolved_attrs.clone());
+                        let note = identified.post_error_note();
                         BasicEffectResult::ClassifiedFailure {
                             failure: EffectFailureKind::provider_with_note(error, note),
                             recovery: None,
                             resource_id: resource.id.clone(),
-                            applied: Applied::Observed(created.into()),
+                            applied: Applied::Observed(identified.into()),
                         }
                     }
                     ResumeFailureKind::InFlight { pending, error } => {

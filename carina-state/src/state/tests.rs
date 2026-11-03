@@ -162,14 +162,14 @@ fn resource_state_from_provider_state_for_resource_and_schema_for_test<
 
 fn resource_state_from_observation_for_test<S: Clone>(
     resource: &carina_core::resource::ResolvedResource<S>,
-    created: &ObservedCreate,
+    identified: &IdentifiedCreate,
     existing: Option<&ResourceState>,
     schema: Option<&carina_core::schema::CompiledResourceSchema>,
     preferred_hashes: Option<&PersistedAttributes>,
 ) -> Result<ResourceState, ResourceStateEncodingError> {
     ResourceState::from_observation(
         resource,
-        created,
+        identified,
         existing,
         schema,
         preferred_hashes,
@@ -7823,7 +7823,7 @@ fn nested_write_only_record_hashes_leaf_under_secret_wrapped_struct() {
 #[test]
 fn resumed_persisted_create_records_nested_write_only_sent_values() {
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, CreateAttempt, CreateObservation, ObservedCreate,
+        AppliedIdentifier, AppliedState, CreateAttempt, CreateObservation, IdentifiedCreate,
         PendingToken, PersistedAttributes, Sent,
     };
 
@@ -7858,7 +7858,7 @@ fn resumed_persisted_create_records_nested_write_only_sent_values() {
         )]),
     )
     .unwrap();
-    let created = ObservedCreate::from_in_flight_for_test(
+    let created = IdentifiedCreate::from_in_flight_for_test(
         pending,
         identifier,
         CreateObservation::Observed(observed_state),
@@ -7891,7 +7891,7 @@ fn resumed_persisted_create_records_nested_write_only_sent_values() {
 #[test]
 fn provider_text_partial_create_writeback_preserves_raw_missing_attribute_keys() {
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, CreateAttempt, CreateObservation, ObservedCreate,
+        AppliedIdentifier, AppliedState, CreateAttempt, CreateObservation, IdentifiedCreate,
         PartialReadDiagnostic, PendingToken, PersistedAttributes, Sent,
     };
 
@@ -7914,7 +7914,7 @@ fn provider_text_partial_create_writeback_preserves_raw_missing_attribute_keys()
         assert!(!label.contains('\x1b'));
         assert!(label.len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
         assert_ne!(label, key);
-        let created = ObservedCreate::from_in_flight_for_test(
+        let created = IdentifiedCreate::from_in_flight_for_test(
             pending,
             identifier,
             CreateObservation::Observed(
@@ -7946,7 +7946,7 @@ fn provider_text_partial_create_writeback_preserves_raw_missing_attribute_keys()
 #[test]
 fn resumed_partial_create_records_exact_missing_attributes() {
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, CreateAttempt, CreateObservation, ObservedCreate,
+        AppliedIdentifier, AppliedState, CreateAttempt, CreateObservation, IdentifiedCreate,
         PartialReadDiagnostic, PendingToken, PersistedAttributes, Sent, SentRecord,
     };
 
@@ -7976,7 +7976,7 @@ fn resumed_partial_create_records_exact_missing_attributes() {
         vec!["computed".to_string()],
     )
     .unwrap();
-    let created = ObservedCreate::from_in_flight_for_test(
+    let created = IdentifiedCreate::from_in_flight_for_test(
         pending,
         identifier.clone(),
         CreateObservation::Observed(observed_state),
@@ -8029,14 +8029,17 @@ fn unobserved_not_found_create_records_identifier_and_partial_read() {
     let identifier = AppliedIdentifier::new("application-logs").unwrap();
     let failure = CreateAttempt::for_test(resource.id.clone())
         .issued(identifier.clone(), Sent::only(Vec::<String>::new()))
-        .failed(
+        .identifier_reported(
             Observation::Read(ReadOutcome::not_found(resource.id.clone())),
             ProviderError::api_error("create access denied"),
         );
-    let created = match failure.into_kind() {
-        CreateFailureKind::Created { created, error: _ } => created,
-        CreateFailureKind::Untracked(error) => {
-            panic!("identifier-bearing failure became untracked: {error}")
+    let identified = match failure.into_kind() {
+        CreateFailureKind::IdentifierReported {
+            identified,
+            error: _,
+        } => identified,
+        CreateFailureKind::NoResource(error) => {
+            panic!("identifier-bearing failure became not_created: {error}")
         }
         CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
             "identifier-bearing failure became outcome unknown for {}: {error}",
@@ -8047,7 +8050,7 @@ fn unobserved_not_found_create_records_identifier_and_partial_read() {
         }
     };
 
-    match created.observation() {
+    match identified.observation() {
         CreateObservation::Observed(state) => {
             panic!("not-found read-back became observed: {state:?}")
         }
@@ -8059,9 +8062,14 @@ fn unobserved_not_found_create_records_identifier_and_partial_read() {
         },
     }
 
-    let row =
-        resource_state_from_observation_for_test(&resolved(&resource), &created, None, None, None)
-            .expect("unobserved create must remain persistable");
+    let row = resource_state_from_observation_for_test(
+        &resolved(&resource),
+        &identified,
+        None,
+        None,
+        None,
+    )
+    .expect("unobserved create must remain persistable");
 
     assert_eq!(
         row.identifier().map(AppliedIdentifier::as_str),
@@ -8092,14 +8100,17 @@ fn unobserved_read_failed_observation_records_identifier_and_provider_error_deta
     let read_error_display = read_error.to_string();
     let failure = CreateAttempt::for_test(resource.id.clone())
         .issued(identifier, Sent::only(Vec::<String>::new()))
-        .failed(
+        .identifier_reported(
             Observation::ReadFailed(read_error),
             ProviderError::api_error("create finishing failed"),
         );
-    let created = match failure.into_kind() {
-        CreateFailureKind::Created { created, error: _ } => created,
-        CreateFailureKind::Untracked(error) => {
-            panic!("identifier-bearing failure became untracked: {error}")
+    let identified = match failure.into_kind() {
+        CreateFailureKind::IdentifierReported {
+            identified,
+            error: _,
+        } => identified,
+        CreateFailureKind::NoResource(error) => {
+            panic!("identifier-bearing failure became not_created: {error}")
         }
         CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
             "identifier-bearing failure became outcome unknown for {}: {error}",
@@ -8110,9 +8121,14 @@ fn unobserved_read_failed_observation_records_identifier_and_provider_error_deta
         }
     };
 
-    let row =
-        resource_state_from_observation_for_test(&resolved(&resource), &created, None, None, None)
-            .expect("read-failed create must remain persistable");
+    let row = resource_state_from_observation_for_test(
+        &resolved(&resource),
+        &identified,
+        None,
+        None,
+        None,
+    )
+    .expect("read-failed create must remain persistable");
 
     assert_eq!(
         row.identifier().map(AppliedIdentifier::as_str),
@@ -8127,12 +8143,12 @@ fn unobserved_read_failed_observation_records_identifier_and_provider_error_deta
 }
 
 #[test]
-fn observed_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappers() {
+fn identified_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappers() {
     use carina_core::differ::Diff;
     use carina_core::provider::{
         AppliedIdentifier, AppliedState, CreateAttempt, CreateFailureKind, CreateObservation,
-        Observation, ObservedCreate, PendingToken, PersistedAttributes, ProviderError, ReadOutcome,
-        Sent,
+        IdentifiedCreate, Observation, PendingToken, PersistedAttributes, ProviderError,
+        ReadOutcome, Sent,
     };
     use carina_core::resource::{ConcreteValue, DeferredValue, Resource, State, Value};
     use carina_core::schema::SchemaRegistry;
@@ -8225,7 +8241,7 @@ fn observed_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappe
             )
             .unwrap()
         };
-        let created = if persisted_envelope {
+        let identified = if persisted_envelope {
             let sent_actions = PersistedValue::encode_desired_value(
                 resource
                     .attributes
@@ -8243,7 +8259,7 @@ fn observed_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappe
                 .issued(identifier.clone(), Sent::AllRequestAttributes)
                 .pending(PendingToken::new(format!("resume-{wrapper}")), 1)
                 .persist(PersistedAttributes::default(), sent_secrets);
-            ObservedCreate::from_in_flight_for_test(
+            IdentifiedCreate::from_in_flight_for_test(
                 pending,
                 identifier.clone(),
                 CreateObservation::Observed(observed_state()),
@@ -8251,17 +8267,17 @@ fn observed_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappe
         } else {
             let failed = CreateAttempt::for_test(resource.id.clone())
                 .issued(identifier.clone(), Sent::AllRequestAttributes)
-                .failed(
+                .identifier_reported(
                     Observation::Read(ReadOutcome::found(observed_state())),
                     ProviderError::internal("synthetic post-create finishing failure"),
                 );
             match failed.into_kind() {
-                CreateFailureKind::Created {
-                    created,
+                CreateFailureKind::IdentifierReported {
+                    identified,
                     error: _error,
-                } => created,
-                CreateFailureKind::Untracked(error) => {
-                    panic!("expected an observed create, got untracked failure: {error}")
+                } => identified,
+                CreateFailureKind::NoResource(error) => {
+                    panic!("expected an observed create, got not_created failure: {error}")
                 }
                 CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
                     "expected an observed create, got unknown outcome for {}: {error}",
@@ -8276,7 +8292,7 @@ fn observed_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappe
 
         let row = resource_state_from_observation_for_test(
             &resolved(&resource),
-            &created,
+            &identified,
             None,
             Some(schema.as_schema()),
             None,

@@ -10057,7 +10057,7 @@ fn assignable_narrow_to_anonymous_unconstrained_sink() {
 }
 
 #[test]
-fn assignable_identified_source_without_length_rejected_by_identityless_length_sink() {
+fn assignable_identified_source_without_length_accepted_by_identityless_length_sink() {
     let log_group_arn = AttributeType::refined_string_with_validator(
         TypeIdentity::new(Some("aws"), ["logs", "LogGroup"], "Arn"),
         None,
@@ -10067,9 +10067,9 @@ fn assignable_identified_source_without_length_rejected_by_identityless_length_s
     );
     let at_most_1024 = make_custom_anon_pattern_and_len(None, Some((None, Some(1024))));
 
-    // Rule 8 is unchanged: this source carries identity evidence, so it is a
-    // refined source whose absent length does not prove the sink's bound.
-    assert!(!assignable(&log_group_arn, &at_most_1024));
+    // An identified String source defers the anonymous sink's length check
+    // to the concrete value, even without its own length evidence (#4230).
+    assert!(assignable(&log_group_arn, &at_most_1024));
 }
 
 #[test]
@@ -10228,11 +10228,17 @@ fn assignable_identityless_sink_rule_recurses_through_composite_types() {
     assert!(assignable(&AttributeType::string(), &sink_union));
     let source_union = AttributeType::union(vec![AttributeType::string(), AttributeType::string()]);
     assert!(assignable(&source_union, &constrained));
-    let conflicting_source_union =
+    let identified_source_union =
         AttributeType::union(vec![AttributeType::string(), identified.clone()]);
+    assert!(assignable(&identified_source_union, &constrained));
+    assert!(!assignable(&identified_source_union, &identified));
+    let conflicting_source_union = AttributeType::union(vec![
+        AttributeType::string(),
+        make_custom_anon_pattern_and_len(Some(r"^[0-9]+$"), None),
+    ]);
     assert!(!assignable(&conflicting_source_union, &constrained));
 
-    // The same recursive paths do not create an identity exception.
+    // The same recursive paths do not supply evidence for identified sinks.
     assert!(!assignable(
         &AttributeType::list(AttributeType::string()),
         &AttributeType::list(identified),
@@ -10291,7 +10297,16 @@ fn assignable_int_custom_rejects_string_custom() {
 
 // -- Custom-pattern and Custom-length assignability matrix (#2218) --
 //
-// The rules `is_assignable_to` enforces for `Custom { pattern, length, .. }`:
+// Expected rules for primitive refinement assignability (#2218, #4230):
+//
+// - An identity-bearing String, Int, or Float source may flow into an
+//   anonymous refined sink of the same primitive kind regardless of its own
+//   pattern/length/range evidence. The sink's constraints are checked on the
+//   value when known at plan or before provider dispatch at apply (#3805).
+//   This exception is limited to identity-less sinks. Rule 7's identity and
+//   constraint comparisons and rule 8's identity-less refined-source evidence
+//   comparisons are unchanged, as are Enum and Int-to-Float widening rules.
+// - Between anonymous refined Strings, the conservative rules below remain:
 //
 // - pattern: differing literal strings are conservatively *incompatible*
 //   (we cannot prove a regex is a refinement of another by string compare,
@@ -10305,6 +10320,347 @@ fn assignable_int_custom_rejects_string_custom() {
 //   no length is rejected against a bounded sink. A completely unrefined
 //   source is the rule-10 exception tested below; its concrete value is
 //   validated separately under carina#3805.
+
+#[test]
+fn typed_ref_anonymous_refined_string_assignability_matrix() {
+    let charset = r"^[ -~]+$";
+    let sinks = [
+        ("length", make_custom_anon_len(10, 40)),
+        (
+            "charset",
+            make_custom_anon_pattern_and_len(Some(charset), None),
+        ),
+        (
+            "charset and length",
+            make_custom_anon_pattern_and_len(Some(charset), Some((Some(10), Some(40)))),
+        ),
+    ];
+    let mut rejected = Vec::new();
+    for (pattern_name, pattern) in [
+        ("absent", None),
+        ("equal", Some(charset)),
+        ("different", Some(r"^arn:")),
+    ] {
+        for (length_name, length) in [
+            ("absent", None),
+            ("narrow", Some((Some(20), Some(30)))),
+            ("wide", Some((Some(1), Some(1024)))),
+        ] {
+            let source = AttributeType::refined_string(
+                Some(TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Arn")),
+                pattern.map(|p| crate::schema::CompiledPattern::try_new(p).unwrap()),
+                length,
+                None,
+            );
+            for (sink_name, sink) in &sinks {
+                if !assignable(&source, sink) {
+                    rejected.push(format!(
+                        "cannot assign aws.Arn(pattern={pattern_name}, length={length_name}) to anonymous String({sink_name})"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(rejected.is_empty(), "{}", rejected.join("\n"));
+}
+
+#[test]
+fn typed_ref_anonymous_refined_string_list_is_assignable() {
+    let source = AttributeType::list(make_custom("VpcId", AttributeType::string()));
+    let sink = AttributeType::list(make_custom_anon_pattern_and_len(
+        Some(r"^[ -~]+$"),
+        Some((Some(1), Some(1024))),
+    ));
+    assert!(
+        assignable(&source, &sink),
+        "cannot assign List<VpcId> to List<String(pattern: ^[ -~]+$, len: 1..=1024)>"
+    );
+}
+
+#[test]
+fn typed_ref_anonymous_refined_string_ref_definition_is_assignable() {
+    let source_defs = std::collections::BTreeMap::from([(
+        "Output".to_string(),
+        make_custom("VpcId", AttributeType::string()),
+    )]);
+    let sink_defs = std::collections::BTreeMap::from([(
+        "Input".to_string(),
+        make_custom_anon_pattern_and_len(Some(r"^[ -~]+$"), Some((Some(1), Some(1024)))),
+    )]);
+    assert!(
+        assignable_with_defs(
+            &AttributeType::ref_("Output".to_string()),
+            &source_defs,
+            &AttributeType::ref_("Input".to_string()),
+            &sink_defs,
+        ),
+        "cannot assign Ref<Output = VpcId> to Ref<Input = anonymous refined String>"
+    );
+}
+
+#[test]
+fn typed_ref_anonymous_refined_string_preserves_named_identity_rules() {
+    let named = |segments: &[&str], length| {
+        AttributeType::refined_string(
+            Some(TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn")),
+            None,
+            length,
+            None,
+        )
+    };
+    let arn = named(&[], None);
+    let role_arn = named(&["iam", "Role"], None);
+    assert!(
+        !assignable(&arn, &role_arn),
+        "rule 7 requires Role identity evidence"
+    );
+    assert!(assignable(&role_arn, &arn));
+
+    let narrow = named(&[], Some((Some(10), Some(40))));
+    let wide = named(&[], Some((Some(1), Some(1024))));
+    assert!(
+        !assignable(&wide, &narrow),
+        "rule 7 still requires named length containment"
+    );
+    assert!(!assignable(&arn, &narrow));
+    assert!(assignable(&narrow, &wide));
+}
+
+#[test]
+fn typed_ref_anonymous_refined_string_preserves_anonymous_refinement_rules() {
+    let alpha = make_custom_anon_pattern_and_len(Some(r"^[a-z]+$"), None);
+    let digits = make_custom_anon_pattern_and_len(Some(r"^[0-9]+$"), None);
+    assert!(
+        !assignable(&alpha, &digits),
+        "rule 8 requires equal anonymous patterns"
+    );
+    assert!(!assignable(&digits, &alpha));
+    assert!(
+        !assignable(
+            &make_custom_anon_len(1, 1024),
+            &make_custom_anon_len(10, 40)
+        ),
+        "rule 8 still requires anonymous length containment"
+    );
+}
+
+#[test]
+fn declared_string_outputs_preserve_incompatible_anonymous_refined_evidence() {
+    use crate::binding_index::{BindingIndex, RefType, RefTypeAssignabilityError};
+    use crate::parser::{ProviderContext, TypeExpr, parse};
+    use crate::resource::{
+        AuthoredAccessPath, AuthoredCompositionCall, AuthoredCompositionCallPath,
+        AuthoredLiveComposition, AuthoredLiveCompositionAttribute,
+        AuthoredLiveCompositionSignature, RelativeBindingName, ResolvedResourceId,
+    };
+
+    let evidence = make_custom_anon_len(1, 1024);
+    let sink = make_custom_anon_len(10, 40);
+    assert!(assignable(&AttributeType::string(), &sink));
+    assert!(!assignable(&evidence, &sink));
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        PatternResourceSchema::new("source.Node")
+            .attribute(
+                PatternAttributeSchema::provider_populated(
+                    "value",
+                    PatternAttributeType::refined_string(
+                        None,
+                        None,
+                        Some((Some(1), Some(1024))),
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let mut parsed = parse("let source = test.source.Node { }", &context).unwrap();
+    for (binding, forwarded_binding, forwarded_attribute) in
+        [("inner", "source", "value"), ("m", "inner", "x")]
+    {
+        parsed.compositions.push(AuthoredLiveComposition {
+            id: ResolvedResourceId::new(crate::resource::ResourceId::with_identity(
+                "_virtual", binding,
+            )),
+            declaration: Default::default(),
+            signature: AuthoredLiveCompositionSignature {
+                arguments: Default::default(),
+                attributes: indexmap::indexmap! {
+                    "x".to_string() => AuthoredLiveCompositionAttribute::from_value(
+                        ParserValue::resource_ref(forwarded_binding.to_string(), forwarded_attribute, vec![]),
+                        Some(crate::validation::resolve_consumer_static_type_for_signature(
+                            &TypeExpr::String,
+                            &context,
+                        )),
+                    ),
+                },
+                pending_constraints: Vec::new(),
+            },
+            binding: Some(RelativeBindingName::new(binding)),
+            dependency_bindings: Default::default(),
+            module_name: "test_module".to_string(),
+            instance: binding.to_string(),
+            call_path: AuthoredCompositionCallPath::direct(AuthoredCompositionCall {
+                id: crate::parser::ModuleCallId::test_dummy_in(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+                ),
+                module_name: "test_module".to_string(),
+                binding: Some(RelativeBindingName::new(binding)),
+                instance: binding.to_string(),
+                module_source: None,
+                module_directory: None,
+                loop_origin: None,
+            }),
+            quoted_string_attrs: Default::default(),
+        });
+    }
+
+    let bindings = BindingIndex::from_parsed(&parsed, &schemas, &context);
+    for binding in ["inner", "m"] {
+        let path = AuthoredAccessPath::new(binding, "x");
+        let RefType::Typed(resolved) = bindings.ref_type(&path) else {
+            panic!("declared String output must resolve with forwarded evidence");
+        };
+        assert_eq!(resolved.display_type_name(), "String");
+        assert!(
+            resolved
+                .is_assignable_to_sink(TypeInSchema::schemaless(&evidence), &bindings)
+                .is_ok()
+        );
+        let Err(RefTypeAssignabilityError::Mismatch(mismatch)) =
+            resolved.is_assignable_to_sink(TypeInSchema::schemaless(&sink), &bindings)
+        else {
+            panic!("rule 8 must reject the forwarded evidence after each String boundary");
+        };
+        assert_eq!(mismatch.actual_type_name(), "String(len: 1..=1024)");
+        assert_eq!(mismatch.declared_type_name(), Some("String"));
+        assert_eq!(
+            mismatch.origin_description((&path).into()),
+            format!("from {binding}.x, declared String"),
+        );
+    }
+}
+
+#[test]
+fn typed_ref_anonymous_refined_string_rejects_enum_sink() {
+    let source = make_custom("VpcId", AttributeType::string());
+    let sink = AttributeType::enum_(
+        TypeIdentity::bare("Status"),
+        Some(vec!["Enabled".to_string(), "Disabled".to_string()]),
+        vec![],
+        None,
+        None,
+    );
+    assert!(
+        !assignable(&source, &sink),
+        "named Strings do not prove Enum membership"
+    );
+}
+
+#[test]
+fn typed_ref_anonymous_refined_int_defers_range_constraints() {
+    for range in [
+        None,
+        Some((Some(30), Some(60))),
+        Some((Some(0), Some(100))),
+        Some((Some(100), Some(200))),
+    ] {
+        let source = AttributeType::refined_int(Some(TypeIdentity::bare("Count")), range);
+        let sink = AttributeType::refined_int(None, Some((Some(25), Some(75))));
+        let actual = assignable(&source, &sink);
+        assert!(
+            actual,
+            "identified Int with range {range:?} must defer the sink's range check; assignability was {actual}"
+        );
+    }
+}
+
+#[test]
+fn typed_ref_anonymous_refined_float_defers_range_constraints() {
+    for range in [
+        None,
+        Some((Some(30.0), Some(60.0))),
+        Some((Some(0.0), Some(100.0))),
+        Some((Some(100.0), Some(200.0))),
+    ] {
+        let source = AttributeType::refined_float(Some(TypeIdentity::bare("Ratio")), range);
+        let sink = AttributeType::refined_float(None, Some((Some(25.0), Some(75.0))));
+        let actual = assignable(&source, &sink);
+        assert!(
+            actual,
+            "identified Float with range {range:?} must defer the sink's range check; assignability was {actual}"
+        );
+    }
+}
+
+#[test]
+fn typed_ref_anonymous_refined_numeric_preserves_identity_range_and_primitive_rules() {
+    let named_int = AttributeType::refined_int(Some(TypeIdentity::bare("Count")), None);
+    let other_int = AttributeType::refined_int(Some(TypeIdentity::bare("Port")), None);
+    assert!(
+        !assignable(&named_int, &other_int),
+        "rule 7 still requires compatible identities"
+    );
+
+    let wide_int = AttributeType::refined_int(None, Some((Some(0), Some(100))));
+    let narrow_int = AttributeType::refined_int(None, Some((Some(25), Some(75))));
+    assert!(
+        !assignable(&wide_int, &narrow_int),
+        "rule 8 still requires identity-less source range containment"
+    );
+
+    let named_float = AttributeType::refined_float(Some(TypeIdentity::bare("Ratio")), None);
+    let ranged_named_int = AttributeType::refined_int(
+        Some(TypeIdentity::bare("Count")),
+        Some((Some(0), Some(100))),
+    );
+    for source in [&named_int, &ranged_named_int] {
+        assert!(
+            !assignable(source, &named_float),
+            "Int to Float widening still requires compatible identities"
+        );
+    }
+
+    let narrow_float = AttributeType::refined_float(None, Some((Some(25.0), Some(75.0))));
+    assert!(
+        !assignable(&wide_int, &narrow_float),
+        "Int to Float widening still requires identity-less source range containment"
+    );
+    assert!(assignable(&named_int, &narrow_float));
+    assert!(
+        assignable(&ranged_named_int, &narrow_float),
+        "identified ranged Int must defer the identity-less Float sink's range check"
+    );
+
+    for source in [AttributeType::float(), named_float.clone()] {
+        assert!(
+            !assignable(&source, &narrow_int),
+            "Float must not narrow to Int"
+        );
+    }
+
+    let status = AttributeType::enum_(
+        TypeIdentity::bare("Status"),
+        Some(vec!["Enabled".to_string(), "Disabled".to_string()]),
+        vec![],
+        None,
+        None,
+    );
+    let refined_string = make_custom_anon_len(1, 1024);
+    for source in [named_int, named_float] {
+        for sink in [&status, &AttributeType::string(), &refined_string] {
+            assert!(
+                !assignable(&source, sink),
+                "identified numerics must not assign to Enum or String: {source:?} -> {sink:?}"
+            );
+        }
+    }
+}
 
 #[test]
 fn assignable_anon_pattern_equal_strings_compatible() {

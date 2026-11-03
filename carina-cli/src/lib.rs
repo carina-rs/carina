@@ -241,7 +241,7 @@ pub(crate) fn fixture_resource_state_metadata(
 
 #[cfg(test)]
 enum FixtureCreateResult {
-    Untracked {
+    NotCreated {
         error: carina_core::provider::ProviderError,
     },
     Pending {
@@ -315,7 +315,7 @@ impl carina_core::provider::Provider for FixtureCreateProvider {
             .expect("fixture create is dispatched once");
         Box::pin(async move {
             match result {
-                FixtureCreateResult::Untracked { error } => Err(attempt.untracked(error)),
+                FixtureCreateResult::NotCreated { error } => Err(attempt.not_created(error)),
                 FixtureCreateResult::Pending {
                     token,
                     identifier,
@@ -341,7 +341,7 @@ impl carina_core::provider::Provider for FixtureCreateProvider {
                         identifier.clone(),
                         attributes,
                     );
-                    Err(attempt.issued(identifier, sent).failed(
+                    Err(attempt.issued(identifier, sent).identifier_reported(
                         carina_core::provider::Observation::Read(
                             carina_core::provider::ReadOutcome::found(state),
                         ),
@@ -430,7 +430,9 @@ fn dispatch_fixture_create(
 ) -> carina_core::provider::CreateFailure {
     let mut resource = carina_core::resource::Resource::from_id(id.clone());
     let sent = match &result {
-        FixtureCreateResult::Untracked { .. } => &carina_core::provider::Sent::AllRequestAttributes,
+        FixtureCreateResult::NotCreated { .. } => {
+            &carina_core::provider::Sent::AllRequestAttributes
+        }
         FixtureCreateResult::Pending { sent, .. } | FixtureCreateResult::Observed { sent, .. } => {
             sent
         }
@@ -495,12 +497,12 @@ pub(crate) fn fixture_in_flight_create(
             pending,
             error: _error,
         } => pending,
-        carina_core::provider::CreateFailureKind::Created {
-            created: _created,
+        carina_core::provider::CreateFailureKind::IdentifierReported {
+            identified: _identified,
             error,
-        } => panic!("pending fixture was classified created: {error}"),
-        carina_core::provider::CreateFailureKind::Untracked(error) => {
-            panic!("pending fixture was classified untracked: {error}")
+        } => panic!("pending fixture was classified identifier-reported: {error}"),
+        carina_core::provider::CreateFailureKind::NoResource(error) => {
+            panic!("pending fixture was classified not_created: {error}")
         }
         carina_core::provider::CreateFailureKind::OutcomeUnknown { error, .. } => {
             panic!("pending fixture was classified outcome unknown: {error}")
@@ -550,12 +552,12 @@ pub(crate) fn fixture_repend_in_flight_create(
                     pending,
                     error: _error,
                 } => pending,
-                carina_core::provider::ResumeFailureKind::Created {
-                    created: _created,
+                carina_core::provider::ResumeFailureKind::IdentifierReported {
+                    identified: _identified,
                     error,
-                } => panic!("re-pend fixture was classified created: {error}"),
-                carina_core::provider::ResumeFailureKind::Ended(error) => {
-                    panic!("re-pend fixture was classified ended: {error}")
+                } => panic!("re-pend fixture was classified identifier-reported: {error}"),
+                carina_core::provider::ResumeFailureKind::NoResource(error) => {
+                    panic!("re-pend fixture was classified no-resource: {error}")
                 }
             }
         },
@@ -563,11 +565,11 @@ pub(crate) fn fixture_repend_in_flight_create(
 }
 
 #[cfg(test)]
-pub(crate) fn fixture_observed_create(
+pub(crate) fn fixture_identified_create(
     id: &carina_core::resource::ResourceId,
     attributes: std::collections::HashMap<String, carina_core::resource::Value>,
     sent: carina_core::provider::Sent,
-) -> carina_core::provider::ObservedCreate {
+) -> carina_core::provider::IdentifiedCreate {
     let failure = dispatch_fixture_create(
         id,
         FixtureCreateResult::Observed {
@@ -577,16 +579,16 @@ pub(crate) fn fixture_observed_create(
         },
     );
     match failure.into_kind() {
-        carina_core::provider::CreateFailureKind::Created {
-            created,
+        carina_core::provider::CreateFailureKind::IdentifierReported {
+            identified,
             error: _error,
-        } => created,
+        } => identified,
         carina_core::provider::CreateFailureKind::InFlight {
             pending: _pending,
             error,
         } => panic!("observed fixture remained pending: {error}"),
-        carina_core::provider::CreateFailureKind::Untracked(error) => {
-            panic!("observed fixture was classified untracked: {error}")
+        carina_core::provider::CreateFailureKind::NoResource(error) => {
+            panic!("observed fixture was classified not_created: {error}")
         }
         carina_core::provider::CreateFailureKind::OutcomeUnknown { error, .. } => {
             panic!("observed fixture was classified outcome unknown: {error}")

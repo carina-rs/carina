@@ -7836,7 +7836,7 @@ let sg = aws.ec2.SecurityGroup {
 }
 
 #[test]
-fn declared_string_output_preserves_forwarded_evidence_in_lsp() {
+fn declared_string_output_accepts_forwarded_arn_at_identityless_sink_in_lsp() {
     let engine = module_boundary_identity_engine();
     let tmp = tempfile::tempdir().unwrap();
     let module = tmp.path().join("module");
@@ -7865,19 +7865,15 @@ let zone = aws.route53.HostedZone {
     std::fs::write(root.join("main.crn"), source).unwrap();
 
     let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", source);
-    let mismatch = diagnostics.iter().find(|diagnostic| {
-        diagnostic.message.contains("Type mismatch")
-            && diagnostic.message.contains("expected String(len: ..=1024)")
-            && diagnostic.message.contains("got aws.logs.LogGroup.Arn")
-            && diagnostic.message.contains("from m.x, declared String")
-    });
+    let unexpected_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| !diagnostic.message.starts_with("Unused let binding"))
+        .map(|diagnostic| &diagnostic.message)
+        .collect();
     assert!(
-        mismatch.is_some(),
-        "LSP must retain the same inferred evidence as validate: {:?}",
-        diagnostics
-            .iter()
-            .map(|diagnostic| &diagnostic.message)
-            .collect::<Vec<_>>(),
+        unexpected_diagnostics.is_empty(),
+        "LSP must accept forwarded Arn evidence at an identity-less String sink, matching validate (#4230): {:?}",
+        unexpected_diagnostics,
     );
 }
 

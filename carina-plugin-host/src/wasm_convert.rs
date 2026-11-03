@@ -1235,39 +1235,41 @@ pub(crate) type DecodedResumeStep =
     proto::ResumeStep<HashMap<String, CoreValue>, CorePartialReadDiagnostic, proto::PendingToken>;
 pub(crate) type DecodedResumeVerdict =
     proto::ResumeVerdict<CoreReadOutcome, proto::PendingToken, CoreProviderError>;
-type DecodedCreatedState = DecodedIssued<(proto::AppliedIdentifier, HashMap<String, CoreValue>)>;
+type DecodedIdentifiedState = DecodedIssued<(proto::AppliedIdentifier, HashMap<String, CoreValue>)>;
 
 /// Result of decoding a create-bearing WIT value after its provider
 /// identifier may have become known.
 ///
 /// `Err` is reserved for values that never yielded a valid identifier. Once
 /// the identifier decodes, malformed attributes or observations can only
-/// become `CreatedReadFailed`, so callers cannot accidentally downgrade the
-/// resource to an untracked create.
+/// become `IdentifierReportedReadFailed`, so callers cannot accidentally downgrade the
+/// resource to a not-created create.
 #[derive(Debug)]
 pub(crate) enum DecodedIssued<T> {
     Decoded(T),
-    CreatedReadFailed(CreatedReadDecodeFailure),
+    IdentifierReportedReadFailed(IdentifierReportedReadDecodeFailure),
 }
 
 impl<T> DecodedIssued<T> {
     fn map<U>(self, map: impl FnOnce(T) -> U) -> DecodedIssued<U> {
         match self {
             Self::Decoded(value) => DecodedIssued::Decoded(map(value)),
-            Self::CreatedReadFailed(failure) => DecodedIssued::CreatedReadFailed(failure),
+            Self::IdentifierReportedReadFailed(failure) => {
+                DecodedIssued::IdentifierReportedReadFailed(failure)
+            }
         }
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct CreatedReadDecodeFailure {
+pub(crate) struct IdentifierReportedReadDecodeFailure {
     identifier: proto::AppliedIdentifier,
     sent: Option<proto::Sent>,
     declared_error: Option<CoreProviderError>,
     decode_error: WasmAppliedStateDecodeError,
 }
 
-impl CreatedReadDecodeFailure {
+impl IdentifierReportedReadDecodeFailure {
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -1316,7 +1318,7 @@ fn decode_created_attributes(
     id: &CoreResourceId,
     sent: Option<proto::Sent>,
     declared_error: Option<CoreProviderError>,
-) -> Result<DecodedCreatedState, WasmAppliedStateDecodeError> {
+) -> Result<DecodedIdentifiedState, WasmAppliedStateDecodeError> {
     let wit::AppliedState {
         identifier,
         attributes,
@@ -1324,16 +1326,18 @@ fn decode_created_attributes(
     let identifier = decode_create_identifier(identifier, id)?;
     match wit_to_core_value_map(&attributes) {
         Ok(attributes) => Ok(DecodedIssued::Decoded((identifier, attributes))),
-        Err(source) => Ok(DecodedIssued::CreatedReadFailed(CreatedReadDecodeFailure {
-            identifier,
-            sent,
-            declared_error,
-            decode_error: WasmAppliedStateDecodeError::attributes(
-                AppliedStateOperation::Create,
-                id,
-                source,
-            ),
-        })),
+        Err(source) => Ok(DecodedIssued::IdentifierReportedReadFailed(
+            IdentifierReportedReadDecodeFailure {
+                identifier,
+                sent,
+                declared_error,
+                decode_error: WasmAppliedStateDecodeError::attributes(
+                    AppliedStateOperation::Create,
+                    id,
+                    source,
+                ),
+            },
+        )),
     }
 }
 
@@ -1524,35 +1528,37 @@ pub(crate) fn wit_to_core_create_step(
     }
 }
 
-fn wit_to_core_created_failure(
-    created: wit::CreatedFailure,
+fn wit_to_core_create_identified(
+    identified: wit::CreateIdentified,
     id: &CoreResourceId,
 ) -> Result<
-    DecodedIssued<proto::CreatedFailure<CoreReadOutcome, CoreProviderError>>,
+    DecodedIssued<proto::CreateIdentified<CoreReadOutcome, CoreProviderError>>,
     WasmAppliedStateDecodeError,
 > {
-    let wit::CreatedFailure {
+    let wit::CreateIdentified {
         identifier,
         read,
         sent,
         error,
-    } = created;
+    } = identified;
     let identifier = decode_create_identifier(identifier, id)?;
     let sent = wit_to_core_sent(sent);
     let error = wit_to_core_provider_error(error);
     match wit_to_core_observation(read, id) {
-        Ok(observation) => Ok(DecodedIssued::Decoded(proto::CreatedFailure {
+        Ok(observation) => Ok(DecodedIssued::Decoded(proto::CreateIdentified {
             identifier,
             observation,
             sent,
             error,
         })),
-        Err(decode_error) => Ok(DecodedIssued::CreatedReadFailed(CreatedReadDecodeFailure {
-            identifier,
-            sent: Some(sent),
-            declared_error: Some(error),
-            decode_error,
-        })),
+        Err(decode_error) => Ok(DecodedIssued::IdentifierReportedReadFailed(
+            IdentifierReportedReadDecodeFailure {
+                identifier,
+                sent: Some(sent),
+                declared_error: Some(error),
+                decode_error,
+            },
+        )),
     }
 }
 
@@ -1561,13 +1567,15 @@ pub(crate) fn wit_to_core_create_verdict(
     id: &CoreResourceId,
 ) -> Result<DecodedIssued<DecodedCreateVerdict>, WasmAppliedStateDecodeError> {
     match verdict {
-        wit::CreateVerdict::Untracked(error) => Ok(DecodedIssued::Decoded(
-            proto::CreateVerdict::Untracked(wit_to_core_provider_error(error)),
+        wit::CreateVerdict::NotCreated(error) => Ok(DecodedIssued::Decoded(
+            proto::CreateVerdict::NotCreated(wit_to_core_provider_error(error)),
         )),
-        wit::CreateVerdict::Created(created) => wit_to_core_created_failure(created, id)
-            .map(|decoded| decoded.map(proto::CreateVerdict::Created)),
-        wit::CreateVerdict::Discarded(error) => Ok(DecodedIssued::Decoded(
-            proto::CreateVerdict::Discarded(wit_to_core_provider_error(error)),
+        wit::CreateVerdict::IdentifierReported(identified) => {
+            wit_to_core_create_identified(identified, id)
+                .map(|decoded| decoded.map(proto::CreateVerdict::IdentifierReported))
+        }
+        wit::CreateVerdict::NoResource(error) => Ok(DecodedIssued::Decoded(
+            proto::CreateVerdict::NoResource(wit_to_core_provider_error(error)),
         )),
         wit::CreateVerdict::InFlight(in_flight) => {
             let wit::CreateInFlight { pending, error } = in_flight;
@@ -1587,16 +1595,18 @@ pub(crate) fn wit_to_core_poll_verdict(
     id: &CoreResourceId,
 ) -> Result<DecodedIssued<DecodedPollVerdict>, WasmAppliedStateDecodeError> {
     match verdict {
-        wit::PollVerdict::Untracked(error) => Ok(DecodedIssued::Decoded(
-            proto::PollVerdict::Untracked(wit_to_core_provider_error(error)),
+        wit::PollVerdict::NotCreated(error) => Ok(DecodedIssued::Decoded(
+            proto::PollVerdict::NotCreated(wit_to_core_provider_error(error)),
         )),
-        wit::PollVerdict::Created(created) => wit_to_core_created_failure(created, id)
-            .map(|decoded| decoded.map(proto::PollVerdict::Created)),
-        wit::PollVerdict::Discarded(error) => Ok(DecodedIssued::Decoded(
-            proto::PollVerdict::Discarded(wit_to_core_provider_error(error)),
+        wit::PollVerdict::IdentifierReported(identified) => {
+            wit_to_core_create_identified(identified, id)
+                .map(|decoded| decoded.map(proto::PollVerdict::IdentifierReported))
+        }
+        wit::PollVerdict::NoResource(error) => Ok(DecodedIssued::Decoded(
+            proto::PollVerdict::NoResource(wit_to_core_provider_error(error)),
         )),
-        wit::PollVerdict::Undetermined(error) => Ok(DecodedIssued::Decoded(
-            proto::PollVerdict::Undetermined(wit_to_core_provider_error(error)),
+        wit::PollVerdict::Unchanged(error) => Ok(DecodedIssued::Decoded(
+            proto::PollVerdict::Unchanged(wit_to_core_provider_error(error)),
         )),
         wit::PollVerdict::InFlight(in_flight) => {
             let wit::CreateInFlight { pending, error } = in_flight;
@@ -1655,32 +1665,34 @@ pub(crate) fn wit_to_core_resume_step(
     }
 }
 
-fn wit_to_core_resumed_failure(
-    created: wit::ResumedFailure,
+fn wit_to_core_resume_identified(
+    identified: wit::ResumeIdentified,
     id: &CoreResourceId,
 ) -> Result<
-    DecodedIssued<proto::ResumedFailure<CoreReadOutcome, CoreProviderError>>,
+    DecodedIssued<proto::ResumeIdentified<CoreReadOutcome, CoreProviderError>>,
     WasmAppliedStateDecodeError,
 > {
-    let wit::ResumedFailure {
+    let wit::ResumeIdentified {
         identifier,
         read,
         error,
-    } = created;
+    } = identified;
     let identifier = decode_create_identifier(identifier, id)?;
     let error = wit_to_core_provider_error(error);
     match wit_to_core_observation(read, id) {
-        Ok(observation) => Ok(DecodedIssued::Decoded(proto::ResumedFailure {
+        Ok(observation) => Ok(DecodedIssued::Decoded(proto::ResumeIdentified {
             identifier,
             observation,
             error,
         })),
-        Err(decode_error) => Ok(DecodedIssued::CreatedReadFailed(CreatedReadDecodeFailure {
-            identifier,
-            sent: None,
-            declared_error: Some(error),
-            decode_error,
-        })),
+        Err(decode_error) => Ok(DecodedIssued::IdentifierReportedReadFailed(
+            IdentifierReportedReadDecodeFailure {
+                identifier,
+                sent: None,
+                declared_error: Some(error),
+                decode_error,
+            },
+        )),
     }
 }
 
@@ -1689,16 +1701,18 @@ pub(crate) fn wit_to_core_resume_verdict(
     id: &CoreResourceId,
 ) -> Result<DecodedIssued<DecodedResumeVerdict>, WasmAppliedStateDecodeError> {
     match verdict {
-        wit::ResumeVerdict::Untracked(error) => Ok(DecodedIssued::Decoded(
-            proto::ResumeVerdict::Untracked(wit_to_core_provider_error(error)),
+        wit::ResumeVerdict::NotCreated(error) => Ok(DecodedIssued::Decoded(
+            proto::ResumeVerdict::NotCreated(wit_to_core_provider_error(error)),
         )),
-        wit::ResumeVerdict::Created(created) => wit_to_core_resumed_failure(created, id)
-            .map(|decoded| decoded.map(proto::ResumeVerdict::Created)),
-        wit::ResumeVerdict::Discarded(error) => Ok(DecodedIssued::Decoded(
-            proto::ResumeVerdict::Discarded(wit_to_core_provider_error(error)),
+        wit::ResumeVerdict::IdentifierReported(identified) => {
+            wit_to_core_resume_identified(identified, id)
+                .map(|decoded| decoded.map(proto::ResumeVerdict::IdentifierReported))
+        }
+        wit::ResumeVerdict::NoResource(error) => Ok(DecodedIssued::Decoded(
+            proto::ResumeVerdict::NoResource(wit_to_core_provider_error(error)),
         )),
-        wit::ResumeVerdict::Undetermined(error) => Ok(DecodedIssued::Decoded(
-            proto::ResumeVerdict::Undetermined(wit_to_core_provider_error(error)),
+        wit::ResumeVerdict::Unchanged(error) => Ok(DecodedIssued::Decoded(
+            proto::ResumeVerdict::Unchanged(wit_to_core_provider_error(error)),
         )),
         wit::ResumeVerdict::InFlight(in_flight) => {
             let wit::ResumeInFlight { pending, error } = in_flight;
@@ -2513,20 +2527,20 @@ mod tests {
         .expect("create in-flight payload must decode");
         let create = match create {
             DecodedIssued::Decoded(verdict) => verdict,
-            DecodedIssued::CreatedReadFailed(failure) => {
-                panic!("in-flight create became a created-read failure: {failure:?}")
+            DecodedIssued::IdentifierReportedReadFailed(failure) => {
+                panic!("in-flight create became an identifier-reported read failure: {failure:?}")
             }
         };
         let create = match create {
             proto::CreateVerdict::InFlight(in_flight) => in_flight,
-            proto::CreateVerdict::Untracked(error) => {
-                panic!("in-flight create became untracked: {error}")
+            proto::CreateVerdict::NotCreated(error) => {
+                panic!("in-flight create became not_created: {error}")
             }
-            proto::CreateVerdict::Created(created) => {
-                panic!("in-flight create became created: {created:?}")
+            proto::CreateVerdict::IdentifierReported(identified) => {
+                panic!("in-flight create became identifier-reported: {identified:?}")
             }
-            proto::CreateVerdict::Discarded(error) => {
-                panic!("in-flight create became discarded: {error}")
+            proto::CreateVerdict::NoResource(error) => {
+                panic!("in-flight create became no_resource: {error}")
             }
         };
         let proto::CreateInFlight { pending, error } = create;
@@ -2550,23 +2564,23 @@ mod tests {
         .expect("poll in-flight payload must decode");
         let poll = match poll {
             DecodedIssued::Decoded(verdict) => verdict,
-            DecodedIssued::CreatedReadFailed(failure) => {
-                panic!("in-flight poll became a created-read failure: {failure:?}")
+            DecodedIssued::IdentifierReportedReadFailed(failure) => {
+                panic!("in-flight poll became an identifier-reported read failure: {failure:?}")
             }
         };
         let poll = match poll {
             proto::PollVerdict::InFlight(in_flight) => in_flight,
-            proto::PollVerdict::Untracked(error) => {
-                panic!("in-flight poll became untracked: {error}")
+            proto::PollVerdict::NotCreated(error) => {
+                panic!("in-flight poll became not_created: {error}")
             }
-            proto::PollVerdict::Created(created) => {
-                panic!("in-flight poll became created: {created:?}")
+            proto::PollVerdict::IdentifierReported(identified) => {
+                panic!("in-flight poll became identifier-reported: {identified:?}")
             }
-            proto::PollVerdict::Discarded(error) => {
-                panic!("in-flight poll became discarded: {error}")
+            proto::PollVerdict::NoResource(error) => {
+                panic!("in-flight poll became no_resource: {error}")
             }
-            proto::PollVerdict::Undetermined(error) => {
-                panic!("in-flight poll became undetermined: {error}")
+            proto::PollVerdict::Unchanged(error) => {
+                panic!("in-flight poll became unchanged: {error}")
             }
         };
         let proto::CreateInFlight { pending, error } = poll;
@@ -2589,23 +2603,23 @@ mod tests {
         .expect("resume in-flight payload must decode");
         let resume = match resume {
             DecodedIssued::Decoded(verdict) => verdict,
-            DecodedIssued::CreatedReadFailed(failure) => {
-                panic!("in-flight resume became a created-read failure: {failure:?}")
+            DecodedIssued::IdentifierReportedReadFailed(failure) => {
+                panic!("in-flight resume became an identifier-reported read failure: {failure:?}")
             }
         };
         let resume = match resume {
             proto::ResumeVerdict::InFlight(in_flight) => in_flight,
-            proto::ResumeVerdict::Untracked(error) => {
-                panic!("in-flight resume became untracked: {error}")
+            proto::ResumeVerdict::NotCreated(error) => {
+                panic!("in-flight resume became not_created: {error}")
             }
-            proto::ResumeVerdict::Created(created) => {
-                panic!("in-flight resume became created: {created:?}")
+            proto::ResumeVerdict::IdentifierReported(identified) => {
+                panic!("in-flight resume became identifier-reported: {identified:?}")
             }
-            proto::ResumeVerdict::Discarded(error) => {
-                panic!("in-flight resume became discarded: {error}")
+            proto::ResumeVerdict::NoResource(error) => {
+                panic!("in-flight resume became no_resource: {error}")
             }
-            proto::ResumeVerdict::Undetermined(error) => {
-                panic!("in-flight resume became undetermined: {error}")
+            proto::ResumeVerdict::Unchanged(error) => {
+                panic!("in-flight resume became unchanged: {error}")
             }
             proto::ResumeVerdict::Resent(verdict) => {
                 panic!("in-flight resume became resent: {verdict:?}")
@@ -2692,9 +2706,9 @@ mod tests {
     }
 
     #[test]
-    fn created_verdict_decode_failure_after_identifier_is_recoverable() {
+    fn identifier_reported_verdict_decode_failure_after_identifier_is_recoverable() {
         let id = CoreResourceId::with_identity("test", "example");
-        let verdict = wit::CreateVerdict::Created(wit::CreatedFailure {
+        let verdict = wit::CreateVerdict::IdentifierReported(wit::CreateIdentified {
             identifier: "created-id".to_string(),
             read: wit::Observation::Read(wit::ReadOutcome::Found(wit::AppliedState {
                 identifier: "created-id".to_string(),
@@ -2706,7 +2720,7 @@ mod tests {
 
         assert!(
             wit_to_core_create_verdict(verdict, &id).is_ok(),
-            "a valid created identifier must survive an observation decode failure"
+            "a valid reported identifier must survive an observation decode failure"
         );
     }
 

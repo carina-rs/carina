@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_create_is_untracked() {
+    fn rejected_create_is_not_created() {
         let provider = WidgetProvider {
             api: api_failing_with(vec![ApiError::Rejected("size too large".into())]),
         };
@@ -138,7 +138,7 @@ mod tests {
         let verdict =
             carina_plugin_sdk::dispatch_create(&provider, &resource_id(), create_request("a", 99))
                 .expect_err("a rejected create must not succeed");
-        assert!(matches!(*verdict, WireCreateVerdict::Untracked(_)));
+        assert!(matches!(*verdict, WireCreateVerdict::NotCreated(_)));
     }
 
     #[test]
@@ -274,7 +274,7 @@ mod tests {
 }
 ```
 
-Test the classification as well as the happy path. Tests like `create_with_unknown_outcome_is_retried_with_the_same_client_token` and `rejected_retry_preserves_the_continuation` are what keep a later change from turning an ambiguous failure into `untracked` and losing track of a real resource.
+Test the classification as well as the happy path. Tests like `create_with_unknown_outcome_is_retried_with_the_same_client_token` and `rejected_retry_preserves_the_continuation` are what keep a later change from turning an ambiguous failure into `not-created` and losing track of a real resource.
 
 ## Acceptance tests
 

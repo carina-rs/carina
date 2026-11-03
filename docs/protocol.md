@@ -1,15 +1,35 @@
 # Provider protocol versions
 
-The current protocol and minimum supported provider protocol are both **19**.
+The current protocol and minimum supported provider protocol are both **20**.
 
 | Protocol version | Minimum provider protocol | Change |
 |------------------|---------------------------|--------|
+| 20 | 20 | Create-outcome names describe cloud knowledge; identifier-bearing payloads are `create-identified` and `resume-identified`. |
 | 19 | 19 | Per-leaf desired normalization with scoped, exactly-once deferred handles. |
 | 18 | 18 | Typed reference schema leaves and batched plan-time reference resolution. |
 | 17 | 17 | Required list element policy; portable canonical-value uniqueness validation. |
 | 16 | 16 | Required identity mode field; declared identity hashing and nested create-only diffing. |
 | 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
 | 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
+
+## Version 20
+
+Protocol v20 renames create, poll, and resume verdicts to state what is known
+about the resource in the cloud. The WIT cases are `not-created`,
+`identifier-reported`, `no-resource`, `unchanged`, `in-flight`, and `resent`
+(where applicable); identifier-bearing records are `create-identified` and
+`resume-identified`. A reported identifier does not establish resource existence:
+read-back may find the resource, return not found, or fail. `unchanged` preserves
+the previous continuation and any known identifier.
+
+`not-created` is produced from an unissued attempt and means nothing was created:
+no request left the provider, or the cloud rejected it without creating anything.
+An unissued attempt has no reported identifier; a request may already have been
+sent. `no-resource` means no cloud resource remains, even if one existed earlier.
+
+This is a rename with revised failure messages. Verdict handling, state and
+saved-plan tags, and state and plan versions are unchanged. Hosts and providers
+must both use protocol v20; providers built for earlier versions must rebuild.
 
 ## Version 19
 
@@ -200,7 +220,7 @@ not a create-only change. Adding an element with an authored create-only leaf
 is a create-only change and therefore replaces the resource.
 
 The WIT world is unchanged in v16; the incompatible representation is in the
-schema JSON records. These requirements remain in protocol v19.
+schema JSON records. These requirements remain in protocol v20.
 
 ## Version 15
 
@@ -233,13 +253,13 @@ into the protocol's pending record.
 Guest decoding keeps the host's `create-progress` variant intact through
 create poll and resume dispatch. Phase validation rejects only the backward
 pairing: host progress is `reading-back`, but the token is in operation phase.
-Create poll and resume return `Undetermined` for that pairing, preserving the
+Create poll and resume return `unchanged` for that pairing, preserving the
 previous host continuation; update decoding rejects the same backward pairing.
 Operation progress with a read-back token is accepted when an identifier is
 available. The guest receives the identifier-bearing handle, and its next
 pending or preserved result reports read-back progress from the token.
 An identifier-less read-back token is permanently invalid: dispatch returns
-terminal `Untracked` with code `READ_BACK_WITHOUT_IDENTIFIER` before calling
+terminal `not-created` with code `READ_BACK_WITHOUT_IDENTIFIER` before calling
 the provider. These SDK guarantees use the existing WIT variants and do not
 change the protocol version.
 
@@ -440,7 +460,7 @@ Create, poll, and resume verdicts gain an `in-flight` arm. It carries the new
 continuation together with the error that stopped the current step. The host
 validates and preserves that continuation through the same typestate path as
 an ordinary `pending` result, including any identifier learned during the
-call. Provider-facing SDK handles use `preserve`; `undetermined` remains a wire
+call. Provider-facing SDK handles use `preserve`; `unchanged` remains a wire
 classification used by guest glue when it cannot decode the request or token
 and therefore has no newer continuation.
 
@@ -510,10 +530,13 @@ version is 11.
 Protocol v10's SDK and native core adapters make create recovery an explicit
 typestate protocol. Initial create, poll, and resume calls receive different,
 opaque attempt handles. Once a provider calls `issued`, that handle has been
-consumed and the remaining API cannot report that nothing reached the cloud.
+consumed and the remaining API cannot report `not-created`. That verdict means
+nothing was created: no request left the provider, or the cloud rejected it
+without creating anything. An unissued attempt has no reported identifier; it
+may already have sent a request.
 There is deliberately no `From<ProviderError>` into an SDK or core create
-verdict, so provider code must classify every failure as untracked, created,
-discarded, undetermined, or still pending. The protocol crate itself contains
+verdict, so provider code must classify every failure as `not-created`, `identifier-reported`,
+`no-resource`, `unchanged`, or still pending. The protocol crate itself contains
 only plain wire records and enums; it does not claim those typestate guarantees.
 
 Create steps carry a redacted `PendingToken`, an optional non-empty provider
@@ -526,17 +549,19 @@ the accepted request's `Sent` set.
 The driver keeps provider verdicts separate from call failures and returns the
 last pending record on poll failure or budget exhaustion. WIT adds
 `poll-create` and `resume-create` steps and verdicts. A guest-side request or
-token decode failure is `undetermined`, so upgrading a provider cannot erase a
-continuation it no longer understands. Guest-side encoding failures are
-classified by call phase and by what the provider established: an initial
-unissued pending token is `untracked`; an initial issued pending token is
-`created` with a failed read; a pending-token failure during either an issued
-or unissued poll is `undetermined`, preserving the previous continuation; and a
-pending-token failure during resume is likewise `undetermined`, preserving the
+token decode failure is `unchanged`, so upgrading a provider cannot erase a
+continuation it no longer understands. The original v10 guest-side encoding
+failures were classified by call phase and by what the provider established: an initial
+unissued pending token is `not-created`; an initial issued pending token is
+`identifier-reported` with a failed read; a pending-token failure during either an issued
+or unissued poll is `unchanged`, preserving the previous continuation; and a
+pending-token failure during resume is likewise `unchanged`, preserving the
 starting envelope. If the attributes of a successful or partially successful
-result cannot be encoded, the result is `created` with a failed read because
+result cannot be encoded, the result is `identifier-reported` with a failed read because
 the provider already reported its identifier. The SDK's JSON-RPC/native-binary
 transport has been removed; v10 providers use the component-model export.
+Current initial-create encoding failures are classified from host-recorded
+egress; an unissued attempt alone does not establish `not-created`.
 
 State format 15 stores managed current instances as one tagged value:
 `none`, `applied`, `create_in_flight`, or `missing_identifier`. An in-flight

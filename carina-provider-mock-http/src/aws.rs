@@ -142,7 +142,9 @@ impl CarinaProvider for MockHttpAwsProvider {
     ) -> Result<CreateStep<Self::CreateToken>, CreateVerdict<Self::CreateToken>> {
         let probe =
             PreparedCreate::prepare(request, attempt, ProbeKind::AwsWorld).map_err(|error| {
-                error.untracked(|message| Self::error(id, ProviderErrorKind::InvalidInput, message))
+                error.not_created(|message| {
+                    Self::error(id, ProviderErrorKind::InvalidInput, message)
+                })
             })?;
         Ok(probe.send().succeeded())
     }

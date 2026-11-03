@@ -10,8 +10,8 @@ use carina_core::resource::ResourceId;
 pub enum CreateMode {
     #[default]
     Success,
-    Untracked,
-    Created,
+    NotCreated,
+    IdentifierReported,
     Pending,
     MalformedPending,
 }
@@ -21,10 +21,10 @@ pub enum ResumeMode {
     #[default]
     Resumed,
     Resend,
-    CreatedReadFailed,
-    Discarded,
-    Untracked,
-    Undetermined,
+    IdentifierReportedReadFailed,
+    NoResource,
+    NotCreated,
+    Unchanged,
     MalformedPending,
     Pending,
     Unsupported(String),
@@ -190,8 +190,8 @@ pub fn decode_controls(environment: &carina_core::EnvironmentSnapshot) -> Decode
             reference_table: text("REFERENCE_TABLE"),
             reference_echo_alias: text("REFERENCE_ECHO_ALIAS").as_deref() == Some("true"),
             create_mode: match text("CREATE_MODE").as_deref() {
-                Some("untracked") => CreateMode::Untracked,
-                Some("created") => CreateMode::Created,
+                Some("not_created") => CreateMode::NotCreated,
+                Some("identifier_reported") => CreateMode::IdentifierReported,
                 Some("pending") => CreateMode::Pending,
                 Some("malformed_pending") => CreateMode::MalformedPending,
                 Some(_) | None => CreateMode::Success,
@@ -199,10 +199,10 @@ pub fn decode_controls(environment: &carina_core::EnvironmentSnapshot) -> Decode
             resume_mode: match text("RESUME_MODE").as_deref() {
                 Some("resumed") | None => ResumeMode::Resumed,
                 Some("resend") => ResumeMode::Resend,
-                Some("created_read_failed") => ResumeMode::CreatedReadFailed,
-                Some("discarded") => ResumeMode::Discarded,
-                Some("untracked") => ResumeMode::Untracked,
-                Some("undetermined") => ResumeMode::Undetermined,
+                Some("identifier_reported_read_failed") => ResumeMode::IdentifierReportedReadFailed,
+                Some("no_resource") => ResumeMode::NoResource,
+                Some("not_created") => ResumeMode::NotCreated,
+                Some("unchanged") => ResumeMode::Unchanged,
                 Some("malformed_pending") => ResumeMode::MalformedPending,
                 Some("pending") => ResumeMode::Pending,
                 Some(unsupported) => ResumeMode::Unsupported(unsupported.to_owned()),
@@ -272,7 +272,7 @@ mod tests {
             ),
             ("REFERENCE_ECHO_ALIAS", "true"),
             ("STATE_FILE", "state.json"),
-            ("CREATE_MODE", "created"),
+            ("CREATE_MODE", "identifier_reported"),
             ("RESUME_MODE", "resend"),
             ("CREATE_SENT", "name,password"),
             ("CREATE_FAIL_FOR", "test.resource.a"),
@@ -323,7 +323,7 @@ mod tests {
                     "{\"alias/example\":{\"Ok\":{\"Resolved\":\"key/example\"}}}".to_owned()
                 ),
                 reference_echo_alias: true,
-                create_mode: CreateMode::Created,
+                create_mode: CreateMode::IdentifierReported,
                 resume_mode: ResumeMode::Resend,
                 create_sent: SentAttributes::Only(
                     ["name".to_owned(), "password".to_owned()].into()
