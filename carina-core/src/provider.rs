@@ -7612,7 +7612,7 @@ impl CustomTypeDispatchTable {
     }
 }
 
-fn bridge_text_to_typed_value(
+pub(crate) fn bridge_text_to_typed_value(
     scalar_kind: RefinedScalarKind,
     canonical_text: &str,
 ) -> Result<Value, String> {
@@ -7776,6 +7776,34 @@ impl<F> crate::parser::CustomTypeResolver for FactoryCustomTypeResolver<F>
 where
     F: ProviderFactorySource,
 {
+    fn projection_declaration(
+        &self,
+        projection: &crate::parser::ResolvedSchemaType,
+    ) -> Result<AttributeType, crate::parser::CustomTypeValidationError> {
+        use crate::parser::CustomTypeValidationError;
+        let owner = projection.provider_names().next().expect("nonempty owners");
+        let missing = || CustomTypeValidationError::MissingDeclaration {
+            owner: owner.into(),
+            identity: projection.identity().clone(),
+        };
+        let mut candidates = self
+            .index
+            .get(owner)
+            .and_then(|index| index.declarations.get(projection.identity()))
+            .ok_or_else(missing)?
+            .iter()
+            .filter(|declaration| projection.matches_projection_declaration(declaration));
+        let selected = candidates.next().ok_or_else(missing)?;
+        if candidates.any(|declaration| !same_scalar_callbacks(selected, declaration)) {
+            return Err(CustomTypeValidationError::Rejected {
+                owner: owner.into(),
+                identity: projection.identity().clone(),
+                message: "exact schema projection has ambiguous callback provenance".into(),
+            });
+        }
+        Ok(selected.clone())
+    }
+
     fn annotation_declaration(
         &self,
         owned: &crate::parser::OwnedTypeIdentity,
@@ -7874,6 +7902,24 @@ where
         }
         Ok(selected.map(|(_, _, declaration)| declaration))
     }
+}
+
+// Fingerprints retain callback presence, but executable callbacks have no
+// portable identity. Duplicate catalog occurrences are safe only when they
+// retain the same host callbacks, including an enum's base declaration.
+fn same_scalar_callbacks(left: &AttributeType, right: &AttributeType) -> bool {
+    let same_callback = match (local_custom_validator(left), local_custom_validator(right)) {
+        (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+        (None, None) => true,
+        _ => false,
+    };
+    same_callback
+        && match (left.raw_shape(), right.raw_shape()) {
+            (RawShape::Enum { base: left, .. }, RawShape::Enum { base: right, .. }) => {
+                same_scalar_callbacks(left, right)
+            }
+            _ => true,
+        }
 }
 
 impl<F> crate::parser::ProviderCustomTypeSource for FactoryCustomTypeResolver<F>

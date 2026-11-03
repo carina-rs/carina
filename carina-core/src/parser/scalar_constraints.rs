@@ -1,9 +1,6 @@
 //! Scalar declaration evidence retained by resolved schema annotations.
 
-use std::{
-    cmp::Ordering,
-    hash::{Hash, Hasher},
-};
+use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
 
@@ -11,7 +8,7 @@ use crate::schema::{AttrTypeKind, CompiledAttributeType, CompiledPattern, Refine
 
 /// Unlike an Option field, an endpoint cannot silently default to unbounded
 /// when a wire record omits it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 enum Endpoint<T> {
     Unbounded,
     Inclusive(T),
@@ -32,7 +29,7 @@ impl<T> From<Option<T>> for Endpoint<T> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct Bounds<T> {
     min: Endpoint<T>,
     max: Endpoint<T>,
@@ -70,7 +67,7 @@ impl<T: Copy + Ord> Bounds<T> {
     }
 }
 
-/// A finite float with stable equality, ordering, and hashing for catalog keys.
+/// A finite float with stable equality and ordering for scalar bounds.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(transparent)]
 struct FiniteFloat(f64);
@@ -106,11 +103,6 @@ impl Ord for FiniteFloat {
         self.0.total_cmp(&other.0)
     }
 }
-impl Hash for FiniteFloat {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.to_bits().hash(state);
-    }
-}
 
 #[derive(Debug, Clone)]
 struct DeclarationPattern(CompiledPattern);
@@ -131,11 +123,6 @@ impl Ord for DeclarationPattern {
         self.0.as_str().cmp(other.0.as_str())
     }
 }
-impl Hash for DeclarationPattern {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.as_str().hash(state);
-    }
-}
 impl Serialize for DeclarationPattern {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.0.as_str())
@@ -151,13 +138,13 @@ impl<'de> Deserialize<'de> for DeclarationPattern {
 
 /// The effective conjunction. Every field is mandatory on the wire, including
 /// unbounded endpoints and the marker distinguishing an empty intersection.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) struct ScalarConstraints {
     scalar: ScalarConstraintKind,
     empty_intersection: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 enum ScalarConstraintKind {
     String {
         length: Bounds<u64>,
@@ -267,15 +254,6 @@ impl ScalarConstraints {
     pub(super) fn materialize(&self, owned: &super::ResolvedSchemaType) -> CompiledAttributeType {
         let binding = crate::schema::RefinementBinding::Annotation(owned.clone());
         self.materialize_with_binding(binding)
-    }
-
-    pub(super) fn materialize_projection(
-        &self,
-        owned: &super::OwnedTypeIdentity,
-    ) -> CompiledAttributeType {
-        self.materialize_with_binding(crate::schema::RefinementBinding::MetadataOnly(Some(
-            owned.identity().clone(),
-        )))
     }
 
     fn materialize_with_binding(

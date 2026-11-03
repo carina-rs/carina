@@ -14659,36 +14659,6 @@ impl fmt::Display for SchemaRegistryError {
 impl std::error::Error for SchemaRegistryError {}
 
 impl SchemaRegistry {
-    /// Owner-bearing scalar declarations observed in admitted resource
-    /// schemas. This is evidence for a particular identity, not a complete
-    /// provider catalog: config-only declarations may be absent here.
-    pub(crate) fn known_custom_type_declarations(
-        &self,
-        identity: &TypeIdentity,
-    ) -> Vec<crate::parser::ResolvedSchemaType> {
-        let mut declarations = Vec::new();
-        for (owner, _, _, schema) in self.iter() {
-            let mut collect = |candidate: &TypeIdentity, declaration: &CompiledAttributeType| {
-                if candidate == identity {
-                    declarations.push(
-                        crate::parser::ResolvedSchemaType::from_schema_declaration(
-                            owner,
-                            declaration,
-                        )
-                        .expect("admitted identified declarations carry scalar kinds"),
-                    );
-                }
-            };
-            for attribute in schema.effective_attributes() {
-                visit_identified_declarations(attribute.field_type(), &mut collect);
-            }
-            for definition in schema.parts().defs.values() {
-                visit_identified_declarations(definition, &mut collect);
-            }
-        }
-        declarations.into_iter().collect()
-    }
-
     pub fn new() -> Self {
         Self::default()
     }

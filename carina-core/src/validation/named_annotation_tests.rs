@@ -503,6 +503,244 @@ fn config_only_declarations_join_resource_declarations_and_truly_unbounded_types
 }
 
 #[test]
+fn review_projection_serde_rebinds_exact_callbacks_and_enum_semantics() {
+    let callback = DraftType::refined_string_with_validator(
+        identity(),
+        None,
+        Some((Some(1), Some(128))),
+        crate::schema::legacy_validator(|_| Err("exact callback rejected".into())),
+        None,
+    );
+    let enumeration = DraftType::enum_(identity(), Some(vec!["VALID".into()]), vec![], None, None);
+    let dynamic_enum = DraftType::enum_(
+        identity(),
+        None,
+        vec![],
+        Some(crate::schema::legacy_validator(|_| {
+            Err("exact enum callback rejected".into())
+        })),
+        None,
+    );
+    for draft in [callback, enumeration, dynamic_enum] {
+        let snapshot = snapshot(vec![("p", vec![draft, string(8, 64, None)])]);
+        let exact = TypeExpr::SchemaType {
+            owned: crate::parser::ResolvedSchemaType::from_schema_declaration(
+                "p",
+                declaration(&snapshot, "p", 0),
+            )
+            .unwrap(),
+        };
+        let restored: TypeExpr =
+            serde_json::from_value(serde_json::to_value(&exact).unwrap()).unwrap();
+        for ty in [&exact, &restored] {
+            assert!(
+                typecheck::check_type_expr_value(
+                    ty,
+                    &text("INVALID"),
+                    snapshot.provider_context(),
+                    typecheck::TypecheckInference::Unavailable,
+                )
+                .require_provider_schemas()
+                .is_err(),
+                "exact validation must survive serde: {ty:?}"
+            );
+        }
+        let missing = self::snapshot(vec![("p", vec![string(1, 128, None)])]);
+        assert!(
+            typecheck::check_type_expr_value(
+                &restored,
+                &text("VALID"),
+                missing.provider_context(),
+                typecheck::TypecheckInference::Unavailable,
+            )
+            .require_provider_schemas()
+            .is_err(),
+            "a missing exact declaration cannot become a scalar"
+        );
+    }
+}
+
+#[test]
+fn review_projection_serde_keeps_reference_semantics_and_rejects_ambiguous_callbacks() {
+    let reference =
+        DraftType::reference(identity(), Some("^ref-".into()), Some((Some(1), Some(64))));
+    let references = snapshot(vec![("p", vec![reference])]);
+    let exact = inference::attribute_type_to_type_expr(declaration(&references, "p", 0), "p");
+    let wire = serde_json::to_value(&exact).unwrap();
+    let restored: TypeExpr = serde_json::from_value(wire.clone()).unwrap();
+    let TypeExpr::SchemaType { owned } = &restored else {
+        panic!("exact projection")
+    };
+    assert!(matches!(
+        owned
+            .resolve_projection(references.provider_context().as_provider_context())
+            .unwrap()
+            .unwrap()
+            .raw_shape(),
+        RawShape::Reference { .. }
+    ));
+    let mut missing_provenance = wire;
+    missing_provenance["SchemaType"]["owned"]
+        .as_object_mut()
+        .unwrap()
+        .remove("projection_fingerprint");
+    assert!(serde_json::from_value::<TypeExpr>(missing_provenance).is_err());
+    let unloaded = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    assert!(matches!(
+        owned.resolve_projection(&unloaded),
+        Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded)
+    ));
+
+    let callback = |reject| {
+        DraftType::refined_string_with_validator(
+            identity(),
+            None,
+            Some((Some(1), Some(64))),
+            crate::schema::legacy_validator(move |_| {
+                if reject {
+                    Err("rejected".into())
+                } else {
+                    Ok(())
+                }
+            }),
+            None,
+        )
+    };
+    let ambiguous = snapshot(vec![("p", vec![callback(false), callback(true)])]);
+    let exact = inference::attribute_type_to_type_expr(declaration(&ambiguous, "p", 0), "p");
+    let restored: TypeExpr = serde_json::from_value(serde_json::to_value(exact).unwrap()).unwrap();
+    let error = typecheck::check_type_expr_value(
+        &restored,
+        &text("VALID"),
+        ambiguous.provider_context(),
+        typecheck::TypecheckInference::Unavailable,
+    )
+    .require_provider_schemas()
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("ambiguous callback provenance"),
+        "{error}"
+    );
+}
+
+#[test]
+fn review_enum_witness_constraints_apply_to_canonical_api_spelling() {
+    use crate::resource::{CanonicalEnumValue, ConcreteValue, RawEnumIdentifier};
+    let strict = snapshot(vec![("p", vec![string(4, 4, Some("^[A-Z]+$"))])]);
+    let enumeration = DraftType::enum_(
+        identity(),
+        Some(vec!["GOOD".into()]),
+        vec![("GOOD".into(), "long_alias".into())],
+        None,
+        None,
+    );
+    let snapshot = snapshot(vec![("p", vec![enumeration])]);
+    let ty = annotation(&strict);
+    for value in [
+        Value::Concrete(ConcreteValue::EnumIdentifier(RawEnumIdentifier::parse(
+            format!("{}.long_alias", identity()),
+        ))),
+        Value::Concrete(ConcreteValue::CanonicalEnum(
+            CanonicalEnumValue::new_for_test(identity(), "GOOD"),
+        )),
+    ] {
+        typecheck::check_type_expr_value(
+            &ty,
+            &value,
+            snapshot.provider_context(),
+            typecheck::TypecheckInference::Unavailable,
+        )
+        .require_provider_schemas()
+        .unwrap();
+    }
+}
+
+#[test]
+fn review_enum_values_validate_canonical_scalar_against_retained_witness() {
+    use crate::resource::{CanonicalEnumValue, ConcreteValue, RawEnumIdentifier};
+    let open_enum = |base| DraftType::enum_with_base(identity(), base, None, vec![], None, None);
+    for base in [string(2, 4, None), string(1, 32, Some("^[A-Z]+$"))] {
+        let strict = snapshot(vec![("p", vec![open_enum(base)])]);
+        let lax = snapshot(vec![("p", vec![open_enum(DraftType::string())])]);
+        let ty = annotation(&strict);
+        let ty: TypeExpr = serde_json::from_value(serde_json::to_value(ty).unwrap()).unwrap();
+        for (spelling, accepted) in [("GOOD", true), ("invalid", false)] {
+            for value in [
+                Value::Concrete(ConcreteValue::EnumIdentifier(RawEnumIdentifier::parse(
+                    format!("{}.{}", identity(), spelling),
+                ))),
+                Value::Concrete(ConcreteValue::CanonicalEnum(
+                    CanonicalEnumValue::new_for_test(identity(), spelling),
+                )),
+            ] {
+                let result = typecheck::check_type_expr_value(
+                    &ty,
+                    &value,
+                    lax.provider_context(),
+                    typecheck::TypecheckInference::Unavailable,
+                )
+                .require_provider_schemas();
+                assert_eq!(result.is_ok(), accepted, "{value:?}: {result:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn review_unloaded_resolution_waits_for_provider_config_declarations() {
+    let snapshot = snapshot_with_config(
+        vec![("p", vec![string(1, 128, None)])],
+        BTreeMap::from([("config_name".into(), string(8, 64, None))]),
+    );
+    let unloaded = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let ty = TypeExpr::try_from(identity()).unwrap();
+    let preliminary =
+        crate::parser::resolve_type_expr_from_schemas(&ty, snapshot.schema_registry(), &unloaded)
+            .unwrap();
+    assert!(matches!(preliminary, TypeExpr::UnloadedSchemaType(_)));
+    let resolved = crate::parser::resolve_type_expr_from_schemas(
+        &preliminary,
+        snapshot.schema_registry(),
+        snapshot.provider_context().as_provider_context(),
+    )
+    .unwrap();
+    assert_eq!(resolved, annotation(&snapshot));
+    assert!(
+        lift_type_expr(&resolved)
+            .unwrap()
+            .validate(&text("A".repeat(80)))
+            .is_err()
+    );
+}
+
+#[test]
+fn review_nonfinite_float_endpoints_are_rejected_during_schema_admission() {
+    for endpoint in [f64::NEG_INFINITY, f64::INFINITY, f64::NAN] {
+        for range in [(Some(endpoint), None), (None, Some(endpoint))] {
+            let schema = ResourceSchema::new("Values").attribute(
+                AttributeSchema::optional(
+                    "value",
+                    DraftType::refined_float(Some(identity()), Some(range)),
+                )
+                .build(),
+            );
+            assert!(
+                schema.validate().is_err(),
+                "admitted nonfinite range {range:?}"
+            );
+            assert!(
+                ValidatedConfigSchema::validate(BTreeMap::from([(
+                    "value".into(),
+                    DraftType::refined_float(Some(identity()), Some(range))
+                ),]))
+                .is_err(),
+                "admitted nonfinite config range {range:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn annotation_resolution_rejects_missing_owners_and_defers_partial_catalogs() {
     use crate::parser::{CustomTypeResolver, CustomTypeValidationError, SchemaTypeOwner};
     let snapshot = snapshot(vec![("p", vec![string(1, 64, None)])]);

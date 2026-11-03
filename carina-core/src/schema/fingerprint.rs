@@ -98,6 +98,20 @@ impl ResourceSchema {
     }
 }
 
+impl AttributeType {
+    /// Portable provenance for rebinding an exact scalar projection. The
+    /// encoding retains enum/reference semantics and callback presence; the
+    /// catalog must still reject indistinguishable declarations with different
+    /// executable callbacks.
+    pub(crate) fn declaration_fingerprint(&self) -> String {
+        let mut encoder = CanonicalEncoder::default();
+        encoder.string(ENCODING_VERSION);
+        encoder.string("exact-scalar-projection-v1");
+        encode_attribute_type(&mut encoder, self);
+        hex::encode(Sha256::digest(encoder.finish()))
+    }
+}
+
 impl OwnerBoundResourceSchema<'_> {
     /// SHA-256 of resource semantics, owner reference forms, and declared edges.
     pub fn semantic_fingerprint(self) -> String {

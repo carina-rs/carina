@@ -249,6 +249,7 @@ impl OwnedTypeIdentity {
                 .unwrap(),
             owned: self,
             projection: None,
+            projection_fingerprint: None,
         }))
     }
 
@@ -310,6 +311,9 @@ struct ResolvedScalarDeclaration {
     owned: OwnedTypeIdentity,
     constraints: super::scalar_constraints::ScalarConstraints,
     projection: Option<AttributeType>,
+    // Portable declaration provenance. Decoding retains this key until the
+    // catalog can rebind the exact host declaration, including its callback.
+    projection_fingerprint: Option<String>,
 }
 
 // Type equality compares portable scalar evidence. The exact host declaration
@@ -333,6 +337,7 @@ struct ResolvedSchemaTypeWire {
     owned: OwnedTypeIdentity,
     constraints: super::scalar_constraints::ScalarConstraints,
     origin: ResolvedDeclarationOrigin,
+    projection_fingerprint: Option<String>,
 }
 
 impl serde::Serialize for ResolvedSchemaType {
@@ -340,11 +345,12 @@ impl serde::Serialize for ResolvedSchemaType {
         ResolvedSchemaTypeWire {
             owned: self.0.owned.clone(),
             constraints: self.0.constraints.clone(),
-            origin: if self.0.projection.is_some() {
+            origin: if self.0.projection_fingerprint.is_some() {
                 ResolvedDeclarationOrigin::Projection
             } else {
                 ResolvedDeclarationOrigin::Annotation
             },
+            projection_fingerprint: self.0.projection_fingerprint.clone(),
         }
         .serialize(serializer)
     }
@@ -361,21 +367,39 @@ impl<'de> serde::Deserialize<'de> for ResolvedSchemaType {
         wire.constraints
             .validate_record()
             .map_err(serde::de::Error::custom)?;
-        let projection = match wire.origin {
-            ResolvedDeclarationOrigin::Annotation => None,
+        match wire.origin {
+            ResolvedDeclarationOrigin::Annotation => {
+                if wire.projection_fingerprint.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "an annotation cannot carry exact projection provenance",
+                    ));
+                }
+            }
             ResolvedDeclarationOrigin::Projection => {
                 if !wire.owned.owners().is_singleton() {
                     return Err(serde::de::Error::custom(
                         "an exact schema projection must have one owner",
                     ));
                 }
-                Some(wire.constraints.materialize_projection(&wire.owned))
+                if !wire
+                    .projection_fingerprint
+                    .as_ref()
+                    .is_some_and(|fingerprint| {
+                        fingerprint.len() == 64
+                            && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                {
+                    return Err(serde::de::Error::custom(
+                        "an exact schema projection requires its declaration fingerprint",
+                    ));
+                }
             }
-        };
+        }
         Ok(Self(std::sync::Arc::new(ResolvedScalarDeclaration {
             owned: wire.owned,
             constraints: wire.constraints,
-            projection,
+            projection: None,
+            projection_fingerprint: wire.projection_fingerprint,
         })))
     }
 }
@@ -398,6 +422,7 @@ impl ResolvedSchemaType {
                 declaration,
             )?,
             projection: Some(declaration.clone()),
+            projection_fingerprint: Some(declaration.declaration_fingerprint()),
         })))
     }
 
@@ -421,16 +446,37 @@ impl ResolvedSchemaType {
                 .with_merged_owners(self.owners().union(other.owners())),
             constraints,
             projection: None,
+            projection_fingerprint: None,
         }))
     }
 
     pub(crate) fn into_annotation(mut self) -> Self {
         std::sync::Arc::make_mut(&mut self.0).projection = None;
+        std::sync::Arc::make_mut(&mut self.0).projection_fingerprint = None;
         self
     }
 
-    pub(crate) fn projection(&self) -> Option<&AttributeType> {
-        self.0.projection.as_ref()
+    pub(crate) fn resolve_projection(
+        &self,
+        config: &ProviderContext,
+    ) -> Result<Option<AttributeType>, CustomTypeValidationError> {
+        match (&self.0.projection, &self.0.projection_fingerprint) {
+            (Some(declaration), _) => Ok(Some(declaration.clone())),
+            (None, Some(_)) => config.custom_types.projection_declaration(self).map(Some),
+            (None, None) => Ok(None),
+        }
+    }
+
+    pub(crate) fn matches_projection_declaration(&self, declaration: &AttributeType) -> bool {
+        self.0
+            .projection_fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| {
+                *fingerprint == declaration.declaration_fingerprint()
+                    && super::scalar_constraints::ScalarConstraints::from_declaration(declaration)
+                        .as_ref()
+                        == Some(&self.0.constraints)
+            })
     }
 
     pub(crate) fn materialize(&self) -> AttributeType {
@@ -869,6 +915,10 @@ type CustomTypeDeclarationLookupFn = Box<
         + Sync,
 >;
 
+type CustomTypeProjectionLookupFn = Box<
+    dyn Fn(&ResolvedSchemaType) -> Result<AttributeType, CustomTypeValidationError> + Send + Sync,
+>;
+
 /// Owner-aware custom-type validation capability.
 ///
 /// Both the factory-backed resolver and [`ProviderCustomTypes`] implement this
@@ -895,6 +945,22 @@ pub trait CustomTypeResolver: Send + Sync {
                 .expect("nonempty owners")
                 .into(),
             identity: owned.identity().clone(),
+        })
+    }
+
+    /// Rebind an exact wire projection to its original declaration. Missing or
+    /// ambiguous provenance must fail rather than fall back to scalar metadata.
+    fn projection_declaration(
+        &self,
+        projection: &ResolvedSchemaType,
+    ) -> Result<AttributeType, CustomTypeValidationError> {
+        Err(CustomTypeValidationError::MissingDeclaration {
+            owner: projection
+                .provider_names()
+                .next()
+                .expect("nonempty owners")
+                .into(),
+            identity: projection.identity().clone(),
         })
     }
 
@@ -965,6 +1031,7 @@ enum ProviderCustomTypeState {
         resolver: CustomTypeValidatorFn,
         enum_lookup: CustomTypeEnumLookupFn,
         annotation_lookup: CustomTypeDeclarationLookupFn,
+        projection_lookup: CustomTypeProjectionLookupFn,
         assignability_closures: BTreeMap<SchemaTypeOwner, crate::schema::AssignabilityClosure>,
     },
 }
@@ -992,32 +1059,31 @@ impl ProviderCustomTypes {
                 known: known.into_iter().collect(),
                 resolver,
                 enum_lookup: Box::new(|_| Ok(None)),
+                projection_lookup: Box::new(|projection| {
+                    Err(CustomTypeValidationError::MissingDeclaration {
+                        owner: projection
+                            .provider_names()
+                            .next()
+                            .expect("nonempty owners")
+                            .into(),
+                        identity: projection.identity().clone(),
+                    })
+                }),
                 annotation_lookup: Box::new(move |owned| {
-                    let mut resolved: Option<ResolvedSchemaType> = None;
                     for owner in owned.owners().iter() {
-                        let declaration = declarations
-                            .iter()
-                            .filter(|candidate| {
-                                candidate.identity() == owned.identity()
-                                    && candidate.scalar_kind() == owned.scalar_kind()
-                                    && candidate.owners().contains(owner)
-                            })
-                            .cloned()
-                            .map(OwnedTypeIdentity::unbounded_witness_for_test)
-                            .reduce(|a, b| a.conjoin(&b))
-                            .ok_or_else(|| {
-                                let SchemaTypeOwner::Provider(owner) = owner;
-                                CustomTypeValidationError::MissingDeclaration {
-                                    owner: owner.clone(),
-                                    identity: owned.identity().clone(),
-                                }
-                            })?;
-                        resolved = Some(match resolved {
-                            Some(existing) => existing.conjoin(&declaration),
-                            None => declaration,
-                        });
+                        if !declarations.iter().any(|candidate| {
+                            candidate.identity() == owned.identity()
+                                && candidate.scalar_kind() == owned.scalar_kind()
+                                && candidate.owners().contains(owner)
+                        }) {
+                            let SchemaTypeOwner::Provider(owner) = owner;
+                            return Err(CustomTypeValidationError::MissingDeclaration {
+                                owner: owner.clone(),
+                                identity: owned.identity().clone(),
+                            });
+                        }
                     }
-                    Ok(resolved.expect("nonempty owners"))
+                    Ok(owned.clone().unbounded_witness_for_test())
                 }),
                 assignability_closures: BTreeMap::new(),
             }),
@@ -1030,6 +1096,7 @@ impl ProviderCustomTypes {
         let source = std::sync::Arc::new(source);
         let validation_source = std::sync::Arc::clone(&source);
         let declaration_source = std::sync::Arc::clone(&source);
+        let projection_source = std::sync::Arc::clone(&source);
         Self {
             state: std::sync::Arc::new(ProviderCustomTypeState::Loaded {
                 known,
@@ -1037,6 +1104,9 @@ impl ProviderCustomTypes {
                 enum_lookup: Box::new(move |owned| source.enum_declaration(owned)),
                 annotation_lookup: Box::new(move |owned| {
                     declaration_source.annotation_declaration(owned)
+                }),
+                projection_lookup: Box::new(move |projection| {
+                    projection_source.projection_declaration(projection)
                 }),
                 assignability_closures,
             }),
@@ -1069,6 +1139,7 @@ impl ProviderCustomTypes {
                 resolver: _,
                 enum_lookup: _,
                 annotation_lookup: _,
+                projection_lookup: _,
                 assignability_closures: _,
             } => false,
             ProviderCustomTypeState::Partial {
@@ -1087,6 +1158,7 @@ impl ProviderCustomTypes {
                 resolver: _resolver,
                 enum_lookup: _enum_lookup,
                 annotation_lookup: _annotation_lookup,
+                projection_lookup: _,
                 assignability_closures: _assignability_closures,
             }
         )
@@ -1105,6 +1177,7 @@ impl ProviderCustomTypes {
                 resolver: _resolver,
                 enum_lookup: _enum_lookup,
                 annotation_lookup: _annotation_lookup,
+                projection_lookup: _,
                 assignability_closures: _assignability_closures,
             } => known,
         }
@@ -1128,6 +1201,7 @@ impl ProviderCustomTypes {
                 resolver: _,
                 enum_lookup: _,
                 annotation_lookup: _,
+                projection_lookup: _,
                 assignability_closures: _,
             } => true,
         }
@@ -1155,6 +1229,7 @@ impl ProviderCustomTypes {
                 resolver: _resolver,
                 enum_lookup: _enum_lookup,
                 annotation_lookup: _annotation_lookup,
+                projection_lookup: _,
                 assignability_closures,
             } => assignability_closures
                 .get(owner)
@@ -1176,6 +1251,31 @@ impl ProviderCustomTypes {
 }
 
 impl CustomTypeResolver for ProviderCustomTypes {
+    fn projection_declaration(
+        &self,
+        projection: &ResolvedSchemaType,
+    ) -> Result<AttributeType, CustomTypeValidationError> {
+        match self.state.as_ref() {
+            ProviderCustomTypeState::Partial {
+                loaded,
+                failed_providers,
+            } => {
+                if projection
+                    .provider_names()
+                    .any(|owner| failed_providers.contains(owner))
+                {
+                    Err(CustomTypeValidationError::ProvidersNotLoaded)
+                } else {
+                    loaded.projection_declaration(projection)
+                }
+            }
+            ProviderCustomTypeState::Loaded {
+                projection_lookup, ..
+            } => projection_lookup(projection),
+            ProviderCustomTypeState::Unloaded => Err(CustomTypeValidationError::ProvidersNotLoaded),
+        }
+    }
+
     fn annotation_declaration(
         &self,
         owned: &OwnedTypeIdentity,
@@ -1230,6 +1330,7 @@ impl CustomTypeResolver for ProviderCustomTypes {
                 resolver,
                 enum_lookup: _enum_lookup,
                 annotation_lookup: _annotation_lookup,
+                projection_lookup: _,
                 assignability_closures: _assignability_closures,
             } => resolver(target, value),
             ProviderCustomTypeState::Unloaded => Err(CustomTypeValidationError::ProvidersNotLoaded),
@@ -1259,6 +1360,7 @@ impl CustomTypeResolver for ProviderCustomTypes {
                 resolver: _resolver,
                 enum_lookup,
                 annotation_lookup: _,
+                projection_lookup: _,
                 assignability_closures: _assignability_closures,
             } => enum_lookup(owned),
             ProviderCustomTypeState::Unloaded => Err(CustomTypeValidationError::ProvidersNotLoaded),
@@ -1400,6 +1502,16 @@ impl LoadedProviderContext {
                     known: BTreeSet::new(),
                     resolver: Box::new(|_target, _value| Ok(())),
                     enum_lookup: Box::new(|_owned| Ok(None)),
+                    projection_lookup: Box::new(|projection| {
+                        Err(CustomTypeValidationError::MissingDeclaration {
+                            owner: projection
+                                .provider_names()
+                                .next()
+                                .expect("nonempty owners")
+                                .into(),
+                            identity: projection.identity().clone(),
+                        })
+                    }),
                     annotation_lookup: Box::new(|owned| {
                         Err(CustomTypeValidationError::MissingDeclaration {
                             owner: owned
@@ -1470,6 +1582,7 @@ impl std::fmt::Debug for ProviderCustomTypes {
                 resolver: _resolver,
                 enum_lookup: _enum_lookup,
                 annotation_lookup: _annotation_lookup,
+                projection_lookup: _,
                 assignability_closures: _assignability_closures,
             } => formatter
                 .debug_struct("Loaded")

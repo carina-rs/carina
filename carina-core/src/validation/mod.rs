@@ -1076,10 +1076,7 @@ fn reference_value_mismatch<B: BindingAddress>(
                     RefTypeAssignabilityError::Mismatch(mismatch),
                 ) => Some(BindingResolutionError::ReferenceType(Box::new(
                     BindingReferenceTypeError {
-                        expected: mismatch
-                            .expected_type_name()
-                            .map(str::to_string)
-                            .unwrap_or_else(|| target.resolved_type_name()),
+                        expected: mismatch.expected_type_name().to_string(),
                         actual: mismatch.actual_type_name().to_string(),
                         declared: mismatch.declared_type_name().map(str::to_string),
                         path: diagnostic_path(reference),
@@ -2230,10 +2227,7 @@ pub fn check_deferred_access_type<B: BindingAddress>(
                 }
                 Err(RefTypeAssignabilityError::Mismatch(mismatch)) => {
                     Err(DeferredAccessTypeError::TypeMismatch {
-                        expected: mismatch
-                            .expected_type_name()
-                            .map(str::to_string)
-                            .unwrap_or_else(|| expected.resolved_type_name()),
+                        expected: mismatch.expected_type_name().to_string(),
                         actual: mismatch.actual_type_name().to_string(),
                         origin: mismatch.origin_description(path.into()),
                     })
@@ -3415,10 +3409,7 @@ fn composition_ref_error_kind<B: BindingAddress>(
                 .map(|error| match error {
                     RefTypeAssignabilityError::Mismatch(mismatch) => {
                         ModuleCallRefErrorKind::TypeMismatch {
-                            expected: mismatch
-                                .expected_type_name()
-                                .map(str::to_string)
-                                .unwrap_or_else(|| sink_type.resolved_type_name()),
+                            expected: mismatch.expected_type_name().to_string(),
                             actual: mismatch.actual_type_name().to_string(),
                             declared: mismatch.declared_type_name().map(str::to_string),
                         }
@@ -4680,10 +4671,7 @@ fn validate_resource_ref_types_inner<
                             resource_location,
                             source_name,
                             attr_name,
-                            mismatch
-                                .expected_type_name()
-                                .map(str::to_string)
-                                .unwrap_or_else(|| sink_type.resolved_type_name()),
+                            mismatch.expected_type_name(),
                             source_name,
                             origin,
                         ));
@@ -4718,7 +4706,7 @@ fn validate_resource_ref_types_inner<
                             crate::binding_index::DeclaredValueAssignment::Assignable
                             | crate::binding_index::DeclaredValueAssignment::IncomingBoundaryMismatch => Ok(()),
                             crate::binding_index::DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Mismatch(mismatch)) => Err(DeferredAccessTypeError::TypeMismatch {
-                                expected: mismatch.expected_type_name().map(str::to_string).unwrap_or_else(|| sink_type.resolved_type_name()), actual: mismatch.actual_type_name().to_string(), origin: format!("from {name}"),
+                                expected: mismatch.expected_type_name().to_string(), actual: mismatch.actual_type_name().to_string(), origin: format!("from {name}"),
                             }),
                             crate::binding_index::DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Unchecked(reason)) => Err(unchecked_assignment_error(reason)),
                         },
@@ -5334,12 +5322,7 @@ fn check_attribute_param_ref<B: BindingAddress>(
             errors.push(format!(
                 "attribute '{}': type mismatch: expected {}, got {} ({})",
                 param_name,
-                mismatch
-                    .expected_type_name()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| expected_type
-                        .expect("lifted expected type exists")
-                        .to_string()),
+                mismatch.expected_type_name(),
                 mismatch.actual_type_name(),
                 mismatch.origin_description(path),
             ));
@@ -5610,10 +5593,7 @@ fn check_export_ref<B: BindingAddress>(
                 "export '{}': type mismatch for '{}': expected {}, got {}{}",
                 param_name,
                 path.to_dot_string(),
-                mismatch
-                    .expected_type_name()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| type_expr.to_string()),
+                mismatch.expected_type_name(),
                 mismatch.actual_type_name(),
                 inferred_origin.as_deref().unwrap_or_default(),
             ));

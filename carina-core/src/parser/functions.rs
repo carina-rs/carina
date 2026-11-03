@@ -727,7 +727,11 @@ fn validate_schema_custom_type_key_with_context<P: PlaceholderKind, B: BindingAd
             unreachable!("deferred values returned before provider validation")
         }
     };
-    if let Some(projection) = witness.and_then(crate::parser::ResolvedSchemaType::projection) {
+    let projection = witness
+        .map(|witness| witness.resolve_projection(config))
+        .transpose()?
+        .flatten();
+    if let Some(projection) = projection.as_ref() {
         if let Some(declaration) = super::IdentifiedCustomTypeDeclaration::new(projection) {
             config.custom_type_resolver().validate(
                 super::CustomTypeValidationTarget::Declaration {
@@ -758,29 +762,56 @@ fn validate_schema_custom_type_key_with_context<P: PlaceholderKind, B: BindingAd
     }
     // The resolved witness can cross a catalog boundary (including serde).
     // Retain its constraints even when the current catalog is less restrictive.
-    // Enum spellings are canonicalized and checked by the catalog above.
-    if let Some(witness) = witness
-        && matches!(
-            value,
-            GenericValue::Concrete(
-                ConcreteValue::String(_) | ConcreteValue::Int(_) | ConcreteValue::Float(_)
-            )
-        )
-    {
+    if let Some(witness) = witness {
+        let invalid_value = |error| super::CustomTypeValidationError::InvalidDeclarationValue {
+            owner: owned
+                .provider_names()
+                .next()
+                .expect("nonempty owners")
+                .into(),
+            identity: owned.identity().clone(),
+            error: Box::new(error),
+        };
+        let enumeration = match projection.as_ref() {
+            Some(declaration)
+                if matches!(
+                    declaration.raw_shape(),
+                    crate::schema::RawShape::Enum { .. }
+                ) =>
+            {
+                Some(declaration.clone())
+            }
+            Some(_) => None,
+            None => config.custom_type_resolver().enum_declaration(owned)?,
+        };
+        let canonical_text = if let Some(enumeration) = enumeration {
+            crate::provider::canonicalize_custom_type_value(&enumeration, &value)
+                .map_err(|error| invalid_value(error.into_type_error()))?
+                .map(|canonical| canonical.as_str().to_string())
+        } else {
+            match &value {
+                GenericValue::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
+                    Some(raw.as_str().to_string())
+                }
+                GenericValue::Concrete(ConcreteValue::CanonicalEnum(canonical)) => {
+                    Some(canonical.api_value().to_string())
+                }
+                _ => None,
+            }
+        };
+        let scalar = match canonical_text {
+            Some(text) => crate::provider::bridge_text_to_typed_value(owned.scalar_kind(), &text)
+                .map_err(|message| {
+                invalid_value(crate::schema::TypeError::ValidationFailed {
+                    message: message.into(),
+                })
+            })?,
+            None => value,
+        };
         witness
             .materialize()
-            .validate_identified_scalar_value(&value)
-            .map_err(
-                |error| crate::parser::CustomTypeValidationError::InvalidDeclarationValue {
-                    owner: owned
-                        .provider_names()
-                        .next()
-                        .expect("nonempty owners")
-                        .into(),
-                    identity: owned.identity().clone(),
-                    error: Box::new(error),
-                },
-            )?;
+            .validate_identified_scalar_value(&scalar)
+            .map_err(invalid_value)?;
     }
     Ok(())
 }

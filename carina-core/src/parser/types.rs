@@ -171,28 +171,28 @@ pub(crate) fn resolve_custom_type_identity(
     Ok(None)
 }
 
-/// Resolve annotations against resource declarations and the actual provider
-/// catalog. Only an unloaded catalog may retain unresolved nominal evidence.
+/// Resolve annotations against the authoritative provider catalog. Resource
+/// schemas alone omit provider configuration and cannot seal a witness.
 pub fn resolve_type_expr_from_schemas(
     ty: &TypeExpr,
-    schemas: &crate::schema::SchemaRegistry,
+    _schemas: &crate::schema::SchemaRegistry,
     config: &ProviderContext,
 ) -> Result<TypeExpr, StaticTypeResolutionError> {
     let identity = match ty {
         TypeExpr::UnloadedSchemaType(unloaded) => unloaded.identity().clone(),
         TypeExpr::List(inner) => {
-            return resolve_type_expr_from_schemas(inner, schemas, config)
+            return resolve_type_expr_from_schemas(inner, _schemas, config)
                 .map(|inner| TypeExpr::List(Box::new(inner)));
         }
         TypeExpr::Map(inner) => {
-            return resolve_type_expr_from_schemas(inner, schemas, config)
+            return resolve_type_expr_from_schemas(inner, _schemas, config)
                 .map(|inner| TypeExpr::Map(Box::new(inner)));
         }
         TypeExpr::Struct { fields } => {
             return fields
                 .iter()
                 .map(|(name, field)| {
-                    resolve_type_expr_from_schemas(field, schemas, config)
+                    resolve_type_expr_from_schemas(field, _schemas, config)
                         .map(|field| (name.clone(), field))
                 })
                 .collect::<Result<_, _>>()
@@ -201,7 +201,7 @@ pub fn resolve_type_expr_from_schemas(
         TypeExpr::Union(members) => {
             return members
                 .iter()
-                .map(|member| resolve_type_expr_from_schemas(member, schemas, config))
+                .map(|member| resolve_type_expr_from_schemas(member, _schemas, config))
                 .collect::<Result<_, _>>()
                 .map(TypeExpr::Union);
         }
@@ -216,27 +216,6 @@ pub fn resolve_type_expr_from_schemas(
         | TypeExpr::DottedUnresolved(_)
         | TypeExpr::StringLiteral(_) => return Ok(ty.clone()),
     };
-    if config.custom_types_loaded() || config.custom_types.is_partial() {
-        return resolve_custom_type_identity(&identity, config)?
-            .ok_or_else(|| unknown_custom_type_error(&identity.to_string(), config));
-    }
-    let candidates = schemas.known_custom_type_declarations(&identity);
-    if let Some(first) = candidates.first() {
-        let mut resolved = first.clone();
-        for candidate in &candidates[1..] {
-            if candidate.scalar_kind() != resolved.scalar_kind() {
-                return Err(StaticTypeResolutionError::ConflictingScalarKinds {
-                    name: resolved.authored_name(),
-                    first_kind: resolved.scalar_kind(),
-                    second_kind: candidate.scalar_kind(),
-                });
-            }
-            resolved = resolved.conjoin(candidate);
-        }
-        return Ok(TypeExpr::SchemaType {
-            owned: resolved.into_annotation(),
-        });
-    }
     resolve_custom_type_identity(&identity, config)?
         .ok_or_else(|| unknown_custom_type_error(&identity.to_string(), config))
 }

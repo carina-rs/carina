@@ -263,7 +263,7 @@ impl DeclaredValueSource {
 /// The first source constraint that failed assignment to a sink.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefTypeMismatch {
-    expected: Option<String>,
+    expected: String,
     actual: String,
     declared: Option<String>,
 }
@@ -276,9 +276,9 @@ pub enum RefTypeAssignabilityError {
 }
 
 impl RefTypeMismatch {
-    pub(crate) fn direct(actual: String) -> Self {
+    pub(crate) fn direct(expected: String, actual: String) -> Self {
         Self {
-            expected: None,
+            expected,
             actual,
             declared: None,
         }
@@ -288,8 +288,8 @@ impl RefTypeMismatch {
         &self.actual
     }
 
-    pub fn expected_type_name(&self) -> Option<&str> {
-        self.expected.as_deref()
+    pub fn expected_type_name(&self) -> &str {
+        &self.expected
     }
 
     /// Present only when forwarded/inferred evidence failed after the
@@ -481,7 +481,7 @@ impl ResolvedRefType {
         {
             let (expected, actual) = authoritative.mismatch_type_names(expected);
             return Err(RefTypeAssignabilityError::Mismatch(RefTypeMismatch {
-                expected: Some(expected),
+                expected,
                 actual,
                 declared: None,
             }));
@@ -494,7 +494,7 @@ impl ResolvedRefType {
             {
                 let (expected, actual) = evidence.mismatch_type_names(expected);
                 return Err(RefTypeAssignabilityError::Mismatch(RefTypeMismatch {
-                    expected: Some(expected),
+                    expected,
                     actual,
                     declared: self
                         .authoritative
@@ -3318,6 +3318,47 @@ mod tests {
         std::sync::LazyLock::new(|| crate::parser::SchemaTypeOwner::Provider("test".into()));
 
     use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
+    #[test]
+    fn review_declared_source_mismatch_preserves_both_constraint_names() {
+        let identity = TypeIdentity::from_dotted("aws.iam.Role.Name");
+        let wide = AttributeType::refined_string(
+            Some(identity.clone()),
+            None,
+            Some((Some(1), Some(128))),
+            None,
+        );
+        let narrow =
+            AttributeType::refined_string(Some(identity), None, Some((Some(8), Some(64))), None);
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::ParsedFile::default();
+        let schemas = SchemaRegistry::new();
+        let bindings = BindingIndex::from_parsed(&parsed, &schemas, &context);
+        let exact = TypeExpr::SchemaType {
+            owned: crate::parser::ResolvedSchemaType::from_schema_declaration("test", &wide)
+                .unwrap(),
+        };
+        let source = ResolvedRefType::new(wide, BTreeMap::new())
+            .with_value_declaration(&exact, &bindings)
+            .unwrap();
+        let sink = TypeInSchema::schemaless(&narrow).with_authority(
+            &context.custom_types,
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+        );
+        let DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Mismatch(mismatch)) =
+            source.assignment_to_sink(sink, &bindings)
+        else {
+            panic!("declaration must fail assignment")
+        };
+        assert_eq!(
+            mismatch.actual_type_name(),
+            "aws.iam.Role.Name (length 1..=128)"
+        );
+        assert_eq!(
+            mismatch.expected_type_name(),
+            "aws.iam.Role.Name (length 8..=64)"
+        );
+    }
+
     #[test]
     fn declaration_mismatch_in_unloaded_session_reports_only_the_mismatch() {
         let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
