@@ -3215,6 +3215,7 @@ for _, account_id in orgs.accounts {
                 self.schemas(),
                 Default::default(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }
@@ -3730,6 +3731,7 @@ fn completion_uses_the_directory_partial_catalog_instead_of_the_document_catalog
                 self.schemas(),
                 Default::default(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }

@@ -3200,6 +3200,7 @@ mod tests {
             vec![schema.validate().expect("valid schema")],
             ValidatedConfigSchema::default(),
             forms,
+            Vec::new(),
         )
         .expect("valid provider schema witness");
         let mut schemas = SchemaRegistry::new();
@@ -3837,6 +3838,7 @@ mod tests {
                 self.schemas(),
                 self.provider_config_attribute_types(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }
@@ -3980,6 +3982,7 @@ mod tests {
                 self.schemas(),
                 self.provider_config_attribute_types(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }

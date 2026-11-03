@@ -70,7 +70,7 @@ mod assignability_edges_stage_a {
         declarations: &[AttributeType],
         edges: Vec<AssignabilityEdge>,
     ) -> Result<ValidatedProviderSchemaWitness, ProviderSchemaValidationError> {
-        ValidatedProviderSchemaWitness::with_assignability_edges(
+        ValidatedProviderSchemaWitness::new(
             vec![resource(declarations)],
             ValidatedConfigSchema::default(),
             ReferenceForms::new(),
@@ -79,11 +79,12 @@ mod assignability_edges_stage_a {
     }
 
     #[test]
-    fn original_constructor_declares_no_assignability_edges() {
+    fn witness_accepts_explicitly_empty_assignability_edges() {
         let admitted = ValidatedProviderSchemaWitness::new(
             vec![resource(&[string("NewName"), string("Name")])],
             ValidatedConfigSchema::default(),
             ReferenceForms::new(),
+            Vec::new(),
         )
         .unwrap();
         assert!(admitted.assignability_edges().is_empty());
@@ -111,7 +112,7 @@ mod assignability_edges_stage_a {
         ]))
         .unwrap();
         let edges = vec![edge("NewName", "Name")];
-        let admitted = ValidatedProviderSchemaWitness::with_assignability_edges(
+        let admitted = ValidatedProviderSchemaWitness::new(
             Vec::new(),
             config,
             ReferenceForms::new(),
@@ -124,7 +125,7 @@ mod assignability_edges_stage_a {
     #[test]
     fn accepts_resource_to_config_edge_with_the_same_scalar_kind() {
         let edges = vec![edge("NewName", "Name")];
-        let admitted = ValidatedProviderSchemaWitness::with_assignability_edges(
+        let admitted = ValidatedProviderSchemaWitness::new(
             vec![resource(&[string("NewName")])],
             ValidatedConfigSchema::validate(std::collections::BTreeMap::from([(
                 "target".into(),
@@ -2089,6 +2090,7 @@ fn schema_registry_lookup_retains_the_owners_complete_reference_form_table() {
         vec![schema],
         ValidatedConfigSchema::default(),
         forms.clone(),
+        Vec::new(),
     )
     .unwrap();
     let mut registry = SchemaRegistry::new();
@@ -2129,6 +2131,7 @@ fn schema_registry_additional_schema_cannot_clear_witness_forms_when_registered_
         vec![owned_schema],
         ValidatedConfigSchema::default(),
         forms.clone(),
+        Vec::new(),
     )
     .expect("provider witness must validate");
     let additional_schema = PatternResourceSchema::new("test.Additional")
@@ -2173,6 +2176,7 @@ fn reference_form_witness(template: &str) -> (ValidatedProviderSchemaWitness, Re
         vec![schema],
         ValidatedConfigSchema::default(),
         forms.clone(),
+        Vec::new(),
     )
     .expect("fixture witness must validate");
     (witness, forms)
@@ -2576,9 +2580,13 @@ fn provider_schema_rejects_conflicting_builtin_bare_declarations() {
                     ValidatedConfigSchema::default(),
                 )
             };
-            let error =
-                ValidatedProviderSchemaWitness::new(resources, config, ReferenceForms::new())
-                    .expect_err("a provider must not silently redefine a core built-in");
+            let error = ValidatedProviderSchemaWitness::new(
+                resources,
+                config,
+                ReferenceForms::new(),
+                Vec::new(),
+            )
+            .expect_err("a provider must not silently redefine a core built-in");
             let message = error.to_string();
             assert!(
                 message.contains("Email") && message.contains("built-in"),
@@ -2612,8 +2620,13 @@ fn provider_schema_accepts_shared_builtin_constructor_declarations() {
             })
             .collect();
         let config = ValidatedConfigSchema::validate(config_types).unwrap();
-        let witness = ValidatedProviderSchemaWitness::new(resources, config, ReferenceForms::new())
-            .expect("providers may reuse the core built-in constructors");
+        let witness = ValidatedProviderSchemaWitness::new(
+            resources,
+            config,
+            ReferenceForms::new(),
+            Vec::new(),
+        )
+        .expect("providers may reuse the core built-in constructors");
         schemas
             .insert_provider_witness(owner, &witness)
             .expect("shared core declarations and wire-decoded declarations remain loadable");

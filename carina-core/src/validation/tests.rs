@@ -8930,6 +8930,7 @@ impl crate::provider::ProviderFactory for RecordingFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -9063,6 +9064,7 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
                 self.schemas(),
                 self.provider_config_attribute_types(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }

@@ -810,9 +810,13 @@ fn provider_scoped_reference_form_suppresses_create_only_replacement_in_plan() {
             .expect("fixture reference template must validate"),
         },
     )]);
-    let witness =
-        ValidatedProviderSchemaWitness::new(vec![schema], ValidatedConfigSchema::default(), forms)
-            .expect("fixture provider schema must validate");
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![schema],
+        ValidatedConfigSchema::default(),
+        forms,
+        Vec::new(),
+    )
+    .expect("fixture provider schema must validate");
     let mut registry = SchemaRegistry::new();
     registry
         .insert_provider_witness("aws", &witness)

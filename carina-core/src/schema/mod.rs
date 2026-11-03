@@ -10175,17 +10175,9 @@ pub(crate) struct ProviderSchemaWitnessParts<'a> {
 }
 
 impl ValidatedProviderSchemaWitness {
-    /// Admit a provider that declares no assignability edges.
-    pub fn new(
-        resources: Vec<ValidatedResourceSchema>,
-        config: ValidatedConfigSchema,
-        reference_forms: ReferenceForms,
-    ) -> Result<Self, ProviderSchemaValidationError> {
-        Self::with_assignability_edges(resources, config, reference_forms, Vec::new())
-    }
-
     /// Admit provider schemas and validate their explicit assignability edges.
-    pub fn with_assignability_edges(
+    /// Pass an explicit empty collection when the provider declares no edges.
+    pub fn new(
         resources: Vec<ValidatedResourceSchema>,
         config: ValidatedConfigSchema,
         reference_forms: ReferenceForms,

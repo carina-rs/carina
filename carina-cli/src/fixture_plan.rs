@@ -1006,6 +1006,7 @@ impl ProviderFactory for FixtureProviderConfigFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -1059,6 +1060,7 @@ impl ProviderFactory for ResolvedValueConstraintFixtureFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -1121,6 +1123,7 @@ impl ProviderFactory for BestFirstPairingFixtureFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -1200,6 +1203,7 @@ impl ProviderFactory for ReplaceCreateOnlyFixtureFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -1272,6 +1276,7 @@ impl ProviderFactory for PlanImageFixtureFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -1334,6 +1339,7 @@ impl ProviderFactory for MovedClaimsPrecedeHeuristicsFixtureFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -1395,6 +1401,7 @@ impl ProviderFactory for EnumDisplayFixtureFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -1464,6 +1471,7 @@ impl ProviderFactory for DynamicEnumFixtureFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -1521,6 +1529,7 @@ impl ProviderFactory for Route53HostedZoneFixtureFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }

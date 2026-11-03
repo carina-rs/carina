@@ -109,7 +109,7 @@ impl ProviderFactory for EdgeFactory {
         ]
     }
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
-        ValidatedProviderSchemaWitness::with_assignability_edges(
+        ValidatedProviderSchemaWitness::new(
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),

@@ -78,6 +78,7 @@ impl ProviderFactory for AwsIdentityFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .expect("valid provider fixture")
     }

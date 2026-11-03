@@ -2560,6 +2560,7 @@ impl WiringContext {
                 missing.cloned().collect(),
                 builtin.config().clone(),
                 builtin.reference_forms().clone(),
+                Vec::new(),
             )
             .expect("the filtered built-in mock schemas remain a valid aggregate witness");
             schemas

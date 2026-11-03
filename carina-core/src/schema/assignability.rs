@@ -479,6 +479,14 @@ fn nominal_scalar_constraints<'a, R: PatternForm>(
     constraints
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AssignmentCheck {
+    Full,
+    /// Re-admit original identities at a declared value's later sink. Only
+    /// identified leaves need this proof; their rule-7 containment still applies.
+    IdentifiedLeaves,
+}
+
 impl<'source, R: PatternForm> TypeInSchema<'source, R> {
     /// Prove assignment, prove a mismatch, or defer for the existing
     /// `ProvidersNotLoaded` reason. Identified types first compare structural
@@ -492,12 +500,38 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
         'source: 'query,
     {
         let source: TypeInSchema<'query, R> = self;
-        source.assignment_on_paths(sink, &mut Vec::new(), &mut Vec::new())
+        source.assignment_on_paths(
+            sink,
+            AssignmentCheck::Full,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+    }
+
+    /// Recheck original identity evidence after a value declaration has passed
+    /// full assignment. An earlier owner's edge is not proof for this sink.
+    /// Identity-less leaves keep the declaration's deferred value checks;
+    /// identified leaves retain ordinary identity admission and containment.
+    pub(crate) fn identity_assignment_to<'query>(
+        self,
+        sink: AssignmentSink<'query, R>,
+    ) -> TypeAssignability<'query>
+    where
+        'source: 'query,
+    {
+        let source: TypeInSchema<'query, R> = self;
+        source.assignment_on_paths(
+            sink,
+            AssignmentCheck::IdentifiedLeaves,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
     }
 
     fn assignment_on_paths<'sink>(
         self,
         sink: AssignmentSink<'sink, R>,
+        check: AssignmentCheck,
         source_refs: &mut Vec<&'source str>,
         sink_refs: &mut Vec<&'sink str>,
     ) -> TypeAssignability<'source>
@@ -516,6 +550,13 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
         use AttrTypeKind::*;
         use TypeAssignability::*;
         let result = match (&source.attr.kind, &target.attr.kind) {
+            (_, kind)
+                if check == AssignmentCheck::IdentifiedLeaves
+                    && identity_leaf(kind).is_none()
+                    && !matches!(kind, List { .. } | Map { .. } | Struct { .. } | Union(_)) =>
+            {
+                Assignable
+            }
             (
                 Union(members),
                 String {
@@ -567,9 +608,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 | Union(_)
                 | Ref(_),
             ) => TypeAssignability::all(members.as_raw_slice().iter().map(|member| {
-                member
-                    .in_schema(self.defs)
-                    .assignment_on_paths(right, source_refs, sink_refs)
+                member.in_schema(self.defs).assignment_on_paths(
+                    right,
+                    check,
+                    source_refs,
+                    sink_refs,
+                )
             })),
             (
                 String {
@@ -621,7 +665,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 | Ref(_),
                 Union(members),
             ) => TypeAssignability::any(members.as_raw_slice().iter().map(|member| {
-                left.assignment_on_paths(sink.rebind(member), source_refs, sink_refs)
+                left.assignment_on_paths(sink.rebind(member), check, source_refs, sink_refs)
             })),
             (
                 UnloadedSchemaType(unloaded),
@@ -754,17 +798,20 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 },
             ) => left.in_schema(self.defs).assignment_on_paths(
                 sink.rebind(right),
+                check,
                 source_refs,
                 sink_refs,
             ),
             (Map { key: lk, value: lv }, Map { key: rk, value: rv }) => TypeAssignability::all([
                 lk.in_schema(self.defs).assignment_on_paths(
                     sink.rebind(rk),
+                    check,
                     source_refs,
                     sink_refs,
                 ),
                 lv.in_schema(self.defs).assignment_on_paths(
                     sink.rebind(rv),
+                    check,
                     source_refs,
                     sink_refs,
                 ),
@@ -791,6 +838,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                                 .in_schema(self.defs)
                                 .assignment_on_paths(
                                     sink.rebind(&field.field_type),
+                                    check,
                                     source_refs,
                                     sink_refs,
                                 ),
@@ -809,6 +857,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             ) => TypeAssignability::all(fields.iter().map(|field| {
                 field.field_type.in_schema(self.defs).assignment_on_paths(
                     sink.rebind(value),
+                    check,
                     source_refs,
                     sink_refs,
                 )
@@ -985,6 +1034,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 TypeAssignability::from_bool(source.structurally_assignable_to(target)),
                 source_base.in_schema(self.defs).assignment_on_paths(
                     sink.rebind(sink_base),
+                    AssignmentCheck::Full,
                     source_refs,
                     sink_refs,
                 ),

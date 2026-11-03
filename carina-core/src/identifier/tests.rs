@@ -7433,6 +7433,7 @@ fn lambda_permission_reference_registry() -> SchemaRegistry {
         vec![schema.validate().expect("schema fixture must be valid")],
         ValidatedConfigSchema::default(),
         forms,
+        Vec::new(),
     )
     .expect("provider schema witness must be valid");
     let mut registry = SchemaRegistry::new();

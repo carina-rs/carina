@@ -188,7 +188,7 @@ pub fn visit_normalized_resource<T>(
     visitor(&resource.resource)
 }
 
-/// Render one error chain for protocol-v20 metadata's string-only failure
+/// Render one error chain for protocol-v21 metadata's string-only failure
 /// channel. Each source is appended at most once even when a legacy outer
 /// display already includes its immediate source text.
 #[doc(hidden)]
@@ -803,7 +803,7 @@ macro_rules! export_provider {
                 operation: &str,
                 error: &(dyn ::std::error::Error + 'static),
             ) -> String {
-                // Protocol v20 metadata exports return a bare string rather
+                // Protocol v21 metadata exports return a bare string rather
                 // than `result`. A JSON string is deliberately the wrong
                 // top-level shape for both schema records and config maps, so
                 // the host reports its normal typed schema-decode failure

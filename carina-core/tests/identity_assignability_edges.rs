@@ -9,7 +9,7 @@ fn schema_fingerprints(edges: Vec<carina_core::schema::AssignabilityEdge>) -> Ve
     use carina_core::provider::ProviderFactory;
     use carina_core::schema::{SchemaRegistry, ValidatedProviderSchemaWitness};
 
-    let witness = ValidatedProviderSchemaWitness::with_assignability_edges(
+    let witness = ValidatedProviderSchemaWitness::new(
         identity_edges::EdgeFactory {
             owner: "mock",
             edges: false,

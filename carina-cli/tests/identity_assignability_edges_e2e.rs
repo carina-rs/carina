@@ -61,7 +61,7 @@ impl ProviderFactory for RuntimeEdgeFactory {
             edges: true,
         }
         .schema_witness();
-        ValidatedProviderSchemaWitness::with_assignability_edges(
+        ValidatedProviderSchemaWitness::new(
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
@@ -239,8 +239,13 @@ impl ProviderFactory for ForwardFactory {
         ]
     }
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
-        ValidatedProviderSchemaWitness::new(self.schemas(), Default::default(), Default::default())
-            .unwrap()
+        ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            Default::default(),
+            Default::default(),
+            Vec::new(),
+        )
+        .unwrap()
     }
     fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
         Default::default()

@@ -2991,6 +2991,7 @@ mod tests {
                 vec![schema],
                 carina_core::schema::ValidatedConfigSchema::default(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap();
             let guest_json = carina_plugin_sdk::provider_schema_to_json(&guest_witness)
@@ -3059,6 +3060,7 @@ mod tests {
                 (identity.clone(), form.clone()),
                 (reference_identity.clone(), form.clone()),
             ]),
+            Vec::new(),
         )
         .unwrap();
         let json = carina_plugin_sdk::provider_schema_to_json(&witness).unwrap();
@@ -3144,6 +3146,7 @@ mod tests {
             vec![schema],
             ValidatedConfigSchema::default(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap();
         let schema_json = carina_plugin_sdk::provider_schema_to_json(&witness).unwrap();

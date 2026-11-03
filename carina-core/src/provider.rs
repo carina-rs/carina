@@ -8207,7 +8207,7 @@ mod tests {
                 })
                 .validate()
                 .unwrap();
-            let witness = ValidatedProviderSchemaWitness::with_assignability_edges(
+            let witness = ValidatedProviderSchemaWitness::new(
                 vec![resource],
                 ValidatedConfigSchema::default(),
                 ReferenceForms::new(),
@@ -8881,6 +8881,7 @@ mod tests {
                 self.schemas(),
                 self.provider_config_attribute_types(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }
@@ -8942,6 +8943,7 @@ mod tests {
                 )]))
                 .unwrap(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap(),
         });
@@ -9050,6 +9052,7 @@ mod tests {
                 self.schemas(),
                 self.provider_config_attribute_types(),
                 Default::default(),
+                Vec::new(),
             )
             .expect("snapshot fixture must expose one valid aggregate witness")
         }
@@ -12650,6 +12653,7 @@ mod tests {
             vec![schema],
             ValidatedConfigSchema::default(),
             forms,
+            Vec::new(),
         )
         .expect("fixture provider schema must validate");
         let mut registry = crate::schema::SchemaRegistry::new();
@@ -12906,6 +12910,7 @@ mod tests {
                     self.schemas(),
                     self.provider_config_attribute_types(),
                     Default::default(),
+                    Vec::new(),
                 )
                 .unwrap()
             }
@@ -12999,6 +13004,7 @@ mod tests {
                     self.schemas(),
                     self.provider_config_attribute_types(),
                     Default::default(),
+                    Vec::new(),
                 )
                 .unwrap()
             }

@@ -202,6 +202,7 @@ fn differ_treats_equal_cyclic_values_as_unchanged() {
         ],
         ValidatedConfigSchema::default(),
         Default::default(),
+        Vec::new(),
     )
     .expect("comparison owner witness is valid");
     schemas
@@ -268,6 +269,7 @@ fn differ_surfaces_a_real_change_inside_a_cyclic_value() {
         ],
         ValidatedConfigSchema::default(),
         Default::default(),
+        Vec::new(),
     )
     .expect("comparison owner witness is valid");
     schemas
@@ -347,6 +349,7 @@ fn resource_schema_validate_routes_ref_through_defs() {
         vec![schema],
         ValidatedConfigSchema::default(),
         Default::default(),
+        Vec::new(),
     )
     .expect("cyclic schema provider witness is valid");
     registry

@@ -219,8 +219,9 @@ pub struct ResolvedRefType {
 
 /// A declared value retains its original reference evidence by construction.
 /// This view is created after path narrowing and has no narrowing/erasure API.
-/// Every later sink judges both the declaration and the original source using
-/// that sink's catalog and authority.
+/// Every later sink fully judges the declaration and re-admits the original's
+/// identified leaves using that sink's catalog and authority. Identity-less
+/// leaves keep the declaration's deferred value checks.
 pub(crate) struct DeclaredValueSource {
     original: ResolvedRefType,
     declaration: crate::validation::LiftedType,
@@ -268,7 +269,9 @@ impl DeclaredValueSource {
             }
             Ok(true) => {}
         }
-        match self.original.is_assignable_to_sink(sink, bindings) {
+        match self.original.check_assignment(|source| {
+            bindings.consume_type_assignment(source.identity_assignment_to(sink))
+        }) {
             Ok(()) => DeclaredValueAssignment::Assignable,
             Err(error @ RefTypeAssignabilityError::Mismatch(_)) => {
                 let incoming = self
@@ -333,8 +336,8 @@ impl RefTypeMismatch {
 
 impl ResolvedRefType {
     /// Retain the original source at a declared value boundary. Every later
-    /// sink checks both the declaration and the original source with its own
-    /// authority, so an earlier provider's edge cannot be forwarded as proof.
+    /// sink checks the declaration and re-admits original identities with its
+    /// own authority, so an earlier provider's edge cannot be forwarded as proof.
     pub(crate) fn with_value_declaration<B: BindingAddress>(
         self,
         type_expr: &crate::parser::TypeExpr,
@@ -475,9 +478,17 @@ impl ResolvedRefType {
         sink: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
         bindings: &BindingIndex<'_, B>,
     ) -> Result<(), RefTypeAssignabilityError> {
+        self.check_assignment(|source| bindings.check_type_assignment(source, sink))
+    }
+
+    fn check_assignment(
+        &self,
+        mut judge: impl FnMut(
+            TypeInSchema<'_, crate::schema::Compiled>,
+        ) -> Result<bool, crate::parser::CustomTypeValidationError>,
+    ) -> Result<(), RefTypeAssignabilityError> {
         let authoritative = self.authoritative.constraint().type_in_schema();
-        if !bindings
-            .check_type_assignment(authoritative, sink)
+        if !judge(authoritative)
             .map_err(|reason| RefTypeAssignabilityError::Unchecked(Box::new(reason)))?
         {
             return Err(RefTypeAssignabilityError::Mismatch(RefTypeMismatch {
@@ -488,8 +499,7 @@ impl ResolvedRefType {
 
         for evidence in &self.evidence {
             let evidence = evidence.type_in_schema();
-            if !bindings
-                .check_type_assignment(evidence, sink)
+            if !judge(evidence)
                 .map_err(|reason| RefTypeAssignabilityError::Unchecked(Box::new(reason)))?
             {
                 return Err(RefTypeAssignabilityError::Mismatch(RefTypeMismatch {
@@ -1023,7 +1033,13 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         source: TypeInSchema<'_, crate::schema::Compiled>,
         sink: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
     ) -> Result<bool, crate::parser::CustomTypeValidationError> {
-        let assignment = source.assignment_to(sink);
+        self.consume_type_assignment(source.assignment_to(sink))
+    }
+
+    fn consume_type_assignment(
+        &self,
+        assignment: crate::schema::TypeAssignability<'_>,
+    ) -> Result<bool, crate::parser::CustomTypeValidationError> {
         if self.provider_context.custom_types_loaded() {
             assignment.require_loaded()
         } else {
@@ -3361,6 +3377,8 @@ mod tests {
 
     #[test]
     fn original_mismatch_does_not_record_an_incoming_boundary_deferral() {
+        // Both leaves are identified: rule 7 must still reject 1..20 -> 1..10
+        // even though original identity-less refinements are no longer rechecked.
         let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let terminal = crate::validation::deferred_types::TypeCheckSession::run(
             &context,

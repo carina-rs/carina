@@ -126,6 +126,7 @@ impl ProviderFactory for RegionConfigFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -260,6 +261,7 @@ impl ProviderFactory for SuspendedValidationFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -358,6 +360,7 @@ impl ProviderFactory for EnumDeclaredCustomTypeFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -457,6 +460,7 @@ impl ProviderFactory for SharedRoleArnFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -554,6 +558,7 @@ impl ProviderFactory for BareTypeFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -899,6 +904,7 @@ impl ProviderFactory for SchemaFixtureFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }

@@ -2648,6 +2648,7 @@ impl ProviderFactory for TestProviderFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -4727,6 +4728,7 @@ impl ProviderFactory for WasmStyleProviderFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }

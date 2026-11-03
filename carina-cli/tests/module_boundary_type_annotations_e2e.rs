@@ -70,6 +70,7 @@ impl ProviderFactory for AwsTestFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -351,6 +352,7 @@ impl ProviderFactory for SharedRoleArnFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }

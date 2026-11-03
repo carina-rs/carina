@@ -168,7 +168,7 @@ impl ProviderSchemaCache {
         let config = provider.provider_config_attribute_types();
         let reference_forms = provider.reference_forms();
         let assignability_edges = provider.assignability_edges();
-        let witness = ValidatedProviderSchemaWitness::with_assignability_edges(
+        let witness = ValidatedProviderSchemaWitness::new(
             resources,
             config,
             reference_forms,
@@ -2040,6 +2040,7 @@ mod tests {
             vec![schema],
             ValidatedConfigSchema::default(),
             ReferenceForms::new(),
+            Vec::new(),
         )
         .unwrap();
 

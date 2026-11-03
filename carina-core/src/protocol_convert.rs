@@ -822,7 +822,7 @@ pub fn protocol_to_provider_schema_witness(
         .iter()
         .map(protocol_to_assignability_edge)
         .collect::<Result<_, _>>()?;
-    ValidatedProviderSchemaWitness::with_assignability_edges(resources, config, forms, edges)
+    ValidatedProviderSchemaWitness::new(resources, config, forms, edges)
         .map_err(SchemaDecodeError::InvalidProviderSchema)
 }
 
@@ -3329,8 +3329,9 @@ mod tests {
             (first.clone(), reference_form()),
         ]);
         let config = ValidatedConfigSchema::default();
-        let witness = ValidatedProviderSchemaWitness::new(vec![schema], config.clone(), forms)
-            .expect("refined String forms must be admitted");
+        let witness =
+            ValidatedProviderSchemaWitness::new(vec![schema], config.clone(), forms, Vec::new())
+                .expect("refined String forms must be admitted");
 
         let wire = provider_schema_to_protocol(&witness).expect("witness must encode");
         assert_eq!(
@@ -3370,6 +3371,7 @@ mod tests {
             vec![schema],
             ValidatedConfigSchema::default(),
             ReferenceForms::from([(identity.clone(), reference_form())]),
+            Vec::new(),
         )
         .expect("the SDK-side aggregate identity is internally consistent");
 

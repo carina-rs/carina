@@ -166,6 +166,7 @@ fn fixture_schemas(resources: &[Resource]) -> SchemaRegistry {
             vec![schema.validate().expect("fixture schema is valid")],
             ValidatedConfigSchema::default(),
             Default::default(),
+            Vec::new(),
         )
         .expect("fixture provider witness is valid");
         schemas

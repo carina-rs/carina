@@ -429,6 +429,41 @@ assert!(color.validate(&red).is_ok());
 
 The closure runs inside the provider's WebAssembly component. When the host validates a value, it sends the type identity and the value to the provider, which runs every validator it registered for that identity. The identity is therefore the type's name across the whole provider, not just one attribute: if two schemas declare the same identity with different validators, a value of that type must pass both. Give each distinct type its own identity, reuse one only for types that mean the same thing, and use the same scalar kind for every declaration of it (`validate()` rejects an identity used as both a string and an int). Even without a validator, an identity names the type in diagnostics and in the editor.
 
+## Assignability edges
+
+Implement the required `CarinaProvider::assignability_edges` method to declare
+directional assignments between named types. Return `Vec::new()` when the
+provider declares no edges. For example, a provider that declares both of these
+String identities can admit a legacy name where a current name is expected:
+
+```rust
+use carina_plugin_sdk::core::schema::{AssignabilityEdge, TypeIdentity};
+
+let edges = vec![AssignabilityEdge::new(
+    TypeIdentity::new(Some("widget"), ["widget"], "LegacyName"),
+    TypeIdentity::new(Some("widget"), ["widget"], "Name"),
+)
+.expect("distinct identities")];
+```
+
+Both endpoints must be String, Int, or Float identities declared by the same
+provider's resource or config schemas, with the same scalar kind. Built-in,
+enum, and reference identities cannot be endpoints. Self edges, duplicate
+edges, and cycles are rejected. Transitive assignments use only that provider's
+edges; edges from different providers never combine into a path.
+
+The provider that owns the sink attribute decides which edges it accepts,
+regardless of the identity's namespace. A type annotation shared by several
+owners requires every owner to admit the assignment. Passing through an
+annotation or module argument does not make one owner's edge proof for a later
+sink. Identified sinks still require length or numeric range containment, and
+the sink's value constraints and validators still run on the resolved value.
+
+A native `ProviderFactory::schema_witness` must pass the same edges to
+`ValidatedProviderSchemaWitness::new` as `CarinaProvider::assignability_edges`
+returns. Have one implementation call the other so native and WebAssembly
+providers cannot disagree.
+
 ## Declared validation
 
 Some rules involve more than one attribute. A schema declares them as data, because a closure cannot cross the boundary between the provider and the host:
