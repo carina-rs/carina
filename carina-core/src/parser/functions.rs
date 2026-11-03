@@ -67,7 +67,12 @@ pub(super) fn parse_fn_def(
                             default_ctx
                                 .seeded_user_functions
                                 .extend(ctx.seeded_user_functions.iter().cloned());
-                            default = Some(parse_expression(remaining, &default_ctx)?);
+                            default = Some(
+                                parse_expression(remaining, &default_ctx)?
+                                    .projection()
+                                    .expect("materialized parser expression")
+                                    .clone(),
+                            );
                         }
                     }
                 }
@@ -136,7 +141,10 @@ pub(super) fn parse_fn_def(
                 let let_expr = parse_expression(
                     next_pair(&mut let_inner, "let expression", "fn_local_let")?,
                     &body_ctx,
-                )?;
+                )?
+                .projection()
+                .expect("materialized parser expression")
+                .clone();
                 body_ctx.set_variable(
                     let_name.clone(),
                     Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::FnLocal {
@@ -154,7 +162,10 @@ pub(super) fn parse_fn_def(
                         preprocessed_file,
                         body_ctx.source_file(),
                     ),
-                    value: parse_expression(body_inner, &body_ctx)?,
+                    value: parse_expression(body_inner, &body_ctx)?
+                        .projection()
+                        .expect("materialized parser expression")
+                        .clone(),
                     source_line,
                     source_file: None,
                 });

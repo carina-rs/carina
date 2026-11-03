@@ -393,7 +393,10 @@ fn parse_if_body(
             let value = parse_expression(
                 next_pair(&mut binding_inner, "binding value", "if local binding")?,
                 &local_ctx,
-            )?;
+            )?
+            .projection()
+            .expect("materialized parser expression")
+            .clone();
             local_ctx.set_variable(name, value);
             continue;
         }
@@ -431,7 +434,10 @@ fn parse_if_body(
                 Ok(IfBodyResult::ModuleCall(call))
             }
             (IfBodyForm::Value, Rule::expression) => {
-                let value = parse_expression(inner, &local_ctx)?;
+                let value = parse_expression(inner, &local_ctx)?
+                    .projection()
+                    .expect("materialized parser expression")
+                    .clone();
                 Ok(IfBodyResult::Value(value))
             }
             (IfBodyForm::ResourceProducingFor, Rule::expression) => {
@@ -550,7 +556,10 @@ fn parse_if_body_value_with_mode(
             let value = parse_expression(
                 next_pair(&mut binding_inner, "binding value", "if local binding")?,
                 &local_ctx,
-            )?;
+            )?
+            .projection()
+            .expect("materialized parser expression")
+            .clone();
             local_ctx.set_variable(name, value);
             continue;
         }

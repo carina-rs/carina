@@ -372,7 +372,14 @@ impl<E> RootDirectoryParse<E> {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub fn from_parsed_for_test(parsed: File<E>) -> Self {
+    pub fn from_parsed_for_test(mut parsed: File<E>) -> Self {
+        if parsed.judged().is_err() {
+            crate::parser::retained::judge_configuration(
+                &mut parsed,
+                &SchemaRegistry::new(),
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            );
+        }
         Self::new(parsed)
     }
 }
@@ -486,6 +493,28 @@ pub struct LoadedConfig {
     /// load boundary so editor callers retain the parsed tree; validation
     /// commands decide whether to treat them as hard errors.
     pub duplicate_declarations: Vec<DuplicateDeclaration>,
+}
+
+/// A source buffer loaded for analysis with the caller's available schemas.
+/// Its file and report are produced together, just like a directory load.
+pub struct BufferConfiguration {
+    parsed: ParsedFile,
+}
+
+impl BufferConfiguration {
+    pub fn parsed(&self) -> &ParsedFile {
+        &self.parsed
+    }
+}
+
+pub fn load_buffer_configuration(
+    parsed: &ParsedFile,
+    schemas: &SchemaRegistry,
+    config: &ProviderContext,
+) -> BufferConfiguration {
+    let mut parsed = parsed.clone();
+    crate::parser::retained::judge_configuration(&mut parsed, schemas, config);
+    BufferConfiguration { parsed }
 }
 
 impl LoadedConfig {
@@ -806,7 +835,7 @@ pub fn parse_directory_with_overrides(
     config: &ProviderContext,
     overrides: &HashMap<String, String>,
 ) -> Result<ParsedRootDirectory, String> {
-    parse_directory_with_overrides_impl(dir, config, overrides, false)
+    parse_directory_with_overrides_impl(dir, config, overrides, false, &SchemaRegistry::new())
         .map(|result| result.parsed)
         .map_err(|error| error.to_string())
 }
@@ -982,7 +1011,16 @@ pub fn parse_directory_with_overrides_and_diagnostics(
     config: &ProviderContext,
     overrides: &HashMap<String, String>,
 ) -> Result<DirectoryParseResult, DirectoryParseFailure> {
-    parse_directory_with_overrides_impl(dir, config, overrides, true)
+    parse_directory_with_overrides_impl(dir, config, overrides, true, &SchemaRegistry::new())
+}
+
+pub fn parse_directory_with_overrides_and_diagnostics_with_schemas(
+    dir: &ResolvedPath,
+    config: &ProviderContext,
+    overrides: &HashMap<String, String>,
+    schemas: &SchemaRegistry,
+) -> Result<DirectoryParseResult, DirectoryParseFailure> {
+    parse_directory_with_overrides_impl(dir, config, overrides, true, schemas)
 }
 
 fn parse_directory_with_overrides_impl(
@@ -990,6 +1028,7 @@ fn parse_directory_with_overrides_impl(
     config: &ProviderContext,
     overrides: &HashMap<String, String>,
     preserve_failed_user_calls: bool,
+    schemas: &SchemaRegistry,
 ) -> Result<DirectoryParseResult, DirectoryParseFailure> {
     let resolved = dir.clone();
     let dir_label = resolved.source_label();
@@ -1123,6 +1162,7 @@ fn parse_directory_with_overrides_impl(
     // LSP needs the ParsedFile even when a reference is unresolved, so it can
     // surface the error as a diagnostic; CLI commands run both checks through
     // the shared validation pipeline.
+    crate::parser::retained::judge_configuration(&mut merged, schemas, config);
     Ok(DirectoryParseResult {
         parsed: RootDirectoryParse::new(merged),
         authored_bindings,

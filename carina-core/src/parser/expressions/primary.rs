@@ -104,7 +104,10 @@ pub(crate) fn parse_postfix_path_segment(
         Rule::index_access => {
             let line = pair.line_col().0;
             let index_expr_pair = first_inner(pair, "index expression", "index access")?;
-            let index_value = parse_expression(index_expr_pair, ctx)?;
+            let index_value = parse_expression(index_expr_pair, ctx)?
+                .projection()
+                .expect("materialized parser expression")
+                .clone();
             subscript_from_value(index_value, line).map(|index| PathSegment::Subscript { index })
         }
         Rule::field_access => {
@@ -604,7 +607,10 @@ fn parse_primary_eval_with_mode_inner(
                         let line = pair.line_col().0;
                         let index_expr_pair =
                             first_inner(pair, "index expression", "index access")?;
-                        let index_value = parse_expression(index_expr_pair, ctx)?;
+                        let index_value = parse_expression(index_expr_pair, ctx)?
+                            .projection()
+                            .expect("materialized parser expression")
+                            .clone();
                         segments.push(PathSegment::Subscript {
                             index: subscript_from_value(index_value, line)?,
                         });
@@ -855,7 +861,10 @@ fn parse_primary_eval_with_mode_inner(
                             let step_line = step.line_col().0;
                             let index_expr_pair =
                                 first_inner(step, "index expression", "index access")?;
-                            let index_value = parse_expression(index_expr_pair, ctx)?;
+                            let index_value = parse_expression(index_expr_pair, ctx)?
+                                .projection()
+                                .expect("materialized parser expression")
+                                .clone();
                             let subscript = subscript_from_value(index_value, step_line)?;
                             if in_field_phase {
                                 subscripts.push(subscript);

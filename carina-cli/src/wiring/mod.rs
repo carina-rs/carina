@@ -940,7 +940,12 @@ impl ValidationProviderCatalogExt for ValidationProviderCatalog<'_> {
     where
         D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        validation::ValidationTypeContext::in_session(file, schemas, self, signatures)
+        validation::ValidationTypeContext::in_session(
+            file.judged().expect("loader-owned expression report"),
+            schemas,
+            self,
+            signatures,
+        )
     }
 }
 
@@ -1275,6 +1280,12 @@ fn binding_use_report_error(report: carina_core::validation::BindingUseReport) -
 
 fn resolve_file_error(error: carina_core::validation::ResolveFileError) -> AppError {
     match error {
+        carina_core::validation::ResolveFileError::Unjudged(error) => {
+            AppError::Config(error.to_string())
+        }
+        carina_core::validation::ResolveFileError::Expression(finding) => {
+            AppError::ExpressionType(finding)
+        }
         carina_core::validation::ResolveFileError::BindingUse(report) => {
             binding_use_report_error(report)
         }
@@ -4510,6 +4521,17 @@ pub(crate) fn validate_module_internal_ref_types(
     for module in module_walk.iter() {
         let mut parsed = module.loaded().parsed.clone();
         let prefix = module.diagnostic_label();
+        let expression_report = parsed
+            .judged()
+            .expect("loader-owned expression report")
+            .report();
+        errors.extend(
+            expression_report
+                .findings()
+                .iter()
+                .cloned()
+                .map(|finding| AppError::ExpressionType(Box::new(finding))),
+        );
         // Module expansion retains the established diagnostic for malformed
         // declarations. This pass only needs successful resolution so valid
         // dotted argument types can act as sources before expansion.

@@ -895,7 +895,7 @@ mod error_format_tests {
             carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
         let module_signatures = carina_core::module_resolver::ResolvedModuleSignatures::new();
         let context = carina_core::validation::ValidationTypeContext::new_providerless(
-            &parsed,
+            parsed.judged().expect("loader-owned expression report"),
             &schemas,
             &provider_context,
             &module_signatures,

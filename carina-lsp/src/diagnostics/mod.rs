@@ -309,10 +309,6 @@ struct DiagnosticValidationInputs<'a> {
 struct ExpandedDiagnosticValidationInputs<'a> {
     graph: &'a carina_core::parser::ModuleResolvedParsedFile,
     binding_index: carina_core::binding_index::BindingIndex<'a, AbsoluteBindingAddress>,
-    inference_bindings: carina_core::validation::inference::InferenceBindings<
-        ParserPlaceholder,
-        AbsoluteBindingAddress,
-    >,
 }
 
 impl ExpandedDiagnosticValidationInputs<'_> {
@@ -329,10 +325,27 @@ impl ExpandedDiagnosticValidationInputs<'_> {
             .find(|candidate| candidate.id() == resource_id)?;
         let attributes = resource.attributes();
         let value = attributes.get(attribute)?;
+        let report = self
+            .graph
+            .judged()
+            .expect("expanded configuration judgement")
+            .report()
+            .for_resource(resource_id);
+        let tree = carina_core::parser::AnalysisTree::try_from_file(self.graph).ok()?;
+        let expression =
+            tree.resources()
+                .find(|resource| resource.id() == resource_id)
+                .and_then(|resource| {
+                    report.expression(resource.attribute_value_location(
+                        attribute,
+                        &carina_core::schema::FieldPath::new(),
+                    ))
+                })
+                .unwrap_or(report.unknown());
         Some(carina_core::validation::check_deferred_access_type(
             value,
             expected,
-            &self.inference_bindings,
+            expression,
             schemas,
             &self.binding_index,
         ))
@@ -508,7 +521,9 @@ impl DiagnosticRun<'_> {
         let inference_bindings =
             carina_core::validation::inference::bindings_from_parsed(binding_input);
         let context = carina_core::validation::ValidationTypeContext::in_session(
-            binding_input,
+            binding_input
+                .judged()
+                .expect("loader-owned expression report"),
             &self.schemas,
             self.provider_context,
             module_signatures,
@@ -541,9 +556,18 @@ impl DiagnosticRun<'_> {
         let mut diagnostics = Vec::new();
         let provider_validation_deduplicator = ProviderValidationDeduplicator::default();
         let text = doc.text();
-        let buffer_analysis = doc
-            .parsed()
-            .and_then(|parsed| analysis_tree(doc, parsed, &mut diagnostics));
+        let buffer_configuration = doc.parsed().map(|parsed| {
+            carina_core::config_loader::load_buffer_configuration(
+                parsed,
+                &self.schemas,
+                self.provider_context.catalog(),
+            )
+        });
+        let buffer_parsed = buffer_configuration
+            .as_ref()
+            .map(|configuration| configuration.parsed());
+        let buffer_analysis =
+            buffer_parsed.and_then(|parsed| analysis_tree(doc, parsed, &mut diagnostics));
         let pinned_base = current_file_path
             .and_then(|path| path.parent())
             .and_then(|path| carina_core::paths::ResolvedPath::new(path).ok());
@@ -651,7 +675,7 @@ impl DiagnosticRun<'_> {
                 .as_ref()
                 .and_then(|directory| directory.semantic_file(path))
         });
-        let current_parsed = doc.parsed().or(merged_current_file);
+        let current_parsed = buffer_parsed.or(merged_current_file);
         // A source parsed in isolation cannot know sibling function
         // declarations. Prefer the successful directory parse over that
         // provisional failure (notably a sibling user function used as a
@@ -673,7 +697,7 @@ impl DiagnosticRun<'_> {
             .map(|directory| directory.parsed.parsed());
         let merged_analysis =
             merged.and_then(|parsed| analysis_tree(doc, parsed, &mut diagnostics));
-        let current_analysis = if doc.parsed().is_some() {
+        let current_analysis = if buffer_parsed.is_some() {
             buffer_analysis
         } else {
             current_parsed.and_then(|parsed| analysis_tree(doc, parsed, &mut diagnostics))
@@ -1013,6 +1037,21 @@ impl DiagnosticRun<'_> {
                 }
             }
             let pre_expansion_input = merged.unwrap_or(parsed);
+            let expression_report = pre_expansion_input
+                .judged()
+                .expect("loader-owned expression report")
+                .report();
+            for finding in expression_report.findings() {
+                if let Some(diagnostic) = render_merged(
+                    doc,
+                    finding,
+                    DiagnosticSeverity::ERROR,
+                    finding.detail().to_string(),
+                ) && !diagnostics.contains(&diagnostic)
+                {
+                    diagnostics.push(diagnostic);
+                }
+            }
             let semantic_view =
                 checks::SemanticView::for_analysis(parsed, merged, base_path.is_some());
             let empty_upstream_exports = Default::default();
@@ -1063,9 +1102,6 @@ impl DiagnosticRun<'_> {
                         carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
                             graph, &self.schemas, Some(&expanded_upstream_exports), &module_signatures, self.provider_context,
                         ),
-                    inference_bindings: carina_core::validation::inference::bindings_from_parsed(
-                        graph,
-                    ),
                 });
             let DiagnosticValidationInputs {
                 binding_index,
@@ -1267,19 +1303,16 @@ impl DiagnosticRun<'_> {
                     .as_ref()
                     .and_then(|resources| resources.get(resource_index))
                     .map(|resource| resource.attributes());
-                // Directory-aware semantic ASTs can expand a sibling-backed
-                // `for` before the buffer-only AST does, so positional
-                // resource indexes are not a stable join key. Named bindings
-                // are parser-enforced identities. Anonymous resources have no
-                // stable cross-AST key and therefore keep the buffer value.
                 let semantic_resource_attributes = semantic_file.and_then(|parsed| {
-                    rref.binding()
-                        .and_then(|binding| {
-                            parsed
-                                .iter_all_resources()
-                                .find(|candidate| candidate.binding() == Some(binding))
+                    let semantic_tree =
+                        carina_core::parser::AnalysisTree::try_from_file(parsed).ok()?;
+                    semantic_tree
+                        .resources()
+                        .find(|candidate| {
+                            candidate.location() == rref.location()
+                                && candidate.binding_address() == rref.binding_address()
                         })
-                        .map(|candidate| candidate.attributes())
+                        .map(|candidate| candidate.attributes().into_owned())
                 });
                 let resource_quoted_string_attrs = rref.quoted_string_attrs();
                 let resource_schema = || rref.schema(&self.schemas);
@@ -1364,6 +1397,12 @@ impl DiagnosticRun<'_> {
                     let bn_map = schema.block_name_map();
                     let mut reported_attribute_diagnostics = HashSet::new();
                     for (attr_name, authored_attr_value) in resource_attributes.iter() {
+                        let judged_expression = expression_report
+                            .expression(rref.attribute_value_location(
+                                attr_name,
+                                &carina_core::schema::FieldPath::new(),
+                            ))
+                            .unwrap_or(expression_report.unknown());
                         let attr_value = if contains_function_call(authored_attr_value) {
                             resolved_resource_attributes
                                 .as_ref()
@@ -1372,24 +1411,10 @@ impl DiagnosticRun<'_> {
                         } else {
                             authored_attr_value
                         };
-                        // Coalesce validation must inspect both authored
-                        // operands. A directory semantic view may already
-                        // have selected one branch, which would erase a
-                        // wrong-typed lazy default from diagnostics.
-                        let typecheck_value = if matches!(
-                            attr_value,
-                            Value::Deferred(
-                                DeferredValue::Coalesce { .. }
-                                    | DeferredValue::IntegerArithmetic(_)
-                            )
-                        ) {
-                            attr_value
-                        } else {
-                            semantic_resource_attributes
-                                .as_ref()
-                                .and_then(|attributes| attributes.get(attr_name))
-                                .unwrap_or(attr_value)
-                        };
+                        let typecheck_value = semantic_resource_attributes
+                            .as_ref()
+                            .and_then(|attributes| attributes.get(attr_name))
+                            .unwrap_or(attr_value);
                         // Resolve block_name to canonical attribute name
                         let canonical_name = bn_map
                             .get(attr_name)
@@ -1555,10 +1580,8 @@ impl DiagnosticRun<'_> {
                                         &finding,
                                         rref.replaceable_attribute_value(attr_name),
                                     ) {
-                                        if is_duplicate_list_error(finding.detail()) {
-                                            reported_attribute_diagnostics
-                                                .insert(canonical_name.to_string());
-                                        }
+                                        reported_attribute_diagnostics
+                                            .insert(canonical_name.to_string());
                                         diagnostics.push(diagnostic);
                                     }
                                     None
@@ -1607,7 +1630,7 @@ impl DiagnosticRun<'_> {
                                                     attr_schema.attr_type(),
                                                     &self.provider_context.catalog().custom_types,
                                                 ),
-                                                &inference_bindings,
+                                                judged_expression,
                                                 &self.schemas,
                                                 &binding_index,
                                             )
@@ -1641,7 +1664,7 @@ impl DiagnosticRun<'_> {
                                                 attr_schema.attr_type(),
                                                 &self.provider_context.catalog().custom_types,
                                             ),
-                                            &inference_bindings,
+                                            judged_expression,
                                             &self.schemas,
                                             &binding_index,
                                         )
@@ -1771,6 +1794,7 @@ impl DiagnosticRun<'_> {
                                 _ => None,
                             };
                             if let Some(message) = type_error {
+                                reported_attribute_diagnostics.insert(canonical_name.to_string());
                                 let finding = carina_core::parser::Located::new(
                                     rref.attribute_key_location(attr_name).clone(),
                                     message,
@@ -1829,7 +1853,10 @@ impl DiagnosticRun<'_> {
                     }
 
                     // Run whole-resource validation, including top-level field groups.
-                    let mut resolved_attrs = rref.resolved_attributes();
+                    let mut resolved_attrs = semantic_resource_attributes
+                        .as_ref()
+                        .map(carina_core::resource::attrs_to_hashmap)
+                        .unwrap_or_else(|| rref.resolved_attributes());
                     for value in resolved_attrs.values_mut() {
                         if let Some(evaluated) =
                             carina_core::parser::evaluate_static_value_for_validation(

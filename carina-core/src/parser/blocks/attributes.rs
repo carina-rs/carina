@@ -83,7 +83,12 @@ pub(in crate::parser) fn parse_arguments_block(
                                 Rule::arg_default_attr => {
                                     let expr_pair =
                                         first_inner(inner_attr, "expression", "arg_default_attr")?;
-                                    default = Some(parse_expression(expr_pair, ctx)?);
+                                    default = Some(
+                                        parse_expression(expr_pair, ctx)?
+                                            .projection()
+                                            .expect("materialized parser expression")
+                                            .clone(),
+                                    );
                                 }
                                 Rule::arg_validation_block => {
                                     let mut rule = None;
@@ -148,7 +153,12 @@ pub(in crate::parser) fn parse_arguments_block(
                     }
                 } else {
                     // Simple form: the next element is the default expression itself.
-                    default = Some(parse_expression(next, ctx)?);
+                    default = Some(
+                        parse_expression(next, ctx)?
+                            .projection()
+                            .expect("materialized parser expression")
+                            .clone(),
+                    );
                 }
             }
 

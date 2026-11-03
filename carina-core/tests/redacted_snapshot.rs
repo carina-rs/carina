@@ -305,11 +305,25 @@ fn snapshot_state_typecheck_uses_checked_conversion() {
     let state = historical_siblings();
     let ordinary = resolve_historical_field("name").unwrap();
     let context = ProviderContext::new(carina_core::EnvironmentSnapshot::new([]));
+    let parsed = carina_core::parser::parse_file(
+        &format!(
+            "let ordinary = {}",
+            carina_core::value::format_value(&ordinary)
+        ),
+        std::path::Path::new("test.crn"),
+        &context,
+    )
+    .unwrap();
+    let report = parsed.judged().unwrap();
+    let expression = report
+        .report()
+        .binding(&carina_core::resource::RelativeBindingName::new("ordinary"))
+        .unwrap();
     check_type_expr_value_providerless(
         &TypeExpr::String,
         &ordinary,
         &context,
-        TypecheckInference::Unavailable,
+        TypecheckInference::Judged(expression),
     )
     .require_provider_schemas()
     .unwrap();
@@ -318,7 +332,7 @@ fn snapshot_state_typecheck_uses_checked_conversion() {
             &TypeExpr::Int,
             &ordinary,
             &context,
-            TypecheckInference::Unavailable
+            TypecheckInference::Judged(expression)
         )
         .require_provider_schemas()
         .is_err()

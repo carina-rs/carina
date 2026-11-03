@@ -132,7 +132,10 @@ where
 /// use carina_core::{resource::SnapshotValue,parser::{ProviderContext,TypeExpr},validation::typecheck::{check_type_expr_value_providerless,TypecheckInference}};
 /// let snapshot: SnapshotValue = unimplemented!();
 /// let context = ProviderContext::new(carina_core::EnvironmentSnapshot::new([]));
-/// check_type_expr_value_providerless(&TypeExpr::String,&snapshot,&context,TypecheckInference::Unavailable);
+/// let parsed = carina_core::parser::parse_file("let value = 'value'", std::path::Path::new("test.crn"), &context).unwrap();
+/// let report = parsed.judged().unwrap();
+/// let expression = report.report().binding(&carina_core::resource::RelativeBindingName::new("value")).unwrap();
+/// check_type_expr_value_providerless(&TypeExpr::String,&snapshot,&context,TypecheckInference::Judged(expression));
 /// ```
 ///
 /// ```compile_fail

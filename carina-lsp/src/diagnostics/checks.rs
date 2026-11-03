@@ -801,10 +801,11 @@ impl DiagnosticRun<'_> {
         if let Some(name) = current_file_name {
             overrides.insert(name.to_string(), doc.text());
         }
-        let result = carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
+        let result = carina_core::config_loader::parse_directory_with_overrides_and_diagnostics_with_schemas(
             base_path,
             self.provider_context.catalog(),
             &overrides,
+            &self.schemas,
         )?;
         Ok(MergedParseResult {
             directory: std::sync::Arc::new(result),
@@ -1327,7 +1328,7 @@ impl DiagnosticRun<'_> {
         semantic_view: &SemanticView<'_>,
         binding_index: &BindingIndex<'_>,
         known_bindings: &HashSet<String>,
-        inference_bindings: &carina_core::validation::inference::InferenceBindings<
+        _inference_bindings: &carina_core::validation::inference::InferenceBindings<
             ParserPlaceholder,
         >,
     ) -> Vec<Diagnostic> {
@@ -1417,15 +1418,25 @@ impl DiagnosticRun<'_> {
                         continue;
                     };
                     let type_expr = &resolved_type;
+                    let authority = match semantic_view {
+                        SemanticView::Standalone(file)
+                        | SemanticView::DirectoryParsed { merged: file } => *file,
+                        SemanticView::DirectoryUnavailable => parsed,
+                    };
+                    let report = authority
+                        .judged()
+                        .expect("loaded attribute report")
+                        .report();
+                    let expression = record_for(attr_param)
+                        .value_location()
+                        .and_then(|location| report.expression(location))
+                        .unwrap_or(report.unknown());
                     let type_error = match self.provider_context.loaded_context() {
                         Some(provider_context) => typecheck::check_type_expr_value(
                             type_expr,
                             semantic_value,
                             provider_context,
-                            TypecheckInference::Available {
-                                bindings: inference_bindings,
-                                schemas: &self.schemas,
-                            },
+                            TypecheckInference::Judged(expression),
                         )
                         .require_provider_schemas()
                         .err(),
@@ -1433,10 +1444,7 @@ impl DiagnosticRun<'_> {
                             type_expr,
                             semantic_value,
                             self.provider_context.catalog(),
-                            TypecheckInference::Available {
-                                bindings: inference_bindings,
-                                schemas: &self.schemas,
-                            },
+                            TypecheckInference::Judged(expression),
                         )
                         .record_at(
                             self.provider_context,
@@ -1716,7 +1724,7 @@ impl DiagnosticRun<'_> {
         D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
         carina_core::validation::inference::infer_export_params(
-            parsed,
+            parsed.judged().expect("loader-owned expression report"),
             &self.schemas,
             self.provider_context.catalog(),
         )

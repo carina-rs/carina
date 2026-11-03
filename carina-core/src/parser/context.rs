@@ -205,6 +205,32 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
         &self.diagnostic_source.path
     }
 
+    pub(super) fn evaluate_retained_expression(
+        &self,
+        pair: pest::iterators::Pair<'_, Rule>,
+        reduce: impl FnOnce() -> Result<Value, ParseError>,
+    ) -> Result<super::retained::ExprValue, ParseError> {
+        super::retained::evaluate(
+            pair,
+            &self.diagnostic_source.file,
+            &self.diagnostic_source.path,
+            reduce,
+        )
+    }
+
+    pub(super) fn evaluate_retained_sink(
+        &self,
+        pair: pest::iterators::Pair<'_, Rule>,
+        reduce: impl FnOnce() -> Result<crate::eval_value::ParsedSinkValue, ParseError>,
+    ) -> Result<super::retained::SinkExpression, ParseError> {
+        super::retained::evaluate_sink(
+            pair,
+            &self.diagnostic_source.file,
+            &self.diagnostic_source.path,
+            reduce,
+        )
+    }
+
     pub(super) fn access_locations(
         &self,
         pair: &pest::iterators::Pair<'_, Rule>,

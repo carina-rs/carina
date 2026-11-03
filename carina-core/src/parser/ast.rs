@@ -1696,10 +1696,15 @@ impl<S, B: BindingAddress> DeferredForExpression<S, ParserPlaceholder, ParserPla
     fn into_expanded(
         self,
         schemas: &crate::schema::SchemaRegistry,
-        bindings: &crate::validation::inference::InferenceBindings<ParserPlaceholder, B>,
-        context: &super::ProviderContext,
+        report: &super::retained::ExpressionReport<B>,
+        _context: &super::ProviderContext,
     ) -> Result<DeferredForExpression<S, NoPlaceholder, LoopSlot, B>, crate::resource::ExpansionError>
     {
+        let element_type = self
+            .site()
+            .iterable_location
+            .and_then(|location| report.expression(location))
+            .and_then(directive_element_type);
         let Self {
             location,
             header,
@@ -1709,7 +1714,6 @@ impl<S, B: BindingAddress> DeferredForExpression<S, ParserPlaceholder, ParserPla
             template_resource,
             deferred_effect_id: _,
         } = self;
-        let element_type = directive_element_type(&iterable, bindings, schemas, context);
         let template_resource = template_resource.try_map_resource(|resource| {
             resource.into_loop_template(schemas, element_type.as_ref())
         })?;
@@ -7504,16 +7508,9 @@ where
     }
 }
 
-fn directive_element_type<B: BindingAddress>(
-    iterable: &Value<ParserPlaceholder, B>,
-    bindings: &crate::validation::inference::InferenceBindings<ParserPlaceholder, B>,
-    schemas: &crate::schema::SchemaRegistry,
-    context: &super::ProviderContext,
-) -> Option<TypeExpr> {
-    match crate::validation::inference::infer_type_from_value(iterable, bindings, schemas, context)
-        .ok()?
-    {
-        TypeExpr::List(element) | TypeExpr::Map(element) => Some(*element),
+fn directive_element_type(expression: &super::retained::JudgedExpr) -> Option<TypeExpr> {
+    match expression.static_type().ok()? {
+        TypeExpr::List(element) | TypeExpr::Map(element) => Some(*element.clone()),
         _ => None,
     }
 }
@@ -7536,7 +7533,7 @@ where
             .iter()
             .map(|argument| (argument.name.as_str(), &argument.static_type))
             .collect();
-        let bindings = crate::validation::inference::bindings_from_parsed(self);
+        let report = self.judged().ok().map(|judged| judged.report());
         let mut seen = HashSet::new();
         self.iter_all_resources()
             .flat_map(|resource| {
@@ -7574,7 +7571,14 @@ where
                             Some(resource.directives()),
                             crate::schema::SchemaKind::Resource,
                             true,
-                            directive_element_type(iterable, &bindings, schemas, context),
+                            report
+                                .and_then(|report| {
+                                    self.deferred_for_sites()
+                                        .find(|site| std::ptr::eq(site.iterable, iterable))
+                                        .and_then(|site| site.iterable_location)
+                                        .and_then(|location| report.expression(location))
+                                })
+                                .and_then(directive_element_type),
                             super::contains_module_argument_matching(iterable, &mut |_| true),
                             Some(iterable),
                         )
@@ -8383,8 +8387,12 @@ impl<E: IntoExpandedExportParam<AbsoluteBindingAddress>>
         if !directive_errors.is_empty() {
             return Err(crate::resource::DirectiveResolutionErrors::new(directive_errors).into());
         }
-        let directive_bindings = crate::validation::inference::bindings_from_parsed(&self);
         self.validate_expansion_boundary(ParserPlaceholderBoundary::ExpandedFile)?;
+        let directive_report = self
+            .judged()
+            .expect("expansion requires a judged configuration")
+            .report()
+            .clone();
 
         let File {
             providers,
@@ -8470,7 +8478,7 @@ impl<E: IntoExpandedExportParam<AbsoluteBindingAddress>>
                         .expressions
                         .into_iter()
                         .map(|expression| {
-                            expression.into_expanded(schemas, &directive_bindings, context)
+                            expression.into_expanded(schemas, &directive_report, context)
                         })
                         .collect::<Result<_, _>>()?,
                 ),
@@ -9865,7 +9873,11 @@ mod substitute_placeholder_tests {
             .unwrap()
             .into_expanded(
                 &crate::schema::SchemaRegistry::new(),
-                &std::collections::HashMap::new(),
+                &crate::parser::retained::judge_expressions(
+                    &crate::parser::RootBindingResolvedParsedFile::default(),
+                    &crate::schema::SchemaRegistry::new(),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                ),
                 &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .unwrap();

@@ -702,7 +702,7 @@ mod diagnostic_status_tests {
                 let binding_use_report = crate::validation::check_bare_binding_uses(
                     &parsed,
                     &crate::validation::ValidationTypeContext::new_providerless(
-                        &parsed,
+                        parsed.judged().expect("loader-owned expression report"),
                         &schemas,
                         provider_context.catalog(),
                         &signatures,
@@ -819,7 +819,12 @@ struct UpstreamRefCheckedModuleGraph<'parsed, 'cfg, E> {
 }
 
 /// Private capability produced only by `ModuleResolver::validate_reference_types`.
-pub(super) struct RefCheckWitness(pub(super) ());
+pub(super) struct RefCheckWitness(
+    pub(super)  std::collections::HashMap<
+        crate::parser::DeclarationLocation,
+        crate::parser::retained::JudgedExpr,
+    >,
+);
 
 /// Compile-time policy for resolving type annotations in loaded modules.
 pub(crate) trait TypeResolutionPolicy {
@@ -1079,7 +1084,15 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             &imported_modules,
             &bindings,
         )
-        .map(|()| RefCheckWitness(()))
+        .map(|()| {
+            RefCheckWitness(
+                parsed
+                    .judged()
+                    .expect("module reference checks require judgement")
+                    .report()
+                    .locations(),
+            )
+        })
         .map_err(ModuleError::ReferenceType)
     }
 
@@ -1120,6 +1133,16 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     /// Modules are directory-scoped: a module is a directory containing one or
     /// more `.crn` files. Single-file modules are not supported — pass the
     /// module's directory, not an individual `.crn` file.
+    #[cfg(test)]
+    pub(super) fn insert_module_for_test(
+        &mut self,
+        name: String,
+        mut file: ParsedFile,
+    ) -> Option<ParsedFile> {
+        crate::parser::retained::judge_configuration(&mut file, self.schemas, self.config());
+        self.imported_modules.insert(name, file)
+    }
+
     pub fn load_module(&mut self, path: &str) -> Result<ParsedFile, ModuleError> {
         let full_path = self.resolve_path(path)?;
 
@@ -1263,6 +1286,19 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             .map_err(ModuleError::Parse)?;
 
         P::resolve_file_type_exprs(&mut merged, self.session)?;
+        crate::parser::retained::judge_configuration(
+            &mut merged,
+            self.schemas,
+            self.session.catalog(),
+        );
+        if let Some(error) = merged
+            .judged()
+            .expect("module loader judgement")
+            .report()
+            .first_error()
+        {
+            return Err(ModuleError::Parse(error));
+        }
         Ok(merged)
     }
 
@@ -1591,6 +1627,14 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
         mut resolver: ModuleResolver<'cfg, StrictTypeResolution>,
     ) -> Result<Self, ModuleError> {
         StrictTypeResolution::resolve_file_type_exprs(parsed, resolver.session)?;
+        if let Some(error) = parsed
+            .judged()
+            .expect("directory loader judgement")
+            .report()
+            .first_error()
+        {
+            return Err(ModuleError::Parse(error));
+        }
         resolver
             .process_imports(&parsed.uses, &parsed.module_calls)
             .map_err(|error| {
@@ -1622,7 +1666,13 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
             &root,
         )?;
         let parsed = std::mem::take(self.parsed);
-        Ok(finish_root_expansion(parsed, contributions, &root))
+        let mut expanded = finish_root_expansion(parsed, contributions, &root);
+        crate::parser::retained::judge_configuration(
+            &mut expanded,
+            self.resolver.schemas,
+            self.resolver.config(),
+        );
+        Ok(expanded)
     }
 }
 
@@ -1687,7 +1737,13 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
             &root,
         )?;
         let parsed = std::mem::take(self.parsed);
-        Ok(finish_root_expansion(parsed, contributions, &root))
+        let mut expanded = finish_root_expansion(parsed, contributions, &root);
+        crate::parser::retained::judge_configuration(
+            &mut expanded,
+            self.resolver.schemas,
+            self.resolver.config(),
+        );
+        Ok(expanded)
     }
 }
 
@@ -1978,7 +2034,8 @@ fn resolve_modules_with_diagnostics_and_resolver<
         Err(error) => errors.push(error),
     }
     graph.warnings.extend(resolver.provider_type_warnings());
-    let graph = finish_root_expansion(graph, contributions, &root);
+    let mut graph = finish_root_expansion(graph, contributions, &root);
+    crate::parser::retained::judge_configuration(&mut graph, resolver.schemas, resolver.config());
     let (graph, deferred_for_errors) = finalize_deferred_for_bodies_collecting(graph);
     errors.extend(deferred_for_errors);
     let constraint_reports = resolver

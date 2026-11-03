@@ -20,6 +20,51 @@ use carina_core::schema::{
 };
 use support::fixture::{analyze, engine_with_schemas, single_schema_map, write_fixture};
 
+#[test]
+fn authored_expression_unsaved_fallback_owns_one_exact_diagnostic() {
+    use std::sync::Arc;
+    use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Range};
+    let fixture = write_fixture(&[
+        ("main.crn", "let b = a ?? 'valid'\n"),
+        ("origin.crn", "let first = 'present'\n"),
+        ("aliases.crn", "let a = first\n"),
+        ("exports.crn", "exports {}\n"),
+        ("providers.crn", ""),
+        ("backend.crn", "backend local { path = 'state.json' }\n"),
+    ]);
+    let engine = engine_with_schemas(SchemaRegistry::new());
+    let path = fixture.path().join("main.crn");
+    let doc = carina_lsp::document::Document::new_with_path(
+        "let b = a ?? 42\n".into(),
+        path.clone(),
+        Arc::new(carina_core::parser::ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
+    );
+    let diagnostics = engine.analyze(&doc, Some(&path));
+    let errors = diagnostics
+        .iter()
+        .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+        .collect::<Vec<_>>();
+    assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+    assert!(
+        errors[0].message.contains("String") && errors[0].message.contains("Int"),
+        "{errors:#?}"
+    );
+    assert_eq!(
+        errors[0].range,
+        Range::new(Position::new(0, 13), Position::new(0, 15))
+    );
+    for sibling in ["origin.crn", "aliases.crn", "exports.crn"] {
+        assert!(
+            analyze(&engine, &fixture, sibling)
+                .iter()
+                .all(|d| d.severity != Some(DiagnosticSeverity::ERROR)),
+            "{sibling}"
+        );
+    }
+}
+
 fn count_with(diags: &[tower_lsp::lsp_types::Diagnostic], substring: &str) -> usize {
     diags
         .iter()

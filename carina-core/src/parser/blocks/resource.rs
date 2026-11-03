@@ -242,7 +242,10 @@ fn parse_block_contents_with_quoted(
                         let value = parse_expression(
                             next_pair(&mut binding_inner, "binding value", "local let binding")?,
                             &local_ctx,
-                        )?;
+                        )?
+                        .projection()
+                        .expect("materialized parser expression")
+                        .clone();
                         // Add to local scope only, not to attributes
                         local_ctx.set_variable(name, value);
                     }
@@ -261,9 +264,11 @@ fn parse_block_contents_with_quoted(
                             next_pair(&mut attr_inner, "attribute value", "block content")?;
                         record_quoted_if_literal(quoted_out, &key, &value_pair);
                         let value_mode = mode.at_named_child(key.clone());
-                        match parse_expression_in_sink(value_pair, &local_ctx, &value_mode)? {
+                        match parse_expression_in_sink(value_pair, &local_ctx, &value_mode)?
+                            .projection()
+                        {
                             ParsedSinkValue::Ready(value) => {
-                                attributes.insert(key, value);
+                                attributes.insert(key, value.clone());
                             }
                             ParsedSinkValue::Pending(_) => {
                                 pending = true;
@@ -322,9 +327,9 @@ fn parse_block_contents_with_quoted(
                 let value_pair = next_pair(&mut attr_inner, "attribute value", "block content")?;
                 record_quoted_if_literal(quoted_out, &key, &value_pair);
                 let value_mode = mode.at_named_child(key.clone());
-                match parse_expression_in_sink(value_pair, &local_ctx, &value_mode)? {
+                match parse_expression_in_sink(value_pair, &local_ctx, &value_mode)?.projection() {
                     ParsedSinkValue::Ready(value) => {
-                        attributes.insert(key, value);
+                        attributes.insert(key, value.clone());
                     }
                     ParsedSinkValue::Pending(_) => {
                         pending = true;
@@ -501,7 +506,10 @@ fn parse_directives(
 
         if let Some(directive) = LifecycleDirective::from_name(&key) {
             let source = ctx.directive_value_source_span(&value_pair);
-            let value = parse_expression(value_pair, ctx)?;
+            let value = parse_expression(value_pair, ctx)?
+                .projection()
+                .expect("materialized parser expression")
+                .clone();
             parsed_directives
                 .directives
                 .set(directive, DirectiveExpr::new(value, source));
@@ -622,7 +630,11 @@ fn parse_ignore_change_path(
                     Rule::index_access => {
                         let index =
                             first_inner(access, "subscript", "directives.ignore_changes path")?;
-                        match parse_expression(index, ctx)? {
+                        match parse_expression(index, ctx)?
+                            .projection()
+                            .expect("materialized parser expression")
+                            .clone()
+                        {
                             Value::Concrete(ConcreteValue::String(key)) => segments.push(
                                 ParsedIgnorePathSegment::MapKey(key.expose_plaintext().to_string()),
                             ),

@@ -534,6 +534,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
         parsed.parsed(),
         base_dir,
         &enriched_context.catalog().environment,
+        ctx.schemas(),
     );
 
     let mut errors: Vec<AppError> = Vec::new();
@@ -625,6 +626,17 @@ pub(crate) fn validate_and_resolve_errors_inner(
             .push(carina_core::validation::ModuleCallFinding::from_type_resolution(diagnostic));
     }
     extend_module_call_errors(&mut errors, root_type_resolution_findings);
+    let expression_report = parsed
+        .judged()
+        .expect("loader-owned expression report")
+        .report();
+    errors.extend(
+        expression_report
+            .findings()
+            .iter()
+            .cloned()
+            .map(|finding| AppError::ExpressionType(Box::new(finding))),
+    );
     if let Err(error) = parsed.resolve_resource_refs_in_session(enriched_context) {
         errors.push(AppError::Config(error.to_string()));
     }
@@ -1714,7 +1726,7 @@ child { values = [source] }
         let report = carina_core::validation::check_bare_binding_uses(
             &parsed,
             &carina_core::validation::ValidationTypeContext::new_providerless(
-                &parsed,
+                parsed.judged().expect("loader-owned expression report"),
                 &schemas,
                 &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
                 &signatures,

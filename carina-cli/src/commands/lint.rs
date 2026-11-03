@@ -303,7 +303,12 @@ fn lint_result(
     let duplicate_declarations = loaded.duplicate_declarations;
     let mut parsed = loaded.parsed;
 
-    let module_walk = ModuleWalk::load(&parsed, base_dir, &provider_context.environment);
+    let module_walk = ModuleWalk::load(
+        &parsed,
+        base_dir,
+        &provider_context.environment,
+        &carina_core::schema::SchemaRegistry::new(),
+    );
     let mut module_boundary_findings = validate_no_provider_in_modules(&module_walk);
     module_boundary_findings.extend(validate_no_state_blocks_in_modules(&module_walk));
     module_boundary_findings.extend(validate_no_backend_in_modules(&module_walk));

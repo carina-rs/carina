@@ -202,16 +202,24 @@ impl dyn ProviderTypeCheckContext + '_ {
 /// use carina_core::{parser::{ProviderContext, TypeExpr}, resource::{AuthoredValue, AuthoredConcreteValue}, validation::{deferred_types::TypeCheckSession, typecheck::{check_type_expr_value_providerless, TypecheckInference}}};
 /// let expected = TypeExpr::String;
 /// let value = AuthoredValue::Concrete(AuthoredConcreteValue::String("value".into()));
+/// let catalog = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+/// let parsed = carina_core::parser::parse_file("let value = 'value'", std::path::Path::new("test.crn"), &catalog).unwrap();
+/// let report = parsed.judged().unwrap();
+/// let expression = report.report().binding(&carina_core::resource::RelativeBindingName::new("value")).unwrap();
 /// let escaped = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
-///     check_type_expr_value_providerless(&expected, &value, session.catalog(), TypecheckInference::Unavailable)
+///     check_type_expr_value_providerless(&expected, &value, session.catalog(), TypecheckInference::Judged(expression))
 /// });
 /// ```
 /// ```
 /// use carina_core::{parser::{ProviderContext, TypeExpr}, resource::{AuthoredValue, AuthoredConcreteValue}, validation::{deferred_types::TypeCheckSession, typecheck::{check_type_expr_value_providerless, TypecheckInference}}};
 /// let expected = TypeExpr::String;
 /// let value = AuthoredValue::Concrete(AuthoredConcreteValue::String("value".into()));
+/// let catalog = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+/// let parsed = carina_core::parser::parse_file("let value = 'value'", std::path::Path::new("test.crn"), &catalog).unwrap();
+/// let report = parsed.judged().unwrap();
+/// let expression = report.report().binding(&carina_core::resource::RelativeBindingName::new("value")).unwrap();
 /// let result = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
-///     check_type_expr_value_providerless(&expected, &value, session.catalog(), TypecheckInference::Unavailable)
+///     check_type_expr_value_providerless(&expected, &value, session.catalog(), TypecheckInference::Judged(expression))
 ///         .record_deferred(session).unwrap();
 /// });
 /// result.publish(&mut Vec::new());

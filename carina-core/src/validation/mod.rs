@@ -564,12 +564,16 @@ pub struct ValidationTypeContext<'a, B: BindingAddress = RelativeBindingName> {
     pub module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     provider_context: typecheck::TypecheckProviderContext<'a>,
     scope_bindings: BindingIndex<'a, B>,
-    inference_bindings: inference::InferenceBindings<ParserPlaceholder, B>,
+    expression_report: &'a crate::parser::retained::ExpressionReport<B>,
+}
+
+pub(crate) fn expression_sink_type(attr_type: &AttributeType, owner: &str) -> TypeExpr {
+    inference::attribute_type_to_type_expr(attr_type, owner)
 }
 
 impl<'a, B: BindingAddress> ValidationTypeContext<'a, B> {
     pub fn in_session<E, D>(
-        file: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+        file: crate::parser::retained::JudgedFile<'a, E, D, B>,
         schemas: &'a SchemaRegistry,
         session: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
@@ -586,7 +590,7 @@ impl<'a, B: BindingAddress> ValidationTypeContext<'a, B> {
     }
 
     pub fn new<E, D>(
-        file: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+        file: crate::parser::retained::JudgedFile<'a, E, D, B>,
         schemas: &'a SchemaRegistry,
         provider_context: &'a LoadedProviderContext,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
@@ -606,7 +610,7 @@ impl<'a, B: BindingAddress> ValidationTypeContext<'a, B> {
     /// an incomplete provider custom-type catalog. Structural checks and
     /// successfully loaded owners remain strict; unavailable owners defer.
     pub fn new_providerless<E, D>(
-        file: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+        file: crate::parser::retained::JudgedFile<'a, E, D, B>,
         schemas: &'a SchemaRegistry,
         provider_context: &'a ProviderContext,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
@@ -623,7 +627,7 @@ impl<'a, B: BindingAddress> ValidationTypeContext<'a, B> {
     }
 
     fn with_provider_context<E, D>(
-        file: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+        judged: crate::parser::retained::JudgedFile<'a, E, D, B>,
         schemas: &'a SchemaRegistry,
         provider_context: typecheck::TypecheckProviderContext<'a>,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
@@ -631,6 +635,7 @@ impl<'a, B: BindingAddress> ValidationTypeContext<'a, B> {
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
+        let file = judged.file();
         Self {
             schemas,
             provider_context,
@@ -652,7 +657,7 @@ impl<'a, B: BindingAddress> ValidationTypeContext<'a, B> {
                     provider_context.as_provider_context(),
                 ),
             },
-            inference_bindings: inference::bindings_from_parsed(file),
+            expression_report: judged.report(),
         }
     }
 
@@ -764,6 +769,10 @@ impl<E> std::ops::Deref for ResolvedFile<E> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveFileError {
+    #[error(transparent)]
+    Unjudged(#[from] crate::parser::retained::UnjudgedConfiguration),
+    #[error(transparent)]
+    Expression(Box<crate::parser::Located<inference::InferenceError>>),
     #[error(transparent)]
     BindingUse(#[from] BindingUseReport),
     #[error(transparent)]
@@ -1125,8 +1134,8 @@ fn reference_value_mismatch<B: BindingAddress>(
 
 fn deferred_value_mismatch<B: BindingAddress>(
     source: ValueSource<'_, B>,
+    expression: &crate::parser::retained::JudgedExpr,
     target: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
-    inference_bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
     schemas: &SchemaRegistry,
     bindings: &BindingIndex<'_, B>,
     authored_binding: &str,
@@ -1141,8 +1150,8 @@ fn deferred_value_mismatch<B: BindingAddress>(
                         value: branch,
                         declared_type: source.declared_type,
                     },
+                    expression,
                     target,
-                    inference_bindings,
                     schemas,
                     bindings,
                     authored_binding,
@@ -1196,7 +1205,7 @@ fn deferred_value_mismatch<B: BindingAddress>(
             | crate::resource::DeferredValue::Secret(_)
             | crate::resource::DeferredValue::Unknown(_)
             | crate::resource::DeferredValue::Placeholder(_),
-        ) => check_deferred_access_type(value, target, inference_bindings, schemas, bindings)
+        ) => check_deferred_access_type(value, target, expression, schemas, bindings)
             .err()
             .map(|error| match error {
                 DeferredAccessTypeError::TypeMismatch {
@@ -1246,6 +1255,29 @@ fn precheck_value_source<B: BindingAddress>(
     context: &ValidationTypeContext<'_, B>,
     diagnostic_path: &impl Fn(ReferencePathRef<'_, B>) -> ModuleCallDiagnosticPath,
 ) -> Option<BindingResolutionError> {
+    let report = match &use_site.owner {
+        crate::parser::BindingUseOwner::Resource(address) => context
+            .expression_report
+            .for_resource(address.resource_id()),
+        crate::parser::BindingUseOwner::ModuleArgument { .. } => context.expression_report,
+    };
+    if let Some(expression) = report.expression(use_site.location()) {
+        let expected = match sink {
+            RefSink::EffectiveType {
+                attr_type,
+                owner: crate::parser::SchemaTypeOwner::Provider(provider),
+                ..
+            } => inference::attribute_type_to_type_expr(attr_type, provider),
+            RefSink::String => TypeExpr::String,
+            RefSink::TypeExpr(ty) => ty.clone(),
+        };
+        if matches!(
+            crate::parser::retained::admit_expression(expression, &expected),
+            Ok(crate::parser::retained::ExpressionAdmission::DeferredInterpolation)
+        ) {
+            return None;
+        }
+    }
     let string_sink = lift_type_expr(&TypeExpr::String).expect("built-in String lifts");
     let lifted_sink;
     let target = match sink {
@@ -1276,8 +1308,10 @@ fn precheck_value_source<B: BindingAddress>(
             value,
             declared_type,
         },
+        report
+            .expression(use_site.location())
+            .unwrap_or(report.unknown()),
         target,
-        &context.inference_bindings,
         context.schemas,
         &context.scope_bindings,
         &use_site.name,
@@ -1839,8 +1873,12 @@ pub fn resolve_bare_binding_uses<
     module_signatures: &crate::module_resolver::ResolvedModuleSignatures,
 ) -> Result<ResolvedFile<E::Expanded>, ResolveFileError> {
     let report = {
-        let context =
-            ValidationTypeContext::new(&file, schemas, provider_context, module_signatures);
+        let context = ValidationTypeContext::new(
+            file.judged()?,
+            schemas,
+            provider_context,
+            module_signatures,
+        );
         check_expanded_bare_binding_uses(&file, &context)
     };
     finish_binding_resolution(file, report, schemas, provider_context)
@@ -1858,8 +1896,12 @@ pub fn resolve_bare_binding_uses_in_session<
     module_signatures: &crate::module_resolver::ResolvedModuleSignatures,
 ) -> Result<ResolvedFile<E::Expanded>, ResolveFileError> {
     let report = {
-        let context =
-            ValidationTypeContext::in_session(&file, schemas, provider_context, module_signatures);
+        let context = ValidationTypeContext::in_session(
+            file.judged()?,
+            schemas,
+            provider_context,
+            module_signatures,
+        );
         check_expanded_bare_binding_uses(&file, &context)
     };
     finish_binding_resolution(file, report, schemas, provider_context.catalog())
@@ -1871,6 +1913,9 @@ fn finish_binding_resolution<E: crate::parser::IntoExpandedExportParam<AbsoluteB
     schemas: &SchemaRegistry,
     provider_context: &ProviderContext,
 ) -> Result<ResolvedFile<E::Expanded>, ResolveFileError> {
+    if let Some(finding) = file.judged()?.report().findings().first() {
+        return Err(ResolveFileError::Expression(Box::new(finding.clone())));
+    }
     if !report.is_ready() {
         return Err(report.into());
     }
@@ -2227,8 +2272,8 @@ impl std::fmt::Display for IntegerArithmeticTypeFinding {
 pub fn check_deferred_access_type<B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     expected: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
-    bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
-    schemas: &SchemaRegistry,
+    expression: &crate::parser::retained::JudgedExpr,
+    _schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
 ) -> Result<(), DeferredAccessTypeError> {
     // Canonical reference-rooted postfix expressions are ResourceRefs. Route
@@ -2272,12 +2317,38 @@ pub fn check_deferred_access_type<B: BindingAddress>(
         };
     }
 
-    let actual = match inference::infer_type_from_value_with_provider_context(
+    check_inferred_assignment(
         value,
-        bindings,
-        schemas,
-        binding_index.provider_context(),
-    ) {
+        expected,
+        expression.static_type().cloned().map_err(Clone::clone),
+        binding_index,
+    )
+}
+
+/// Check values produced by state/runtime evaluation, which have no authored
+/// expression. Parser-phase projections cannot enter this API.
+pub fn check_runtime_value_type<B: BindingAddress>(
+    input: inference::RuntimeTypeInput<'_, B>,
+    expected: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
+    bindings: &inference::InferenceBindings<crate::resource::NoPlaceholder, B>,
+    schemas: &SchemaRegistry,
+    binding_index: &BindingIndex<'_, B>,
+) -> Result<(), DeferredAccessTypeError> {
+    check_inferred_assignment(
+        input.value(),
+        expected,
+        inference::infer_runtime_type(input, bindings, schemas, binding_index.provider_context()),
+        binding_index,
+    )
+}
+
+fn check_inferred_assignment<P: PlaceholderKind, B: BindingAddress>(
+    value: &GenericValue<P, B>,
+    expected: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
+    inferred: Result<TypeExpr, crate::static_type::InferenceIssue>,
+    binding_index: &BindingIndex<'_, B>,
+) -> Result<(), DeferredAccessTypeError> {
+    let actual = match inferred {
         Ok(actual) => actual,
         Err(crate::static_type::InferenceIssue::Failed(
             error @ inference::InferenceError::InvalidAccess { .. },
@@ -2367,8 +2438,7 @@ fn prove_integer_operand<B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     expression: &crate::integer_arithmetic::ValidatedIntegerExpr<ParserPlaceholder, B>,
     side: crate::integer_arithmetic::IntegerOperandSide,
-    bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
-    schemas: &SchemaRegistry,
+    report: &crate::parser::retained::ExpressionReport<B>,
     binding_index: &BindingIndex<'_, B>,
 ) -> Result<(), DeferredAccessTypeError> {
     let integer = lift_type_expr(&TypeExpr::Int).expect("built-in Int lifts");
@@ -2384,41 +2454,25 @@ fn prove_integer_operand<B: BindingAddress>(
             crate::resource::ApplyTimeUnknown::UpstreamExport { path },
         )) => Some(binding_index.postfix_ref_type(path)),
         GenericValue::Deferred(crate::resource::DeferredValue::Secret(inner)) => {
-            return prove_integer_operand(
-                inner,
-                expression,
-                side,
-                bindings,
-                schemas,
-                binding_index,
-            );
+            return prove_integer_operand(inner, expression, side, report, binding_index);
         }
         GenericValue::Deferred(crate::resource::DeferredValue::Coalesce { value, default }) => {
-            prove_integer_operand(value, expression, side, bindings, schemas, binding_index)?;
-            return prove_integer_operand(
-                default,
-                expression,
-                side,
-                bindings,
-                schemas,
-                binding_index,
-            );
+            prove_integer_operand(value, expression, side, report, binding_index)?;
+            return prove_integer_operand(default, expression, side, report, binding_index);
         }
         GenericValue::Deferred(crate::resource::DeferredValue::ModuleIf(deferred)) => {
             prove_integer_operand(
                 deferred.then_value(),
                 expression,
                 side,
-                bindings,
-                schemas,
+                report,
                 binding_index,
             )?;
             return prove_integer_operand(
                 deferred.else_value(),
                 expression,
                 side,
-                bindings,
-                schemas,
+                report,
                 binding_index,
             );
         }
@@ -2459,12 +2513,15 @@ fn prove_integer_operand<B: BindingAddress>(
             });
     }
 
-    match inference::infer_type_from_value_with_provider_context(
-        value,
-        bindings,
-        schemas,
-        binding_index.provider_context(),
-    ) {
+    match expression
+        .operator_span()
+        .location()
+        .map(|location| report.operand(location, side))
+        .unwrap_or(report.unknown())
+        .static_type()
+        .cloned()
+        .map_err(Clone::clone)
+    {
         Ok(TypeExpr::Int) => Ok(()),
         Ok(TypeExpr::UnloadedSchemaType(_))
         | Err(crate::static_type::InferenceIssue::NotInferable(
@@ -2557,8 +2614,7 @@ fn check_integer_result_sink<B: BindingAddress>(
 fn check_integer_arithmetic_types_with_sink<'a, B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     sink: Option<RefSink<'a>>,
-    bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
-    schemas: &SchemaRegistry,
+    report: &crate::parser::retained::ExpressionReport<B>,
     binding_index: &BindingIndex<'_, B>,
 ) -> Vec<crate::parser::Located<IntegerArithmeticTypeFinding>> {
     let mut findings = Vec::new();
@@ -2572,8 +2628,7 @@ fn check_integer_arithmetic_types_with_sink<'a, B: BindingAddress>(
             expression.lhs(),
             expression,
             crate::integer_arithmetic::IntegerOperandSide::Left,
-            bindings,
-            schemas,
+            report,
             binding_index,
         )
         .and_then(|()| {
@@ -2581,8 +2636,7 @@ fn check_integer_arithmetic_types_with_sink<'a, B: BindingAddress>(
                 expression.rhs(),
                 expression,
                 crate::integer_arithmetic::IntegerOperandSide::Right,
-                bindings,
-                schemas,
+                report,
                 binding_index,
             )
         })
@@ -2628,10 +2682,16 @@ where
         >,
         name: &str,
         schema: crate::schema::OwnerBoundResourceSchema<'_>,
-        bindings: &crate::validation::inference::InferenceBindings<ParserPlaceholder, B>,
-        schemas: &crate::schema::SchemaRegistry,
+        _bindings: &crate::validation::inference::InferenceBindings<ParserPlaceholder, B>,
+        _schemas: &crate::schema::SchemaRegistry,
         binding_index: &crate::binding_index::BindingIndex<'_, B>,
     ) -> Vec<crate::parser::Located<crate::validation::IntegerArithmeticTypeFinding>> {
+        let report = self
+            .file()
+            .judged()
+            .expect("arithmetic requires a judged configuration")
+            .report()
+            .for_resource(resource.id());
         let attributes = resource.attributes();
         let sink = schema
             .effective_attribute_by_authored_name(name)
@@ -2641,8 +2701,7 @@ where
             &attributes[name],
             sink,
             schema.schema_type_owner(),
-            bindings,
-            schemas,
+            report,
             binding_index,
         )
     }
@@ -2656,15 +2715,13 @@ fn check_integer_arithmetic_types<B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     sink: crate::schema::EffectiveType<'_>,
     owner: &crate::parser::SchemaTypeOwner,
-    bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
-    schemas: &SchemaRegistry,
+    report: &crate::parser::retained::ExpressionReport<B>,
     binding_index: &BindingIndex<'_, B>,
 ) -> Vec<crate::parser::Located<IntegerArithmeticTypeFinding>> {
     check_integer_arithmetic_types_with_sink(
         value,
         Some(RefSink::from_effective_type(sink, owner)),
-        bindings,
-        schemas,
+        report,
         binding_index,
     )
 }
@@ -2673,13 +2730,10 @@ fn append_unique_integer_arithmetic_findings<B: BindingAddress>(
     findings: &mut Vec<crate::parser::Located<IntegerArithmeticTypeFinding>>,
     value: &GenericValue<ParserPlaceholder, B>,
     sink: Option<RefSink<'_>>,
-    bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
-    schemas: &SchemaRegistry,
+    report: &crate::parser::retained::ExpressionReport<B>,
     binding_index: &BindingIndex<'_, B>,
 ) {
-    for finding in
-        check_integer_arithmetic_types_with_sink(value, sink, bindings, schemas, binding_index)
-    {
+    for finding in check_integer_arithmetic_types_with_sink(value, sink, report, binding_index) {
         let duplicate = findings.iter().any(|existing| {
             existing.to_string() == finding.to_string() && existing.location() == finding.location()
         });
@@ -2708,55 +2762,48 @@ pub fn check_file_integer_arithmetic_values<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
-    bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
-    schemas: &SchemaRegistry,
+    _bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
+    _schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
 ) -> Vec<crate::parser::Located<IntegerArithmeticTypeFinding>> {
     let parsed = tree.file();
+    let report = parsed
+        .judged()
+        .expect("arithmetic requires a judged configuration")
+        .report();
     let mut findings = Vec::new();
-    let mut check =
-        |value: &GenericValue<ParserPlaceholder, B>,
-         sink: Option<RefSink<'_>>,
-         value_bindings: &inference::InferenceBindings<ParserPlaceholder, B>| {
-            append_unique_integer_arithmetic_findings(
-                &mut findings,
-                value,
-                sink,
-                value_bindings,
-                schemas,
-                binding_index,
-            );
-        };
+    let mut check = |value: &GenericValue<ParserPlaceholder, B>, sink: Option<RefSink<'_>>| {
+        append_unique_integer_arithmetic_findings(
+            &mut findings,
+            value,
+            sink,
+            report,
+            binding_index,
+        );
+    };
 
     for value in parsed.variables.values() {
-        check(value, Some(RefSink::TypeExpr(&INT_REF_SINK)), bindings);
+        check(value, Some(RefSink::TypeExpr(&INT_REF_SINK)));
     }
     for call in &parsed.module_calls {
         for (_, argument) in call.arguments() {
             check(
                 argument.walker_value(),
                 Some(RefSink::TypeExpr(&INT_REF_SINK)),
-                bindings,
             );
         }
     }
     for argument in &parsed.arguments {
         if let Some(value) = &argument.default {
-            check(
-                value,
-                Some(RefSink::TypeExpr(&argument.static_type)),
-                bindings,
-            );
+            check(value, Some(RefSink::TypeExpr(&argument.static_type)));
         }
     }
     for attribute in &parsed.attribute_params {
         if let Some(expression) = &attribute.value {
             match expression {
-                crate::parser::BoundaryExpression::Value(value) => check(
-                    value,
-                    attribute.static_type.as_ref().map(RefSink::TypeExpr),
-                    bindings,
-                ),
+                crate::parser::BoundaryExpression::Value(value) => {
+                    check(value, attribute.static_type.as_ref().map(RefSink::TypeExpr))
+                }
                 crate::parser::BoundaryExpression::Handle(handle) => {
                     let _typed_handle = handle;
                 }
@@ -2765,11 +2812,7 @@ pub fn check_file_integer_arithmetic_values<
     }
     for export in &parsed.export_params {
         if let Some(value) = export.value() {
-            check(
-                value,
-                export.type_expr_opt().map(RefSink::TypeExpr),
-                bindings,
-            );
+            check(value, export.type_expr_opt().map(RefSink::TypeExpr));
         }
     }
     for provider in &parsed.providers {
@@ -2779,77 +2822,38 @@ pub fn check_file_integer_arithmetic_values<
             .chain(provider.default_tags.values())
             .chain(provider.unresolved_attributes.values())
         {
-            check(value, Some(RefSink::TypeExpr(&INT_REF_SINK)), bindings);
+            check(value, Some(RefSink::TypeExpr(&INT_REF_SINK)));
         }
     }
     if let Some(backend) = &parsed.backend {
         for value in backend.attributes.values() {
-            check(value, Some(RefSink::TypeExpr(&INT_REF_SINK)), bindings);
+            check(value, Some(RefSink::TypeExpr(&INT_REF_SINK)));
         }
     }
     for state_block in &parsed.state_blocks {
         if let crate::parser::StateBlock::Import { id, .. } = state_block {
-            check(id, Some(RefSink::TypeExpr(&INT_REF_SINK)), bindings);
+            check(id, Some(RefSink::TypeExpr(&INT_REF_SINK)));
         }
     }
     // Wait arithmetic is fully evaluated while parsing; the typed RHS is a
     // placeholder-free literal and therefore has no deferred arithmetic node
     // for this parser-stage proof walk.
     for deferred in parsed.deferred_for_sites() {
-        check(
-            deferred.iterable,
-            Some(RefSink::TypeExpr(&INT_REF_SINK)),
-            bindings,
-        );
+        check(deferred.iterable, Some(RefSink::TypeExpr(&INT_REF_SINK)));
     }
 
     for function in parsed.user_functions.values() {
-        let mut function_bindings = bindings.clone();
-        for parameter in &function.params {
-            // A same-named directory binding must not accidentally prove an
-            // unannotated lexical parameter.
-            function_bindings.remove(&parameter.name);
-            if let Some(type_expr) = &parameter.param_type {
-                function_bindings.insert(
-                    parameter.name.clone(),
-                    inference::InferenceBinding::Argument {
-                        type_expr: type_expr.clone(),
-                    },
-                );
-            }
-        }
         for parameter in &function.params {
             if let Some(value) = &parameter.default {
-                check(
-                    value,
-                    parameter.param_type.as_ref().map(RefSink::TypeExpr),
-                    &function_bindings,
-                );
+                check(value, parameter.param_type.as_ref().map(RefSink::TypeExpr));
             }
         }
-        for (name, value, _) in &function.local_lets {
-            function_bindings.remove(name);
-            check(
-                value,
-                Some(RefSink::TypeExpr(&INT_REF_SINK)),
-                &function_bindings,
-            );
-            if let Ok(type_expr) = inference::infer_type_from_value_with_provider_context(
-                value,
-                &function_bindings,
-                schemas,
-                binding_index.provider_context(),
-            ) {
-                function_bindings.insert(
-                    name.clone(),
-                    inference::InferenceBinding::Argument { type_expr },
-                );
-            }
+        for (_, value, _) in &function.local_lets {
+            check(value, Some(RefSink::TypeExpr(&INT_REF_SINK)));
         }
         check(
             &function.body.value,
             function.return_type.as_ref().map(RefSink::TypeExpr),
-            &function_bindings,
         );
     }
 
@@ -4570,6 +4574,11 @@ fn validate_resource_ref_types_inner<
 ) -> Result<(), ResourceRefTypeValidationError> {
     let mut all_errors = Vec::new();
     let inference_bindings = inference::bindings_from_parsed(parsed);
+    let report = parsed
+        .judged()
+        .expect("resource validation requires a judged configuration")
+        .report();
+    let tree = crate::parser::AnalysisTree::try_from_file(parsed)?;
 
     // Validate declarations directly instead of relying on a later resource
     // attribute to happen to expose an expression. Keep the authored
@@ -4593,7 +4602,18 @@ fn validate_resource_ref_types_inner<
          attrs: &indexmap::IndexMap<String, GenericValue<ParserPlaceholder, B>>,
          validated_schema: crate::schema::OwnerBoundResourceSchema<'_>,
          module_source: Option<&crate::resource::ModuleSource>| {
+            let report = report.for_resource(resource_id);
             for (attr_name, attr_value) in attrs {
+                let expression =
+                    tree.resources()
+                        .find(|resource| resource.id() == resource_id)
+                        .and_then(|resource| {
+                            report.expression(resource.attribute_value_location(
+                                attr_name,
+                                &crate::schema::FieldPath::new(),
+                            ))
+                        })
+                        .unwrap_or(report.unknown());
                 let declared_source = module_source
                     .and_then(crate::resource::ModuleSource::module_call)
                     .and_then(|_call| {
@@ -4727,7 +4747,8 @@ fn validate_resource_ref_types_inner<
                             }),
                             crate::binding_index::DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Unchecked(reason)) => Err(unchecked_assignment_error(reason)),
                         },
-                        None => check_deferred_access_type(access, sink_type, &inference_bindings, registry, bindings),
+                        None => check_deferred_access_type(access, sink_type,
+                            match access { GenericValue::Deferred(crate::resource::DeferredValue::Access(access)) => report.access(access), _ => expression }, registry, bindings),
                     };
                     match checked {
                         Ok(()) => {}
@@ -4749,8 +4770,7 @@ fn validate_resource_ref_types_inner<
                         attr_value,
                         effective_sink,
                         validated_schema.schema_type_owner(),
-                        &inference_bindings,
-                        registry,
+                        report,
                         bindings,
                     ) {
                         if declaration_arithmetic_findings
@@ -4857,82 +4877,45 @@ fn deferred_iterable_shape(
     bindings: &inference::InferenceBindings<ParserPlaceholder>,
     schemas: &SchemaRegistry,
 ) -> Result<DeferredIterableShape, crate::static_type::InferenceIssue> {
-    deferred_iterable_shape_for_phase(
-        value,
-        bindings,
-        schemas,
-        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-    )
-}
-
-fn deferred_iterable_shape_for_phase<B: BindingAddress>(
-    value: &GenericValue<ParserPlaceholder, B>,
-    bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
-    schemas: &SchemaRegistry,
-    provider_context: &ProviderContext,
-) -> Result<DeferredIterableShape, crate::static_type::InferenceIssue> {
     match value {
-        GenericValue::Deferred(crate::resource::DeferredValue::ModuleIf(_)) => {
-            infer_type_from_value_to_iterable_shape(value, bindings, schemas, provider_context)
-        }
-        GenericValue::Concrete(crate::resource::ConcreteValue::List(_items)) => {
+        GenericValue::Concrete(crate::resource::ConcreteValue::List(_)) => {
             Ok(DeferredIterableShape::List)
         }
-        GenericValue::Concrete(crate::resource::ConcreteValue::Map(_entries)) => {
+        GenericValue::Concrete(crate::resource::ConcreteValue::Map(_)) => {
             Ok(DeferredIterableShape::Map)
         }
-        GenericValue::Concrete(
-            crate::resource::ConcreteValue::String(_)
-            | crate::resource::ConcreteValue::Int(_)
-            | crate::resource::ConcreteValue::Float(_)
-            | crate::resource::ConcreteValue::Bool(_)
-            | crate::resource::ConcreteValue::Duration(_)
-            | crate::resource::ConcreteValue::EnumIdentifier(_)
-            | crate::resource::ConcreteValue::CanonicalEnum(_)
-            | crate::resource::ConcreteValue::StringList(_),
+        _ => inference::infer_type_from_value(
+            value,
+            bindings,
+            schemas,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
-        | GenericValue::Deferred(
-            crate::resource::DeferredValue::ResourceRef { .. }
-            | crate::resource::DeferredValue::BindingRef { .. }
-            | crate::resource::DeferredValue::IntegerArithmetic(_)
-            | crate::resource::DeferredValue::Interpolation(_)
-            | crate::resource::DeferredValue::FunctionCall { .. }
-            | crate::resource::DeferredValue::ResolvedFunctionCall { .. }
-            | crate::resource::DeferredValue::Unavailable { .. }
-            | crate::resource::DeferredValue::Access(_)
-            | crate::resource::DeferredValue::Secret(_)
-            | crate::resource::DeferredValue::Coalesce { .. }
-            | crate::resource::DeferredValue::Unknown(_)
-            | crate::resource::DeferredValue::Placeholder(_),
-        ) => infer_type_from_value_to_iterable_shape(value, bindings, schemas, provider_context),
+        .map(iterable_shape_from_type),
     }
 }
 
-fn infer_type_from_value_to_iterable_shape<B: BindingAddress>(
-    value: &GenericValue<ParserPlaceholder, B>,
-    bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
-    schemas: &SchemaRegistry,
-    provider_context: &ProviderContext,
+fn deferred_iterable_shape_for_phase(
+    expression: &crate::parser::retained::JudgedExpr,
 ) -> Result<DeferredIterableShape, crate::static_type::InferenceIssue> {
-    inference::infer_type_from_value(value, bindings, schemas, provider_context).map(|inferred| {
-        match inferred {
-            TypeExpr::List(_element) => DeferredIterableShape::List,
-            TypeExpr::Map(_element) => DeferredIterableShape::Map,
-            non_iterable @ (TypeExpr::String
-            | TypeExpr::Bool
-            | TypeExpr::Int
-            | TypeExpr::Float
-            | TypeExpr::Duration
-            | TypeExpr::Simple(_)
-            | TypeExpr::UnloadedSchemaType(_)
-            | TypeExpr::Ref(_)
-            | TypeExpr::DottedUnresolved(_)
-            | TypeExpr::SchemaType { .. }
-            | TypeExpr::Struct { .. }
-            | TypeExpr::StringLiteral(_)
-            | TypeExpr::Union(_)) => DeferredIterableShape::NonIterable(non_iterable),
-        }
-    })
+    if let Some(kind) = expression.collection_kind() {
+        return Ok(match kind {
+            crate::parser::retained::CollectionKind::List => DeferredIterableShape::List,
+            crate::parser::retained::CollectionKind::Map => DeferredIterableShape::Map,
+        });
+    }
+    expression
+        .static_type()
+        .cloned()
+        .map_err(Clone::clone)
+        .map(iterable_shape_from_type)
+}
+
+fn iterable_shape_from_type(inferred: TypeExpr) -> DeferredIterableShape {
+    match inferred {
+        TypeExpr::List(_) => DeferredIterableShape::List,
+        TypeExpr::Map(_) => DeferredIterableShape::Map,
+        non_iterable => DeferredIterableShape::NonIterable(non_iterable),
+    }
 }
 
 /// Static type failure for an iterable retained as a
@@ -4990,9 +4973,9 @@ fn validate_deferred_for_iterable_types_with_bindings<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
-    schemas: &SchemaRegistry,
-    bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
-    provider_context: &ProviderContext,
+    _schemas: &SchemaRegistry,
+    _bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
+    _provider_context: &ProviderContext,
 ) -> Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>> {
     let mut diagnostics = Vec::new();
     for deferred in tree.for_iterables() {
@@ -5001,12 +4984,21 @@ fn validate_deferred_for_iterable_types_with_bindings<
             ForBinding::Map(_, _) => DeferredIterableKind::Map,
         };
         validate_deferred_iterable_operand(
-            deferred.iterable(),
             DeferredIterableValidationContext {
                 expected,
-                bindings,
-                schemas,
-                provider_context,
+                judged: tree
+                    .file()
+                    .judged()
+                    .expect("iterable validation requires judgement")
+                    .report()
+                    .expression(deferred.location())
+                    .unwrap_or(
+                        tree.file()
+                            .judged()
+                            .expect("judged configuration")
+                            .report()
+                            .unknown(),
+                    ),
                 location: deferred.location(),
                 expression: deferred.iterable(),
             },
@@ -5072,9 +5064,7 @@ impl std::fmt::Display for DeferredIterableKind {
 
 struct DeferredIterableValidationContext<'a, B: BindingAddress> {
     expected: DeferredIterableKind,
-    bindings: &'a inference::InferenceBindings<ParserPlaceholder, B>,
-    schemas: &'a SchemaRegistry,
-    provider_context: &'a ProviderContext,
+    judged: &'a crate::parser::retained::JudgedExpr,
     location: &'a crate::parser::DeclarationLocation,
     expression: &'a GenericValue<ParserPlaceholder, B>,
 }
@@ -5088,29 +5078,19 @@ impl<B: BindingAddress> Clone for DeferredIterableValidationContext<'_, B> {
 }
 
 fn validate_deferred_iterable_operand<B: BindingAddress>(
-    value: &GenericValue<ParserPlaceholder, B>,
     context: DeferredIterableValidationContext<'_, B>,
     diagnostics: &mut Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>>,
 ) {
-    match value {
-        GenericValue::Deferred(crate::resource::DeferredValue::Coalesce { value, default }) => {
-            validate_deferred_iterable_operand(value, context, diagnostics);
-            validate_deferred_iterable_operand(default, context, diagnostics);
-            return;
-        }
-        GenericValue::Deferred(crate::resource::DeferredValue::Secret(inner)) => {
-            validate_deferred_iterable_operand(inner, context, diagnostics);
-            return;
-        }
-        _ => {}
+    if let Some(operands) = context.judged.coalesce_operands() {
+        let mut operand_context = context;
+        operand_context.judged = &operands[0];
+        validate_deferred_iterable_operand(operand_context, diagnostics);
+        operand_context.judged = &operands[1];
+        validate_deferred_iterable_operand(operand_context, diagnostics);
+        return;
     }
 
-    let inferred = match deferred_iterable_shape_for_phase(
-        value,
-        context.bindings,
-        context.schemas,
-        context.provider_context,
-    ) {
+    let inferred = match deferred_iterable_shape_for_phase(context.judged) {
         Ok(inferred) => Some(inferred),
         Err(crate::static_type::InferenceIssue::Failed(
             inference::InferenceError::IncompatibleCoalesceTypes { left, default },
@@ -7971,7 +7951,7 @@ impl ModuleCallChecker<'_> {
             bindings,
             owner,
         } = context;
-        let inference_bindings = inference::bindings_from_parsed(authority_file);
+
         let call_label = module_call_label(authored_call);
         for authored in authored_call.arguments_with_source_spans() {
             let argument = authored.name();
@@ -8093,16 +8073,28 @@ impl ModuleCallChecker<'_> {
             }
             if let ResolvedParameterType::Handle(expected) = &resolved_parameter {
                 let infer_actual = || {
-                    inference::infer_type_from_value(
-                        value,
-                        &inference_bindings,
-                        self.schemas,
-                        self.provider_context.as_provider_context(),
-                    )
-                    .map_or_else(
-                        |_error| typecheck::value_kind_name(value).to_string(),
-                        |actual| actual.to_string(),
-                    )
+                    authority_file
+                        .judged()
+                        .expect("module arguments require judgement")
+                        .report()
+                        .expression(
+                            authored_call
+                                .id()
+                                .argument_value_location(argument)
+                                .expect("argument provenance"),
+                        )
+                        .unwrap_or(
+                            authority_file
+                                .judged()
+                                .expect("judged configuration")
+                                .report()
+                                .unknown(),
+                        )
+                        .static_type()
+                        .map_or_else(
+                            |_error| typecheck::value_kind_name(value).to_string(),
+                            |actual| actual.to_string(),
+                        )
                 };
                 let reference_check = match value {
                     crate::resource::Value::Deferred(
@@ -8143,14 +8135,18 @@ impl ModuleCallChecker<'_> {
                 ));
                 continue;
             }
-            let inference = if semantic_argument.is_some() {
-                typecheck::TypecheckInference::Available {
-                    bindings: &inference_bindings,
-                    schemas: self.schemas,
-                }
-            } else {
-                typecheck::TypecheckInference::Unavailable
-            };
+            let inference = authority_file
+                .judged()
+                .expect("module arguments require a judged configuration")
+                .report()
+                .expression(
+                    authored_call
+                        .id()
+                        .argument_value_location(argument)
+                        .expect("authored argument expression"),
+                )
+                .map(typecheck::TypecheckInference::Judged)
+                .unwrap_or(typecheck::TypecheckInference::Unavailable);
             if let Err(error) = self.provider_context.check_at(
                 &resolved_parameter.as_type_expr(),
                 value,
@@ -8345,7 +8341,7 @@ impl ModuleCallChecker<'_> {
             let binding_use_report = check_bare_binding_uses(
                 &module,
                 &ValidationTypeContext::with_provider_context(
-                    &module,
+                    module.judged().expect("loader-owned expression report"),
                     self.schemas,
                     self.provider_context,
                     &signatures,
@@ -8780,7 +8776,12 @@ pub fn check_module_calls_from_analysis(
         provider_context.catalog(),
         overrides,
     );
-    let context = ValidationTypeContext::in_session(parsed, schemas, provider_context, &signatures);
+    let context = ValidationTypeContext::in_session(
+        parsed.judged().expect("loader-owned expression report"),
+        schemas,
+        provider_context,
+        &signatures,
+    );
     let binding_use_report = check_bare_binding_uses(parsed, &context);
     let bindings = BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
         parsed,

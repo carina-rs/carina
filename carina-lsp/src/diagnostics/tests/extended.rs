@@ -1727,6 +1727,17 @@ fn render_value_type_error(
     type_expr: &TypeExpr,
     value: &Value,
 ) -> Option<String> {
+    let parsed = carina_core::parser::parse_file(
+        &format!("let fixture = {}", carina_core::value::format_value(value)),
+        std::path::Path::new("test.crn"),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let report = parsed.judged().unwrap();
+    let expression = report
+        .report()
+        .binding(&carina_core::resource::RelativeBindingName::new("fixture"))
+        .unwrap();
     carina_core::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
@@ -1736,7 +1747,7 @@ fn render_value_type_error(
                         type_expr,
                         value,
                         provider_context,
-                        carina_core::validation::typecheck::TypecheckInference::Unavailable,
+                        carina_core::validation::typecheck::TypecheckInference::Judged(expression),
                     )
                     .require_provider_schemas()
                 }
@@ -1744,7 +1755,7 @@ fn render_value_type_error(
                     type_expr,
                     value,
                     &engine.provider_context,
-                    carina_core::validation::typecheck::TypecheckInference::Unavailable,
+                    carina_core::validation::typecheck::TypecheckInference::Judged(expression),
                 )
                 .record_deferred(session),
             };

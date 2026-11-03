@@ -111,16 +111,24 @@ struct ModuleExpansionSource<'a> {
     directory: Option<&'a crate::paths::ResolvedPath>,
     scope: Option<&'a ModuleInstanceScope>,
     parent_call_path: Option<&'a crate::resource::ExpandedCompositionCallPath>,
+    caller_judgements:
+        &'a HashMap<crate::parser::DeclarationLocation, crate::parser::retained::JudgedExpr>,
 }
 
-impl ModuleExpansionSource<'_> {
-    fn imported() -> Self {
+impl<'a> ModuleExpansionSource<'a> {
+    fn imported(
+        caller_judgements: &'a HashMap<
+            crate::parser::DeclarationLocation,
+            crate::parser::retained::JudgedExpr,
+        >,
+    ) -> Self {
         Self {
             module: None,
             source: None,
             directory: None,
             scope: None,
             parent_call_path: None,
+            caller_judgements,
         }
     }
 }
@@ -165,9 +173,6 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         binding_index: Option<&BindingIndex<'_>>,
         resolved_bindings: Option<&crate::binding_index::ResolvedBindings<ParserPlaceholder>>,
     ) -> Result<crate::parser::RootBindingResolvedParsedFile, ModuleError> {
-        match ref_check {
-            super::resolver::RefCheckWitness(()) => {}
-        }
         let expanded = self
             .expand_module_call_inner(
                 authored_call,
@@ -175,7 +180,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 instance_prefix,
                 binding_index,
                 resolved_bindings,
-                ModuleExpansionSource::imported(),
+                ModuleExpansionSource::imported(&ref_check.0),
             )
             .map_err(|error| error.with_failing_call(call.id().clone()))?;
         if let Some(error) =
@@ -195,9 +200,6 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         binding_index: Option<&BindingIndex<'_>>,
         resolved_bindings: Option<&crate::binding_index::ResolvedBindings<ParserPlaceholder>>,
     ) -> Result<crate::parser::RootBindingResolvedParsedFile, Vec<ModuleError>> {
-        match ref_check {
-            super::resolver::RefCheckWitness(()) => {}
-        }
         let expanded = self
             .expand_module_call_inner(
                 authored_call,
@@ -205,7 +207,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 instance_prefix,
                 binding_index,
                 resolved_bindings,
-                ModuleExpansionSource::imported(),
+                ModuleExpansionSource::imported(&ref_check.0),
             )
             .map_err(|error| vec![error.with_failing_call(call.id().clone())])?;
         let errors = super::resolver::deferred_for_body_errors(&expanded)
@@ -504,6 +506,41 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             })
             .collect();
 
+        let module_report = module
+            .judged()
+            .expect("module loader supplies its report")
+            .report();
+        let argument_judgements: HashMap<_, _> = module
+            .arguments
+            .iter()
+            .map(|argument| {
+                let supplied = call
+                    .id()
+                    .argument_value_location(&argument.name)
+                    .and_then(|location| expansion_source.caller_judgements.get(location));
+                let default = module
+                    .parser_binding_metadata
+                    .syntax()
+                    .declarations()
+                    .iter()
+                    .find(|declaration| {
+                        declaration.detail().kind()
+                            == crate::config_loader::DeclarationKind::Argument
+                            && declaration.detail().name() == argument.name
+                    })
+                    .and_then(|declaration| declaration.detail().value_location())
+                    .and_then(|location| module_report.expression(location));
+                let judged = supplied
+                    .or(default)
+                    .or_else(|| module_report.parameter(&argument.name))
+                    .unwrap_or(module_report.unknown());
+                (
+                    argument.name.clone(),
+                    judged.after_substitution(&argument_values[&argument.name]),
+                )
+            })
+            .collect();
+
         // Type-check argument values against declared types
         for arg in &module.arguments {
             let argument = resolved_arguments.get(&arg.name).unwrap();
@@ -589,7 +626,9 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 .check(
                     &resolved_type,
                     value,
-                    crate::validation::typecheck::TypecheckInference::Unavailable,
+                    crate::validation::typecheck::TypecheckInference::Judged(
+                        &argument_judgements[&arg.name],
+                    ),
                 )
                 .map_err(|mismatch| ModuleError::InvalidArgumentType {
                     module: call.module_name.clone(),
@@ -744,6 +783,26 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 .map_err(contextualize_access_error)?;
         let selected = &selected_module_ifs.contribution;
 
+        let mut instance = module
+            .clone()
+            .resolve_bindings(&mut |binding| module_instance_scope.resolve(binding));
+        instance
+            .parser_binding_metadata
+            .syntax
+            .expressions_mut()
+            .bind_arguments(argument_judgements.iter().map(|(name, expression)| {
+                (
+                    module_instance_scope.resolve(RelativeBindingName::new(name.as_str())),
+                    expression.clone(),
+                )
+            }));
+        crate::parser::retained::judge_configuration(&mut instance, self.schemas, self.config());
+        let instance_judgements = instance
+            .judged()
+            .expect("instance judgement")
+            .report()
+            .locations();
+
         let nested_signatures = crate::module_resolver::ResolvedModuleSignatures::default();
         let nested_binding_index =
             BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
@@ -783,6 +842,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                         directory: Some(&child_directory),
                         scope: Some(&child_scope),
                         parent_call_path: Some(&expanded_call_path),
+                        caller_judgements: &instance_judgements,
                     },
                 )
                 .map_err(|error| error.with_failing_call(nested_call.id().clone()))?;
@@ -794,11 +854,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         let mut expanded_parser_metadata: crate::parser::ParserBindingMetadata<
             AbsoluteBindingAddress,
         > = crate::parser::ParserBindingMetadata::default();
-        *expanded_parser_metadata.syntax = module
-            .parser_binding_metadata
-            .syntax()
-            .clone()
-            .map_bindings(&mut |binding| module_instance_scope.resolve(binding));
+        *expanded_parser_metadata.syntax = instance.parser_binding_metadata.syntax().clone();
         let mut expanded_binding_uses =
             resolve_module_binding_uses::<P>(module, &module_scope_resolver)
                 .map_err(contextualize_access_error)?;
@@ -1139,6 +1195,13 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         contribution.parser_binding_metadata = expanded_parser_metadata;
         contribution.deferred_module_ifs = selected_module_ifs.forwarded.clone();
         contribution.warnings = module.warnings.clone();
+        let mut instance_report = instance
+            .judged()
+            .expect("instance judgement")
+            .report()
+            .clone();
+        instance_report.record_instance(&contribution, call.binding_name.as_ref());
+        crate::parser::retained::attach_report(&mut contribution, instance_report);
         // Recursive expansion materializes child contributions separately.
         // Prefix them in authored order so the flattened runtime graph keeps
         // origin/main's child-before-parent traversal order. Reversing here is
@@ -1194,7 +1257,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             call,
             &expanded_call,
             instance_prefix,
-            &super::resolver::RefCheckWitness(()),
+            &super::resolver::RefCheckWitness(HashMap::new()),
             None,
             None,
         )
@@ -5222,9 +5285,7 @@ mod tests {
                     &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                     session,
                 );
-                resolver
-                    .imported_modules
-                    .insert("outer".to_string(), module);
+                resolver.insert_module_for_test("outer".to_string(), module);
                 resolver
                     .module_paths
                     .insert("outer".to_string(), "./outer".to_string());
@@ -5237,7 +5298,7 @@ mod tests {
                         "instance",
                         None,
                         None,
-                        ModuleExpansionSource::imported(),
+                        ModuleExpansionSource::imported(&HashMap::new()),
                     )
                     .unwrap();
                 let DeferredForBody::ModuleCall(call) =
