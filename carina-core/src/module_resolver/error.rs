@@ -90,7 +90,7 @@ pub enum ModuleError {
     InvalidArgumentType {
         module: String,
         argument: String,
-        mismatch: TypeExprValueError,
+        mismatch: Box<TypeExprValueError>,
     },
 
     #[error(
@@ -110,7 +110,7 @@ pub enum ModuleError {
     /// use carina_core::module_resolver::ModuleError;
     /// let _ = ModuleError::ArgumentValueAccess {
     ///     module: "child".into(), source_path: "sibling.crn".into(), line: 1,
-    ///     diagnostic: None,
+    ///     diagnostic: Box::new(None),
     /// };
     /// ```
     #[error("module '{module}' ({source_path}) at line {line}: {}", .diagnostic.detail())]
@@ -118,7 +118,7 @@ pub enum ModuleError {
         module: String,
         source_path: String,
         line: usize,
-        diagnostic: crate::parser::Located<String>,
+        diagnostic: Box<crate::parser::Located<String>>,
     },
 
     #[error(
@@ -647,6 +647,13 @@ fn display_source_path_relative_to(path: &Path, root: &Path) -> String {
 mod tests {
     use super::*;
     use crate::parser::ProviderContext;
+
+    #[test]
+    fn module_errors_stay_below_clippy_large_error_threshold() {
+        let size = size_of::<ModuleError>();
+        println!("ModuleError: {size} bytes");
+        assert!(size < 128, "ModuleError is {size} bytes");
+    }
 
     #[test]
     fn spanned_generic_undefined_identifier_is_not_a_deferred_for_rejection() {

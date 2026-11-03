@@ -280,7 +280,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     })
                     .unwrap_or_else(|| call_source_path.clone()),
                 line,
-                diagnostic: crate::parser::Located::new(location, message),
+                diagnostic: Box::new(crate::parser::Located::new(location, message)),
             }
         };
 
@@ -594,7 +594,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 .map_err(|mismatch| ModuleError::InvalidArgumentType {
                     module: call.module_name.clone(),
                     argument: arg.name.clone(),
-                    mismatch,
+                    mismatch: Box::new(mismatch),
                 })?;
         }
 

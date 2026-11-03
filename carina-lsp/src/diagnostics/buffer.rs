@@ -155,7 +155,7 @@ impl DiagnosticEngine {
                 Some(carina_diagnostic(
                     line_idx as u32,
                     col,
-                    col + position::char_len(&name),
+                    col + position::char_len(name),
                     DiagnosticSeverity::WARNING,
                     w.message.clone(),
                 ))

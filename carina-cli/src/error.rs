@@ -989,7 +989,7 @@ pub enum AppError {
     CommandInput(#[from] std::sync::Arc<CommandInputError>),
 
     #[error(transparent)]
-    ExportBoundary(#[from] carina_core::validation::ExportBoundaryError),
+    ExportBoundary(Box<carina_core::validation::ExportBoundaryError>),
 
     /// An authored reference selected unavailable historical secret evidence.
     #[error(transparent)]
@@ -1442,6 +1442,12 @@ impl From<crate::commands::init::InitError> for AppError {
     }
 }
 
+impl From<carina_core::validation::ExportBoundaryError> for AppError {
+    fn from(error: carina_core::validation::ExportBoundaryError) -> Self {
+        Self::ExportBoundary(Box::new(error))
+    }
+}
+
 impl AppError {
     pub(crate) fn invalid_saved_plan_provider_evidence(
         path: carina_core::paths::DisplayPath,
@@ -1608,6 +1614,14 @@ impl From<&str> for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_errors_stay_within_clippy_large_error_threshold() {
+        let size = size_of::<AppError>();
+        println!("AppError: {size} bytes");
+        // Clippy measures variant payloads; this also includes the enum discriminant.
+        assert!(size <= 128, "AppError is {size} bytes");
+    }
 
     #[test]
     fn provider_text_saved_plan_secret_error_locations_are_display_only() {

@@ -877,12 +877,10 @@ impl DiagnosticRun<'_> {
         // does.
         if let Some(base) = base_path
             && let Some(err) = self.finalize_provider_diagnostic(doc, current_file_name, base)
+            && let Some(diagnostic) = render_analysis_resolution_error(doc, &err)
+            && !diagnostics.contains(&diagnostic)
         {
-            if let Some(diagnostic) = render_analysis_resolution_error(doc, &err)
-                && !diagnostics.contains(&diagnostic)
-            {
-                diagnostics.push(diagnostic);
-            }
+            diagnostics.push(diagnostic);
         }
 
         // Directory binding authority for parser-owned reference occurrences.
@@ -1445,13 +1443,11 @@ impl DiagnosticRun<'_> {
                                         &finding,
                                         DiagnosticSeverity::ERROR,
                                         finding.detail().to_string(),
-                                    ) {
-                                        if !diagnostics.iter().any(|existing| {
-                                            existing.range == diagnostic.range
-                                                && existing.message == diagnostic.message
-                                        }) {
-                                            diagnostics.push(diagnostic);
-                                        }
+                                    ) && !diagnostics.iter().any(|existing| {
+                                        existing.range == diagnostic.range
+                                            && existing.message == diagnostic.message
+                                    }) {
+                                        diagnostics.push(diagnostic);
                                     }
                                 }
                                 continue;
