@@ -230,7 +230,9 @@ identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 //     "1", "2012", "2012_10_17", "v1" — used for date-like enum values
 //     such as `aws.iam.PolicyDocument.Version.2012_10_17` (carina#3051).
 //     Subsumes the previous `ASCII_DIGIT+`-only shape (`Type.ipsec.1`).
-namespaced_id = @{ identifier ~ ("." ~ (identifier | numeric_tail))+ }
+namespaced_id = ${ reference_prefix ~ ("." ~ reference_field)* }
+reference_prefix = ${ identifier ~ "." ~ reference_field }
+reference_field = @{ identifier | numeric_tail }
 // Silent rule (`_{...}`): not surfaced as a `Rule` variant, so the
 // formatter's exhaustive dispatch does not need a counterpart. The
 // containing `namespaced_id` is atomic, so the tail text is captured

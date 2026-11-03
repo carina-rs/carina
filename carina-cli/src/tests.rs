@@ -2819,13 +2819,8 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
     let backend = RefreshTestBackend::new(state);
 
     // Config only has "keep" -- "orphan" was removed from .crn.
-    let mut parsed = carina_core::parser::InferredFile::default();
-    parsed.resources = vec![
-        Resource::with_provider("mock", "test.resource", "keep", None).with_attribute(
-            "name",
-            Value::Concrete(ConcreteValue::String("keep".into())),
-        ),
-    ];
+    let parsed =
+        crate::test_support::inferred_fixture("let keep = mock.test.resource { name = 'keep' }\n");
 
     // MockProvider returns not_found for both resources (simulates external deletion)
     let lock = LockInfo::for_test("state-refresh");

@@ -21,7 +21,6 @@ use crate::schema::SchemaRegistry;
 
 use super::error::{ModuleError, ModuleErrorCallSource};
 use super::expander::instance_prefix_for_call;
-use super::loader::sorted_crn_paths_in;
 use super::validation::{ConstraintOrigin, ModuleConstraintDiagnostic};
 
 type ModuleResolvedValue = crate::resource::Value<ParserPlaceholder, AbsoluteBindingAddress>;
@@ -136,12 +135,79 @@ impl ResidualModuleResolutionError {
         self.0.display_relative_to(root)
     }
 
+    pub fn file_diagnostic(
+        &self,
+        base: &crate::paths::ResolvedPath,
+    ) -> Option<crate::parser::FileScoped<&ParseError>> {
+        let ResidualModuleResolutionDiagnostic::Parse {
+            source_path: Some(path),
+            error,
+        } = self.diagnostic()?
+        else {
+            return None;
+        };
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            base.source_label().join(path)
+        };
+        Some(crate::parser::scope_parse_failure(&path, error))
+    }
+
+    pub fn element_diagnostic(&self) -> Option<&crate::parser::Located<ParseError>> {
+        match self.0.root_cause() {
+            ModuleError::Parse(error) => error.element_diagnostic(),
+            ModuleError::ParseInFile { error, .. } => error.element_diagnostic(),
+            _ => None,
+        }
+    }
+
+    pub fn call_diagnostics<'a, D, B: crate::resource::BindingAddress>(
+        &'a self,
+        tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+    ) -> Vec<crate::parser::Located<&'a Self>>
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        let Some(diagnostic) = self.diagnostic() else {
+            return Vec::new();
+        };
+        let constraint_origin = match diagnostic {
+            ResidualModuleResolutionDiagnostic::Constraint { origin } => Some(origin),
+            _ => None,
+        };
+        let mut findings: Vec<_> = tree.module_calls().filter(|call| match self.call_source() {
+            ModuleErrorCallSource::Failing(identity) => identity == call.id(),
+            ModuleErrorCallSource::Owners(owners) => owners.iter().any(|identity| identity == call.id()),
+            ModuleErrorCallSource::Unavailable => false,
+        }).filter(|call| !matches!(constraint_origin, Some(ConstraintOrigin::LiveCall(identity)) if identity == call.id()))
+            .map(|call| crate::parser::Located::new(call.id().module_name_location().clone(), self)).collect();
+        if let ModuleError::ArgumentValueAccess { diagnostic, .. } = self.0.root_cause() {
+            // Keep the authored module operand as well as its caller anchors.
+            // In the operand's own file it replaces any broader call anchor.
+            findings.retain(|finding| finding.location().file() != diagnostic.location().file());
+            findings.insert(
+                0,
+                crate::parser::Located::new(diagnostic.location().clone(), self),
+            );
+        }
+        findings
+    }
+
+    pub fn analysis_invariant(&self) -> Option<&crate::parser::AnalysisTreeError> {
+        match self.0.root_cause() {
+            ModuleError::AnalysisInvariant(error) => Some(error),
+            _ => None,
+        }
+    }
+
     pub fn is_constraint(&self) -> bool {
         matches!(self.0.root_cause(), ModuleError::Constraint(_diagnostic))
     }
 
     pub fn diagnostic(&self) -> Option<ResidualModuleResolutionDiagnostic<'_>> {
         match self.0.root_cause() {
+            ModuleError::AnalysisInvariant(_) => None,
             ModuleError::WithProviderTypeWarnings { .. } => {
                 unreachable!("root_cause removes diagnostic wrappers")
             }
@@ -155,7 +221,7 @@ impl ResidualModuleResolutionError {
                 module: _module,
                 source_path,
                 line,
-                message: _message,
+                diagnostic: _diagnostic,
             } => Some(ResidualModuleResolutionDiagnostic::ArgumentValueAccess {
                 source_path,
                 line: *line,
@@ -250,6 +316,7 @@ impl ResidualModuleResolutionError {
     fn is_covered_by(&self, findings: &[crate::validation::ModuleCallFinding]) -> bool {
         let root_cause = self.0.root_cause();
         match root_cause {
+            ModuleError::AnalysisInvariant(_) => false,
             ModuleError::WithProviderTypeWarnings { .. } => {
                 unreachable!("root_cause removes diagnostic wrappers")
             }
@@ -291,7 +358,7 @@ impl ResidualModuleResolutionError {
                 module: _,
                 source_path: _,
                 line: _,
-                message: _,
+                diagnostic: _,
             } => false,
             ModuleError::DroppedConditionalBinding {
                 binding: _,
@@ -308,6 +375,17 @@ impl ResidualModuleResolutionError {
                             .iter()
                             .filter_map(|finding| finding.message().type_resolution_diagnostic()),
                         crate::validation::TypeResolutionParserError::new(path, error),
+                    )
+                }
+                ParseError::AtElement(finding) => {
+                    crate::validation::type_resolution_parser_error_is_covered(
+                        findings
+                            .iter()
+                            .filter_map(|finding| finding.message().type_resolution_diagnostic()),
+                        crate::validation::TypeResolutionParserError::new(
+                            finding.location().file().path(),
+                            finding.detail(),
+                        ),
                     )
                 }
                 ParseError::Syntax(_)
@@ -485,7 +563,7 @@ fn without_covered_reference_type_members(
             module: _,
             source_path: _,
             line: _,
-            message: _,
+            diagnostic: _,
         }
         | ModuleError::DroppedConditionalBinding {
             binding: _,
@@ -497,6 +575,7 @@ fn without_covered_reference_type_members(
         | ModuleError::Io(_)
         | ModuleError::Parse(_)
         | ModuleError::ParseInFile { path: _, error: _ }
+        | ModuleError::AnalysisInvariant(_)
         | ModuleError::TypeResolution(_)
         | ModuleError::UnknownArgument {
             module: _,
@@ -653,6 +732,7 @@ mod diagnostic_status_tests {
                                     crate::validation::ModuleCallReferenceChecks::Skipped,
                             },
                         )
+                        .unwrap()
                     },
                 );
                 let error = ModuleError::MissingArgument {
@@ -766,7 +846,7 @@ impl TypeResolutionPolicy for StrictTypeResolution {
         parsed: &mut crate::parser::File<E>,
         config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<(), ModuleError> {
-        let type_errors = crate::validation::resolve_file_type_exprs(parsed, config);
+        let type_errors = crate::validation::resolve_file_type_exprs(parsed, config)?;
         if let Some(first) = type_errors.into_iter().next() {
             return Err(ModuleError::TypeResolution(Box::new(first)));
         }
@@ -792,7 +872,7 @@ impl TypeResolutionPolicy for DeferredUpstreamTypeResolution {
         parsed: &mut crate::parser::File<E>,
         config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<(), ModuleError> {
-        crate::validation::resolve_file_type_exprs_best_effort(parsed, config);
+        crate::validation::resolve_file_type_exprs_best_effort(parsed, config)?;
         Ok(())
     }
 
@@ -830,6 +910,7 @@ pub(crate) struct ModuleResolver<'cfg, P = StrictTypeResolution> {
     /// not change while recursively resolving nested module imports and is
     /// therefore the stable base for user-facing source labels.
     configuration_root: PathBuf,
+    source_overrides: crate::config_loader::SourceOverrides,
     /// Cache of loaded modules: path -> ParsedFile
     pub(super) module_cache: HashMap<crate::paths::CanonicalPath, ParsedFile>,
     /// Currently resolving modules (for cycle detection)
@@ -943,6 +1024,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             io_base_dir,
             module_locations: HashMap::new(),
             configuration_root: base_dir.clone(),
+            source_overrides: Default::default(),
             base_dir,
             module_cache: HashMap::new(),
             resolving: HashSet::new(),
@@ -1142,10 +1224,11 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     /// in `main.crn` would be invisible to `${env}` interpolations in
     /// sibling `role.crn` (#2815). #2817.
     fn load_directory_module(&self, dir_path: &ResolvedPath) -> Result<ParsedFile, ModuleError> {
-        let paths = sorted_crn_paths_in(dir_path)?;
+        let paths = super::loader::source_paths_with_overrides(dir_path, &self.source_overrides)?;
         let mut files: Vec<(std::path::PathBuf, String)> = Vec::with_capacity(paths.len());
         for path in paths {
-            let content = path.read_to_string()?;
+            let content =
+                crate::config_loader::read_source_with_overrides(&path, &self.source_overrides)?;
             files.push((path.source_label(), content));
         }
         let parsed_files = crate::config_loader::parse_directory_files_located_from_root(
@@ -1176,7 +1259,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         // intact. Besides folding module-local values, this records the direct
         // dependency bindings that expansion subsequently instance-prefixes.
         // Argument bindings remain deferred for call-site substitution.
-        crate::parser::resolve_resource_refs_in_session(&mut merged, self.session)
+        crate::parser::resolve_resource_refs_in_session_unsealed(&mut merged, self.session)
             .map_err(ModuleError::Parse)?;
 
         P::resolve_file_type_exprs(&mut merged, self.session)?;
@@ -1553,10 +1636,12 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
         base_dir: &ResolvedPath,
         config: &'cfg dyn crate::validation::deferred_types::ProviderTypeCheckContext,
         schemas: &'cfg SchemaRegistry,
+        overrides: &crate::config_loader::SourceOverrides,
     ) -> Result<Self, ModuleError> {
         let mut resolver = ModuleResolver::<DeferredUpstreamTypeResolution>::for_upstream(
             base_dir, config, schemas,
         );
+        resolver.source_overrides = overrides.clone();
         resolver.process_imports(&parsed.uses, &parsed.module_calls)?;
         let root_witness = resolver.validate_reference_types(parsed)?;
         Ok(Self {
@@ -1571,11 +1656,13 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
         base_dir: &ResolvedPath,
         config: &'cfg dyn crate::validation::deferred_types::ProviderTypeCheckContext,
         schemas: &'cfg SchemaRegistry,
+        overrides: &crate::config_loader::SourceOverrides,
     ) -> Result<Self, ModuleError> {
         let mut resolver =
             ModuleResolver::<DeferredUpstreamTypeResolution>::for_providerless_upstream(
                 base_dir, config, schemas,
             );
+        resolver.source_overrides = overrides.clone();
         resolver.process_imports(&parsed.uses, &parsed.module_calls)?;
         let root_witness = resolver.validate_reference_types(parsed)?;
         Ok(Self {
@@ -1785,10 +1872,16 @@ pub(crate) fn resolve_upstream_modules_with_providerless_config<
     base_dir: &ResolvedPath,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: &SchemaRegistry,
+    overrides: &crate::config_loader::SourceOverrides,
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
-    let expanded =
-        UpstreamRefCheckedModuleGraph::check_providerless(&mut parsed, base_dir, config, schemas)?
-            .expand()?;
+    let expanded = UpstreamRefCheckedModuleGraph::check_providerless(
+        &mut parsed,
+        base_dir,
+        config,
+        schemas,
+        overrides,
+    )?
+    .expand()?;
     finalize_deferred_for_bodies(expanded)
 }
 
@@ -1799,9 +1892,11 @@ pub(crate) fn resolve_upstream_modules_with_config<
     base_dir: &ResolvedPath,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: &SchemaRegistry,
+    overrides: &crate::config_loader::SourceOverrides,
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
     let expanded =
-        UpstreamRefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas)?.expand()?;
+        UpstreamRefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas, overrides)?
+            .expand()?;
     finalize_deferred_for_bodies(expanded)
 }
 
@@ -1818,7 +1913,28 @@ pub fn resolve_modules_with_diagnostics<E: ResolveExportBindingPhase<ParserPlace
     schemas: &SchemaRegistry,
     covered_findings: &[crate::validation::ModuleCallFinding],
 ) -> ModuleResolutionDiagnosticResult<E::Absolute> {
-    let resolver = ModuleResolver::with_constraint_reports(base_dir, config, schemas);
+    resolve_modules_with_diagnostics_and_overrides(
+        parsed,
+        base_dir,
+        config,
+        schemas,
+        covered_findings,
+        &Default::default(),
+    )
+}
+
+pub fn resolve_modules_with_diagnostics_and_overrides<
+    E: ResolveExportBindingPhase<ParserPlaceholder> + Clone,
+>(
+    parsed: &RootDirectoryParse<E>,
+    base_dir: &ResolvedPath,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    schemas: &SchemaRegistry,
+    covered_findings: &[crate::validation::ModuleCallFinding],
+    overrides: &crate::config_loader::SourceOverrides,
+) -> ModuleResolutionDiagnosticResult<E::Absolute> {
+    let mut resolver = ModuleResolver::with_constraint_reports(base_dir, config, schemas);
+    resolver.source_overrides = overrides.clone();
     resolve_modules_with_diagnostics_and_resolver(parsed.parsed(), resolver, covered_findings)
 }
 
@@ -2141,7 +2257,7 @@ fn deferred_for_resource_expression_error(
             parse_error_to_module_error(error)
         }
         crate::parser::DeferredForResourceExpressionError::Unsupported { file, error } => {
-            let error = ParseError::DeferredForBodyUnsupported(error);
+            let error = ParseError::AtElement(error);
             match file {
                 Some(path) => ModuleError::ParseInFile {
                     path: std::path::PathBuf::from(path),

@@ -152,12 +152,25 @@ fn deferred_for_unsupported_bodies_surface_parser_diagnostics() {
              let src = mock.test.resource {{ name = 'src' }}\n\
              let items = for x in src.list {{ {body} }}\n"
         );
-        let main_path = fixture.path().join("main.crn");
-        std::fs::write(&main_path, &source).expect("main fixture");
+        let sibling_path = fixture.path().join("sibling.crn");
+        let other_path = fixture.path().join("main.crn");
+        let other = "let unrelated = 'ok'\n";
+        std::fs::write(&other_path, other).unwrap();
+        std::fs::write(&sibling_path, &source).expect("sibling fixture");
+        let unrelated_diagnostics = test_engine().analyze(
+            &create_document_at(other, other_path.clone()),
+            Some(&other_path),
+        );
+        assert!(
+            !unrelated_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("for x in src.list")),
+            "sibling diagnostic leaked: {unrelated_diagnostics:#?}"
+        );
 
         let diagnostics = test_engine().analyze(
-            &create_document_at(&source, main_path.clone()),
-            Some(&main_path),
+            &create_document_at(&source, sibling_path.clone()),
+            Some(&sibling_path),
         );
         let diagnostic = diagnostics
             .iter()
@@ -852,67 +865,6 @@ let vpc = awscc.ec2.Vpc {
 }
 
 #[test]
-fn carina_diagnostic_helper_produces_correct_fields() {
-    use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Range};
-
-    let diag = carina_diagnostic(
-        5,
-        10,
-        20,
-        DiagnosticSeverity::ERROR,
-        "test error message".to_string(),
-    );
-
-    assert_eq!(
-        diag.range,
-        Range {
-            start: Position {
-                line: 5,
-                character: 10,
-            },
-            end: Position {
-                line: 5,
-                character: 20,
-            },
-        }
-    );
-    assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
-    assert_eq!(diag.source, Some("carina".to_string()));
-    assert_eq!(diag.message, "test error message");
-    // Verify default fields are not set
-    assert!(diag.code.is_none());
-    assert!(diag.code_description.is_none());
-    assert!(diag.tags.is_none());
-    assert!(diag.related_information.is_none());
-    assert!(diag.data.is_none());
-}
-
-#[test]
-fn carina_diagnostic_helper_with_multiline_range() {
-    use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Range};
-
-    let diag = carina_diagnostic_range(
-        Range {
-            start: Position {
-                line: 3,
-                character: 0,
-            },
-            end: Position {
-                line: 4,
-                character: 0,
-            },
-        },
-        DiagnosticSeverity::ERROR,
-        "resource-level error".to_string(),
-    );
-
-    assert_eq!(diag.range.start.line, 3);
-    assert_eq!(diag.range.end.line, 4);
-    assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
-    assert_eq!(diag.source, Some("carina".to_string()));
-}
-
-#[test]
 fn unused_for_binding_emits_lsp_diagnostic() {
     // A for-loop binding never referenced in the body should surface as an
     // LSP diagnostic — not only a CLI warning — so editor users see it too.
@@ -1037,18 +989,33 @@ awscc.ec2.SecurityGroup {
 }
 
 // ---------------------------------------------------------------------------
-// #2309 — find_attribute_value_range coverage
+// #2309 — parser-owned replacement spans
 // ---------------------------------------------------------------------------
+
+fn replaceable_attribute_range(doc: &crate::document::Document, name: &str) -> Option<Range> {
+    let parsed = doc
+        .parsed()
+        .unwrap_or_else(|| panic!("document parse failed: {:?}", doc.parse_error()));
+    let tree = carina_core::parser::AnalysisTree::try_from_file(parsed).unwrap();
+    let resource = tree.project_resources().next()?;
+    parser_span_range(doc, resource.replaceable_attribute_value(name)?.span())
+}
+
+#[test]
+fn value_range_ignores_interpolation_text_in_trailing_comment() {
+    let doc = super::create_document("mock.test.Thing {\n  mode = 'bad' # ${decoy}\n}\n");
+    assert_eq!(
+        replaceable_attribute_range(&doc, "mode"),
+        Some(Range::new(Position::new(1, 9), Position::new(1, 14))),
+    );
+}
 
 #[test]
 fn value_range_covers_dotted_identifier() {
-    let engine = super::test_engine();
     let doc = super::create_document(
         "let _ = aws.s3.Bucket {\n  versioning = aws.s3.VersioningStatus.NotReal\n}\n",
     );
-    let range = engine
-        .find_attribute_value_range(&doc, "versioning", None)
-        .expect("range located");
+    let range = replaceable_attribute_range(&doc, "versioning").expect("range located");
     assert_eq!(range.start.line, 1);
     // Compute expected columns from the line text directly so the
     // assertion stays robust to incidental indentation tweaks.
@@ -1065,12 +1032,9 @@ fn value_range_includes_quotes_for_string_literal() {
     // Code action for `StringLiteralExpectedEnum` replaces the quoted
     // literal *with* its surrounding quotes — applying the fix drops
     // the quotes and writes the bare identifier.
-    let engine = super::test_engine();
     let doc =
         super::create_document("awscc.sso.Assignment {\n  target_type = \"AWS_ACCOUNT\"\n}\n");
-    let range = engine
-        .find_attribute_value_range(&doc, "target_type", None)
-        .expect("range located");
+    let range = replaceable_attribute_range(&doc, "target_type").expect("range located");
     let text = doc.text();
     let line = text.lines().nth(1).unwrap();
     let value_start = line.find('"').unwrap() as u32;
@@ -1084,13 +1048,8 @@ fn value_range_includes_quotes_for_string_literal() {
 fn value_range_returns_none_for_block_syntax_value() {
     // `attr = { ... }` has no single offending identifier — the code
     // action declines to fix it (no range, hence no quick-fix).
-    let engine = super::test_engine();
     let doc = super::create_document("aws.s3.Bucket {\n  tags = { Env = \"prod\" }\n}\n");
-    assert!(
-        engine
-            .find_attribute_value_range(&doc, "tags", None)
-            .is_none()
-    );
+    assert!(replaceable_attribute_range(&doc, "tags").is_none());
 }
 
 #[test]
@@ -1100,11 +1059,8 @@ fn value_range_uses_character_offsets_for_multibyte_literal() {
     // (e.g. `"あ"`) must still produce a `Range` whose `end.character`
     // equals the codepoint count, not the UTF-8 byte length — otherwise
     // an editor applying the quick-fix would corrupt surrounding text.
-    let engine = super::test_engine();
     let doc = super::create_document("aws.s3.Bucket {\n  versioning = \"あ\"\n}\n");
-    let range = engine
-        .find_attribute_value_range(&doc, "versioning", None)
-        .expect("range located");
+    let range = replaceable_attribute_range(&doc, "versioning").expect("range located");
     let text = doc.text();
     let line = text.lines().nth(1).unwrap();
     // The literal `"あ"` is 3 codepoints: `"`, `あ`, `"`.
@@ -1142,12 +1098,10 @@ fn value_range_locates_value_separated_by_tabs() {
     // (or one mid-edit, before the formatter has run) still surfaces
     // the quick-fix. Pin the behavior so a future tightening can't
     // silently regress it.
-    let engine = super::test_engine();
     let doc = super::create_document(
         "let _ = aws.s3.Bucket {\n\tversioning\t=\taws.s3.VersioningStatus.NotReal\n}\n",
     );
-    let range = engine
-        .find_attribute_value_range(&doc, "versioning", None)
+    let range = replaceable_attribute_range(&doc, "versioning")
         .expect("range located even with tab separators");
     assert_eq!(range.start.line, 1);
     let text = doc.text();

@@ -315,6 +315,13 @@ fn validate_flags_chained_ref_to_deferred_inner_field_without_wait() {
 
     let diags = cli_validate(&fixture);
     assert!(
+        diags
+            .iter()
+            .any(|diagnostic| diagnostic.contains("route53.crn:6:5:")
+                && diagnostic.contains("populated asynchronously")),
+        "{diags:#?}"
+    );
+    assert!(
         diags.iter().any(
             |d| d.contains("cert.domain_validation_options[0].resource_record.value")
                 && d.contains("wait cert")

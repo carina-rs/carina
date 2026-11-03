@@ -32,6 +32,7 @@ pub(crate) fn apply_pipe_step(
     ctx: &ParseContext,
     line: usize,
     column: usize,
+    location: crate::parser::DeclarationLocation,
 ) -> Result<EvalValue, ParseError> {
     if let Some(EvalValue::Closure {
         name: fn_name,
@@ -61,14 +62,21 @@ pub(crate) fn apply_pipe_step(
     if let Some(user_fn) = ctx.resolved_user_function(&func_name) {
         if !ctx.config.custom_types_loaded() {
             let arguments = lower_function_arguments(eval_args.clone(), line)?;
-            record_deferred_function_type_check(&user_fn, &arguments, ctx, line, Some(column));
+            record_deferred_function_type_check(
+                &user_fn,
+                &arguments,
+                ctx,
+                line,
+                Some(column),
+                location.clone(),
+            );
         }
         if !ctx.seeded_user_functions.contains(&func_name) && eval_args.iter().all(is_static_eval) {
             return evaluate_user_function_eval(&user_fn, eval_args, ctx, line)
                 .map(EvalValue::from_value);
         }
         let args = lower_function_arguments(eval_args, line)?;
-        record_deferred_function_type_check(&user_fn, &args, ctx, line, Some(column));
+        record_deferred_function_type_check(&user_fn, &args, ctx, line, Some(column), location);
         return Ok(EvalValue::from_value(Value::Deferred(
             DeferredValue::ResolvedFunctionCall {
                 function: user_fn,
@@ -283,6 +291,7 @@ pub(crate) fn parse_pipe_expr_with_mode(
 
     // Desugar pipe: `x |> f(args)` becomes `f(x, args)`
     for func_call_pair in inner {
+        let location = ctx.declaration_location(&func_call_pair);
         let (line, column) = func_call_pair.line_col();
         let mut fc_inner = func_call_pair.into_inner();
         let func_name = next_pair(&mut fc_inner, "function name", "pipe function call")?
@@ -293,7 +302,7 @@ pub(crate) fn parse_pipe_expr_with_mode(
             .collect();
         let extra_args = extra_args?;
 
-        value = apply_pipe_step(value, func_name, extra_args, ctx, line, column)?;
+        value = apply_pipe_step(value, func_name, extra_args, ctx, line, column, location)?;
     }
 
     Ok(value)

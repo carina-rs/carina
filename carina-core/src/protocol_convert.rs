@@ -2389,6 +2389,7 @@ pub fn try_resource_to_protocol<S, D>(
         default_tag_keys: _default_tag_keys,
         loop_provenance: _loop_provenance,
         quoted_string_attrs: _quoted_string_attrs,
+        declaration: _declaration,
     } = resource;
     let attributes = attributes
         .iter()
@@ -2423,6 +2424,7 @@ pub fn try_data_source_to_protocol<S, D>(
         dependencies: _dependencies,
         module_source: _module_source,
         quoted_string_attrs: _quoted_string_attrs,
+        declaration: _declaration,
     } = data_source;
     let attributes = attributes
         .iter()
@@ -3705,6 +3707,7 @@ mod tests {
         let resolved_function: std::sync::Arc<
             crate::parser::UserFunction<crate::resource::AbsoluteBindingAddress>,
         > = std::sync::Arc::new(crate::parser::UserFunction {
+            type_annotations: Vec::new(),
             name: "fixture".to_string(),
             params: Vec::new(),
             return_type: None,
@@ -3712,6 +3715,9 @@ mod tests {
             annotation_source_file: None,
             local_lets: Vec::new(),
             body: crate::parser::UserFunctionBody {
+                location: crate::parser::ModuleCallId::test_dummy_in("test.crn")
+                    .declaration_location()
+                    .clone(),
                 value: Value::Concrete(ConcreteValue::Int(1)),
                 source_line: 0,
                 source_file: None,

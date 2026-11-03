@@ -1,44 +1,28 @@
-//! Analysis-pass diagnostics for resource and wait `depends_on` lists.
-//!
-//! Shared by `carina validate` and the LSP.
-//!
-//! Both resource and wait owners check dependency scope and kind, reporting
-//! unknown or disallowed targets as errors and duplicate elements as warnings.
-//! Data sources are valid wait dependencies.
-//!
-//! Resources additionally report self-dependencies and cycles as errors, and
-//! redundant edges already implied by value references as warnings.
-//!
-//! Element-type errors (`["foo"]` instead of `[foo]`) are caught
-//! upstream by `parser::blocks::resource::check_directives_depends_on_elements`
-//! before this pass runs.
-
-use std::cell::OnceCell;
+//! Analysis of dependency operand occurrences and typed dependency cycles.
+//! All findings have parser-owned locations, including one outgoing edge per
+//! cycle member. Directory/whole-file failures do not belong to this family.
 use std::collections::{HashMap, HashSet};
 
-use crate::deps::{collect_dependencies, sort_resources_by_dependencies};
-use crate::parser::{File, ResourceRef, UnexpandedDependencyOperand};
-
 use super::{DependencyArgumentResolution, ResolvedArgumentTypes, ResolvedDependencyArgumentType};
-use crate::resource::{BindingAddress, ModuleSource, ParserPlaceholder};
+use crate::deps::collect_dependencies;
+use crate::parser::{
+    AnalysisItemKind, AnalysisResourceRef, AnalysisTree, DeclarationLocation, Located,
+    UnexpandedDependencyOperand,
+};
+use crate::resource::{BindingAddress, ParserPlaceholder};
 
-type ParsedResourceRef<'a, D, B> =
-    ResourceRef<'a, ModuleSource, ParserPlaceholder, ParserPlaceholder, D, B>;
+type ResourceRef<'a, D, B> = AnalysisResourceRef<'a, ParserPlaceholder, ParserPlaceholder, D, B>;
 
-/// Severity of a depends_on diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
     Error,
     Warning,
 }
-
-/// The declaration whose dependency list owns an element diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependsOnOwner {
     Resource,
     Wait,
 }
-
 impl DependsOnOwner {
     fn context(self) -> &'static str {
         match self {
@@ -48,50 +32,55 @@ impl DependsOnOwner {
     }
 }
 
-/// The owner binding and optional element of a depends_on diagnostic.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DependsOnLocation {
-    pub owner: DependsOnOwner,
-    pub binding: String,
-    pub dep: Option<String>,
+/// Which authored outgoing edge participates in a cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyEdgeOrigin {
+    ExplicitDependency,
+    ValueReference,
 }
-
-/// A single depends_on diagnostic.
-///
-/// `location` lets the LSP resolve a binding or element span without parsing
-/// the message text. Cycle errors and other whole-graph diagnostics leave it
-/// `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyCycleMember {
+    pub binding: String,
+    pub target: String,
+    pub origin: DependencyEdgeOrigin,
+    pub location: DeclarationLocation,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyCycle {
+    pub members: Vec<DependencyCycleMember>,
+}
+impl std::fmt::Display for DependencyCycle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Circular dependency detected: ")?;
+        for member in &self.members {
+            write!(f, "{} -> ", member.binding)?;
+        }
+        if let Some(first) = self.members.first() {
+            f.write_str(&first.binding)?;
+        }
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependsOnDiagnosticKind {
+    Element {
+        owner: DependsOnOwner,
+        binding: String,
+        dependency: String,
+    },
+    Cycle {
+        cycle: DependencyCycle,
+    },
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependsOnDiagnostic {
     pub severity: Severity,
     pub message: String,
-    pub location: Option<DependsOnLocation>,
+    pub kind: DependsOnDiagnosticKind,
 }
-
-impl DependsOnDiagnostic {
-    fn error(msg: impl Into<String>) -> Self {
-        Self {
-            severity: Severity::Error,
-            message: msg.into(),
-            location: None,
-        }
-    }
-
-    fn warning(msg: impl Into<String>) -> Self {
-        Self {
-            severity: Severity::Warning,
-            message: msg.into(),
-            location: None,
-        }
-    }
-
-    fn at_element(mut self, owner: DependsOnOwner, binding: &str, dep: &str) -> Self {
-        self.location = Some(DependsOnLocation {
-            owner,
-            binding: binding.to_string(),
-            dep: Some(dep.to_string()),
-        });
-        self
+impl std::fmt::Display for DependsOnDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
     }
 }
 
@@ -104,260 +93,226 @@ enum DependencyTarget<'a> {
     Handle,
     Unknown,
 }
-
-/// Resolve retained operands against declarations, never a union of lexical names.
-fn classify_operand<'a, E, B: BindingAddress, D>(
-    parsed: &File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
-    bindings_by_name: &HashMap<&str, ParsedResourceRef<'_, D, B>>,
+fn classify_operand<'a, B: BindingAddress, D, E>(
+    tree: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
+    bindings: &HashMap<&str, &ResourceRef<'_, D, B>>,
     argument_types: &'a ResolvedArgumentTypes,
-    managed_group_names: &OnceCell<HashSet<String>>,
     operand: &UnexpandedDependencyOperand<B>,
-    dep_name: &str,
+    name: &str,
 ) -> DependencyTarget<'a>
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    if parsed
-        .upstream_states
-        .iter()
-        .any(|upstream| upstream.binding.as_str() == dep_name)
-    {
+    if tree.is_upstream(name) {
         return DependencyTarget::Upstream;
     }
-    if let Some(target) = bindings_by_name.get(dep_name) {
-        return if matches!(target, ResourceRef::DataSource(_)) {
+    if let Some(target) = bindings.get(name) {
+        return if target.kind() == AnalysisItemKind::DataSource {
             DependencyTarget::DataSource
         } else {
             DependencyTarget::Managed
         };
     }
-    if let UnexpandedDependencyOperand::BareBinding(binding) = operand
-        && parsed
-            .parser_binding_metadata
-            .structural_handles()
-            .get(binding)
-            .is_some_and(|handle| handle.is_for_binding())
-    {
+    if matches!(operand, UnexpandedDependencyOperand::BareBinding(_)) && tree.is_loop_group(name) {
         return DependencyTarget::LoopGroup;
     }
     if matches!(operand, UnexpandedDependencyOperand::Handle(_)) {
         return DependencyTarget::Handle;
     }
-    if matches!(operand, UnexpandedDependencyOperand::BareBinding(_))
-        && managed_group_names
-            .get_or_init(|| {
-                parsed
-                    .iter_all_resources()
-                    .filter(|resource| {
-                        matches!(
-                            resource,
-                            ResourceRef::Resource(_) | ResourceRef::Deferred { .. }
-                        )
-                    })
-                    .filter_map(|resource| resource.binding_address())
-                    .flat_map(crate::resolved_graph::loop_group_bindings)
-                    .map(|group| group.to_string())
-                    .collect()
-            })
-            .contains(dep_name)
-    {
-        return DependencyTarget::LoopGroup;
-    }
-    // Declaration resolution supplies the same value-vs-handle result for
-    // module arguments in both dependency-list contexts.
-    if let Some(parameter_type) = argument_types.types.get(dep_name) {
-        return DependencyTarget::ModuleParam(parameter_type);
+    if let Some(parameter) = argument_types.types.get(name) {
+        return DependencyTarget::ModuleParam(parameter);
     }
     DependencyTarget::Unknown
 }
 
-/// The `directives.depends_on` list of a resource, or an empty slice.
+/// A raw file cannot enter analysis or omit the argument-type witness.
 ///
-/// `LiveComposition` carries no explicit dependencies and is treated as an
-/// empty `depends_on` list.
-fn depends_on_of<'a, B: BindingAddress, D>(
-    rref: ParsedResourceRef<'a, D, B>,
-) -> Option<&'a crate::parser::UnexpandedDependencies<B>>
-where
-    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
-{
-    rref.explicit_dependencies()
-}
-
-/// Run all depends_on checks against a parsed file. Returns the full
-/// list of diagnostics (errors + warnings); callers decide how to surface
-/// them.
-///
-/// Raw parses cannot be checked without the argument-type resolution witness:
-///
-/// ```compile_fail,E0061
-/// use carina_core::{parser::ParsedFile, validation::depends_on::validate_depends_on};
-/// let unresolved = ParsedFile::default();
-/// validate_depends_on(&unresolved);
+/// ```compile_fail,E0308
+/// use carina_core::{parser::ParsedFile, validation::{depends_on::validate_depends_on, ResolvedArgumentTypes}};
+/// fn analyze(file: &ParsedFile, types: &ResolvedArgumentTypes) { validate_depends_on(file, types); }
 /// ```
-pub fn validate_depends_on<E, B: BindingAddress, D>(
-    parsed: &File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+pub fn validate_depends_on<B: BindingAddress, D, E>(
+    tree: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
     argument_types: &ResolvedArgumentTypes,
-) -> Vec<DependsOnDiagnostic>
+) -> Vec<Located<DependsOnDiagnostic>>
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    // Common-case fast path: most resources and waits have no `depends_on`
-    // set, and the checks below allocate per-resource.
-    // Walk top-level + for-body template resources so loops are covered
-    // (per the carina-core "directory-scoped, never single-file" rule).
-    let resources_have_no_depends_on = parsed
-        .iter_all_resources()
-        .all(|rref| depends_on_of(rref).is_none_or(|dependencies| dependencies.is_empty()));
-    let waits_have_no_depends_on = parsed
-        .wait_bindings
-        .iter()
-        .all(|wait| wait.depends_on.is_empty());
-    if resources_have_no_depends_on && waits_have_no_depends_on {
+    let resources_have_dependencies = tree
+        .project_resources()
+        .any(|resource| !resource.dependencies().is_empty());
+    if !resources_have_dependencies && tree.waits().all(|wait| wait.dependencies().is_empty()) {
         return Vec::new();
     }
-
-    let mut diags = Vec::new();
-
-    let bindings_by_name: HashMap<&str, ParsedResourceRef<'_, D, B>> = parsed
-        .iter_all_resources()
-        .filter_map(|rref| rref.binding().map(|n| (n, rref)))
+    let bindings: HashMap<_, _> = tree
+        .project_resources()
+        .filter_map(|r| r.binding().map(|binding| (binding, r)))
         .collect();
-    // Most operands resolve directly or carry parser-approved handles. Rebuild
-    // expanded loop groups only when a retained bare operand needs that lookup.
-    let managed_group_names = OnceCell::new();
-
-    let mut check_dependencies =
-        |owner_kind: DependsOnOwner,
-         binding: Option<&str>,
-         depends_on: &crate::parser::UnexpandedDependencies<B>,
-         value_ref_deps: Option<&HashSet<B>>| {
-            let self_name = binding.unwrap_or("(anonymous)");
-            let context = owner_kind.context();
-            let mut seen = HashSet::new();
-            let mut duplicate_warned = HashSet::new();
-            for operand in depends_on {
-                let dep_name = operand.diagnostic_reference();
-                if !seen.insert(dep_name.clone()) {
-                    if duplicate_warned.insert(dep_name.clone()) {
-                        diags.push(
-                            DependsOnDiagnostic::warning(format!(
-                                "{context} on '{self_name}': binding '{dep_name}' is listed multiple times"
-                            ))
-                            .at_element(owner_kind, self_name, &dep_name),
-                        );
-                    }
-                    continue;
-                }
-
-                if owner_kind == DependsOnOwner::Resource && dep_name == self_name {
-                    diags.push(
-                        DependsOnDiagnostic::error(format!(
-                            "{context} on '{self_name}': self-reference is not allowed \
-                             (binding '{dep_name}' depends on itself)"
-                        ))
-                        .at_element(owner_kind, self_name, &dep_name),
+    let mut out = Vec::new();
+    let mut check = |owner: DependsOnOwner,
+                     binding: Option<&str>,
+                     dependencies: &[crate::parser::AnalysisDependencyRef<'_, B>],
+                     value_deps: &HashSet<B>| {
+        let name = binding.unwrap_or("(anonymous)");
+        let context = owner.context();
+        let mut seen = HashSet::new();
+        let mut warned = HashSet::new();
+        for dependency in dependencies {
+            let operand = dependency.operand();
+            let dep = operand.diagnostic_reference();
+            let mut emit = |severity, message| {
+                out.push(Located::new(
+                    dependency.location().clone(),
+                    DependsOnDiagnostic {
+                        severity,
+                        message,
+                        kind: DependsOnDiagnosticKind::Element {
+                            owner,
+                            binding: name.to_string(),
+                            dependency: dep.clone(),
+                        },
+                    },
+                ))
+            };
+            if !seen.insert(dep.clone()) {
+                if warned.insert(dep.clone()) {
+                    emit(
+                        Severity::Warning,
+                        format!("{context} on '{name}': binding '{dep}' is listed multiple times"),
                     );
-                    continue;
                 }
-
-                let diagnostic = match classify_operand(
-                    parsed,
-                    &bindings_by_name,
-                    argument_types,
-                    &managed_group_names,
-                    operand,
-                    &dep_name,
-                ) {
-                    DependencyTarget::Upstream => Some(DependsOnDiagnostic::error(format!(
-                        "{context} on '{self_name}': upstream_state binding '{dep_name}' \
-                         is not a valid depends_on target"
-                    ))),
-                    DependencyTarget::Unknown => Some(DependsOnDiagnostic::error(format!(
-                        "{context} on '{self_name}': binding '{dep_name}' is not declared in this scope"
-                    ))),
-                    DependencyTarget::ModuleParam(DependencyArgumentResolution::Resolved(
-                        ResolvedDependencyArgumentType::Value(parameter_type),
-                    )) => Some(DependsOnDiagnostic::error(format!(
-                        "{context}: expected a managed resource handle; got {parameter_type}"
-                    ))),
-                    DependencyTarget::DataSource if owner_kind == DependsOnOwner::Resource => {
-                        Some(DependsOnDiagnostic::error(format!(
-                            "{context} on '{self_name}': data sources cannot be \
-                             depends_on targets (binding '{dep_name}')"
-                        )))
-                    }
-                    DependencyTarget::Managed | DependencyTarget::DataSource => value_ref_deps
-                        .filter(|dependencies| dependencies.contains(&operand.binding_reference()))
-                        .map(|_| {
-                            DependsOnDiagnostic::warning(format!(
-                                "{context} on '{self_name}': edge to '{dep_name}' is redundant; \
-                                 '{dep_name}' is already referenced by value"
-                            ))
-                        }),
-                    DependencyTarget::ModuleParam(
-                        DependencyArgumentResolution::Unresolved
-                        | DependencyArgumentResolution::Resolved(
-                            ResolvedDependencyArgumentType::ManagedHandle,
-                        ),
-                    )
-                    | DependencyTarget::LoopGroup
-                    | DependencyTarget::Handle => None,
-                };
-                if let Some(diagnostic) = diagnostic {
-                    diags.push(diagnostic.at_element(owner_kind, self_name, &dep_name));
-                }
+                continue;
             }
-        };
-
-    for resource in parsed.iter_all_resources() {
-        let Some(depends_on) =
-            depends_on_of(resource).filter(|dependencies| !dependencies.is_empty())
-        else {
-            continue;
-        };
-        let mut value_ref_deps = HashSet::new();
-        for value in resource.attributes().values() {
-            collect_dependencies(value, &mut value_ref_deps);
+            if owner == DependsOnOwner::Resource && dep == name {
+                emit(
+                    Severity::Error,
+                    format!(
+                        "{context} on '{name}': self-reference is not allowed (binding '{dep}' depends on itself)"
+                    ),
+                );
+                continue;
+            }
+            let diagnostic = match classify_operand(tree, &bindings, argument_types, operand, &dep)
+            {
+                DependencyTarget::Upstream => Some((
+                    Severity::Error,
+                    format!(
+                        "{context} on '{name}': upstream_state binding '{dep}' is not a valid depends_on target"
+                    ),
+                )),
+                DependencyTarget::Unknown => Some((
+                    Severity::Error,
+                    format!("{context} on '{name}': binding '{dep}' is not declared in this scope"),
+                )),
+                DependencyTarget::ModuleParam(DependencyArgumentResolution::Resolved(
+                    ResolvedDependencyArgumentType::Value(ty),
+                )) => Some((
+                    Severity::Error,
+                    format!("{context}: expected a managed resource handle; got {ty}"),
+                )),
+                DependencyTarget::DataSource if owner == DependsOnOwner::Resource => Some((
+                    Severity::Error,
+                    format!(
+                        "{context} on '{name}': data sources cannot be depends_on targets (binding '{dep}')"
+                    ),
+                )),
+                DependencyTarget::Managed | DependencyTarget::DataSource
+                    if owner == DependsOnOwner::Resource
+                        && value_deps.contains(&operand.binding_reference()) =>
+                {
+                    Some((
+                        Severity::Warning,
+                        format!(
+                            "{context} on '{name}': edge to '{dep}' is redundant; '{dep}' is already referenced by value"
+                        ),
+                    ))
+                }
+                _ => None,
+            };
+            if let Some((severity, message)) = diagnostic {
+                emit(severity, message);
+            }
         }
-        value_ref_deps.extend(resource.dependency_bindings().iter().cloned());
-        check_dependencies(
+    };
+    for resource in tree.project_resources() {
+        let mut value_deps = HashSet::new();
+        for value in resource.attributes().values() {
+            collect_dependencies(value, &mut value_deps);
+        }
+        value_deps.extend(resource.dependency_bindings().iter().cloned());
+        check(
             DependsOnOwner::Resource,
             resource.binding(),
-            depends_on,
-            Some(&value_ref_deps),
+            resource.dependencies(),
+            &value_deps,
         );
     }
-
-    // The parser rejects wait/self handles and non-handle operand kinds.
-    // Data sources are valid wait targets; redundant-edge linting is resource-only.
-    for wait in &parsed.wait_bindings {
-        check_dependencies(
+    for wait in tree.waits() {
+        check(
             DependsOnOwner::Wait,
-            Some(wait.binding.as_str()),
-            &wait.depends_on,
-            None,
+            Some(wait.binding().as_str()),
+            wait.dependencies(),
+            &HashSet::new(),
         );
     }
-
-    // Check the combined graph of value references and explicit dependencies
-    // only when at least one resource declares depends_on. A reported cycle
-    // may consist entirely of value references, so do not attribute it to
-    // depends_on.
-    //
-    // carina#3181: only managed resources can participate in a cycle —
-    // data sources are rejected as `depends_on` targets above (so they
-    // can be sources but never the depended-on end of an edge), and
-    // composition resources are post-apply synthetic nodes with no
-    // directives. A cycle therefore lives entirely within the managed
-    // slice.
-    if !resources_have_no_depends_on
-        && let Err(msg) = sort_resources_by_dependencies(&parsed.resources)
-    {
-        diags.push(DependsOnDiagnostic::error(msg));
+    if resources_have_dependencies && let Some(cycle) = first_dependency_cycle(tree) {
+        out.push(Located::new(
+            cycle.members[0].location.clone(),
+            DependsOnDiagnostic {
+                severity: Severity::Error,
+                message: cycle.to_string(),
+                kind: DependsOnDiagnosticKind::Cycle { cycle },
+            },
+        ));
     }
+    out
+}
 
-    diags
+/// Use the ordering pass's node set, edges and first-cycle DFS. Each edge's
+/// origin was attached at the analysis boundary without changing membership.
+fn first_dependency_cycle<B: BindingAddress, D, E>(
+    tree: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
+) -> Option<DependencyCycle>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    let resources: Vec<_> = tree
+        .top_level_resources()
+        .filter(|resource| resource.kind() == AnalysisItemKind::Resource)
+        .collect();
+    let bindings: Vec<_> = resources
+        .iter()
+        .map(|resource| resource.binding_address())
+        .collect();
+    let cycle = crate::deps::dependency_order(&bindings, |index| {
+        resources[index]
+            .dependency_edges()
+            .keys()
+            .cloned()
+            .collect()
+    })
+    .err()?;
+    let members = cycle
+        .windows(2)
+        .map(|edge| {
+            let source = resources[edge[0]];
+            let target = resources[edge[1]];
+            let binding = target
+                .binding_address()
+                .expect("cycle targets are named resources");
+            let origin = &source.dependency_edges()[binding];
+            DependencyCycleMember {
+                binding: source
+                    .binding()
+                    .expect("cycle members are named resources")
+                    .to_string(),
+                target: binding.to_string(),
+                origin: *origin.detail(),
+                location: origin.location().clone(),
+            }
+        })
+        .collect();
+    Some(DependencyCycle { members })
 }
 
 #[cfg(test)]
@@ -369,22 +324,30 @@ mod tests {
         E: crate::parser::ExportParamLike + Clone,
         D: crate::parser::DeferredForPhaseTraversal + Clone,
     >(
-        parsed: &File<E, crate::resource::ParserPlaceholder, crate::resource::ParserPlaceholder, D>,
-    ) -> Vec<DependsOnDiagnostic> {
+        parsed: &crate::parser::File<
+            E,
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            D,
+        >,
+    ) -> Result<Vec<Located<DependsOnDiagnostic>>, crate::parser::AnalysisTreeError> {
         let mut parsed = parsed.clone();
         let report = crate::validation::deferred_types::with_session_for_test(
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| super::super::resolve_file_type_exprs_report(&mut parsed, session, None),
-        );
+        )?;
         assert!(
             report.diagnostics().is_empty(),
             "{:?}",
             report.diagnostics()
         );
-        validate_depends_on(&parsed, report.resolved_argument_types())
+        Ok(validate_depends_on(
+            &AnalysisTree::try_from_file(&parsed)?,
+            report.resolved_argument_types(),
+        ))
     }
 
-    fn diag_messages(diags: &[DependsOnDiagnostic], sev: Severity) -> Vec<String> {
+    fn diag_messages(diags: &[Located<DependsOnDiagnostic>], sev: Severity) -> Vec<String> {
         diags
             .iter()
             .filter(|d| d.severity == sev)
@@ -401,7 +364,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         let errors = diag_messages(&diags, Severity::Error);
         assert!(
             errors
@@ -412,7 +375,7 @@ mod tests {
         );
     }
 
-    fn check_wait_depends_on(dependency: &str) -> Vec<DependsOnDiagnostic> {
+    fn check_wait_depends_on(dependency: &str) -> Vec<Located<DependsOnDiagnostic>> {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
             directory.path().join("resources.crn"),
@@ -434,7 +397,7 @@ let lookup = read aws.acm.Certificate { domain_name = "lookup.example.com" }
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("multi-file wait fixture must parse");
-        check(parsed.parsed())
+        check(parsed.parsed()).unwrap()
     }
 
     #[test]
@@ -449,12 +412,12 @@ let lookup = read aws.acm.Certificate { domain_name = "lookup.example.com" }
                 .contains("binding 'nope' is not declared in this scope")
         );
         assert_eq!(
-            diagnostic.location,
-            Some(DependsOnLocation {
+            diagnostic.kind,
+            DependsOnDiagnosticKind::Element {
                 owner: DependsOnOwner::Wait,
                 binding: "ready".to_string(),
-                dep: Some("nope".to_string()),
-            }),
+                dependency: "nope".to_string(),
+            },
         );
     }
 
@@ -486,11 +449,11 @@ let lookup = read aws.acm.Certificate { domain_name = "lookup.example.com" }
             "upstream",
             r#"let upstream = upstream_state { source = "../upstream" }"#,
         );
-        let wait_errors = diag_messages(&check(&parsed), Severity::Error);
+        let wait_errors = diag_messages(&check(&parsed).unwrap(), Severity::Error);
         // Compare the same retained operand on the resource path.
         parsed.resources[0].dependencies.depends_on =
             std::mem::take(&mut parsed.wait_bindings[0].depends_on);
-        let resource_errors = diag_messages(&check(&parsed), Severity::Error);
+        let resource_errors = diag_messages(&check(&parsed).unwrap(), Severity::Error);
         assert_eq!(resource_errors.len(), 1, "{resource_errors:?}");
         assert_eq!(
             wait_errors,
@@ -516,7 +479,7 @@ let lookup = read aws.acm.Certificate { domain_name = "lookup.example.com" }
             ),
         ] {
             let parsed = forward_wait_dependency(dependency, declaration);
-            let errors = diag_messages(&check(&parsed), Severity::Error);
+            let errors = diag_messages(&check(&parsed).unwrap(), Severity::Error);
             actual.push((dependency, errors));
             expected.push((dependency, vec![format!(
                 "wait.depends_on on 'ready': binding '{dependency}' is not declared in this scope"
@@ -526,7 +489,8 @@ let lookup = read aws.acm.Certificate { domain_name = "lookup.example.com" }
     }
 
     #[test]
-    fn wait_depends_on_rejects_resolved_value_argument_like_resources() {
+    fn wait_depends_on_rejects_resolved_value_argument_like_resources()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let mut parsed = parse(
             "arguments { rec: aws.iam.Policy.Arn }\n\
              let cert = aws.acm.Certificate { directives { depends_on = [rec] } }\n\
@@ -547,7 +511,7 @@ let lookup = read aws.acm.Certificate { domain_name = "lookup.example.com" }
         };
         let report =
             crate::validation::deferred_types::with_session_for_test(&context, |session| {
-                super::super::resolve_file_type_exprs_report(&mut parsed, session, None)
+                super::super::resolve_file_type_exprs_report(&mut parsed, session, None).unwrap()
             });
         assert!(
             report.diagnostics().is_empty(),
@@ -555,7 +519,10 @@ let lookup = read aws.acm.Certificate { domain_name = "lookup.example.com" }
             report.diagnostics()
         );
         let errors = diag_messages(
-            &validate_depends_on(&parsed, report.resolved_argument_types()),
+            &validate_depends_on(
+                &AnalysisTree::try_from_file(&parsed)?,
+                report.resolved_argument_types(),
+            ),
             Severity::Error,
         );
         assert_eq!(
@@ -565,12 +532,13 @@ let lookup = read aws.acm.Certificate { domain_name = "lookup.example.com" }
                 "wait.depends_on: expected a managed resource handle; got aws.iam.Policy.Arn",
             ],
         );
+        Ok(())
     }
 
     #[test]
     fn wait_depends_on_warns_once_for_duplicates_without_redundant_edges() {
         let parsed = forward_wait_dependency("cert, cert, cert", "");
-        let diagnostics = check(&parsed);
+        let diagnostics = check(&parsed).unwrap();
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(diagnostics[0].severity, Severity::Warning);
         assert_eq!(
@@ -633,7 +601,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
         .expect("fixture must parse");
         assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
 
-        let errors = diag_messages(&check(&parsed), Severity::Error);
+        let errors = diag_messages(&check(&parsed).unwrap(), Severity::Error);
         assert!(
             errors
                 .iter()
@@ -651,7 +619,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         let errors = diag_messages(&diags, Severity::Error);
         assert!(
             errors
@@ -675,7 +643,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         let warnings = diag_messages(&diags, Severity::Warning);
         assert!(
             warnings
@@ -699,7 +667,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         let warnings = diag_messages(&diags, Severity::Warning);
         let role_warnings: Vec<_> = warnings
             .iter()
@@ -725,7 +693,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let errors = diag_messages(&check(&parsed), Severity::Error);
+        let errors = diag_messages(&check(&parsed).unwrap(), Severity::Error);
         assert!(
             errors.is_empty(),
             "expanded managed groups are valid dependency targets: {errors:?}",
@@ -738,15 +706,21 @@ let other = wait cert { until = cert.status == "ISSUED" }
             r#"
                 arguments { records: String }
                 let member = aws.s3.Bucket { bucket_name = "one" }
-                let consumer = aws.s3.Bucket { bucket_name = "consumer" }
+                let consumer = aws.s3.Bucket { bucket_name = "consumer" directives { depends_on = [missing] } }
             "#,
         )
         .unwrap();
         // Model an expanded group without a retained parser loop handle.
         parsed.resources[0].binding = Some("records[0]".into());
-        parsed.resources[1].dependencies.depends_on = vec!["records".into()].into();
+        *parsed.resources[1]
+            .dependencies
+            .depends_on
+            .iter_mut()
+            .next()
+            .expect("authored operand") =
+            UnexpandedDependencyOperand::BareBinding("records".into());
 
-        let diagnostics = check(&parsed);
+        let diagnostics = check(&parsed).unwrap();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
@@ -763,7 +737,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         let warnings = diag_messages(&diags, Severity::Warning);
         assert!(
             warnings
@@ -787,7 +761,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         let errors = diag_messages(&diags, Severity::Error);
         assert!(
             errors
@@ -795,6 +769,60 @@ let other = wait cert { until = cert.status == "ISSUED" }
                 .any(|m| m.contains("Circular") || m.contains("cycle")),
             "expected cycle error, got {:?}",
             errors
+        );
+    }
+
+    #[test]
+    fn overlapping_cycles_report_only_main_first_ring() {
+        let parsed = parse_and_resolve("let a = mock.test.Resource { value = c.output directives { depends_on = [b] } }\nlet b = mock.test.Resource { directives { depends_on = [a] } }\nlet c = mock.test.Resource { directives { depends_on = [b] } }\n").unwrap();
+        let diagnostics = check(&parsed).unwrap();
+        let cycles: Vec<_> = diagnostics
+            .iter()
+            .filter_map(|diagnostic| match &diagnostic.kind {
+                DependsOnDiagnosticKind::Cycle { cycle } => Some(cycle),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cycles.len(), 1, "{diagnostics:#?}");
+        let members = &cycles[0].members;
+        assert_eq!(members.len(), 2, "{diagnostics:#?}");
+        assert_eq!(
+            members
+                .iter()
+                .map(|member| member.binding.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["a", "b"])
+        );
+        assert!(
+            members
+                .iter()
+                .all(|member| member.origin == DependencyEdgeOrigin::ExplicitDependency)
+        );
+    }
+
+    #[test]
+    fn cycles_ignore_deferred_if_branches() {
+        let parsed = parse_and_resolve("arguments { enabled: Bool }\nlet a = if enabled { mock.test.Resource { value = 'a' directives { depends_on = [b] } } }\nlet b = mock.test.Resource { value = a.output }\n").unwrap();
+        let diagnostics = check(&parsed).unwrap();
+        assert!(
+            diagnostics.iter().all(|diagnostic| !matches!(
+                diagnostic.kind,
+                DependsOnDiagnosticKind::Cycle { .. }
+            )),
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn read_template_depends_on_does_not_enable_cycle_checks() {
+        let parsed = parse_and_resolve("let a = mock.test.Resource { value = b.output }\nlet b = mock.test.Resource { value = a.output }\nlet up = upstream_state { source = './up' }\nlet copies = for item in up.items { read mock.test.Resource { name = item directives { depends_on = [a] } } }\n").unwrap();
+        let diagnostics = check(&parsed).unwrap();
+        assert!(
+            diagnostics.iter().all(|diagnostic| !matches!(
+                diagnostic.kind,
+                DependsOnDiagnosticKind::Cycle { .. }
+            )),
+            "{diagnostics:#?}"
         );
     }
 
@@ -829,7 +857,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         let errors = diag_messages(&diags, Severity::Error);
         assert!(
             errors
@@ -856,7 +884,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         let warnings = diag_messages(&diags, Severity::Warning);
         assert!(
             warnings
@@ -884,7 +912,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         let warnings = diag_messages(&diags, Severity::Warning);
         assert!(
             warnings
@@ -920,7 +948,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         let errors = diag_messages(&diags, Severity::Error);
         assert!(
             errors
@@ -944,7 +972,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         assert!(
             diags.is_empty(),
             "expected zero diagnostics for valid depends_on, got {:?}",

@@ -1834,12 +1834,13 @@ fn module_handle_dependency_does_not_change_anonymous_identity_hash() {
     };
     let mut without_dependency = vec![resource()];
     let mut with_dependency = vec![resource()];
-    with_dependency[0].dependencies.depends_on = crate::parser::UnexpandedDependencies::new(vec![
-        crate::parser::UnexpandedDependencyOperand::AttributeSelection {
-            binding: absolute_binding("producer"),
-            attribute: "validation_record".to_string(),
-        },
-    ]);
+    with_dependency[0].dependencies.depends_on =
+        crate::parser::UnexpandedDependencies::new_for_test(vec![
+            crate::parser::UnexpandedDependencyOperand::AttributeSelection {
+                binding: absolute_binding("producer"),
+                attribute: "validation_record".to_string(),
+            },
+        ]);
 
     compute_anonymous_identifiers_for_test(&mut without_dependency, &[], &registry, &|_| {
         Vec::new()

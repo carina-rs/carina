@@ -23,6 +23,55 @@ use thiserror::Error;
 type RuntimeValue = GenericValue<NoPlaceholder, AbsoluteBindingAddress>;
 type RuntimeProviderConfig = ProviderConfig<NoPlaceholder, AbsoluteBindingAddress>;
 
+/// An analysis pass either rejects an unsealed input or reports an authored
+/// semantic error. A semantic finding always has parser-owned provenance.
+#[derive(Debug, thiserror::Error)]
+pub enum AnalysisResolutionError {
+    #[error(transparent)]
+    Invariant(#[from] super::AnalysisTreeError),
+    #[error(transparent)]
+    Diagnostic(Box<super::Located<ParseError>>),
+}
+
+impl AnalysisResolutionError {
+    fn from_parse_failure(error: ParseError) -> Self {
+        match error {
+            ParseError::AtElement(finding) => Self::Diagnostic(finding),
+            error => Self::Invariant(super::AnalysisTreeError::new(
+                super::AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                    element: format!("semantic failure: {error}"),
+                },
+            )),
+        }
+    }
+}
+
+fn provider_analysis_failure(
+    locations: &[HashMap<String, super::DeclarationLocation>],
+    index: usize,
+    key: &str,
+    error: ParseError,
+) -> AnalysisResolutionError {
+    if let ParseError::AtElement(finding) = error {
+        return AnalysisResolutionError::Diagnostic(finding);
+    }
+    match locations
+        .get(index)
+        .and_then(|attributes| attributes.get(key))
+    {
+        Some(location) => AnalysisResolutionError::Diagnostic(Box::new(super::Located::new(
+            location.clone(),
+            error,
+        ))),
+        None => {
+            super::AnalysisTreeError::new(super::AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                element: format!("provider {index} attribute {key}"),
+            })
+            .into()
+        }
+    }
+}
+
 trait ProviderAttributeBindingPhase: BindingAddress {
     fn evaluate_resolved_user_function(
         function: &super::UserFunction<Self>,
@@ -534,9 +583,13 @@ trait PreApplyResourceMut {
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value>;
     fn directives_mut(&mut self) -> &mut crate::resource::AuthoredDirectives;
     fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<RelativeBindingName>;
+    fn declaration(&self) -> &super::DeclarationProvenance;
 }
 
 impl PreApplyResourceMut for Resource {
+    fn declaration(&self) -> &super::DeclarationProvenance {
+        &self.declaration
+    }
     fn id(&self) -> &crate::resource::ResourceId {
         &self.id
     }
@@ -558,6 +611,9 @@ impl PreApplyResourceMut for Resource {
 }
 
 impl PreApplyResourceMut for DataSource {
+    fn declaration(&self) -> &super::DeclarationProvenance {
+        &self.declaration
+    }
     fn id(&self) -> &crate::resource::ResourceId {
         &self.id
     }
@@ -621,6 +677,43 @@ pub fn resolve_resource_refs_with_config<E: ExportParamLike>(
 
 /// Resolve pending checks with the same session used for declaration checks.
 pub fn resolve_resource_refs_in_session<E: ExportParamLike>(
+    parsed: &mut File<E>,
+    session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+) -> Result<(), AnalysisResolutionError> {
+    super::AnalysisTree::try_from_file(parsed)?;
+    resolve_resource_refs_with_policy(parsed, session.catalog(), Some(session), false, false)
+        .map_err(AnalysisResolutionError::from_parse_failure)
+}
+
+/// Resolve a copy of the already sealed input. The original remains a valid
+/// read-only analysis view; no independently supplied raw file can bypass it.
+///
+/// ```compile_fail,E0308
+/// use carina_core::parser::{ParsedFile, resolve_resource_refs_from_analysis};
+/// use carina_core::validation::deferred_types::ProviderTypeCheckContext;
+/// fn resolve(file: &ParsedFile, session: &dyn ProviderTypeCheckContext) {
+///     resolve_resource_refs_from_analysis(file, session);
+/// }
+/// ```
+pub fn resolve_resource_refs_from_analysis<E: ExportParamLike + Clone>(
+    tree: &super::AnalysisTree<
+        '_,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        super::ParsedDeferredForPhase<ParserPlaceholder, RelativeBindingName>,
+        RelativeBindingName,
+        E,
+    >,
+    session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+) -> Result<File<E>, AnalysisResolutionError> {
+    let mut parsed = tree.file().clone();
+    resolve_resource_refs_with_policy(&mut parsed, session.catalog(), Some(session), false, false)
+        .map_err(AnalysisResolutionError::from_parse_failure)?;
+    Ok(parsed)
+}
+
+/// Parser/module-loader evaluation before the analysis boundary is sealed.
+pub(crate) fn resolve_resource_refs_in_session_unsealed<E: ExportParamLike>(
     parsed: &mut File<E>,
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<(), ParseError> {
@@ -699,6 +792,16 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     defer_unknown_functions: bool,
     preserve_failed_user_calls: bool,
 ) -> Result<(), ParseError> {
+    let syntax = parsed.parser_binding_metadata.syntax().clone();
+    let locate_named = |kind, name: &str, error: ParseError| match syntax
+        .declarations()
+        .iter()
+        .rev()
+        .find(|record| record.kind() == kind && record.name() == name)
+    {
+        Some(record) => error.at(record.value_location().unwrap_or(record.location())),
+        None => error,
+    };
     if let Some(session) = session {
         for check in parsed
             .parser_binding_metadata
@@ -708,7 +811,8 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 check,
                 &parsed.user_functions,
                 session,
-            )?;
+            )
+            .map_err(|error| error.at(&check.location))?;
         }
     }
 
@@ -814,7 +918,18 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 session,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
-            )?;
+            )
+            .map_err(|error| {
+                match syntax
+                    .backend_keys()
+                    .iter()
+                    .rev()
+                    .find(|record| record.detail() == key)
+                {
+                    Some(record) => error.at(record.location()),
+                    None => error,
+                }
+            })?;
             if crate::value::contains_secret(&evaluated) {
                 let span = backend.attribute_spans.get(key).copied().ok_or_else(|| {
                     ParseError::InternalError {
@@ -822,13 +937,24 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                         context: "secret-derived backend attribute validation".to_string(),
                     }
                 })?;
-                return Err(ParseError::SecretDerivedBackendAttribute {
+                let error = ParseError::SecretDerivedBackendAttribute {
                     backend_type: backend.backend_type.clone(),
                     attribute: key.clone(),
                     line: span.start_line(),
                     start_column: span.start_column(),
                     end_column: span.end_column(),
-                });
+                };
+                return Err(
+                    match syntax
+                        .backend_keys()
+                        .iter()
+                        .rev()
+                        .find(|record| record.detail() == key)
+                    {
+                        Some(record) => error.at(record.location()),
+                        None => error,
+                    },
+                );
             }
             *value = evaluated;
         }
@@ -853,9 +979,12 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 defer_unknown_functions,
                 preserve_failed_user_calls,
             )
-            .map_err(|error| match &source_file {
-                Some(path) => error.in_file(path.clone()),
-                None => error,
+            .map_err(|error| match resource.declaration().location() {
+                Some(location) => error.at(location),
+                None => match &source_file {
+                    Some(path) => error.in_file(path.clone()),
+                    None => error,
+                },
             })?;
             resolved_attrs.insert(key.clone(), resolved);
         }
@@ -881,6 +1010,15 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     // effect. Keep resource references deferred so apply-time expansion still
     // substitutes the loop value and other runtime bindings normally.
     for deferred in parsed.parsed_deferred_for_expressions_mut() {
+        let location = match deferred.body() {
+            super::DeferredForBody::Resource(resource) => {
+                resource.as_resource().declaration.location().cloned()
+            }
+            super::DeferredForBody::Read(source) => source.declaration.location().cloned(),
+            super::DeferredForBody::ModuleCall(call) => {
+                Some(call.id().declaration_location().clone())
+            }
+        };
         match &mut deferred.body {
             crate::parser::DeferredForBody::Resource(resource) => resolve_directive_function_calls(
                 resource.directives_mut(),
@@ -911,7 +1049,11 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 session,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
-            )?;
+            )
+            .map_err(|error| match &location {
+                Some(location) => error.at(location),
+                None => error,
+            })?;
         }
     }
 
@@ -961,7 +1103,10 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
             session,
             defer_unknown_functions,
             preserve_failed_user_calls,
-        )?;
+        )
+        .map_err(|error| {
+            locate_named(crate::config_loader::DeclarationKind::Binding, &key, error)
+        })?;
         parsed.variables[&key] = resolved;
     }
 
@@ -971,6 +1116,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     // Type checking module arguments, attributes, or exports before this pass
     // would treat that deferred call as unknown and silently accept it.
     for call in &mut parsed.module_calls {
+        let location = call.id().declaration_location().clone();
         for argument in call.arguments_mut() {
             argument.try_rewrite(|value| {
                 resolve_function_calls_only(
@@ -981,6 +1127,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                     defer_unknown_functions,
                     preserve_failed_user_calls,
                 )
+                .map_err(|error| error.at(&location))
             })?;
         }
     }
@@ -993,7 +1140,14 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 session,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
-            )?;
+            )
+            .map_err(|error| {
+                locate_named(
+                    crate::config_loader::DeclarationKind::Argument,
+                    &argument.name,
+                    error,
+                )
+            })?;
         }
     }
     for attribute in &mut parsed.attribute_params {
@@ -1011,7 +1165,14 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 session,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
-            )?;
+            )
+            .map_err(|error| {
+                locate_named(
+                    crate::config_loader::DeclarationKind::ModuleAttribute,
+                    &attribute.name,
+                    error,
+                )
+            })?;
         }
     }
     for export in &mut parsed.export_params {
@@ -1027,7 +1188,14 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 session,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
-            )?;
+            )
+            .map_err(|error| {
+                locate_named(
+                    crate::config_loader::DeclarationKind::Export,
+                    export.name(),
+                    error,
+                )
+            })?;
             export.replace_value(resolved);
         }
     }
@@ -1354,78 +1522,7 @@ pub fn check_identifier_scope<E: ExportParamLike>(parsed: &File<E>) -> Vec<Parse
 /// from the generic "is this identifier in scope" walk, and folding
 /// them together would force callers that only want one kind of
 /// validation to pay for both.
-pub fn check_provider_instance_routing<E>(parsed: &File<E>) -> Vec<ParseError> {
-    let mut errors = Vec::new();
-    // carina#3181: walk the typed top-level slices. `directives()` is
-    // `None` for the composition arm (no `directives` on a synthetic node),
-    // which routes to the `None` match arm — and a composition's `id` has an
-    // empty provider, so it is skipped there, matching prior behaviour.
-    for rref in parsed.iter_top_level_resources() {
-        let id = rref.id();
-        let provider_instance = rref.directives().and_then(|d| d.provider_instance.as_ref());
-        match provider_instance {
-            Some(binding) => {
-                let Some(instance) = parsed
-                    .providers
-                    .iter()
-                    .find(|p| p.binding.as_deref() == Some(binding.as_str()))
-                else {
-                    errors.push(ParseError::InvalidExpression {
-                        line: 0,
-                        message: format!(
-                            "directives.provider: `{binding}` is not a known \
-                             provider instance. Declare it with `let {binding} \
-                             = provider <kind> {{ ... }}`."
-                        ),
-                    });
-                    continue;
-                };
-                if instance.name != id.provider {
-                    errors.push(ParseError::InvalidExpression {
-                        line: 0,
-                        message: format!(
-                            "directives.provider: instance `{binding}` has kind \
-                             `{}`, but resource `{}.{}` requires kind `{}`",
-                            instance.name, id.provider, id.resource_type, id.provider,
-                        ),
-                    });
-                }
-            }
-            None => {
-                // Mock / synthetic resources (no provider prefix) have no
-                // kind to route by; skip them.
-                if id.provider.is_empty() {
-                    continue;
-                }
-                let (kind_has_any, kind_has_default) =
-                    parsed
-                        .providers
-                        .iter()
-                        .fold((false, false), |(any, def), p| {
-                            let matches = p.name == id.provider;
-                            (any || matches, def || (matches && p.is_default()))
-                        });
-                if !kind_has_any {
-                    continue;
-                }
-                if !kind_has_default {
-                    errors.push(ParseError::InvalidExpression {
-                        line: 0,
-                        message: format!(
-                            "resource `{}.{}` has no default provider \
-                             instance for kind `{}`: either add instance \
-                             attributes to the top-level `provider {}` \
-                             block, or set `directives {{ provider = \
-                             <instance> }}` explicitly.",
-                            id.provider, id.resource_type, id.provider, id.provider,
-                        ),
-                    });
-                }
-            }
-        }
-    }
-    errors
-}
+pub use crate::validation::routing::check_provider_instance_routing;
 
 fn accumulate_undefined_reference_errors(
     parsed: &File<impl ExportParamLike>,
@@ -1880,8 +1977,8 @@ fn resolve_directive_function_calls(
             defer_unknown_functions,
             preserve_failed_user_calls,
         )
-        .map_err(|error| match expression.source().authored_location() {
-            Some((source_file, _)) => error.in_file(source_file),
+        .map_err(|error| match expression.source().declaration_location() {
+            Some(location) => error.at(location),
             None => error,
         })?;
         Ok(())
@@ -1994,6 +2091,64 @@ fn resolve_function_calls_only<B: ProviderAttributeBindingPhase>(
     }
 }
 
+pub fn resolve_provider_unresolved_attributes_for_analysis<
+    E: ExportParamLike<ParserPlaceholder, RelativeBindingName>,
+    D,
+>(
+    parsed: &mut File<E, ParserPlaceholder, ParserPlaceholder, D, RelativeBindingName>,
+    config: &ProviderContext,
+) -> Result<(), AnalysisResolutionError>
+where
+    D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, RelativeBindingName>,
+{
+    let locations = super::AnalysisTree::try_from_file(parsed)?
+        .provider_attribute_locations()
+        .to_vec();
+    resolve_provider_unresolved_attributes_mapped(parsed, config, |index, key, error| {
+        provider_analysis_failure(&locations, index, key, error)
+    })
+}
+
+pub fn resolve_expanded_provider_unresolved_attributes_for_analysis<
+    E: ExportParamLike<ParserPlaceholder, AbsoluteBindingAddress>,
+    D,
+>(
+    parsed: &mut File<E, ParserPlaceholder, ParserPlaceholder, D, AbsoluteBindingAddress>,
+    config: &ProviderContext,
+) -> Result<(), AnalysisResolutionError>
+where
+    D: super::DeferredForPhaseTraversal<
+            ParserPlaceholder,
+            ParserPlaceholder,
+            AbsoluteBindingAddress,
+        >,
+{
+    let locations = super::AnalysisTree::try_from_file(parsed)?
+        .provider_attribute_locations()
+        .to_vec();
+    resolve_provider_unresolved_attributes_mapped(parsed, config, |index, key, error| {
+        provider_analysis_failure(&locations, index, key, error)
+    })
+}
+
+pub fn finalize_provider_configs_for_analysis<
+    E: ExportParamLike<ParserPlaceholder, B>,
+    B: BindingAddress,
+    D,
+>(
+    parsed: &mut File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+) -> Result<(), AnalysisResolutionError>
+where
+    D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    let locations = super::AnalysisTree::try_from_file(parsed)?
+        .provider_attribute_locations()
+        .to_vec();
+    finalize_provider_configs_mapped(parsed, |index, key, error| {
+        provider_analysis_failure(&locations, index, key, error)
+    })
+}
+
 /// Resolve `ResourceRef` values inside provider blocks'
 /// `unresolved_attributes` against the merged binding map produced by
 /// `parsed.resources` + `parsed.arguments` + `parsed.module_calls` +
@@ -2040,6 +2195,17 @@ fn resolve_provider_unresolved_attributes_for_phase<E, B: ProviderAttributeBindi
 where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
+    resolve_provider_unresolved_attributes_mapped(parsed, config, |_, _, error| error)
+}
+
+fn resolve_provider_unresolved_attributes_mapped<E, B: ProviderAttributeBindingPhase, D, Failure>(
+    parsed: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    config: &ProviderContext,
+    mut map_error: impl FnMut(usize, &str, ParseError) -> Failure,
+) -> Result<(), Failure>
+where
+    D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
     let mut binding_map: HashMap<String, HashMap<String, GenericValue<ParserPlaceholder, B>>> =
         HashMap::new();
     // carina#3181: walk every top-level resource — managed, data source,
@@ -2067,10 +2233,11 @@ where
             .entry(wb.binding.as_str().to_string())
             .or_default();
     }
-    for provider in &mut parsed.providers {
+    for (index, provider) in parsed.providers.iter_mut().enumerate() {
         let mut resolved = IndexMap::new();
         for (key, expr) in &provider.unresolved_attributes {
-            let r = resolve_value_with_config(expr, &binding_map, config, None, false, false)?;
+            let r = resolve_value_with_config(expr, &binding_map, config, None, false, false)
+                .map_err(|error| map_error(index, key, error))?;
             resolved.insert(key.clone(), r);
         }
         provider.unresolved_attributes = resolved;
@@ -2206,20 +2373,37 @@ pub fn finalize_provider_configs<E, B: BindingAddress, D>(
         B,
     >,
 ) -> Result<(), ParseError> {
-    for provider in parsed.providers.iter_mut() {
+    finalize_provider_configs_mapped(parsed, |_, _, error| error)
+}
+
+fn finalize_provider_configs_mapped<E, B: BindingAddress, D, Failure>(
+    parsed: &mut super::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+        B,
+    >,
+    mut map_error: impl FnMut(usize, &str, ParseError) -> Failure,
+) -> Result<(), Failure> {
+    for (index, provider) in parsed.providers.iter_mut().enumerate() {
         if let Some(value) = provider.unresolved_attributes.shift_remove("default_tags") {
             match value {
                 GenericValue::Concrete(GenericConcreteValue::Map(tags)) => {
                     provider.default_tags = tags;
                 }
                 other => {
-                    return Err(ParseError::InvalidExpression {
-                        line: 0,
-                        message: format!(
-                            "Provider '{}': default_tags must resolve to a map, got {other:?}",
-                            provider.name
-                        ),
-                    });
+                    return Err(map_error(
+                        index,
+                        "default_tags",
+                        ParseError::InvalidExpression {
+                            line: 0,
+                            message: format!(
+                                "Provider '{}': default_tags must resolve to a map, got {other:?}",
+                                provider.name
+                            ),
+                        },
+                    ));
                 }
             }
         }

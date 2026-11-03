@@ -1975,7 +1975,7 @@ fn publish_execution_checks<S>(
     for diagnostic in sink.diagnostics {
         let message = match diagnostic {
             crate::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning)
-            | crate::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(warning) => warning.message,
+            | crate::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(warning) => warning.into_warning().message,
         };
         if !result
             .failures

@@ -1763,6 +1763,7 @@ fn module_composition<P: PlaceholderKind + PartialEq, B: carina_core::resource::
             )
         },
         quoted_string_attrs: HashSet::new(),
+        declaration: Default::default(),
     }
 }
 
@@ -1777,11 +1778,13 @@ fn authored_module_composition<P: PlaceholderKind + PartialEq>(
     argument: Value<P, carina_core::resource::RelativeBindingName>,
     rejected: &str,
 ) -> LiveComposition<P, carina_core::resource::RelativeBindingName> {
-    module_composition(
+    let mut composition = module_composition(
         argument,
         rejected,
         carina_core::resource::RelativeBindingName::new("checked"),
-    )
+    );
+    composition.declaration = crate::test_support::composition_declaration_fixture();
+    composition
 }
 
 #[test]
@@ -4427,12 +4430,15 @@ let lookup = read mock.iam.Roles {{
         ),
     );
     parsed.compositions.push(composition);
+    let mut authored_reference = crate::test_support::parsed_fixture(
+        "let checked = mock.test.resource {}\nlet lookup = read mock.iam.Roles { name_regex = checked.value }\n",
+    );
     parsed.data_sources[0].set_attr(
         "name_regex",
-        Value::<
-            carina_core::resource::ParserPlaceholder,
-            carina_core::resource::RelativeBindingName,
-        >::resource_ref("checked", "value", Vec::new()),
+        authored_reference.data_sources[0]
+            .attributes
+            .shift_remove("name_regex")
+            .unwrap(),
     );
     let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
         fixture.runtime(),
@@ -9568,6 +9574,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
         instance: "github_actions_carina".to_string(),
         call_path: crate::test_composition_call_path(),
         quoted_string_attrs: std::collections::HashSet::new(),
+        declaration: Default::default(),
     };
     let sorted_resources = [role_resource];
     let pre_resolve_compositions = vec![composition];
@@ -9681,6 +9688,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
                 instance: binding.to_string(),
                 call_path: crate::test_composition_call_path(),
                 quoted_string_attrs: std::collections::HashSet::new(),
+                declaration: Default::default(),
             }
         };
     let inner_virtual = make_virtual(
@@ -9874,6 +9882,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         instance: "carina_module".to_string(),
         call_path: crate::test_composition_call_path(),
         quoted_string_attrs: std::collections::HashSet::new(),
+        declaration: Default::default(),
     };
 
     let mut sorted_resources = vec![role_managed];

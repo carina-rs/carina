@@ -579,6 +579,28 @@ fn round5_indexed_list_errors_keep_paths_without_element_spans() {
 }
 
 #[test]
+fn computed_container_does_not_borrow_argument_element_spans() {
+    let (source, diagnostics) =
+        unique_list_declaration_scope_fixture("tags_list = concat([5], [6])", true);
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("expected String"))
+        .collect();
+    assert_eq!(errors.len(), 2, "{diagnostics:#?}");
+    let start = source.lines().nth(2).unwrap().find("tags_list").unwrap() as u32;
+    for diagnostic in errors {
+        assert_eq!(
+            diagnostic.range,
+            Range::new(
+                Position::new(2, start),
+                Position::new(2, start + "tags_list".len() as u32)
+            ),
+            "{diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
 fn non_unique_lists_continue_to_allow_duplicate_elements() {
     for body in [
         "tags_list = [\"ok\", \"ok\"]",
@@ -643,15 +665,14 @@ fn unique_list_count_error_stays_in_the_second_resource() {
         .nth(1)
         .unwrap();
     let attributes = resource.attributes();
-    let text = document.text();
-    let source = DiagnosticSource::new(&document, &text);
+    let tree =
+        carina_core::parser::AnalysisTree::try_from_file(document.parsed().unwrap()).unwrap();
     let (diagnostics, reported_duplicate) = test_engine().validate_container_value(
-        &source,
+        &document,
+        tree.project_resources().nth(1).unwrap(),
         "values",
         attributes.get("values").unwrap(),
         &effective_type,
-        None,
-        Some((3, 6)),
     );
     let diagnostic = only_message_diagnostic(&diagnostics, "outside allowed range");
     assert_eq!(diagnostic.range.start.line, 4, "{diagnostics:?}");
@@ -731,15 +752,14 @@ fn unique_list_item_error_does_not_mark_a_duplicate_as_reported() {
     let effective_attribute = schema.effective_attribute("matrix").unwrap();
     let effective_type = effective_attribute.value_type();
     let engine = test_engine();
-    let text = document.text();
-    let source = DiagnosticSource::new(&document, &text);
+    let tree =
+        carina_core::parser::AnalysisTree::try_from_file(document.parsed().unwrap()).unwrap();
     let (diagnostics, reported_duplicate) = engine.validate_container_value(
-        &source,
+        &document,
+        tree.project_resources().next().unwrap(),
         "matrix",
         value,
         &effective_type,
-        None,
-        Some((0, 3)),
     );
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert!(diagnostics[0].message.contains("expected String"));
@@ -7736,6 +7756,7 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
             instance: call_binding.to_string(),
             call_path: CompositionCallPath::direct(call),
             quoted_string_attrs: Default::default(),
+            declaration: Default::default(),
         }
     }
 
@@ -7778,7 +7799,7 @@ let first = unrelated { }
         },
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     );
-    let diagnostics = render_module_call_findings(&doc, doc.source_file(), &findings);
+    let diagnostics = render_module_call_findings(&doc, &findings);
 
     assert!(
         diagnostics.is_empty(),
@@ -13755,6 +13776,18 @@ fn same_block_duplicate_export_has_error_without_last_wins_warning() {
     let base = temp.path();
     let source = "exports {\n  x = \"one\"\n  x = \"two\"\n}\n";
     let path = base.join("main.crn");
+    std::fs::write(&path, source).unwrap();
+    let sibling_path = base.join("sibling.crn");
+    let sibling_source = "let unrelated = 'sibling'\n";
+    std::fs::write(&sibling_path, sibling_source).unwrap();
+    let sibling = create_document_at(sibling_source, sibling_path.clone());
+    let sibling_diagnostics = test_engine().analyze(&sibling, Some(&sibling_path));
+    assert!(
+        sibling_diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.starts_with("duplicate ")),
+        "a sibling buffer must not inherit duplicates: {sibling_diagnostics:#?}",
+    );
     let doc = create_document_at(source, path.clone());
 
     let diagnostics = test_engine().analyze(&doc, Some(&path));
@@ -13764,6 +13797,10 @@ fn same_block_duplicate_export_has_error_without_last_wins_warning() {
         .collect();
 
     assert_eq!(duplicates.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        duplicates[0].range,
+        Range::new(Position::new(1, 2), Position::new(1, 3))
+    );
     assert_eq!(
         duplicates[0].severity,
         Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
@@ -13782,6 +13819,18 @@ fn same_block_duplicate_module_attribute_has_error_without_last_wins_warning() {
     let base = temp.path();
     let source = "attributes {\n  x = \"one\"\n  x = \"two\"\n}\n";
     let path = base.join("main.crn");
+    std::fs::write(&path, source).unwrap();
+    let sibling_path = base.join("sibling.crn");
+    let sibling_source = "let unrelated = 'sibling'\n";
+    std::fs::write(&sibling_path, sibling_source).unwrap();
+    let sibling = create_document_at(sibling_source, sibling_path.clone());
+    let sibling_diagnostics = test_engine().analyze(&sibling, Some(&sibling_path));
+    assert!(
+        sibling_diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.starts_with("duplicate ")),
+        "a sibling buffer must not inherit duplicates: {sibling_diagnostics:#?}",
+    );
     let doc = create_document_at(source, path.clone());
 
     let diagnostics = test_engine().analyze(&doc, Some(&path));
@@ -13795,6 +13844,10 @@ fn same_block_duplicate_module_attribute_has_error_without_last_wins_warning() {
         .collect();
 
     assert_eq!(duplicates.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        duplicates[0].range,
+        Range::new(Position::new(1, 2), Position::new(1, 3))
+    );
     assert_eq!(
         duplicates[0].severity,
         Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
@@ -13814,6 +13867,18 @@ fn same_block_duplicate_export_survives_broken_sibling_parse() {
     std::fs::write(base.join("broken.crn"), "provider gcp { region = ").unwrap();
     let source = "exports {\n  x = \"one\"\n  x = \"two\"\n}\n";
     let path = base.join("main.crn");
+    std::fs::write(&path, source).unwrap();
+    let sibling_path = base.join("sibling.crn");
+    let sibling_source = "let unrelated = 'sibling'\n";
+    std::fs::write(&sibling_path, sibling_source).unwrap();
+    let sibling = create_document_at(sibling_source, sibling_path.clone());
+    let sibling_diagnostics = test_engine().analyze(&sibling, Some(&sibling_path));
+    assert!(
+        sibling_diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.starts_with("duplicate ")),
+        "a sibling buffer must not inherit duplicates: {sibling_diagnostics:#?}",
+    );
     let doc = create_document_at(source, path.clone());
 
     let diagnostics = test_engine().analyze(&doc, Some(&path));
@@ -15063,6 +15128,21 @@ mock.test.resource {
 "#;
     std::fs::write(root.path().join("main.crn"), source).expect("write caller fixture");
 
+    let sibling_source = "let unrelated = 'sibling'\n";
+    std::fs::write(root.path().join("sibling.crn"), sibling_source).unwrap();
+    let sibling_diagnostics = analyze_with_buffer(
+        &structural_ref_engine(),
+        root.path(),
+        "sibling.crn",
+        sibling_source,
+    );
+    assert!(
+        sibling_diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("Unknown attribute 'missing'")),
+        "a sibling buffer must not inherit the missing leaf: {sibling_diagnostics:#?}",
+    );
+
     let diagnostics =
         analyze_with_buffer(&structural_ref_engine(), root.path(), "main.crn", source);
     let unknown = diagnostics
@@ -15190,7 +15270,8 @@ fn module_parameter_dependency_and_ref_attribute_are_valid_in_module_scope() {
 }
 
 #[test]
-fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() {
+fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position()
+-> Result<(), carina_core::parser::AnalysisTreeError> {
     let root = tempfile::tempdir().unwrap();
     let module = root.path().join("modules/bad");
     std::fs::create_dir_all(&module).unwrap();
@@ -15222,7 +15303,7 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() 
     );
     let merged = engine
         .with_run_for_test(|run| {
-            run.parse_merged_with_buffer(
+            run.parse_and_resolve_merged_with_buffer(
                 &call_doc,
                 Some("call.crn"),
                 &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
@@ -15230,6 +15311,7 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() 
         })
         .expect("root directory parses before module expansion");
     let errors = match &merged.module_resolution {
+        checks::MergedModuleResolution::Unanalyzed => panic!("module analysis must run"),
         crate::diagnostics::checks::MergedModuleResolution::ConstraintFailed {
             findings: _,
             errors,
@@ -15254,6 +15336,18 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() 
                 .collect::<Vec<_>>();
             panic!("missing resolver error: {rendered:#?}")
         });
+    let sibling_doc =
+        create_document_at("let unrelated = 'unrelated'\n", module.join("sibling.crn"));
+    let tree = carina_core::parser::AnalysisTree::try_from_file(merged.directory.parsed.parsed())?;
+    let sibling_diagnostics = engine.with_run_for_test(|run| {
+        run.module_resolver_error_diagnostics(
+            &sibling_doc,
+            &tree,
+            error,
+            &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
+        )
+    });
+    assert!(sibling_diagnostics.is_empty(), "{sibling_diagnostics:#?}");
     let module_doc = crate::document::Document::new_with_path(
         module_source.to_string(),
         module_path.clone(),
@@ -15264,10 +15358,9 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() 
     let diagnostics = engine.with_run_for_test(|run| {
         run.module_resolver_error_diagnostics(
             &module_doc,
-            merged.directory.parsed.parsed(),
+            &tree,
             error,
             &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
-            Some(&module_path),
         )
     });
     let diagnostic = diagnostics
@@ -15276,12 +15369,18 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() 
         .unwrap_or_else(|| panic!("missing module-file diagnostic: {diagnostics:#?}"));
 
     assert_eq!(diagnostic.range.start.line, 4, "{diagnostic:#?}");
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(4, 29), Position::new(4, 36)),
+        "{diagnostic:#?}",
+    );
     assert!(
         diagnostic
             .message
             .contains("modules/bad/resource.crn) at line 5"),
         "CLI/LSP must render the same authored location: {diagnostic:#?}",
     );
+    Ok(())
 }
 
 #[test]
@@ -16174,11 +16273,15 @@ fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
         .expect("parsed directory retains main.crn source");
     *parsed_source = current_source.to_string();
 
+    let doc = create_document_at(current_source, temp.path().join("main.crn"));
+    let tree =
+        carina_core::parser::AnalysisTree::try_from_file(merged_result.parsed.parsed()).unwrap();
     let diagnostics = test_engine().with_run_for_test(|run| {
         run.check_mixed_tag_key_styles(
-            "main.crn",
+            &doc,
             &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
             &merged_result,
+            &tree,
         )
     });
 
@@ -16500,7 +16603,9 @@ fn providerless_orphan_reports_deferred_function_and_attribute_type_checks() {
         |context| {
             let mut parsed = doc.parsed().unwrap().clone();
             assert!(
-                carina_core::validation::resolve_file_type_exprs(&mut parsed, context).is_empty()
+                carina_core::validation::resolve_file_type_exprs(&mut parsed, context)
+                    .unwrap()
+                    .is_empty()
             );
             carina_core::parser::resolve_resource_refs_in_session(&mut parsed, context).unwrap();
         },
@@ -16620,7 +16725,7 @@ fn loaded_catalog_settles_type_checks_and_keeps_typos_as_unknown_types() {
 }
 
 #[test]
-fn settlement_reviewer_fixtures_a_b_c_d_have_cli_parity() {
+fn provider_catalog_completeness_controls_annotation_warnings_and_errors() {
     let failed = "provider broken { source = 'file:///definitely-missing/broken.wasm' }\n";
     let attribute = "attributes {\n  x: AwsAccountId = '123'\n}\n";
     let functions = "fn f(x: Arnn) { x }\nfn g(): Bogus { 'x' }\n";
@@ -16685,10 +16790,10 @@ fn settlement_reviewer_fixtures_a_b_c_d_have_cli_parity() {
             .collect::<Vec<_>>();
         sites.sort_unstable();
         let expected_sites = match name {
-            "a" => vec![(2, 2)],
+            "a" => vec![(2, 5)],
             "b" => vec![(1, 8), (2, 8)],
-            "c" => vec![(1, 2)],
-            "d" => vec![(0, 8), (1, 8), (3, 2)],
+            "c" => vec![(1, 5)],
+            "d" => vec![(0, 8), (1, 8), (3, 5)],
             _ => unreachable!("fixture table"),
         };
         assert_eq!(sites, expected_sites, "fixture {name}: {diagnostics:#?}");
@@ -16929,7 +17034,20 @@ fn settlement_loaded_error_from_another_file_stays_out_of_the_current_document()
         .unwrap();
         session.record(
             &expected,
-            ProviderTypeCheckSite::at_line(Path::new("/project/other.crn"), 9, 3, "foreign check"),
+            ProviderTypeCheckSite::new(
+                carina_core::parser::parse_file(
+                    "\n\n\n\n\n\n\n\n  attributes { value: Missing = 'id' }",
+                    Path::new("/project/other.crn"),
+                    &carina_core::parser::ProviderContext::new(
+                        carina_core::EnvironmentSnapshot::empty(),
+                    ),
+                )
+                .unwrap()
+                .attribute_params[0]
+                    .type_check_location()
+                    .clone(),
+                "foreign check",
+            ),
         );
         Vec::new()
     });

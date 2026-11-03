@@ -234,6 +234,7 @@ pub(crate) fn parse_postfix_eval_with_mode(
     } else {
         "postfix expression"
     };
+    let syntax = pair.clone();
     let mut inner = pair.into_inner();
     let base = next_pair(&mut inner, "primary expression", context)?;
     let steps = inner.collect::<Vec<_>>();
@@ -244,7 +245,29 @@ pub(crate) fn parse_postfix_eval_with_mode(
     // the resource as an enum candidate merely because the final expression
     // occurs in a typed attribute.
     let value = parse_primary_eval_with_mode(base, ctx, untyped_mode.as_ref().unwrap_or(mode))?;
-    apply_postfix_steps(value, steps, ctx)
+    let has_steps = !steps.is_empty();
+    let mut result = apply_postfix_steps(value, steps, ctx)?;
+    if let EvalValue::User(Value::Deferred(DeferredValue::Access(access))) = &mut result
+        && has_steps
+    {
+        access.set_access_locations(ctx.access_locations(&syntax));
+    }
+    if let EvalValue::User(Value::Deferred(DeferredValue::ResourceRef { path })) = &mut result {
+        if path.reference_locations().is_none() {
+            if let crate::parser::AccessLocations::Reference(locations) =
+                ctx.access_locations(&syntax)
+            {
+                path.set_reference_locations(locations);
+            }
+        } else if has_steps {
+            path.set_reference_locations(
+                path.reference_locations()
+                    .expect("checked reference provenance")
+                    .with_access(ctx.access_locations(&syntax)),
+            );
+        }
+    }
+    Ok(result)
 }
 
 /// Lower a `namespaced_id` pair to its `EvalValue`, attaching any
@@ -277,13 +300,9 @@ fn parse_namespaced_id_value(
             })
             .collect();
         segments.extend(trailing_segments);
-        let path = AccessPath::with_segments_at_source(
-            parts[0].to_string(),
-            parts[1].to_string(),
-            segments,
-            ctx.source_file(),
-            line,
-        );
+        let mut path =
+            AccessPath::with_segments(parts[0].to_string(), parts[1].to_string(), segments);
+        path.set_reference_locations(ctx.reference_locations(&pair));
         EvalValue::from_value(Value::Deferred(DeferredValue::ResourceRef { path }))
     };
 
@@ -301,13 +320,12 @@ fn parse_namespaced_id_value(
                 })
                 .collect();
             segments.extend(trailing_segments);
-            let path = AccessPath::with_segments_at_source(
+            let mut path = AccessPath::with_segments(
                 handle.canonical_binding_name().to_string(),
                 parts[1].to_string(),
                 segments,
-                ctx.source_file(),
-                line,
             );
+            path.set_reference_locations(ctx.reference_locations(&pair));
             return Ok(EvalValue::from_value(Value::Deferred(
                 DeferredValue::ResourceRef { path },
             )));
@@ -384,6 +402,49 @@ pub(crate) fn parse_primary_eval(
 }
 
 pub(crate) fn parse_primary_eval_with_mode(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+    mode: &ExpressionMode<'_>,
+) -> Result<EvalValue, ParseError> {
+    let syntax = if pair.as_rule() == Rule::primary {
+        first_inner(pair.clone(), "value", "reference provenance")?
+    } else {
+        pair.clone()
+    };
+    let mut result = parse_primary_eval_with_mode_inner(pair, ctx, mode)?;
+    if let EvalValue::User(Value::Deferred(DeferredValue::Access(access))) = &mut result
+        && matches!(
+            syntax.as_rule(),
+            Rule::namespaced_id | Rule::subscripted_id | Rule::variable_ref
+        )
+        && access.access_locations().is_none()
+    {
+        access.set_access_locations(ctx.access_locations(&syntax));
+    }
+    if let EvalValue::User(Value::Deferred(DeferredValue::ResourceRef { path })) = &mut result {
+        if path.reference_locations().is_none()
+            && matches!(
+                syntax.as_rule(),
+                Rule::namespaced_id | Rule::subscripted_id | Rule::variable_ref
+            )
+        {
+            if let crate::parser::AccessLocations::Reference(locations) =
+                ctx.access_locations(&syntax)
+            {
+                path.set_reference_locations(locations);
+            }
+        } else if syntax.as_rule() == Rule::subscripted_id {
+            path.set_reference_locations(
+                path.reference_locations()
+                    .expect("checked reference provenance")
+                    .with_access(ctx.access_locations(&syntax)),
+            );
+        }
+    }
+    Ok(result)
+}
+
+fn parse_primary_eval_with_mode_inner(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
     mode: &ExpressionMode<'_>,
@@ -596,6 +657,7 @@ pub(crate) fn parse_primary_eval_with_mode(
         }
         Rule::string => parse_string_value(inner, ctx).map(EvalValue::from_value),
         Rule::function_call => {
+            let location = ctx.declaration_location(&inner);
             let (line, column) = inner.line_col();
             let mut fc_inner = inner.into_inner();
             let func_name = next_pair(&mut fc_inner, "function name", "function call")?
@@ -645,6 +707,7 @@ pub(crate) fn parse_primary_eval_with_mode(
                         ctx,
                         line,
                         Some(column),
+                        location.clone(),
                     );
                 }
                 if !ctx.seeded_user_functions.contains(&func_name)
@@ -660,6 +723,7 @@ pub(crate) fn parse_primary_eval_with_mode(
                     ctx,
                     line,
                     Some(column),
+                    location,
                 );
                 return Ok(EvalValue::from_value(Value::Deferred(
                     DeferredValue::ResolvedFunctionCall {

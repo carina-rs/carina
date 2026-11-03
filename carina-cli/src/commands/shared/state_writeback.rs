@@ -2445,7 +2445,7 @@ mod apply_state_save_tests {
     }
 
     #[tokio::test]
-    async fn round3_writeback_pairs_reference_lists_with_prepared_identity_evidence() {
+    async fn writeback_pairs_reference_lists_with_prepared_identity_evidence() {
         use carina_core::explicit::ExplicitFields;
         use carina_core::provider::{InitializedProvider, RawSavedAttrs};
         use carina_core::schema::{AttributeSchema, AttributeType, StructField};

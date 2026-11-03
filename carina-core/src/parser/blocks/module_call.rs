@@ -20,8 +20,7 @@ pub(crate) fn parse_module_call(
     source_file: &std::path::Path,
 ) -> Result<ModuleCall, ParseError> {
     let span = pair.as_span();
-    let call_span = SourceSpan::from_pest(&pair, preprocessed_file);
-    let call_id = ModuleCallId::direct(source_file.to_path_buf(), call_span);
+    let call_id = ModuleCallId::from_pair(&pair, preprocessed_file, source_file);
     let mut inner = pair.into_inner();
     let module_name = next_pair(&mut inner, "module name", "module call")?
         .as_str()
@@ -81,8 +80,7 @@ pub(crate) fn parse_module_call(
     Ok(ModuleCall::from_authored_arguments_in_source(
         module_name,
         None,
-        call_span,
+        call_id,
         arguments,
-        source_file.to_path_buf(),
     ))
 }

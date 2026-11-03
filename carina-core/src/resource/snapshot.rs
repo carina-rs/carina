@@ -333,6 +333,7 @@ impl<S, P: ValueKind, B: BindingAddress, D> Resource<S, P, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         } = self;
         Resource {
             id,
@@ -346,6 +347,7 @@ impl<S, P: ValueKind, B: BindingAddress, D> Resource<S, P, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         }
     }
 }
@@ -393,6 +395,7 @@ impl<S, P: ValueKind, B: BindingAddress, D> DataSource<S, P, B, D> {
             dependencies,
             module_source,
             quoted_string_attrs,
+            declaration,
         } = self;
         DataSource {
             id,
@@ -402,6 +405,7 @@ impl<S, P: ValueKind, B: BindingAddress, D> DataSource<S, P, B, D> {
             dependencies,
             module_source,
             quoted_string_attrs,
+            declaration,
         }
     }
 }
@@ -478,6 +482,7 @@ impl<P: ValueKind, B: BindingAddress> AccessExpr<P, B> {
             step: self.step.clone(),
             source_line: self.source_line,
             display_root: self.display_root.clone(),
+            reference: self.reference.clone(),
         }
     }
 }

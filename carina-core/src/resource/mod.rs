@@ -1007,6 +1007,7 @@ impl<S, P: ValueKind> From<ResourceWithDependenciesWire<S, P>> for SchemaUnresol
                 default_tag_keys,
                 loop_provenance,
                 quoted_string_attrs: HashSet::new(),
+                declaration: Default::default(),
             },
             value_dependencies,
             explicit_dependencies,
@@ -1731,7 +1732,7 @@ pub struct AccessPath<B: BindingAddress = AbsoluteBindingAddress> {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     segments: Vec<PathSegment>,
     #[serde(skip, default)]
-    diagnostic_source: DiagnosticSourceLocation,
+    reference: crate::parser::ReferenceProvenance,
 }
 
 pub type AuthoredAccessPath = AccessPath<RelativeBindingName>;
@@ -1802,18 +1803,6 @@ impl AccessPath<RelativeBindingName> {
         segments: Vec<PathSegment>,
     ) -> Self {
         Self::from_binding(binding.into(), attribute, segments)
-    }
-
-    pub(crate) fn with_segments_at_source(
-        binding: impl Into<RelativeBindingName>,
-        attribute: impl Into<String>,
-        segments: Vec<PathSegment>,
-        source_file: &std::path::Path,
-        source_line: usize,
-    ) -> Self {
-        let mut path = Self::with_segments(binding, attribute, segments);
-        path.diagnostic_source = DiagnosticSourceLocation::authored(source_file, source_line);
-        path
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1904,23 +1893,38 @@ impl<B: BindingAddress> AccessPath<B> {
             binding,
             attribute,
             segments,
-            diagnostic_source: DiagnosticSourceLocation::default(),
+            reference: Default::default(),
         }
     }
 
-    fn map_bindings<T: BindingAddress>(self, map: &mut impl FnMut(B) -> T) -> AccessPath<T> {
+    pub(crate) fn map_bindings<T: BindingAddress>(
+        self,
+        map: &mut impl FnMut(B) -> T,
+    ) -> AccessPath<T> {
         let Self {
             binding,
             attribute,
             segments,
-            diagnostic_source,
+            reference,
         } = self;
         AccessPath {
             binding: map(binding),
             attribute,
             segments,
-            diagnostic_source,
+            reference,
         }
+    }
+
+    pub(crate) fn reference_locations_shared(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::parser::ReferenceLocations>> {
+        self.reference.shared_locations()
+    }
+    pub(crate) fn reference_locations(&self) -> Option<&crate::parser::ReferenceLocations> {
+        self.reference.locations()
+    }
+    pub(crate) fn set_reference_locations(&mut self, locations: crate::parser::ReferenceLocations) {
+        self.reference = crate::parser::ReferenceProvenance::from_locations(locations);
     }
 
     /// Return this reference path with one more postfix access step.
@@ -1954,7 +1958,12 @@ impl<B: BindingAddress> AccessPath<B> {
     }
 
     pub(crate) fn diagnostic_source_owned(&self) -> Option<(Option<std::path::PathBuf>, usize)> {
-        self.diagnostic_source.owned()
+        self.reference.locations().map(|locations| {
+            (
+                Some(locations.occurrence().file().path().to_path_buf()),
+                locations.occurrence().span().start_line(),
+            )
+        })
     }
 
     /// Returns the leading run of `.field` segments before the first
@@ -2535,6 +2544,7 @@ fn deferred_access<P: ValueKind, B: BindingAddress>(
         step,
         source_line,
         display_root,
+        reference: Default::default(),
     }))
 }
 
@@ -2725,6 +2735,7 @@ pub(crate) fn parser_deferred_for_access(
         step,
         source_line,
         display_root: Some(LoopAccessDisplayRoot::Rooted(binding)),
+        reference: Default::default(),
     }))
 }
 
@@ -3594,6 +3605,7 @@ impl DiagnosticSourceRange {
 
 #[derive(Debug, Clone)]
 struct AuthoredDiagnosticSourceSpan {
+    location: Option<Arc<crate::parser::DeclarationLocation>>,
     source_file: PathBuf,
     range: DiagnosticSourceRange,
 }
@@ -3648,8 +3660,33 @@ impl DiagnosticSourceSpan {
             end_column: NonZeroUsize::new(end_column).expect("parser source columns are one-based"),
         };
         Self(DiagnosticSourceSpanState::Authored(
-            AuthoredDiagnosticSourceSpan { source_file, range },
+            AuthoredDiagnosticSourceSpan {
+                source_file,
+                range,
+                location: None,
+            },
         ))
+    }
+
+    pub(crate) fn from_declaration(location: crate::parser::DeclarationLocation) -> Self {
+        let span = location.span();
+        let mut source = Self::authored(
+            location.file().path().to_path_buf(),
+            span.start_line(),
+            span.start_column(),
+            span.end_line(),
+            span.end_column(),
+        );
+        if let DiagnosticSourceSpanState::Authored(authored) = &mut source.0 {
+            authored.location = Some(Arc::new(location));
+        }
+        source
+    }
+    pub(crate) fn declaration_location(&self) -> Option<&crate::parser::DeclarationLocation> {
+        match &self.0 {
+            DiagnosticSourceSpanState::Authored(source) => source.location.as_deref(),
+            DiagnosticSourceSpanState::Deserialized => None,
+        }
     }
 
     fn deserialized() -> Self {
@@ -3712,6 +3749,12 @@ impl ModuleArgumentDiagnostic {
     pub(crate) fn source_line(&self) -> Option<usize> {
         self.authored_location()
             .map(|(_, range)| range.start_line())
+    }
+
+    fn declaration_location(&self) -> Option<&crate::parser::DeclarationLocation> {
+        self.source
+            .as_ref()
+            .and_then(DiagnosticSourceSpan::declaration_location)
     }
 
     pub fn authored_location(&self) -> Option<(&Path, DiagnosticSourceRange)> {
@@ -3887,9 +3930,16 @@ pub struct AccessExpr<P: ValueKind = NoPlaceholder, B: BindingAddress = Absolute
     /// `item.missing`). It is display metadata, like `source_line`, and is
     /// intentionally omitted from the serialized Value representation.
     display_root: Option<LoopAccessDisplayRoot>,
+    reference: crate::parser::AccessProvenance,
 }
 
 impl<P: ValueKind, B: BindingAddress> AccessExpr<P, B> {
+    pub(crate) fn access_locations(&self) -> Option<&crate::parser::AccessLocations> {
+        self.reference.locations()
+    }
+    pub(crate) fn set_access_locations(&mut self, locations: crate::parser::AccessLocations) {
+        self.reference = crate::parser::AccessProvenance::from_locations(locations);
+    }
     pub fn base(&self) -> &Value<P, B> {
         &self.base
     }
@@ -3959,7 +4009,20 @@ impl<P: ValueKind, B: BindingAddress> AccessExpr<P, B> {
                 ValuePathSegmentResult::Resolved(value) => {
                     ValuePathSegmentResult::Resolved(restore_display_root(value))
                 }
-                ValuePathSegmentResult::Deferred(value) => {
+                ValuePathSegmentResult::Deferred(mut value) => {
+                    if let Some(locations) = self.reference.locations() {
+                        match &mut value {
+                            Value::Deferred(DeferredValue::ResourceRef { path }) => {
+                                if let Some(locations) = locations.for_path(&path.reference) {
+                                    path.set_reference_locations(locations);
+                                }
+                            }
+                            Value::Deferred(DeferredValue::Access(access)) => {
+                                access.reference = self.reference.clone()
+                            }
+                            _ => {}
+                        }
+                    }
                     ValuePathSegmentResult::Deferred(restore_display_root(value))
                 }
                 ValuePathSegmentResult::DeferredMiss(error) => {
@@ -3998,6 +4061,7 @@ impl<P: ValueKind, B: BindingAddress> AccessExpr<P, B> {
             base: Box::new(base),
             step: self.step.clone(),
             source_line: self.source_line,
+            reference: self.reference.clone(),
             display_root: self.display_root.as_ref().map(|root| match root {
                 LoopAccessDisplayRoot::Rooted(binding)
                 | LoopAccessDisplayRoot::DeferredMiss(binding) => {
@@ -4107,6 +4171,30 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 | DeferredValue::Placeholder(_),
             ) => false,
         }
+    }
+
+    /// Preserve an authored reference occurrence after substituting its base.
+    /// Only the selected reference changes; references inside a selected
+    /// container retain their own provenance.
+    pub(crate) fn with_reference_locations(
+        mut self,
+        locations: &crate::parser::ReferenceLocations,
+    ) -> Self {
+        match &mut self {
+            Value::Deferred(DeferredValue::ResourceRef { path }) => {
+                path.set_reference_locations(locations.clone());
+            }
+            Value::Deferred(DeferredValue::Access(access)) => {
+                access.set_access_locations(crate::parser::AccessLocations::Reference(
+                    locations.clone(),
+                ));
+            }
+            Value::Deferred(DeferredValue::Secret(inner)) => {
+                **inner = inner.clone().with_reference_locations(locations);
+            }
+            _ => {}
+        }
+        self
     }
 
     /// Attach authored display context to a valid deferred access. This does
@@ -5640,6 +5728,14 @@ pub enum ParserPlaceholder {
 }
 
 impl ParserPlaceholder {
+    fn declaration_location(&self) -> Option<&crate::parser::DeclarationLocation> {
+        match self {
+            Self::ModuleArgument { diagnostic, .. } => diagnostic.declaration_location(),
+            Self::EmptyInterpolation { source } => source.declaration_location(),
+            Self::FnParam { .. } | Self::FnLocal { .. } | Self::Loop(_) => None,
+        }
+    }
+
     /// Authored location for diagnostics, independent of placeholder kind.
     pub fn authored_location(&self) -> Option<(&Path, DiagnosticSourceRange)> {
         match self {
@@ -5865,6 +5961,20 @@ impl LeftoverPlaceholder {
     /// Render this error with its authored source location when one is known.
     pub fn located(&self) -> impl fmt::Display + '_ {
         LocatedLeftoverPlaceholder(self)
+    }
+
+    /// Validate source completeness at the parser-to-expanded boundary.
+    pub fn diagnostic(
+        &self,
+    ) -> Result<crate::parser::Located<&Self>, crate::parser::AnalysisTreeError> {
+        let location = self.placeholder.declaration_location().ok_or_else(|| {
+            crate::parser::AnalysisTreeError::new(
+                crate::parser::AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                    element: self.to_string(),
+                },
+            )
+        })?;
+        Ok(crate::parser::Located::new(location.clone(), self))
     }
 
     pub fn placeholder(&self) -> &ParserPlaceholder {
@@ -6524,6 +6634,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                     step: access.step,
                     source_line: access.source_line,
                     display_root: access.display_root,
+                    reference: access.reference,
                 }))
             }
             Self::Deferred(DeferredValue::Secret(value)) => Value::Deferred(DeferredValue::Secret(
@@ -6879,12 +6990,14 @@ impl<P: ValueKind, B: BindingAddress> DeferredValue<P, B> {
                     step,
                     source_line,
                     display_root,
+                    reference,
                 } = access;
                 DeferredValue::Access(AccessExpr {
                     base: Box::new(base.map_bindings(map)),
                     step,
                     source_line,
                     display_root,
+                    reference,
                 })
             }
             DeferredValue::Secret(value) => {
@@ -8910,6 +9023,9 @@ pub struct Resource<
     /// Parse-time only; `#[serde(skip)]` keeps it out of state.
     #[serde(default, skip)]
     pub quoted_string_attrs: HashSet<String>,
+    /// Parser-owned declaration provenance; absent on programmatic/state nodes.
+    #[serde(skip)]
+    pub declaration: crate::parser::DeclarationProvenance,
 }
 
 /// Persisted resource representation used by saved plans.
@@ -8956,6 +9072,7 @@ impl<S, P: ValueKind> Resource<S, P, RelativeBindingName> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         } = self;
         Resource {
             id,
@@ -8972,6 +9089,7 @@ impl<S, P: ValueKind> Resource<S, P, RelativeBindingName> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         }
     }
 
@@ -9003,6 +9121,7 @@ impl<P: ValueKind> Resource<ModuleSource, P, AbsoluteBindingAddress> {
             default_tag_keys: _default_tag_keys,
             loop_provenance: _loop_provenance,
             quoted_string_attrs: _quoted_string_attrs,
+            declaration: _declaration,
         } = self;
         for value in attributes.values_mut() {
             value.map_absolute_bindings(map);
@@ -9047,6 +9166,7 @@ impl<P: ValueKind, B: BindingAddress, D> From<Resource<ModuleSource, P, B, D>>
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         } = resource;
         Self {
             id,
@@ -9060,6 +9180,7 @@ impl<P: ValueKind, B: BindingAddress, D> From<Resource<ModuleSource, P, B, D>>
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         }
     }
 }
@@ -9081,6 +9202,7 @@ impl<S, B: BindingAddress, D> Resource<S, ParserPlaceholder, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         } = self;
         let directives = directives.resolve(
             &id,
@@ -9099,6 +9221,7 @@ impl<S, B: BindingAddress, D> Resource<S, ParserPlaceholder, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         })
     }
 }
@@ -9121,6 +9244,7 @@ impl<S, B: BindingAddress, D> Resource<S, ParserPlaceholder, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         } = self;
         let directives = directives.into_loop_template(
             &id,
@@ -9148,6 +9272,7 @@ impl<S, B: BindingAddress, D> Resource<S, ParserPlaceholder, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         })
     }
 }
@@ -9166,6 +9291,7 @@ impl<P: ValueKind, B: BindingAddress> Resource<ModuleSource, P, B> {
             default_tag_keys: DefaultTagKeys::default(),
             loop_provenance: LoopProvenance::default(),
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         }
     }
 
@@ -9246,6 +9372,7 @@ impl<S, D> Resource<S, NoPlaceholder, AbsoluteBindingAddress, D> {
             default_tag_keys: _default_tag_keys,
             loop_provenance: _loop_provenance,
             quoted_string_attrs: _quoted_string_attrs,
+            declaration: _declaration,
         } = self;
         attributes
             .values()
@@ -9266,6 +9393,7 @@ impl<S, D> Resource<S, NoPlaceholder, AbsoluteBindingAddress, D> {
             default_tag_keys,
             loop_provenance: _,
             quoted_string_attrs,
+            declaration,
         } = self;
         ProviderResource {
             id,
@@ -9279,6 +9407,7 @@ impl<S, D> Resource<S, NoPlaceholder, AbsoluteBindingAddress, D> {
             default_tag_keys,
             loop_provenance: LoopProvenance::default(),
             quoted_string_attrs,
+            declaration,
         }
     }
 
@@ -9299,6 +9428,7 @@ impl<S, D> Resource<S, NoPlaceholder, AbsoluteBindingAddress, D> {
             default_tag_keys,
             loop_provenance: _,
             quoted_string_attrs,
+            declaration: _declaration,
         } = provider;
         self.id = id;
         self.attributes = attributes;
@@ -9467,6 +9597,7 @@ impl<S, P: ValueKind, B: BindingAddress, D> Resource<S, P, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         } = self;
         Resource {
             id,
@@ -9480,6 +9611,7 @@ impl<S, P: ValueKind, B: BindingAddress, D> Resource<S, P, B, D> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         }
     }
 }

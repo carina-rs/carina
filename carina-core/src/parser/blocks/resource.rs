@@ -63,6 +63,9 @@ pub(crate) fn parse_resource_for_target(
         Rule::anonymous_resource => "anonymous resource",
         _ => "resource expression",
     };
+    let declaration =
+        crate::parser::DeclarationProvenance::from_pair(&pair, preprocessed_file, source_file);
+    let syntax = pair.clone();
     let mut iter = pair.into_inner();
     let namespaced_type = next_pair(&mut iter, "resource type", context)?
         .as_str()
@@ -104,8 +107,16 @@ pub(crate) fn parse_resource_for_target(
     let attributes = parsed_contents.attributes;
     let ParsedDirectives {
         directives,
-        depends_on,
+        mut depends_on,
     } = parsed_contents.directives.unwrap_or_default();
+    depends_on.record_reference_origins(&attributes);
+    depends_on.record_binding_reference_origins(
+        &attributes,
+        &syntax,
+        preprocessed_file,
+        source_file,
+        ctx,
+    )?;
 
     let (id, binding, loop_provenance) = match target {
         ResourceParseTarget::Pending { origin } => (
@@ -154,6 +165,7 @@ pub(crate) fn parse_resource_for_target(
         default_tag_keys: Default::default(),
         loop_provenance,
         quoted_string_attrs,
+        declaration,
     })
 }
 
@@ -399,6 +411,8 @@ pub(crate) fn parse_read_resource_expr(
     preprocessed_file: &crate::parser::PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<DataSource, ParseError> {
+    let declaration =
+        crate::parser::DeclarationProvenance::from_pair(&pair, preprocessed_file, source_file);
     let mut inner = pair.into_inner();
 
     let namespaced_type = next_pair(&mut inner, "resource type", "read resource expression")?
@@ -456,6 +470,7 @@ pub(crate) fn parse_read_resource_expr(
         dependencies: Default::default(),
         module_source: None,
         quoted_string_attrs,
+        declaration,
     })
 }
 
@@ -543,15 +558,18 @@ fn parse_directives(
                 let mut source_lines = Vec::new();
                 for element in list.into_inner() {
                     source_lines.push(element.line_col().0);
-                    operands.push(
+                    let location = ctx.declaration_location(&element);
+                    operands.push(crate::parser::Located::new(
+                        location,
                         crate::parser::expressions::dependency::parse_dependency_operand(
                             element,
                             ctx,
                             "parsed_directives.directives.depends_on",
                         )?,
-                    );
+                    ));
                 }
-                parsed_directives.depends_on = crate::parser::UnexpandedDependencies::new(operands);
+                parsed_directives.depends_on =
+                    crate::parser::UnexpandedDependencies::from_located(operands);
                 parsed_directives.directives.depends_on_diagnostic_sources =
                     DiagnosticSourceLocations::authored(ctx.source_file(), source_lines);
             }

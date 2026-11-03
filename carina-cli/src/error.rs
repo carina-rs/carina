@@ -989,7 +989,7 @@ pub enum AppError {
     CommandInput(#[from] std::sync::Arc<CommandInputError>),
 
     #[error(transparent)]
-    ExportBoundary(#[from] carina_core::validation::ExportBoundaryError),
+    ExportBoundary(Box<carina_core::validation::ExportBoundaryError>),
 
     /// An authored reference selected unavailable historical secret evidence.
     #[error(transparent)]
@@ -1271,9 +1271,32 @@ pub enum AppError {
     #[error(transparent)]
     ModuleCall(Box<carina_core::validation::ModuleCallFinding>),
 
-    /// A type-resolution failure without parser location metadata.
+    /// Invalid parser/expansion provenance at the sealed analysis boundary.
     #[error(transparent)]
-    TypeResolution(Box<carina_core::validation::TypeResolutionDiagnostic>),
+    AnalysisInvariant(#[from] carina_core::parser::AnalysisTreeError),
+
+    #[error("{0}")]
+    DependsOn(
+        Box<carina_core::parser::Located<carina_core::validation::depends_on::DependsOnDiagnostic>>,
+    ),
+    #[error("{0}")]
+    Wait(Box<carina_core::parser::Located<carina_core::validation::wait::WaitDiagnostic>>),
+    #[error("{0}")]
+    DeferredPopulate(
+        Box<
+            carina_core::parser::Located<
+                carina_core::validation::deferred_populate::DeferredPopulateDiagnostic,
+            >,
+        >,
+    ),
+    #[error("{0}")]
+    ProviderRouting(
+        Box<
+            carina_core::parser::Located<
+                carina_core::validation::routing::ProviderRoutingDiagnostic,
+            >,
+        >,
+    ),
 
     /// Validation errors (schema mismatch, invalid config, etc.)
     #[error("{0}")]
@@ -1416,6 +1439,12 @@ pub enum AppError {
 impl From<crate::commands::init::InitError> for AppError {
     fn from(error: crate::commands::init::InitError) -> Self {
         Self::Init(Box::new(error))
+    }
+}
+
+impl From<carina_core::validation::ExportBoundaryError> for AppError {
+    fn from(error: carina_core::validation::ExportBoundaryError) -> Self {
+        Self::ExportBoundary(Box::new(error))
     }
 }
 
@@ -1585,6 +1614,14 @@ impl From<&str> for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_errors_stay_within_clippy_large_error_threshold() {
+        let size = size_of::<AppError>();
+        println!("AppError: {size} bytes");
+        // Clippy measures variant payloads; this also includes the enum discriminant.
+        assert!(size <= 128, "AppError is {size} bytes");
+    }
 
     #[test]
     fn provider_text_saved_plan_secret_error_locations_are_display_only() {

@@ -8,7 +8,7 @@ use super::ProviderContext;
 use super::Rule;
 use super::ast::{ParsedFile, ParserBindingMetadata, UpstreamState, UserFunction};
 use super::blocks::attributes::{
-    ParsedArgumentsBlock, parse_arguments_block, parse_attributes_block, parse_exports_block,
+    parse_arguments_block, parse_attributes_block, parse_exports_block,
 };
 use super::blocks::backend::parse_backend_block;
 use super::blocks::module_call::parse_module_call;
@@ -262,6 +262,36 @@ pub fn parse_file(
     let parsed = parse_with_seeded_bindings_inner(input, config, &[], &user_functions, true, path)?;
     super::resolve::reject_cyclic_let_bindings(&parsed)?;
     Ok(parsed)
+}
+
+/// Parse a file with explicit file-only ownership for failures without a declaration.
+pub fn parse_file_scoped(
+    input: &str,
+    path: &std::path::Path,
+    config: &ProviderContext,
+) -> Result<ParsedFile, Box<super::FileScoped<ParseError>>> {
+    parse_file(input, path, config).map_err(|error| Box::new(super::FileScoped::new(path, error)))
+}
+
+/// Parse the sealed declaration inventory even when semantic evaluation (such
+/// as duplicate-binding rejection) cannot produce a complete runtime tree.
+pub fn parse_syntax_inventory(
+    input: &str,
+    path: &Path,
+) -> Result<super::SyntaxInventory, Box<super::FileScoped<ParseError>>> {
+    let parse = || {
+        let file = super::preprocess_file(input)?;
+        let pairs = file.parse()?;
+        Ok(super::SyntaxInventory::from_pairs(pairs, &file, path))
+    };
+    parse().map_err(|error| Box::new(super::FileScoped::new(path, error)))
+}
+
+pub(crate) fn scope_parse_failure<'a>(
+    path: &Path,
+    error: &'a ParseError,
+) -> super::FileScoped<&'a ParseError> {
+    super::FileScoped::new(path, error)
 }
 
 /// Read factory declarations without evaluating unrelated function/resource
@@ -921,6 +951,7 @@ fn parse_with_seeded_bindings_inner(
 ) -> Result<ParsedFile, ParseError> {
     let preprocessed_file = Arc::new(super::preprocess_file(input)?);
     let pairs = preprocessed_file.parse()?;
+    let syntax = super::SyntaxInventory::from_pairs(pairs.clone(), &preprocessed_file, source_file);
     // Bootstrap passes use provisional sibling names and exist only to
     // classify declarations. The final pass both emits source warnings and
     // evaluates static conditions against the now-typed seed table.
@@ -943,7 +974,6 @@ fn parse_with_seeded_bindings_inner(
     let mut uses = Vec::new();
     let mut module_calls = Vec::new();
     let mut arguments = Vec::new();
-    let mut argument_type_sources = Vec::new();
     let mut attribute_params = Vec::new();
     let mut export_params = Vec::new();
     let mut backend = None;
@@ -986,12 +1016,7 @@ fn parse_with_seeded_bindings_inner(
                                     ctx.restore_warnings(warnings);
                                     result?
                                 };
-                                let ParsedArgumentsBlock {
-                                    parameters,
-                                    type_sources,
-                                } = parsed_arguments_block;
-                                arguments.extend(parameters);
-                                argument_type_sources.extend(type_sources);
+                                arguments.extend(parsed_arguments_block);
                             }
                             Rule::attributes_block => {
                                 let parsed_attribute_params = {
@@ -1345,9 +1370,6 @@ fn parse_with_seeded_bindings_inner(
             .get_or_insert_with(|| source_file.to_path_buf());
         parser_binding_metadata.insert_pending_function_type_check(check);
     }
-    for (name, span) in argument_type_sources {
-        parser_binding_metadata.insert_argument_type_source(name, source_file.to_path_buf(), span);
-    }
     let seeded_bindings = ctx.seeded_bindings.clone();
     let mut variables = IndexMap::new();
     for (name, binding) in std::mem::take(&mut ctx.bindings) {
@@ -1425,6 +1447,7 @@ fn parse_with_seeded_bindings_inner(
         .into_iter()
         .map(crate::resource::RelativeBindingName::new)
         .collect();
+    parser_binding_metadata.syntax = Box::new(syntax);
     parsed.parser_binding_metadata = parser_binding_metadata;
     parsed.warnings = warnings;
     *parsed.parsed_deferred_for_expressions_mut() = ctx.parsed_deferred_for_expressions;

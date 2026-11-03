@@ -893,7 +893,7 @@ pub(crate) fn failed_configuration_report<T>(
                     )
                 {
                     errors.extend(
-                        validation::resolve_file_type_exprs(&mut parsed, session)
+                        validation::resolve_file_type_exprs(&mut parsed, session)?
                             .into_iter()
                             .map(|error| error.to_string()),
                     );
@@ -910,8 +910,8 @@ impl carina_core::validation::deferred_types::ProviderTypeCheckSink for CliTypeC
         diagnostic: carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic,
     ) {
         match diagnostic {
-            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning) => crate::commands::validate::print_provider_type_warning(&warning),
-            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => self.errors.push(error.message),
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning) => crate::commands::validate::print_provider_type_warning(&warning.into_warning()),
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => self.errors.push(error.into_warning().message),
         }
     }
 }
@@ -961,8 +961,8 @@ impl carina_core::validation::deferred_types::ProviderTypeCheckSink for Validati
         diagnostic: carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic,
     ) {
         match diagnostic {
-            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning) => self.warnings.push(warning),
-            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => self.errors.push(AppError::Validation(error.message)),
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning) => self.warnings.push(warning.into_warning()),
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => self.errors.push(AppError::Validation(error.into_warning().message)),
         }
     }
 }
@@ -3029,8 +3029,8 @@ pub fn validate_resources_with_ctx<
 /// `AppError::Validation`. Warnings are emitted to stderr (no
 /// AppError::Warning variant exists today) so they don't fail the
 /// command but remain visible.
-pub fn validate_depends_on_with_ctx<E, B, D>(
-    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+pub fn validate_depends_on_with_ctx<B, D, E>(
+    tree: &carina_core::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
     argument_types: &validation::ResolvedArgumentTypes,
 ) -> Vec<AppError>
 where
@@ -3039,10 +3039,10 @@ where
 {
     use carina_core::validation::depends_on::{Severity, validate_depends_on};
     let mut errors = Vec::new();
-    for diag in validate_depends_on(parsed, argument_types) {
+    for diag in validate_depends_on(tree, argument_types) {
         match diag.severity {
-            Severity::Error => errors.push(AppError::Validation(diag.message)),
-            Severity::Warning => eprintln!("warning: {}", diag.message),
+            Severity::Error => errors.push(AppError::DependsOn(Box::new(diag))),
+            Severity::Warning => eprintln!("warning: {diag}"),
         }
     }
     errors
@@ -3051,17 +3051,17 @@ where
 /// Surface `wait <target> { ... }` diagnostics as `AppError::Validation`.
 /// Shared with the LSP via the underlying
 /// `carina_core::validation::wait::validate_wait_bindings` pass.
-pub fn validate_wait_bindings_with_ctx<E, D, B>(
+pub fn validate_wait_bindings_with_ctx<D, B, E>(
     ctx: &WiringContext,
-    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    tree: &carina_core::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
 ) -> Vec<AppError>
 where
     B: BindingAddress,
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    carina_core::validation::wait::validate_wait_bindings(parsed, ctx.schemas())
+    carina_core::validation::wait::validate_wait_bindings(tree, ctx.schemas())
         .into_iter()
-        .map(|d| AppError::Validation(d.message))
+        .map(|diagnostic| AppError::Wait(Box::new(diagnostic)))
         .collect()
 }
 
@@ -3076,15 +3076,12 @@ pub fn validate_deferred_populate_refs_with_ctx<
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     ctx: &WiringContext,
-    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    tree: &carina_core::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
 ) -> Vec<AppError> {
-    carina_core::validation::deferred_populate::validate_deferred_populate_refs(
-        parsed,
-        ctx.schemas(),
-    )
-    .into_iter()
-    .map(|d| AppError::Validation(d.message))
-    .collect()
+    carina_core::validation::deferred_populate::validate_deferred_populate_refs(tree, ctx.schemas())
+        .into_iter()
+        .map(|diagnostic| AppError::DeferredPopulate(Box::new(diagnostic)))
+        .collect()
 }
 
 pub fn validate_resource_ref_types_with_ctx<
@@ -3101,12 +3098,16 @@ pub fn validate_resource_ref_types_with_ctx<
         ctx.schemas(),
         ctx.provider_context().as_provider_context(),
     );
-    lift_validation_result(validation::validate_resource_ref_types(
-        parsed,
-        ctx.schemas(),
-        argument_names,
-        &bindings,
-    ))
+    match validation::validate_resource_ref_types(parsed, ctx.schemas(), argument_names, &bindings)
+    {
+        Ok(()) => Vec::new(),
+        Err(validation::ResourceRefTypeValidationError::Validation(message)) => {
+            split_validation_message(&message)
+        }
+        Err(validation::ResourceRefTypeValidationError::AnalysisInvariant(error)) => {
+            vec![AppError::AnalysisInvariant(error)]
+        }
+    }
 }
 
 pub fn validate_composition_ref_types_with_ctx<
@@ -4465,7 +4466,14 @@ pub(crate) fn validate_module_attribute_refs_after_expansion_failure(
     let mut errors = Vec::new();
     for module in module_walk.iter() {
         let mut parsed = module.loaded().parsed.clone();
-        for finding in validation::resolve_file_type_exprs(&mut parsed, config) {
+        let findings = match validation::resolve_file_type_exprs(&mut parsed, config) {
+            Ok(findings) => findings,
+            Err(error) => {
+                errors.push(AppError::AnalysisInvariant(error));
+                continue;
+            }
+        };
+        for finding in findings {
             errors.push(AppError::Validation(format!(
                 "{}: {finding}",
                 module.diagnostic_label()
@@ -4504,7 +4512,14 @@ pub(crate) fn validate_module_internal_ref_types(
         // Module expansion retains the established diagnostic for malformed
         // declarations. This pass only needs successful resolution so valid
         // dotted argument types can act as sources before expansion.
-        if !validation::resolve_file_type_exprs(&mut parsed, config).is_empty() {
+        let findings = match validation::resolve_file_type_exprs(&mut parsed, config) {
+            Ok(findings) => findings,
+            Err(error) => {
+                errors.push(AppError::AnalysisInvariant(error));
+                continue;
+            }
+        };
+        if !findings.is_empty() {
             // The module resolver owns declaration errors, including their
             // declaration range. This preflight cannot compare references
             // until those declarations resolve. Deferrals are already retained
@@ -4532,7 +4547,14 @@ pub(crate) fn validate_module_internal_ref_types(
             &HashSet::new(),
             &bindings,
         ) {
-            errors.extend(prefixed_validation_messages(&joined, &prefix));
+            match joined {
+                validation::ResourceRefTypeValidationError::Validation(message) => {
+                    errors.extend(prefixed_validation_messages(&message, &prefix))
+                }
+                validation::ResourceRefTypeValidationError::AnalysisInvariant(error) => {
+                    errors.push(AppError::AnalysisInvariant(error))
+                }
+            }
         }
         if let Err(joined) = validation::validate_attribute_param_ref_types_with_bindings(
             &parsed.attribute_params,

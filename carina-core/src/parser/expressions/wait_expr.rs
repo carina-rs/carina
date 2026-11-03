@@ -33,8 +33,12 @@ pub(crate) fn parse_wait_expr(
     pair: Pair<'_, Rule>,
     binding_name: &str,
     ctx: &ParseContext<'_>,
+    preprocessed_file: &crate::parser::PreprocessedFile,
+    source_file: &std::path::Path,
 ) -> Result<WaitBinding, ParseError> {
     debug_assert_eq!(pair.as_rule(), Rule::wait_expr);
+    let declaration =
+        crate::parser::DeclarationProvenance::from_pair(&pair, preprocessed_file, source_file);
     let (line, _) = pair.as_span().start_pos().line_col();
     let mut inner = pair.into_inner();
 
@@ -100,11 +104,15 @@ pub(crate) fn parse_wait_expr(
                 depends_on_seen = true;
                 let list = first_inner(child, "list", "wait_depends_on_attr")?;
                 for expression in list.into_inner() {
-                    depends_on.push(super::dependency::parse_dependency_operand(
-                        expression,
-                        ctx,
-                        "wait.depends_on",
-                    )?);
+                    let location = ctx.declaration_location(&expression);
+                    depends_on.push(crate::parser::Located::new(
+                        location,
+                        super::dependency::parse_dependency_operand(
+                            expression,
+                            ctx,
+                            "wait.depends_on",
+                        )?,
+                    ));
                 }
             }
             other => {
@@ -130,8 +138,9 @@ pub(crate) fn parse_wait_expr(
         until_raw,
         until_predicate,
         timeout_secs,
-        depends_on: UnexpandedDependencies::new(depends_on),
+        depends_on: UnexpandedDependencies::from_located(depends_on),
         line,
+        declaration,
     })
 }
 
@@ -446,8 +455,9 @@ mod tests {
     fn parse_wait_pair(pair: Pair<'_, Rule>) -> Result<WaitBinding, ParseError> {
         let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let source = std::sync::Arc::new(preprocess_file(pair.as_str())?);
-        let ctx = ParseContext::new(&config, std::path::Path::new("wait.crn"), source);
-        parse_wait_expr(pair, "cert_issued", &ctx)
+        let source_file = std::path::Path::new("wait.crn");
+        let ctx = ParseContext::new(&config, source_file, std::sync::Arc::clone(&source));
+        parse_wait_expr(pair, "cert_issued", &ctx, &source, source_file)
     }
 
     fn parse_one(src: &str) -> WaitBinding {

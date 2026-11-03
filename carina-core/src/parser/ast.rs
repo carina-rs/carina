@@ -357,6 +357,10 @@ impl<S, P: ValueKind, B: BindingAddress, D> DeferredForTemplateResource<S, P, B,
         &mut self.resource.attributes
     }
 
+    pub(in crate::parser) fn declaration_mut(&mut self) -> &mut super::DeclarationProvenance {
+        &mut self.resource.declaration
+    }
+
     pub(crate) fn loop_provenance_mut(&mut self) -> &mut crate::resource::LoopProvenance {
         &mut self.resource.loop_provenance
     }
@@ -367,8 +371,16 @@ impl<S, P: ValueKind, B: BindingAddress, D> DeferredForTemplateResource<S, P, B,
 
     pub(crate) fn id_and_attributes_mut(
         &mut self,
-    ) -> (&ResourceId, &mut IndexMap<String, Value<P, B>>) {
-        (&self.resource.id, &mut self.resource.attributes)
+    ) -> (
+        &ResourceId,
+        &mut IndexMap<String, Value<P, B>>,
+        &mut super::DeclarationProvenance,
+    ) {
+        (
+            &self.resource.id,
+            &mut self.resource.attributes,
+            &mut self.resource.declaration,
+        )
     }
 
     pub(crate) fn resolve_ignore_changes(
@@ -457,6 +469,7 @@ impl<S, P: ValueKind, B: BindingAddress> DeferredForTemplateResource<S, P, B> {
 /// Only the display path and line cross the saved-plan wire boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticLocation {
+    iterable: super::DeclarationProvenance,
     display_file: Option<String>,
     source_file: Option<PathBuf>,
     line: usize,
@@ -465,6 +478,7 @@ pub struct DiagnosticLocation {
 impl DiagnosticLocation {
     fn new(file: Option<String>, line: usize) -> Self {
         Self {
+            iterable: Default::default(),
             source_file: file.as_ref().map(PathBuf::from),
             display_file: file,
             line,
@@ -484,6 +498,7 @@ impl DiagnosticLocation {
             })
             .unwrap_or_else(|| source.display().to_string());
         Self {
+            iterable: Default::default(),
             display_file: Some(display),
             source_file: Some(source.to_path_buf()),
             line,
@@ -731,6 +746,12 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
             header: &self.header,
             binding: &self.binding,
             iterable: &self.iterable,
+            iterable_location: self
+                .location
+                .iterable
+                .elements()
+                .get(super::elements::ElementKind::Iterable),
+            checks_scope: true,
         }
     }
 }
@@ -800,7 +821,7 @@ pub(crate) enum DeferredForResourceExpressionError {
     UndefinedIterable(ParseError),
     Unsupported {
         file: Option<String>,
-        error: Box<DeferredForBodyUnsupportedError>,
+        error: Box<super::Located<ParseError>>,
     },
 }
 
@@ -904,6 +925,15 @@ impl<P: ValueKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
         }
     }
 
+    pub(in crate::parser) fn record_iterable_location(
+        &mut self,
+        location: super::DeclarationLocation,
+        declaration: super::DeclarationProvenance,
+    ) {
+        self.location.iterable = declaration;
+        self.location.iterable.set_iterable(location);
+    }
+
     pub fn location(&self) -> &DiagnosticLocation {
         &self.location
     }
@@ -922,7 +952,9 @@ impl<P: ValueKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
             self.location.source_file().is_none(),
             "deferred diagnostic source was already recorded"
         );
+        let iterable = self.location.iterable.clone();
         self.location = DiagnosticLocation::from_source(source, project_root, self.line());
+        self.location.iterable = iterable;
     }
 
     pub fn target(&self) -> &DeferredForTarget<B> {
@@ -976,6 +1008,15 @@ impl<P: ValueKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
             header: &self.header,
             binding: &self.binding,
             iterable: &self.iterable,
+            iterable_location: self
+                .location
+                .iterable
+                .elements()
+                .get(super::elements::ElementKind::Iterable),
+            checks_scope: matches!(
+                self.iterable_state,
+                ParsedDeferredForIterableState::Deferred
+            ),
         }
     }
 
@@ -1044,15 +1085,24 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
                     file: location
                         .source_file()
                         .map(|file| file.display().to_string()),
-                    error: Box::new(DeferredForBodyUnsupportedError {
-                        line: location.line(),
-                        header,
-                        body: DeferredForBodyKind::Read {
-                            resource_type: data_source.id.display_type(),
-                        },
-                        span,
-                        iterable_resolution,
-                    }),
+                    error: Box::new(super::Located::new(
+                        location
+                            .iterable
+                            .location()
+                            .expect("deferred for expression must retain parser provenance")
+                            .clone(),
+                        ParseError::DeferredForBodyUnsupported(Box::new(
+                            DeferredForBodyUnsupportedError {
+                                line: location.line(),
+                                header,
+                                body: DeferredForBodyKind::Read {
+                                    resource_type: data_source.id.display_type(),
+                                },
+                                span,
+                                iterable_resolution,
+                            },
+                        )),
+                    )),
                 });
             }
             DeferredForBody::ModuleCall(call) => {
@@ -1060,15 +1110,24 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
                     file: location
                         .source_file()
                         .map(|file| file.display().to_string()),
-                    error: Box::new(DeferredForBodyUnsupportedError {
-                        line: location.line(),
-                        header,
-                        body: DeferredForBodyKind::ModuleCall {
-                            name: call.module_name,
-                        },
-                        span,
-                        iterable_resolution,
-                    }),
+                    error: Box::new(super::Located::new(
+                        location
+                            .iterable
+                            .location()
+                            .expect("deferred for expression must retain parser provenance")
+                            .clone(),
+                        ParseError::DeferredForBodyUnsupported(Box::new(
+                            DeferredForBodyUnsupportedError {
+                                line: location.line(),
+                                header,
+                                body: DeferredForBodyKind::ModuleCall {
+                                    name: call.module_name,
+                                },
+                                span,
+                                iterable_resolution,
+                            },
+                        )),
+                    )),
                 });
             }
         };
@@ -1202,6 +1261,8 @@ pub struct DeferredForSite<
     pub header: &'a str,
     pub binding: &'a ForBinding,
     pub iterable: &'a Value<P, B>,
+    pub(crate) iterable_location: Option<&'a super::DeclarationLocation>,
+    pub(crate) checks_scope: bool,
 }
 
 impl<P: ValueKind, B: BindingAddress> DeferredForSite<'_, P, B> {
@@ -1431,6 +1492,7 @@ mod deferred_template_resource_serde {
                     default_tag_keys,
                     loop_provenance,
                     quoted_string_attrs: HashSet::new(),
+                    declaration: Default::default(),
                 },
                 legacy_null_name,
             })
@@ -1822,6 +1884,7 @@ pub enum ResourceMut<
     Deferred {
         id: &'a ResourceId,
         attributes: &'a mut IndexMap<String, Value<T, B>>,
+        declaration: &'a mut super::DeclarationProvenance,
     },
 }
 
@@ -2347,12 +2410,12 @@ impl<P: ValueKind, B: BindingAddress> ValidationBlock<P, B> {
         condition: ValidateExpr<P, B>,
         error_message: Option<String>,
         source_span: SourceSpan,
-        source_file: PathBuf,
+        source_location: super::DeclarationLocation,
     ) -> Self {
         Self {
             condition,
             error_message,
-            source: DeclarationSource::authored(source_span, source_file),
+            source: DeclarationSource::authored(source_span, source_location),
         }
     }
 
@@ -2362,7 +2425,7 @@ impl<P: ValueKind, B: BindingAddress> ValidationBlock<P, B> {
             condition,
             error_message,
             SourceSpan::dummy(),
-            PathBuf::from("test.crn"),
+            ModuleCallId::test_dummy_in("test.crn").location,
         )
     }
 
@@ -2693,12 +2756,12 @@ impl<P: ValueKind, B: BindingAddress> RequireBlock<P, B> {
         condition: ValidateExpr<P, B>,
         error_message: String,
         source_span: SourceSpan,
-        source_file: PathBuf,
+        source_location: super::DeclarationLocation,
     ) -> Self {
         Self {
             condition,
             error_message,
-            source: DeclarationSource::authored(source_span, source_file),
+            source: DeclarationSource::authored(source_span, source_location),
         }
     }
 
@@ -2708,7 +2771,7 @@ impl<P: ValueKind, B: BindingAddress> RequireBlock<P, B> {
             condition,
             error_message,
             SourceSpan::dummy(),
-            PathBuf::from("test.crn"),
+            ModuleCallId::test_dummy_in("test.crn").location,
         )
     }
 
@@ -2829,18 +2892,22 @@ pub struct AttributeParameter<
 }
 
 impl<P: ValueKind, B: BindingAddress> AttributeParameter<TypeExpr, P, B> {
+    pub fn type_check_location(&self) -> &super::DeclarationLocation {
+        &self.source.location
+    }
+
     pub(crate) fn new_in_source(
         name: String,
         type_expr: Option<TypeExpr>,
         value: Option<BoundaryExpression<P, B>>,
         source_span: SourceSpan,
-        source_file: PathBuf,
+        source_location: super::DeclarationLocation,
     ) -> Self {
         Self {
             name,
             static_type: type_expr,
             value,
-            source: DeclarationSource::authored(source_span, source_file),
+            source: DeclarationSource::authored(source_span, source_location),
         }
     }
 
@@ -2855,7 +2922,7 @@ impl<P: ValueKind, B: BindingAddress> AttributeParameter<TypeExpr, P, B> {
             type_expr,
             value.map(BoundaryExpression::Value),
             SourceSpan::dummy(),
-            PathBuf::from("test.crn"),
+            ModuleCallId::test_dummy_in("test.crn").location,
         )
     }
 
@@ -2929,18 +2996,22 @@ pub struct ParsedExportParam<
 }
 
 impl<P: ValueKind, B: BindingAddress> ParsedExportParam<P, B> {
+    pub fn type_check_location(&self) -> &super::DeclarationLocation {
+        &self.source.location
+    }
+
     pub(crate) fn new_in_source(
         name: String,
         type_expr: Option<TypeExpr>,
         value: Option<BoundaryExpression<P, B>>,
         source_span: SourceSpan,
-        source_file: PathBuf,
+        source_location: super::DeclarationLocation,
     ) -> Self {
         Self {
             name,
             static_type: type_expr,
             value,
-            source: DeclarationSource::authored(source_span, source_file),
+            source: DeclarationSource::authored(source_span, source_location),
         }
     }
 
@@ -2955,7 +3026,7 @@ impl<P: ValueKind, B: BindingAddress> ParsedExportParam<P, B> {
             type_expr,
             value.map(BoundaryExpression::Value),
             SourceSpan::dummy(),
-            PathBuf::from("test.crn"),
+            ModuleCallId::test_dummy_in("test.crn").location,
         )
     }
 
@@ -3008,6 +3079,7 @@ pub trait ExportParamLike<P: ValueKind = ParserPlaceholder, B: BindingAddress = 
     fn handle(&self) -> Option<&UnexpandedResourceHandle<B>>;
     fn source_file(&self) -> &Path;
     fn source_span(&self) -> SourceSpan;
+    fn type_check_location(&self) -> &super::DeclarationLocation;
     fn replace_value(&mut self, value: Value<P, B>);
     fn type_expr_opt(&self) -> Option<&TypeExpr>;
     fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr>;
@@ -3029,6 +3101,9 @@ impl<P: ValueKind + PartialEq, B: BindingAddress> ExportParamLike<P, B>
     }
     fn handle(&self) -> Option<&UnexpandedResourceHandle<B>> {
         self.value.as_ref().and_then(BoundaryExpression::handle)
+    }
+    fn type_check_location(&self) -> &super::DeclarationLocation {
+        &self.source.location
     }
     fn source_file(&self) -> &Path {
         &self.source.file
@@ -3426,34 +3501,41 @@ impl<B: BindingAddress> StateBlock<ParserPlaceholder, B> {
 pub struct UseStatement {
     pub path: String,
     pub alias: String,
-    source: DeclarationSource,
+    location: super::DeclarationLocation,
 }
 
 impl UseStatement {
     pub(crate) fn new_in_source(
         path: String,
         alias: String,
-        source_span: SourceSpan,
-        source_file: PathBuf,
+        location: super::DeclarationLocation,
     ) -> Self {
         Self {
             path,
             alias,
-            source: DeclarationSource::authored(source_span, source_file),
+            location,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn dummy(path: String, alias: String) -> Self {
-        Self::new_in_source(path, alias, SourceSpan::dummy(), PathBuf::from("test.crn"))
+        Self::new_in_source(
+            path,
+            alias,
+            ModuleCallId::test_dummy_in("test.crn").location,
+        )
+    }
+
+    pub fn declaration_location(&self) -> &super::DeclarationLocation {
+        &self.location
     }
 
     pub fn source_span(&self) -> SourceSpan {
-        self.source.span
+        self.location.span()
     }
 
     pub fn source_file(&self) -> &Path {
-        &self.source.file
+        self.location.file().path()
     }
 }
 
@@ -3470,6 +3552,7 @@ pub struct FnParam<B: BindingAddress = RelativeBindingName> {
 /// Functions are pure value transformations only.
 #[derive(Debug, Clone)]
 pub struct UserFunctionBody<B: BindingAddress = RelativeBindingName> {
+    pub(crate) location: super::DeclarationLocation,
     pub value: Value<ParserPlaceholder, B>,
     pub source_line: usize,
     /// Owning `.crn` file, stamped by the directory loader after parsing.
@@ -3479,6 +3562,7 @@ pub struct UserFunctionBody<B: BindingAddress = RelativeBindingName> {
 /// User-defined pure function
 #[derive(Debug, Clone)]
 pub struct UserFunction<B: BindingAddress = RelativeBindingName> {
+    pub(crate) type_annotations: Vec<super::Located<crate::validation::TypeResolutionContext>>,
     pub name: String,
     pub params: Vec<FnParam<B>>,
     /// Optional return type annotation
@@ -3498,6 +3582,7 @@ impl<B: BindingAddress> UserFunction<B> {
         map: &mut impl FnMut(B) -> T,
     ) -> UserFunction<T> {
         UserFunction {
+            type_annotations: self.type_annotations,
             name: self.name,
             params: self
                 .params
@@ -3518,6 +3603,7 @@ impl<B: BindingAddress> UserFunction<B> {
                 .map(|(name, value, line)| (name, value.map_bindings(map), line))
                 .collect(),
             body: UserFunctionBody {
+                location: self.body.location,
                 value: self.body.value.map_bindings(map),
                 source_line: self.body.source_line,
                 source_file: self.body.source_file,
@@ -3670,12 +3756,12 @@ impl<P: ValueKind> ModuleArgument<P, AbsoluteBindingAddress> {
     }
 }
 
-/// Parser-owned identity of a source file containing a module call.
+/// Parser-owned identity of a source file containing declarations.
 ///
 /// The inner path is intentionally opaque: callers may inspect it for
 /// diagnostics and saved-plan normalization, but only the parser can mint an
 /// identity-bearing module call.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourceFileId(Arc<Path>);
 
 impl SourceFileId {
@@ -3813,6 +3899,7 @@ pub enum BareBindingKind {
 /// lookup. This data is parser-only and never enters [`Value`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BareBindingUse {
+    pub(in crate::parser) location: super::DeclarationLocation,
     pub source_file: SourceFileId,
     pub scope: BindingScopeId,
     pub owner: BindingUseOwner,
@@ -3820,6 +3907,12 @@ pub struct BareBindingUse {
     pub name: String,
     pub span: SourceSpan,
     pub binding: BareBindingKind,
+}
+
+impl BareBindingUse {
+    pub fn location(&self) -> &super::DeclarationLocation {
+        &self.location
+    }
 }
 
 /// A value sink reserved because at least one structural leaf cannot be
@@ -4100,20 +4193,70 @@ pub enum CallExpansion {
 /// User-authored names and argument values deliberately do not participate in
 /// equality. The source file and authored span identify the call site, while
 /// [`CallExpansion`] distinguishes concrete iterations sharing that span.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct ModuleCallId {
-    source_file: SourceFileId,
-    call_span: SourceSpan,
+    argument_locations:
+        Arc<HashMap<String, (super::DeclarationLocation, super::DeclarationLocation)>>,
+    location: super::DeclarationLocation,
+    name_location: Arc<super::DeclarationLocation>,
     expansion: CallExpansion,
 }
 
+impl PartialEq for ModuleCallId {
+    fn eq(&self, other: &Self) -> bool {
+        self.location == other.location && self.expansion == other.expansion
+    }
+}
+impl Eq for ModuleCallId {}
+impl std::hash::Hash for ModuleCallId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.location, state);
+        std::hash::Hash::hash(&self.expansion, state);
+    }
+}
+
 impl ModuleCallId {
-    pub(in crate::parser) fn direct(source_file: PathBuf, call_span: SourceSpan) -> Self {
-        Self {
-            source_file: SourceFileId::new(source_file),
-            call_span,
+    pub(in crate::parser) fn from_pair(
+        pair: &pest::iterators::Pair<'_, super::Rule>,
+        file: &super::PreprocessedFile,
+        source: &Path,
+    ) -> Self {
+        let name = pair
+            .clone()
+            .into_inner()
+            .next()
+            .expect("module name grammar");
+        let mut id = Self {
+            location: super::DeclarationLocation::from_pair(pair, file, source),
+            name_location: Arc::new(super::DeclarationLocation::from_pair(&name, file, source)),
+            argument_locations: Arc::new(HashMap::new()),
             expansion: CallExpansion::Direct,
+        };
+        let mut locations = HashMap::new();
+        for argument in pair
+            .clone()
+            .into_inner()
+            .filter(|pair| pair.as_rule() == super::Rule::module_call_arg)
+        {
+            let mut parts = argument.into_inner();
+            let key = parts.next().expect("module argument key");
+            let value = parts.next().expect("module argument value");
+            locations.insert(
+                key.as_str().to_string(),
+                (
+                    super::DeclarationLocation::from_pair(&key, file, source),
+                    super::DeclarationLocation::from_pair(&value, file, source),
+                ),
+            );
         }
+        id.argument_locations = Arc::new(locations);
+        id
+    }
+    pub fn argument_key_location(&self, name: &str) -> Option<&super::DeclarationLocation> {
+        self.argument_locations.get(name).map(|(key, _)| key)
+    }
+    pub fn argument_value_location(&self, name: &str) -> Option<&super::DeclarationLocation> {
+        self.argument_locations.get(name).map(|(_, value)| value)
     }
 
     fn expand(&mut self, expansion_key: String) {
@@ -4121,24 +4264,39 @@ impl ModuleCallId {
     }
 
     pub fn source_file(&self) -> &Path {
-        self.source_file.path()
+        self.location.file().path()
     }
 
     pub fn source_file_id(&self) -> &SourceFileId {
-        &self.source_file
+        self.location.file()
     }
 
     pub fn call_span(&self) -> SourceSpan {
-        self.call_span
+        self.location.span()
+    }
+
+    pub fn module_name_location(&self) -> &super::DeclarationLocation {
+        &self.name_location
+    }
+
+    pub fn declaration_location(&self) -> &super::DeclarationLocation {
+        &self.location
     }
 
     pub fn expansion(&self) -> &CallExpansion {
         &self.expansion
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils", feature = "test-support"))]
     pub(crate) fn test_dummy_in(source_file: impl Into<PathBuf>) -> Self {
-        Self::direct(source_file.into(), SourceSpan::dummy())
+        let file = super::preprocess_file("fixture {}").expect("module-call fixture");
+        let pair = file
+            .parse()
+            .expect("module-call fixture")
+            .flatten()
+            .find(|pair| pair.as_rule() == super::Rule::module_call)
+            .expect("module-call fixture pair");
+        Self::from_pair(&pair, &file, &source_file.into())
     }
 }
 
@@ -4156,17 +4314,14 @@ impl<P: ValueKind, B: BindingAddress> ModuleCall<P, B> {
     pub(super) fn from_authored_arguments_in_source(
         module_name: impl Into<String>,
         binding_name: Option<B>,
-        call_span: SourceSpan,
+        id: ModuleCallId,
         arguments: HashMap<String, AuthoredModuleArgument<P, B>>,
-        source_file: PathBuf,
     ) -> Self {
         Self {
             module_name: module_name.into(),
             binding_name,
             arguments,
-            source: Box::new(ModuleCallSite {
-                id: ModuleCallId::direct(source_file, call_span),
-            }),
+            source: Box::new(ModuleCallSite { id }),
             loop_origin: None,
         }
     }
@@ -4328,15 +4483,30 @@ impl<P: ValueKind> ModuleCall<P, RelativeBindingName> {
         arguments: HashMap<String, ModuleArgument<P, RelativeBindingName>>,
     ) -> Self {
         let span = SourceSpan::dummy();
+        let source = format!(
+            "fixture {{ {} }}",
+            arguments
+                .keys()
+                .map(|name| format!("{name} = 0"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let file = super::preprocess_file(&source).unwrap();
+        let pair = file
+            .parse()
+            .unwrap()
+            .flatten()
+            .find(|pair| pair.as_rule() == super::Rule::module_call)
+            .unwrap();
+        let id = ModuleCallId::from_pair(&pair, &file, Path::new("test.crn"));
         Self::from_authored_arguments_in_source(
             module_name,
             binding_name.map(RelativeBindingName::new),
-            span,
+            id,
             arguments
                 .into_iter()
                 .map(|(name, argument)| (name, AuthoredModuleArgument::new(argument, span, span)))
                 .collect(),
-            PathBuf::from("test.crn"),
         )
     }
 
@@ -4517,21 +4687,26 @@ struct ModuleCallSite {
 pub(crate) struct DeclarationSource {
     pub(crate) file: PathBuf,
     pub(crate) span: SourceSpan,
+    location: super::DeclarationLocation,
 }
 
 #[cfg(test)]
 impl Default for DeclarationSource {
     fn default() -> Self {
-        Self {
-            file: PathBuf::from("test.crn"),
-            span: SourceSpan::dummy(),
-        }
+        Self::authored(
+            SourceSpan::dummy(),
+            ModuleCallId::test_dummy_in("test.crn").location,
+        )
     }
 }
 
 impl DeclarationSource {
-    fn authored(span: SourceSpan, file: PathBuf) -> Self {
-        Self { file, span }
+    fn authored(span: SourceSpan, location: super::DeclarationLocation) -> Self {
+        Self {
+            file: location.file().path().to_path_buf(),
+            span,
+            location,
+        }
     }
 }
 
@@ -4542,7 +4717,7 @@ impl DeclarationSource {
 /// Calls expanded from one `for` body intentionally share the authored span
 /// and are distinguished by the [`CallExpansion`] carried by
 /// [`ModuleCall::id`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourceSpan {
     start_byte: usize,
     end_byte: usize,
@@ -4563,6 +4738,73 @@ pub enum ArgumentOrigin {
 }
 
 impl SourceSpan {
+    /// Capture a grammar-owned declaration header without exposing an offset
+    /// constructor for diagnostic locations.
+    pub(in crate::parser) fn from_block_header(
+        pair: &pest::iterators::Pair<'_, super::Rule>,
+        file: &super::PreprocessedFile,
+    ) -> Self {
+        use super::Rule;
+        let keyword = match pair.as_rule() {
+            Rule::arguments_block => "arguments",
+            Rule::attributes_block => "attributes",
+            Rule::exports_block => "exports",
+            Rule::backend_block => "backend",
+            Rule::moved_block => "moved",
+            Rule::removed_block => "removed",
+            Rule::import_state_block => "import",
+            Rule::let_binding => "let",
+            Rule::provider_block => {
+                let name = pair.clone().into_inner().next().expect("provider name");
+                return Self::from_preprocessed_range(
+                    pair.as_span().start(),
+                    name.as_span().end(),
+                    file,
+                );
+            }
+            _ => unreachable!("only declaration grammar has a block header"),
+        };
+        Self::from_preprocessed_range(
+            pair.as_span().start(),
+            pair.as_span().start() + keyword.len(),
+            file,
+        )
+    }
+
+    pub(in crate::parser) fn from_reference_prefix(
+        pair: &pest::iterators::Pair<'_, super::Rule>,
+        file: &super::PreprocessedFile,
+    ) -> Self {
+        if matches!(
+            pair.as_rule(),
+            super::Rule::postfix_expr | super::Rule::for_iterable
+        ) {
+            let mut inner = pair.clone().into_inner();
+            let base = inner.next().expect("postfix grammar has a base");
+            if let Some(selector) = inner.find(|p| p.as_rule() == super::Rule::field_access) {
+                return Self::from_preprocessed_range(
+                    base.as_span().start(),
+                    selector.as_span().end(),
+                    file,
+                );
+            }
+        }
+        let reference = if pair.as_rule() == super::Rule::variable_ref {
+            pair.clone()
+        } else {
+            pair.clone()
+                .into_inner()
+                .flatten()
+                .find(|p| p.as_rule() == super::Rule::variable_ref)
+                .expect("reference syntax has a variable root")
+        };
+        let mut tokens = reference.into_inner();
+        let root = tokens.next().expect("variable reference root");
+        let selector = tokens
+            .find(|p| p.as_rule() == super::Rule::field_access)
+            .expect("access path has an attribute selector");
+        Self::from_preprocessed_range(root.as_span().start(), selector.as_span().end(), file)
+    }
     /// Build a parser-authored span and restore heredoc-collapsed positions.
     ///
     /// Pest's implicit skip may extend wrapper pairs through trailing trivia.
@@ -4573,6 +4815,29 @@ impl SourceSpan {
         pair: &pest::iterators::Pair<'_, crate::parser::Rule>,
         file: &crate::parser::PreprocessedFile,
     ) -> Self {
+        if pair.as_rule() == super::Rule::interpolation {
+            let span = pair.as_span();
+            let start = file.original_position(span.start());
+            // The exclusive end can map onto a heredoc's closing marker.
+            // Its final included brace is an ASCII grammar delimiter.
+            let end = file.original_position(span.end() - 1);
+            return Self {
+                start_byte: start.byte(),
+                end_byte: end.byte() + 1,
+                start_line: start.line(),
+                start_column: start.column(),
+                end_line: end.line(),
+                end_column: end.column() + 1,
+            };
+        }
+        if pair.as_rule() == super::Rule::if_expr {
+            let span = pair.as_span();
+            return Self::from_preprocessed_range(
+                span.start(),
+                span.end() - (pair.as_str().len() - pair.as_str().trim_end().len()),
+                file,
+            );
+        }
         let range = Self::preprocessed_range(pair);
         Self::from_preprocessed_range(range.start, range.end, file)
     }
@@ -4581,13 +4846,19 @@ impl SourceSpan {
         pair: &pest::iterators::Pair<'_, crate::parser::Rule>,
     ) -> std::ops::Range<usize> {
         let span = pair.as_span();
+        // Compound-atomic names keep a prefix pair for diagnostics, but their
+        // silent numeric tails are still part of the same lexical token.
+        if pair.as_rule() == super::Rule::namespaced_id {
+            return span.start()..span.end();
+        }
         let start = span.start();
         let token_end = pair
             .clone()
             .into_inner()
             .flatten()
             .filter(|inner| {
-                inner.clone().into_inner().next().is_none()
+                inner.as_rule() == super::Rule::namespaced_id
+                    || inner.clone().into_inner().next().is_none()
                     || matches!(
                         inner.as_str().as_bytes().last(),
                         Some(b'\'' | b'"' | b')' | b']' | b'}')
@@ -4596,15 +4867,19 @@ impl SourceSpan {
             .map(|inner| inner.as_span().end())
             .max()
             .unwrap_or_else(|| span.end());
-        // A module call's closing brace is grammar punctuation rather than an
-        // inner pair. The module-call pair itself ends exactly at that brace;
-        // unlike declaration/value pairs, it cannot absorb trailing trivia
-        // outside the block.
+        // A compound token's closing delimiter is grammar punctuation rather
+        // than an inner pair. Its pair ends exactly at that delimiter, unlike
+        // declaration/value wrappers that can absorb trailing trivia.
         let end = if matches!(
             pair.as_rule(),
             crate::parser::Rule::module_call
+                | crate::parser::Rule::function_call
                 | crate::parser::Rule::for_expr
                 | crate::parser::Rule::if_expr
+                | crate::parser::Rule::resource_expr
+                | crate::parser::Rule::anonymous_resource
+                | crate::parser::Rule::read_resource_expr
+                | crate::parser::Rule::wait_expr
         ) {
             span.end()
         } else {
@@ -4779,14 +5054,13 @@ impl UnexpandedCompositionAttribute<AbsoluteBindingAddress> {
 /// runtime [`Value`] model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParserBindingMetadata<B: BindingAddress = RelativeBindingName> {
+    pub(crate) syntax: Box<super::SyntaxInventory<B>>,
     pub(crate) unexpanded_composition_attributes: Vec<UnexpandedCompositionAttribute<B>>,
     structural_handles: IndexMap<B, UnexpandedStructuralHandle<B>>,
     structural_aliases: IndexMap<B, UnexpandedStructuralHandle<B>>,
     value_structural_handles: IndexMap<B, UnexpandedStructuralHandleMetadata<B>>,
     resource_source_files: HashMap<ResourceId, PathBuf>,
     template_dependency_values: HashMap<ResourceId, IndexMap<String, Value<ParserPlaceholder, B>>>,
-    argument_type_sources: IndexMap<String, (SourceFileId, SourceSpan)>,
-    export_type_sources: IndexMap<String, (SourceFileId, SourceSpan)>,
     pending_function_type_checks: Vec<PendingFunctionTypeCheck<B>>,
 }
 
@@ -4880,14 +5154,13 @@ impl ParserBindingMetadata {
 impl<B: BindingAddress> Default for ParserBindingMetadata<B> {
     fn default() -> Self {
         Self {
+            syntax: Default::default(),
             unexpanded_composition_attributes: Vec::new(),
             structural_handles: IndexMap::new(),
             structural_aliases: IndexMap::new(),
             value_structural_handles: IndexMap::new(),
             resource_source_files: HashMap::new(),
             template_dependency_values: HashMap::new(),
-            argument_type_sources: IndexMap::new(),
-            export_type_sources: IndexMap::new(),
             pending_function_type_checks: Vec::new(),
         }
     }
@@ -4899,6 +5172,7 @@ impl<B: BindingAddress> Default for ParserBindingMetadata<B> {
 /// example a `for` iterable) without silently dropping the later type check.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PendingFunctionTypeCheck<B: BindingAddress = RelativeBindingName> {
+    pub(crate) location: super::DeclarationLocation,
     pub(crate) function_name: String,
     pub(crate) arguments: Vec<FunctionArgument<ParserPlaceholder, B>>,
     pub(crate) source_line: usize,
@@ -4907,6 +5181,9 @@ pub(crate) struct PendingFunctionTypeCheck<B: BindingAddress = RelativeBindingNa
 }
 
 impl<B: BindingAddress> ParserBindingMetadata<B> {
+    pub fn syntax(&self) -> &super::SyntaxInventory<B> {
+        &self.syntax
+    }
     pub(crate) fn structural_handles(&self) -> &IndexMap<B, UnexpandedStructuralHandle<B>> {
         &self.structural_handles
     }
@@ -4932,38 +5209,6 @@ impl<B: BindingAddress> ParserBindingMetadata<B> {
         id: &ResourceId,
     ) -> Option<&IndexMap<String, Value<ParserPlaceholder, B>>> {
         self.template_dependency_values.get(id)
-    }
-
-    pub(crate) fn insert_argument_type_source(
-        &mut self,
-        name: String,
-        source_file: PathBuf,
-        span: SourceSpan,
-    ) {
-        self.argument_type_sources
-            .insert(name, (SourceFileId::new(source_file), span));
-    }
-
-    pub(crate) fn argument_type_source(&self, name: &str) -> Option<(&SourceFileId, SourceSpan)> {
-        self.argument_type_sources
-            .get(name)
-            .map(|(source_file, span)| (source_file, *span))
-    }
-
-    pub(crate) fn insert_export_type_source(
-        &mut self,
-        name: String,
-        file: PathBuf,
-        span: SourceSpan,
-    ) {
-        self.export_type_sources
-            .insert(name, (SourceFileId::new(file), span));
-    }
-
-    pub(crate) fn export_type_source(&self, name: &str) -> Option<(&SourceFileId, SourceSpan)> {
-        self.export_type_sources
-            .get(name)
-            .map(|(file, span)| (file, *span))
     }
 
     pub(crate) fn insert_pending_function_type_check(
@@ -4996,14 +5241,13 @@ impl<B: BindingAddress> ParserBindingMetadata<B> {
         visit: &mut impl FnMut(&Value<ParserPlaceholder, B>) -> Result<(), E>,
     ) -> Result<(), E> {
         let Self {
+            syntax: _syntax,
             unexpanded_composition_attributes,
             structural_handles: _structural_handles,
             structural_aliases: _structural_aliases,
             value_structural_handles,
             resource_source_files: _resource_source_files,
             template_dependency_values,
-            argument_type_sources: _argument_type_sources,
-            export_type_sources: _export_type_sources,
             pending_function_type_checks,
         } = self;
         let _structural_outputs = unexpanded_composition_attributes;
@@ -5036,6 +5280,7 @@ impl<B: BindingAddress> ParserBindingMetadata<B> {
     }
 
     pub(crate) fn extend(&mut self, other: Self) {
+        self.syntax.extend(*other.syntax);
         self.unexpanded_composition_attributes
             .extend(other.unexpanded_composition_attributes);
         self.structural_handles.extend(other.structural_handles);
@@ -5046,9 +5291,6 @@ impl<B: BindingAddress> ParserBindingMetadata<B> {
             .extend(other.resource_source_files);
         self.template_dependency_values
             .extend(other.template_dependency_values);
-        self.argument_type_sources
-            .extend(other.argument_type_sources);
-        self.export_type_sources.extend(other.export_type_sources);
         for check in other.pending_function_type_checks {
             self.insert_pending_function_type_check(check);
         }
@@ -5088,17 +5330,17 @@ impl ParserBindingMetadata<RelativeBindingName> {
         resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
     ) -> ParserBindingMetadata<AbsoluteBindingAddress> {
         let Self {
+            syntax,
             unexpanded_composition_attributes,
             structural_handles,
             structural_aliases,
             value_structural_handles,
             resource_source_files,
             template_dependency_values,
-            argument_type_sources,
-            export_type_sources,
             pending_function_type_checks,
         } = self;
         ParserBindingMetadata {
+            syntax: Box::new((*syntax).map_bindings(resolve)),
             unexpanded_composition_attributes: unexpanded_composition_attributes
                 .into_iter()
                 .map(|attribute| attribute.map_bindings(resolve))
@@ -5128,12 +5370,11 @@ impl ParserBindingMetadata<RelativeBindingName> {
                     )
                 })
                 .collect(),
-            argument_type_sources,
-            export_type_sources,
             pending_function_type_checks: pending_function_type_checks
                 .into_iter()
                 .map(|check| {
                     let PendingFunctionTypeCheck {
+                        location,
                         function_name,
                         arguments,
                         source_line,
@@ -5141,6 +5382,7 @@ impl ParserBindingMetadata<RelativeBindingName> {
                         source_file,
                     } = check;
                     PendingFunctionTypeCheck {
+                        location,
                         function_name,
                         arguments: arguments
                             .into_iter()
@@ -5162,17 +5404,17 @@ impl ParserBindingMetadata<AbsoluteBindingAddress> {
         map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
     ) {
         let Self {
+            syntax,
             unexpanded_composition_attributes,
             structural_handles,
             structural_aliases,
             value_structural_handles,
             resource_source_files: _resource_source_files,
             template_dependency_values,
-            argument_type_sources: _argument_type_sources,
-            export_type_sources: _export_type_sources,
             pending_function_type_checks,
         } = self;
 
+        syntax.map_absolute_bindings(map);
         for attribute in unexpanded_composition_attributes {
             attribute.map_absolute_bindings(map);
         }
@@ -5208,6 +5450,7 @@ impl ParserBindingMetadata<AbsoluteBindingAddress> {
 
         for check in pending_function_type_checks {
             let PendingFunctionTypeCheck {
+                location: _location,
                 function_name: _function_name,
                 arguments,
                 source_line: _source_line,
@@ -5491,6 +5734,7 @@ pub struct WaitBinding<B: BindingAddress = RelativeBindingName> {
     pub depends_on: super::UnexpandedDependencies<B>,
     /// Source line of the `wait` keyword. Used by diagnostics.
     pub line: usize,
+    pub declaration: super::DeclarationProvenance,
 }
 
 impl WaitBinding<AbsoluteBindingAddress> {
@@ -5506,6 +5750,7 @@ impl WaitBinding<AbsoluteBindingAddress> {
             timeout_secs: _timeout_secs,
             depends_on,
             line: _line,
+            declaration: _declaration,
         } = self;
         *binding = map(binding);
         *target = map(target);
@@ -5566,7 +5811,10 @@ impl<P: ValueKind, B: BindingAddress> InferredExportParam<P, B> {
             name: name.into(),
             static_type,
             value,
-            source: DeclarationSource::authored(SourceSpan::dummy(), PathBuf::from("test.crn")),
+            source: DeclarationSource::authored(
+                SourceSpan::dummy(),
+                ModuleCallId::test_dummy_in("test.crn").location,
+            ),
         }
     }
     pub fn source_span(&self) -> SourceSpan {
@@ -5591,6 +5839,9 @@ impl<P: ValueKind + PartialEq, B: BindingAddress> ExportParamLike<P, B>
     }
     fn handle(&self) -> Option<&UnexpandedResourceHandle<B>> {
         None
+    }
+    fn type_check_location(&self) -> &super::DeclarationLocation {
+        &self.source.location
     }
     fn source_file(&self) -> &Path {
         &self.source.file
@@ -5853,6 +6104,17 @@ pub trait DeferredForPhaseTraversal<
     where
         Self: Sized;
 
+    /// Analysis also inspects parser-side read templates before their iterable
+    /// becomes known. The general resource walk intentionally omits them.
+    fn analysis_resource_refs(
+        &self,
+    ) -> Box<dyn Iterator<Item = ResourceRef<'_, ModuleSource, P, T, Self, B>> + '_>
+    where
+        Self: Sized,
+    {
+        self.resource_refs()
+    }
+
     fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, P, T, B>> + '_>
     where
         Self: Sized;
@@ -5898,6 +6160,22 @@ impl<P: ValueKind, B: BindingAddress> DeferredForPhaseTraversal<P, P, B>
         P: 'a,
         B: 'a;
 
+    fn analysis_resource_refs(
+        &self,
+    ) -> Box<dyn Iterator<Item = ResourceRef<'_, ModuleSource, P, P, Self, B>> + '_> {
+        Box::new(
+            self.expressions
+                .iter()
+                .filter_map(|deferred| match deferred.body() {
+                    DeferredForBody::Resource(resource) => {
+                        Some(ResourceRef::Deferred { resource, deferred })
+                    }
+                    DeferredForBody::Read(source) => Some(ResourceRef::DataSource(source)),
+                    DeferredForBody::ModuleCall(_) => None,
+                }),
+        )
+    }
+
     fn resource_refs(
         &self,
     ) -> Box<dyn Iterator<Item = ResourceRef<'_, ModuleSource, P, P, Self, B>> + '_> {
@@ -5919,8 +6197,12 @@ impl<P: ValueKind, B: BindingAddress> DeferredForPhaseTraversal<P, P, B>
                 .iter_mut()
                 .filter_map(|deferred| match &mut deferred.body {
                     DeferredForBody::Resource(resource) => {
-                        let (id, attributes) = resource.id_and_attributes_mut();
-                        Some(ResourceMut::Deferred { id, attributes })
+                        let (id, attributes, declaration) = resource.id_and_attributes_mut();
+                        Some(ResourceMut::Deferred {
+                            id,
+                            attributes,
+                            declaration,
+                        })
                     }
                     DeferredForBody::Read(_) | DeferredForBody::ModuleCall(_) => None,
                 }),
@@ -6010,8 +6292,12 @@ impl<P: ValueKind, T: ValueKind, B: BindingAddress> DeferredForPhaseTraversal<P,
 
     fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, P, T, B>> + '_> {
         Box::new(self.expressions.iter_mut().map(|deferred| {
-            let (id, attributes) = deferred.template_resource.id_and_attributes_mut();
-            ResourceMut::Deferred { id, attributes }
+            let (id, attributes, declaration) = deferred.template_resource.id_and_attributes_mut();
+            ResourceMut::Deferred {
+                id,
+                attributes,
+                declaration,
+            }
         }))
     }
 
@@ -6734,6 +7020,7 @@ where
                         timeout_secs,
                         depends_on,
                         line,
+                        declaration,
                     } = wait;
                     let UntilPredicateAst {
                         root,
@@ -6752,6 +7039,7 @@ where
                         timeout_secs,
                         depends_on: depends_on.resolve_bindings(resolve),
                         line,
+                        declaration,
                     }
                 })
                 .collect(),
@@ -7797,6 +8085,7 @@ where
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         } = resource;
         let _resource_metadata = (
             directives,
@@ -7808,6 +8097,7 @@ where
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
+            declaration,
         );
         for (attribute, value) in attributes {
             value.collect_leftover_placeholders(
@@ -7830,6 +8120,7 @@ where
             dependencies,
             module_source,
             quoted_string_attrs,
+            declaration,
         } = data_source;
         let _data_source_metadata = (
             directives,
@@ -7837,6 +8128,7 @@ where
             dependencies,
             module_source,
             quoted_string_attrs,
+            declaration,
         );
         for (attribute, value) in attributes {
             value.collect_leftover_placeholders(
@@ -8489,6 +8781,7 @@ fn build_expanded_child<
     crate::resource::retain_deferred_iterable_dependencies(
         &mut resource.dependencies,
         deferred.root_bindings(),
+        deferred.site().iterable_location,
     );
     let resource = substitute_attrs(
         resource,
@@ -8547,6 +8840,7 @@ fn substitute_attrs<S, D>(
         default_tag_keys,
         loop_provenance,
         quoted_string_attrs,
+        declaration,
     } = resource;
     // Only the loop element supplies values here. Direct resource references
     // remain deferred and must fail the directive's strict Bool boundary.
@@ -8588,6 +8882,7 @@ fn substitute_attrs<S, D>(
         default_tag_keys,
         loop_provenance,
         quoted_string_attrs,
+        declaration,
     })
 }
 
@@ -9029,6 +9324,7 @@ mod substitute_placeholder_tests {
                 loop_origin: None,
             }),
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         });
 
         parsed.arguments.push(ArgumentParameter {
@@ -9059,6 +9355,7 @@ mod substitute_placeholder_tests {
             timeout_secs: None,
             depends_on: Default::default(),
             line: 1,
+            declaration: Default::default(),
         });
         parsed.uses.push(UseStatement::dummy(
             "./module".to_string(),
@@ -9067,6 +9364,7 @@ mod substitute_placeholder_tests {
         parsed.user_functions.insert(
             "function_name".to_string(),
             UserFunction {
+                type_annotations: Vec::new(),
                 name: "function_name".to_string(),
                 params: Vec::new(),
                 return_type: None,
@@ -9074,6 +9372,9 @@ mod substitute_placeholder_tests {
                 annotation_source_file: None,
                 local_lets: Vec::new(),
                 body: UserFunctionBody {
+                    location: ModuleCallId::test_dummy_in("test.crn")
+                        .declaration_location()
+                        .clone(),
                     value: Value::Concrete(ConcreteValue::Int(1)),
                     source_line: 1,
                     source_file: None,
@@ -10403,7 +10704,7 @@ impl<P: ValueKind, B: BindingAddress> ValidateExpr<P, B> {
                 lhs: Box::new(lhs.try_map_bound_arguments(map)?),
                 op: *op,
                 rhs: Box::new(rhs.try_map_bound_arguments(map)?),
-                operator_span: *operator_span,
+                operator_span: operator_span.clone(),
             },
             Self::Compare { lhs, op, rhs } => ValidateExpr::Compare {
                 lhs: Box::new(lhs.try_map_bound_arguments(map)?),

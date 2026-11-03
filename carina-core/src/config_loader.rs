@@ -65,9 +65,13 @@ impl DeclarationKind {
 pub struct DeclarationOccurrence {
     kind: DeclarationKind,
     file: PathBuf,
+    location: parser::DeclarationLocation,
 }
 
 impl DeclarationOccurrence {
+    pub fn location(&self) -> &parser::DeclarationLocation {
+        &self.location
+    }
     pub fn kind(&self) -> DeclarationKind {
         self.kind
     }
@@ -89,6 +93,51 @@ impl DuplicateDeclaration {
     /// Construct a duplicate group only when at least two declarations exist.
     pub(crate) fn new(name: String, occurrences: Vec<DeclarationOccurrence>) -> Option<Self> {
         (occurrences.len() >= 2).then_some(Self { name, occurrences })
+    }
+
+    pub fn covers_parse_error(&self, error: &parser::ParseError) -> bool {
+        match error {
+            parser::ParseError::Located { error, .. } => self.covers_parse_error(error),
+            parser::ParseError::DuplicateBinding { name, .. } => {
+                self.name == *name
+                    && self.occurrences.iter().any(|occurrence| {
+                        matches!(
+                            occurrence.kind,
+                            DeclarationKind::Binding | DeclarationKind::Argument
+                        )
+                    })
+            }
+            parser::ParseError::UserFunctionError(message) => {
+                message == "duplicate function definition in one file"
+                    && self
+                        .occurrences
+                        .iter()
+                        .any(|occurrence| occurrence.kind == DeclarationKind::UserFunction)
+            }
+            _ => false,
+        }
+    }
+
+    /// One finding per contributing file, retaining the existing anchor occurrence.
+    pub fn diagnostics(&self) -> impl Iterator<Item = parser::Located<&Self>> {
+        let mut by_file = IndexMap::<_, &DeclarationOccurrence>::new();
+        for occurrence in &self.occurrences {
+            by_file
+                .entry(&occurrence.file)
+                .and_modify(|anchor| {
+                    // The former binding-span index retained the last let;
+                    // declaration-block, function and provider checks used the first.
+                    if anchor.kind == DeclarationKind::Binding
+                        && occurrence.kind == DeclarationKind::Binding
+                    {
+                        *anchor = occurrence;
+                    }
+                })
+                .or_insert(occurrence);
+        }
+        by_file
+            .into_values()
+            .map(move |occurrence| parser::Located::new(occurrence.location.clone(), self))
     }
 
     pub fn name(&self) -> &str {
@@ -334,7 +383,10 @@ impl RootDirectoryParse<crate::parser::InferredExportParam> {
         &mut self,
         schemas: &crate::provider::ProviderLoadedSchemaRegistry,
         context: &ProviderContext,
-    ) -> crate::validation::inference::ExportsInferredWithLoadedProviderSchemas<'_> {
+    ) -> Result<
+        crate::validation::inference::ExportsInferredWithLoadedProviderSchemas<'_>,
+        crate::parser::AnalysisTreeError,
+    > {
         crate::validation::inference::retry_unchecked_export_inference(
             &mut self.parsed,
             schemas,
@@ -346,7 +398,7 @@ impl RootDirectoryParse<crate::parser::InferredExportParam> {
     pub fn resolve_type_exprs_report(
         &mut self,
         config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-    ) -> crate::validation::FileTypeResolutionReport {
+    ) -> Result<crate::validation::FileTypeResolutionReport, crate::parser::AnalysisTreeError> {
         crate::validation::resolve_file_type_exprs_report(&mut self.parsed, config, None)
     }
 
@@ -354,7 +406,7 @@ impl RootDirectoryParse<crate::parser::InferredExportParam> {
     pub fn resolve_resource_refs_in_session(
         &mut self,
         session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-    ) -> Result<(), parser::ParseError> {
+    ) -> Result<(), parser::AnalysisResolutionError> {
         parser::resolve_resource_refs_in_session(&mut self.parsed, session)
     }
 
@@ -487,12 +539,7 @@ pub(crate) fn find_duplicate_declarations(
             .strip_prefix(directory)
             .unwrap_or(file.as_path())
             .to_path_buf();
-        collect_file_declarations(
-            &relative_file,
-            &resolved.parsed,
-            &resolved.local_variable_names,
-            &mut occurrences,
-        );
+        collect_file_declarations(&relative_file, &resolved.parsed, &mut occurrences);
     }
 
     duplicate_groups(occurrences)
@@ -503,76 +550,33 @@ type DeclarationGroups = BTreeMap<(UniquenessNamespace, String), Vec<Declaration
 fn collect_file_declarations(
     relative_file: &Path,
     parsed: &ParsedFile,
-    local_variable_names: &HashSet<String>,
     occurrences: &mut DeclarationGroups,
 ) {
-    let mut record = |kind: DeclarationKind, name: &str| {
+    collect_inventory_declarations(
+        relative_file,
+        parsed.parser_binding_metadata.syntax(),
+        occurrences,
+    );
+}
+
+fn collect_inventory_declarations(
+    relative_file: &Path,
+    inventory: &parser::SyntaxInventory,
+    occurrences: &mut DeclarationGroups,
+) {
+    // The parser's occurrence inventory precedes name-keyed merging and seed
+    // injection. It neither collapses duplicates nor counts seeded echoes.
+    for declaration in inventory.declarations() {
+        let kind = declaration.kind();
+        let name = declaration.name();
         occurrences
             .entry((kind.uniqueness_namespace(), name.to_string()))
             .or_default()
             .push(DeclarationOccurrence {
                 kind,
                 file: relative_file.to_path_buf(),
+                location: declaration.location().clone(),
             });
-    };
-
-    // These vectors preserve repeated declarations in one file, so record
-    // every element rather than collapsing to a set. Arguments deliberately
-    // group into the binding namespace because the parser registers them as
-    // lexical bindings; their occurrence kind keeps diagnostics precise.
-    for export in &parsed.export_params {
-        record(DeclarationKind::Export, &export.name);
-    }
-    for argument in &parsed.arguments {
-        record(DeclarationKind::Argument, &argument.name);
-    }
-    for attribute in &parsed.attribute_params {
-        record(DeclarationKind::ModuleAttribute, &attribute.name);
-    }
-
-    // Start from ParsedFile's canonical structural-binding inventory, whose
-    // coverage test in parser/ast.rs is the guard against newly added binding
-    // kinds silently escaping this directory-level uniqueness check. A single
-    // let declaration can appear there and in `variables`; collapse that echo
-    // below. Arguments and functions deliberately leave this set because this
-    // pass records them above in their parser-defined namespaces.
-    let argument_names: HashSet<&str> = parsed
-        .arguments
-        .iter()
-        .map(|argument| argument.name.as_str())
-        .collect();
-    let function_names: HashSet<&str> = parsed.user_functions.keys().map(String::as_str).collect();
-    let mut binding_names: BTreeSet<&str> = parsed
-        .structural_binding_names()
-        .into_iter()
-        .filter(|name| !argument_names.contains(name) && !function_names.contains(name))
-        .collect();
-    for name in local_variable_names {
-        if parsed.variables.contains_key(name.as_str())
-            && !binding_names.contains(name.as_str())
-            && !argument_names.contains(name.as_str())
-        {
-            binding_names.insert(name);
-        }
-    }
-    for name in binding_names {
-        if name != "_" {
-            record(DeclarationKind::Binding, name);
-        }
-    }
-
-    // The parser already rejects duplicates within one file, but sibling
-    // function maps would otherwise retain whichever file merged last.
-    for name in parsed.user_functions.keys() {
-        record(DeclarationKind::UserFunction, name);
-    }
-
-    // Provider configuration is kind-level. Named provider instances reuse a
-    // kind's single top-level default and remain ordinary binding declarations.
-    for provider in &parsed.providers {
-        if provider.is_default() {
-            record(DeclarationKind::ProviderKind, &provider.name);
-        }
     }
 }
 
@@ -590,13 +594,58 @@ fn duplicate_groups(occurrences: DeclarationGroups) -> Vec<DuplicateDeclaration>
 /// This is the degraded-mode counterpart to directory extraction for editors:
 /// it cannot diagnose cross-file collisions, but it preserves same-block
 /// diagnostics when an unrelated sibling fails to parse.
-pub fn find_duplicate_declarations_in_parsed_file(
+pub fn find_duplicate_declarations_in_analysis(
     file_name: &Path,
-    parsed: &ParsedFile,
+    tree: &parser::AnalysisTree<'_>,
 ) -> Vec<DuplicateDeclaration> {
     let mut occurrences = BTreeMap::new();
-    let local_variable_names = local_variable_names(parsed);
-    collect_file_declarations(file_name, parsed, &local_variable_names, &mut occurrences);
+    collect_inventory_declarations(file_name, tree.syntax(), &mut occurrences);
+    duplicate_groups(occurrences)
+}
+
+/// In-memory source snapshots keyed by the edited file path.
+pub type SourceOverrides = HashMap<PathBuf, String>;
+
+/// Read the editor snapshot even when a module/upstream reaches it by an alias.
+pub(crate) fn read_source_with_overrides(
+    path: &ResolvedPath,
+    overrides: &SourceOverrides,
+) -> std::io::Result<String> {
+    for (source, text) in overrides {
+        if *source == path.source_label()
+            || ResolvedPath::new(source).is_ok_and(|source| source.identity() == path.identity())
+        {
+            return Ok(text.clone());
+        }
+    }
+    path.read_to_string()
+}
+
+pub(crate) fn directory_source_overrides(
+    dir: &ResolvedPath,
+    overrides: &SourceOverrides,
+) -> HashMap<String, String> {
+    overrides
+        .iter()
+        .filter_map(|(path, text)| {
+            let parent = ResolvedPath::new(path.parent()?).ok()?;
+            if parent.identity() != dir.identity() {
+                return None;
+            }
+            Some((path.file_name()?.to_str()?.to_owned(), text.clone()))
+        })
+        .collect()
+}
+
+pub fn find_duplicate_declarations_in_source(
+    source: &str,
+    path: &Path,
+) -> Vec<DuplicateDeclaration> {
+    let Ok(inventory) = parser::parse_syntax_inventory(source, path) else {
+        return Vec::new();
+    };
+    let mut occurrences = BTreeMap::new();
+    collect_inventory_declarations(path, &inventory, &mut occurrences);
     duplicate_groups(occurrences)
 }
 
@@ -787,10 +836,35 @@ pub struct DirectoryParseResult {
 /// CLI-facing loaders continue to render this as the same string they
 /// historically returned. Editors can additionally inspect [`Self::source_file`]
 /// and only publish parser errors owned by the document being analyzed.
+///
+/// A consumer cannot attach arbitrary line numbers to a file:
+///
+/// ```compile_fail,E0624
+/// use carina_core::{config_loader::DirectoryParseFailure, parser::ParseError};
+/// let error = ParseError::InvalidExpression { line: 99, message: "error".into() };
+/// let _ = DirectoryParseFailure::from_parse_error(error);
+/// ```
+///
+/// The representation cannot be assembled by consumers either:
+///
+/// ```compile_fail,E0451
+/// use carina_core::config_loader::DirectoryParseFailure;
+/// fn fabricate() -> DirectoryParseFailure {
+///     DirectoryParseFailure { kind: todo!() }
+/// }
+/// ```
 #[derive(Debug, thiserror::Error)]
-pub enum DirectoryParseFailure {
+#[error(transparent)]
+pub struct DirectoryParseFailure {
+    kind: DirectoryParseFailureKind,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum DirectoryParseFailureKind {
     #[error("{0}")]
     Message(String),
+    #[error(transparent)]
+    Element(Box<parser::Located<parser::ParseError>>),
     #[error("{location}: {error}")]
     Parse {
         location: PathBuf,
@@ -800,28 +874,78 @@ pub enum DirectoryParseFailure {
 }
 
 impl DirectoryParseFailure {
+    fn new(kind: DirectoryParseFailureKind) -> Self {
+        let kind = match kind {
+            DirectoryParseFailureKind::Parse {
+                error,
+                location,
+                source_file,
+            } => match *error {
+                parser::ParseError::AtElement(finding) => {
+                    DirectoryParseFailureKind::Element(finding)
+                }
+                error => DirectoryParseFailureKind::Parse {
+                    error: Box::new(error),
+                    location,
+                    source_file,
+                },
+            },
+            kind => kind,
+        };
+        Self { kind }
+    }
+
+    fn message(message: String) -> Self {
+        Self::new(DirectoryParseFailureKind::Message(message))
+    }
+
     fn from_parse_error(error: parser::ParseError) -> Self {
         match error {
-            parser::ParseError::Located { path, error } => Self::Parse {
-                location: path.clone(),
-                source_file: Some(path),
-                error,
-            },
-            error => Self::Message(error.to_string()),
+            parser::ParseError::AtElement(finding) => {
+                Self::new(DirectoryParseFailureKind::Element(finding))
+            }
+            parser::ParseError::Located { path, error } => {
+                Self::new(DirectoryParseFailureKind::Parse {
+                    location: path.clone(),
+                    source_file: Some(path),
+                    error,
+                })
+            }
+            error => Self::message(error.to_string()),
         }
     }
 
     pub fn source_file(&self) -> Option<&Path> {
-        match self {
-            Self::Parse { source_file, .. } => source_file.as_deref(),
-            Self::Message(_) => None,
+        match &self.kind {
+            DirectoryParseFailureKind::Parse { source_file, .. } => source_file.as_deref(),
+            DirectoryParseFailureKind::Element(finding) => Some(finding.location().file().path()),
+            DirectoryParseFailureKind::Message(_) => None,
+        }
+    }
+
+    pub fn diagnostic(&self) -> Option<parser::FileScoped<&parser::ParseError>> {
+        match &self.kind {
+            DirectoryParseFailureKind::Parse {
+                source_file: Some(path),
+                error,
+                ..
+            } => Some(parser::scope_parse_failure(path, error)),
+            _ => None,
         }
     }
 
     pub fn parse_error(&self) -> Option<&parser::ParseError> {
-        match self {
-            Self::Parse { error, .. } => Some(error.as_ref()),
-            Self::Message(_) => None,
+        match &self.kind {
+            DirectoryParseFailureKind::Parse { error, .. } => Some(error.as_ref()),
+            DirectoryParseFailureKind::Element(finding) => Some(finding.detail()),
+            DirectoryParseFailureKind::Message(_) => None,
+        }
+    }
+
+    pub fn element_diagnostic(&self) -> Option<&parser::Located<parser::ParseError>> {
+        match &self.kind {
+            DirectoryParseFailureKind::Element(finding) => Some(finding),
+            _ => None,
         }
     }
 }
@@ -872,7 +996,7 @@ fn parse_directory_with_overrides_impl(
     let dir = dir_label.as_path();
     let files = resolved
         .crn_files()
-        .map_err(|error| DirectoryParseFailure::Message(error.to_string()))?;
+        .map_err(|error| DirectoryParseFailure::message(error.to_string()))?;
     let mut paths: Vec<(ResolvedPath, String)> = files
         .into_iter()
         .filter_map(|p| {
@@ -888,13 +1012,13 @@ fn parse_directory_with_overrides_impl(
             paths.push((
                 resolved
                     .join(name)
-                    .map_err(|error| DirectoryParseFailure::Message(error.to_string()))?,
+                    .map_err(|error| DirectoryParseFailure::message(error.to_string()))?,
                 name.clone(),
             ));
         }
     }
     if paths.is_empty() {
-        return Err(DirectoryParseFailure::Message(format!(
+        return Err(DirectoryParseFailure::message(format!(
             "No .crn files found in {}",
             dir.display()
         )));
@@ -907,7 +1031,7 @@ fn parse_directory_with_overrides_impl(
         let content = match overrides.get(name) {
             Some(buffer) => buffer.clone(),
             None => file.read_to_string().map_err(|e| {
-                DirectoryParseFailure::Message(format!("Failed to read {}: {}", file.display(), e))
+                DirectoryParseFailure::message(format!("Failed to read {}: {}", file.display(), e))
             })?,
         };
         file_inputs.push((file.source_label(), content));
@@ -920,11 +1044,13 @@ fn parse_directory_with_overrides_impl(
                 .source_file
                 .clone()
                 .unwrap_or_else(|| dir.to_path_buf());
-            return Err(DirectoryParseFailure::Parse {
-                location,
-                source_file: located.source_file,
-                error: located.error,
-            });
+            return Err(DirectoryParseFailure::new(
+                DirectoryParseFailureKind::Parse {
+                    location,
+                    source_file: located.source_file,
+                    error: located.error,
+                },
+            ));
         }
     };
     let authored_bindings = AuthoredBindingView::from_directory_files(&parsed_files);
@@ -947,11 +1073,11 @@ fn parse_directory_with_overrides_impl(
                 parser::resolve_resource_refs_for_diagnostics(&mut semantic, config).map_err(
                     |error| {
                         let located = LocatedParseError::in_file(path, error);
-                        DirectoryParseFailure::Parse {
+                        DirectoryParseFailure::new(DirectoryParseFailureKind::Parse {
                             location: located.source_file.clone().unwrap_or_else(|| path.clone()),
                             source_file: located.source_file,
                             error: located.error,
-                        }
+                        })
                     },
                 )?;
                 Ok((path.clone(), semantic))
@@ -1138,6 +1264,10 @@ pub(crate) struct LocatedParseError {
 impl LocatedParseError {
     fn in_file(path: &Path, error: parser::ParseError) -> Self {
         match error {
+            error @ parser::ParseError::AtElement(_) => Self {
+                source_file: error.source_file().map(Path::to_path_buf),
+                error: Box::new(error),
+            },
             parser::ParseError::Located { path, error } => Self {
                 source_file: Some(path),
                 error,
@@ -1151,6 +1281,10 @@ impl LocatedParseError {
 
     fn directory_wide(error: parser::ParseError) -> Self {
         match error {
+            error @ parser::ParseError::AtElement(_) => Self {
+                source_file: error.source_file().map(Path::to_path_buf),
+                error: Box::new(error),
+            },
             parser::ParseError::Located { path, error } => Self {
                 source_file: Some(path),
                 error,
@@ -1163,6 +1297,9 @@ impl LocatedParseError {
     }
 
     fn render(&self, fallback: &Path) -> String {
+        if let Some(finding) = self.error.element_diagnostic() {
+            return finding.to_string();
+        }
         let location = self.source_file.as_deref().unwrap_or(fallback);
         format!("{}: {}", location.display(), self.error)
     }
@@ -1575,7 +1712,6 @@ pub fn find_crn_files_in_dir(dir: &ResolvedPath) -> Result<Vec<ResolvedPath>, St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::ModuleCall;
     use crate::resource::{DeferredValue, Value};
     use std::fs;
 
@@ -2828,8 +2964,12 @@ let orgs = upstream_state {
                 path.ends_with("main.crn"),
                 "unexpected error owner: {path:?}"
             );
+            let finding = error
+                .element_diagnostic()
+                .expect("deferred expression location");
+            assert_eq!(finding.location().file().path(), path);
             assert!(matches!(
-                error.as_ref(),
+                finding.detail(),
                 crate::parser::ParseError::DeferredForBodyUnsupported(details)
                     if details.line == 3
                         && details.header == "for x in src.list"
@@ -2882,9 +3022,13 @@ let orgs = upstream_state {
             path.ends_with("parent/main.crn"),
             "unexpected error owner: {path:?}"
         );
+        let finding = error
+            .element_diagnostic()
+            .expect("deferred expression location");
+        assert_eq!(finding.location().file().path(), path);
         assert!(
             matches!(
-                error.as_ref(),
+                finding.detail(),
                 crate::parser::ParseError::DeferredForBodyUnsupported(details)
                     if details.line == 3
                         && details.header == "for name in names"
@@ -2938,7 +3082,12 @@ let orgs = upstream_state {
             panic!("expected a file-owned typed parse error, got {error:?}");
         };
         assert!(path.ends_with("b/main.crn"), "unexpected owner: {path:?}");
-        let crate::parser::ParseError::DeferredForBodyUnsupported(details) = error.as_ref() else {
+        let finding = error
+            .element_diagnostic()
+            .expect("deferred expression location");
+        assert_eq!(finding.location().file().path(), path);
+        let crate::parser::ParseError::DeferredForBodyUnsupported(details) = finding.detail()
+        else {
             panic!("expected a deferred-body error, got {error:?}");
         };
         assert_eq!(details.header, "for i in items");
@@ -3214,12 +3363,17 @@ awscc.ec2.SecurityGroup {
             .collect()
     }
 
-    fn duplicate_messages_for_two_copies(parsed: ParsedFile) -> Vec<String> {
+    fn duplicate_messages_for_two_copies(source: &str) -> Vec<String> {
         let temp = tempfile::tempdir().unwrap();
         let parsed_files: Vec<_> = ["a.crn", "b.crn"]
             .into_iter()
             .map(|name| {
-                let parsed = parsed.clone();
+                let parsed = parser::parse_file(
+                    source,
+                    &temp.path().join(name),
+                    &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                )
+                .expect("authored duplicate fixture");
                 let local_variable_names = parsed.variables.keys().cloned().collect();
                 (
                     temp.path().join(name),
@@ -3265,27 +3419,26 @@ awscc.ec2.SecurityGroup {
     #[test]
     fn duplicate_extraction_only_treats_underscore_as_discard_in_binding_namespace() {
         let temp = tempfile::tempdir().unwrap();
-        let parsed_files: Vec<_> = ["a.crn", "b.crn"]
+        let parsed = parser::parse_file(
+            "exports { value = 'value' }",
+            &temp.path().join("fixture.crn"),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let location = parsed.parser_binding_metadata.syntax().declarations()[0]
+            .location()
+            .clone();
+        let occurrences = ["a.crn", "b.crn"]
             .into_iter()
-            .map(|name| {
-                let parsed = ParsedFile {
-                    export_params: vec![crate::parser::ParsedExportParam::dummy(
-                        "_".to_string(),
-                        None,
-                        None,
-                    )],
-                    ..ParsedFile::default()
-                };
-                (
-                    temp.path().join(name),
-                    DirectoryResolvedFile {
-                        parsed,
-                        local_variable_names: HashSet::new(),
-                    },
-                )
+            .map(|name| DeclarationOccurrence {
+                kind: DeclarationKind::Export,
+                file: name.into(),
+                location: location.clone(),
             })
             .collect();
-        let messages: Vec<_> = find_duplicate_declarations(temp.path(), &parsed_files)
+        let groups =
+            BTreeMap::from([((UniquenessNamespace::Export, "_".to_string()), occurrences)]);
+        let messages: Vec<_> = duplicate_groups(groups)
             .iter()
             .map(ToString::to_string)
             .collect();
@@ -3312,94 +3465,42 @@ awscc.ec2.SecurityGroup {
 
     #[test]
     fn duplicate_extraction_covers_resource_bindings() {
-        let mut resource = crate::resource::AuthoredResource::new("mock.test.Thing", "shared");
-        resource.binding = Some(crate::parser::RelativeBindingName::new("shared"));
-        let parsed = ParsedFile {
-            resources: vec![resource],
-            ..ParsedFile::default()
-        };
-
         assert_eq!(
-            duplicate_messages_for_two_copies(parsed),
+            duplicate_messages_for_two_copies("let shared = mock.test.Thing {}"),
             vec!["duplicate binding 'shared': declared in a.crn and b.crn"]
         );
     }
 
     #[test]
     fn duplicate_extraction_covers_data_source_bindings() {
-        let mut data_source = crate::resource::AuthoredDataSource::new("mock.test.Thing", "shared");
-        data_source.binding = Some(crate::parser::RelativeBindingName::new("shared"));
-        let parsed = ParsedFile {
-            data_sources: vec![data_source],
-            ..ParsedFile::default()
-        };
-
         assert_eq!(
-            duplicate_messages_for_two_copies(parsed),
+            duplicate_messages_for_two_copies("let shared = read mock.test.Thing {}"),
             vec!["duplicate binding 'shared': declared in a.crn and b.crn"]
         );
     }
 
     #[test]
     fn duplicate_extraction_covers_module_call_bindings() {
-        let parsed = ParsedFile {
-            module_calls: vec![ModuleCall::test(
-                "module".to_string(),
-                Some("shared".to_string()),
-                HashMap::new(),
-            )],
-            ..ParsedFile::default()
-        };
-
         assert_eq!(
-            duplicate_messages_for_two_copies(parsed),
+            duplicate_messages_for_two_copies("let shared = module {}"),
             vec!["duplicate binding 'shared': declared in a.crn and b.crn"]
         );
     }
 
     #[test]
     fn duplicate_extraction_covers_wait_bindings() {
-        let parsed = ParsedFile {
-            wait_bindings: vec![crate::parser::WaitBinding {
-                binding: crate::parser::RelativeBindingName::from("shared"),
-                target: crate::parser::RelativeBindingName::from("target"),
-                until_raw: "target.status == 'ready'".to_string(),
-                until_predicate: crate::parser::UntilPredicateAst {
-                    root: crate::parser::RelativeBindingName::new("target"),
-                    attribute_segments: vec!["status".to_string()],
-                    rhs: Value::Concrete(crate::resource::ConcreteValue::String("ready".into())),
-                },
-                timeout_secs: None,
-                depends_on: Default::default(),
-                line: 1,
-            }],
-            ..ParsedFile::default()
-        };
-
         assert_eq!(
-            duplicate_messages_for_two_copies(parsed),
+            duplicate_messages_for_two_copies(
+                "let shared = wait target { until = target.status == 'ready' }"
+            ),
             vec!["duplicate binding 'shared': declared in a.crn and b.crn"]
         );
     }
 
     #[test]
     fn duplicate_extraction_covers_named_provider_bindings() {
-        let parsed = ParsedFile {
-            providers: vec![crate::parser::ProviderConfig {
-                name: "mock".to_string(),
-                attributes: IndexMap::new(),
-                default_tags: IndexMap::new(),
-                source: None,
-                version: None,
-                revision: None,
-                unresolved_attributes: IndexMap::new(),
-                binding: Some("shared".to_string()),
-            }],
-            ..ParsedFile::default()
-        };
-
         assert_eq!(
-            duplicate_messages_for_two_copies(parsed),
+            duplicate_messages_for_two_copies("let shared = provider mock {}"),
             vec!["duplicate binding 'shared': declared in a.crn and b.crn"]
         );
     }
@@ -3589,11 +3690,11 @@ awscc.ec2.SecurityGroup {
             .source_file
             .clone()
             .unwrap_or_else(|| caller.to_path_buf());
-        let failure = DirectoryParseFailure::Parse {
+        let failure = DirectoryParseFailure::new(DirectoryParseFailureKind::Parse {
             location,
             source_file: located.source_file,
             error: located.error,
-        };
+        });
 
         assert_eq!(
             failure.to_string(),
@@ -3610,11 +3711,11 @@ awscc.ec2.SecurityGroup {
         }
         .in_file(file);
         let located = LocatedParseError::in_file(file, error);
-        let failure = DirectoryParseFailure::Parse {
+        let failure = DirectoryParseFailure::new(DirectoryParseFailureKind::Parse {
             location: located.source_file.clone().unwrap(),
             source_file: located.source_file,
             error: located.error,
-        };
+        });
 
         assert_eq!(
             failure.to_string(),

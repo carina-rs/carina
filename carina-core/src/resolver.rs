@@ -40,6 +40,15 @@ impl From<crate::parser::ParseError> for ResolutionError {
                 Self::Message(message) => Self::Message(format!("{}: {message}", path.display())),
                 unavailable @ Self::UnavailableSecret(_) => unavailable,
             },
+            crate::parser::ParseError::AtElement(finding) => {
+                let (location, error) = (*finding).into_parts();
+                match Self::from(error) {
+                    Self::Message(message) => {
+                        Self::Message(crate::parser::Located::new(location, message).to_string())
+                    }
+                    unavailable @ Self::UnavailableSecret(_) => unavailable,
+                }
+            }
             error => Self::Message(error.to_string()),
         }
     }
@@ -893,19 +902,22 @@ fn user_function_runtime_error(
 
 fn function_annotation_site<B: BindingAddress>(
     function: &crate::parser::UserFunction<B>,
-    span: Option<crate::parser::SourceSpan>,
+    kind: crate::validation::TypeResolutionDeclarationKind,
+    name: &str,
     context: String,
 ) -> crate::validation::deferred_types::ProviderTypeCheckSite {
     use crate::validation::deferred_types::ProviderTypeCheckSite;
-    let source = function
-        .annotation_source_file
-        .as_deref()
-        .or(function.body.source_file.as_deref())
-        .unwrap_or_else(|| std::path::Path::new("<config>"));
-    match span {
-        Some(span) => ProviderTypeCheckSite::new(source, span, context),
-        None => ProviderTypeCheckSite::at_line(source, function.body.source_line, 1, context),
-    }
+    let annotation = crate::validation::TypeResolutionContext::Declaration {
+        kind,
+        name: name.to_string(),
+    };
+    let location = function
+        .type_annotations
+        .iter()
+        .find(|finding| finding.detail() == &annotation)
+        .expect("function annotation parser provenance")
+        .location();
+    ProviderTypeCheckSite::new(location.clone(), context)
 }
 
 fn evaluate_runtime_user_function<B: BindingAddress>(
@@ -991,7 +1003,8 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
                     crate::validation::typecheck::TypecheckInference::Unavailable,
                     function_annotation_site(
                         function,
-                        parameter.type_span,
+                        crate::validation::TypeResolutionDeclarationKind::FunctionParameter,
+                        &format!("{}' parameter '{}", function.name, parameter.name),
                         format!(
                             "function '{}' parameter '{}'",
                             function.name, parameter.name
@@ -1043,7 +1056,8 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
                 crate::validation::typecheck::TypecheckInference::Unavailable,
                 function_annotation_site(
                     function,
-                    function.return_type_span,
+                    crate::validation::TypeResolutionDeclarationKind::FunctionReturn,
+                    &function.name,
                     format!("function '{}' return value", function.name),
                 ),
             )
@@ -1272,6 +1286,12 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                 RuntimeContext::Session(session) => session,
                 RuntimeContext::Projection(_context) => return Ok(value.clone()),
             };
+
+            // Declaration resolution already owns this failure. Preserve the
+            // call just as the parser's pending-function path does.
+            if session.function_declaration_failed(function) {
+                return Ok(value.clone());
+            }
 
             let resolved_args = match resolve_function_arguments(args, bindings, config)? {
                 FunctionArgumentResolution::FullyResolved(args) => args,
@@ -1564,6 +1584,39 @@ mod tests {
         assert_eq!(
             ResolutionError::from(ordinary).to_string(),
             "/project/functions.crn: Invalid expression at line 8: ordinary failure",
+        );
+    }
+
+    #[test]
+    fn element_owned_function_errors_preserve_unavailable_secret() {
+        let parsed = crate::config_loader::parse_directory_files(
+            &[
+                ("/project/main.crn".into(), "let unrelated = 'main'".into()),
+                (
+                    "/project/functions.crn".into(),
+                    "fn identity() { 'value' }".into(),
+                ),
+            ],
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap()
+        .remove(1)
+        .1
+        .into_inner();
+        let snapshot = crate::value::redact_secrets_in_value(&Value::Deferred(
+            DeferredValue::Secret(Box::new(Value::Concrete(ConcreteValue::String(
+                "historical secret".into(),
+            )))),
+        ))
+        .unwrap();
+        let unavailable = snapshot.to_value_at("state.credentials.token").unwrap_err();
+        let error = crate::parser::ParseError::AtElement(Box::new(crate::parser::Located::new(
+            parsed.user_functions["identity"].body.location.clone(),
+            crate::parser::ParseError::UnavailableSecret(unavailable.clone()),
+        )));
+        assert_eq!(
+            ResolutionError::from(error),
+            ResolutionError::UnavailableSecret(unavailable)
         );
     }
 

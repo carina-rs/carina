@@ -3,7 +3,7 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use crate::parser::Rule;
-use crate::parser::ast::{SourceSpan, UseStatement};
+use crate::parser::ast::UseStatement;
 use crate::parser::context::{ParseContext, next_pair};
 use crate::parser::error::ParseError;
 use crate::parser::parse_expression;
@@ -14,8 +14,7 @@ pub(in crate::parser) fn parse_use_expr(
     pair: pest::iterators::Pair<Rule>,
     binding_name: &str,
     ctx: &ParseContext,
-    source_span: SourceSpan,
-    source_file: &std::path::Path,
+    location: crate::parser::DeclarationLocation,
 ) -> Result<UseStatement, ParseError> {
     let span = pair.as_span();
     let line = span.start_pos().line_col().0;
@@ -62,7 +61,6 @@ pub(in crate::parser) fn parse_use_expr(
     Ok(UseStatement::new_in_source(
         path,
         binding_name.to_string(),
-        source_span,
-        source_file.to_path_buf(),
+        location,
     ))
 }

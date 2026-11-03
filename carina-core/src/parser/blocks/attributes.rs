@@ -19,11 +19,6 @@ use crate::parser::types::parse_type_expr;
 use crate::parser::{parse_expression, parse_expression_eval};
 use crate::resource::{ConcreteValue, DeferredValue};
 
-pub(in crate::parser) struct ParsedArgumentsBlock {
-    pub parameters: Vec<ArgumentParameter>,
-    pub type_sources: Vec<(String, SourceSpan)>,
-}
-
 fn parse_boundary_expression(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
@@ -52,11 +47,10 @@ pub(in crate::parser) fn parse_arguments_block(
     config: &ProviderContext,
     ctx: &mut ParseContext,
     preprocessed_file: &PreprocessedFile,
-    source_file: &std::path::Path,
+    _source_file: &std::path::Path,
     warnings: &mut Vec<ParseWarning>,
-) -> Result<ParsedArgumentsBlock, ParseError> {
+) -> Result<Vec<ArgumentParameter>, ParseError> {
     let mut arguments = Vec::new();
-    let mut type_sources = Vec::new();
 
     for param in pair.into_inner() {
         if param.as_rule() == Rule::arguments_param {
@@ -65,7 +59,6 @@ pub(in crate::parser) fn parse_arguments_block(
                 .as_str()
                 .to_string();
             let type_pair = next_pair(&mut param_inner, "type expression", "arguments parameter")?;
-            let type_span = SourceSpan::from_pest(&type_pair, preprocessed_file);
             let type_expr = parse_type_expr(type_pair, config, warnings, Some(preprocessed_file))?;
 
             let mut description = None;
@@ -113,9 +106,12 @@ pub(in crate::parser) fn parse_arguments_block(
                                                         &validate_pair,
                                                         preprocessed_file,
                                                     );
+                                                    let location =
+                                                        ctx.declaration_location(&validate_pair);
                                                     rule = Some((
                                                         parse_validate_expr(validate_pair, ctx)?,
                                                         source_span,
+                                                        location,
                                                     ));
                                                 }
                                                 Rule::validation_error_message_attr => {
@@ -137,12 +133,12 @@ pub(in crate::parser) fn parse_arguments_block(
                                             }
                                         }
                                     }
-                                    if let Some((condition, source_span)) = rule {
+                                    if let Some((condition, source_span, location)) = rule {
                                         validations.push(ValidationBlock::new_in_source(
                                             condition,
                                             error_msg,
                                             source_span,
-                                            source_file.to_path_buf(),
+                                            location,
                                         ));
                                     }
                                 }
@@ -157,7 +153,6 @@ pub(in crate::parser) fn parse_arguments_block(
             }
 
             register_argument_binding(ctx, &name, &type_expr);
-            type_sources.push((name.clone(), type_span));
             arguments.push(ArgumentParameter {
                 name,
                 static_type: type_expr,
@@ -168,10 +163,7 @@ pub(in crate::parser) fn parse_arguments_block(
         }
     }
 
-    Ok(ParsedArgumentsBlock {
-        parameters: arguments,
-        type_sources,
-    })
+    Ok(arguments)
 }
 
 /// Register an argument name as a lexical binding so subsequent expressions
@@ -266,6 +258,11 @@ pub(in crate::parser) fn parse_attributes_block(
     for param in pair.into_inner() {
         if param.as_rule() == Rule::attributes_param {
             let source_span = SourceSpan::from_pest(&param, preprocessed_file);
+            let mut source_location = super::super::DeclarationLocation::from_pair(
+                &param,
+                preprocessed_file,
+                source_file,
+            );
             let mut param_inner = param.into_inner();
             let name = next_pair(&mut param_inner, "parameter name", "attributes block")?
                 .as_str()
@@ -279,6 +276,7 @@ pub(in crate::parser) fn parse_attributes_block(
             )?;
             let (type_expr, value) = if next.as_rule() == Rule::type_expr {
                 // Has explicit type annotation: name: type = expr
+                source_location = ctx.declaration_location(&next);
                 let type_expr = Some(parse_type_expr(
                     next,
                     ctx.config,
@@ -299,7 +297,7 @@ pub(in crate::parser) fn parse_attributes_block(
                 type_expr,
                 value,
                 source_span,
-                source_file.to_path_buf(),
+                source_location,
             ));
         }
     }
@@ -319,6 +317,11 @@ pub(in crate::parser) fn parse_exports_block(
     for param in pair.into_inner() {
         if param.as_rule() == Rule::exports_param {
             let source_span = SourceSpan::from_pest(&param, preprocessed_file);
+            let mut source_location = super::super::DeclarationLocation::from_pair(
+                &param,
+                preprocessed_file,
+                source_file,
+            );
             let mut param_inner = param.into_inner();
             let name = next_pair(&mut param_inner, "parameter name", "exports block")?
                 .as_str()
@@ -326,6 +329,7 @@ pub(in crate::parser) fn parse_exports_block(
 
             let next = next_pair(&mut param_inner, "type or expression", "exports parameter")?;
             let (type_expr, value) = if next.as_rule() == Rule::type_expr {
+                source_location = ctx.declaration_location(&next);
                 let type_expr = Some(parse_type_expr(
                     next,
                     ctx.config,
@@ -345,7 +349,7 @@ pub(in crate::parser) fn parse_exports_block(
                 type_expr,
                 value,
                 source_span,
-                source_file.to_path_buf(),
+                source_location,
             ));
         }
     }
