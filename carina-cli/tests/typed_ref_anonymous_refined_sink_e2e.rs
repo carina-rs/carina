@@ -488,7 +488,10 @@ fn typed_ref_apply_rejects_unknown_output_before_consumer_create() {
                 Value::Concrete(ConcreteValue::String(value.into())),
             );
             let error = result.failures()[0].to_string();
-            assert!(error.contains(path) && error.contains(reason), "{error}");
+            assert!(
+                error.contains(&format!("'{path}'")) && error.contains(reason),
+                "{error}"
+            );
             if path == "xs" {
                 assert!(error.contains("index 0"), "{error}");
             }
