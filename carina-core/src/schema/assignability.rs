@@ -1,6 +1,10 @@
 //! Boundary assignability when provider declarations may not be loaded.
 
 use super::{AttrTypeKind, PatternForm, TypeIdentity, TypeInSchema, resolve_refs_on_path};
+use crate::binding_index::{
+    BindingIndex, DeclaredValueAssignment, RefTypeAssignabilityError, RefTypeMismatch,
+    ResolvedRefType,
+};
 use crate::parser::CustomTypeValidationError;
 
 /// Missing provider evidence is distinct from a proven type mismatch.
@@ -487,6 +491,53 @@ enum AssignmentCheck {
     IdentifiedLeaves,
 }
 
+impl TypeInSchema<'_, super::Compiled> {
+    /// Judge a declaration and its original sources together at the same sink.
+    /// The originals' identity-less leaves may retain deferred value checks
+    /// only after the declaration has passed full assignment at this sink.
+    pub(crate) fn declared_assignment_to<B: crate::resource::BindingAddress>(
+        self,
+        original: &ResolvedRefType,
+        incoming: AssignmentSink<'_, super::Compiled>,
+        sink: AssignmentSink<'_, super::Compiled>,
+        bindings: &BindingIndex<'_, B>,
+    ) -> DeclaredValueAssignment {
+        // A rejected declaration owns the mismatch. Its original source is
+        // relevant only after the declaration passes at this sink.
+        match bindings.check_type_assignment(self, sink) {
+            Err(error) => {
+                return DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Unchecked(
+                    Box::new(error),
+                ));
+            }
+            Ok(false) => {
+                return DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Mismatch(
+                    RefTypeMismatch::direct(self.resolved_type_name()),
+                ));
+            }
+            Ok(true) => {}
+        }
+        match original.check_assignment(|source| {
+            bindings.consume_type_assignment(source.identity_assignment_to(sink))
+        }) {
+            Ok(()) => DeclaredValueAssignment::Assignable,
+            Err(error @ RefTypeAssignabilityError::Mismatch(_)) => {
+                // The incoming boundary already owns a proven rejection.
+                // Inspect that relation without recording another deferral:
+                // unknown incoming edges cannot explain this sink's mismatch.
+                if original.has_proven_mismatch_at(incoming) {
+                    DeclaredValueAssignment::IncomingBoundaryMismatch
+                } else {
+                    DeclaredValueAssignment::Rejected(error)
+                }
+            }
+            Err(error @ RefTypeAssignabilityError::Unchecked(_)) => {
+                DeclaredValueAssignment::Rejected(error)
+            }
+        }
+    }
+}
+
 impl<'source, R: PatternForm> TypeInSchema<'source, R> {
     /// Prove assignment, prove a mismatch, or defer for the existing
     /// `ProvidersNotLoaded` reason. Identified types first compare structural
@@ -512,7 +563,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
     /// full assignment. An earlier owner's edge is not proof for this sink.
     /// Identity-less leaves keep the declaration's deferred value checks;
     /// identified leaves retain ordinary identity admission and containment.
-    pub(crate) fn identity_assignment_to<'query>(
+    fn identity_assignment_to<'query>(
         self,
         sink: AssignmentSink<'query, R>,
     ) -> TypeAssignability<'query>
@@ -1034,7 +1085,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 TypeAssignability::from_bool(source.structurally_assignable_to(target)),
                 source_base.in_schema(self.defs).assignment_on_paths(
                     sink.rebind(sink_base),
-                    AssignmentCheck::Full,
+                    check,
                     source_refs,
                     sink_refs,
                 ),
@@ -1315,6 +1366,52 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enum_identity_readmission_preserves_the_assignment_check_mode() {
+        use crate::schema::AttributeType;
+
+        let enum_type = |base| {
+            AttributeType::enum_with_base(
+                TypeIdentity::bare("Mode"),
+                base,
+                None,
+                Vec::new(),
+                None,
+                None,
+            )
+        };
+        let original = enum_type(AttributeType::refined_string(
+            None,
+            None,
+            Some((Some(1), Some(16))),
+            None,
+        ));
+        let declaration = enum_type(AttributeType::refined_string(
+            None,
+            None,
+            Some((Some(1), Some(8))),
+            None,
+        ));
+        let catalog = crate::parser::ProviderCustomTypes::default();
+        let owner = crate::parser::SchemaTypeOwner::Provider("test".into());
+        let sink = TypeInSchema::schemaless(&declaration)
+            .with_authority(&catalog, SinkAuthority::Owner(&owner));
+
+        assert_eq!(
+            TypeInSchema::schemaless(&original).assignment_to(sink),
+            TypeAssignability::Mismatch
+        );
+        assert_eq!(
+            TypeInSchema::schemaless(&declaration).assignment_to(sink),
+            TypeAssignability::Assignable
+        );
+        assert_eq!(
+            TypeInSchema::schemaless(&original).identity_assignment_to(sink),
+            TypeAssignability::Assignable,
+            "identity-less enum bases retain the declaration's deferred value checks"
+        );
+    }
 
     #[test]
     fn assignment_consumers_preserve_the_unchecked_policy() {

@@ -50,6 +50,39 @@ impl ProviderFactory for RuntimeEdgeFactory {
                 .attribute(
                     AttributeSchema::optional("bucket", identity_edges::string("Name")).build(),
                 )
+                .attribute(
+                    AttributeSchema::optional(
+                        "buckets",
+                        AttributeType::list(identity_edges::string("Name")),
+                    )
+                    .build(),
+                )
+                .attribute(
+                    AttributeSchema::optional(
+                        "bucket_map",
+                        AttributeType::map(identity_edges::string("Name")),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        schemas.push(
+            ResourceSchema::new("CollectionProducer")
+                .attribute(
+                    AttributeSchema::provider_populated(
+                        "new_buckets",
+                        AttributeType::list(identity_edges::string("NewName")),
+                    )
+                    .build(),
+                )
+                .attribute(
+                    AttributeSchema::provider_populated(
+                        "new_bucket_map",
+                        AttributeType::map(identity_edges::string("NewName")),
+                    )
+                    .build(),
+                )
                 .validate()
                 .unwrap(),
         );
@@ -220,19 +253,16 @@ impl ProviderFactory for ForwardFactory {
         "Other identity sink"
     }
     fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+        let name =
+            || AttributeType::refined_string(Some(TypeIdentity::bare("Name")), None, None, None);
         vec![
             ResourceSchema::new("Receiver")
+                .attribute(AttributeSchema::optional("bucket", name()).build())
                 .attribute(
-                    AttributeSchema::optional(
-                        "bucket",
-                        AttributeType::refined_string(
-                            Some(TypeIdentity::bare("Name")),
-                            None,
-                            None,
-                            None,
-                        ),
-                    )
-                    .build(),
+                    AttributeSchema::optional("buckets", AttributeType::list(name())).build(),
+                )
+                .attribute(
+                    AttributeSchema::optional("bucket_map", AttributeType::map(name())).build(),
                 )
                 .validate()
                 .unwrap(),
@@ -292,6 +322,74 @@ fn identity_edges_module_argument_retains_actual_identity_at_later_sink() {
         }
     }
 }
+
+fn collection_module_errors(owner: &str, collection: &str, attribute: &str) -> Vec<String> {
+    // The call admits NewName through mock's edge into the Name declaration.
+    // Each later sink must re-admit the original collection under its own owner.
+    let scenario = module_scenario(owner);
+    fs::write(
+        scenario.project.path().join("producer.crn"),
+        "let producer = mock.CollectionProducer {}\n",
+    )
+    .unwrap();
+    fs::write(
+        scenario.project.path().join("consumer.crn"),
+        format!("let child = use {{ source = './child' }}\nlet instance = child {{ input = producer.new_{attribute} }}\n"),
+    )
+    .unwrap();
+    fs::write(
+        scenario.project.path().join("child/arguments.crn"),
+        format!("arguments {{ input: {collection}(mock.Bucket.Name) }}\n"),
+    )
+    .unwrap();
+    fs::write(
+        scenario.project.path().join("child/resources.crn"),
+        format!("let consumer = {owner}.Receiver {{ {attribute} = input }}\n"),
+    )
+    .unwrap();
+    carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(scenario.project.path()).unwrap(),
+        LoadedProviderFactory::for_test(vec![
+            Box::new(RuntimeEdgeFactory),
+            Box::new(ForwardFactory),
+        ]),
+    )
+}
+
+#[test]
+fn identity_edges_list_module_argument_rejects_a_later_owner_without_the_edge() {
+    let errors = collection_module_errors("other", "list", "buckets");
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert!(
+        errors[0].contains("Type mismatch: expected List<Name>, got List<mock.Bucket.NewName>")
+            && errors[0].contains("child/resources.crn"),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn identity_edges_list_module_argument_accepts_the_edge_declaring_owner() {
+    let errors = collection_module_errors("mock", "list", "buckets");
+    assert!(errors.is_empty(), "{errors:#?}");
+}
+
+#[test]
+fn identity_edges_map_module_argument_rejects_a_later_owner_without_the_edge() {
+    let errors = collection_module_errors("other", "map", "bucket_map");
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert!(
+        errors[0].contains("Type mismatch: expected Map<Name>, got Map<mock.Bucket.NewName>")
+            && errors[0].contains("child/resources.crn"),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn identity_edges_map_module_argument_accepts_the_edge_declaring_owner() {
+    let errors = collection_module_errors("mock", "map", "bucket_map");
+    assert!(errors.is_empty(), "{errors:#?}");
+}
+
 #[test]
 fn identity_edges_plan_runs_the_sink_identity_validator() {
     let runtime = tokio::runtime::Runtime::new().unwrap();

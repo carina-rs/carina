@@ -250,54 +250,13 @@ impl DeclaredValueSource {
         sink: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
         bindings: &BindingIndex<'_, B>,
     ) -> DeclaredValueAssignment {
-        // A rejected declaration owns the mismatch. Its original source is
-        // relevant only after the declaration passes at this sink.
-        let declaration = TypeInSchema::schemaless(&self.declaration);
-        match bindings.check_type_assignment(declaration, sink) {
-            Err(error) => {
-                return DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Unchecked(
-                    Box::new(error),
-                ));
-            }
-            Ok(false) => {
-                return DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Mismatch(
-                    RefTypeMismatch {
-                        actual: declaration.resolved_type_name(),
-                        declared: None,
-                    },
-                ));
-            }
-            Ok(true) => {}
-        }
-        match self.original.check_assignment(|source| {
-            bindings.consume_type_assignment(source.identity_assignment_to(sink))
-        }) {
-            Ok(()) => DeclaredValueAssignment::Assignable,
-            Err(error @ RefTypeAssignabilityError::Mismatch(_)) => {
-                let incoming = self
-                    .declaration
-                    .assignment_sink(&bindings.provider_context().custom_types);
-                // The incoming boundary already owns a proven rejection.
-                // Inspect that relation without recording another deferral:
-                // unknown incoming edges cannot explain this sink's mismatch.
-                let incoming_mismatch = std::iter::once(self.original.authoritative.constraint())
-                    .chain(&self.original.evidence)
-                    .any(|source| {
-                        matches!(
-                            source.type_in_schema().assignment_to(incoming),
-                            crate::schema::TypeAssignability::Mismatch,
-                        )
-                    });
-                if incoming_mismatch {
-                    DeclaredValueAssignment::IncomingBoundaryMismatch
-                } else {
-                    DeclaredValueAssignment::Rejected(error)
-                }
-            }
-            Err(error @ RefTypeAssignabilityError::Unchecked(_)) => {
-                DeclaredValueAssignment::Rejected(error)
-            }
-        }
+        TypeInSchema::schemaless(&self.declaration).declared_assignment_to(
+            &self.original,
+            self.declaration
+                .assignment_sink(&bindings.provider_context().custom_types),
+            sink,
+            bindings,
+        )
     }
 }
 
@@ -316,6 +275,13 @@ pub enum RefTypeAssignabilityError {
 }
 
 impl RefTypeMismatch {
+    pub(crate) fn direct(actual: String) -> Self {
+        Self {
+            actual,
+            declared: None,
+        }
+    }
+
     pub fn actual_type_name(&self) -> &str {
         &self.actual
     }
@@ -481,7 +447,22 @@ impl ResolvedRefType {
         self.check_assignment(|source| bindings.check_type_assignment(source, sink))
     }
 
-    fn check_assignment(
+    /// Inspect an incoming boundary without consuming or recording deferrals.
+    pub(crate) fn has_proven_mismatch_at(
+        &self,
+        sink: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
+    ) -> bool {
+        std::iter::once(self.authoritative.constraint())
+            .chain(&self.evidence)
+            .any(|source| {
+                matches!(
+                    source.type_in_schema().assignment_to(sink),
+                    crate::schema::TypeAssignability::Mismatch,
+                )
+            })
+    }
+
+    pub(crate) fn check_assignment(
         &self,
         mut judge: impl FnMut(
             TypeInSchema<'_, crate::schema::Compiled>,
@@ -1036,7 +1017,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         self.consume_type_assignment(source.assignment_to(sink))
     }
 
-    fn consume_type_assignment(
+    pub(crate) fn consume_type_assignment(
         &self,
         assignment: crate::schema::TypeAssignability<'_>,
     ) -> Result<bool, crate::parser::CustomTypeValidationError> {
