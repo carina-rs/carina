@@ -3511,6 +3511,7 @@ pub struct FnParam<B: BindingAddress = RelativeBindingName> {
 /// Functions are pure value transformations only.
 #[derive(Debug, Clone)]
 pub struct UserFunctionBody<B: BindingAddress = RelativeBindingName> {
+    pub(crate) location: super::DeclarationLocation,
     pub value: Value<ParserPlaceholder, B>,
     pub source_line: usize,
     /// Owning `.crn` file, stamped by the directory loader after parsing.
@@ -3561,6 +3562,7 @@ impl<B: BindingAddress> UserFunction<B> {
                 .map(|(name, value, line)| (name, value.map_bindings(map), line))
                 .collect(),
             body: UserFunctionBody {
+                location: self.body.location,
                 value: self.body.value.map_bindings(map),
                 source_line: self.body.source_line,
                 source_file: self.body.source_file,
@@ -5124,6 +5126,7 @@ impl<B: BindingAddress> Default for ParserBindingMetadata<B> {
 /// example a `for` iterable) without silently dropping the later type check.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PendingFunctionTypeCheck<B: BindingAddress = RelativeBindingName> {
+    pub(crate) location: super::DeclarationLocation,
     pub(crate) function_name: String,
     pub(crate) arguments: Vec<FunctionArgument<ParserPlaceholder, B>>,
     pub(crate) source_line: usize,
@@ -5325,6 +5328,7 @@ impl ParserBindingMetadata<RelativeBindingName> {
                 .into_iter()
                 .map(|check| {
                     let PendingFunctionTypeCheck {
+                        location,
                         function_name,
                         arguments,
                         source_line,
@@ -5332,6 +5336,7 @@ impl ParserBindingMetadata<RelativeBindingName> {
                         source_file,
                     } = check;
                     PendingFunctionTypeCheck {
+                        location,
                         function_name,
                         arguments: arguments
                             .into_iter()
@@ -5399,6 +5404,7 @@ impl ParserBindingMetadata<AbsoluteBindingAddress> {
 
         for check in pending_function_type_checks {
             let PendingFunctionTypeCheck {
+                location: _location,
                 function_name: _function_name,
                 arguments,
                 source_line: _source_line,
@@ -9305,6 +9311,9 @@ mod substitute_placeholder_tests {
                 annotation_source_file: None,
                 local_lets: Vec::new(),
                 body: UserFunctionBody {
+                    location: ModuleCallId::test_dummy_in("test.crn")
+                        .declaration_location()
+                        .clone(),
                     value: Value::Concrete(ConcreteValue::Int(1)),
                     source_line: 1,
                     source_file: None,

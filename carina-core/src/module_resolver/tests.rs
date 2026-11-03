@@ -4614,12 +4614,14 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
                 rhs: Value::Concrete(ConcreteValue::String("available".into())),
             },
             timeout_secs: Some(300),
-            depends_on: UnexpandedDependencies::new(vec![UnexpandedDependencyOperand::Handle(
-                crate::eval_value::UnexpandedResourceHandle::new(
-                    "subnet",
-                    ResourceTypePath::new("", "ec2.Subnet"),
+            depends_on: UnexpandedDependencies::new_for_test(vec![
+                UnexpandedDependencyOperand::Handle(
+                    crate::eval_value::UnexpandedResourceHandle::new(
+                        "subnet",
+                        ResourceTypePath::new("", "ec2.Subnet"),
+                    ),
                 ),
-            )]),
+            ]),
             line: 1,
             declaration: Default::default(),
         });

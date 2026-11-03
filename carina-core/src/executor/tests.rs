@@ -8898,9 +8898,9 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
     let mut parent = tag_update_resource("vpc", None);
     let mut child = tag_update_resource("child", None);
     if unknown_read {
-        child.dependencies.depends_on.push(
+        child.dependencies.depends_on = crate::parser::UnexpandedDependencies::new_for_test(vec![
             crate::parser::UnexpandedDependencyOperand::BareBinding(absolute_binding("vpc")),
-        );
+        ]);
     } else {
         child.set_attr("vpc_id", Value::root_resource_ref("vpc", "id", vec![]));
     }

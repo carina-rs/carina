@@ -365,6 +365,7 @@ fn parse_expression_with_resource_or_module(
     let mut pipe_inner = pipe.into_inner();
     let _compose = next_pair(&mut pipe_inner, "compose expression", "pipe expression")?;
     for function_call in pipe_inner {
+        let location = ctx.declaration_location(&function_call);
         let position = ctx.original_position(&function_call)?;
         let (line, column) = (position.line(), position.column());
         let mut function_inner = function_call.into_inner();
@@ -374,7 +375,15 @@ fn parse_expression_with_resource_or_module(
         let extra_args = function_inner
             .map(|argument| parse_expression_eval(argument, ctx))
             .collect::<Result<Vec<_>, _>>()?;
-        value = apply_pipe_step(value, function_name, extra_args, ctx, line, column)?;
+        value = apply_pipe_step(
+            value,
+            function_name,
+            extra_args,
+            ctx,
+            line,
+            column,
+            location,
+        )?;
         binding_kind = LetBindingKind::Value;
     }
 

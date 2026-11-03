@@ -552,6 +552,9 @@ pub struct SyntaxInventory<
     B: crate::resource::BindingAddress = crate::resource::RelativeBindingName,
 > {
     declarations: Vec<Located<DeclarationRecord>>,
+    // Keep authored names for declaration diagnostics, and scope membership
+    // in the binding phase so module expansion cannot leak private names.
+    binding_names: Vec<B>,
     type_annotations: Vec<Located<crate::validation::TypeResolutionContext>>,
     attribute_keys: Vec<AttributeKeyLocation>,
     providers: Vec<Located<ProviderDeclaration>>,
@@ -566,6 +569,7 @@ impl<B: crate::resource::BindingAddress> Default for SyntaxInventory<B> {
     fn default() -> Self {
         Self {
             declarations: Vec::new(),
+            binding_names: Vec::new(),
             type_annotations: Vec::new(),
             attribute_keys: Vec::new(),
             providers: Vec::new(),
@@ -606,11 +610,15 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
     pub fn declarations(&self) -> &[Located<DeclarationRecord>] {
         &self.declarations
     }
+    pub(crate) fn binding_names(&self) -> &[B] {
+        &self.binding_names
+    }
     pub fn upstream_sources(&self) -> &[Located<B>] {
         &self.upstream_sources
     }
     pub(crate) fn extend(&mut self, other: Self) {
         self.declarations.extend(other.declarations);
+        self.binding_names.extend(other.binding_names);
         self.type_annotations.extend(other.type_annotations);
         self.attribute_keys.extend(other.attribute_keys);
         self.providers.extend(other.providers);
@@ -627,6 +635,7 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
     ) -> SyntaxInventory<C> {
         SyntaxInventory {
             declarations: self.declarations,
+            binding_names: self.binding_names.into_iter().map(&mut *map).collect(),
             type_annotations: self.type_annotations,
             attribute_keys: self.attribute_keys,
             providers: self.providers,
@@ -692,6 +701,18 @@ impl SyntaxInventory {
             type_annotations.extend(function_type_annotations(&function, file, source));
         }
         let mut out = Self {
+            binding_names: declarations
+                .iter()
+                .filter(|declaration| {
+                    matches!(
+                        declaration.kind(),
+                        crate::config_loader::DeclarationKind::Binding
+                            | crate::config_loader::DeclarationKind::Argument
+                            | crate::config_loader::DeclarationKind::UserFunction
+                    )
+                })
+                .map(|declaration| crate::resource::RelativeBindingName::new(declaration.name()))
+                .collect(),
             declarations,
             type_annotations,
             ..Self::default()

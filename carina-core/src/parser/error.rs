@@ -69,7 +69,23 @@ impl UnresolvedTypeToken {
     }
 }
 
-/// Parse error
+/// Parse error.
+///
+/// Consumers cannot convert hand-built line numbers into a scoped finding:
+///
+/// ```compile_fail
+/// use carina_core::parser::ParseError;
+/// let error = ParseError::InvalidExpression { line: 42, message: "error".into() };
+/// let _ = error.file_diagnostic();
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::parser::ParseError;
+/// let _ = ParseError::Located {
+///     path: "arbitrary.crn".into(),
+///     error: Box::new(ParseError::InvalidExpression { line: 42, message: "error".into() }),
+/// };
+/// ```
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
     /// A runtime function selected historical evidence without its plaintext.
@@ -80,10 +96,15 @@ pub enum ParseError {
     /// file in the same directory. The inner error retains the precise line;
     /// this wrapper retains which document that line belongs to.
     #[error("{path}: {error}")]
+    #[non_exhaustive]
     Located {
         path: PathBuf,
         error: Box<ParseError>,
     },
+
+    /// An evaluation failure retaining its parser-owned expression location.
+    #[error(transparent)]
+    AtElement(Box<super::Located<ParseError>>),
 
     // A pest diagnostic is a terminal, already formatted leaf. Keep it in
     // Display and do not expose it again through Error::source.
@@ -347,7 +368,7 @@ pub struct ParseWarning {
 
 impl ParseError {
     pub(crate) fn in_file(self, path: impl Into<PathBuf>) -> Self {
-        if matches!(self, Self::Located { .. }) {
+        if matches!(self, Self::Located { .. } | Self::AtElement(_)) {
             self
         } else {
             Self::Located {
@@ -357,14 +378,29 @@ impl ParseError {
         }
     }
 
-    pub fn file_diagnostic(&self) -> Option<super::FileScoped<&Self>> {
-        self.source_file()
-            .map(|path| super::FileScoped::new(path, self))
+    pub(in crate::parser) fn at(self, location: &super::DeclarationLocation) -> Self {
+        match self {
+            Self::AtElement(_) => self,
+            Self::Located { path, error } if path == location.file().path() => {
+                (*error).at(location)
+            }
+            _ => Self::AtElement(Box::new(super::Located::new(location.clone(), self))),
+        }
+    }
+
+    /// Borrow an existing parser-owned finding without constructing provenance.
+    pub fn element_diagnostic(&self) -> Option<&super::Located<Self>> {
+        match self {
+            Self::AtElement(finding) => Some(finding),
+            Self::Located { error, .. } => error.element_diagnostic(),
+            _ => None,
+        }
     }
 
     pub fn source_file(&self) -> Option<&Path> {
         match self {
             Self::Located { path, .. } => Some(path),
+            Self::AtElement(finding) => Some(finding.location().file().path()),
             _ => None,
         }
     }

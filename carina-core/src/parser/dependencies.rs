@@ -50,10 +50,37 @@ impl<B: BindingAddress> UnexpandedDependencyOperand<B> {
 /// let operands: UnexpandedDependencies = UnexpandedDependencies::default();
 /// let _ = serde_json::to_string(&operands);
 /// ```
+///
+/// Operand construction is parser-owned and always retains a location:
+///
+/// ```compile_fail
+/// use carina_core::parser::{UnexpandedDependencies, UnexpandedDependencyOperand};
+/// let _: UnexpandedDependencies = UnexpandedDependencies::new(vec![]);
+/// ```
+///
+/// ```compile_fail,E0624
+/// use carina_core::parser::UnexpandedDependencies;
+/// let _: UnexpandedDependencies = UnexpandedDependencies::from_located(vec![]);
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::parser::{UnexpandedDependencies, UnexpandedDependencyOperand};
+/// let mut dependencies: UnexpandedDependencies = Default::default();
+/// dependencies.push(UnexpandedDependencyOperand::BareBinding("arbitrary".into()));
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::parser::{RelativeBindingName, UnexpandedDependencies};
+/// let _: UnexpandedDependencies = vec![RelativeBindingName::new("arbitrary")].into();
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::parser::{RelativeBindingName, UnexpandedDependencies};
+/// let _: UnexpandedDependencies = [RelativeBindingName::new("arbitrary")].into_iter().collect();
+/// ```
 #[derive(Debug, Clone)]
 pub struct UnexpandedDependencies<B: BindingAddress = RelativeBindingName> {
-    operands: Vec<UnexpandedDependencyOperand<B>>,
-    locations: Vec<super::DeclarationLocation>,
+    operands: Vec<super::Located<UnexpandedDependencyOperand<B>>>,
     // Value-reference origins survive eager value resolution alongside the
     // explicit operands. They do not contribute to len/is_empty or semantics.
     reference_origins: Vec<crate::resource::AccessPath<B>>,
@@ -63,28 +90,35 @@ impl<B: BindingAddress> Default for UnexpandedDependencies<B> {
     fn default() -> Self {
         Self {
             operands: Vec::new(),
-            locations: Vec::new(),
             reference_origins: Vec::new(),
         }
     }
 }
 impl<B: BindingAddress> UnexpandedDependencies<B> {
-    pub fn new(operands: Vec<UnexpandedDependencyOperand<B>>) -> Self {
+    pub(in crate::parser) fn from_located(
+        operands: Vec<super::Located<UnexpandedDependencyOperand<B>>>,
+    ) -> Self {
         Self {
             operands,
-            locations: Vec::new(),
             reference_origins: Vec::new(),
         }
     }
-    pub(crate) fn from_located(
-        operands: Vec<super::Located<UnexpandedDependencyOperand<B>>>,
-    ) -> Self {
-        let (locations, operands) = operands.into_iter().map(super::Located::into_parts).unzip();
-        Self {
-            operands,
-            locations,
-            reference_origins: Vec::new(),
-        }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(operands: Vec<UnexpandedDependencyOperand<B>>) -> Self {
+        let parsed = super::parse_file(
+            "let operand = 1",
+            std::path::Path::new("test.crn"),
+            &super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let location = parsed.parser_binding_metadata.syntax().declarations()[0].location();
+        Self::from_located(
+            operands
+                .into_iter()
+                .map(|operand| super::Located::new(location.clone(), operand))
+                .collect(),
+        )
     }
 
     pub(crate) fn reference_origins(&self) -> &[crate::resource::AccessPath<B>] {
@@ -102,8 +136,8 @@ impl<B: BindingAddress> UnexpandedDependencies<B> {
         }
     }
 
-    pub(crate) fn locations(&self) -> &[super::DeclarationLocation] {
-        &self.locations
+    pub(crate) fn located_operands(&self) -> &[super::Located<UnexpandedDependencyOperand<B>>] {
+        &self.operands
     }
 
     // Expansion may drop a forwarded operand, so transform its provenance in
@@ -112,37 +146,26 @@ impl<B: BindingAddress> UnexpandedDependencies<B> {
         &self,
         mut map: impl FnMut(
             usize,
-            &UnexpandedDependencyOperand<B>,
+            &super::Located<UnexpandedDependencyOperand<B>>,
         ) -> Result<Option<UnexpandedDependencyOperand<C>>, E>,
     ) -> Result<UnexpandedDependencies<C>, E> {
         let mut operands = Vec::new();
-        let mut locations = Vec::new();
-        for (index, operand) in self.operands.iter().enumerate() {
-            if let Some(operand) = map(index, operand)? {
-                operands.push(operand);
-                if let Some(location) = self.locations.get(index) {
-                    locations.push(location.clone());
-                }
+        for (index, located) in self.operands.iter().enumerate() {
+            if let Some(operand) = map(index, located)? {
+                operands.push(super::Located::new(located.location().clone(), operand));
             }
         }
         Ok(UnexpandedDependencies {
             operands,
-            locations,
             reference_origins: Vec::new(),
         })
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &UnexpandedDependencyOperand<B>> {
-        self.operands.iter()
+        self.operands.iter().map(super::Located::detail)
     }
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut UnexpandedDependencyOperand<B>> {
-        self.operands.iter_mut()
-    }
-    pub fn as_slice(&self) -> &[UnexpandedDependencyOperand<B>] {
-        &self.operands
-    }
-    pub fn push(&mut self, operand: UnexpandedDependencyOperand<B>) {
-        self.operands.push(operand);
+        self.operands.iter_mut().map(|operand| operand.detail_mut())
     }
     pub fn is_empty(&self) -> bool {
         self.operands.is_empty()
@@ -170,9 +193,11 @@ impl<B: BindingAddress> UnexpandedDependencies<B> {
             operands: self
                 .operands
                 .into_iter()
-                .map(|operand| operand.map_bindings(map))
+                .map(|operand| {
+                    let (location, operand) = operand.into_parts();
+                    super::Located::new(location, operand.map_bindings(map))
+                })
                 .collect(),
-            locations: self.locations,
             reference_origins: self
                 .reference_origins
                 .into_iter()
@@ -199,22 +224,31 @@ impl UnexpandedDependencies<AbsoluteBindingAddress> {
 }
 impl<B: BindingAddress> IntoIterator for UnexpandedDependencies<B> {
     type Item = UnexpandedDependencyOperand<B>;
-    type IntoIter = std::vec::IntoIter<Self::Item>;
+    type IntoIter = std::iter::Map<
+        std::vec::IntoIter<super::Located<Self::Item>>,
+        fn(super::Located<Self::Item>) -> Self::Item,
+    >;
     fn into_iter(self) -> Self::IntoIter {
-        self.operands.into_iter()
+        self.operands
+            .into_iter()
+            .map(|operand| operand.into_parts().1)
     }
 }
 impl<'a, B: BindingAddress> IntoIterator for &'a UnexpandedDependencies<B> {
     type Item = &'a UnexpandedDependencyOperand<B>;
-    type IntoIter = std::slice::Iter<'a, UnexpandedDependencyOperand<B>>;
+    type IntoIter = std::iter::Map<
+        std::slice::Iter<'a, super::Located<UnexpandedDependencyOperand<B>>>,
+        fn(&'a super::Located<UnexpandedDependencyOperand<B>>) -> Self::Item,
+    >;
     fn into_iter(self) -> Self::IntoIter {
-        self.operands.iter()
+        self.operands.iter().map(super::Located::detail)
     }
 }
 
+#[cfg(test)]
 impl<B: BindingAddress> FromIterator<B> for UnexpandedDependencies<B> {
     fn from_iter<T: IntoIterator<Item = B>>(bindings: T) -> Self {
-        Self::new(
+        Self::new_for_test(
             bindings
                 .into_iter()
                 .map(UnexpandedDependencyOperand::BareBinding)
@@ -222,6 +256,7 @@ impl<B: BindingAddress> FromIterator<B> for UnexpandedDependencies<B> {
         )
     }
 }
+#[cfg(test)]
 impl<B: BindingAddress> From<Vec<B>> for UnexpandedDependencies<B> {
     fn from(bindings: Vec<B>) -> Self {
         bindings.into_iter().collect()
@@ -230,7 +265,7 @@ impl<B: BindingAddress> From<Vec<B>> for UnexpandedDependencies<B> {
 
 impl<B: BindingAddress> PartialEq for UnexpandedDependencies<B> {
     fn eq(&self, other: &Self) -> bool {
-        self.operands == other.operands
+        self.iter().eq(other.iter())
     }
 }
 impl<B: BindingAddress> Eq for UnexpandedDependencies<B> {}

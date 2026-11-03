@@ -738,9 +738,11 @@ impl DirectiveResolutionError {
         let mut diagnostics = Vec::new();
         for source in self.diagnostic_sources() {
             let location = source.declaration_location().ok_or_else(|| {
-                crate::parser::AnalysisTreeError::MissingSyntaxProvenance {
-                    element: format!("directive {}", self.directive()),
-                }
+                crate::parser::AnalysisTreeError::new(
+                    crate::parser::AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                        element: format!("directive {}", self.directive()),
+                    },
+                )
             })?;
             if files.insert(location.file().clone()) {
                 diagnostics.push(crate::parser::Located::new(location.clone(), self));
@@ -1545,9 +1547,10 @@ mod tests {
             None,
         );
         resource.directives = template;
-        resource.dependencies.depends_on = crate::parser::UnexpandedDependencies::new(vec![
-            crate::parser::UnexpandedDependencyOperand::BareBinding(source),
-        ]);
+        resource.dependencies.depends_on =
+            crate::parser::UnexpandedDependencies::new_for_test(vec![
+                crate::parser::UnexpandedDependencyOperand::BareBinding(source),
+            ]);
         let mut visited = Vec::new();
         resource.map_absolute_bindings(&mut |binding| {
             visited.push(binding.to_string());

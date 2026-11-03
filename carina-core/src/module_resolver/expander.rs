@@ -1463,7 +1463,7 @@ fn resolve_directive_dependencies(
     use crate::parser::UnexpandedDependencyOperand as Operand;
     let mut resolved = dependencies.try_filter_map(|index, operand| {
         (|| {
-            let operand = match operand {
+            let operand = match operand.detail() {
                 Operand::Handle(handle) => {
                     match resolver.resolve_structural_argument(handle.structural())? {
                         ScopedStructuralArgument::Handle(handle) => {
@@ -1497,11 +1497,7 @@ fn resolve_directive_dependencies(
         })()
         .map_err(|error| {
             ArgumentSubstitutionError::Authored(crate::parser::Located::new(
-                dependencies
-                    .locations()
-                    .get(index)
-                    .expect("parser-owned dependency provenance")
-                    .clone(),
+                operand.location().clone(),
                 Box::new(error),
             ))
         })

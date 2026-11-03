@@ -3715,6 +3715,9 @@ mod tests {
             annotation_source_file: None,
             local_lets: Vec::new(),
             body: crate::parser::UserFunctionBody {
+                location: crate::parser::ModuleCallId::test_dummy_in("test.crn")
+                    .declaration_location()
+                    .clone(),
                 value: Value::Concrete(ConcreteValue::Int(1)),
                 source_line: 0,
                 source_file: None,

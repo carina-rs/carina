@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use carina_core::config_loader::{parse_directory, parse_directory_files};
 use carina_core::module_resolver::resolve_modules_providerless;
 use carina_core::parser::{
-    AnalysisItemKind, AnalysisTree, AnalysisTreeError, DeclarationLocation, ParsedFile,
+    AnalysisItemKind, AnalysisTree, AnalysisTreeErrorKind, DeclarationLocation, ParsedFile,
     ProviderContext,
 };
 use carina_core::paths::ResolvedPath;
@@ -126,6 +126,93 @@ fn expand_directory(root: &Path) -> carina_core::parser::ExpandedParsedFile {
     .publish(&mut NoTypeErrors)
     .into_expanded(&carina_core::schema::SchemaRegistry::new(), &config)
     .expect("placeholder expansion")
+}
+
+#[test]
+fn review_round1_module_private_bindings_do_not_enter_root_iterable_scope() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("module")).unwrap();
+    let sibling = "for x in vpc.ids { mock.test.Resource { name = x } }\n";
+    for (name, source) in [
+        (
+            "main.crn",
+            "let child = use { source = './module' }\nlet instance = child {}\n",
+        ),
+        ("sibling.crn", sibling),
+        (
+            "module/arguments.crn",
+            "arguments { unused: Bool = true }\n",
+        ),
+        (
+            "module/main.crn",
+            "let vpc = mock.test.Resource { name = 'private' }\n",
+        ),
+    ] {
+        std::fs::write(root.path().join(name), source).unwrap();
+    }
+    let path = ResolvedPath::new(root.path()).unwrap();
+    let expanded = TypeCheckSession::run(&context(), |session| {
+        let parsed = parse_directory(&path, session.catalog()).unwrap();
+        resolve_modules_providerless(parsed, &path, session).unwrap()
+    })
+    .publish(&mut NoTypeErrors);
+    let tree = AnalysisTree::try_from_file(&expanded).unwrap();
+    let findings = carina_core::validation::validate_for_iterable_bindings(&tree);
+    assert_eq!(
+        findings.len(),
+        1,
+        "module-private vpc leaked into root scope"
+    );
+    assert_location(
+        findings[0].location(),
+        &root.path().join("sibling.crn"),
+        sibling,
+        "vpc.ids",
+    );
+    assert!(
+        findings[0]
+            .to_string()
+            .contains("Undefined identifier `vpc`")
+    );
+}
+
+#[test]
+fn review_round1_root_and_module_loops_at_the_same_span_keep_distinct_files() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("module")).unwrap();
+    let loop_source = "for x in ['one'] { mock.test.Resource { name = x } }\n";
+    std::fs::write(root.path().join("main.crn"), loop_source).unwrap();
+    std::fs::write(
+        root.path().join("sibling.crn"),
+        "let child = use { source = './module' }\nlet instance = child {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("module/main.crn"),
+        format!("{loop_source}arguments {{ unused: Bool = true }}\n"),
+    )
+    .unwrap();
+    let expanded = expand_directory(root.path());
+    let tree = AnalysisTree::try_from_file(&expanded).unwrap();
+    let loops: Vec<_> = tree
+        .resources()
+        .filter(|item| item.kind() != AnalysisItemKind::Composition)
+        .collect();
+    assert_eq!(loops.len(), 2);
+    assert_eq!(loops[0].location().span(), loops[1].location().span());
+    let files: std::collections::HashSet<_> = loops
+        .iter()
+        .map(|item| item.location().file().path().to_path_buf())
+        .collect();
+    assert_eq!(
+        files,
+        [
+            root.path().join("main.crn"),
+            root.path().join("module/main.crn")
+        ]
+        .into_iter()
+        .collect()
+    );
 }
 
 #[test]
@@ -274,8 +361,8 @@ let selected_read = if enabled { read mock.test.Lookup { name = 'then read' } } 
         Err(error) => error,
     };
     assert!(matches!(
-        error,
-        AnalysisTreeError::MissingResourceProvenance {
+        error.kind(),
+        AnalysisTreeErrorKind::MissingResourceProvenance {
             kind: AnalysisItemKind::Composition,
             ..
         }
@@ -431,8 +518,8 @@ fn analysis_tree_rejects_missing_declaration_provenance() {
         Err(error) => error,
     };
     assert!(matches!(
-        error,
-        AnalysisTreeError::MissingResourceProvenance {
+        error.kind(),
+        AnalysisTreeErrorKind::MissingResourceProvenance {
             kind: AnalysisItemKind::Resource,
             ..
         }

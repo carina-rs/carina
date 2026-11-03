@@ -486,7 +486,10 @@ impl ModuleError {
                 display_source_path_relative_to(path, root),
                 display_parse_error_relative_to(error, root),
             ),
-            Self::Parse(error) => format!("Parse error: {error}"),
+            Self::Parse(error) => format!(
+                "Parse error: {}",
+                display_parse_error_relative_to(error, root)
+            ),
             Self::ParseInFile { path, error } => format!(
                 "Parse error in {}: {}",
                 display_source_path_relative_to(path, root),
@@ -573,6 +576,9 @@ fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
         ParseError::DeferredForBodyUnsupported(_)
         | ParseError::UndefinedDeferredIterable { .. } => true,
         ParseError::Located { path: _, error } => parse_error_is_deferred_for_body_rejection(error),
+        ParseError::AtElement(finding) => {
+            parse_error_is_deferred_for_body_rejection(finding.detail())
+        }
         ParseError::DeferredForBodyTemplate {
             line: _,
             header: _,
@@ -605,6 +611,17 @@ fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
 
 fn display_parse_error_relative_to(error: &ParseError, root: &Path) -> String {
     match error {
+        ParseError::AtElement(finding) => {
+            let location = finding.location();
+            let span = location.span();
+            format!(
+                "{}:{}:{}: {}",
+                display_source_path_relative_to(location.file().path(), root),
+                span.start_line(),
+                span.start_column(),
+                display_parse_error_relative_to(finding.detail(), root)
+            )
+        }
         ParseError::Located { path, error } => format!(
             "{}: {}",
             display_source_path_relative_to(path, root),

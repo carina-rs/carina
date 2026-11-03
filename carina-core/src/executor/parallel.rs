@@ -2112,9 +2112,9 @@ mod tests {
             Effect::Update { to, .. } => to.into_inner().into_unexpanded_for_test(),
             _ => unreachable!(),
         };
-        child.dependencies.depends_on.push(
+        child.dependencies.depends_on = crate::parser::UnexpandedDependencies::new_for_test(vec![
             crate::parser::UnexpandedDependencyOperand::BareBinding(absolute("parent")),
-        );
+        ]);
         let child = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("id"),
             from: Box::new((state_for(&child.id)).to_snapshot()),

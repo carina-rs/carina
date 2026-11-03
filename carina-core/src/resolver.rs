@@ -40,6 +40,15 @@ impl From<crate::parser::ParseError> for ResolutionError {
                 Self::Message(message) => Self::Message(format!("{}: {message}", path.display())),
                 unavailable @ Self::UnavailableSecret(_) => unavailable,
             },
+            crate::parser::ParseError::AtElement(finding) => {
+                let (location, error) = (*finding).into_parts();
+                match Self::from(error) {
+                    Self::Message(message) => {
+                        Self::Message(crate::parser::Located::new(location, message).to_string())
+                    }
+                    unavailable @ Self::UnavailableSecret(_) => unavailable,
+                }
+            }
             error => Self::Message(error.to_string()),
         }
     }
@@ -1564,6 +1573,39 @@ mod tests {
         assert_eq!(
             ResolutionError::from(ordinary).to_string(),
             "/project/functions.crn: Invalid expression at line 8: ordinary failure",
+        );
+    }
+
+    #[test]
+    fn element_owned_function_errors_preserve_unavailable_secret() {
+        let parsed = crate::config_loader::parse_directory_files(
+            &[
+                ("/project/main.crn".into(), "let unrelated = 'main'".into()),
+                (
+                    "/project/functions.crn".into(),
+                    "fn identity() { 'value' }".into(),
+                ),
+            ],
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap()
+        .remove(1)
+        .1
+        .into_inner();
+        let snapshot = crate::value::redact_secrets_in_value(&Value::Deferred(
+            DeferredValue::Secret(Box::new(Value::Concrete(ConcreteValue::String(
+                "historical secret".into(),
+            )))),
+        ))
+        .unwrap();
+        let unavailable = snapshot.to_value_at("state.credentials.token").unwrap_err();
+        let error = crate::parser::ParseError::AtElement(Box::new(crate::parser::Located::new(
+            parsed.user_functions["identity"].body.location.clone(),
+            crate::parser::ParseError::UnavailableSecret(unavailable.clone()),
+        )));
+        assert_eq!(
+            ResolutionError::from(error),
+            ResolutionError::UnavailableSecret(unavailable)
         );
     }
 

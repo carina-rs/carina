@@ -264,8 +264,11 @@ fn analysis_boundary_rejects_missing_export_and_type_inventory() {
         parsed.parser_binding_metadata = Default::default();
         assert!(
             matches!(
-                AnalysisTree::try_from_file(&parsed),
-                Err(AnalysisTreeError::MissingSyntaxProvenance { .. })
+                AnalysisTree::try_from_file(&parsed)
+                    .err()
+                    .as_ref()
+                    .map(AnalysisTreeError::kind),
+                Some(AnalysisTreeErrorKind::MissingSyntaxProvenance { .. })
             ),
             "unprovenanced analysis input: {source}"
         );
@@ -284,10 +287,126 @@ fn analysis_boundary_rejects_missing_merged_renderer_inventory() {
         parsed.parser_binding_metadata = Default::default();
         assert!(
             matches!(
-                AnalysisTree::try_from_file(&parsed),
-                Err(AnalysisTreeError::MissingSyntaxProvenance { .. })
+                AnalysisTree::try_from_file(&parsed)
+                    .err()
+                    .as_ref()
+                    .map(AnalysisTreeError::kind),
+                Some(AnalysisTreeErrorKind::MissingSyntaxProvenance { .. })
             ),
             "unprovenanced merged renderer input: {source}"
         );
     }
+}
+
+#[test]
+fn review_round1_loop_inventory_requires_exact_file_identity() {
+    let source = "for x in ['a'] { mock.test.Resource { name = x } }\n";
+    let files = crate::config_loader::parse_directory_files(
+        &[
+            ("main.crn".into(), source.into()),
+            ("module/main.crn".into(), source.into()),
+        ],
+        &context(),
+    )
+    .unwrap();
+    let mut files = files.into_iter();
+    let mut root = files.next().unwrap().1.into_inner();
+    let module = files.next().unwrap().1.into_inner();
+    assert!(AnalysisTree::try_from_file(&root).is_ok());
+    assert!(AnalysisTree::try_from_file(&module).is_ok());
+    // Simulate expansion losing the root inventory while retaining an
+    // identically positioned loop from module/main.crn.
+    root.parser_binding_metadata = module.parser_binding_metadata;
+    assert!(
+        AnalysisTree::try_from_file(&root).is_err(),
+        "module/main.crn must not supply provenance for a loop in main.crn"
+    );
+}
+
+#[test]
+fn review_round1_provider_analysis_returns_missing_provenance() {
+    let mut parsed = review_round1_provider_directory();
+    parsed.parser_binding_metadata = Default::default();
+    assert!(matches!(
+        resolve_provider_unresolved_attributes_for_analysis(&mut parsed, &context()),
+        Err(AnalysisResolutionError::Invariant(_))
+    ));
+}
+
+#[test]
+fn review_round1_expanded_provider_analysis_returns_missing_provenance() {
+    let mut parsed = review_round1_provider_directory().resolve_root_for_test();
+    parsed.parser_binding_metadata = Default::default();
+    assert!(matches!(
+        resolve_expanded_provider_unresolved_attributes_for_analysis(&mut parsed, &context()),
+        Err(AnalysisResolutionError::Invariant(_))
+    ));
+}
+
+#[test]
+fn review_round1_provider_finalization_returns_missing_provenance() {
+    let mut parsed = review_round1_provider_directory();
+    parsed.parser_binding_metadata = Default::default();
+    assert!(matches!(
+        finalize_provider_configs_for_analysis(&mut parsed),
+        Err(AnalysisResolutionError::Invariant(_))
+    ));
+}
+
+fn review_round1_provider_directory() -> ParsedFile {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("main.crn"), "let unrelated = 'main'\n").unwrap();
+    std::fs::write(
+        root.path().join("sibling.crn"),
+        "provider mock { default_tags = {} }\n",
+    )
+    .unwrap();
+    crate::config_loader::parse_directory(
+        &crate::paths::ResolvedPath::new(root.path()).unwrap(),
+        &context(),
+    )
+    .unwrap()
+    .into_parsed()
+}
+
+#[test]
+fn review_round1_filtered_dependencies_keep_later_operand_locations() {
+    let source = "mock.test.Resource { directives { depends_on = [first, first, second] } }\n";
+    let files = crate::config_loader::parse_directory_files(
+        &[
+            ("main.crn".into(), "let unrelated = 'main'".into()),
+            ("sibling.crn".into(), source.into()),
+        ],
+        &context(),
+    )
+    .unwrap();
+    let parsed = files.into_iter().nth(1).unwrap().1.into_inner();
+    let dependencies = &parsed.resources[0].dependencies.depends_on;
+    let filtered: UnexpandedDependencies = dependencies
+        .try_filter_map(|index, operand| {
+            Ok::<_, std::convert::Infallible>((index != 0).then(|| operand.detail().clone()))
+        })
+        .unwrap();
+    assert_eq!(filtered.diagnostic_references(), ["first", "second"]);
+    for (operand, start) in filtered.located_operands().iter().zip([
+        source.match_indices("first").nth(1).unwrap().0,
+        source.find("second").unwrap(),
+    ]) {
+        assert_eq!(operand.location().file().path(), Path::new("sibling.crn"));
+        assert_eq!(operand.location().span().start_byte(), start);
+        assert_eq!(
+            slice(source, operand.location()),
+            operand.detail().diagnostic_reference()
+        );
+    }
+    let remapped =
+        filtered.map_bindings(&mut |binding| crate::resource::RootScope::new().resolve(binding));
+    assert_eq!(
+        remapped.located_operands()[0].location(),
+        dependencies.located_operands()[1].location()
+    );
+    assert_eq!(
+        remapped.located_operands()[1].location(),
+        dependencies.located_operands()[2].location()
+    );
 }

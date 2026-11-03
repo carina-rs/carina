@@ -6,8 +6,8 @@ mod analysis;
 pub use analysis::{
     AnalysisDependencyRef, AnalysisForRef, AnalysisItemKind, AnalysisReference,
     AnalysisResourceRef, AnalysisTree, AnalysisTreeDiagnostic, AnalysisTreeError,
-    AnalysisValueReference, AnalysisWaitRef, DeclarationLocation, DeclarationProvenance,
-    DirectoryScoped, FileScoped, Located,
+    AnalysisTreeErrorKind, AnalysisValueReference, AnalysisWaitRef, DeclarationLocation,
+    DeclarationProvenance, DirectoryScoped, FileScoped, Located,
 };
 mod ast;
 pub(crate) use ast::ParserSeedMetadata;
@@ -33,8 +33,9 @@ mod functions;
 mod grammar;
 mod let_binding;
 mod resolve;
+pub(crate) use resolve::resolve_resource_refs_in_session_unsealed;
 pub use resolve::{
-    finalize_provider_configs_for_analysis,
+    AnalysisResolutionError, finalize_provider_configs_for_analysis,
     resolve_expanded_provider_unresolved_attributes_for_analysis,
     resolve_provider_unresolved_attributes_for_analysis,
 };

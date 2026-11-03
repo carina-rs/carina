@@ -109,13 +109,15 @@ fn analysis_tree_rejects_unlocated_data_wait_and_nested_declarations() {
             Ok(_) => panic!("case {case} admitted unlocated {expected:?}"),
             Err(error) => error,
         };
-        match error {
-            AnalysisTreeError::MissingResourceProvenance { kind, .. } => assert_eq!(kind, expected),
-            AnalysisTreeError::MissingWaitProvenance { .. } => {
+        match error.kind() {
+            AnalysisTreeErrorKind::MissingResourceProvenance { kind, .. } => {
+                assert_eq!(*kind, expected)
+            }
+            AnalysisTreeErrorKind::MissingWaitProvenance { .. } => {
                 assert_eq!(expected, AnalysisItemKind::Wait)
             }
-            error @ (AnalysisTreeError::MissingElementProvenance { .. }
-            | AnalysisTreeError::MissingSyntaxProvenance { .. }) => {
+            error @ (AnalysisTreeErrorKind::MissingElementProvenance { .. }
+            | AnalysisTreeErrorKind::MissingSyntaxProvenance { .. }) => {
                 panic!("unexpected element invariant: {error}")
             }
         }
@@ -3081,6 +3083,14 @@ fn secret_derived_backend_attribute_error_carries_the_attribute_span() {
     )
     .expect_err("secret-derived backend attributes must be rejected");
 
+    let ParseError::AtElement(finding) = error else {
+        panic!("backend validation must retain its parser-owned location: {error:?}")
+    };
+    let (location, error) = (*finding).into_parts();
+    assert_eq!(
+        &input[location.span().start_byte()..location.span().end_byte()],
+        "path"
+    );
     match error {
         ParseError::SecretDerivedBackendAttribute {
             backend_type,

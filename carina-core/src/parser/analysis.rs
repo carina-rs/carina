@@ -109,6 +109,7 @@ impl DeclarationLocation {
                 | Rule::for_expr
                 | Rule::if_expr
                 | Rule::resource_address
+                | Rule::function_call
         ));
         Self {
             file: SourceFileId::new(source_file.to_path_buf()),
@@ -264,6 +265,10 @@ impl<D> Located<D> {
         &self.detail
     }
 
+    pub(in crate::parser) fn detail_mut(&mut self) -> &mut D {
+        &mut self.detail
+    }
+
     pub fn into_parts(self) -> (DeclarationLocation, D) {
         (self.location, self.detail)
     }
@@ -369,8 +374,37 @@ pub enum AnalysisItemKind {
 }
 
 /// Invariant failure at the boundary between parsing/expansion and analysis.
+///
+/// Consumers cannot manufacture a directory finding from an arbitrary label:
+///
+/// ```compile_fail
+/// use carina_core::parser::AnalysisTreeError;
+/// let _ = AnalysisTreeError::MissingSyntaxProvenance { element: "arbitrary".into() }.diagnostic();
+/// ```
+///
+/// ```compile_fail,E0451
+/// use carina_core::parser::{AnalysisTreeError, AnalysisTreeErrorKind};
+/// let _ = AnalysisTreeError {
+///     kind: AnalysisTreeErrorKind::MissingSyntaxProvenance { element: "arbitrary".into() },
+/// }.diagnostic();
+/// ```
+///
+/// ```compile_fail,E0624
+/// use carina_core::parser::{AnalysisTreeError, AnalysisTreeErrorKind};
+/// let _ = AnalysisTreeError::new(
+///     AnalysisTreeErrorKind::MissingSyntaxProvenance { element: "arbitrary".into() },
+/// );
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum AnalysisTreeError {
+#[error(transparent)]
+pub struct AnalysisTreeError {
+    kind: AnalysisTreeErrorKind,
+}
+
+/// Read-only details of a rejected analysis input. These details alone cannot
+/// construct an error or mint a scoped diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AnalysisTreeErrorKind {
     #[error("missing parser syntax provenance for {element}")]
     MissingSyntaxProvenance { element: String },
     #[error("missing declaration provenance for {kind:?} {id}")]
@@ -393,9 +427,17 @@ pub enum AnalysisTreeDiagnostic<'a> {
 }
 
 impl AnalysisTreeError {
+    pub(crate) fn new(kind: AnalysisTreeErrorKind) -> Self {
+        Self { kind }
+    }
+
+    pub fn kind(&self) -> &AnalysisTreeErrorKind {
+        &self.kind
+    }
+
     pub fn diagnostic(&self) -> AnalysisTreeDiagnostic<'_> {
-        match self {
-            Self::MissingElementProvenance { declaration, .. } => {
+        match &self.kind {
+            AnalysisTreeErrorKind::MissingElementProvenance { declaration, .. } => {
                 AnalysisTreeDiagnostic::File(FileScoped::new(declaration.file().path(), self))
             }
             _ => AnalysisTreeDiagnostic::Directory(DirectoryScoped { detail: self }),
@@ -540,9 +582,11 @@ fn collect_value_references<P: ValueKind, B: BindingAddress>(
                 typed_consumer,
             }),
             None => {
-                result = Err(AnalysisTreeError::MissingSyntaxProvenance {
-                    element: format!("{context} reference {path}"),
-                })
+                result = Err(AnalysisTreeError::new(
+                    AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                        element: format!("{context} reference {path}"),
+                    },
+                ))
             }
         },
     );
@@ -576,19 +620,15 @@ impl<'a, B: BindingAddress> AnalysisDependencyRef<'a, B> {
 
 fn dependency_refs<'a, B: BindingAddress>(
     dependencies: &'a super::UnexpandedDependencies<B>,
-    declaration: &DeclarationLocation,
-) -> Result<Vec<AnalysisDependencyRef<'a, B>>, AnalysisTreeError> {
-    if dependencies.len() != dependencies.locations().len() {
-        return Err(AnalysisTreeError::MissingElementProvenance {
-            declaration: declaration.clone(),
-            element: "dependency operand".into(),
-        });
-    }
-    Ok(dependencies
+) -> Vec<AnalysisDependencyRef<'a, B>> {
+    dependencies
+        .located_operands()
         .iter()
-        .zip(dependencies.locations())
-        .map(|(operand, location)| AnalysisDependencyRef { operand, location })
-        .collect())
+        .map(|operand| AnalysisDependencyRef {
+            operand: operand.detail(),
+            location: operand.location(),
+        })
+        .collect()
 }
 
 fn append_reference_origins<B: BindingAddress>(
@@ -598,10 +638,10 @@ fn append_reference_origins<B: BindingAddress>(
 ) -> Result<(), AnalysisTreeError> {
     for path in dependencies.reference_origins() {
         let locations = path.reference_locations_shared().ok_or_else(|| {
-            AnalysisTreeError::MissingElementProvenance {
+            AnalysisTreeError::new(AnalysisTreeErrorKind::MissingElementProvenance {
                 declaration: declaration.clone(),
                 element: format!("reference edge {path}"),
-            }
+            })
         })?;
         if !references
             .iter()
@@ -620,16 +660,15 @@ fn required_element(
     provenance: &DeclarationProvenance,
     kind: super::elements::ElementKind,
 ) -> Result<&DeclarationLocation, AnalysisTreeError> {
-    provenance
-        .elements()
-        .get(kind)
-        .ok_or_else(|| AnalysisTreeError::MissingElementProvenance {
+    provenance.elements().get(kind).ok_or_else(|| {
+        AnalysisTreeError::new(AnalysisTreeErrorKind::MissingElementProvenance {
             declaration: provenance
                 .location()
                 .expect("declaration checked before elements")
                 .clone(),
             element: format!("{kind:?}"),
         })
+    })
 }
 
 type AttributeProvenance<'a, B> = (
@@ -655,9 +694,11 @@ fn attribute_provenance<'a, P: ValueKind, B: BindingAddress>(
             .clone()
             .find(|entry| entry.is_block())
             .or_else(|| root_keys.next_back())
-            .ok_or_else(|| AnalysisTreeError::MissingElementProvenance {
-                declaration: location.clone(),
-                element: format!("attribute key {key}"),
+            .ok_or_else(|| {
+                AnalysisTreeError::new(AnalysisTreeErrorKind::MissingElementProvenance {
+                    declaration: location.clone(),
+                    element: format!("attribute key {key}"),
+                })
             })?
             .location();
         keys.insert(key.clone(), key_location);
@@ -668,10 +709,12 @@ fn attribute_provenance<'a, P: ValueKind, B: BindingAddress>(
                 locations: locations.clone(),
             }),
             None => {
-                result = Err(AnalysisTreeError::MissingElementProvenance {
-                    declaration: location.clone(),
-                    element: format!("reference {path}"),
-                })
+                result = Err(AnalysisTreeError::new(
+                    AnalysisTreeErrorKind::MissingElementProvenance {
+                        declaration: location.clone(),
+                        element: format!("reference {path}"),
+                    },
+                ))
             }
         });
         result?;
@@ -940,10 +983,10 @@ where
                     ),
                 };
                 let location = provenance.location().ok_or_else(|| {
-                    AnalysisTreeError::MissingResourceProvenance {
+                    AnalysisTreeError::new(AnalysisTreeErrorKind::MissingResourceProvenance {
                         kind,
                         id: resource.id().clone(),
-                    }
+                    })
                 })?;
                 let (attribute_locations, references, dependencies, provider_location) =
                     match resource {
@@ -974,7 +1017,7 @@ where
                             (
                                 keys,
                                 refs,
-                                dependency_refs(&item.dependencies.depends_on, location)?,
+                                dependency_refs(&item.dependencies.depends_on),
                                 provider,
                             )
                         }
@@ -1005,7 +1048,7 @@ where
                             (
                                 keys,
                                 refs,
-                                dependency_refs(&item.dependencies.depends_on, location)?,
+                                dependency_refs(&item.dependencies.depends_on),
                                 provider,
                             )
                         }
@@ -1061,7 +1104,7 @@ where
                             (
                                 keys,
                                 refs,
-                                dependency_refs(&item.dependencies.depends_on, location)?,
+                                dependency_refs(&item.dependencies.depends_on),
                                 provider,
                             )
                         }
@@ -1093,9 +1136,9 @@ where
             .iter()
             .map(|wait| {
                 let location = wait.declaration.location().ok_or_else(|| {
-                    AnalysisTreeError::MissingWaitProvenance {
+                    AnalysisTreeError::new(AnalysisTreeErrorKind::MissingWaitProvenance {
                         binding: wait.binding.as_str().to_owned(),
-                    }
+                    })
                 })?;
                 Ok(AnalysisWaitRef {
                     wait,
@@ -1112,7 +1155,7 @@ where
                         &wait.declaration,
                         super::elements::ElementKind::UntilRhs,
                     )?,
-                    dependencies: dependency_refs(&wait.depends_on, location)?,
+                    dependencies: dependency_refs(&wait.depends_on),
                 })
             })
             .collect::<Result<_, AnalysisTreeError>>()?;
@@ -1179,7 +1222,9 @@ where
             if present {
                 Ok(())
             } else {
-                Err(AnalysisTreeError::MissingSyntaxProvenance { element })
+                Err(AnalysisTreeError::new(
+                    AnalysisTreeErrorKind::MissingSyntaxProvenance { element },
+                ))
             }
         };
         for item in &resources {
@@ -1198,7 +1243,7 @@ where
             if let Some(origin) = resource.loop_provenance.display_origin() {
                 require_syntax(
                     syntax.loops().iter().any(|location| {
-                        location.file().path().ends_with(origin.file())
+                        Some(location.file()) == origin.source_file()
                             && Some(location.span()) == origin.source_span()
                     }),
                     format!("loop identity origin {}", item.id()),
@@ -1234,16 +1279,20 @@ where
                 .iter()
                 .rev()
                 .find(|block| *block.detail() == super::ConfigurationBlock::Backend)
-                .ok_or_else(|| AnalysisTreeError::MissingSyntaxProvenance {
-                    element: "backend declaration".to_string(),
+                .ok_or_else(|| {
+                    AnalysisTreeError::new(AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                        element: "backend declaration".to_string(),
+                    })
                 })?;
             for key in backend.attributes.keys() {
                 if !syntax.backend_keys().iter().any(|entry| {
                     entry.detail() == key && entry.location().file() == header.location().file()
                 }) {
-                    return Err(AnalysisTreeError::MissingSyntaxProvenance {
-                        element: format!("backend attribute {key}"),
-                    });
+                    return Err(AnalysisTreeError::new(
+                        AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                            element: format!("backend attribute {key}"),
+                        },
+                    ));
                 }
             }
             Some(header.location())
@@ -1277,8 +1326,10 @@ where
                         && declaration.location().file().path() == source
                         && span.contains(declaration.location().span())
                 })
-                .ok_or_else(|| AnalysisTreeError::MissingSyntaxProvenance {
-                    element: format!("{kind:?} declaration {name}"),
+                .ok_or_else(|| {
+                    AnalysisTreeError::new(AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                        element: format!("{kind:?} declaration {name}"),
+                    })
                 })
         };
         for export in &file.export_params {
@@ -1390,9 +1441,11 @@ where
                 .nth(*occurrence)
                 .is_none()
             {
-                return Err(AnalysisTreeError::MissingSyntaxProvenance {
-                    element: format!("{context} annotation"),
-                });
+                return Err(AnalysisTreeError::new(
+                    AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                        element: format!("{context} annotation"),
+                    },
+                ));
             }
             *occurrence += 1;
         }
@@ -1408,8 +1461,10 @@ where
                 .filter(|record| record.name == provider.name && record.binding == provider.binding)
                 .nth(*occurrence);
             *occurrence += 1;
-            let record = record.ok_or_else(|| AnalysisTreeError::MissingSyntaxProvenance {
-                element: format!("provider {} declaration", provider.name),
+            let record = record.ok_or_else(|| {
+                AnalysisTreeError::new(AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                    element: format!("provider {} declaration", provider.name),
+                })
             })?;
             let mut locations = std::collections::HashMap::new();
             for key in provider.unresolved_attributes.keys() {
@@ -1418,8 +1473,10 @@ where
                     .iter()
                     .rev()
                     .find(|attribute| attribute.detail() == key)
-                    .ok_or_else(|| AnalysisTreeError::MissingSyntaxProvenance {
-                        element: format!("provider {} attribute {key}", provider.name),
+                    .ok_or_else(|| {
+                        AnalysisTreeError::new(AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                            element: format!("provider {} attribute {key}", provider.name),
+                        })
                     })?;
                 locations.insert(key.clone(), location.location().clone());
             }
@@ -1436,8 +1493,10 @@ where
                     .iter()
                     .filter(|source| *source.detail() == state.binding)
                     .nth(*occurrence)
-                    .ok_or_else(|| AnalysisTreeError::MissingSyntaxProvenance {
-                        element: format!("upstream source {}", state.binding),
+                    .ok_or_else(|| {
+                        AnalysisTreeError::new(AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                            element: format!("upstream source {}", state.binding),
+                        })
                     })?;
                 *occurrence += 1;
                 Ok(Located::new(source.location().clone(), state))
@@ -1447,9 +1506,9 @@ where
             .deferred_for_sites()
             .map(|site| {
                 let location = site.iterable_location.ok_or_else(|| {
-                    AnalysisTreeError::MissingSyntaxProvenance {
+                    AnalysisTreeError::new(AnalysisTreeErrorKind::MissingSyntaxProvenance {
                         element: format!("iterable {}", site.header),
-                    }
+                    })
                 })?;
                 let mut refs = Vec::new();
                 collect_value_references(site.iterable, site.header, false, &mut refs)?;
@@ -1498,8 +1557,10 @@ where
                     .iter()
                     .find(|record| record.kind() == kind && record.name() == name)
                     .map(|record| record.value_location().unwrap_or(record.location()))
-                    .ok_or_else(|| AnalysisTreeError::MissingSyntaxProvenance {
-                        element: format!("{kind:?} {name} value"),
+                    .ok_or_else(|| {
+                        AnalysisTreeError::new(AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                            element: format!("{kind:?} {name} value"),
+                        })
                     })
             };
         use crate::config_loader::DeclarationKind;
@@ -1604,9 +1665,9 @@ where
         for state in &file.state_blocks {
             if let super::StateBlock::Import { id, .. } = state {
                 let location = syntax.state_targets().first().ok_or_else(|| {
-                    AnalysisTreeError::MissingSyntaxProvenance {
+                    AnalysisTreeError::new(AnalysisTreeErrorKind::MissingSyntaxProvenance {
                         element: "state import".into(),
-                    }
+                    })
                 })?;
                 add_value(location, id, None, None)?;
             }
@@ -1635,17 +1696,9 @@ where
             root_configuration: file.backend.is_some() || !file.providers.is_empty(),
             backend_location,
             binding_names: syntax
-                .declarations()
+                .binding_names()
                 .iter()
-                .filter(|declaration| {
-                    matches!(
-                        declaration.kind(),
-                        crate::config_loader::DeclarationKind::Binding
-                            | crate::config_loader::DeclarationKind::Argument
-                            | crate::config_loader::DeclarationKind::UserFunction
-                    )
-                })
-                .map(|declaration| declaration.name().to_string())
+                .map(ToString::to_string)
                 .chain(file.variables.keys().cloned())
                 .chain(file.structural_bindings.iter().map(ToString::to_string))
                 .collect(),

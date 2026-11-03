@@ -658,6 +658,7 @@ fn parse_primary_eval_with_mode_inner(
         }
         Rule::string => parse_string_value(inner, ctx).map(EvalValue::from_value),
         Rule::function_call => {
+            let location = ctx.declaration_location(&inner);
             let (line, column) = inner.line_col();
             let mut fc_inner = inner.into_inner();
             let func_name = next_pair(&mut fc_inner, "function name", "function call")?
@@ -707,6 +708,7 @@ fn parse_primary_eval_with_mode_inner(
                         ctx,
                         line,
                         Some(column),
+                        location.clone(),
                     );
                 }
                 if !ctx.seeded_user_functions.contains(&func_name)
@@ -722,6 +724,7 @@ fn parse_primary_eval_with_mode_inner(
                     ctx,
                     line,
                     Some(column),
+                    location,
                 );
                 return Ok(EvalValue::from_value(Value::Deferred(
                     DeferredValue::ResolvedFunctionCall {

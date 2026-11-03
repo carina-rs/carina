@@ -981,22 +981,39 @@ impl DiagnosticRun<'_> {
         base: &carina_core::paths::ResolvedPath,
     ) -> Vec<Diagnostic> {
         let message = residual.display_relative_to(&base.source_label());
+        let element = residual.element_diagnostic();
+        let mut diagnostics = element
+            .and_then(|finding| {
+                render_merged(doc, finding, DiagnosticSeverity::ERROR, message.clone())
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
         if matches!(
             residual.call_source(),
             carina_core::module_resolver::ModuleErrorCallSource::Unavailable
-        ) && let Some(finding) = residual.file_diagnostic(base)
+        ) && element.is_none()
+            && let Some(finding) = residual.file_diagnostic(base)
         {
             return render_parse(doc, &finding, DiagnosticSeverity::ERROR, message)
                 .into_iter()
                 .collect();
         }
-        residual
-            .call_diagnostics(tree)
-            .iter()
-            .filter_map(|finding| {
-                render_merged(doc, finding, DiagnosticSeverity::ERROR, message.clone())
-            })
-            .collect()
+        diagnostics.extend(
+            residual
+                .call_diagnostics(tree)
+                .iter()
+                // Keep caller-owned failures, but prefer the precise semantic
+                // element when a call and its error share the current file.
+                .filter(|finding| {
+                    element.is_none_or(|element| {
+                        finding.location().file() != element.location().file()
+                    })
+                })
+                .filter_map(|finding| {
+                    render_merged(doc, finding, DiagnosticSeverity::ERROR, message.clone())
+                }),
+        );
+        diagnostics
     }
 
     /// Check tag-key casing against the directory-wide CLI population while
@@ -1059,7 +1076,7 @@ impl DiagnosticRun<'_> {
         doc: &Document,
         current_file_name: Option<&str>,
         base_path: &carina_core::paths::ResolvedPath,
-    ) -> Option<Box<carina_core::parser::Located<carina_core::parser::ParseError>>> {
+    ) -> Option<carina_core::parser::AnalysisResolutionError> {
         let mut overrides: HashMap<String, String> = HashMap::new();
         if let Some(name) = current_file_name {
             overrides.insert(name.to_string(), doc.text());

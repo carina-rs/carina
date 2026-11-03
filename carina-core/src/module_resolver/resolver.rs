@@ -154,6 +154,14 @@ impl ResidualModuleResolutionError {
         Some(crate::parser::scope_parse_failure(&path, error))
     }
 
+    pub fn element_diagnostic(&self) -> Option<&crate::parser::Located<ParseError>> {
+        match self.0.root_cause() {
+            ModuleError::Parse(error) => error.element_diagnostic(),
+            ModuleError::ParseInFile { error, .. } => error.element_diagnostic(),
+            _ => None,
+        }
+    }
+
     pub fn call_diagnostics<'a, D, B: crate::resource::BindingAddress>(
         &'a self,
         tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
@@ -358,6 +366,17 @@ impl ResidualModuleResolutionError {
                             .iter()
                             .filter_map(|finding| finding.message().type_resolution_diagnostic()),
                         crate::validation::TypeResolutionParserError::new(path, error),
+                    )
+                }
+                ParseError::AtElement(finding) => {
+                    crate::validation::type_resolution_parser_error_is_covered(
+                        findings
+                            .iter()
+                            .filter_map(|finding| finding.message().type_resolution_diagnostic()),
+                        crate::validation::TypeResolutionParserError::new(
+                            finding.location().file().path(),
+                            finding.detail(),
+                        ),
                     )
                 }
                 ParseError::Syntax(_)
@@ -1229,7 +1248,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         // intact. Besides folding module-local values, this records the direct
         // dependency bindings that expansion subsequently instance-prefixes.
         // Argument bindings remain deferred for call-site substitution.
-        crate::parser::resolve_resource_refs_in_session(&mut merged, self.session)
+        crate::parser::resolve_resource_refs_in_session_unsealed(&mut merged, self.session)
             .map_err(ModuleError::Parse)?;
 
         P::resolve_file_type_exprs(&mut merged, self.session)?;

@@ -5968,9 +5968,11 @@ impl LeftoverPlaceholder {
         &self,
     ) -> Result<crate::parser::Located<&Self>, crate::parser::AnalysisTreeError> {
         let location = self.placeholder.declaration_location().ok_or_else(|| {
-            crate::parser::AnalysisTreeError::MissingSyntaxProvenance {
-                element: self.to_string(),
-            }
+            crate::parser::AnalysisTreeError::new(
+                crate::parser::AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                    element: self.to_string(),
+                },
+            )
         })?;
         Ok(crate::parser::Located::new(location.clone(), self))
     }

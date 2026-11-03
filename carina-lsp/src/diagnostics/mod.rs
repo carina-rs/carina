@@ -59,15 +59,7 @@ where
     match carina_core::parser::AnalysisTree::try_from_file(parsed) {
         Ok(tree) => Some(tree),
         Err(error) => {
-            let message = error.to_string();
-            let diagnostic = match error.diagnostic() {
-                carina_core::parser::AnalysisTreeDiagnostic::File(finding) => {
-                    render_merged(doc, &finding, DiagnosticSeverity::ERROR, message)
-                }
-                carina_core::parser::AnalysisTreeDiagnostic::Directory(finding) => {
-                    render_merged(doc, &finding, DiagnosticSeverity::ERROR, message)
-                }
-            };
+            let diagnostic = render_analysis_invariant(doc, &error);
             if let Some(diagnostic) = diagnostic
                 && !diagnostics.contains(&diagnostic)
             {
@@ -75,6 +67,38 @@ where
             }
             None
         }
+    }
+}
+
+fn render_analysis_invariant(
+    doc: &Document,
+    error: &carina_core::parser::AnalysisTreeError,
+) -> Option<Diagnostic> {
+    let message = error.to_string();
+    match error.diagnostic() {
+        carina_core::parser::AnalysisTreeDiagnostic::File(finding) => {
+            render_merged(doc, &finding, DiagnosticSeverity::ERROR, message)
+        }
+        carina_core::parser::AnalysisTreeDiagnostic::Directory(finding) => {
+            render_merged(doc, &finding, DiagnosticSeverity::ERROR, message)
+        }
+    }
+}
+
+fn render_analysis_resolution_error(
+    doc: &Document,
+    error: &carina_core::parser::AnalysisResolutionError,
+) -> Option<Diagnostic> {
+    match error {
+        carina_core::parser::AnalysisResolutionError::Invariant(error) => {
+            render_analysis_invariant(doc, error)
+        }
+        carina_core::parser::AnalysisResolutionError::Diagnostic(finding) => render_merged(
+            doc,
+            finding.as_ref(),
+            DiagnosticSeverity::ERROR,
+            finding.detail().to_string(),
+        ),
     }
 }
 
@@ -681,15 +705,21 @@ impl DiagnosticRun<'_> {
                     .iter()
                     .any(|duplicate| duplicate.covers_parse_error(parse_error))
             {
-                let finding = error
-                    .diagnostic()
-                    .expect("directory parser error file provenance");
-                diagnostics.extend(render_parse(
-                    doc,
-                    &finding,
-                    DiagnosticSeverity::ERROR,
-                    parse_error.to_string(),
-                ));
+                if let Some(finding) = error.element_diagnostic() {
+                    diagnostics.extend(render_merged(
+                        doc,
+                        finding,
+                        DiagnosticSeverity::ERROR,
+                        parse_error.to_string(),
+                    ));
+                } else if let Some(finding) = error.diagnostic() {
+                    diagnostics.extend(render_parse(
+                        doc,
+                        &finding,
+                        DiagnosticSeverity::ERROR,
+                        parse_error.to_string(),
+                    ));
+                }
             }
             failed_directory_type_resolution = type_resolution;
             true
@@ -892,27 +922,15 @@ impl DiagnosticRun<'_> {
         // clone after declaration resolution so the session already owns any
         // failed signatures. This surfaces source-owned body errors (for example, a
         // sibling call that binds a structural handle and then uses the
-        // parameter bare). `ParseError::Located` keeps the diagnostic on the
-        // function document rather than the caller document.
-        if let (Some(result), Some(current_file_path)) = (merged_result.as_ref(), current_file_path)
-        {
+        // parameter bare). Resolution retains the parser-owned expression
+        // location through the merged pass.
+        if let Some(result) = merged_result.as_ref() {
             let mut strict = result.directory.parsed.parsed().clone();
             if let Err(error) = carina_core::parser::resolve_resource_refs_in_session(
                 &mut strict,
                 self.provider_context,
-            ) && error
-                .source_file()
-                .is_some_and(|source_file| source_file == current_file_path)
-            {
-                let finding = error
-                    .file_diagnostic()
-                    .expect("strict directory failure owns a source file");
-                diagnostics.extend(render_parse(
-                    doc,
-                    &finding,
-                    DiagnosticSeverity::ERROR,
-                    error.to_string(),
-                ));
+            ) {
+                diagnostics.extend(render_analysis_resolution_error(doc, &error));
             }
         }
         // Every catalog runs the same declaration producers. An incomplete
@@ -939,7 +957,7 @@ impl DiagnosticRun<'_> {
                                     self.provider_context,
                                 )
                             {
-                                diagnostics.push(parse_error_in_document(doc, &error));
+                                diagnostics.extend(render_analysis_resolution_error(doc, &error));
                             }
                             findings
                         })
@@ -980,12 +998,11 @@ impl DiagnosticRun<'_> {
         if let Some(base) = base_path
             && let Some(err) = self.finalize_provider_diagnostic(doc, current_file_name, base)
         {
-            diagnostics.extend(render_merged(
-                doc,
-                err.as_ref(),
-                DiagnosticSeverity::ERROR,
-                err.detail().to_string(),
-            ));
+            if let Some(diagnostic) = render_analysis_resolution_error(doc, &err)
+                && !diagnostics.contains(&diagnostic)
+            {
+                diagnostics.push(diagnostic);
+            }
         }
 
         // `known_bindings` for the text-scan undefined-reference check.
@@ -1320,8 +1337,10 @@ impl DiagnosticRun<'_> {
                 ) {
                     Ok(()) => Some(resolved),
                     Err(error) => {
-                        if matches!(&error, ParseError::SecretDerivedBackendAttribute { .. }) {
-                            diagnostics.push(parse_error_in_document(doc, &error));
+                        if matches!(&error, carina_core::parser::AnalysisResolutionError::Diagnostic(finding)
+                            if matches!(finding.detail(), ParseError::SecretDerivedBackendAttribute { .. }))
+                        {
+                            diagnostics.extend(render_analysis_resolution_error(doc, &error));
                         }
                         None
                     }
@@ -3123,6 +3142,7 @@ fn check_resource_ref_type_mismatch(
 fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
     match error {
         ParseError::Located { error, .. } => parse_error_to_diagnostic(error),
+        ParseError::AtElement(finding) => parse_error_to_diagnostic(finding.detail()),
         ParseError::Syntax(pest_error) => {
             let (line, col) = match pest_error.line_col {
                 pest::error::LineColLocation::Pos((line, col)) => (line, col),

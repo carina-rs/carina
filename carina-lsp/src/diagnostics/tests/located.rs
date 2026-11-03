@@ -83,6 +83,103 @@ impl Directory {
 const MAIN: &str = "provider aws {}\nlet cert = aws.acm.Certificate { domain_name = 'main' }\n";
 
 #[test]
+fn review_round1_merged_function_error_uses_parser_owned_body_location() {
+    let directory = Directory::new(&[
+        (
+            "main.crn",
+            "provider aws {}\nlet cert = aws.acm.Certificate { domain_name = 'main' }\nlet invalid = identity(cert)\n",
+        ),
+        (
+            "sibling.crn",
+            "# identity is called from main.crn\nfn identity(r: aws.acm.Certificate): String { r }\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine_with_wait_target(),
+        "'r' is a resource handle, not a value",
+        &[("r", 5)],
+    );
+}
+
+#[test]
+fn review_round1_module_function_error_keeps_its_element_location() {
+    let directory = Directory::new(&[
+        (
+            "main.crn",
+            "provider aws {}\nlet child = use { source = './module' }\nlet instance = child {}\n",
+        ),
+        ("sibling.crn", "let unrelated = 'sibling'\n"),
+        (
+            "module/arguments.crn",
+            "arguments { unused: Bool = true }\n",
+        ),
+        (
+            "module/functions.crn",
+            "fn identity(resource_argument: aws.acm.Certificate): String { resource_argument }\n",
+        ),
+        (
+            "module/resources.crn",
+            "let cert = aws.acm.Certificate { domain_name = 'module' }\nlet invalid = identity(cert)\n",
+        ),
+    ]);
+    let engine = test_engine_with_wait_target();
+    let message = "'resource_argument' is a resource handle, not a value";
+    directory.assert_ranges(&engine, "main.crn", message, &[("child", 1)]);
+    directory.assert_ranges(&engine, "sibling.crn", message, &[]);
+    directory.assert_ranges(
+        &engine,
+        "module/functions.crn",
+        message,
+        &[("resource_argument", 1)],
+    );
+}
+
+#[test]
+fn review_round1_provider_error_uses_sibling_attribute_location() {
+    let directory = Directory::new(&[
+        ("main.crn", "let regional = provider aws {}\n"),
+        ("sibling.crn", "provider aws { default_tags = 'wrong' }\n"),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine_with_wait_target(),
+        "default_tags must resolve to a map",
+        &[("'wrong'", 0)],
+    );
+}
+
+#[test]
+fn review_round1_expanded_provider_invariant_is_rendered() {
+    use carina_core::parser::{AnalysisResolutionError, ProviderContext};
+    let directory = Directory::new(&[
+        ("main.crn", "provider aws {}\n"),
+        ("sibling.crn", "let unrelated = 'sibling'\n"),
+    ]);
+    let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let mut expanded = carina_core::config_loader::parse_directory(
+        &carina_core::paths::ResolvedPath::new(directory.root.path()).unwrap(),
+        &config,
+    )
+    .unwrap()
+    .into_parsed()
+    .resolve_root_for_test();
+    expanded.providers.push(expanded.providers[0].clone());
+    let error = carina_core::parser::resolve_expanded_provider_unresolved_attributes_for_analysis(
+        &mut expanded,
+        &config,
+    )
+    .unwrap_err();
+    assert!(matches!(&error, AnalysisResolutionError::Invariant(_)));
+    for name in ["main.crn", "sibling.crn"] {
+        let source = std::fs::read_to_string(directory.root.path().join(name)).unwrap();
+        let doc = create_document_at(&source, directory.root.path().join(name));
+        let diagnostic = render_analysis_resolution_error(&doc, &error)
+            .expect("surface the directory invariant");
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+        assert!(diagnostic.message.contains("provider aws declaration"));
+    }
+}
+
+#[test]
 fn review_4220_routing_waits_for_the_directory_parse() {
     let directory = Directory::new(&[
         ("main.crn", "let regional = provider aws {}\n"),

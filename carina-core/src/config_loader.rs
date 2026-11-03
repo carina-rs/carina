@@ -388,7 +388,7 @@ impl RootDirectoryParse<crate::parser::InferredExportParam> {
     pub fn resolve_resource_refs_in_session(
         &mut self,
         session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-    ) -> Result<(), parser::ParseError> {
+    ) -> Result<(), parser::AnalysisResolutionError> {
         parser::resolve_resource_refs_in_session(&mut self.parsed, session)
     }
 
@@ -857,10 +857,28 @@ pub struct DirectoryParseResult {
 /// CLI-facing loaders continue to render this as the same string they
 /// historically returned. Editors can additionally inspect [`Self::source_file`]
 /// and only publish parser errors owned by the document being analyzed.
+///
+/// A consumer cannot attach arbitrary line numbers to a file:
+///
+/// ```compile_fail
+/// use carina_core::{config_loader::DirectoryParseFailure, parser::ParseError};
+/// let _ = DirectoryParseFailure::Parse {
+///     location: "arbitrary.crn".into(), source_file: Some("arbitrary.crn".into()),
+///     error: Box::new(ParseError::InvalidExpression { line: 99, message: "error".into() }),
+/// }.diagnostic();
+/// ```
 #[derive(Debug, thiserror::Error)]
-pub enum DirectoryParseFailure {
+#[error(transparent)]
+pub struct DirectoryParseFailure {
+    kind: DirectoryParseFailureKind,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum DirectoryParseFailureKind {
     #[error("{0}")]
     Message(String),
+    #[error(transparent)]
+    Element(Box<parser::Located<parser::ParseError>>),
     #[error("{location}: {error}")]
     Parse {
         location: PathBuf,
@@ -870,27 +888,58 @@ pub enum DirectoryParseFailure {
 }
 
 impl DirectoryParseFailure {
+    fn new(kind: DirectoryParseFailureKind) -> Self {
+        let kind = match kind {
+            DirectoryParseFailureKind::Parse {
+                error,
+                location,
+                source_file,
+            } => match *error {
+                parser::ParseError::AtElement(finding) => {
+                    DirectoryParseFailureKind::Element(finding)
+                }
+                error => DirectoryParseFailureKind::Parse {
+                    error: Box::new(error),
+                    location,
+                    source_file,
+                },
+            },
+            kind => kind,
+        };
+        Self { kind }
+    }
+
+    fn message(message: String) -> Self {
+        Self::new(DirectoryParseFailureKind::Message(message))
+    }
+
     fn from_parse_error(error: parser::ParseError) -> Self {
         match error {
-            parser::ParseError::Located { path, error } => Self::Parse {
-                location: path.clone(),
-                source_file: Some(path),
-                error,
-            },
-            error => Self::Message(error.to_string()),
+            parser::ParseError::AtElement(finding) => {
+                Self::new(DirectoryParseFailureKind::Element(finding))
+            }
+            parser::ParseError::Located { path, error } => {
+                Self::new(DirectoryParseFailureKind::Parse {
+                    location: path.clone(),
+                    source_file: Some(path),
+                    error,
+                })
+            }
+            error => Self::message(error.to_string()),
         }
     }
 
     pub fn source_file(&self) -> Option<&Path> {
-        match self {
-            Self::Parse { source_file, .. } => source_file.as_deref(),
-            Self::Message(_) => None,
+        match &self.kind {
+            DirectoryParseFailureKind::Parse { source_file, .. } => source_file.as_deref(),
+            DirectoryParseFailureKind::Element(finding) => Some(finding.location().file().path()),
+            DirectoryParseFailureKind::Message(_) => None,
         }
     }
 
     pub fn diagnostic(&self) -> Option<parser::FileScoped<&parser::ParseError>> {
-        match self {
-            Self::Parse {
+        match &self.kind {
+            DirectoryParseFailureKind::Parse {
                 source_file: Some(path),
                 error,
                 ..
@@ -900,9 +949,17 @@ impl DirectoryParseFailure {
     }
 
     pub fn parse_error(&self) -> Option<&parser::ParseError> {
-        match self {
-            Self::Parse { error, .. } => Some(error.as_ref()),
-            Self::Message(_) => None,
+        match &self.kind {
+            DirectoryParseFailureKind::Parse { error, .. } => Some(error.as_ref()),
+            DirectoryParseFailureKind::Element(finding) => Some(finding.detail()),
+            DirectoryParseFailureKind::Message(_) => None,
+        }
+    }
+
+    pub fn element_diagnostic(&self) -> Option<&parser::Located<parser::ParseError>> {
+        match &self.kind {
+            DirectoryParseFailureKind::Element(finding) => Some(finding),
+            _ => None,
         }
     }
 }
@@ -953,7 +1010,7 @@ fn parse_directory_with_overrides_impl(
     let dir = dir_label.as_path();
     let files = resolved
         .crn_files()
-        .map_err(|error| DirectoryParseFailure::Message(error.to_string()))?;
+        .map_err(|error| DirectoryParseFailure::message(error.to_string()))?;
     let mut paths: Vec<(ResolvedPath, String)> = files
         .into_iter()
         .filter_map(|p| {
@@ -969,13 +1026,13 @@ fn parse_directory_with_overrides_impl(
             paths.push((
                 resolved
                     .join(name)
-                    .map_err(|error| DirectoryParseFailure::Message(error.to_string()))?,
+                    .map_err(|error| DirectoryParseFailure::message(error.to_string()))?,
                 name.clone(),
             ));
         }
     }
     if paths.is_empty() {
-        return Err(DirectoryParseFailure::Message(format!(
+        return Err(DirectoryParseFailure::message(format!(
             "No .crn files found in {}",
             dir.display()
         )));
@@ -988,7 +1045,7 @@ fn parse_directory_with_overrides_impl(
         let content = match overrides.get(name) {
             Some(buffer) => buffer.clone(),
             None => file.read_to_string().map_err(|e| {
-                DirectoryParseFailure::Message(format!("Failed to read {}: {}", file.display(), e))
+                DirectoryParseFailure::message(format!("Failed to read {}: {}", file.display(), e))
             })?,
         };
         file_inputs.push((file.source_label(), content));
@@ -1001,11 +1058,13 @@ fn parse_directory_with_overrides_impl(
                 .source_file
                 .clone()
                 .unwrap_or_else(|| dir.to_path_buf());
-            return Err(DirectoryParseFailure::Parse {
-                location,
-                source_file: located.source_file,
-                error: located.error,
-            });
+            return Err(DirectoryParseFailure::new(
+                DirectoryParseFailureKind::Parse {
+                    location,
+                    source_file: located.source_file,
+                    error: located.error,
+                },
+            ));
         }
     };
     let authored_bindings = AuthoredBindingView::from_directory_files(&parsed_files);
@@ -1028,11 +1087,11 @@ fn parse_directory_with_overrides_impl(
                 parser::resolve_resource_refs_for_diagnostics(&mut semantic, config).map_err(
                     |error| {
                         let located = LocatedParseError::in_file(path, error);
-                        DirectoryParseFailure::Parse {
+                        DirectoryParseFailure::new(DirectoryParseFailureKind::Parse {
                             location: located.source_file.clone().unwrap_or_else(|| path.clone()),
                             source_file: located.source_file,
                             error: located.error,
-                        }
+                        })
                     },
                 )?;
                 Ok((path.clone(), semantic))
@@ -1219,6 +1278,10 @@ pub(crate) struct LocatedParseError {
 impl LocatedParseError {
     fn in_file(path: &Path, error: parser::ParseError) -> Self {
         match error {
+            error @ parser::ParseError::AtElement(_) => Self {
+                source_file: error.source_file().map(Path::to_path_buf),
+                error: Box::new(error),
+            },
             parser::ParseError::Located { path, error } => Self {
                 source_file: Some(path),
                 error,
@@ -1232,6 +1295,10 @@ impl LocatedParseError {
 
     fn directory_wide(error: parser::ParseError) -> Self {
         match error {
+            error @ parser::ParseError::AtElement(_) => Self {
+                source_file: error.source_file().map(Path::to_path_buf),
+                error: Box::new(error),
+            },
             parser::ParseError::Located { path, error } => Self {
                 source_file: Some(path),
                 error,
@@ -1244,6 +1311,9 @@ impl LocatedParseError {
     }
 
     fn render(&self, fallback: &Path) -> String {
+        if let Some(finding) = self.error.element_diagnostic() {
+            return finding.to_string();
+        }
         let location = self.source_file.as_deref().unwrap_or(fallback);
         format!("{}: {}", location.display(), self.error)
     }
@@ -3621,11 +3691,11 @@ awscc.ec2.SecurityGroup {
             .source_file
             .clone()
             .unwrap_or_else(|| caller.to_path_buf());
-        let failure = DirectoryParseFailure::Parse {
+        let failure = DirectoryParseFailure::new(DirectoryParseFailureKind::Parse {
             location,
             source_file: located.source_file,
             error: located.error,
-        };
+        });
 
         assert_eq!(
             failure.to_string(),
@@ -3642,11 +3712,11 @@ awscc.ec2.SecurityGroup {
         }
         .in_file(file);
         let located = LocatedParseError::in_file(file, error);
-        let failure = DirectoryParseFailure::Parse {
+        let failure = DirectoryParseFailure::new(DirectoryParseFailureKind::Parse {
             location: located.source_file.clone().unwrap(),
             source_file: located.source_file,
             error: located.error,
-        };
+        });
 
         assert_eq!(
             failure.to_string(),

@@ -23,6 +23,55 @@ use thiserror::Error;
 type RuntimeValue = GenericValue<NoPlaceholder, AbsoluteBindingAddress>;
 type RuntimeProviderConfig = ProviderConfig<NoPlaceholder, AbsoluteBindingAddress>;
 
+/// An analysis pass either rejects an unsealed input or reports an authored
+/// semantic error. A semantic finding always has parser-owned provenance.
+#[derive(Debug, thiserror::Error)]
+pub enum AnalysisResolutionError {
+    #[error(transparent)]
+    Invariant(#[from] super::AnalysisTreeError),
+    #[error(transparent)]
+    Diagnostic(Box<super::Located<ParseError>>),
+}
+
+impl AnalysisResolutionError {
+    fn from_parse_failure(error: ParseError) -> Self {
+        match error {
+            ParseError::AtElement(finding) => Self::Diagnostic(finding),
+            error => Self::Invariant(super::AnalysisTreeError::new(
+                super::AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                    element: format!("semantic failure: {error}"),
+                },
+            )),
+        }
+    }
+}
+
+fn provider_analysis_failure(
+    locations: &[HashMap<String, super::DeclarationLocation>],
+    index: usize,
+    key: &str,
+    error: ParseError,
+) -> AnalysisResolutionError {
+    if let ParseError::AtElement(finding) = error {
+        return AnalysisResolutionError::Diagnostic(finding);
+    }
+    match locations
+        .get(index)
+        .and_then(|attributes| attributes.get(key))
+    {
+        Some(location) => AnalysisResolutionError::Diagnostic(Box::new(super::Located::new(
+            location.clone(),
+            error,
+        ))),
+        None => {
+            super::AnalysisTreeError::new(super::AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                element: format!("provider {index} attribute {key}"),
+            })
+            .into()
+        }
+    }
+}
+
 trait ProviderAttributeBindingPhase: BindingAddress {
     fn evaluate_resolved_user_function(
         function: &super::UserFunction<Self>,
@@ -534,9 +583,13 @@ trait PreApplyResourceMut {
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value>;
     fn directives_mut(&mut self) -> &mut crate::resource::AuthoredDirectives;
     fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<RelativeBindingName>;
+    fn declaration(&self) -> &super::DeclarationProvenance;
 }
 
 impl PreApplyResourceMut for Resource {
+    fn declaration(&self) -> &super::DeclarationProvenance {
+        &self.declaration
+    }
     fn id(&self) -> &crate::resource::ResourceId {
         &self.id
     }
@@ -558,6 +611,9 @@ impl PreApplyResourceMut for Resource {
 }
 
 impl PreApplyResourceMut for DataSource {
+    fn declaration(&self) -> &super::DeclarationProvenance {
+        &self.declaration
+    }
     fn id(&self) -> &crate::resource::ResourceId {
         &self.id
     }
@@ -621,6 +677,16 @@ pub fn resolve_resource_refs_with_config<E: ExportParamLike>(
 
 /// Resolve pending checks with the same session used for declaration checks.
 pub fn resolve_resource_refs_in_session<E: ExportParamLike>(
+    parsed: &mut File<E>,
+    session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+) -> Result<(), AnalysisResolutionError> {
+    super::AnalysisTree::try_from_file(parsed)?;
+    resolve_resource_refs_with_policy(parsed, session.catalog(), Some(session), false, false)
+        .map_err(AnalysisResolutionError::from_parse_failure)
+}
+
+/// Parser/module-loader evaluation before the analysis boundary is sealed.
+pub(crate) fn resolve_resource_refs_in_session_unsealed<E: ExportParamLike>(
     parsed: &mut File<E>,
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<(), ParseError> {
@@ -699,6 +765,16 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     defer_unknown_functions: bool,
     preserve_failed_user_calls: bool,
 ) -> Result<(), ParseError> {
+    let syntax = parsed.parser_binding_metadata.syntax().clone();
+    let locate_named = |kind, name: &str, error: ParseError| match syntax
+        .declarations()
+        .iter()
+        .rev()
+        .find(|record| record.kind() == kind && record.name() == name)
+    {
+        Some(record) => error.at(record.value_location().unwrap_or(record.location())),
+        None => error,
+    };
     if let Some(session) = session {
         for check in parsed
             .parser_binding_metadata
@@ -708,7 +784,8 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 check,
                 &parsed.user_functions,
                 session,
-            )?;
+            )
+            .map_err(|error| error.at(&check.location))?;
         }
     }
 
@@ -814,7 +891,18 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 session,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
-            )?;
+            )
+            .map_err(|error| {
+                match syntax
+                    .backend_keys()
+                    .iter()
+                    .rev()
+                    .find(|record| record.detail() == key)
+                {
+                    Some(record) => error.at(record.location()),
+                    None => error,
+                }
+            })?;
             if crate::value::contains_secret(&evaluated) {
                 let span = backend.attribute_spans.get(key).copied().ok_or_else(|| {
                     ParseError::InternalError {
@@ -822,13 +910,24 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                         context: "secret-derived backend attribute validation".to_string(),
                     }
                 })?;
-                return Err(ParseError::SecretDerivedBackendAttribute {
+                let error = ParseError::SecretDerivedBackendAttribute {
                     backend_type: backend.backend_type.clone(),
                     attribute: key.clone(),
                     line: span.start_line(),
                     start_column: span.start_column(),
                     end_column: span.end_column(),
-                });
+                };
+                return Err(
+                    match syntax
+                        .backend_keys()
+                        .iter()
+                        .rev()
+                        .find(|record| record.detail() == key)
+                    {
+                        Some(record) => error.at(record.location()),
+                        None => error,
+                    },
+                );
             }
             *value = evaluated;
         }
@@ -853,9 +952,12 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 defer_unknown_functions,
                 preserve_failed_user_calls,
             )
-            .map_err(|error| match &source_file {
-                Some(path) => error.in_file(path.clone()),
-                None => error,
+            .map_err(|error| match resource.declaration().location() {
+                Some(location) => error.at(location),
+                None => match &source_file {
+                    Some(path) => error.in_file(path.clone()),
+                    None => error,
+                },
             })?;
             resolved_attrs.insert(key.clone(), resolved);
         }
@@ -881,6 +983,15 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     // effect. Keep resource references deferred so apply-time expansion still
     // substitutes the loop value and other runtime bindings normally.
     for deferred in parsed.parsed_deferred_for_expressions_mut() {
+        let location = match deferred.body() {
+            super::DeferredForBody::Resource(resource) => {
+                resource.as_resource().declaration.location().cloned()
+            }
+            super::DeferredForBody::Read(source) => source.declaration.location().cloned(),
+            super::DeferredForBody::ModuleCall(call) => {
+                Some(call.id().declaration_location().clone())
+            }
+        };
         match &mut deferred.body {
             crate::parser::DeferredForBody::Resource(resource) => resolve_directive_function_calls(
                 resource.directives_mut(),
@@ -911,7 +1022,11 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 session,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
-            )?;
+            )
+            .map_err(|error| match &location {
+                Some(location) => error.at(location),
+                None => error,
+            })?;
         }
     }
 
@@ -961,7 +1076,10 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
             session,
             defer_unknown_functions,
             preserve_failed_user_calls,
-        )?;
+        )
+        .map_err(|error| {
+            locate_named(crate::config_loader::DeclarationKind::Binding, &key, error)
+        })?;
         parsed.variables[&key] = resolved;
     }
 
@@ -971,6 +1089,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     // Type checking module arguments, attributes, or exports before this pass
     // would treat that deferred call as unknown and silently accept it.
     for call in &mut parsed.module_calls {
+        let location = call.id().declaration_location().clone();
         for argument in call.arguments_mut() {
             argument.try_rewrite(|value| {
                 resolve_function_calls_only(
@@ -981,6 +1100,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                     defer_unknown_functions,
                     preserve_failed_user_calls,
                 )
+                .map_err(|error| error.at(&location))
             })?;
         }
     }
@@ -993,7 +1113,14 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 session,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
-            )?;
+            )
+            .map_err(|error| {
+                locate_named(
+                    crate::config_loader::DeclarationKind::Argument,
+                    &argument.name,
+                    error,
+                )
+            })?;
         }
     }
     for attribute in &mut parsed.attribute_params {
@@ -1011,7 +1138,14 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 session,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
-            )?;
+            )
+            .map_err(|error| {
+                locate_named(
+                    crate::config_loader::DeclarationKind::ModuleAttribute,
+                    &attribute.name,
+                    error,
+                )
+            })?;
         }
     }
     for export in &mut parsed.export_params {
@@ -1027,7 +1161,14 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 session,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
-            )?;
+            )
+            .map_err(|error| {
+                locate_named(
+                    crate::config_loader::DeclarationKind::Export,
+                    export.name(),
+                    error,
+                )
+            })?;
             export.replace_value(resolved);
         }
     }
@@ -1809,8 +1950,8 @@ fn resolve_directive_function_calls(
             defer_unknown_functions,
             preserve_failed_user_calls,
         )
-        .map_err(|error| match expression.source().authored_location() {
-            Some((source_file, _)) => error.in_file(source_file),
+        .map_err(|error| match expression.source().declaration_location() {
+            Some(location) => error.at(location),
             None => error,
         })?;
         Ok(())
@@ -1929,16 +2070,15 @@ pub fn resolve_provider_unresolved_attributes_for_analysis<
 >(
     parsed: &mut File<E, ParserPlaceholder, ParserPlaceholder, D, RelativeBindingName>,
     config: &ProviderContext,
-) -> Result<(), Box<super::Located<ParseError>>>
+) -> Result<(), AnalysisResolutionError>
 where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, RelativeBindingName>,
 {
-    let locations = super::AnalysisTree::try_from_file(parsed)
-        .expect("parser/expansion provenance invariant")
+    let locations = super::AnalysisTree::try_from_file(parsed)?
         .provider_attribute_locations()
         .to_vec();
     resolve_provider_unresolved_attributes_mapped(parsed, config, |index, key, error| {
-        Box::new(super::Located::new(locations[index][key].clone(), error))
+        provider_analysis_failure(&locations, index, key, error)
     })
 }
 
@@ -1948,7 +2088,7 @@ pub fn resolve_expanded_provider_unresolved_attributes_for_analysis<
 >(
     parsed: &mut File<E, ParserPlaceholder, ParserPlaceholder, D, AbsoluteBindingAddress>,
     config: &ProviderContext,
-) -> Result<(), Box<super::Located<ParseError>>>
+) -> Result<(), AnalysisResolutionError>
 where
     D: super::DeferredForPhaseTraversal<
             ParserPlaceholder,
@@ -1956,12 +2096,11 @@ where
             AbsoluteBindingAddress,
         >,
 {
-    let locations = super::AnalysisTree::try_from_file(parsed)
-        .expect("parser/expansion provenance invariant")
+    let locations = super::AnalysisTree::try_from_file(parsed)?
         .provider_attribute_locations()
         .to_vec();
     resolve_provider_unresolved_attributes_mapped(parsed, config, |index, key, error| {
-        Box::new(super::Located::new(locations[index][key].clone(), error))
+        provider_analysis_failure(&locations, index, key, error)
     })
 }
 
@@ -1971,16 +2110,15 @@ pub fn finalize_provider_configs_for_analysis<
     D,
 >(
     parsed: &mut File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
-) -> Result<(), Box<super::Located<ParseError>>>
+) -> Result<(), AnalysisResolutionError>
 where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    let locations = super::AnalysisTree::try_from_file(parsed)
-        .expect("parser/expansion provenance invariant")
+    let locations = super::AnalysisTree::try_from_file(parsed)?
         .provider_attribute_locations()
         .to_vec();
     finalize_provider_configs_mapped(parsed, |index, key, error| {
-        Box::new(super::Located::new(locations[index][key].clone(), error))
+        provider_analysis_failure(&locations, index, key, error)
     })
 }
 
