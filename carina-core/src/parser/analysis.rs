@@ -1,6 +1,6 @@
 //! Parser-owned locations and the sealed, read-only view used by analysis.
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use super::{
     DeferredForPhaseTraversal, File, ParsedDeferredForPhase, PreprocessedFile, ResourceRef, Rule,
@@ -27,6 +27,11 @@ use crate::resource::{
 /// ```compile_fail,E0624
 /// use carina_core::parser::DeclarationLocation;
 /// fn fabricate() { let _ = DeclarationLocation::from_pair; }
+/// ```
+///
+/// ```compile_fail,E0624
+/// use carina_core::parser::DeclarationLocation;
+/// fn fabricate() { let _ = DeclarationLocation::block_header_from_pair; }
 /// ```
 ///
 /// There is no constructor from offsets, line numbers, or a file/span tuple:
@@ -73,15 +78,58 @@ impl DeclarationLocation {
     ) -> Self {
         assert!(matches!(
             pair.as_rule(),
-            Rule::resource_expr
+            Rule::interpolation
+                | Rule::let_binding
+                | Rule::resource_expr
                 | Rule::anonymous_resource
                 | Rule::read_resource_expr
                 | Rule::wait_expr
                 | Rule::module_call
+                | Rule::identifier
+                | Rule::discard_pattern
+                | Rule::string
+                | Rule::expression
+                | Rule::for_iterable
+                | Rule::namespaced_id
+                | Rule::reference_prefix
+                | Rule::variable_ref
+                | Rule::postfix_expr
+                | Rule::subscripted_id
+                | Rule::validate_additive_expr
+                | Rule::validate_multiplicative_expr
+                | Rule::validate_primary
+                | Rule::upstream_state_expr
+                | Rule::primary
+                | Rule::type_expr
+                | Rule::for_expr
+                | Rule::if_expr
+                | Rule::resource_address
         ));
         Self {
             file: SourceFileId::new(source_file.to_path_buf()),
             span: SourceSpan::from_pest(pair, file),
+        }
+    }
+
+    pub(in crate::parser) fn reference_prefix_from_pair(
+        pair: &pest::iterators::Pair<'_, Rule>,
+        file: &PreprocessedFile,
+        source: &Path,
+    ) -> Self {
+        Self {
+            file: SourceFileId::new(source.to_path_buf()),
+            span: SourceSpan::from_reference_prefix(pair, file),
+        }
+    }
+
+    pub(in crate::parser) fn block_header_from_pair(
+        pair: &pest::iterators::Pair<'_, Rule>,
+        file: &PreprocessedFile,
+        source: &Path,
+    ) -> Self {
+        Self {
+            file: SourceFileId::new(source.to_path_buf()),
+            span: SourceSpan::from_block_header(pair, file),
         }
     }
 
@@ -98,15 +146,49 @@ impl DeclarationLocation {
 /// may lack it; [`AnalysisTree::try_from_file`] rejects those nodes. This field
 /// is skipped by each owning node's serializer and never affects semantics.
 #[derive(Debug, Clone, Default)]
-pub struct DeclarationProvenance(Option<DeclarationLocation>);
+pub struct DeclarationProvenance {
+    location: Option<DeclarationLocation>,
+    elements: Arc<super::elements::ElementLocations>,
+}
 
 impl DeclarationProvenance {
-    pub(crate) fn from_location(location: DeclarationLocation) -> Self {
-        Self(Some(location))
+    pub(crate) fn for_composition(
+        location: DeclarationLocation,
+        declarations: &[Located<super::DeclarationRecord>],
+    ) -> Self {
+        Self {
+            location: Some(location),
+            elements: Arc::new(super::elements::ElementLocations::from_module_attributes(
+                declarations,
+            )),
+        }
+    }
+
+    pub(in crate::parser) fn from_pair(
+        pair: &pest::iterators::Pair<'_, Rule>,
+        file: &PreprocessedFile,
+        source: &Path,
+    ) -> Self {
+        Self {
+            location: Some(DeclarationLocation::from_pair(pair, file, source)),
+            elements: Arc::new(super::elements::ElementLocations::from_pair(
+                pair, file, source,
+            )),
+        }
+    }
+
+    pub(crate) fn elements(&self) -> &super::elements::ElementLocations {
+        &self.elements
+    }
+
+    pub(in crate::parser) fn set_iterable(&mut self, location: DeclarationLocation) {
+        Arc::make_mut(&mut self.elements)
+            .values
+            .push((super::elements::ElementKind::Iterable, location));
     }
 
     pub(crate) fn location(&self) -> Option<&DeclarationLocation> {
-        self.0.as_ref()
+        self.location.as_ref()
     }
 }
 
@@ -173,6 +255,95 @@ impl<D> Located<D> {
     }
 }
 
+impl<D: std::fmt::Display> std::fmt::Display for Located<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let span = self.location.span();
+        write!(
+            f,
+            "{}:{}:{}: {}",
+            self.location.file().path().display(),
+            span.start_line(),
+            span.start_column(),
+            self.detail
+        )
+    }
+}
+
+impl<D: std::error::Error + 'static> std::error::Error for Located<D> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.detail)
+    }
+}
+
+/// A file-wide finding, or a parse failure for which no declaration exists.
+/// Only the parser can attach a file. Never use this for a declaration or element finding.
+///
+/// ```compile_fail,E0451
+/// use carina_core::parser::{FileScoped, SourceFileId};
+/// fn fabricate(file: SourceFileId) -> FileScoped<&'static str> { FileScoped { file, detail: "error" } }
+/// ```
+///
+/// ```compile_fail,E0624
+/// use carina_core::parser::FileScoped;
+/// let _ = FileScoped::new(std::path::Path::new("a.crn"), "error");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileScoped<D> {
+    file: SourceFileId,
+    detail: D,
+}
+impl<D> FileScoped<D> {
+    pub(in crate::parser) fn new(file: &Path, detail: D) -> Self {
+        Self {
+            file: SourceFileId::new(file.to_path_buf()),
+            detail,
+        }
+    }
+    pub fn file(&self) -> &SourceFileId {
+        &self.file
+    }
+    pub fn detail(&self) -> &D {
+        &self.detail
+    }
+    pub fn into_detail(self) -> D {
+        self.detail
+    }
+}
+
+/// A directory/graph finding with no responsible declaration or source file.
+/// Use only for genuinely directory-wide failures; cycles belong to their members
+/// and must be emitted as `Located` findings instead. There is no general
+/// constructor: any directory-wide producer must expose a per-kind factory.
+///
+/// ```compile_fail,E0599
+/// use carina_core::parser::DirectoryScoped;
+/// let _ = DirectoryScoped::new("missing location");
+/// ```
+///
+/// ```compile_fail,E0308
+/// use carina_core::parser::{DirectoryScoped, Located};
+/// fn attach(finding: DirectoryScoped<&'static str>) -> Located<&'static str> { finding }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryScoped<D> {
+    detail: D,
+}
+impl<D> DirectoryScoped<D> {
+    pub fn detail(&self) -> &D {
+        &self.detail
+    }
+    pub fn into_detail(self) -> D {
+        self.detail
+    }
+}
+
+impl<D> std::ops::Deref for Located<D> {
+    type Target = D;
+    fn deref(&self) -> &D {
+        &self.detail
+    }
+}
+
 /// The declaration kind of a resource in the analysis view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalysisItemKind {
@@ -186,6 +357,8 @@ pub enum AnalysisItemKind {
 /// Invariant failure at the boundary between parsing/expansion and analysis.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AnalysisTreeError {
+    #[error("missing parser syntax provenance for {element}")]
+    MissingSyntaxProvenance { element: String },
     #[error("missing declaration provenance for {kind:?} {id}")]
     MissingResourceProvenance {
         kind: AnalysisItemKind,
@@ -193,6 +366,11 @@ pub enum AnalysisTreeError {
     },
     #[error("missing declaration provenance for wait {binding}")]
     MissingWaitProvenance { binding: String },
+    #[error("missing {element} provenance in {}", declaration.file().path().display())]
+    MissingElementProvenance {
+        declaration: DeclarationLocation,
+        element: String,
+    },
 }
 
 /// A sealed resource view: every item has a location, independent of its id.
@@ -221,6 +399,247 @@ pub struct AnalysisResourceRef<
 {
     resource: ResourceRef<'a, ModuleSource, P, T, D, B>,
     location: &'a DeclarationLocation,
+    attribute_locations: std::collections::HashMap<String, &'a DeclarationLocation>,
+    attribute_keys: &'a [super::AttributeKeyLocation],
+    references: Vec<AnalysisReference<B>>,
+    dependencies: Vec<AnalysisDependencyRef<'a, B>>,
+    provider_location: &'a DeclarationLocation,
+    iterable: AnalysisIterableRef<'a, P, B>,
+}
+
+enum AnalysisIterableRef<'a, P: ValueKind, B: BindingAddress> {
+    Direct,
+    Deferred {
+        value: &'a Value<P, B>,
+        location: &'a DeclarationLocation,
+    },
+}
+
+/// A reference whose occurrence and prefix provenance were validated at the boundary.
+#[derive(Debug, Clone)]
+pub struct AnalysisReference<B: BindingAddress = RelativeBindingName> {
+    path: crate::resource::AccessPath<B>,
+    locations: Arc<super::ReferenceLocations>,
+}
+
+/// An authored reference occurrence in a value, with its consumer context.
+pub struct AnalysisValueReference<B: BindingAddress = RelativeBindingName> {
+    reference: AnalysisReference<B>,
+    context: String,
+    usage: crate::resource::ResourceRefUsage,
+    typed_consumer: bool,
+}
+impl<B: BindingAddress> AnalysisValueReference<B> {
+    pub fn reference(&self) -> &AnalysisReference<B> {
+        &self.reference
+    }
+    pub fn context(&self) -> &str {
+        &self.context
+    }
+    pub fn usage(&self) -> crate::resource::ResourceRefUsage {
+        self.usage
+    }
+    pub fn typed_consumer(&self) -> bool {
+        self.typed_consumer
+    }
+}
+
+/// A deferred iterable validated together with its parser-owned provenance.
+pub struct AnalysisForRef<'a, P: ValueKind, B: BindingAddress> {
+    site: super::DeferredForSite<'a, P, B>,
+    location: &'a DeclarationLocation,
+    references: Vec<AnalysisReference<B>>,
+}
+impl<'a, P: ValueKind, B: BindingAddress> AnalysisForRef<'a, P, B> {
+    pub fn location(&self) -> &'a DeclarationLocation {
+        self.location
+    }
+    pub fn binding(&self) -> &'a super::ForBinding {
+        self.site.binding
+    }
+    pub fn header(&self) -> &'a str {
+        self.site.header
+    }
+    pub fn iterable(&self) -> &'a Value<P, B> {
+        self.site.iterable
+    }
+    pub fn references(&self) -> &[AnalysisReference<B>] {
+        &self.references
+    }
+    pub fn reference_for_path(
+        &self,
+        path: &crate::resource::AccessPath<B>,
+    ) -> &AnalysisReference<B> {
+        self.references
+            .iter()
+            .find(|reference| {
+                reference.path() == path
+                    && reference.path().reference_locations_shared()
+                        == path.reference_locations_shared()
+            })
+            .expect("every iterable reference was validated at the analysis boundary")
+    }
+    pub fn checks_scope(&self) -> bool {
+        self.site.checks_scope
+    }
+}
+
+fn collect_value_references<P: ValueKind, B: BindingAddress>(
+    value: &Value<P, B>,
+    context: &str,
+    typed_consumer: bool,
+    references: &mut Vec<AnalysisValueReference<B>>,
+) -> Result<(), AnalysisTreeError> {
+    let mut result = Ok(());
+    value.visit_resource_refs_with_usage(
+        &mut |path, usage| match path.reference_locations_shared() {
+            Some(locations) => references.push(AnalysisValueReference {
+                reference: AnalysisReference {
+                    path: path.clone(),
+                    locations: locations.clone(),
+                },
+                context: context.to_string(),
+                usage,
+                typed_consumer,
+            }),
+            None => {
+                result = Err(AnalysisTreeError::MissingSyntaxProvenance {
+                    element: format!("{context} reference {path}"),
+                })
+            }
+        },
+    );
+    result
+}
+impl<B: BindingAddress> AnalysisReference<B> {
+    pub fn path(&self) -> &crate::resource::AccessPath<B> {
+        &self.path
+    }
+    pub fn location(&self) -> &DeclarationLocation {
+        self.locations.occurrence()
+    }
+    pub fn prefix_location(&self) -> &DeclarationLocation {
+        self.locations.prefix()
+    }
+}
+
+/// One operand occurrence; order and duplicates are preserved.
+pub struct AnalysisDependencyRef<'a, B: BindingAddress = RelativeBindingName> {
+    operand: &'a super::UnexpandedDependencyOperand<B>,
+    location: &'a DeclarationLocation,
+}
+impl<'a, B: BindingAddress> AnalysisDependencyRef<'a, B> {
+    pub fn operand(&self) -> &'a super::UnexpandedDependencyOperand<B> {
+        self.operand
+    }
+    pub fn location(&self) -> &'a DeclarationLocation {
+        self.location
+    }
+}
+
+fn dependency_refs<'a, B: BindingAddress>(
+    dependencies: &'a super::UnexpandedDependencies<B>,
+    declaration: &DeclarationLocation,
+) -> Result<Vec<AnalysisDependencyRef<'a, B>>, AnalysisTreeError> {
+    if dependencies.len() != dependencies.locations().len() {
+        return Err(AnalysisTreeError::MissingElementProvenance {
+            declaration: declaration.clone(),
+            element: "dependency operand".into(),
+        });
+    }
+    Ok(dependencies
+        .iter()
+        .zip(dependencies.locations())
+        .map(|(operand, location)| AnalysisDependencyRef { operand, location })
+        .collect())
+}
+
+fn append_reference_origins<B: BindingAddress>(
+    references: &mut Vec<AnalysisReference<B>>,
+    dependencies: &super::UnexpandedDependencies<B>,
+    declaration: &DeclarationLocation,
+) -> Result<(), AnalysisTreeError> {
+    for path in dependencies.reference_origins() {
+        let locations = path.reference_locations_shared().ok_or_else(|| {
+            AnalysisTreeError::MissingElementProvenance {
+                declaration: declaration.clone(),
+                element: format!("reference edge {path}"),
+            }
+        })?;
+        if !references
+            .iter()
+            .any(|existing| existing.path == *path && existing.location() == locations.occurrence())
+        {
+            references.push(AnalysisReference {
+                path: path.clone(),
+                locations: locations.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn required_element(
+    provenance: &DeclarationProvenance,
+    kind: super::elements::ElementKind,
+) -> Result<&DeclarationLocation, AnalysisTreeError> {
+    provenance
+        .elements()
+        .get(kind)
+        .ok_or_else(|| AnalysisTreeError::MissingElementProvenance {
+            declaration: provenance
+                .location()
+                .expect("declaration checked before elements")
+                .clone(),
+            element: format!("{kind:?}"),
+        })
+}
+
+type AttributeProvenance<'a, B> = (
+    std::collections::HashMap<String, &'a DeclarationLocation>,
+    Vec<AnalysisReference<B>>,
+);
+
+fn attribute_provenance<'a, P: ValueKind, B: BindingAddress>(
+    attributes: &indexmap::IndexMap<String, Value<P, B>>,
+    provenance: &'a DeclarationProvenance,
+    location: &'a DeclarationLocation,
+) -> Result<AttributeProvenance<'a, B>, AnalysisTreeError> {
+    let mut keys = std::collections::HashMap::new();
+    let mut references = Vec::new();
+    for (key, value) in attributes {
+        let mut root_keys =
+            provenance.elements().keys.iter().filter(|entry| {
+                matches!(entry.path(), [super::AttributePathSegment::Attribute(name)] if name == key)
+            });
+        // Blocks are collected into a list after assignments. Otherwise the
+        // parser keeps the last authored assignment for each attribute.
+        let key_location = root_keys
+            .clone()
+            .find(|entry| entry.is_block())
+            .or_else(|| root_keys.next_back())
+            .ok_or_else(|| AnalysisTreeError::MissingElementProvenance {
+                declaration: location.clone(),
+                element: format!("attribute key {key}"),
+            })?
+            .location();
+        keys.insert(key.clone(), key_location);
+        let mut result = Ok(());
+        value.visit_resource_refs(&mut |path| match path.reference_locations_shared() {
+            Some(locations) => references.push(AnalysisReference {
+                path: path.clone(),
+                locations: locations.clone(),
+            }),
+            None => {
+                result = Err(AnalysisTreeError::MissingElementProvenance {
+                    declaration: location.clone(),
+                    element: format!("reference {path}"),
+                })
+            }
+        });
+        result?;
+    }
+    Ok((keys, references))
 }
 
 impl<'a, P, T, D, B> AnalysisResourceRef<'a, P, T, D, B>
@@ -230,12 +649,64 @@ where
     B: BindingAddress,
     D: DeferredForPhaseTraversal<P, T, B>,
 {
+    fn managed_resource(&self) -> Option<&'a crate::resource::Resource<ModuleSource, P, B>> {
+        match self.resource {
+            ResourceRef::Resource(resource) => Some(resource),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn has_attribute_derived_conflict(
+        &self,
+        conflict: &crate::identifier::AttributeDerivedAnonymousResourceConflict,
+        schemas: &crate::schema::SchemaRegistry,
+    ) -> bool
+    where
+        P: crate::resource::PlaceholderKind,
+    {
+        self.managed_resource().is_some_and(|resource| {
+            resource.binding.is_none()
+                && resource.loop_provenance.is_empty()
+                && conflict.includes(resource, schemas)
+        })
+    }
+
+    pub(crate) fn module_identity_locations(&self) -> Vec<&'a DeclarationLocation> {
+        match self
+            .managed_resource()
+            .and_then(|resource| resource.module_source.as_ref())
+        {
+            Some(ModuleSource::Module(module)) => module
+                .module_call_path()
+                .calls()
+                .map(|call| call.id.declaration_location())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn location(&self) -> &'a DeclarationLocation {
         self.location
     }
 
     pub fn id(&self) -> &'a ResourceId {
         self.resource.id()
+    }
+
+    pub fn binding_address(&self) -> Option<&'a B> {
+        self.resource.binding_address()
+    }
+    pub fn dependencies(&self) -> &[AnalysisDependencyRef<'a, B>] {
+        &self.dependencies
+    }
+    pub fn references(&self) -> &[AnalysisReference<B>] {
+        &self.references
+    }
+    pub fn attribute_keys(&self) -> &'a [super::AttributeKeyLocation] {
+        self.attribute_keys
+    }
+    pub fn provider_location(&self) -> &'a DeclarationLocation {
+        self.provider_location
     }
 
     pub fn binding(&self) -> Option<&'a str> {
@@ -262,12 +733,12 @@ where
         }
     }
 
-    pub fn deferred_iterable(&self) -> Option<&'a Value<P, B>> {
-        match self.resource {
-            ResourceRef::Deferred { deferred, .. } => Some(D::deferred_iterable(deferred)),
-            ResourceRef::Resource(_)
-            | ResourceRef::DataSource(_)
-            | ResourceRef::LiveComposition(_) => None,
+    pub fn deferred_iterable(&self) -> Option<Located<&'a Value<P, B>>> {
+        match self.iterable {
+            AnalysisIterableRef::Direct => None,
+            AnalysisIterableRef::Deferred { value, location } => {
+                Some(Located::new(location.clone(), value))
+            }
         }
     }
 }
@@ -282,6 +753,14 @@ where
         self.resource.attributes()
     }
 
+    pub fn located_attributes(&self) -> Vec<Located<(String, Value<P, B>)>> {
+        self.attributes()
+            .into_owned()
+            .into_iter()
+            .map(|(key, value)| Located::new(self.attribute_locations[&key].clone(), (key, value)))
+            .collect()
+    }
+
     pub fn directives(&self) -> Option<&'a Directives<B, P>> {
         self.resource.directives()
     }
@@ -291,9 +770,25 @@ where
 pub struct AnalysisWaitRef<'a, B: BindingAddress = RelativeBindingName> {
     wait: &'a WaitBinding<B>,
     location: &'a DeclarationLocation,
+    target_location: &'a DeclarationLocation,
+    lhs_location: &'a DeclarationLocation,
+    rhs_location: &'a DeclarationLocation,
+    dependencies: Vec<AnalysisDependencyRef<'a, B>>,
 }
 
 impl<'a, B: BindingAddress> AnalysisWaitRef<'a, B> {
+    pub fn target_location(&self) -> &'a DeclarationLocation {
+        self.target_location
+    }
+    pub fn lhs_location(&self) -> &'a DeclarationLocation {
+        self.lhs_location
+    }
+    pub fn rhs_location(&self) -> &'a DeclarationLocation {
+        self.rhs_location
+    }
+    pub fn dependencies(&self) -> &[AnalysisDependencyRef<'a, B>] {
+        &self.dependencies
+    }
     pub fn location(&self) -> &'a DeclarationLocation {
         self.location
     }
@@ -343,6 +838,22 @@ pub struct AnalysisTree<
 {
     resources: Vec<AnalysisResourceRef<'a, P, T, D, B>>,
     waits: Vec<AnalysisWaitRef<'a, B>>,
+    providers: &'a [super::ProviderConfig<P, B>],
+    upstream_names: std::collections::HashSet<&'a str>,
+    loop_groups: std::collections::HashSet<String>,
+    syntax: &'a super::SyntaxInventory<B>,
+    type_annotations: Vec<Located<crate::validation::TypeResolutionContext>>,
+    provider_attribute_locations: Vec<std::collections::HashMap<String, DeclarationLocation>>,
+    upstream_states: Vec<Located<&'a super::UpstreamState<B>>>,
+    value_references: Vec<AnalysisValueReference<B>>,
+    iterables: Vec<AnalysisForRef<'a, P, B>>,
+    arguments: &'a [super::ArgumentParameter<super::TypeExpr, P, B>],
+    functions: &'a std::collections::HashMap<String, super::UserFunction<B>>,
+    module_calls: &'a [super::ModuleCall<P, B>],
+    binding_names: std::collections::HashSet<String>,
+    module_definition: bool,
+    root_configuration: bool,
+    backend_location: Option<&'a DeclarationLocation>,
 }
 
 impl<'a, P, T, D, B> AnalysisTree<'a, P, T, D, B>
@@ -352,7 +863,10 @@ where
     B: BindingAddress,
     D: DeferredForPhaseTraversal<P, T, B>,
 {
-    pub fn try_from_file<E>(file: &'a File<E, P, T, D, B>) -> Result<Self, AnalysisTreeError> {
+    pub fn try_from_file<E: super::ExportParamLike<P, B>>(
+        file: &'a File<E, P, T, D, B>,
+    ) -> Result<Self, AnalysisTreeError> {
+        let mut value_references = Vec::new();
         let resource_refs = file
             .resources
             .iter()
@@ -372,7 +886,7 @@ where
                     super::DeferredIfBody::ModuleCall(_) => None,
                 })
             }));
-        let resources = resource_refs
+        let resources: Vec<AnalysisResourceRef<'a, P, T, D, B>> = resource_refs
             .map(|resource| {
                 let (provenance, kind) = match resource {
                     ResourceRef::Resource(item) => (&item.declaration, AnalysisItemKind::Resource),
@@ -393,7 +907,147 @@ where
                         id: resource.id().clone(),
                     }
                 })?;
-                Ok(AnalysisResourceRef { resource, location })
+                let (attribute_locations, references, dependencies, provider_location) =
+                    match resource {
+                        ResourceRef::Resource(item) => {
+                            for (key, value) in &item.attributes {
+                                collect_value_references(
+                                    value,
+                                    &format!("{} attribute `{key}`", item.id),
+                                    true,
+                                    &mut value_references,
+                                )?;
+                            }
+                            let (keys, mut refs) =
+                                attribute_provenance(&item.attributes, provenance, location)?;
+                            append_reference_origins(
+                                &mut refs,
+                                &item.dependencies.depends_on,
+                                location,
+                            )?;
+                            let provider = if item.directives.provider_instance.is_some() {
+                                required_element(
+                                    provenance,
+                                    super::elements::ElementKind::Provider,
+                                )?
+                            } else {
+                                location
+                            };
+                            (
+                                keys,
+                                refs,
+                                dependency_refs(&item.dependencies.depends_on, location)?,
+                                provider,
+                            )
+                        }
+                        ResourceRef::DataSource(item) => {
+                            for (key, value) in &item.attributes {
+                                collect_value_references(
+                                    value,
+                                    &format!("{} attribute `{key}`", item.id),
+                                    true,
+                                    &mut value_references,
+                                )?;
+                            }
+                            let (keys, mut refs) =
+                                attribute_provenance(&item.attributes, provenance, location)?;
+                            append_reference_origins(
+                                &mut refs,
+                                &item.dependencies.depends_on,
+                                location,
+                            )?;
+                            let provider = if item.directives.provider_instance.is_some() {
+                                required_element(
+                                    provenance,
+                                    super::elements::ElementKind::Provider,
+                                )?
+                            } else {
+                                location
+                            };
+                            (
+                                keys,
+                                refs,
+                                dependency_refs(&item.dependencies.depends_on, location)?,
+                                provider,
+                            )
+                        }
+                        ResourceRef::LiveComposition(item) => {
+                            let attrs = item
+                                .signature
+                                .attributes
+                                .iter()
+                                .filter_map(|(name, attr)| {
+                                    attr.value().map(|value| (name.clone(), value))
+                                })
+                                .collect();
+                            let (keys, refs) = attribute_provenance(&attrs, provenance, location)?;
+                            for (key, value) in &attrs {
+                                collect_value_references(
+                                    value,
+                                    &format!("{} attribute `{key}`", item.id),
+                                    true,
+                                    &mut value_references,
+                                )?;
+                            }
+                            (keys, refs, Vec::new(), location)
+                        }
+                        ResourceRef::Deferred { resource, deferred } => {
+                            let item = resource.as_resource();
+                            for (key, value) in &item.attributes {
+                                collect_value_references(
+                                    value,
+                                    &format!(
+                                        "for-body `{}` {} attribute `{key}`",
+                                        D::deferred_header(deferred),
+                                        item.id
+                                    ),
+                                    true,
+                                    &mut value_references,
+                                )?;
+                            }
+                            let (keys, mut refs) =
+                                attribute_provenance(&item.attributes, provenance, location)?;
+                            append_reference_origins(
+                                &mut refs,
+                                &item.dependencies.depends_on,
+                                location,
+                            )?;
+                            let provider = if item.directives.provider_instance.is_some() {
+                                required_element(
+                                    provenance,
+                                    super::elements::ElementKind::Provider,
+                                )?
+                            } else {
+                                location
+                            };
+                            (
+                                keys,
+                                refs,
+                                dependency_refs(&item.dependencies.depends_on, location)?,
+                                provider,
+                            )
+                        }
+                    };
+                let iterable = match resource {
+                    ResourceRef::Deferred { deferred, .. } => AnalysisIterableRef::Deferred {
+                        value: D::deferred_iterable(deferred),
+                        location: required_element(
+                            provenance,
+                            super::elements::ElementKind::Iterable,
+                        )?,
+                    },
+                    _ => AnalysisIterableRef::Direct,
+                };
+                Ok(AnalysisResourceRef {
+                    resource,
+                    location,
+                    attribute_locations,
+                    references,
+                    dependencies,
+                    provider_location,
+                    iterable,
+                    attribute_keys: &provenance.elements().keys,
+                })
             })
             .collect::<Result<_, AnalysisTreeError>>()?;
         let waits = file
@@ -405,10 +1059,445 @@ where
                         binding: wait.binding.as_str().to_owned(),
                     }
                 })?;
-                Ok(AnalysisWaitRef { wait, location })
+                Ok(AnalysisWaitRef {
+                    wait,
+                    location,
+                    target_location: required_element(
+                        &wait.declaration,
+                        super::elements::ElementKind::WaitTarget,
+                    )?,
+                    lhs_location: required_element(
+                        &wait.declaration,
+                        super::elements::ElementKind::UntilLhs,
+                    )?,
+                    rhs_location: required_element(
+                        &wait.declaration,
+                        super::elements::ElementKind::UntilRhs,
+                    )?,
+                    dependencies: dependency_refs(&wait.depends_on, location)?,
+                })
             })
             .collect::<Result<_, AnalysisTreeError>>()?;
-        Ok(Self { resources, waits })
+        let mut loop_groups: std::collections::HashSet<String> = file
+            .parser_binding_metadata
+            .structural_handles()
+            .iter()
+            .filter(|(_, handle)| handle.is_for_binding())
+            .map(|(binding, _)| binding.to_string())
+            .collect();
+        for resource in file.iter_all_resources() {
+            if matches!(
+                resource,
+                ResourceRef::Resource(_) | ResourceRef::Deferred { .. }
+            ) && let Some(binding) = resource.binding_address()
+            {
+                loop_groups.extend(
+                    crate::resolved_graph::loop_group_bindings(binding)
+                        .into_iter()
+                        .map(|group| group.to_string()),
+                );
+            }
+        }
+        for export in &file.export_params {
+            if let Some(value) = export.value() {
+                collect_value_references(
+                    value,
+                    &format!("exports.{}", export.name()),
+                    true,
+                    &mut value_references,
+                )?;
+            }
+        }
+        for attribute in &file.attribute_params {
+            if let Some(super::BoundaryExpression::Value(value)) = &attribute.value {
+                collect_value_references(
+                    value,
+                    &format!("attributes.{}", attribute.name),
+                    true,
+                    &mut value_references,
+                )?;
+            }
+        }
+        for (name, value) in &file.variables {
+            collect_value_references(value, &format!("let {name}"), false, &mut value_references)?;
+        }
+        for call in &file.module_calls {
+            let caller = call
+                .binding_name
+                .as_ref()
+                .map(BindingAddress::as_str)
+                .unwrap_or(&call.module_name);
+            for (name, value) in call.arguments() {
+                collect_value_references(
+                    value.walker_value(),
+                    &format!("module `{caller}` argument `{name}`"),
+                    true,
+                    &mut value_references,
+                )?;
+            }
+        }
+        let syntax = file.parser_binding_metadata.syntax();
+        let require_syntax = |present: bool, element: String| {
+            if present {
+                Ok(())
+            } else {
+                Err(AnalysisTreeError::MissingSyntaxProvenance { element })
+            }
+        };
+        for item in &resources {
+            let Some(resource) = item.managed_resource() else {
+                continue;
+            };
+            if resource.binding.is_none() && resource.loop_provenance.is_empty() {
+                require_syntax(
+                    syntax.anonymous_headers().iter().any(|header| {
+                        header.file() == item.location().file()
+                            && item.location().span().contains(header.span())
+                    }),
+                    format!("anonymous resource header {}", item.id()),
+                )?;
+            }
+            if let Some(origin) = resource.loop_provenance.display_origin() {
+                require_syntax(
+                    syntax.loops().iter().any(|location| {
+                        location.file().path().ends_with(origin.file())
+                            && Some(location.span()) == origin.source_span()
+                    }),
+                    format!("loop identity origin {}", item.id()),
+                )?;
+            }
+        }
+        require_syntax(
+            syntax
+                .configuration_blocks()
+                .iter()
+                .filter(|block| *block.detail() == super::ConfigurationBlock::State)
+                .count()
+                == file.state_blocks.len(),
+            "state block declarations".into(),
+        )?;
+        for block in &file.state_blocks {
+            let span = match block {
+                super::StateBlock::Moved { addresses } => addresses.to_span(),
+                super::StateBlock::Import { to_span, .. } => *to_span,
+                super::StateBlock::Removed { .. } => continue,
+            };
+            require_syntax(
+                syntax
+                    .state_targets()
+                    .iter()
+                    .any(|location| Some(location.span()) == span),
+                "state destination".into(),
+            )?;
+        }
+        let backend_location = if let Some(backend) = &file.backend {
+            let header = syntax
+                .configuration_blocks()
+                .iter()
+                .rev()
+                .find(|block| *block.detail() == super::ConfigurationBlock::Backend)
+                .ok_or_else(|| AnalysisTreeError::MissingSyntaxProvenance {
+                    element: "backend declaration".to_string(),
+                })?;
+            for key in backend.attributes.keys() {
+                if !syntax.backend_keys().iter().any(|entry| {
+                    entry.detail() == key && entry.location().file() == header.location().file()
+                }) {
+                    return Err(AnalysisTreeError::MissingSyntaxProvenance {
+                        element: format!("backend attribute {key}"),
+                    });
+                }
+            }
+            Some(header.location())
+        } else {
+            None
+        };
+        use crate::validation::{
+            TypeResolutionContext as Context, TypeResolutionDeclarationKind as Kind,
+        };
+        let mut type_annotations: Vec<_> = syntax
+            .type_annotations()
+            .iter()
+            .filter(|annotation| {
+                matches!(
+                    annotation.detail(),
+                    Context::Declaration {
+                        kind: Kind::Argument,
+                        ..
+                    }
+                )
+            })
+            .cloned()
+            .collect();
+        let declaration = |kind, name: &str, source: &Path, span: super::SourceSpan| {
+            syntax
+                .declarations()
+                .iter()
+                .find(|declaration| {
+                    declaration.kind() == kind
+                        && declaration.name() == name
+                        && declaration.location().file().path() == source
+                        && span.contains(declaration.location().span())
+                })
+                .ok_or_else(|| AnalysisTreeError::MissingSyntaxProvenance {
+                    element: format!("{kind:?} declaration {name}"),
+                })
+        };
+        for export in &file.export_params {
+            let record = declaration(
+                crate::config_loader::DeclarationKind::Export,
+                export.name(),
+                export.source_file(),
+                export.source_span(),
+            )?;
+            require_syntax(
+                export.value().is_none() || record.value_location().is_some(),
+                format!("export {} value", export.name()),
+            )?;
+            let location = match record.annotation() {
+                super::DeclarationAnnotation::Authored(location) => location,
+                super::DeclarationAnnotation::Unannotated => record.location(),
+            };
+            type_annotations.push(Located::new(
+                location.clone(),
+                Context::Declaration {
+                    kind: Kind::Export,
+                    name: export.name().to_string(),
+                },
+            ));
+        }
+        for attribute in &file.attribute_params {
+            let record = declaration(
+                crate::config_loader::DeclarationKind::ModuleAttribute,
+                &attribute.name,
+                attribute.source_file(),
+                attribute.source_span(),
+            )?;
+            require_syntax(
+                attribute.value.is_none() || record.value_location().is_some(),
+                format!("module attribute {} value", attribute.name),
+            )?;
+            if attribute.static_type.is_some() {
+                let location = match record.annotation() {
+                    super::DeclarationAnnotation::Authored(location) => location,
+                    super::DeclarationAnnotation::Unannotated => record.location(),
+                };
+                type_annotations.push(Located::new(
+                    location.clone(),
+                    Context::Declaration {
+                        kind: Kind::Attribute,
+                        name: attribute.name.clone(),
+                    },
+                ));
+            }
+        }
+        for function in file.user_functions.values() {
+            type_annotations.extend(function.type_annotations.iter().cloned());
+        }
+        let mut expected = file
+            .arguments
+            .iter()
+            .map(|argument| Context::Declaration {
+                kind: Kind::Argument,
+                name: argument.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        for function in file.user_functions.values() {
+            for parameter in function
+                .params
+                .iter()
+                .filter(|parameter| parameter.param_type.is_some())
+            {
+                expected.push(Context::Declaration {
+                    kind: Kind::FunctionParameter,
+                    name: format!("{}' parameter '{}", function.name, parameter.name),
+                });
+            }
+            if function.return_type.is_some() {
+                expected.push(Context::Declaration {
+                    kind: Kind::FunctionReturn,
+                    name: function.name.clone(),
+                });
+            }
+        }
+        let mut type_occurrences = std::collections::HashMap::new();
+        for context in expected {
+            let occurrence = type_occurrences.entry(context.clone()).or_insert(0);
+            if type_annotations
+                .iter()
+                .filter(|annotation| annotation.detail() == &context)
+                .nth(*occurrence)
+                .is_none()
+            {
+                return Err(AnalysisTreeError::MissingSyntaxProvenance {
+                    element: format!("{context} annotation"),
+                });
+            }
+            *occurrence += 1;
+        }
+        let mut provider_occurrences = std::collections::HashMap::new();
+        let mut provider_attribute_locations = Vec::new();
+        for provider in &file.providers {
+            let occurrence = provider_occurrences
+                .entry((&provider.name, &provider.binding))
+                .or_insert(0);
+            let record = syntax
+                .providers()
+                .iter()
+                .filter(|record| record.name == provider.name && record.binding == provider.binding)
+                .nth(*occurrence);
+            *occurrence += 1;
+            let record = record.ok_or_else(|| AnalysisTreeError::MissingSyntaxProvenance {
+                element: format!("provider {} declaration", provider.name),
+            })?;
+            let mut locations = std::collections::HashMap::new();
+            for key in provider.unresolved_attributes.keys() {
+                let location = record
+                    .attributes
+                    .iter()
+                    .rev()
+                    .find(|attribute| attribute.detail() == key)
+                    .ok_or_else(|| AnalysisTreeError::MissingSyntaxProvenance {
+                        element: format!("provider {} attribute {key}", provider.name),
+                    })?;
+                locations.insert(key.clone(), location.location().clone());
+            }
+            provider_attribute_locations.push(locations);
+        }
+        let mut source_occurrences = std::collections::HashMap::<&B, usize>::new();
+        let upstream_states = file
+            .upstream_states
+            .iter()
+            .map(|state| {
+                let occurrence = source_occurrences.entry(&state.binding).or_default();
+                let source = syntax
+                    .upstream_sources()
+                    .iter()
+                    .filter(|source| *source.detail() == state.binding)
+                    .nth(*occurrence)
+                    .ok_or_else(|| AnalysisTreeError::MissingSyntaxProvenance {
+                        element: format!("upstream source {}", state.binding),
+                    })?;
+                *occurrence += 1;
+                Ok(Located::new(source.location().clone(), state))
+            })
+            .collect::<Result<_, AnalysisTreeError>>()?;
+        let iterables = file
+            .deferred_for_sites()
+            .map(|site| {
+                let location = site.iterable_location.ok_or_else(|| {
+                    AnalysisTreeError::MissingSyntaxProvenance {
+                        element: format!("iterable {}", site.header),
+                    }
+                })?;
+                let mut refs = Vec::new();
+                collect_value_references(site.iterable, site.header, false, &mut refs)?;
+                Ok(AnalysisForRef {
+                    site,
+                    location,
+                    references: refs
+                        .into_iter()
+                        .map(|reference| reference.reference)
+                        .collect(),
+                })
+            })
+            .collect::<Result<_, AnalysisTreeError>>()?;
+        Ok(Self {
+            resources,
+            waits,
+            providers: &file.providers,
+            upstream_names: file
+                .upstream_states
+                .iter()
+                .map(|state| state.binding.as_str())
+                .collect(),
+            loop_groups,
+            syntax,
+            type_annotations,
+            provider_attribute_locations,
+            upstream_states,
+            value_references,
+            iterables,
+            arguments: &file.arguments,
+            functions: &file.user_functions,
+            module_calls: &file.module_calls,
+            module_definition: !file.arguments.is_empty() || !file.attribute_params.is_empty(),
+            root_configuration: file.backend.is_some() || !file.providers.is_empty(),
+            backend_location,
+            binding_names: syntax
+                .declarations()
+                .iter()
+                .filter(|declaration| {
+                    matches!(
+                        declaration.kind(),
+                        crate::config_loader::DeclarationKind::Binding
+                            | crate::config_loader::DeclarationKind::Argument
+                            | crate::config_loader::DeclarationKind::UserFunction
+                    )
+                })
+                .map(|declaration| declaration.name().to_string())
+                .chain(file.variables.keys().cloned())
+                .chain(file.structural_bindings.iter().map(ToString::to_string))
+                .collect(),
+        })
+    }
+
+    pub fn providers(&self) -> &'a [super::ProviderConfig<P, B>] {
+        self.providers
+    }
+    pub fn is_module_definition(&self) -> bool {
+        self.module_definition
+    }
+    pub fn is_root_configuration(&self) -> bool {
+        self.root_configuration
+    }
+    pub fn backend_location(&self) -> Option<&'a DeclarationLocation> {
+        self.backend_location
+    }
+    pub fn backend_attribute_location(&self, name: &str) -> &'a DeclarationLocation {
+        let header = self
+            .backend_location
+            .expect("backend must exist before validating its attributes");
+        self.syntax
+            .backend_keys()
+            .iter()
+            .rev()
+            .find(|key| key.detail() == name && key.location().file() == header.file())
+            .map(|key| key.location())
+            .unwrap_or(header)
+    }
+    pub fn is_upstream(&self, binding: &str) -> bool {
+        self.upstream_names.contains(binding)
+    }
+    pub fn is_loop_group(&self, binding: &str) -> bool {
+        self.loop_groups.contains(binding)
+    }
+    pub(crate) fn provider_attribute_locations(
+        &self,
+    ) -> &[std::collections::HashMap<String, DeclarationLocation>] {
+        &self.provider_attribute_locations
+    }
+    pub fn type_annotations(&self) -> &[Located<crate::validation::TypeResolutionContext>] {
+        &self.type_annotations
+    }
+    pub fn syntax(&self) -> &'a super::SyntaxInventory<B> {
+        self.syntax
+    }
+    pub fn module_calls(&self) -> impl Iterator<Item = &'a super::ModuleCall<P, B>> {
+        self.module_calls.iter()
+    }
+
+    pub fn binding_names(&self) -> &std::collections::HashSet<String> {
+        &self.binding_names
+    }
+    pub fn upstream_states(&self) -> &[Located<&'a super::UpstreamState<B>>] {
+        &self.upstream_states
+    }
+    pub fn value_references(&self) -> &[AnalysisValueReference<B>] {
+        &self.value_references
+    }
+    pub fn for_iterables(&self) -> &[AnalysisForRef<'a, P, B>] {
+        &self.iterables
     }
 
     pub fn resources(&self) -> impl Iterator<Item = &AnalysisResourceRef<'a, P, T, D, B>> {
@@ -422,6 +1511,7 @@ where
 
 impl<'a, E, P, T, D, B> TryFrom<&'a File<E, P, T, D, B>> for AnalysisTree<'a, P, T, D, B>
 where
+    E: super::ExportParamLike<P, B>,
     P: ValueKind,
     T: ValueKind,
     B: BindingAddress,
@@ -431,5 +1521,60 @@ where
 
     fn try_from(file: &'a File<E, P, T, D, B>) -> Result<Self, Self::Error> {
         Self::try_from_file(file)
+    }
+}
+
+impl<D, B: BindingAddress> AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>
+where
+    D: DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    pub fn inference_bindings(
+        &self,
+    ) -> crate::validation::inference::InferenceBindings<ParserPlaceholder, B> {
+        use crate::validation::inference::InferenceBinding;
+        let mut bindings = std::collections::HashMap::new();
+        for upstream in self.upstream_states() {
+            bindings.insert(
+                upstream.binding.to_string(),
+                InferenceBinding::UpstreamState,
+            );
+        }
+        for resource in self.resources() {
+            if let Some(binding) = resource.binding_address() {
+                let kind = if resource.kind() == AnalysisItemKind::Composition {
+                    InferenceBinding::Virtual {
+                        attributes: resource.attributes().into_owned(),
+                    }
+                } else {
+                    InferenceBinding::Resource {
+                        provider: resource.id().provider.clone(),
+                        resource_type: resource.id().resource_type.clone(),
+                    }
+                };
+                bindings.insert(binding.to_string(), kind);
+            }
+        }
+        for call in self.module_calls {
+            if let Some(binding) = &call.binding_name {
+                bindings
+                    .entry(binding.to_string())
+                    .or_insert(InferenceBinding::ModuleCall);
+            }
+        }
+        for argument in self.arguments {
+            bindings
+                .entry(argument.name.clone())
+                .or_insert_with(|| InferenceBinding::Argument {
+                    type_expr: argument.static_type.clone(),
+                });
+        }
+        for function in self.functions.values() {
+            bindings.entry(function.name.clone()).or_insert_with(|| {
+                InferenceBinding::UserFunction {
+                    return_type: function.return_type.clone(),
+                }
+            });
+        }
+        bindings
     }
 }

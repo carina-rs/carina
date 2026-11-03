@@ -3034,15 +3034,20 @@ pub fn validate_depends_on_with_ctx<E, B, D>(
     argument_types: &validation::ResolvedArgumentTypes,
 ) -> Vec<AppError>
 where
+    E: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
     use carina_core::validation::depends_on::{Severity, validate_depends_on};
+    let tree = match carina_core::parser::AnalysisTree::try_from_file(parsed) {
+        Ok(tree) => tree,
+        Err(error) => return vec![AppError::AnalysisInvariant(error)],
+    };
     let mut errors = Vec::new();
-    for diag in validate_depends_on(parsed, argument_types) {
+    for diag in validate_depends_on(&tree, argument_types) {
         match diag.severity {
-            Severity::Error => errors.push(AppError::Validation(diag.message)),
-            Severity::Warning => eprintln!("warning: {}", diag.message),
+            Severity::Error => errors.push(AppError::DependsOn(Box::new(diag))),
+            Severity::Warning => eprintln!("warning: {diag}"),
         }
     }
     errors
@@ -3056,12 +3061,17 @@ pub fn validate_wait_bindings_with_ctx<E, D, B>(
     parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
 ) -> Vec<AppError>
 where
+    E: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    carina_core::validation::wait::validate_wait_bindings(parsed, ctx.schemas())
+    let tree = match carina_core::parser::AnalysisTree::try_from_file(parsed) {
+        Ok(tree) => tree,
+        Err(error) => return vec![AppError::AnalysisInvariant(error)],
+    };
+    carina_core::validation::wait::validate_wait_bindings(&tree, ctx.schemas())
         .into_iter()
-        .map(|d| AppError::Validation(d.message))
+        .map(|diagnostic| AppError::Wait(Box::new(diagnostic)))
         .collect()
 }
 
@@ -3071,19 +3081,23 @@ where
 /// `carina_core::validation::deferred_populate::validate_deferred_populate_refs`
 /// pass. carina#3034.
 pub fn validate_deferred_populate_refs_with_ctx<
-    E,
+    E: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
 ) -> Vec<AppError> {
+    let tree = match carina_core::parser::AnalysisTree::try_from_file(parsed) {
+        Ok(tree) => tree,
+        Err(error) => return vec![AppError::AnalysisInvariant(error)],
+    };
     carina_core::validation::deferred_populate::validate_deferred_populate_refs(
-        parsed,
+        &tree,
         ctx.schemas(),
     )
     .into_iter()
-    .map(|d| AppError::Validation(d.message))
+    .map(|diagnostic| AppError::DeferredPopulate(Box::new(diagnostic)))
     .collect()
 }
 

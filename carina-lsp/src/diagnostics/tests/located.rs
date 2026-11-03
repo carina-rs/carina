@@ -1,0 +1,947 @@
+//! Directory acceptance tests for parser-owned diagnostic locations (#4220).
+use super::*;
+
+struct Directory {
+    root: tempfile::TempDir,
+}
+
+impl Directory {
+    fn new(files: &[(&str, &str)]) -> Self {
+        let root = tempfile::tempdir().unwrap();
+        for (name, source) in files {
+            let path = root.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, source).unwrap();
+        }
+        Self { root }
+    }
+
+    fn assert_ranges(
+        &self,
+        engine: &DiagnosticEngine,
+        name: &str,
+        message: &str,
+        tokens: &[(&str, usize)],
+    ) {
+        let source = std::fs::read_to_string(self.root.path().join(name)).unwrap();
+        self.assert_buffer_ranges(engine, name, &source, message, tokens);
+    }
+
+    fn assert_buffer_ranges(
+        &self,
+        engine: &DiagnosticEngine,
+        name: &str,
+        source: &str,
+        message: &str,
+        tokens: &[(&str, usize)],
+    ) {
+        let path = self.root.path().join(name);
+        let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
+        let mut actual: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains(message))
+            .map(|diagnostic| diagnostic.range)
+            .collect();
+        let mut expected: Vec<_> = tokens
+            .iter()
+            .map(|(token, occurrence)| {
+                let start = source.match_indices(token).nth(*occurrence).unwrap().0;
+                let position = |byte| {
+                    let prefix = &source[..byte];
+                    Position::new(
+                        prefix.bytes().filter(|byte| *byte == b'\n').count() as u32,
+                        prefix.rsplit('\n').next().unwrap().encode_utf16().count() as u32,
+                    )
+                };
+                Range::new(position(start), position(start + token.len()))
+            })
+            .collect();
+        let order = |range: &Range| {
+            (
+                range.start.line,
+                range.start.character,
+                range.end.line,
+                range.end.character,
+            )
+        };
+        actual.sort_by_key(order);
+        expected.sort_by_key(order);
+        assert_eq!(actual, expected, "{name}: {diagnostics:#?}");
+    }
+
+    fn assert_sibling_owner(
+        &self,
+        engine: &DiagnosticEngine,
+        message: &str,
+        tokens: &[(&str, usize)],
+    ) {
+        self.assert_ranges(engine, "main.crn", message, &[]);
+        self.assert_ranges(engine, "sibling.crn", message, tokens);
+    }
+}
+
+const MAIN: &str = "provider aws {}\nlet cert = aws.acm.Certificate { domain_name = 'main' }\n";
+
+#[test]
+fn depends_on_belongs_to_sibling_unnamed_resource() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        (
+            "sibling.crn",
+            "aws.acm.Certificate {\n  domain_name = '😀 missing'\n  directives { depends_on = [\n    missing\n  ] }\n}\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine_with_wait_target(),
+        "binding 'missing' is not declared",
+        &[("missing", 1)],
+    );
+}
+
+#[test]
+fn depends_on_duplicate_anchors_second_occurrence() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        (
+            "sibling.crn",
+            "let consumer = aws.acm.Certificate {\n  domain_name = 'consumer'\n  directives { depends_on = [cert,\n    cert, cert] }\n}\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine_with_wait_target(),
+        "listed multiple times",
+        &[("cert", 1)],
+    );
+}
+
+#[test]
+fn depends_on_belongs_to_sibling_for_body() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        (
+            "sibling.crn",
+            "let items = for item in [1] {\n  aws.acm.Certificate {\n    domain_name = 'loop'\n    directives { depends_on = [missing] }\n  }\n}\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine_with_wait_target(),
+        "binding 'missing' is not declared",
+        &[("missing", 0)],
+    );
+}
+
+#[test]
+fn wait_target_belongs_to_sibling() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        (
+            "sibling.crn",
+            "let ready = wait absent {\n  until = absent.status == 'ready'\n}\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine_with_wait_target(),
+        "not a known resource",
+        &[("absent", 0)],
+    );
+}
+
+#[test]
+fn wait_operands_belong_to_sibling() {
+    let engine = test_engine_with_wait_target();
+    for (source, message, token) in [
+        (
+            "let ready = wait cert {\n  until =\n    cert.statu == 'ready'\n}\n",
+            "unknown attribute",
+            "cert.statu",
+        ),
+        (
+            "let ready = wait cert {\n  until = cert.status ==\n    ready\n}\n",
+            "cannot resolve `ready`",
+            "ready",
+        ),
+        (
+            "let ready = wait cert {\n  until = cert.status == 'ready'\n  depends_on = [\n    missing\n  ]\n}\n",
+            "binding 'missing' is not declared",
+            "missing",
+        ),
+    ] {
+        let directory = Directory::new(&[("main.crn", MAIN), ("sibling.crn", source)]);
+        let occurrence = usize::from(message == "cannot resolve `ready`");
+        directory.assert_sibling_owner(&engine, message, &[(token, occurrence)]);
+    }
+}
+
+#[test]
+fn provider_routing_belongs_to_sibling() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        (
+            "sibling.crn",
+            "aws.acm.Certificate {\n  domain_name = 'consumer'\n  directives { provider = typo }\n}\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine_with_wait_target(),
+        "`typo` is not a known provider instance",
+        &[("typo", 0)],
+    );
+}
+
+#[test]
+fn repeated_provider_directives_anchor_the_effective_operand() {
+    let directory = Directory::new(&[
+        ("main.crn", "provider aws {}\nlet valid = provider aws {}\n"),
+        (
+            "sibling.crn",
+            "aws.acm.Certificate {\n  domain_name = 'consumer'\n  directives { provider = valid provider = typo }\n}\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine_with_wait_target(),
+        "`typo` is not a known provider instance",
+        &[("typo", 0)],
+    );
+}
+
+#[test]
+fn cycle_belongs_only_to_members_and_preserves_value_edge() {
+    let directory = Directory::new(&[
+        (
+            "main.crn",
+            "provider aws {}\nlet independent = aws.acm.Certificate { domain_name = 'unrelated' }\n",
+        ),
+        (
+            "sibling.crn",
+            "let a = aws.acm.Certificate {\n  domain_name = 'a'\n  directives { depends_on = [b] }\n}\n",
+        ),
+        (
+            "values.crn",
+            "let b = aws.acm.Certificate {\n  domain_name = a.domain_name\n}\n",
+        ),
+    ]);
+    let engine = test_engine_with_wait_target();
+    directory.assert_sibling_owner(&engine, "Circular dependency", &[("b", 0)]);
+    directory.assert_ranges(
+        &engine,
+        "values.crn",
+        "Circular dependency",
+        &[("a.domain_name", 0)],
+    );
+}
+
+fn deferred_engine() -> DiagnosticEngine {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("acm.Certificate")
+            .attribute(AttributeSchema::optional("domain_name", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::provider_populated("status", AttributeType::string())
+                    .deferred_populate()
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    DiagnosticEngine::new(loaded_test_providers(schemas), vec!["aws".into()])
+}
+
+#[test]
+fn deferred_populate_belongs_to_sibling_attribute() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        (
+            "sibling.crn",
+            "aws.acm.Certificate {\n  domain_name = cert.status\n}\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &deferred_engine(),
+        "populated asynchronously",
+        &[("domain_name", 0)],
+    );
+}
+
+#[test]
+fn repeated_attribute_keys_anchor_the_effective_value() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        (
+            "sibling.crn",
+            "aws.acm.Certificate {\n  domain_name = 'overwritten'\n  domain_name = cert.status\n}\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &deferred_engine(),
+        "populated asynchronously",
+        &[("domain_name", 1)],
+    );
+}
+
+#[test]
+fn deferred_if_body_diagnostics_belong_to_sibling() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        ("arguments.crn", "arguments { enabled: Bool }\n"),
+        (
+            "sibling.crn",
+            "let selected = if enabled {\n  aws.acm.Certificate {\n    domain_name = cert.status\n    directives { provider = typo depends_on = [missing] }\n  }\n}\n",
+        ),
+    ]);
+    let engine = deferred_engine();
+    directory.assert_sibling_owner(&engine, "populated asynchronously", &[("domain_name", 0)]);
+    directory.assert_sibling_owner(
+        &engine,
+        "binding 'missing' is not declared",
+        &[("missing", 0)],
+    );
+    directory.assert_sibling_owner(
+        &engine,
+        "`typo` is not a known provider instance",
+        &[("typo", 0)],
+    );
+}
+
+#[test]
+fn expanded_module_diagnostic_keeps_its_authored_file() {
+    let directory = Directory::new(&[
+        (
+            "main.crn",
+            "provider aws {}\nlet module = use { source = './module' }\nlet instance = module {}\n",
+        ),
+        (
+            "module/arguments.crn",
+            "arguments { label: String = 'module' }\n",
+        ),
+        (
+            "module/sibling.crn",
+            "let cert = aws.acm.Certificate { domain_name = 'module' }\nlet job = aws.acm.Certificate { domain_name = 'job' }\nlet ready = wait job { until = job.statu == 'ready' }\naws.acm.Certificate {\n  domain_name = cert.status\n  directives { depends_on = [cert, cert] }\n}\n",
+        ),
+    ]);
+    let engine = deferred_engine();
+    let root_path = directory.root.path().join("main.crn");
+    let root_source = std::fs::read_to_string(&root_path).unwrap();
+    let document = create_document_at(&root_source, root_path);
+    let merged = engine
+        .with_run_for_test(|run| {
+            run.parse_merged_with_buffer(
+                &document,
+                Some("main.crn"),
+                &carina_core::paths::ResolvedPath::new(directory.root.path()).unwrap(),
+            )
+        })
+        .unwrap();
+    let crate::diagnostics::checks::MergedModuleResolution::Expanded { graph } =
+        &merged.module_resolution
+    else {
+        panic!("fixture must exercise a genuinely expanded module")
+    };
+    let tree = carina_core::parser::AnalysisTree::try_from_file(graph.as_ref()).unwrap();
+    let waits = engine.with_run_for_test(|run| {
+        carina_core::validation::wait::validate_wait_bindings(&tree, &run.schemas)
+    });
+    assert_eq!(waits.len(), 1);
+    assert_eq!(
+        waits[0].location().file().path(),
+        directory.root.path().join("module/sibling.crn")
+    );
+    directory.assert_ranges(&engine, "main.crn", "populated asynchronously", &[]);
+    directory.assert_ranges(
+        &engine,
+        "module/sibling.crn",
+        "populated asynchronously",
+        &[("domain_name", 2)],
+    );
+    directory.assert_ranges(&engine, "main.crn", "unknown attribute", &[]);
+    directory.assert_ranges(
+        &engine,
+        "module/sibling.crn",
+        "unknown attribute",
+        &[("job.statu", 0)],
+    );
+    directory.assert_ranges(&engine, "main.crn", "listed multiple times", &[]);
+    directory.assert_ranges(
+        &engine,
+        "module/sibling.crn",
+        "listed multiple times",
+        &[("cert", 3)],
+    );
+}
+
+#[test]
+fn deferred_populate_and_routing_in_static_and_deferred_for_bodies_keep_the_owner() {
+    for iterable in ["['item']", "names"] {
+        let source = format!(
+            "let items = for item in {iterable} {{\n  aws.acm.Certificate {{\n    domain_name = cert.status\n    directives {{ provider = typo }}\n  }}\n}}\n"
+        );
+        let directory = Directory::new(&[
+            ("main.crn", MAIN),
+            ("arguments.crn", "arguments { names: list(String) }\n"),
+            ("sibling.crn", &source),
+        ]);
+        let engine = deferred_engine();
+        directory.assert_sibling_owner(&engine, "populated asynchronously", &[("domain_name", 0)]);
+        directory.assert_sibling_owner(
+            &engine,
+            "`typo` is not a known provider instance",
+            &[("typo", 0)],
+        );
+    }
+}
+
+#[test]
+fn unsaved_sibling_override_uses_its_current_parser_span() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        (
+            "sibling.crn",
+            "aws.acm.Certificate { domain_name = 'on disk' }\n",
+        ),
+    ]);
+    let source = "# unsaved 😀\n\naws.acm.Certificate {\n  domain_name = 'current'\n  directives { depends_on = [missing] }\n}\n";
+    let path = directory.root.path().join("sibling.crn");
+    let engine = test_engine_with_wait_target();
+    let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
+    let matching: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("binding 'missing' is not declared")
+        })
+        .collect();
+    assert_eq!(matching.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        matching[0].range,
+        Range::new(Position::new(4, 29), Position::new(4, 36))
+    );
+}
+
+#[test]
+fn cycle_from_exports_uses_the_sibling_lets_reference_location() {
+    let directory = Directory::new(&[
+        (
+            "main.crn",
+            "provider aws {}\nlet a = aws.acm.Certificate { domain_name = 'a' directives { depends_on = [b] } }\nlet value = a.domain_name\n",
+        ),
+        (
+            "exports.crn",
+            "let b = aws.acm.Certificate { domain_name = value }\nexports { result = b.domain_name }\n",
+        ),
+        ("unrelated.crn", "let unrelated = 'unrelated'\n"),
+    ]);
+    let engine = test_engine_with_wait_target();
+    directory.assert_ranges(
+        &engine,
+        "main.crn",
+        "Circular dependency",
+        &[("b", 0), ("a.domain_name", 0)],
+    );
+    directory.assert_ranges(&engine, "exports.crn", "Circular dependency", &[]);
+    directory.assert_ranges(&engine, "unrelated.crn", "Circular dependency", &[]);
+}
+
+#[test]
+fn depends_on_precise_anchors_ignore_strings_comments_and_other_resources() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        (
+            "sibling.crn",
+            "let first = aws.acm.Certificate {\n  domain_name = 'depends_on = [missing]'\n  # depends_on = [missing]\n  directives { depends_on = [missing] }\n}\nlet second = aws.acm.Certificate {\n  domain_name = 'other'\n  directives { depends_on = [another] }\n}\n",
+        ),
+    ]);
+    let engine = test_engine_with_wait_target();
+    directory.assert_sibling_owner(
+        &engine,
+        "binding 'missing' is not declared",
+        &[("missing", 2)],
+    );
+    directory.assert_sibling_owner(
+        &engine,
+        "binding 'another' is not declared",
+        &[("another", 0)],
+    );
+}
+
+#[test]
+fn upstream_resolve_owns_each_recorded_source() {
+    let directory = Directory::new(&[
+        (
+            "main.crn",
+            "let other = upstream_state { source = './broken' }\n",
+        ),
+        (
+            "sibling.crn",
+            "let orgs = upstream_state {\n  source =\n    './broken'\n}\n",
+        ),
+        ("broken/main.crn", "invalid {{{"),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine(),
+        "upstream_state `orgs`: failed to parse",
+        &[("'./broken'", 0)],
+    );
+}
+
+#[test]
+fn upstream_field_owns_repeated_occurrences_after_unicode_heredoc() {
+    let directory = Directory::new(&[
+        (
+            "main.crn",
+            "let orgs = upstream_state { source = './upstream' }\nlet decoy = 'orgs.missing'\n",
+        ),
+        (
+            "sibling.crn",
+            "let note = <<TEXT\n😀 orgs.missing\nTEXT\n# orgs.missing\nlet first = orgs.missing\nlet second = orgs.missing\n",
+        ),
+        (
+            "upstream/exports.crn",
+            "exports { accounts: list(String) = ['a'] }\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine(),
+        "does not export `missing`",
+        &[("orgs.missing", 2), ("orgs.missing", 3)],
+    );
+}
+
+#[test]
+fn upstream_for_shape_owns_multiline_iterable() {
+    let directory = Directory::new(&[
+        (
+            "main.crn",
+            "provider aws {}\nlet orgs = upstream_state { source = './upstream' }\nlet decoy = 'orgs.accounts'\n",
+        ),
+        (
+            "sibling.crn",
+            "let note = '😀 orgs.accounts'\nfor item in\n  orgs.accounts\n{ aws.acm.Certificate { domain_name = 'loop' } }\n",
+        ),
+        (
+            "upstream/exports.crn",
+            "exports { accounts: map(String) = { a = 'a' } }\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine_with_wait_target(),
+        "is declared as",
+        &[("orgs.accounts", 1)],
+    );
+}
+
+#[test]
+fn upstream_attribute_shape_owns_reference_prefix() {
+    let directory = Directory::new(&[
+        (
+            "main.crn",
+            "let orgs = upstream_state { source = './upstream' }\nlet decoy = 'orgs.accounts'\n",
+        ),
+        (
+            "sibling.crn",
+            "let first = orgs.accounts.name\nlet second = orgs.accounts.name\n",
+        ),
+        (
+            "upstream/exports.crn",
+            "exports { accounts: list(String) = ['a'] }\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine(),
+        "reads it as a struct",
+        &[("orgs.accounts", 0), ("orgs.accounts", 1)],
+    );
+}
+
+#[test]
+fn upstream_subscript_shape_owns_reference_prefix() {
+    let directory = Directory::new(&[
+        (
+            "main.crn",
+            "let orgs = upstream_state { source = './upstream' }\nlet decoy = 'orgs.accounts'\n",
+        ),
+        (
+            "sibling.crn",
+            "let first = orgs.accounts['bad']\nlet second = orgs.accounts['bad']\n",
+        ),
+        (
+            "upstream/exports.crn",
+            "exports { accounts: list(String) = ['a'] }\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine(),
+        "subscript",
+        &[("orgs.accounts", 0), ("orgs.accounts", 1)],
+    );
+}
+
+#[test]
+fn upstream_field_in_main_is_not_reanchored_at_export_alias() {
+    let directory = Directory::new(&[
+        (
+            "main.crn",
+            "let orgs = upstream_state { source = './upstream' }\nlet bad = orgs.missing\n",
+        ),
+        ("exports.crn", "exports { result = bad }\n# orgs.missing\n"),
+        (
+            "upstream/exports.crn",
+            "exports { accounts: list(String) = ['a'] }\n",
+        ),
+    ]);
+    let engine = test_engine();
+    directory.assert_ranges(&engine, "exports.crn", "does not export `missing`", &[]);
+    directory.assert_ranges(
+        &engine,
+        "main.crn",
+        "does not export `missing`",
+        &[("orgs.missing", 0)],
+    );
+}
+
+#[test]
+fn upstream_field_unsaved_override_owns_new_occurrences() {
+    let directory = Directory::new(&[
+        (
+            "main.crn",
+            "let orgs = upstream_state { source = './upstream' }\n",
+        ),
+        ("sibling.crn", "let old = orgs.missing\n"),
+        (
+            "upstream/exports.crn",
+            "exports { accounts: list(String) = ['a'] }\n",
+        ),
+    ]);
+    let engine = test_engine();
+    directory.assert_buffer_ranges(
+        &engine,
+        "sibling.crn",
+        "# orgs.missing\nlet note = '😀'\nlet edited = orgs.missing\n",
+        "does not export `missing`",
+        &[("orgs.missing", 1)],
+    );
+    directory.assert_buffer_ranges(
+        &engine,
+        "sibling.crn",
+        "let fixed = orgs.accounts\n",
+        "does not export `missing`",
+        &[],
+    );
+}
+
+#[test]
+fn remaining_type_resolution_owns_annotation_tokens() {
+    for source in [
+        "arguments { value:\n  TotallyMadeUpType }\n",
+        "attributes { value:\n  TotallyMadeUpType = 'x' }\n",
+        "exports { value:\n  TotallyMadeUpType = 'x' }\n",
+        "fn example(value:\n  TotallyMadeUpType) { value }\n",
+        "fn example(value: String):\n  TotallyMadeUpType { value }\n",
+    ] {
+        let directory = Directory::new(&[("main.crn", MAIN), ("sibling.crn", source)]);
+        directory.assert_sibling_owner(
+            &test_engine_with_wait_target(),
+            "unknown custom type",
+            &[("TotallyMadeUpType", 0)],
+        );
+    }
+}
+
+#[test]
+fn remaining_deferred_iterable_type_owns_multiline_expression() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        (
+            "sibling.crn",
+            "arguments { count: Int }\nfor item in\n  count\n{ aws.acm.Certificate { domain_name = 'loop' } }\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine_with_wait_target(),
+        "expected list iterable, got Int",
+        &[("count", 1)],
+    );
+}
+
+#[test]
+fn remaining_inference_failure_owns_inline_export_name() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        (
+            "sibling.crn",
+            "let note = '😀'\nexports { result = [1, 'a'] }\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine_with_wait_target(),
+        "type annotation required",
+        &[("result", 0)],
+    );
+}
+
+#[test]
+fn remaining_duplicate_declarations_keep_every_same_file_occurrence() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        (
+            "sibling.crn",
+            "let same = '😀'\nlet same = 'second'\nlet same = 'third'\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine(),
+        "same'",
+        &[("same", 0), ("same", 1), ("same", 2)],
+    );
+}
+
+#[test]
+fn remaining_duplicate_declarations_keep_occurrences_across_files() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        (
+            "sibling.crn",
+            "exports { same = 'first' same = 'second' }\n",
+        ),
+        ("exports.crn", "exports { same = 'third' }\n"),
+    ]);
+    let engine = test_engine();
+    directory.assert_sibling_owner(&engine, "same'", &[("same", 0), ("same", 1)]);
+    directory.assert_ranges(&engine, "exports.crn", "same'", &[("same", 0)]);
+}
+
+#[test]
+fn remaining_unknown_iterable_root_owns_recorded_reference() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        (
+            "sibling.crn",
+            "for item in\n  missing.items\n{ aws.acm.Certificate { domain_name = 'loop' } }\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine_with_wait_target(),
+        "Undefined identifier `missing`",
+        &[("missing.items", 0)],
+    );
+}
+
+#[test]
+fn remaining_missing_upstream_directory_owns_source_value() {
+    let directory = Directory::new(&[
+        (
+            "main.crn",
+            "let other = upstream_state { source = './missing' }\n",
+        ),
+        (
+            "sibling.crn",
+            "let orgs = upstream_state {\n  source =\n    './missing'\n}\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine(),
+        "upstream_state 'orgs': source",
+        &[("'./missing'", 0)],
+    );
+}
+
+#[test]
+fn upstream_field_utf16_columns_after_heredoc_and_astral_literal() {
+    let directory = Directory::new(&[
+        (
+            "main.crn",
+            "let orgs = upstream_state { source = './upstream' }\n",
+        ),
+        (
+            "sibling.crn",
+            "let note = <<TEXT\n😀 orgs.missing\nTEXT\nlet values = ['😀', orgs.missing, orgs.missing]\n",
+        ),
+        (
+            "upstream/exports.crn",
+            "exports { accounts: list(String) = ['a'] }\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine(),
+        "does not export `missing`",
+        &[("orgs.missing", 1), ("orgs.missing", 2)],
+    );
+}
+
+#[test]
+fn remaining_duplicate_inventory_covers_all_declaration_kinds() {
+    for (source, name, message) in [
+        (
+            "let repeated = 'a'\nlet repeated = 'b'\n",
+            "repeated",
+            "duplicate binding",
+        ),
+        (
+            "arguments { repeated: String repeated: String }\n",
+            "repeated",
+            "duplicate argument",
+        ),
+        (
+            "attributes { repeated = 'a' repeated = 'b' }\n",
+            "repeated",
+            "duplicate module attribute",
+        ),
+        (
+            "exports { repeated = 'a' repeated = 'b' }\n",
+            "repeated",
+            "duplicate export",
+        ),
+        (
+            "fn repeated() { 'a' }\nfn repeated() { 'b' }\n",
+            "repeated",
+            "duplicate function",
+        ),
+        (
+            "provider mock {}\nprovider mock {}\n",
+            "mock",
+            "duplicate provider kind",
+        ),
+    ] {
+        let directory = Directory::new(&[("main.crn", MAIN), ("sibling.crn", source)]);
+        directory.assert_sibling_owner(
+            &test_engine_with_wait_target(),
+            message,
+            &[(name, 0), (name, 1)],
+        );
+    }
+}
+
+#[test]
+fn remaining_duplicate_inventory_honors_unsaved_override() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        ("sibling.crn", "let repeated = 'a'\nlet repeated = 'b'\n"),
+    ]);
+    let engine = test_engine();
+    directory.assert_buffer_ranges(
+        &engine,
+        "sibling.crn",
+        "let fixed = '😀'\n",
+        "duplicate binding",
+        &[],
+    );
+    directory.assert_buffer_ranges(
+        &engine,
+        "sibling.crn",
+        "let note = '😀'\nlet repeated = 'a'\nlet repeated = 'b'\n",
+        "duplicate binding",
+        &[("repeated", 0), ("repeated", 1)],
+    );
+}
+
+#[test]
+fn remaining_provider_finalization_owns_recorded_attribute_value() {
+    let directory = Directory::new(&[
+        ("main.crn", "let tag_values = 'bad'\n"),
+        (
+            "sibling.crn",
+            "provider aws {\n  default_tags =\n    tag_values\n}\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine_with_wait_target(),
+        "default_tags must resolve to a map",
+        &[("tag_values", 0)],
+    );
+}
+
+#[test]
+fn closure_module_placement_owns_multiline_provider_header() {
+    let directory = Directory::new(&[
+        ("main.crn", "arguments { label: String = 'module' }\n"),
+        (
+            "sibling.crn",
+            "let note = <<TEXT\nprovider aws {}\nTEXT\nprovider\n  aws {}\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine(),
+        "provider blocks are not allowed inside modules",
+        &[("provider\n  aws", 0)],
+    );
+}
+
+#[test]
+fn closure_arguments_in_root_owns_keyword_after_heredoc() {
+    let directory = Directory::new(&[
+        ("main.crn", "provider aws {}\n"),
+        (
+            "sibling.crn",
+            "let note = <<TEXT\narguments {\nTEXT\narguments\n{ label: String = 'module' }\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine(),
+        "arguments blocks are only valid inside module definitions",
+        &[("arguments", 1)],
+    );
+}
+
+#[test]
+fn closure_backend_attribute_owns_utf16_key() {
+    let directory = Directory::new(&[
+        ("main.crn", "let label = 'main'\n"),
+        (
+            "sibling.crn",
+            "let note = '😀' backend local { path = 'state.json' typo = 'x' }\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine(),
+        "Unknown attribute 'typo' for backend type 'local'",
+        &[("typo", 0)],
+    );
+}
+
+#[test]
+fn closure_anonymous_identity_owns_utf16_resource_headers() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Thing")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let directory = Directory::new(&[
+        ("main.crn", "provider mock {}\n"),
+        (
+            "sibling.crn",
+            "let note = '😀' mock.test.Thing { name = 'one' }\nmock.test.Thing { name = 'two' }\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &custom_engine(schemas),
+        "identity is derived from mutable attributes",
+        &[("mock.test.Thing", 0), ("mock.test.Thing", 1)],
+    );
+}
+
+#[test]
+fn closure_module_attribute_owns_inline_name_and_value() {
+    for (source, message, token) in [
+        (
+            "let note = '😀'\nattributes { result: String = 1 }\n",
+            "expected String",
+            "result",
+        ),
+        (
+            "let note = '😀'\nattributes { result = missing }\n",
+            "Undefined resource 'missing'",
+            "missing",
+        ),
+    ] {
+        let directory = Directory::new(&[
+            ("main.crn", "let label = 'main'\n"),
+            ("sibling.crn", source),
+        ]);
+        directory.assert_sibling_owner(&test_engine_with_wait_target(), message, &[(token, 0)]);
+    }
+}

@@ -146,7 +146,7 @@ pub enum ModuleError {
     /// loading so the CLI/LSP finding can cover this resolver backstop without
     /// comparing rendered parse-error text.
     #[error(transparent)]
-    TypeResolution(Box<crate::validation::TypeResolutionDiagnostic>),
+    TypeResolution(Box<crate::parser::Located<crate::validation::TypeResolutionDiagnostic>>),
 
     #[error("Unknown argument '{argument}' for module '{module}'")]
     UnknownArgument { module: String, argument: String },
@@ -482,14 +482,12 @@ impl ModuleError {
                 display_source_path_relative_to(path, root),
                 display_parse_error_relative_to(error, root),
             ),
-            Self::TypeResolution(diagnostic) => diagnostic.source_location().map_or_else(
-                || diagnostic.to_string(),
-                |source| {
-                    format!(
-                        "{}: {diagnostic}",
-                        display_source_path_relative_to(source.source_file().path(), root),
-                    )
-                },
+            Self::TypeResolution(diagnostic) => format!(
+                "{}:{}:{}: {}",
+                display_source_path_relative_to(diagnostic.location().file().path(), root),
+                diagnostic.location().span().start_line(),
+                diagnostic.location().span().start_column(),
+                diagnostic.detail()
             ),
             Self::NotFound(_)
             | Self::CircularImport(_)

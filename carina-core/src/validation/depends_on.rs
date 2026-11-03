@@ -1,44 +1,29 @@
-//! Analysis-pass diagnostics for resource and wait `depends_on` lists.
-//!
-//! Shared by `carina validate` and the LSP.
-//!
-//! Both resource and wait owners check dependency scope and kind, reporting
-//! unknown or disallowed targets as errors and duplicate elements as warnings.
-//! Data sources are valid wait dependencies.
-//!
-//! Resources additionally report self-dependencies and cycles as errors, and
-//! redundant edges already implied by value references as warnings.
-//!
-//! Element-type errors (`["foo"]` instead of `[foo]`) are caught
-//! upstream by `parser::blocks::resource::check_directives_depends_on_elements`
-//! before this pass runs.
-
-use std::cell::OnceCell;
+//! Analysis of dependency operand occurrences and typed dependency cycles.
+//! All findings have parser-owned locations, including one outgoing edge per
+//! cycle member. Directory/whole-file failures do not belong to this family.
 use std::collections::{HashMap, HashSet};
-
-use crate::deps::{collect_dependencies, sort_resources_by_dependencies};
-use crate::parser::{File, ResourceRef, UnexpandedDependencyOperand};
+use std::sync::Arc;
 
 use super::{DependencyArgumentResolution, ResolvedArgumentTypes, ResolvedDependencyArgumentType};
-use crate::resource::{BindingAddress, ModuleSource, ParserPlaceholder};
+use crate::deps::collect_dependencies;
+use crate::parser::{
+    AnalysisItemKind, AnalysisResourceRef, AnalysisTree, DeclarationLocation, Located,
+    UnexpandedDependencyOperand,
+};
+use crate::resource::{BindingAddress, ParserPlaceholder};
 
-type ParsedResourceRef<'a, D, B> =
-    ResourceRef<'a, ModuleSource, ParserPlaceholder, ParserPlaceholder, D, B>;
+type ResourceRef<'a, D, B> = AnalysisResourceRef<'a, ParserPlaceholder, ParserPlaceholder, D, B>;
 
-/// Severity of a depends_on diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
     Error,
     Warning,
 }
-
-/// The declaration whose dependency list owns an element diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependsOnOwner {
     Resource,
     Wait,
 }
-
 impl DependsOnOwner {
     fn context(self) -> &'static str {
         match self {
@@ -48,50 +33,74 @@ impl DependsOnOwner {
     }
 }
 
-/// The owner binding and optional element of a depends_on diagnostic.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DependsOnLocation {
-    pub owner: DependsOnOwner,
-    pub binding: String,
-    pub dep: Option<String>,
+/// Which authored outgoing edge participates in a cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyEdgeOrigin {
+    ExplicitDependency,
+    ValueReference,
 }
-
-/// A single depends_on diagnostic.
-///
-/// `location` lets the LSP resolve a binding or element span without parsing
-/// the message text. Cycle errors and other whole-graph diagnostics leave it
-/// `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyCycleMember {
+    pub binding: String,
+    pub target: String,
+    pub origin: DependencyEdgeOrigin,
+    pub location: DeclarationLocation,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyCycle {
+    pub members: Vec<DependencyCycleMember>,
+}
+impl std::fmt::Display for DependencyCycle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Circular dependency detected: ")?;
+        let ring = self
+            .members
+            .windows(2)
+            .all(|pair| pair[0].target == pair[1].binding)
+            && self
+                .members
+                .first()
+                .zip(self.members.last())
+                .is_some_and(|(first, last)| last.target == first.binding);
+        if ring {
+            for member in &self.members {
+                write!(f, "{} -> ", member.binding)?;
+            }
+            if let Some(first) = self.members.first() {
+                f.write_str(&first.binding)?;
+            }
+        } else {
+            for (index, member) in self.members.iter().enumerate() {
+                if index > 0 {
+                    f.write_str("; ")?;
+                }
+                write!(f, "{} -> {}", member.binding, member.target)?;
+            }
+        }
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependsOnDiagnosticKind {
+    Element {
+        owner: DependsOnOwner,
+        binding: String,
+        dependency: String,
+    },
+    Cycle {
+        cycle: Arc<DependencyCycle>,
+        member: usize,
+    },
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependsOnDiagnostic {
     pub severity: Severity,
     pub message: String,
-    pub location: Option<DependsOnLocation>,
+    pub kind: DependsOnDiagnosticKind,
 }
-
-impl DependsOnDiagnostic {
-    fn error(msg: impl Into<String>) -> Self {
-        Self {
-            severity: Severity::Error,
-            message: msg.into(),
-            location: None,
-        }
-    }
-
-    fn warning(msg: impl Into<String>) -> Self {
-        Self {
-            severity: Severity::Warning,
-            message: msg.into(),
-            location: None,
-        }
-    }
-
-    fn at_element(mut self, owner: DependsOnOwner, binding: &str, dep: &str) -> Self {
-        self.location = Some(DependsOnLocation {
-            owner,
-            binding: binding.to_string(),
-            dep: Some(dep.to_string()),
-        });
-        self
+impl std::fmt::Display for DependsOnDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
     }
 }
 
@@ -104,260 +113,321 @@ enum DependencyTarget<'a> {
     Handle,
     Unknown,
 }
-
-/// Resolve retained operands against declarations, never a union of lexical names.
-fn classify_operand<'a, E, B: BindingAddress, D>(
-    parsed: &File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
-    bindings_by_name: &HashMap<&str, ParsedResourceRef<'_, D, B>>,
+fn classify_operand<'a, B: BindingAddress, D>(
+    tree: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+    bindings: &HashMap<&str, &ResourceRef<'_, D, B>>,
     argument_types: &'a ResolvedArgumentTypes,
-    managed_group_names: &OnceCell<HashSet<String>>,
     operand: &UnexpandedDependencyOperand<B>,
-    dep_name: &str,
+    name: &str,
 ) -> DependencyTarget<'a>
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    if parsed
-        .upstream_states
-        .iter()
-        .any(|upstream| upstream.binding.as_str() == dep_name)
-    {
+    if tree.is_upstream(name) {
         return DependencyTarget::Upstream;
     }
-    if let Some(target) = bindings_by_name.get(dep_name) {
-        return if matches!(target, ResourceRef::DataSource(_)) {
+    if let Some(target) = bindings.get(name) {
+        return if target.kind() == AnalysisItemKind::DataSource {
             DependencyTarget::DataSource
         } else {
             DependencyTarget::Managed
         };
     }
-    if let UnexpandedDependencyOperand::BareBinding(binding) = operand
-        && parsed
-            .parser_binding_metadata
-            .structural_handles()
-            .get(binding)
-            .is_some_and(|handle| handle.is_for_binding())
-    {
+    if matches!(operand, UnexpandedDependencyOperand::BareBinding(_)) && tree.is_loop_group(name) {
         return DependencyTarget::LoopGroup;
     }
     if matches!(operand, UnexpandedDependencyOperand::Handle(_)) {
         return DependencyTarget::Handle;
     }
-    if matches!(operand, UnexpandedDependencyOperand::BareBinding(_))
-        && managed_group_names
-            .get_or_init(|| {
-                parsed
-                    .iter_all_resources()
-                    .filter(|resource| {
-                        matches!(
-                            resource,
-                            ResourceRef::Resource(_) | ResourceRef::Deferred { .. }
-                        )
-                    })
-                    .filter_map(|resource| resource.binding_address())
-                    .flat_map(crate::resolved_graph::loop_group_bindings)
-                    .map(|group| group.to_string())
-                    .collect()
-            })
-            .contains(dep_name)
-    {
-        return DependencyTarget::LoopGroup;
-    }
-    // Declaration resolution supplies the same value-vs-handle result for
-    // module arguments in both dependency-list contexts.
-    if let Some(parameter_type) = argument_types.types.get(dep_name) {
-        return DependencyTarget::ModuleParam(parameter_type);
+    if let Some(parameter) = argument_types.types.get(name) {
+        return DependencyTarget::ModuleParam(parameter);
     }
     DependencyTarget::Unknown
 }
 
-/// The `directives.depends_on` list of a resource, or an empty slice.
+/// A raw file cannot enter analysis or omit the argument-type witness.
 ///
-/// `LiveComposition` carries no explicit dependencies and is treated as an
-/// empty `depends_on` list.
-fn depends_on_of<'a, B: BindingAddress, D>(
-    rref: ParsedResourceRef<'a, D, B>,
-) -> Option<&'a crate::parser::UnexpandedDependencies<B>>
-where
-    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
-{
-    rref.explicit_dependencies()
-}
-
-/// Run all depends_on checks against a parsed file. Returns the full
-/// list of diagnostics (errors + warnings); callers decide how to surface
-/// them.
-///
-/// Raw parses cannot be checked without the argument-type resolution witness:
-///
-/// ```compile_fail,E0061
-/// use carina_core::{parser::ParsedFile, validation::depends_on::validate_depends_on};
-/// let unresolved = ParsedFile::default();
-/// validate_depends_on(&unresolved);
+/// ```compile_fail,E0308
+/// use carina_core::{parser::ParsedFile, validation::{depends_on::validate_depends_on, ResolvedArgumentTypes}};
+/// fn analyze(file: &ParsedFile, types: &ResolvedArgumentTypes) { validate_depends_on(file, types); }
 /// ```
-pub fn validate_depends_on<E, B: BindingAddress, D>(
-    parsed: &File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+pub fn validate_depends_on<B: BindingAddress, D>(
+    tree: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
     argument_types: &ResolvedArgumentTypes,
-) -> Vec<DependsOnDiagnostic>
+) -> Vec<Located<DependsOnDiagnostic>>
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    // Common-case fast path: most resources and waits have no `depends_on`
-    // set, and the checks below allocate per-resource.
-    // Walk top-level + for-body template resources so loops are covered
-    // (per the carina-core "directory-scoped, never single-file" rule).
-    let resources_have_no_depends_on = parsed
-        .iter_all_resources()
-        .all(|rref| depends_on_of(rref).is_none_or(|dependencies| dependencies.is_empty()));
-    let waits_have_no_depends_on = parsed
-        .wait_bindings
-        .iter()
-        .all(|wait| wait.depends_on.is_empty());
-    if resources_have_no_depends_on && waits_have_no_depends_on {
+    let resources_have_dependencies = tree
+        .resources()
+        .any(|resource| !resource.dependencies().is_empty());
+    if !resources_have_dependencies && tree.waits().all(|wait| wait.dependencies().is_empty()) {
         return Vec::new();
     }
-
-    let mut diags = Vec::new();
-
-    let bindings_by_name: HashMap<&str, ParsedResourceRef<'_, D, B>> = parsed
-        .iter_all_resources()
-        .filter_map(|rref| rref.binding().map(|n| (n, rref)))
+    let bindings: HashMap<_, _> = tree
+        .resources()
+        .filter_map(|r| r.binding().map(|binding| (binding, r)))
         .collect();
-    // Most operands resolve directly or carry parser-approved handles. Rebuild
-    // expanded loop groups only when a retained bare operand needs that lookup.
-    let managed_group_names = OnceCell::new();
-
-    let mut check_dependencies =
-        |owner_kind: DependsOnOwner,
-         binding: Option<&str>,
-         depends_on: &crate::parser::UnexpandedDependencies<B>,
-         value_ref_deps: Option<&HashSet<B>>| {
-            let self_name = binding.unwrap_or("(anonymous)");
-            let context = owner_kind.context();
-            let mut seen = HashSet::new();
-            let mut duplicate_warned = HashSet::new();
-            for operand in depends_on {
-                let dep_name = operand.diagnostic_reference();
-                if !seen.insert(dep_name.clone()) {
-                    if duplicate_warned.insert(dep_name.clone()) {
-                        diags.push(
-                            DependsOnDiagnostic::warning(format!(
-                                "{context} on '{self_name}': binding '{dep_name}' is listed multiple times"
-                            ))
-                            .at_element(owner_kind, self_name, &dep_name),
-                        );
-                    }
-                    continue;
-                }
-
-                if owner_kind == DependsOnOwner::Resource && dep_name == self_name {
-                    diags.push(
-                        DependsOnDiagnostic::error(format!(
-                            "{context} on '{self_name}': self-reference is not allowed \
-                             (binding '{dep_name}' depends on itself)"
-                        ))
-                        .at_element(owner_kind, self_name, &dep_name),
+    let mut out = Vec::new();
+    let mut check = |owner: DependsOnOwner,
+                     binding: Option<&str>,
+                     dependencies: &[crate::parser::AnalysisDependencyRef<'_, B>],
+                     value_deps: &HashSet<B>| {
+        let name = binding.unwrap_or("(anonymous)");
+        let context = owner.context();
+        let mut seen = HashSet::new();
+        let mut warned = HashSet::new();
+        for dependency in dependencies {
+            let operand = dependency.operand();
+            let dep = operand.diagnostic_reference();
+            let mut emit = |severity, message| {
+                out.push(Located::new(
+                    dependency.location().clone(),
+                    DependsOnDiagnostic {
+                        severity,
+                        message,
+                        kind: DependsOnDiagnosticKind::Element {
+                            owner,
+                            binding: name.to_string(),
+                            dependency: dep.clone(),
+                        },
+                    },
+                ))
+            };
+            if !seen.insert(dep.clone()) {
+                if warned.insert(dep.clone()) {
+                    emit(
+                        Severity::Warning,
+                        format!("{context} on '{name}': binding '{dep}' is listed multiple times"),
                     );
-                    continue;
                 }
-
-                let diagnostic = match classify_operand(
-                    parsed,
-                    &bindings_by_name,
-                    argument_types,
-                    &managed_group_names,
-                    operand,
-                    &dep_name,
-                ) {
-                    DependencyTarget::Upstream => Some(DependsOnDiagnostic::error(format!(
-                        "{context} on '{self_name}': upstream_state binding '{dep_name}' \
-                         is not a valid depends_on target"
-                    ))),
-                    DependencyTarget::Unknown => Some(DependsOnDiagnostic::error(format!(
-                        "{context} on '{self_name}': binding '{dep_name}' is not declared in this scope"
-                    ))),
-                    DependencyTarget::ModuleParam(DependencyArgumentResolution::Resolved(
-                        ResolvedDependencyArgumentType::Value(parameter_type),
-                    )) => Some(DependsOnDiagnostic::error(format!(
-                        "{context}: expected a managed resource handle; got {parameter_type}"
-                    ))),
-                    DependencyTarget::DataSource if owner_kind == DependsOnOwner::Resource => {
-                        Some(DependsOnDiagnostic::error(format!(
-                            "{context} on '{self_name}': data sources cannot be \
-                             depends_on targets (binding '{dep_name}')"
-                        )))
-                    }
-                    DependencyTarget::Managed | DependencyTarget::DataSource => value_ref_deps
-                        .filter(|dependencies| dependencies.contains(&operand.binding_reference()))
-                        .map(|_| {
-                            DependsOnDiagnostic::warning(format!(
-                                "{context} on '{self_name}': edge to '{dep_name}' is redundant; \
-                                 '{dep_name}' is already referenced by value"
-                            ))
-                        }),
-                    DependencyTarget::ModuleParam(
-                        DependencyArgumentResolution::Unresolved
-                        | DependencyArgumentResolution::Resolved(
-                            ResolvedDependencyArgumentType::ManagedHandle,
-                        ),
-                    )
-                    | DependencyTarget::LoopGroup
-                    | DependencyTarget::Handle => None,
-                };
-                if let Some(diagnostic) = diagnostic {
-                    diags.push(diagnostic.at_element(owner_kind, self_name, &dep_name));
-                }
+                continue;
             }
-        };
-
-    for resource in parsed.iter_all_resources() {
-        let Some(depends_on) =
-            depends_on_of(resource).filter(|dependencies| !dependencies.is_empty())
-        else {
-            continue;
-        };
-        let mut value_ref_deps = HashSet::new();
-        for value in resource.attributes().values() {
-            collect_dependencies(value, &mut value_ref_deps);
+            if owner == DependsOnOwner::Resource && dep == name {
+                emit(
+                    Severity::Error,
+                    format!(
+                        "{context} on '{name}': self-reference is not allowed (binding '{dep}' depends on itself)"
+                    ),
+                );
+                continue;
+            }
+            let diagnostic = match classify_operand(tree, &bindings, argument_types, operand, &dep)
+            {
+                DependencyTarget::Upstream => Some((
+                    Severity::Error,
+                    format!(
+                        "{context} on '{name}': upstream_state binding '{dep}' is not a valid depends_on target"
+                    ),
+                )),
+                DependencyTarget::Unknown => Some((
+                    Severity::Error,
+                    format!("{context} on '{name}': binding '{dep}' is not declared in this scope"),
+                )),
+                DependencyTarget::ModuleParam(DependencyArgumentResolution::Resolved(
+                    ResolvedDependencyArgumentType::Value(ty),
+                )) => Some((
+                    Severity::Error,
+                    format!("{context}: expected a managed resource handle; got {ty}"),
+                )),
+                DependencyTarget::DataSource if owner == DependsOnOwner::Resource => Some((
+                    Severity::Error,
+                    format!(
+                        "{context} on '{name}': data sources cannot be depends_on targets (binding '{dep}')"
+                    ),
+                )),
+                DependencyTarget::Managed | DependencyTarget::DataSource
+                    if owner == DependsOnOwner::Resource
+                        && value_deps.contains(&operand.binding_reference()) =>
+                {
+                    Some((
+                        Severity::Warning,
+                        format!(
+                            "{context} on '{name}': edge to '{dep}' is redundant; '{dep}' is already referenced by value"
+                        ),
+                    ))
+                }
+                _ => None,
+            };
+            if let Some((severity, message)) = diagnostic {
+                emit(severity, message);
+            }
         }
-        value_ref_deps.extend(resource.dependency_bindings().iter().cloned());
-        check_dependencies(
+    };
+    for resource in tree.resources() {
+        let mut value_deps = HashSet::new();
+        for value in resource.attributes().values() {
+            collect_dependencies(value, &mut value_deps);
+        }
+        value_deps.extend(resource.dependency_bindings().iter().cloned());
+        check(
             DependsOnOwner::Resource,
             resource.binding(),
-            depends_on,
-            Some(&value_ref_deps),
+            resource.dependencies(),
+            &value_deps,
         );
     }
-
-    // The parser rejects wait/self handles and non-handle operand kinds.
-    // Data sources are valid wait targets; redundant-edge linting is resource-only.
-    for wait in &parsed.wait_bindings {
-        check_dependencies(
+    for wait in tree.waits() {
+        check(
             DependsOnOwner::Wait,
-            Some(wait.binding.as_str()),
-            &wait.depends_on,
-            None,
+            Some(wait.binding().as_str()),
+            wait.dependencies(),
+            &HashSet::new(),
         );
     }
-
-    // Check the combined graph of value references and explicit dependencies
-    // only when at least one resource declares depends_on. A reported cycle
-    // may consist entirely of value references, so do not attribute it to
-    // depends_on.
-    //
-    // carina#3181: only managed resources can participate in a cycle —
-    // data sources are rejected as `depends_on` targets above (so they
-    // can be sources but never the depended-on end of an edge), and
-    // composition resources are post-apply synthetic nodes with no
-    // directives. A cycle therefore lives entirely within the managed
-    // slice.
-    if !resources_have_no_depends_on
-        && let Err(msg) = sort_resources_by_dependencies(&parsed.resources)
-    {
-        diags.push(DependsOnDiagnostic::error(msg));
+    if resources_have_dependencies {
+        for cycle in dependency_cycles(tree) {
+            let cycle = Arc::new(cycle);
+            for (member, edge) in cycle.members.iter().enumerate() {
+                out.push(Located::new(
+                    edge.location.clone(),
+                    DependsOnDiagnostic {
+                        severity: Severity::Error,
+                        message: cycle.to_string(),
+                        kind: DependsOnDiagnosticKind::Cycle {
+                            cycle: Arc::clone(&cycle),
+                            member,
+                        },
+                    },
+                ));
+            }
+        }
     }
+    out
+}
 
-    diags
+/// Find cycles using authored edge origins rather than rendered cycle strings.
+/// Edges and traversal follow declaration/occurrence order for deterministic anchors.
+fn dependency_cycles<B: BindingAddress, D>(
+    tree: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+) -> Vec<DependencyCycle>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    let resources: Vec<_> = tree
+        .resources()
+        .filter(|resource| {
+            matches!(
+                resource.kind(),
+                AnalysisItemKind::Resource | AnalysisItemKind::DeferredResource
+            )
+        })
+        .collect();
+    let bindings: HashMap<_, _> = resources
+        .iter()
+        .enumerate()
+        .filter_map(|(index, r)| r.binding_address().map(|binding| (binding.clone(), index)))
+        .collect();
+    let mut edges = vec![Vec::<(usize, DependencyCycleMember)>::new(); resources.len()];
+    for (index, resource) in resources.iter().enumerate() {
+        let name = resource
+            .binding()
+            .map(str::to_string)
+            .unwrap_or_else(|| resource.id().to_string());
+        for dependency in resource.dependencies() {
+            if let Some(&target) = bindings.get(&dependency.operand().binding_reference()) {
+                edges[index].push((
+                    target,
+                    DependencyCycleMember {
+                        binding: name.clone(),
+                        target: resources[target]
+                            .binding()
+                            .expect("indexed named resource")
+                            .to_string(),
+                        origin: DependencyEdgeOrigin::ExplicitDependency,
+                        location: dependency.location().clone(),
+                    },
+                ));
+            }
+        }
+        for reference in resource.references() {
+            if let Some(&target) = bindings.get(reference.path().binding_address()) {
+                edges[index].push((
+                    target,
+                    DependencyCycleMember {
+                        binding: name.clone(),
+                        target: resources[target]
+                            .binding()
+                            .expect("indexed named resource")
+                            .to_string(),
+                        origin: DependencyEdgeOrigin::ValueReference,
+                        location: reference.location().clone(),
+                    },
+                ));
+            }
+        }
+    }
+    // Strongly connected components retain all participants in overlapping
+    // cycles. A back-edge-only DFS can omit members reached after a sibling
+    // branch has already finished, or emit the same member more than once.
+    fn finish(
+        index: usize,
+        edges: &[Vec<(usize, DependencyCycleMember)>],
+        visited: &mut [bool],
+        order: &mut Vec<usize>,
+    ) {
+        if visited[index] {
+            return;
+        }
+        visited[index] = true;
+        for (target, _) in &edges[index] {
+            finish(*target, edges, visited, order);
+        }
+        order.push(index);
+    }
+    fn collect(
+        index: usize,
+        reverse: &[Vec<usize>],
+        visited: &mut [bool],
+        members: &mut Vec<usize>,
+    ) {
+        if visited[index] {
+            return;
+        }
+        visited[index] = true;
+        members.push(index);
+        for source in &reverse[index] {
+            collect(*source, reverse, visited, members);
+        }
+    }
+    let mut reverse = vec![Vec::new(); resources.len()];
+    for (source, outgoing) in edges.iter().enumerate() {
+        for (target, _) in outgoing {
+            reverse[*target].push(source);
+        }
+    }
+    let mut visited = vec![false; resources.len()];
+    let mut order = Vec::new();
+    for index in 0..resources.len() {
+        finish(index, &edges, &mut visited, &mut order);
+    }
+    visited.fill(false);
+    let mut cycles = Vec::new();
+    for index in order.into_iter().rev() {
+        if visited[index] {
+            continue;
+        }
+        let mut component = Vec::new();
+        collect(index, &reverse, &mut visited, &mut component);
+        if component.len() == 1 && !edges[index].iter().any(|(target, _)| *target == index) {
+            continue;
+        }
+        component.sort_unstable();
+        let membership: HashSet<_> = component.iter().copied().collect();
+        let members = component
+            .iter()
+            .map(|index| {
+                edges[*index]
+                    .iter()
+                    .find(|(target, _)| membership.contains(target))
+                    .expect("cyclic component has an internal outgoing edge")
+                    .1
+                    .clone()
+            })
+            .collect();
+        cycles.push(DependencyCycle { members });
+    }
+    cycles
 }
 
 #[cfg(test)]
@@ -369,8 +439,13 @@ mod tests {
         E: crate::parser::ExportParamLike + Clone,
         D: crate::parser::DeferredForPhaseTraversal + Clone,
     >(
-        parsed: &File<E, crate::resource::ParserPlaceholder, crate::resource::ParserPlaceholder, D>,
-    ) -> Vec<DependsOnDiagnostic> {
+        parsed: &crate::parser::File<
+            E,
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            D,
+        >,
+    ) -> Vec<Located<DependsOnDiagnostic>> {
         let mut parsed = parsed.clone();
         let report = crate::validation::deferred_types::with_session_for_test(
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
@@ -381,10 +456,13 @@ mod tests {
             "{:?}",
             report.diagnostics()
         );
-        validate_depends_on(&parsed, report.resolved_argument_types())
+        validate_depends_on(
+            &AnalysisTree::try_from_file(&parsed).expect("parsed analysis provenance"),
+            report.resolved_argument_types(),
+        )
     }
 
-    fn diag_messages(diags: &[DependsOnDiagnostic], sev: Severity) -> Vec<String> {
+    fn diag_messages(diags: &[Located<DependsOnDiagnostic>], sev: Severity) -> Vec<String> {
         diags
             .iter()
             .filter(|d| d.severity == sev)
@@ -412,7 +490,7 @@ mod tests {
         );
     }
 
-    fn check_wait_depends_on(dependency: &str) -> Vec<DependsOnDiagnostic> {
+    fn check_wait_depends_on(dependency: &str) -> Vec<Located<DependsOnDiagnostic>> {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
             directory.path().join("resources.crn"),
@@ -449,12 +527,12 @@ let lookup = read aws.acm.Certificate { domain_name = "lookup.example.com" }
                 .contains("binding 'nope' is not declared in this scope")
         );
         assert_eq!(
-            diagnostic.location,
-            Some(DependsOnLocation {
+            diagnostic.kind,
+            DependsOnDiagnosticKind::Element {
                 owner: DependsOnOwner::Wait,
                 binding: "ready".to_string(),
-                dep: Some("nope".to_string()),
-            }),
+                dependency: "nope".to_string(),
+            },
         );
     }
 
@@ -555,7 +633,10 @@ let lookup = read aws.acm.Certificate { domain_name = "lookup.example.com" }
             report.diagnostics()
         );
         let errors = diag_messages(
-            &validate_depends_on(&parsed, report.resolved_argument_types()),
+            &validate_depends_on(
+                &AnalysisTree::try_from_file(&parsed).expect("parsed analysis provenance"),
+                report.resolved_argument_types(),
+            ),
             Severity::Error,
         );
         assert_eq!(
@@ -738,13 +819,19 @@ let other = wait cert { until = cert.status == "ISSUED" }
             r#"
                 arguments { records: String }
                 let member = aws.s3.Bucket { bucket_name = "one" }
-                let consumer = aws.s3.Bucket { bucket_name = "consumer" }
+                let consumer = aws.s3.Bucket { bucket_name = "consumer" directives { depends_on = [missing] } }
             "#,
         )
         .unwrap();
         // Model an expanded group without a retained parser loop handle.
         parsed.resources[0].binding = Some("records[0]".into());
-        parsed.resources[1].dependencies.depends_on = vec!["records".into()].into();
+        *parsed.resources[1]
+            .dependencies
+            .depends_on
+            .iter_mut()
+            .next()
+            .expect("authored operand") =
+            UnexpandedDependencyOperand::BareBinding("records".into());
 
         let diagnostics = check(&parsed);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
@@ -795,6 +882,32 @@ let other = wait cert { until = cert.status == "ISSUED" }
                 .any(|m| m.contains("Circular") || m.contains("cycle")),
             "expected cycle error, got {:?}",
             errors
+        );
+    }
+
+    #[test]
+    fn overlapping_cycles_report_every_member_once_with_typed_outgoing_origins() {
+        let parsed = parse_and_resolve("let a = mock.test.Resource { value = c.output directives { depends_on = [b] } }\nlet b = mock.test.Resource { directives { depends_on = [a] } }\nlet c = mock.test.Resource { directives { depends_on = [b] } }\n").unwrap();
+        let diagnostics = check(&parsed);
+        let members: Vec<_> = diagnostics
+            .iter()
+            .filter_map(|diagnostic| match &diagnostic.kind {
+                DependsOnDiagnosticKind::Cycle { cycle, member } => Some(&cycle.members[*member]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(members.len(), 3, "{diagnostics:#?}");
+        assert_eq!(
+            members
+                .iter()
+                .map(|member| member.binding.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["a", "b", "c"])
+        );
+        assert!(
+            members
+                .iter()
+                .all(|member| member.origin == DependencyEdgeOrigin::ExplicitDependency)
         );
     }
 

@@ -37,6 +37,9 @@ const ALLOWED_MISSING: &[&str] = &[
     // pest built-ins with matching semantics but different spellings —
     // the formatter uses explicit `trivia` / `ws` / `newline` / `comment`
     // productions instead of the implicit `WHITESPACE` / `COMMENT` hooks.
+    // Parser-only capture of the precise binding.field diagnostic prefix.
+    // It changes the parse tree, without changing accepted DSL syntax.
+    "reference_prefix",
     "WHITESPACE",
     "COMMENT",
     // Lexer-level string/comment helpers. The formatter consumes these

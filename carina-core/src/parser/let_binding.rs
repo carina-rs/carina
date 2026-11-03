@@ -139,7 +139,7 @@ pub(super) fn parse_let_binding_extended(
     ),
     ParseError,
 > {
-    let source_span = crate::parser::SourceSpan::from_pest(&pair, preprocessed_file);
+    let declaration_location = ctx.declaration_location(&pair);
     let mut inner = pair.into_inner();
     let name = ParserBindingName::from_let_binding_pair(next_pair(
         &mut inner,
@@ -152,7 +152,7 @@ pub(super) fn parse_let_binding_extended(
     // grammar permits it here and only here (see carina.pest); everywhere
     // else it is a parse error.
     if rhs_pair.as_rule() == Rule::use_expr {
-        let use_stmt = parse_use_expr(rhs_pair, name.as_str(), ctx, source_span, source_file)?;
+        let use_stmt = parse_use_expr(rhs_pair, name.as_str(), ctx, declaration_location)?;
         let value = EvalValue::structural_handle(UnexpandedStructuralHandle::new(
             UnexpandedStructuralHandleKind::Use,
             name.as_str(),

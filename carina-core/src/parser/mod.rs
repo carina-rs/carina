@@ -4,8 +4,9 @@
 
 mod analysis;
 pub use analysis::{
-    AnalysisItemKind, AnalysisResourceRef, AnalysisTree, AnalysisTreeError, AnalysisWaitRef,
-    DeclarationLocation, DeclarationProvenance, Located,
+    AnalysisDependencyRef, AnalysisForRef, AnalysisItemKind, AnalysisReference,
+    AnalysisResourceRef, AnalysisTree, AnalysisTreeError, AnalysisValueReference, AnalysisWaitRef,
+    DeclarationLocation, DeclarationProvenance, DirectoryScoped, FileScoped, Located,
 };
 mod ast;
 pub(crate) use ast::ParserSeedMetadata;
@@ -14,14 +15,29 @@ mod config;
 mod context;
 mod deferred_if;
 mod dependencies;
+#[cfg(test)]
+mod element_tests;
+mod elements;
 pub use dependencies::{UnexpandedDependencies, UnexpandedDependencyOperand};
+pub(crate) use elements::{AccessLocations, AccessProvenance};
+pub use elements::{
+    AttributeKeyLocation, ConfigurationBlock, DeclarationAnnotation, DeclarationRecord,
+    ReferenceLocations, ReferenceProvenance, SyntaxInventory,
+};
 mod entry;
+pub(crate) use entry::scope_parse_failure;
 mod error;
 mod expressions;
 mod functions;
 mod grammar;
 mod let_binding;
 mod resolve;
+pub use resolve::{
+    finalize_provider_configs_for_analysis,
+    resolve_expanded_provider_unresolved_attributes_for_analysis,
+    resolve_provider_unresolved_attributes_for_analysis,
+};
+
 mod static_eval;
 mod types;
 mod util;
@@ -102,8 +118,8 @@ pub use deferred_if::{DeferredIfBody, DeferredIfCondition, DeferredStructuralIf,
 pub use entry::{
     AnonymousResourceSourceSpan, AttributeValueSourceSpans, LetBindingSourceSpans, SourceSpanIndex,
     TopLevelBlockSourceSpan, attribute_value_source_span, attribute_value_source_spans, parse_file,
-    parse_file_and_resolve, parse_provider_factory_declarations,
-    top_level_anonymous_resource_spans, top_level_backend_block_spans,
+    parse_file_and_resolve, parse_file_scoped, parse_provider_factory_declarations,
+    parse_syntax_inventory, top_level_anonymous_resource_spans, top_level_backend_block_spans,
     top_level_exports_block_spans, top_level_let_binding_spans, top_level_state_block_spans,
     top_level_upstream_state_spans,
 };

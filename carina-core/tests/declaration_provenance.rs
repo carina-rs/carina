@@ -438,3 +438,90 @@ fn analysis_tree_rejects_missing_declaration_provenance() {
         }
     ));
 }
+
+#[test]
+fn element_provenance_survives_module_expansion_and_deferred_phase_changes() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("child")).unwrap();
+    let main = "let child = use { source = './child' }\nlet remote = upstream_state { source = '../remote' }\nlet instance = child { names = remote.items }\n";
+    let child = "arguments { names: list(String) }\nlet target = mock.test.Resource {}\nlet consumer = mock.test.Resource {\n  value = target.status\n  directives { depends_on = [target, target] }\n}\nlet ready = wait target { until = target.status == 'ready' depends_on = [target, target] }\nlet items = for name in names { mock.test.Resource { name = name } }\nattributes { output: String = target.status }\n";
+    std::fs::write(root.path().join("main.crn"), main).unwrap();
+    let child_path = root.path().join("child/main.crn");
+    std::fs::write(&child_path, child).unwrap();
+    let expanded = expand_directory(root.path());
+    let tree = AnalysisTree::try_from_file(&expanded).expect("expanded element provenance");
+    let consumer = tree
+        .resources()
+        .find(|resource| {
+            resource
+                .binding()
+                .is_some_and(|binding| binding.ends_with(".consumer"))
+        })
+        .unwrap();
+    assert_eq!(consumer.dependencies().len(), 2);
+    let first_operand = child.find("[target, target]").unwrap() + 1;
+    for (dependency, start) in consumer
+        .dependencies()
+        .iter()
+        .zip([first_operand, first_operand + "target, ".len()])
+    {
+        assert_eq!(dependency.location().file().path(), child_path);
+        assert_eq!(dependency.location().span().start_byte(), start);
+        assert_eq!(
+            dependency.location().span().end_byte(),
+            start + "target".len()
+        );
+    }
+    assert_ne!(
+        consumer.dependencies()[0].location(),
+        consumer.dependencies()[1].location()
+    );
+    let reference = &consumer.references()[0];
+    assert_location(reference.location(), &child_path, child, "target.status");
+    assert!(reference.path().binding().ends_with(".target"));
+    let wait = tree.waits().next().unwrap();
+    assert_eq!(wait.dependencies().len(), 2);
+    assert_eq!(wait.target_location().file().path(), child_path);
+    assert_eq!(
+        &child[wait.lhs_location().span().start_byte()..wait.lhs_location().span().end_byte()],
+        "target.status"
+    );
+    let deferred = tree
+        .resources()
+        .find(|resource| resource.kind() == AnalysisItemKind::DeferredResource)
+        .unwrap();
+    let iterable = deferred.deferred_iterable().unwrap();
+    assert_eq!(iterable.location().file().path(), child_path);
+    assert_eq!(
+        &child[iterable.location().span().start_byte()..iterable.location().span().end_byte()],
+        "names"
+    );
+    assert!(
+        tree.syntax()
+            .for_iterables()
+            .iter()
+            .any(|iterable| iterable.location().file().path() == child_path)
+    );
+    assert!(
+        tree.syntax()
+            .declarations()
+            .iter()
+            .any(|declaration| declaration.name() == "output"
+                && declaration.location().file().path() == child_path)
+    );
+    let composition = tree
+        .resources()
+        .find(|resource| resource.kind() == AnalysisItemKind::Composition)
+        .unwrap();
+    let output = composition
+        .attribute_keys()
+        .iter()
+        .find(|attribute| {
+            attribute.path()
+                == [carina_core::parser::AttributePathSegment::Attribute(
+                    "output".into(),
+                )]
+        })
+        .unwrap();
+    assert_location(output.location(), &child_path, child, "output");
+}

@@ -205,12 +205,44 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
         &self.diagnostic_source.path
     }
 
+    pub(super) fn access_locations(
+        &self,
+        pair: &pest::iterators::Pair<'_, Rule>,
+    ) -> super::AccessLocations {
+        super::AccessLocations::from_pair(
+            pair,
+            &self.diagnostic_source.file,
+            &self.diagnostic_source.path,
+        )
+    }
+
+    pub(super) fn reference_locations(
+        &self,
+        pair: &pest::iterators::Pair<'_, Rule>,
+    ) -> super::ReferenceLocations {
+        super::ReferenceLocations::from_pair(
+            pair,
+            &self.diagnostic_source.file,
+            &self.diagnostic_source.path,
+        )
+    }
+
+    pub(super) fn declaration_location(
+        &self,
+        pair: &pest::iterators::Pair<'_, Rule>,
+    ) -> super::DeclarationLocation {
+        super::DeclarationLocation::from_pair(
+            pair,
+            &self.diagnostic_source.file,
+            &self.diagnostic_source.path,
+        )
+    }
+
     pub(super) fn diagnostic_source_span(
         &self,
         pair: &pest::iterators::Pair<'_, super::Rule>,
     ) -> DiagnosticSourceSpan {
-        let span = pair.as_span();
-        self.diagnostic_source_range(span.start()..span.end())
+        DiagnosticSourceSpan::from_declaration(self.declaration_location(pair))
     }
 
     /// Only directive values exclude trailing trivia consumed by pest's
@@ -219,22 +251,7 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
         &self,
         pair: &pest::iterators::Pair<'_, super::Rule>,
     ) -> DiagnosticSourceSpan {
-        self.diagnostic_source_range(SourceSpan::preprocessed_range(pair))
-    }
-
-    fn diagnostic_source_range(&self, range: std::ops::Range<usize>) -> DiagnosticSourceSpan {
-        let AuthoredDiagnosticSource { path, file } = &self.diagnostic_source;
-        // Map the last included byte before restoring the exclusive end. The
-        // following preprocessed byte can map to a heredoc's closing marker.
-        let start = file.original_position(range.start);
-        let end = file.original_position(range.end.saturating_sub(1));
-        DiagnosticSourceSpan::authored(
-            path.clone(),
-            start.line(),
-            start.column(),
-            end.line(),
-            end.column() + 1,
-        )
+        DiagnosticSourceSpan::from_declaration(self.declaration_location(pair))
     }
 }
 
@@ -803,6 +820,11 @@ impl<'a> ExpressionMode<'a> {
             ParseBindingRef::Unbound => return None,
         };
         let authored = BareBindingUse {
+            location: super::DeclarationLocation::from_pair(
+                token,
+                sink.preprocessed_file,
+                sink.source_file,
+            ),
             source_file: SourceFileId::new(sink.source_file.to_path_buf()),
             scope: ctx
                 .binding_scope(name)

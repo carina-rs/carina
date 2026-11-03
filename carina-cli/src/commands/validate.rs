@@ -562,7 +562,7 @@ mod tests {
                 report
                     .errors()
                     .iter()
-                    .any(|error| (matches!(error, AppError::TypeResolution(_)) || matches!(error, AppError::ModuleCall(finding) if finding.kind() == carina_core::validation::ModuleCallFindingKind::TypeResolution))
+                    .any(|error| matches!(error, AppError::ModuleCall(finding) if finding.kind() == carina_core::validation::ModuleCallFindingKind::TypeResolution)
                         && crate::error::format_error_with_source_chain(error)
                             .contains(&format!("unknown custom type '{name}'"))),
                 "{:#?}",

@@ -19,11 +19,6 @@ use crate::parser::types::parse_type_expr;
 use crate::parser::{parse_expression, parse_expression_eval};
 use crate::resource::{ConcreteValue, DeferredValue};
 
-pub(in crate::parser) struct ParsedArgumentsBlock {
-    pub parameters: Vec<ArgumentParameter>,
-    pub type_sources: Vec<(String, SourceSpan)>,
-}
-
 fn parse_boundary_expression(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
@@ -54,9 +49,8 @@ pub(in crate::parser) fn parse_arguments_block(
     preprocessed_file: &PreprocessedFile,
     source_file: &std::path::Path,
     warnings: &mut Vec<ParseWarning>,
-) -> Result<ParsedArgumentsBlock, ParseError> {
+) -> Result<Vec<ArgumentParameter>, ParseError> {
     let mut arguments = Vec::new();
-    let mut type_sources = Vec::new();
 
     for param in pair.into_inner() {
         if param.as_rule() == Rule::arguments_param {
@@ -65,7 +59,6 @@ pub(in crate::parser) fn parse_arguments_block(
                 .as_str()
                 .to_string();
             let type_pair = next_pair(&mut param_inner, "type expression", "arguments parameter")?;
-            let type_span = SourceSpan::from_pest(&type_pair, preprocessed_file);
             let type_expr = parse_type_expr(type_pair, config, warnings, Some(preprocessed_file))?;
 
             let mut description = None;
@@ -157,7 +150,6 @@ pub(in crate::parser) fn parse_arguments_block(
             }
 
             register_argument_binding(ctx, &name, &type_expr);
-            type_sources.push((name.clone(), type_span));
             arguments.push(ArgumentParameter {
                 name,
                 static_type: type_expr,
@@ -168,10 +160,7 @@ pub(in crate::parser) fn parse_arguments_block(
         }
     }
 
-    Ok(ParsedArgumentsBlock {
-        parameters: arguments,
-        type_sources,
-    })
+    Ok(arguments)
 }
 
 /// Register an argument name as a lexical binding so subsequent expressions

@@ -1354,78 +1354,7 @@ pub fn check_identifier_scope<E: ExportParamLike>(parsed: &File<E>) -> Vec<Parse
 /// from the generic "is this identifier in scope" walk, and folding
 /// them together would force callers that only want one kind of
 /// validation to pay for both.
-pub fn check_provider_instance_routing<E>(parsed: &File<E>) -> Vec<ParseError> {
-    let mut errors = Vec::new();
-    // carina#3181: walk the typed top-level slices. `directives()` is
-    // `None` for the composition arm (no `directives` on a synthetic node),
-    // which routes to the `None` match arm — and a composition's `id` has an
-    // empty provider, so it is skipped there, matching prior behaviour.
-    for rref in parsed.iter_top_level_resources() {
-        let id = rref.id();
-        let provider_instance = rref.directives().and_then(|d| d.provider_instance.as_ref());
-        match provider_instance {
-            Some(binding) => {
-                let Some(instance) = parsed
-                    .providers
-                    .iter()
-                    .find(|p| p.binding.as_deref() == Some(binding.as_str()))
-                else {
-                    errors.push(ParseError::InvalidExpression {
-                        line: 0,
-                        message: format!(
-                            "directives.provider: `{binding}` is not a known \
-                             provider instance. Declare it with `let {binding} \
-                             = provider <kind> {{ ... }}`."
-                        ),
-                    });
-                    continue;
-                };
-                if instance.name != id.provider {
-                    errors.push(ParseError::InvalidExpression {
-                        line: 0,
-                        message: format!(
-                            "directives.provider: instance `{binding}` has kind \
-                             `{}`, but resource `{}.{}` requires kind `{}`",
-                            instance.name, id.provider, id.resource_type, id.provider,
-                        ),
-                    });
-                }
-            }
-            None => {
-                // Mock / synthetic resources (no provider prefix) have no
-                // kind to route by; skip them.
-                if id.provider.is_empty() {
-                    continue;
-                }
-                let (kind_has_any, kind_has_default) =
-                    parsed
-                        .providers
-                        .iter()
-                        .fold((false, false), |(any, def), p| {
-                            let matches = p.name == id.provider;
-                            (any || matches, def || (matches && p.is_default()))
-                        });
-                if !kind_has_any {
-                    continue;
-                }
-                if !kind_has_default {
-                    errors.push(ParseError::InvalidExpression {
-                        line: 0,
-                        message: format!(
-                            "resource `{}.{}` has no default provider \
-                             instance for kind `{}`: either add instance \
-                             attributes to the top-level `provider {}` \
-                             block, or set `directives {{ provider = \
-                             <instance> }}` explicitly.",
-                            id.provider, id.resource_type, id.provider, id.provider,
-                        ),
-                    });
-                }
-            }
-        }
-    }
-    errors
-}
+pub use crate::validation::routing::check_provider_instance_routing;
 
 fn accumulate_undefined_reference_errors(
     parsed: &File<impl ExportParamLike>,
@@ -1994,6 +1923,67 @@ fn resolve_function_calls_only<B: ProviderAttributeBindingPhase>(
     }
 }
 
+pub fn resolve_provider_unresolved_attributes_for_analysis<
+    E: ExportParamLike<ParserPlaceholder, RelativeBindingName>,
+    D,
+>(
+    parsed: &mut File<E, ParserPlaceholder, ParserPlaceholder, D, RelativeBindingName>,
+    config: &ProviderContext,
+) -> Result<(), Box<super::Located<ParseError>>>
+where
+    D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, RelativeBindingName>,
+{
+    let locations = super::AnalysisTree::try_from_file(parsed)
+        .expect("parser/expansion provenance invariant")
+        .provider_attribute_locations()
+        .to_vec();
+    resolve_provider_unresolved_attributes_mapped(parsed, config, |index, key, error| {
+        Box::new(super::Located::new(locations[index][key].clone(), error))
+    })
+}
+
+pub fn resolve_expanded_provider_unresolved_attributes_for_analysis<
+    E: ExportParamLike<ParserPlaceholder, AbsoluteBindingAddress>,
+    D,
+>(
+    parsed: &mut File<E, ParserPlaceholder, ParserPlaceholder, D, AbsoluteBindingAddress>,
+    config: &ProviderContext,
+) -> Result<(), Box<super::Located<ParseError>>>
+where
+    D: super::DeferredForPhaseTraversal<
+            ParserPlaceholder,
+            ParserPlaceholder,
+            AbsoluteBindingAddress,
+        >,
+{
+    let locations = super::AnalysisTree::try_from_file(parsed)
+        .expect("parser/expansion provenance invariant")
+        .provider_attribute_locations()
+        .to_vec();
+    resolve_provider_unresolved_attributes_mapped(parsed, config, |index, key, error| {
+        Box::new(super::Located::new(locations[index][key].clone(), error))
+    })
+}
+
+pub fn finalize_provider_configs_for_analysis<
+    E: ExportParamLike<ParserPlaceholder, B>,
+    B: BindingAddress,
+    D,
+>(
+    parsed: &mut File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+) -> Result<(), Box<super::Located<ParseError>>>
+where
+    D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    let locations = super::AnalysisTree::try_from_file(parsed)
+        .expect("parser/expansion provenance invariant")
+        .provider_attribute_locations()
+        .to_vec();
+    finalize_provider_configs_mapped(parsed, |index, key, error| {
+        Box::new(super::Located::new(locations[index][key].clone(), error))
+    })
+}
+
 /// Resolve `ResourceRef` values inside provider blocks'
 /// `unresolved_attributes` against the merged binding map produced by
 /// `parsed.resources` + `parsed.arguments` + `parsed.module_calls` +
@@ -2040,6 +2030,17 @@ fn resolve_provider_unresolved_attributes_for_phase<E, B: ProviderAttributeBindi
 where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
+    resolve_provider_unresolved_attributes_mapped(parsed, config, |_, _, error| error)
+}
+
+fn resolve_provider_unresolved_attributes_mapped<E, B: ProviderAttributeBindingPhase, D, Failure>(
+    parsed: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    config: &ProviderContext,
+    mut map_error: impl FnMut(usize, &str, ParseError) -> Failure,
+) -> Result<(), Failure>
+where
+    D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
     let mut binding_map: HashMap<String, HashMap<String, GenericValue<ParserPlaceholder, B>>> =
         HashMap::new();
     // carina#3181: walk every top-level resource — managed, data source,
@@ -2067,10 +2068,11 @@ where
             .entry(wb.binding.as_str().to_string())
             .or_default();
     }
-    for provider in &mut parsed.providers {
+    for (index, provider) in parsed.providers.iter_mut().enumerate() {
         let mut resolved = IndexMap::new();
         for (key, expr) in &provider.unresolved_attributes {
-            let r = resolve_value_with_config(expr, &binding_map, config, None, false, false)?;
+            let r = resolve_value_with_config(expr, &binding_map, config, None, false, false)
+                .map_err(|error| map_error(index, key, error))?;
             resolved.insert(key.clone(), r);
         }
         provider.unresolved_attributes = resolved;
@@ -2206,20 +2208,37 @@ pub fn finalize_provider_configs<E, B: BindingAddress, D>(
         B,
     >,
 ) -> Result<(), ParseError> {
-    for provider in parsed.providers.iter_mut() {
+    finalize_provider_configs_mapped(parsed, |_, _, error| error)
+}
+
+fn finalize_provider_configs_mapped<E, B: BindingAddress, D, Failure>(
+    parsed: &mut super::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+        B,
+    >,
+    mut map_error: impl FnMut(usize, &str, ParseError) -> Failure,
+) -> Result<(), Failure> {
+    for (index, provider) in parsed.providers.iter_mut().enumerate() {
         if let Some(value) = provider.unresolved_attributes.shift_remove("default_tags") {
             match value {
                 GenericValue::Concrete(GenericConcreteValue::Map(tags)) => {
                     provider.default_tags = tags;
                 }
                 other => {
-                    return Err(ParseError::InvalidExpression {
-                        line: 0,
-                        message: format!(
-                            "Provider '{}': default_tags must resolve to a map, got {other:?}",
-                            provider.name
-                        ),
-                    });
+                    return Err(map_error(
+                        index,
+                        "default_tags",
+                        ParseError::InvalidExpression {
+                            line: 0,
+                            message: format!(
+                                "Provider '{}': default_tags must resolve to a map, got {other:?}",
+                                provider.name
+                            ),
+                        },
+                    ));
                 }
             }
         }

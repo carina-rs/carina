@@ -3,6 +3,12 @@
 //! Functions for generating random suffixes, resolving attribute prefixes,
 //! reconciling prefixed names with state, and computing anonymous resource identifiers.
 
+mod diagnostics;
+pub use diagnostics::{
+    anonymous_identity_diagnostics, attribute_derived_conflict_diagnostics,
+    legacy_loop_move_target_diagnostics,
+};
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 

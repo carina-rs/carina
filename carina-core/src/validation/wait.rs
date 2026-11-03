@@ -18,7 +18,7 @@
 //! binding LHS) is enforced upstream by `parse_wait_expr`; the parse
 //! error surfaces via the regular parser diagnostic path.
 
-use crate::parser::{File, TopLevelResourceRef};
+use crate::parser::{AnalysisItemKind, AnalysisTree, Located};
 use crate::resource::BindingAddress;
 use crate::schema::{SchemaKind, SchemaRegistry};
 use crate::wait::predicate::validate_wait_predicate;
@@ -34,23 +34,40 @@ enum WaitTarget {
 
 /// A wait-construct diagnostic.
 ///
-/// `binding_name` and `target` carry structured location hints so the
-/// LSP can resolve a per-span anchor without re-parsing the message.
+/// The detail retains semantic context. The enclosing `Located` owns the only
+/// rendering anchor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaitDiagnostic {
     pub message: String,
     pub binding_name: String,
     pub target: String,
-    pub attribute: Option<String>,
-    pub rhs: Option<String>,
+    pub kind: WaitDiagnosticKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitDiagnosticKind {
+    Target,
+    Attribute,
+    RightHandSide,
+}
+impl std::fmt::Display for WaitDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 /// Run all wait diagnostics against a parsed file + schema registry.
 /// Returns the full list of errors; callers decide how to surface them.
-pub fn validate_wait_bindings<E, D, B>(
-    parsed: &File<E, crate::resource::ParserPlaceholder, crate::resource::ParserPlaceholder, D, B>,
+pub fn validate_wait_bindings<D, B>(
+    parsed: &AnalysisTree<
+        '_,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+        B,
+    >,
     schemas: &SchemaRegistry,
-) -> Vec<WaitDiagnostic>
+) -> Vec<Located<WaitDiagnostic>>
 where
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<
@@ -59,43 +76,49 @@ where
             B,
         >,
 {
-    if parsed.wait_bindings.is_empty() {
+    if parsed.waits().next().is_none() {
         return Vec::new();
     }
-    let mut out: Vec<WaitDiagnostic> = Vec::new();
+    let mut out: Vec<Located<WaitDiagnostic>> = Vec::new();
 
     // Build the binding → wait-target lookup once.
     // Walk the typed top-level slices so unsupported data-source and
     // composition targets remain distinct from a missing binding. Both are
     // rejected explicitly before managed-resource predicate validation.
     let mut by_binding: std::collections::HashMap<B, WaitTarget> = std::collections::HashMap::new();
-    for rref in parsed.iter_top_level_resources() {
+    for rref in parsed.resources() {
         if let Some(b) = rref.binding_address() {
             let id = rref.id();
-            let target = match rref {
-                TopLevelResourceRef::Resource(_) => WaitTarget::Pollable {
-                    provider: id.provider.clone(),
-                    resource_type: id.resource_type.clone(),
-                },
-                TopLevelResourceRef::DataSource(_) => WaitTarget::DataSource,
-                TopLevelResourceRef::LiveComposition(_) => WaitTarget::LiveComposition,
+            let target = match rref.kind() {
+                AnalysisItemKind::Resource | AnalysisItemKind::DeferredResource => {
+                    WaitTarget::Pollable {
+                        provider: id.provider.clone(),
+                        resource_type: id.resource_type.clone(),
+                    }
+                }
+                AnalysisItemKind::DataSource => WaitTarget::DataSource,
+                AnalysisItemKind::Composition => WaitTarget::LiveComposition,
+                AnalysisItemKind::Wait => unreachable!("resources do not contain waits"),
             };
             by_binding.insert(b.clone(), target);
         }
     }
 
-    for wb in &parsed.wait_bindings {
-        let Some(target) = by_binding.get(&wb.target) else {
-            out.push(WaitDiagnostic {
-                message: format!(
-                    "wait `{}`: target binding `{}` is not a known resource",
-                    wb.binding, wb.target
-                ),
-                binding_name: wb.binding.as_str().to_string(),
-                target: wb.target.as_str().to_string(),
-                attribute: None,
-                rhs: None,
-            });
+    for wb in parsed.waits() {
+        let Some(target) = by_binding.get(wb.target()) else {
+            out.push(Located::new(
+                wb.target_location().clone(),
+                WaitDiagnostic {
+                    message: format!(
+                        "wait `{}`: target binding `{}` is not a known resource",
+                        wb.binding(),
+                        wb.target()
+                    ),
+                    binding_name: wb.binding().as_str().to_string(),
+                    target: wb.target().as_str().to_string(),
+                    kind: WaitDiagnosticKind::Target,
+                },
+            ));
             continue;
         };
         let pollable = match target {
@@ -105,23 +128,27 @@ where
             } => Ok((provider, resource_type)),
             WaitTarget::DataSource => Err(format!(
                 "wait `{}`: target binding `{}` is a data source; wait targets must be managed resources",
-                wb.binding, wb.target
+                wb.binding(),
+                wb.target()
             )),
             WaitTarget::LiveComposition => Err(format!(
                 "wait `{}`: target binding `{}` is a composition; waiting on module-call outputs is not supported",
-                wb.binding, wb.target
+                wb.binding(),
+                wb.target()
             )),
         };
         let (provider, resource_type) = match pollable {
             Ok(target) => target,
             Err(message) => {
-                out.push(WaitDiagnostic {
-                    message,
-                    binding_name: wb.binding.as_str().to_string(),
-                    target: wb.target.as_str().to_string(),
-                    attribute: None,
-                    rhs: None,
-                });
+                out.push(Located::new(
+                    wb.target_location().clone(),
+                    WaitDiagnostic {
+                        message,
+                        binding_name: wb.binding().as_str().to_string(),
+                        target: wb.target().as_str().to_string(),
+                        kind: WaitDiagnosticKind::Target,
+                    },
+                ));
                 continue;
             }
         };
@@ -132,20 +159,25 @@ where
             continue;
         };
         if let Err(error) = validate_wait_predicate(
-            &wb.until_predicate.root,
-            &wb.until_predicate.attribute_segments,
-            &wb.until_predicate.rhs,
+            &wb.until_predicate().root,
+            &wb.until_predicate().attribute_segments,
+            &wb.until_predicate().rhs,
             Some(schema.schema()),
         ) {
-            let attribute = (!wb.until_predicate.attribute_segments.is_empty())
-                .then(|| wb.until_predicate.attribute_segments.join("."));
-            out.push(WaitDiagnostic {
-                message: format!("wait `{}`: {error}", wb.binding),
-                binding_name: wb.binding.as_str().to_string(),
-                target: wb.target.as_str().to_string(),
-                attribute,
-                rhs: error.rhs_anchor().map(str::to_string),
-            });
+            let (kind, location) = if error.rhs_anchor().is_some() {
+                (WaitDiagnosticKind::RightHandSide, wb.rhs_location())
+            } else {
+                (WaitDiagnosticKind::Attribute, wb.lhs_location())
+            };
+            out.push(Located::new(
+                location.clone(),
+                WaitDiagnostic {
+                    message: format!("wait `{}`: {error}", wb.binding()),
+                    binding_name: wb.binding().as_str().to_string(),
+                    target: wb.target().as_str().to_string(),
+                    kind,
+                },
+            ));
         }
     }
     out
@@ -200,7 +232,10 @@ let status_ready = wait cert {
         )
         .expect("fixture must parse");
 
-        let diagnostics = validate_wait_bindings(&parsed, &wait_schemas());
+        let diagnostics = validate_wait_bindings(
+            &AnalysisTree::try_from_file(&parsed).expect("parsed wait provenance"),
+            &wait_schemas(),
+        );
         let messages = diagnostics
             .iter()
             .map(|diagnostic| diagnostic.message.as_str())
@@ -225,7 +260,13 @@ let status_ready = wait cert {
         )
         .expect("fixture must parse");
 
-        assert!(validate_wait_bindings(&parsed, &wait_schemas()).is_empty());
+        assert!(
+            validate_wait_bindings(
+                &AnalysisTree::try_from_file(&parsed).expect("parsed wait provenance"),
+                &wait_schemas()
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -261,7 +302,13 @@ let renewed = wait cert {
         )
         .expect("fixture must parse");
 
-        assert_eq!(validate_wait_bindings(&parsed, &schemas), Vec::new());
+        assert_eq!(
+            validate_wait_bindings(
+                &AnalysisTree::try_from_file(&parsed).expect("parsed wait provenance"),
+                &schemas
+            ),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -290,7 +337,13 @@ let ready = wait job {
         )
         .expect("fixture must parse");
 
-        assert_eq!(validate_wait_bindings(&parsed, &schemas), Vec::new());
+        assert_eq!(
+            validate_wait_bindings(
+                &AnalysisTree::try_from_file(&parsed).expect("parsed wait provenance"),
+                &schemas
+            ),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -323,7 +376,13 @@ let ready = wait job {
         )
         .expect("fixture must parse");
 
-        assert_eq!(validate_wait_bindings(&parsed, &schemas), Vec::new());
+        assert_eq!(
+            validate_wait_bindings(
+                &AnalysisTree::try_from_file(&parsed).expect("parsed wait provenance"),
+                &schemas
+            ),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -352,7 +411,10 @@ let ready = wait job {
         )
         .expect("fixture must parse");
 
-        let diagnostics = validate_wait_bindings(&parsed, &schemas);
+        let diagnostics = validate_wait_bindings(
+            &AnalysisTree::try_from_file(&parsed).expect("parsed wait provenance"),
+            &schemas,
+        );
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(
             diagnostics[0].message,
@@ -393,13 +455,12 @@ let found = wait lookup {
         .expect("fixture must parse");
 
         assert_eq!(
-            validate_wait_bindings(&parsed, &schemas),
+            validate_wait_bindings(&AnalysisTree::try_from_file(&parsed).expect("parsed wait provenance"), &schemas).into_iter().map(|diagnostic| diagnostic.into_parts().1).collect::<Vec<_>>(),
             vec![WaitDiagnostic {
                 message: "wait `found`: target binding `lookup` is a data source; wait targets must be managed resources".to_string(),
                 binding_name: "found".to_string(),
                 target: "lookup".to_string(),
-                attribute: None,
-                rhs: None,
+                kind: WaitDiagnosticKind::Target,
             }]
         );
     }

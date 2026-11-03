@@ -2417,13 +2417,12 @@ fn resolve_upstream_export_keys(
         binding: carina_core::resource::RelativeBindingName::new(binding),
         source: std::path::PathBuf::from(source),
     };
-    let (mut exports, _errors) =
-        carina_core::upstream_exports::resolve_upstream_exports_providerless_with_schemas(
-            base,
-            &[upstream],
-            provider_ctx,
-            Some(schemas),
-        );
+    let mut exports = carina_core::upstream_exports::discover_upstream_exports(
+        base,
+        &[upstream],
+        provider_ctx,
+        Some(schemas),
+    );
     exports.remove(binding)
 }
 
@@ -2497,13 +2496,12 @@ fn infer_for_binding_type(
                 binding: binding.clone(),
                 source: std::path::PathBuf::from(source),
             };
-            let (mut resolved, _errors) =
-                carina_core::upstream_exports::resolve_upstream_exports_providerless_with_schemas(
-                    base,
-                    &[upstream],
-                    provider_ctx,
-                    Some(schemas),
-                );
+            let mut resolved = carina_core::upstream_exports::discover_upstream_exports(
+                base,
+                &[upstream],
+                provider_ctx,
+                Some(schemas),
+            );
             // Move the entry out of `resolved` rather than cloning so we
             // don't pay a deep `Value` clone on the per-keystroke path.
             resolved.remove(&binding).unwrap_or_default()

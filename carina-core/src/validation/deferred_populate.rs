@@ -32,308 +32,90 @@
 //! error in milliseconds, with an actionable suggestion, rather than
 //! after a multi-minute apply.
 
+use crate::parser::{AnalysisTree, DeclarationLocation, Located};
+use crate::resource::{AccessPath, BindingAddress, ParserPlaceholder, PathSegment};
+use crate::schema::{EffectiveAttribute, SchemaKind, SchemaRegistry, Shape};
 use std::collections::{HashMap, HashSet};
 
-use crate::parser::File;
-use crate::resource::{
-    AccessPath, BindingAddress, ConcreteValue, DeferredValue, InterpolationPart, ParserPlaceholder,
-    PathSegment, Value,
-};
-use crate::schema::{EffectiveAttribute, SchemaKind, SchemaRegistry, Shape};
-
-/// One diagnostic for a deferred-populate-bound chained reference
-/// that lacks a synchronizing `wait` block.
-///
-/// `binding` and `attribute_path` carry structured location hints so
-/// the LSP can resolve a per-span anchor without re-parsing the
-/// message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeferredPopulateDiagnostic {
-    /// The error message (same wording for `carina validate` and LSP).
     pub message: String,
-    /// The DSL binding name of the resource holding the offending
-    /// attribute (e.g. the route53 RecordSet's binding).
-    pub holder_binding: Option<String>,
-    /// The attribute key on the holder resource that contains the
-    /// offending chained reference (e.g. `resource_records`).
     pub attribute_key: String,
-    /// The full unresolved path as the user wrote it (e.g.
-    /// `cert.domain_validation_options[0].resource_record_value`).
     pub unresolved_path: String,
-    /// The target binding that needs a `wait` (e.g. `cert`).
     pub target_binding: String,
 }
+impl std::fmt::Display for DeferredPopulateDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
 
-/// Run the deferred-populate diagnostic against a parsed file +
-/// schema registry.
-pub fn validate_deferred_populate_refs<
-    E,
-    B: BindingAddress,
-    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
->(
-    parsed: &File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+pub fn validate_deferred_populate_refs<B: BindingAddress, D>(
+    tree: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
     schemas: &SchemaRegistry,
-) -> Vec<DeferredPopulateDiagnostic> {
-    // binding name → (provider, resource_type) for schema lookup.
-    // Walks both top-level resources and for-expression bodies so a
-    // chained ref inside a `for` body still finds its target binding.
-    let mut by_binding: HashMap<B, (String, String)> = HashMap::new();
-    for rref in parsed.iter_all_resources() {
-        if let Some(b) = rref.binding_address() {
-            let id = rref.id();
-            by_binding.insert(b.clone(), (id.provider.clone(), id.resource_type.clone()));
-        }
-    }
-    if by_binding.is_empty() {
-        return Vec::new();
-    }
-
-    // Set of binding names that have a `wait` block declared against
-    // them in the same directory. A wait on binding `cert` satisfies
-    // the rule for ANY chained access on `cert` (see module doc).
-    let synchronized: HashSet<B> = parsed
-        .wait_bindings
-        .iter()
-        .map(|wb| wb.target.clone())
+) -> Vec<Located<DeferredPopulateDiagnostic>>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    let by_binding: HashMap<_, _> = tree
+        .resources()
+        .filter_map(|resource| {
+            resource.binding_address().map(|binding| {
+                (
+                    binding.clone(),
+                    (&resource.id().provider, &resource.id().resource_type),
+                )
+            })
+        })
         .collect();
-
-    let mut out: Vec<DeferredPopulateDiagnostic> = Vec::new();
-    for rref in parsed.iter_all_resources() {
-        let attrs = rref.attributes();
-        for (key, value) in attrs.iter() {
-            collect_unsynchronized_refs(
-                value,
-                key,
-                rref.binding_address(),
-                &by_binding,
-                &synchronized,
-                schemas,
-                &mut out,
-            );
+    let synchronized: HashSet<_> = tree.waits().map(|wait| wait.target().clone()).collect();
+    let mut out = Vec::new();
+    for resource in tree.resources() {
+        for attribute in resource.located_attributes() {
+            let (key, value) = attribute.detail();
+            value.visit_resource_refs(&mut |path| {
+                check_ref(
+                    path,
+                    key,
+                    attribute.location(),
+                    &by_binding,
+                    &synchronized,
+                    schemas,
+                    &mut out,
+                )
+            });
         }
     }
     out
 }
 
-/// Walk `value` recursively, emitting one diagnostic per chained ref
-/// that targets a deferred-populate-flagged attribute on an
-/// unsynchronized binding.
-fn collect_unsynchronized_refs<B: BindingAddress>(
-    value: &Value<ParserPlaceholder, B>,
-    attribute_key: &str,
-    holder_binding: Option<&B>,
-    by_binding: &HashMap<B, (String, String)>,
-    synchronized: &HashSet<B>,
-    schemas: &SchemaRegistry,
-    out: &mut Vec<DeferredPopulateDiagnostic>,
-) {
-    match value {
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
-            for nested in deferred.values() {
-                collect_unsynchronized_refs(
-                    nested,
-                    attribute_key,
-                    holder_binding,
-                    by_binding,
-                    synchronized,
-                    schemas,
-                    out,
-                );
-            }
-        }
-        Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            check_ref(
-                path,
-                attribute_key,
-                holder_binding,
-                by_binding,
-                synchronized,
-                schemas,
-                out,
-            );
-        }
-        Value::Concrete(ConcreteValue::List(items)) => {
-            for item in items {
-                collect_unsynchronized_refs(
-                    item,
-                    attribute_key,
-                    holder_binding,
-                    by_binding,
-                    synchronized,
-                    schemas,
-                    out,
-                );
-            }
-        }
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            for v in map.values() {
-                collect_unsynchronized_refs(
-                    v,
-                    attribute_key,
-                    holder_binding,
-                    by_binding,
-                    synchronized,
-                    schemas,
-                    out,
-                );
-            }
-        }
-        Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            for part in parts {
-                if let InterpolationPart::Expr(v) = part {
-                    collect_unsynchronized_refs(
-                        v,
-                        attribute_key,
-                        holder_binding,
-                        by_binding,
-                        synchronized,
-                        schemas,
-                        out,
-                    );
-                }
-            }
-        }
-        Value::Deferred(
-            DeferredValue::FunctionCall { args, .. }
-            | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
-        ) => {
-            for arg in args {
-                collect_unsynchronized_refs(
-                    arg.walker_value(),
-                    attribute_key,
-                    holder_binding,
-                    by_binding,
-                    synchronized,
-                    schemas,
-                    out,
-                );
-            }
-        }
-        Value::Deferred(DeferredValue::Access(access)) => {
-            collect_unsynchronized_refs(
-                access.base(),
-                attribute_key,
-                holder_binding,
-                by_binding,
-                synchronized,
-                schemas,
-                out,
-            );
-        }
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            collect_unsynchronized_refs(
-                inner,
-                attribute_key,
-                holder_binding,
-                by_binding,
-                synchronized,
-                schemas,
-                out,
-            );
-        }
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            collect_unsynchronized_refs(
-                value,
-                attribute_key,
-                holder_binding,
-                by_binding,
-                synchronized,
-                schemas,
-                out,
-            );
-            collect_unsynchronized_refs(
-                default,
-                attribute_key,
-                holder_binding,
-                by_binding,
-                synchronized,
-                schemas,
-                out,
-            );
-        }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            collect_unsynchronized_refs(
-                expression.lhs(),
-                attribute_key,
-                holder_binding,
-                by_binding,
-                synchronized,
-                schemas,
-                out,
-            );
-            collect_unsynchronized_refs(
-                expression.rhs(),
-                attribute_key,
-                holder_binding,
-                by_binding,
-                synchronized,
-                schemas,
-                out,
-            );
-        }
-        Value::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::EnumIdentifier(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::StringList(_),
-        ) => {
-            // Scalar leaves carry no references.
-        }
-        Value::Deferred(
-            DeferredValue::Unknown(_)
-            | DeferredValue::Placeholder(_)
-            | DeferredValue::BindingRef { .. },
-        ) => {
-            // BindingRef lacks the attribute path check_ref needs for deferred_populate.
-            // Unknown is parser-deferred and likewise carries no resource attribute path.
-        }
-    }
-}
-
-/// Check one `ResourceRef` against the schema and the wait set.
 fn check_ref<B: BindingAddress>(
     path: &AccessPath<B>,
-    attribute_key: &str,
-    holder_binding: Option<&B>,
-    by_binding: &HashMap<B, (String, String)>,
+    key: &str,
+    location: &DeclarationLocation,
+    bindings: &HashMap<B, (&String, &String)>,
     synchronized: &HashSet<B>,
     schemas: &SchemaRegistry,
-    out: &mut Vec<DeferredPopulateDiagnostic>,
+    out: &mut Vec<Located<DeferredPopulateDiagnostic>>,
 ) {
     let target = path.binding_address();
     if synchronized.contains(target) {
         return;
     }
-    let Some((provider, resource_type)) = by_binding.get(target) else {
-        // Unknown binding (typo, cross-file ref the parser couldn't
-        // resolve, …). Other passes report that — staying silent here
-        // avoids spurious double diagnostics.
+    let Some((provider, resource_type)) = bindings.get(target) else {
         return;
     };
     let Some(schema) = schemas.get(provider, resource_type, SchemaKind::Resource) else {
         return;
     };
-    let Some(attr_schema) = schema.effective_attribute_by_authored_name(path.attribute()) else {
+    let Some(attribute) = schema.effective_attribute_by_authored_name(path.attribute()) else {
         return;
     };
-
-    if path_traverses_deferred(attr_schema, path.segments()) {
-        out.push(DeferredPopulateDiagnostic {
-            message: format!(
-                "attribute `{attribute_key}` references `{}`, which is populated asynchronously by the provider after Create. \
-                 Add a `wait {target} {{ until = ... }}` block in this directory before downstream resources read this attribute.",
-                path.to_dot_string(),
-            ),
-            holder_binding: holder_binding.map(|binding| binding.as_str().to_string()),
-            attribute_key: attribute_key.to_string(),
-            unresolved_path: path.to_dot_string(),
-            target_binding: target.as_str().to_string(),
-        });
+    if path_traverses_deferred(attribute, path.segments()) {
+        out.push(Located::new(location.clone(), DeferredPopulateDiagnostic {
+            message: format!("attribute `{key}` references `{}`, which is populated asynchronously by the provider after Create. Add a `wait {target} {{ until = ... }}` block in this directory before downstream resources read this attribute.", path.to_dot_string()),
+            attribute_key: key.to_string(), unresolved_path: path.to_dot_string(), target_binding: target.to_string(),
+        }));
     }
 }
 
@@ -410,15 +192,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::parser::{
-        DeferredForBody, DeferredForTarget, ForBinding, ParsedDeferredForExpression, ParsedFile,
-        SourceSpan, WaitBinding,
-    };
-    use crate::resource::{
-        AuthoredAccessPath as AccessPath, AuthoredConcreteValue as ConcreteValue,
-        AuthoredDeferredValue as DeferredValue, AuthoredResource as Resource,
-        AuthoredValue as Value, PathSegment, ResourceId, Subscript,
-    };
+    use crate::parser::{ParsedFile, ProviderContext, parse};
     use crate::schema::SchemaRegistry;
 
     fn cert_schema_with_dvo_inner_field_deferred<R: crate::schema::PatternForm>()
@@ -493,45 +267,18 @@ mod tests {
             )
     }
 
-    fn dvo_chained_ref(field: &str) -> Value {
-        let path = AccessPath::with_segments(
-            "cert",
-            "domain_validation_options",
-            vec![
-                PathSegment::Subscript {
-                    index: Subscript::Int { index: 0 },
-                },
-                PathSegment::Field {
-                    name: field.to_string(),
-                },
-            ],
-        );
-        Value::Deferred(DeferredValue::ResourceRef { path })
+    fn fixture(source: &str) -> ParsedFile {
+        parse(
+            source,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("authored diagnostic fixture")
     }
 
-    /// Build a `ParsedFile` with a cert binding + a route53 RecordSet
-    /// that references the deferred field.
     fn parsed_with_unsynchronized_chained_ref() -> ParsedFile {
-        let mut cert = Resource::new("acm.Certificate", "cert");
-        cert.id = ResourceId::with_identity("acm.Certificate", "cert");
-        cert.id.provider = "aws".to_string();
-        cert.binding = Some("cert".into());
-
-        let mut record = Resource::new("route53.RecordSet", "record");
-        record.id = ResourceId::with_identity("route53.RecordSet", "record");
-        record.id.provider = "aws".to_string();
-        record.binding = Some("record".into());
-        record.set_attr(
-            "resource_records",
-            Value::Concrete(ConcreteValue::List(vec![dvo_chained_ref(
-                "resource_record_value",
-            )])),
-        );
-
-        ParsedFile {
-            resources: vec![cert, record],
-            ..ParsedFile::default()
-        }
+        fixture(
+            "let cert = aws.acm.Certificate {}\nlet record = aws.route53.RecordSet { resource_records = [cert.domain_validation_options[0].resource_record_value] }\n",
+        )
     }
 
     fn registry_for_acm() -> SchemaRegistry {
@@ -554,7 +301,10 @@ mod tests {
     #[test]
     fn list_wrapped_chained_ref_to_deferred_inner_field_is_flagged() {
         let parsed = parsed_with_unsynchronized_chained_ref();
-        let diags = validate_deferred_populate_refs(&parsed, &registry_for_acm());
+        let diags = validate_deferred_populate_refs(
+            &AnalysisTree::try_from_file(&parsed).expect("parsed deferred-populate provenance"),
+            &registry_for_acm(),
+        );
         assert_eq!(diags.len(), 1, "got: {diags:?}");
         let d = &diags[0];
         assert_eq!(d.target_binding, "cert");
@@ -570,113 +320,50 @@ mod tests {
 
     #[test]
     fn parser_side_deferred_resource_body_is_checked() {
-        let mut parsed = parsed_with_unsynchronized_chained_ref();
-        let record = parsed.resources.pop().expect("record resource"); // allow: direct — fixture test inspection
-        let target = DeferredForTarget::bound(crate::resource::RelativeBindingName::new("records"))
-            .expect("fixture binding is valid");
-        let body = DeferredForBody::resource(record);
-        parsed
-            .parsed_deferred_for_expressions_mut()
-            .push(ParsedDeferredForExpression::new(
-                (
-                    None,
-                    1,
-                    SourceSpan::dummy(),
-                    "for item in pending.items".to_string(),
-                ),
-                target,
-                Value::Concrete(ConcreteValue::List(Vec::new())),
-                crate::parser::ParsedDeferredForIterableState::Deferred,
-                ForBinding::Simple("item".to_string()),
-                body,
-            ));
-
-        let diags = validate_deferred_populate_refs(&parsed, &registry_for_acm());
+        let parsed = fixture(
+            "arguments { names: list(String) }\nlet cert = aws.acm.Certificate {}\nlet records = for name in names { aws.route53.RecordSet { name = name resource_records = [cert.domain_validation_options[0].resource_record_value] } }\n",
+        );
+        let diags = validate_deferred_populate_refs(
+            &AnalysisTree::try_from_file(&parsed).expect("parsed deferred-populate provenance"),
+            &registry_for_acm(),
+        );
         assert_eq!(diags.len(), 1, "got: {diags:?}");
         assert_eq!(diags[0].target_binding, "cert");
     }
 
     #[test]
     fn wait_block_on_target_binding_satisfies_the_rule() {
-        let mut parsed = parsed_with_unsynchronized_chained_ref();
-        // A wait on the cert binding — predicate text is irrelevant
-        // for this pass; presence is the contract.
-        parsed.wait_bindings.push(WaitBinding {
-            binding: "cert_issued".into(),
-            target: "cert".into(),
-            until_raw: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
-            until_predicate: crate::parser::UntilPredicateAst {
-                root: "cert".into(),
-                attribute_segments: vec!["status".to_string()],
-                rhs: crate::resource::Value::<
-                    crate::resource::NoPlaceholder,
-                    crate::resource::RelativeBindingName,
-                >::Concrete(crate::resource::ConcreteValue::String(
-                    "ISSUED".into(),
-                )),
-            },
-            timeout_secs: None,
-            depends_on: Default::default(),
-            line: 0,
-            declaration: Default::default(),
-        });
-        let diags = validate_deferred_populate_refs(&parsed, &registry_for_acm());
+        let parsed = fixture(
+            "let cert = aws.acm.Certificate {}\nlet record = aws.route53.RecordSet { resource_records = [cert.domain_validation_options[0].resource_record_value] }\nlet ready = wait cert { until = cert.status == 'ISSUED' }\n",
+        );
+        let diags = validate_deferred_populate_refs(
+            &AnalysisTree::try_from_file(&parsed).expect("parsed deferred-populate provenance"),
+            &registry_for_acm(),
+        );
         assert!(diags.is_empty(), "got: {diags:?}");
     }
 
     #[test]
     fn chained_ref_to_non_deferred_inner_field_is_not_flagged() {
-        let mut record = Resource::new("route53.RecordSet", "record");
-        record.id = ResourceId::with_identity("route53.RecordSet", "record");
-        record.id.provider = "aws".to_string();
-        record.binding = Some("record".into());
-        record.set_attr("name", dvo_chained_ref("domain_name"));
-
-        let mut cert = Resource::new("acm.Certificate", "cert");
-        cert.id = ResourceId::with_identity("acm.Certificate", "cert");
-        cert.id.provider = "aws".to_string();
-        cert.binding = Some("cert".into());
-
-        let p = ParsedFile {
-            resources: vec![cert, record],
-            ..ParsedFile::default()
-        };
-        let diags = validate_deferred_populate_refs(&p, &registry_for_acm());
+        let p = fixture(
+            "let cert = aws.acm.Certificate {}\nlet record = aws.route53.RecordSet { name = cert.domain_validation_options[0].domain_name }\n",
+        );
+        let diags = validate_deferred_populate_refs(
+            &AnalysisTree::try_from_file(&p).expect("parsed deferred-populate provenance"),
+            &registry_for_acm(),
+        );
         assert!(diags.is_empty(), "got: {diags:?}");
     }
 
     #[test]
     fn unknown_target_binding_does_not_emit_double_diagnostic() {
-        // A typo in the binding name produces an undefined-identifier
-        // error elsewhere; this pass must not pile on.
-        let mut record = Resource::new("route53.RecordSet", "record");
-        record.id = ResourceId::with_identity("route53.RecordSet", "record");
-        record.id.provider = "aws".to_string();
-        record.binding = Some("record".into());
-        let path = AccessPath::with_segments(
-            "typo_cert", // <-- unknown binding
-            "domain_validation_options",
-            vec![
-                PathSegment::Subscript {
-                    index: Subscript::Int { index: 0 },
-                },
-                PathSegment::Field {
-                    name: "resource_record_value".to_string(),
-                },
-            ],
+        let p = fixture(
+            "let record = aws.route53.RecordSet { resource_records = [typo_cert.domain_validation_options[0].resource_record_value] }\n",
         );
-        record.set_attr(
-            "resource_records",
-            Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
-                DeferredValue::ResourceRef { path },
-            )])),
+        let diags = validate_deferred_populate_refs(
+            &AnalysisTree::try_from_file(&p).expect("parsed deferred-populate provenance"),
+            &registry_for_acm(),
         );
-
-        let p = ParsedFile {
-            resources: vec![record],
-            ..ParsedFile::default()
-        };
-        let diags = validate_deferred_populate_refs(&p, &registry_for_acm());
         assert!(diags.is_empty(), "got: {diags:?}");
     }
 
@@ -714,55 +401,26 @@ mod tests {
             consumer.validate().expect("schema fixture must be valid"),
         );
 
-        let mut db = Resource::new("rds.DBInstance", "db");
-        db.id = ResourceId::with_identity("rds.DBInstance", "db");
-        db.id.provider = "aws".to_string();
-        db.binding = Some("db".into());
-
-        let mut inst = Resource::new("ec2.Instance", "i");
-        inst.id = ResourceId::with_identity("ec2.Instance", "i");
-        inst.id.provider = "aws".to_string();
-        inst.binding = Some("i".into());
-        let path = AccessPath::with_segments(
-            "db",
-            "endpoint",
-            vec![PathSegment::Field {
-                name: "address".to_string(),
-            }],
+        let p = fixture(
+            "let db = aws.rds.DBInstance {}\nlet i = aws.ec2.Instance { user_data = db.endpoint.address }\n",
         );
-        inst.set_attr(
-            "user_data",
-            Value::Deferred(DeferredValue::ResourceRef { path }),
+        let diags = validate_deferred_populate_refs(
+            &AnalysisTree::try_from_file(&p).expect("parsed deferred-populate provenance"),
+            &r,
         );
-
-        let p = ParsedFile {
-            resources: vec![db, inst],
-            ..ParsedFile::default()
-        };
-        let diags = validate_deferred_populate_refs(&p, &r);
         assert_eq!(diags.len(), 1, "got: {diags:?}");
         assert_eq!(diags[0].target_binding, "db");
     }
 
     #[test]
     fn schema_lookup_miss_does_not_panic_or_emit() {
-        // Resource type not in the registry — pass should bail
-        // silently. Other passes report unknown resource types.
-        let mut record = Resource::new("unknown.thing", "x");
-        record.id = ResourceId::with_identity("unknown.thing", "x");
-        record.id.provider = "aws".to_string();
-        record.binding = Some("x".into());
-        record.set_attr(
-            "resource_records",
-            Value::Concrete(ConcreteValue::List(vec![dvo_chained_ref(
-                "resource_record_value",
-            )])),
+        let p = fixture(
+            "let x = aws.unknown.thing {}\nlet record = aws.route53.RecordSet { resource_records = [x.domain_validation_options[0].resource_record_value] }\n",
         );
-        let p = ParsedFile {
-            resources: vec![record],
-            ..ParsedFile::default()
-        };
-        let diags = validate_deferred_populate_refs(&p, &registry_for_acm());
+        let diags = validate_deferred_populate_refs(
+            &AnalysisTree::try_from_file(&p).expect("parsed deferred-populate provenance"),
+            &registry_for_acm(),
+        );
         // Schema for "unknown.thing" missing means nothing to check;
         // crucially no panic.
         assert!(diags.is_empty(), "got: {diags:?}");

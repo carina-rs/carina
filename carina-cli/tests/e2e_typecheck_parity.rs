@@ -276,7 +276,6 @@ fn cli_annotation_diagnostics(
     }
     for error in typed.errors {
         match &error {
-            AppError::TypeResolution(_) => {}
             AppError::ModuleCall(finding)
                 if finding.kind()
                     == carina_core::validation::ModuleCallFindingKind::TypeResolution => {}

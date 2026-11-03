@@ -5338,7 +5338,10 @@ let renewed = wait cert {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("fixture must parse");
-    let validation = crate::validation::wait::validate_wait_bindings(&parsed, &schemas);
+    let validation = crate::validation::wait::validate_wait_bindings(
+        &crate::parser::AnalysisTree::try_from_file(&parsed).expect("parser wait provenance"),
+        &schemas,
+    );
     assert_eq!(validation.len(), 1);
 
     let cert =

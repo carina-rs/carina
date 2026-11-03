@@ -364,12 +364,8 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                             module_source
                                 .clone()
                                 .unwrap_or_else(|| call.module_name.clone()),
-                            crate::resource::DiagnosticSourceSpan::authored(
-                                call_source_file.to_path_buf(),
-                                call.source_span().start_line(),
-                                call.source_span().start_column(),
-                                call.source_span().end_line(),
-                                call.source_span().end_column(),
+                            crate::resource::DiagnosticSourceSpan::from_declaration(
+                                call.id().declaration_location().clone(),
                             ),
                             &arg.static_type,
                         ),
@@ -793,6 +789,11 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         let mut expanded_parser_metadata: crate::parser::ParserBindingMetadata<
             AbsoluteBindingAddress,
         > = crate::parser::ParserBindingMetadata::default();
+        expanded_parser_metadata.syntax = module
+            .parser_binding_metadata
+            .syntax()
+            .clone()
+            .map_bindings(&mut |binding| module_instance_scope.resolve(binding));
         let mut expanded_binding_uses =
             resolve_module_binding_uses::<P>(module, &module_scope_resolver)
                 .map_err(contextualize_access_error)?;
@@ -1024,8 +1025,9 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 instance: instance_prefix.to_string(),
                 call_path: expanded_call_path.clone(),
                 quoted_string_attrs: HashSet::new(),
-                declaration: crate::parser::DeclarationProvenance::from_location(
+                declaration: crate::parser::DeclarationProvenance::for_composition(
                     call.id().declaration_location().clone(),
+                    module.parser_binding_metadata.syntax().declarations(),
                 ),
             };
             compositions.push(composition);
@@ -1454,8 +1456,7 @@ fn resolve_directive_dependencies(
 ) -> Result<crate::parser::UnexpandedDependencies<AbsoluteBindingAddress>, ArgumentSubstitutionError>
 {
     use crate::parser::UnexpandedDependencyOperand as Operand;
-    let mut resolved = Vec::with_capacity(dependencies.len());
-    for (index, operand) in dependencies.iter().enumerate() {
+    let mut resolved = dependencies.try_filter_map(|index, operand| {
         let operand = match operand {
             Operand::Handle(handle) => {
                 match resolver.resolve_structural_argument(handle.structural())? {
@@ -1464,7 +1465,7 @@ fn resolve_directive_dependencies(
                             .resource_handle()
                             .expect("resource capability retains its type across scope resolution"),
                     ),
-                    ScopedStructuralArgument::Forwarded(_) => continue,
+                    ScopedStructuralArgument::Forwarded(_) => return Ok(None),
                 }
             }
             Operand::BareBinding(binding) => {
@@ -1474,7 +1475,7 @@ fn resolve_directive_dependencies(
                     diagnostic_sources.get_owned(index),
                 )?
                 else {
-                    continue;
+                    return Ok(None);
                 };
                 Operand::BareBinding(binding)
             }
@@ -1484,9 +1485,18 @@ fn resolve_directive_dependencies(
                 attribute: attribute.clone(),
             },
         };
-        resolved.push(operand);
+        Ok(Some(operand))
+    })?;
+    let mut origins = Vec::new();
+    for path in dependencies.reference_origins() {
+        let value = resolve_plain_module_value(
+            &Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
+            resolver,
+        )?;
+        value.visit_resource_refs(&mut |path| origins.push(path.clone()));
     }
-    Ok(crate::parser::UnexpandedDependencies::new(resolved))
+    resolved.set_reference_origins(origins);
+    Ok(resolved)
 }
 
 fn resolve_wait_binding(
@@ -3291,27 +3301,24 @@ fn resolve_module_directives(
         expression.value().visit_placeholders(&mut |placeholder| {
             if let ParserPlaceholder::ModuleArgument { name, .. } = placeholder
                 && let Some(argument) = resolver.arguments.arguments.get(name)
-                && let ArgumentOrigin::Authored { value_span, .. } = argument.origin
+                && let ArgumentOrigin::Authored { .. } = argument.origin
             {
-                sources.push(crate::resource::DiagnosticSourceSpan::authored(
-                    resolver.arguments.caller_source_file.to_path_buf(),
-                    value_span.start_line(),
-                    value_span.start_column(),
-                    value_span.end_line(),
-                    value_span.end_column(),
+                let location = resolver
+                    .call_path
+                    .immediate()
+                    .id
+                    .argument_value_location(name)
+                    .expect("authored argument provenance");
+                sources.push(crate::resource::DiagnosticSourceSpan::from_declaration(
+                    location.clone(),
                 ));
             }
         });
         // Substitution and loop expansion may erase the original argument
         // slots. Every instantiated expression retains its caller anchors.
         for call in resolver.call_path.calls() {
-            let span = call.id.call_span();
-            sources.push(crate::resource::DiagnosticSourceSpan::authored(
-                call.id.source_file().to_path_buf(),
-                span.start_line(),
-                span.start_column(),
-                span.end_line(),
-                span.end_column(),
+            sources.push(crate::resource::DiagnosticSourceSpan::from_declaration(
+                call.id.declaration_location().clone(),
             ));
         }
         expression

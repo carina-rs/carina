@@ -537,11 +537,16 @@ pub(crate) fn validate_and_resolve_errors_inner(
         errors.extend(
             carina_core::parser::check_identifier_scope(parsed.parsed())
                 .into_iter()
-                .chain(carina_core::parser::check_provider_instance_routing(
-                    parsed.parsed(),
-                ))
                 .map(|error| AppError::Config(error.to_string())),
         );
+        match carina_core::parser::AnalysisTree::try_from_file(parsed.parsed()) {
+            Ok(tree) => errors.extend(
+                carina_core::parser::check_provider_instance_routing(&tree)
+                    .into_iter()
+                    .map(|diagnostic| AppError::ProviderRouting(Box::new(diagnostic))),
+            ),
+            Err(error) => errors.push(AppError::AnalysisInvariant(error)),
+        }
     }
 
     if !skip_resource_validation {
@@ -558,14 +563,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
         );
         errors.extend(
             carina_core::validation::inference::attached_inference_failures(schema_checked_exports)
-                .map(|failure| {
-                    AppError::Validation(
-                        carina_core::validation::inference::format_inference_error(
-                            failure.name,
-                            failure.error,
-                        ),
-                    )
-                }),
+                .map(|failure| AppError::Validation(failure.to_string())),
         );
     }
 
@@ -602,10 +600,8 @@ pub(crate) fn validate_and_resolve_errors_inner(
     let type_resolution = parsed.resolve_type_exprs_report(enriched_context);
     let resolved_argument_types = type_resolution.resolved_argument_types().clone();
     for diagnostic in type_resolution.into_diagnostics() {
-        match carina_core::validation::ModuleCallFinding::try_from_type_resolution(diagnostic) {
-            Ok(finding) => root_type_resolution_findings.push(finding),
-            Err(diagnostic) => errors.push(AppError::TypeResolution(diagnostic)),
-        }
+        root_type_resolution_findings
+            .push(carina_core::validation::ModuleCallFinding::from_type_resolution(diagnostic));
     }
     extend_module_call_errors(&mut errors, root_type_resolution_findings);
     if let Err(error) = parsed.resolve_resource_refs_in_session(enriched_context) {
@@ -853,9 +849,17 @@ pub(crate) fn validate_and_resolve_errors_inner(
     }
 
     let (upstream_exports, upstream_resolve_errors) = if !skip_resource_validation {
+        let analysis = match carina_core::parser::AnalysisTree::try_from_file(parsed) {
+            Ok(tree) => tree,
+            Err(error) => {
+                errors.push(AppError::AnalysisInvariant(error));
+                return Err(non_empty_validation_failure(errors));
+            }
+        };
+
         carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
             base_dir,
-            &parsed.upstream_states,
+            &analysis,
             enriched_context,
             Some(ctx.schemas()),
         )
@@ -980,16 +984,24 @@ pub(crate) fn validate_and_resolve_errors_inner(
     // that situation. No state I/O: we parse the upstream's `.crn`
     // files directly.
     if !skip_resource_validation {
+        let analysis = match carina_core::parser::AnalysisTree::try_from_file(parsed) {
+            Ok(tree) => tree,
+            Err(error) => {
+                errors.push(AppError::AnalysisInvariant(error));
+                return Err(non_empty_validation_failure(errors));
+            }
+        };
+
         let field_errors =
             carina_core::upstream_exports::check_upstream_state_untyped_field_references(
-                parsed,
+                &analysis,
                 &upstream_exports,
             );
         // #1894 (option 2): cross-directory `for`-iterable shape check.
         // Surfaces pending `list ↔ map` migrations in the upstream's
         // `exports.crn` before they hit apply.
         let shape_errors = carina_core::upstream_exports::check_upstream_state_for_iterable_shapes(
-            parsed,
+            &analysis,
             &upstream_exports,
         );
         // #1894 follow-up: cross-directory attribute-access shape check.
@@ -998,11 +1010,11 @@ pub(crate) fn validate_and_resolve_errors_inner(
         // declared `TypeExpr`.
         let attribute_access_errors =
             carina_core::upstream_exports::check_upstream_state_attribute_access_shape_fallbacks(
-                parsed,
+                &analysis,
                 &upstream_exports,
             );
         let subscript_errors = carina_core::upstream_exports::check_upstream_state_subscript_shapes(
-            parsed,
+            &analysis,
             &upstream_exports,
         );
         // The four upstream-ref shape/existence checks return distinct concrete types

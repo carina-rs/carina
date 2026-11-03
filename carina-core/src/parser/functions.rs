@@ -25,6 +25,8 @@ pub(super) fn parse_fn_def(
     warnings: &mut Vec<ParseWarning>,
     preprocessed_file: &super::PreprocessedFile,
 ) -> Result<UserFunction, ParseError> {
+    let type_annotations =
+        super::elements::function_type_annotations(&pair, preprocessed_file, ctx.source_file());
     let mut inner = pair.into_inner();
     let name = next_pair(&mut inner, "function name", "fn_def")?
         .as_str()
@@ -161,6 +163,7 @@ pub(super) fn parse_fn_def(
     })?;
 
     Ok(UserFunction {
+        type_annotations,
         name,
         params,
         return_type,

@@ -1957,12 +1957,9 @@ fn module_call_diagnostics_preserve_symlink_parent_source_spelling() {
             name: "Missing".to_string(),
         }
         .into(),
-        Some(TypeResolutionSource::new(
-            SourceFileId::new(path.clone()),
-            SourceSpan::dummy(),
-        )),
+        parser_test_location(&path),
     );
-    let finding = ModuleCallFinding::try_from_type_resolution(diagnostic).unwrap();
+    let finding = ModuleCallFinding::from_type_resolution(diagnostic);
     assert_eq!(finding.anchor().source_file.path(), path);
 }
 
@@ -5481,10 +5478,8 @@ let child = child_module { value = forwarded }
         "the fixture must exercise display-label-independent identity",
     );
 
-    let expected_anchor = ModuleCallFindingAnchor {
-        source_file: report.findings()[0].use_site.source_file.clone(),
-        span: report.findings()[0].use_site.span,
-    };
+    let expected_anchor =
+        ModuleCallFindingAnchor::new(report.findings()[0].use_site.location().clone());
     assert_eq!(authored[0].anchor(), &expected_anchor);
     assert_eq!(expanded[0].anchor(), &expected_anchor);
     let merged = merge_module_call_findings([authored, expanded]);
@@ -9255,18 +9250,12 @@ fn enriched_context_with_iam_policy_arn() -> LoadedProviderContext {
 
 #[test]
 fn resolve_file_type_exprs_rejects_unknown_in_arguments() {
-    use crate::parser::ArgumentParameter;
-
-    let mut parsed = empty_parsed();
-    parsed.arguments.push(ArgumentParameter {
-        name: "bad_arg".to_string(),
-        static_type: local_type(crate::parser::bare_type_for_test(
-            "totally_made_up_type".to_string(),
-        )),
-        default: None,
-        description: None,
-        validations: Vec::new(),
-    });
+    let mut parsed = crate::parser::parse_file(
+        "arguments { bad_arg: TotallyMadeUpType }",
+        std::path::Path::new("arguments.crn"),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     let findings = crate::validation::deferred_types::with_session_for_test(
         &enriched_context_with_iam_policy_arn(),
@@ -9335,29 +9324,19 @@ fn file_type_resolution_parser_error_coverage_ignores_rendered_wording() {
     assert_eq!(report.diagnostics().len(), 1);
     assert!(report.covered_parser_error());
     assert_eq!(
-        report.diagnostics()[0].to_string(),
+        report.diagnostics()[0].detail().to_string(),
         "argument 'bad_arg': unknown custom type 'TotallyMadeUpType'",
     );
 }
 
 #[test]
 fn resolve_file_type_exprs_accepts_registered_bare_identity() {
-    use crate::parser::ArgumentParameter;
-
-    let mut parsed = empty_parsed();
-    parsed.arguments.push(ArgumentParameter {
-        name: "policy".to_string(),
-        // The fixture registers `IamPolicyArn` as a bare-identity
-        // validator; this is the round-trip "name a registered custom
-        // type and have it pass" path that proves the resolver isn't
-        // over-firing.
-        static_type: local_type(crate::parser::bare_type_for_test(
-            "iam_policy_arn".to_string(),
-        )),
-        default: None,
-        description: None,
-        validations: Vec::new(),
-    });
+    let mut parsed = crate::parser::parse_file(
+        "arguments { policy: IamPolicyArn }",
+        std::path::Path::new("arguments.crn"),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     let findings = crate::validation::deferred_types::with_session_for_test(
         &enriched_context_with_iam_policy_arn(),
@@ -9375,60 +9354,11 @@ fn resolve_file_type_exprs_accepts_registered_bare_identity() {
 
 #[test]
 fn resolve_file_type_exprs_walks_into_list_map_union_struct() {
-    use crate::parser::ArgumentParameter;
-
-    let mut parsed = empty_parsed();
-
-    // List<UnknownA>
-    parsed.arguments.push(ArgumentParameter {
-        name: "in_list".to_string(),
-        static_type: local_type(TypeExpr::List(Box::new(crate::parser::bare_type_for_test(
-            "unknown_a".to_string(),
-        )))),
-        default: None,
-        description: None,
-        validations: Vec::new(),
-    });
-
-    // Map<UnknownB>
-    parsed.arguments.push(ArgumentParameter {
-        name: "in_map".to_string(),
-        static_type: local_type(TypeExpr::Map(Box::new(crate::parser::bare_type_for_test(
-            "unknown_b".to_string(),
-        )))),
-        default: None,
-        description: None,
-        validations: Vec::new(),
-    });
-
-    // Union of two unknowns. Each member is reported independently —
-    // this is intentional: the union shape is ambiguous about which
-    // member the user "meant", so calling out every unknown helps
-    // the user pinpoint the typo.
-    parsed.arguments.push(ArgumentParameter {
-        name: "in_union".to_string(),
-        static_type: local_type(TypeExpr::Union(vec![
-            crate::parser::bare_type_for_test("unknown_c".to_string()),
-            crate::parser::bare_type_for_test("unknown_d".to_string()),
-        ])),
-        default: None,
-        description: None,
-        validations: Vec::new(),
-    });
-
-    // Struct { nested: UnknownE }
-    parsed.arguments.push(ArgumentParameter {
-        name: "in_struct".to_string(),
-        static_type: local_type(TypeExpr::Struct {
-            fields: vec![(
-                "nested".to_string(),
-                crate::parser::bare_type_for_test("unknown_e".to_string()),
-            )],
-        }),
-        default: None,
-        description: None,
-        validations: Vec::new(),
-    });
+    let mut parsed = crate::parser::parse_file(
+        "arguments { in_list: list(UnknownA) in_map: map(UnknownB) in_union: UnknownC | UnknownD in_struct: struct { nested: UnknownE } }",
+        std::path::Path::new("arguments.crn"),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).unwrap();
 
     let findings = crate::validation::deferred_types::with_session_for_test(
         &enriched_context_with_iam_policy_arn(),
@@ -9450,18 +9380,12 @@ fn resolve_file_type_exprs_walks_into_list_map_union_struct() {
 
 #[test]
 fn resolve_file_type_exprs_defers_unknown_bare_types_until_the_catalog_is_loaded() {
-    use crate::parser::ArgumentParameter;
-
-    let mut parsed = empty_parsed();
-    parsed.arguments.push(ArgumentParameter {
-        name: "bad_arg".to_string(),
-        static_type: local_type(crate::parser::bare_type_for_test(
-            "totally_made_up_type".to_string(),
-        )),
-        default: None,
-        description: None,
-        validations: Vec::new(),
-    });
+    let mut parsed = crate::parser::parse_file(
+        "arguments { bad_arg: TotallyMadeUpType }",
+        std::path::Path::new("arguments.crn"),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
 
     // Bootstrap parsing has no authoritative provider catalog, so the live
     // resolver must retain the provisional simple type without diagnosing it.
@@ -9774,10 +9698,7 @@ fn module_type_resolution_dedup_uses_typed_identity_not_display_text() {
                 name: "Missing".to_string(),
             }
             .into(),
-            Some(TypeResolutionSource::new(
-                SourceFileId::new(std::path::PathBuf::from(source_file)),
-                SourceSpan::dummy(),
-            )),
+            parser_test_location(std::path::Path::new(source_file)),
         )))
     };
     let first = diagnostic("first.crn");
@@ -9901,7 +9822,10 @@ fn file_type_resolution_report_mints_resolved_dependency_argument_types() {
         "{:?}",
         report.diagnostics()
     );
-    let diagnostics = depends_on::validate_depends_on(&parsed, report.resolved_argument_types());
+    let diagnostics = depends_on::validate_depends_on(
+        &crate::parser::AnalysisTree::try_from_file(&parsed).expect("parser dependency provenance"),
+        report.resolved_argument_types(),
+    );
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert_eq!(diagnostics[0].severity, depends_on::Severity::Error);
     assert_eq!(
@@ -9942,7 +9866,10 @@ let consumer = mock.test.resource {
     });
     assert!(!report.diagnostics().is_empty());
     let argument_types = report.resolved_argument_types();
-    let diagnostics = depends_on::validate_depends_on(&parsed, argument_types);
+    let diagnostics = depends_on::validate_depends_on(
+        &crate::parser::AnalysisTree::try_from_file(&parsed).expect("parser dependency provenance"),
+        argument_types,
+    );
     for expected in [
         "got aws.iam.Policy.Arn",
         "binding 'missing' is not declared",
@@ -9960,13 +9887,24 @@ let consumer = mock.test.resource {
         diagnostics.iter().all(|diagnostic| {
             diagnostic.severity != depends_on::Severity::Error
                 || !matches!(
-                    diagnostic
-                        .location
-                        .as_ref()
-                        .and_then(|location| location.dep.as_deref()),
-                    Some("bad" | "handle")
+                    &diagnostic.kind,
+                    depends_on::DependsOnDiagnosticKind::Element { dependency, .. } if matches!(dependency.as_str(), "bad" | "handle")
                 )
         }),
         "only the unresolved argument's handle-kind check must be skipped: {diagnostics:#?}"
     );
+}
+
+fn parser_test_location(path: &std::path::Path) -> crate::parser::DeclarationLocation {
+    crate::parser::parse_file(
+        "let anchor = 1",
+        path,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap()
+    .parser_binding_metadata
+    .syntax()
+    .declarations()[0]
+        .location()
+        .clone()
 }

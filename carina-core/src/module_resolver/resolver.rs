@@ -136,6 +136,47 @@ impl ResidualModuleResolutionError {
         self.0.display_relative_to(root)
     }
 
+    pub fn file_diagnostic(
+        &self,
+        base: &crate::paths::ResolvedPath,
+    ) -> Option<crate::parser::FileScoped<&ParseError>> {
+        let ResidualModuleResolutionDiagnostic::Parse {
+            source_path: Some(path),
+            error,
+        } = self.diagnostic()?
+        else {
+            return None;
+        };
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            base.source_label().join(path)
+        };
+        Some(crate::parser::scope_parse_failure(&path, error))
+    }
+
+    pub fn call_diagnostics<'a, D, B: crate::resource::BindingAddress>(
+        &'a self,
+        tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+    ) -> Vec<crate::parser::Located<&'a Self>>
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        let Some(diagnostic) = self.diagnostic() else {
+            return Vec::new();
+        };
+        let constraint_origin = match diagnostic {
+            ResidualModuleResolutionDiagnostic::Constraint { origin } => Some(origin),
+            _ => None,
+        };
+        tree.module_calls().filter(|call| match self.call_source() {
+            ModuleErrorCallSource::Failing(identity) => identity == call.id(),
+            ModuleErrorCallSource::Owners(owners) => owners.iter().any(|identity| identity == call.id()),
+            ModuleErrorCallSource::Unavailable => false,
+        }).filter(|call| !matches!(constraint_origin, Some(ConstraintOrigin::LiveCall(identity)) if identity == call.id()))
+            .map(|call| crate::parser::Located::new(call.id().module_name_location().clone(), self)).collect()
+    }
+
     pub fn is_constraint(&self) -> bool {
         matches!(self.0.root_cause(), ModuleError::Constraint(_diagnostic))
     }

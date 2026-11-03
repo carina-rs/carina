@@ -20,9 +20,7 @@ pub(crate) fn parse_module_call(
     source_file: &std::path::Path,
 ) -> Result<ModuleCall, ParseError> {
     let span = pair.as_span();
-    let location =
-        crate::parser::DeclarationLocation::from_pair(&pair, preprocessed_file, source_file);
-    let call_id = ModuleCallId::direct(location.clone());
+    let call_id = ModuleCallId::from_pair(&pair, preprocessed_file, source_file);
     let mut inner = pair.into_inner();
     let module_name = next_pair(&mut inner, "module name", "module call")?
         .as_str()
@@ -82,7 +80,7 @@ pub(crate) fn parse_module_call(
     Ok(ModuleCall::from_authored_arguments_in_source(
         module_name,
         None,
-        location,
+        call_id,
         arguments,
     ))
 }

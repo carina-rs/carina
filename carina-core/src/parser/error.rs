@@ -357,6 +357,11 @@ impl ParseError {
         }
     }
 
+    pub fn file_diagnostic(&self) -> Option<super::FileScoped<&Self>> {
+        self.source_file()
+            .map(|path| super::FileScoped::new(path, self))
+    }
+
     pub fn source_file(&self) -> Option<&Path> {
         match self {
             Self::Located { path, .. } => Some(path),

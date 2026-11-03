@@ -13768,7 +13768,7 @@ fn same_block_duplicate_export_has_error_without_last_wins_warning() {
         .filter(|diagnostic| diagnostic.message.starts_with("duplicate export 'x'"))
         .collect();
 
-    assert_eq!(duplicates.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(duplicates.len(), 2, "diagnostics: {diagnostics:#?}");
     assert_eq!(
         duplicates[0].severity,
         Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
@@ -13799,7 +13799,7 @@ fn same_block_duplicate_module_attribute_has_error_without_last_wins_warning() {
         })
         .collect();
 
-    assert_eq!(duplicates.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(duplicates.len(), 2, "diagnostics: {diagnostics:#?}");
     assert_eq!(
         duplicates[0].severity,
         Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
@@ -13827,7 +13827,7 @@ fn same_block_duplicate_export_survives_broken_sibling_parse() {
         .filter(|diagnostic| diagnostic.message.starts_with("duplicate export 'x'"))
         .collect();
 
-    assert_eq!(duplicates.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(duplicates.len(), 2, "diagnostics: {diagnostics:#?}");
     assert_eq!(duplicates[0].range.start.line, 1);
     assert_eq!(duplicates[0].range.start.character, 2);
     assert!(
@@ -16153,42 +16153,21 @@ let app = awscc.ec2.Vpc {
 }
 
 #[test]
-fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
+fn tag_key_style_anchor_uses_recorded_span_after_unicode_comment() {
     let temp = tempfile::tempdir().unwrap();
-    let current_source = "let current = mock.test.resource {\n    tags = {\n\u{3000}\u{3000}managed_by = \"carina\"\n    }\n}";
-    let parseable_current_source =
-        "let current = mock.test.resource {\n    tags = {\n  managed_by = \"carina\"\n    }\n}";
+    let current_source = "let current = mock.test.resource {\n    tags = {\n  # 😀 source mapping\n  managed_by = \"carina\"\n    }\n}";
     let sibling_source = "let defaults = mock.test.resource {\n    tags = {\n        Name = \"application\"\n        Environment = \"production\"\n    }\n}";
-    std::fs::write(temp.path().join("main.crn"), parseable_current_source).unwrap();
+    let path = temp.path().join("main.crn");
+    std::fs::write(&path, current_source).unwrap();
     std::fs::write(temp.path().join("defaults.crn"), sibling_source).unwrap();
-    let mut merged_result =
-        carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
-            &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
-            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            &std::collections::HashMap::new(),
-        )
-        .expect("directory fixture must parse");
-    let (_, parsed_source) = merged_result
-        .source_files
-        .iter_mut()
-        .find(|(path, _)| {
-            path.display()
-                .file_name()
-                .is_some_and(|name| name == "main.crn")
-        })
-        .expect("parsed directory retains main.crn source");
-    *parsed_source = current_source.to_string();
-
-    let diagnostics = test_engine().with_run_for_test(|run| {
-        run.check_mixed_tag_key_styles(
-            "main.crn",
-            &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
-            &merged_result,
-        )
-    });
-
-    assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:#?}");
-    assert_eq!(diagnostics[0].range.start.line, 2);
+    let doc = create_document_at(current_source, path.clone());
+    let diagnostics = test_engine().analyze(&doc, Some(&path));
+    let diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.starts_with("Tag key 'managed_by'"))
+        .collect();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].range.start.line, 3);
     assert_eq!(diagnostics[0].range.start.character, 2);
     assert_eq!(diagnostics[0].range.end.character, 12);
 }

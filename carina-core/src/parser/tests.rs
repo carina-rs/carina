@@ -114,6 +114,10 @@ fn analysis_tree_rejects_unlocated_data_wait_and_nested_declarations() {
             AnalysisTreeError::MissingWaitProvenance { .. } => {
                 assert_eq!(expected, AnalysisItemKind::Wait)
             }
+            error @ (AnalysisTreeError::MissingElementProvenance { .. }
+            | AnalysisTreeError::MissingSyntaxProvenance { .. }) => {
+                panic!("unexpected element invariant: {error}")
+            }
         }
     }
 }
@@ -5248,28 +5252,10 @@ fn resolve_provider_attributes_with_remote_preserves_function_call_line() {
 #[test]
 fn provider_default_tags_remain_deferred_and_saved_plan_validation_accepts_them() {
     use crate::parser::resolve_provider_attributes_with_remote;
-    use crate::resource::AuthoredAccessPath as AccessPath;
-
-    let mut parsed = InferredFile::default();
-    parsed.providers.push(ProviderConfig {
-        name: "aws".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::from([(
-            "Owner".to_string(),
-            Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::new("mgmt", "owner"),
-            }),
-        )]),
-        source: None,
-        version: None,
-        revision: None,
-        unresolved_attributes: IndexMap::new(),
-        binding: None,
-    });
-    parsed.upstream_states.push(UpstreamState {
-        binding: "mgmt".into(),
-        source: "../mgmt".into(),
-    });
+    let parsed = parse(
+        "let mgmt = upstream_state { source = '../mgmt' }\nprovider aws { default_tags = { Owner = mgmt.owner } }",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).unwrap();
     let remote: HashMap<String, HashMap<String, crate::resource::ExpandedValue>> = HashMap::new();
 
     let parsed = cross_deferred_for_resolution_seam(parsed)
@@ -18393,7 +18379,9 @@ fn check_provider_instance_routing_accepts_named_instance() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let errs = crate::parser::check_provider_instance_routing(&parsed);
+    let errs = crate::parser::check_provider_instance_routing(
+        &AnalysisTree::try_from_file(&parsed).expect("parser routing provenance"),
+    );
     assert!(
         errs.is_empty(),
         "valid named-instance routing must not produce errors, got: {errs:?}"
@@ -18417,7 +18405,9 @@ fn check_provider_instance_routing_accepts_default_when_none() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let errs = crate::parser::check_provider_instance_routing(&parsed);
+    let errs = crate::parser::check_provider_instance_routing(
+        &AnalysisTree::try_from_file(&parsed).expect("parser routing provenance"),
+    );
     assert!(
         errs.is_empty(),
         "default-instance routing must not produce errors, got: {errs:?}"
@@ -18441,7 +18431,9 @@ fn check_provider_instance_routing_rejects_unknown_binding() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let errs = crate::parser::check_provider_instance_routing(&parsed);
+    let errs = crate::parser::check_provider_instance_routing(
+        &AnalysisTree::try_from_file(&parsed).expect("parser routing provenance"),
+    );
     assert_eq!(
         errs.len(),
         1,
@@ -18476,7 +18468,9 @@ fn check_provider_instance_routing_rejects_kind_mismatch() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let errs = crate::parser::check_provider_instance_routing(&parsed);
+    let errs = crate::parser::check_provider_instance_routing(
+        &AnalysisTree::try_from_file(&parsed).expect("parser routing provenance"),
+    );
     assert_eq!(
         errs.len(),
         1,
@@ -18507,7 +18501,9 @@ fn check_provider_instance_routing_rejects_missing_default_instance() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let errs = crate::parser::check_provider_instance_routing(&parsed);
+    let errs = crate::parser::check_provider_instance_routing(
+        &AnalysisTree::try_from_file(&parsed).expect("parser routing provenance"),
+    );
     assert_eq!(
         errs.len(),
         1,
@@ -18551,7 +18547,9 @@ fn check_provider_instance_routing_multi_file_named_instance() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("multi-file directory parse must succeed");
-    let errs = crate::parser::check_provider_instance_routing(&parsed);
+    let errs = crate::parser::check_provider_instance_routing(
+        &AnalysisTree::try_from_file(&parsed).expect("parser routing provenance"),
+    );
     assert!(
         errs.is_empty(),
         "cross-file named-instance routing must validate cleanly, got: {errs:?}"

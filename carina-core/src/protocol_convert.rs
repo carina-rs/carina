@@ -3707,6 +3707,7 @@ mod tests {
         let resolved_function: std::sync::Arc<
             crate::parser::UserFunction<crate::resource::AbsoluteBindingAddress>,
         > = std::sync::Arc::new(crate::parser::UserFunction {
+            type_annotations: Vec::new(),
             name: "fixture".to_string(),
             params: Vec::new(),
             return_type: None,

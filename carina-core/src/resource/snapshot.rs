@@ -482,6 +482,7 @@ impl<P: ValueKind, B: BindingAddress> AccessExpr<P, B> {
             step: self.step.clone(),
             source_line: self.source_line,
             display_root: self.display_root.clone(),
+            reference: self.reference.clone(),
         }
     }
 }

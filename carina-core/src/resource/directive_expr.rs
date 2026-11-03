@@ -729,6 +729,26 @@ impl DirectiveResolutionError {
         )
     }
 
+    /// Validate the expansion boundary and retain the first responsible source
+    /// per file, including caller arguments and omitted defaults.
+    pub fn diagnostics(
+        &self,
+    ) -> Result<Vec<crate::parser::Located<&Self>>, crate::parser::AnalysisTreeError> {
+        let mut files = std::collections::HashSet::new();
+        let mut diagnostics = Vec::new();
+        for source in self.diagnostic_sources() {
+            let location = source.declaration_location().ok_or_else(|| {
+                crate::parser::AnalysisTreeError::MissingSyntaxProvenance {
+                    element: format!("directive {}", self.directive()),
+                }
+            })?;
+            if files.insert(location.file().clone()) {
+                diagnostics.push(crate::parser::Located::new(location.clone(), self));
+            }
+        }
+        Ok(diagnostics)
+    }
+
     pub fn source_in_file(&self, file: &Path) -> Option<DiagnosticSourceRange> {
         self.diagnostic_sources()
             .filter_map(DiagnosticSourceSpan::authored_location)

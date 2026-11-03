@@ -1271,9 +1271,32 @@ pub enum AppError {
     #[error(transparent)]
     ModuleCall(Box<carina_core::validation::ModuleCallFinding>),
 
-    /// A type-resolution failure without parser location metadata.
+    /// Invalid parser/expansion provenance at the sealed analysis boundary.
     #[error(transparent)]
-    TypeResolution(Box<carina_core::validation::TypeResolutionDiagnostic>),
+    AnalysisInvariant(carina_core::parser::AnalysisTreeError),
+
+    #[error("{0}")]
+    DependsOn(
+        Box<carina_core::parser::Located<carina_core::validation::depends_on::DependsOnDiagnostic>>,
+    ),
+    #[error("{0}")]
+    Wait(Box<carina_core::parser::Located<carina_core::validation::wait::WaitDiagnostic>>),
+    #[error("{0}")]
+    DeferredPopulate(
+        Box<
+            carina_core::parser::Located<
+                carina_core::validation::deferred_populate::DeferredPopulateDiagnostic,
+            >,
+        >,
+    ),
+    #[error("{0}")]
+    ProviderRouting(
+        Box<
+            carina_core::parser::Located<
+                carina_core::validation::routing::ProviderRoutingDiagnostic,
+            >,
+        >,
+    ),
 
     /// Validation errors (schema mismatch, invalid config, etc.)
     #[error("{0}")]
