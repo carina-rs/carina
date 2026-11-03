@@ -147,7 +147,7 @@ planning starts.
 The image is meant for reviewing a plan where the text output is hard to scan,
 such as a pull request:
 
-- Each changed resource is a card colored by its effect (create, update,
+- Each changed resource is a card colored by its action (create, update,
   replace, delete, and so on). Update cards list the names of the changed
   attributes; replace cards list the attributes that force the replacement.
 - Cards are laid out left to right in apply order. Cards in the same column
@@ -159,7 +159,7 @@ such as a pull request:
   appear only when they connect two changed resources. A module call with no
   changes is collapsed into a single card.
 - Resources inside a module call are grouped in a box labelled with the call.
-- The header shows per-effect counts, with replace and destroy counts in bold,
+- The header shows per-action counts, with replace and destroy counts in bold,
   and the state lineage and serial the plan was computed against.
 
 The image never contains attribute values, so it can be shared without
@@ -300,16 +300,17 @@ carina plan --detailed-exitcode
 
 ## Output Format
 
-The plan output shows each resource with its effect type:
+The plan output shows each resource with the action Carina will take:
 
 - **Create** (`+`) -- new resource to be created
 - **Update** (`~`) -- existing resource with attribute changes
 - **Delete** (`-`) -- resource to be removed
-- **Replace** (`+/-`) -- resource that must be destroyed and recreated
+- **Replace** (`+/-`) -- resource that must be destroyed and recreated; the plan
+  holds a Delete and a Create for it, shown together as one line
 - **Release** (`!`) -- an omitted key is no longer authored by the configuration,
   but the remote value is left unchanged because the API does not reset omitted keys
 
-A summary line shows the total count of each effect type. Releases have their own
+A summary line shows the total count of each action. Releases have their own
 `to release` count; a plan containing only releases is not reported as "No changes."
 
 ## Keyed partial-update list releases

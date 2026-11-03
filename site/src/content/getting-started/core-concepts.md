@@ -12,8 +12,13 @@ Carina treats infrastructure operations as data. Instead of immediately creating
 | **Create** | Provision a new resource |
 | **Update** | Modify an existing resource in place |
 | **Delete** | Remove a resource |
-| **Replace** | Delete and recreate a resource (when a create-only property changes) |
 | **Read** | Query an existing resource without managing it (data source) |
+| **Import** | Adopt an existing cloud resource into state (`import` block) |
+| **Remove** | Drop a resource from state without deleting it in the cloud (`removed` block) |
+| **Move** | Rename a resource in state without destroying and recreating it (`moved` block) |
+| **Wait** | Poll a managed resource until a condition holds before its dependents run (`wait` expression); not stored in state |
+
+There is no separate Replace effect. When a create-only property changes, the plan holds a **Delete** and a **Create** for the same resource, and `carina plan` shows the pair as one "replace" line.
 
 Effects are values you can inspect before anything is executed. Running `carina plan` produces a Plan; running `carina apply` executes it.
 
