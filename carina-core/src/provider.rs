@@ -7604,7 +7604,7 @@ impl CustomTypeDispatchTable {
             .bindings
             .get(identity)
             .ok_or_else(|| format!("custom type `{identity}` is not declared by this provider"))?;
-        let value = bridge_text_to_typed_value(binding.scalar_kind, canonical_text)?;
+        let value = bridge_text_to_typed_value(binding.scalar_kind, canonical_text.into())?;
         for callback in &binding.callbacks {
             callback(&value).map_err(custom_validator_bridge_message)?;
         }
@@ -7614,19 +7614,19 @@ impl CustomTypeDispatchTable {
 
 pub(crate) fn bridge_text_to_typed_value(
     scalar_kind: RefinedScalarKind,
-    canonical_text: &str,
+    canonical_text: ValueString,
 ) -> Result<Value, String> {
     match scalar_kind {
-        RefinedScalarKind::String => Ok(Value::Concrete(ConcreteValue::String(
-            canonical_text.to_string().into(),
-        ))),
+        RefinedScalarKind::String => Ok(Value::Concrete(ConcreteValue::String(canonical_text))),
         RefinedScalarKind::Int => Ok(Value::Concrete(ConcreteValue::Int(
             canonical_text
+                .expose_plaintext()
                 .parse::<i64>()
                 .map_err(|error| format!("invalid integer bridge value: {error}"))?,
         ))),
         RefinedScalarKind::Float => {
             let value = canonical_text
+                .expose_plaintext()
                 .parse::<f64>()
                 .map_err(|error| format!("invalid float bridge value: {error}"))?;
             if !value.is_finite() {

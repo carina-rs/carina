@@ -11,7 +11,7 @@ use super::{ProviderContext, Rule, is_static_eval, parse_expression};
 use crate::eval_value::{BareStructuralHandle, EvalValue, UnexpandedStructuralHandleKind};
 use crate::resource::{
     BindingAddress, ConcreteValue, DeferredValue, ParserPlaceholder, PlaceholderKind,
-    Value as GenericValue,
+    Value as GenericValue, ValueString,
 };
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
@@ -763,14 +763,21 @@ fn validate_schema_custom_type_key_with_context<P: PlaceholderKind, B: BindingAd
     // The resolved witness can cross a catalog boundary (including serde).
     // Retain its constraints even when the current catalog is less restrictive.
     if let Some(witness) = witness {
-        let invalid_value = |error| super::CustomTypeValidationError::InvalidDeclarationValue {
-            owner: owned
-                .provider_names()
-                .next()
-                .expect("nonempty owners")
-                .into(),
-            identity: owned.identity().clone(),
-            error: Box::new(error),
+        let sensitive = value.contains_diagnostic_sensitive_string();
+        let invalid_value = |error: crate::schema::TypeError| {
+            super::CustomTypeValidationError::InvalidDeclarationValue {
+                owner: owned
+                    .provider_names()
+                    .next()
+                    .expect("nonempty owners")
+                    .into(),
+                identity: owned.identity().clone(),
+                error: Box::new(if sensitive {
+                    error.masked_for_secret()
+                } else {
+                    error
+                }),
+            }
         };
         let enumeration = match projection.as_ref() {
             Some(declaration)
@@ -800,12 +807,20 @@ fn validate_schema_custom_type_key_with_context<P: PlaceholderKind, B: BindingAd
             }
         };
         let scalar = match canonical_text {
-            Some(text) => crate::provider::bridge_text_to_typed_value(owned.scalar_kind(), &text)
-                .map_err(|message| {
-                invalid_value(crate::schema::TypeError::ValidationFailed {
-                    message: message.into(),
-                })
-            })?,
+            Some(text) => {
+                let source = match &value {
+                    GenericValue::Concrete(ConcreteValue::String(source)) => Some(source),
+                    _ => None,
+                };
+                let text = ValueString::derived_from(text, source);
+                crate::provider::bridge_text_to_typed_value(owned.scalar_kind(), text).map_err(
+                    |message| {
+                        invalid_value(crate::schema::TypeError::ValidationFailed {
+                            message: message.into(),
+                        })
+                    },
+                )?
+            }
             None => value,
         };
         witness

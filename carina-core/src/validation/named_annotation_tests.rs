@@ -686,6 +686,59 @@ fn review_enum_values_validate_canonical_scalar_against_retained_witness() {
     }
 }
 
+fn assert_enum_witness_masks_env_value(base: DraftType, expected: &str) {
+    let open_enum = |base| DraftType::enum_with_base(identity(), base, None, vec![], None, None);
+    let strict = snapshot(vec![("p", vec![open_enum(base)])]);
+    let lax = snapshot(vec![("p", vec![open_enum(DraftType::string())])]);
+    let plaintext = "private-token";
+    let runtime = ProviderContext::new(crate::EnvironmentSnapshot::new([(
+        "ANNOTATION_SECRET".into(),
+        plaintext.into(),
+    )]));
+    let context = lax.provider_context().with_runtime(&runtime);
+    let mut parsed = crate::parser::parse(
+        "let source = p.Values { value0 = env('ANNOTATION_SECRET') }",
+        context.as_provider_context(),
+    )
+    .unwrap();
+    crate::parser::resolve_resource_refs_with_config(&mut parsed, context.as_provider_context())
+        .unwrap();
+    let env_value = parsed.resources[0].get_attr("value0").unwrap();
+    assert!(env_value.contains_diagnostic_sensitive_string());
+    let ty: TypeExpr =
+        serde_json::from_value(serde_json::to_value(annotation(&strict)).unwrap()).unwrap();
+    for value in [env_value, &text(plaintext)] {
+        let error = typecheck::check_type_expr_value(
+            &ty,
+            value,
+            &context,
+            typecheck::TypecheckInference::Unavailable,
+        )
+        .require_provider_schemas()
+        .expect_err("the retained witness must reject the value");
+        let message = error.to_string();
+        assert!(message.contains(expected), "{message}");
+        if value.contains_diagnostic_sensitive_string() {
+            assert!(!message.contains(plaintext), "secret leaked: {message}");
+            assert!(!format!("{error:?}").contains(plaintext));
+            assert!(message.contains("(secret)"), "{message}");
+            assert!(!message.contains("'(secret)'"), "{message}");
+        } else {
+            assert!(message.contains(plaintext), "{message}");
+        }
+    }
+}
+
+#[test]
+fn review_enum_witness_length_error_masks_env_value() {
+    assert_enum_witness_masks_env_value(string(2, 4, None), "outside allowed range [2, 4]");
+}
+
+#[test]
+fn review_enum_witness_pattern_error_masks_env_value() {
+    assert_enum_witness_masks_env_value(string(1, 32, Some("^[A-Z]+$")), "required pattern");
+}
+
 #[test]
 fn review_unloaded_resolution_waits_for_provider_config_declarations() {
     let snapshot = snapshot_with_config(
@@ -869,6 +922,78 @@ fn module_call_literal_values_obey_the_resolved_witness() {
             .contains("length 65 is outside allowed range [1, 64]")),
         "{findings:#?}"
     );
+}
+
+#[test]
+fn review_bare_enum_module_argument_rejects_empty_witness() {
+    let enumeration = DraftType::enum_(
+        identity(),
+        Some(vec!["GOOD".into()]),
+        vec![("GOOD".into(), "friendly".into())],
+        None,
+        None,
+    );
+    let caller = snapshot(vec![("p", vec![enumeration.clone()])]);
+    let callee = snapshot(vec![(
+        "p",
+        vec![enumeration, string(1, 4, None), string(8, 12, None)],
+    )]);
+    for (argument, sink) in [
+        ("choice", annotation(&callee)),
+        ("[choice]", TypeExpr::List(Box::new(annotation(&callee)))),
+    ] {
+        let source = format!(
+            "let choice = aws.iam.Role.Name.friendly\n\
+             let child = use {{ source = './child' }}\n\
+             let instance = child {{ x = {argument} }}\n"
+        );
+        let findings = call_findings(&source, &caller, sink);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message().to_string().contains("empty intersection")),
+            "a bare enum must fail an empty witness: {argument}: {findings:#?}"
+        );
+    }
+}
+
+#[test]
+fn review_bare_enum_module_argument_checks_retained_canonical_constraints() {
+    let caller = snapshot(vec![(
+        "p",
+        vec![DraftType::enum_(
+            identity(),
+            Some(vec!["GOOD".into(), "invalid".into()]),
+            vec![
+                ("GOOD".into(), "long_alias".into()),
+                ("invalid".into(), "bad_alias".into()),
+            ],
+            None,
+            None,
+        )],
+    )]);
+    for base in [string(4, 4, None), string(1, 32, Some("^[A-Z]+$"))] {
+        let callee = snapshot(vec![(
+            "p",
+            vec![DraftType::enum_with_base(
+                identity(),
+                base,
+                None,
+                vec![],
+                None,
+                None,
+            )],
+        )]);
+        for (member, accepted) in [("long_alias", true), ("bad_alias", false)] {
+            let source = format!(
+                "let choice = aws.iam.Role.Name.{member}\n\
+                 let child = use {{ source = './child' }}\n\
+                 let instance = child {{ x = choice }}\n"
+            );
+            let findings = call_findings(&source, &caller, annotation(&callee));
+            assert_eq!(findings.is_empty(), accepted, "{member}: {findings:#?}");
+        }
+    }
 }
 
 #[test]

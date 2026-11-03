@@ -524,17 +524,11 @@ impl std::fmt::Display for BindingResolutionError {
 // renderer. Structured consumers use `type_error()` or match the public enum.
 impl std::error::Error for BindingResolutionError {}
 
-#[derive(Clone, Copy)]
-enum EnumSinkAuthority<'a> {
-    Owner(&'a crate::parser::SchemaTypeOwner),
-    Annotation(&'a TypeExpr),
-}
-
 struct ExpectedEnumTarget<'a> {
     attr_type: &'a AttributeType,
     defs: &'a std::collections::BTreeMap<String, AttributeType>,
     ancestry: FieldAncestry,
-    authority: EnumSinkAuthority<'a>,
+    owner: &'a crate::parser::SchemaTypeOwner,
 }
 
 /// Typed inputs shared by CLI and LSP while consuming parser-authored bare
@@ -799,19 +793,12 @@ fn binding_value_assignable_to_enum<B: BindingAddress>(
     .scalar_kind();
     let identity_assignable = |source: &AttributeType| -> Result<bool, BindingResolutionError> {
         let target_type = scalar_kind.identified_type(identity.clone());
-        let lifted;
-        let sink = match target.authority {
-            EnumSinkAuthority::Owner(owner) => target_type
-                .in_schema(crate::schema::empty_defs_for_schema_walks())
-                .with_authority(
-                    &config.custom_types,
-                    crate::schema::SinkAuthority::Owner(owner),
-                ),
-            EnumSinkAuthority::Annotation(expected) => {
-                lifted = lift_type_expr(expected).expect("a resolved enum annotation lifts");
-                lifted.assignment_sink(&config.custom_types)
-            }
-        };
+        let sink = target_type
+            .in_schema(crate::schema::empty_defs_for_schema_walks())
+            .with_authority(
+                &config.custom_types,
+                crate::schema::SinkAuthority::Owner(target.owner),
+            );
         let assignment = crate::schema::TypeInSchema::schemaless(source).assignment_to(sink);
         if config.custom_types_loaded() {
             assignment
@@ -914,10 +901,9 @@ fn binding_value_assignable_to_enum<B: BindingAddress>(
 
 fn enum_shadow_or_existing(
     use_site: &crate::parser::BareBindingUse,
-    target: ExpectedEnumTarget<'_>,
+    resolver: &EnumValueResolver<'_, crate::schema::Compiled>,
     existing_error: BindingResolutionError,
 ) -> BindingResolutionError {
-    let resolver = EnumValueResolver::with_defs(target.attr_type, target.defs);
     let Some(identity) = resolver.enum_identity() else {
         return existing_error;
     };
@@ -954,7 +940,7 @@ fn enum_target_from_sink<'a>(sink: RefSink<'a>) -> Option<ExpectedEnumTarget<'a>
                 attr_type,
                 defs,
                 ancestry,
-                authority: EnumSinkAuthority::Owner(owner),
+                owner,
             })
         }
         RefSink::EffectiveType {
@@ -1307,7 +1293,7 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
                 &identity,
             ),
         };
-        return existing.map_err(|error| enum_shadow_or_existing(use_site, target, error));
+        return existing.map_err(|error| enum_shadow_or_existing(use_site, &resolver, error));
     }
 
     if let Some(error) = prechecked {
@@ -1554,61 +1540,30 @@ fn resolve_record_against_module<B: BindingAddress>(
     let expected = resolved.as_type_expr();
     let enum_declaration = module_enum_declaration(&expected, context.provider_context)?;
 
-    match &record.source {
+    let result = match &record.source {
         crate::parser::BareBindingSource::Value {
             value,
             declared_type,
-        } => {
-            if let Some(declaration) = enum_declaration.as_ref() {
-                let target = ExpectedEnumTarget {
-                    attr_type: declaration,
-                    defs: crate::schema::empty_defs_for_schema_walks(),
-                    ancestry: FieldAncestry::WRITABLE,
-                    authority: EnumSinkAuthority::Annotation(&expected),
-                };
-                let resolver = EnumValueResolver::with_defs(target.attr_type, target.defs);
-                let identity = resolver
-                    .enum_identity()
-                    .expect("module enum declaration must have an enum identity");
-                return binding_value_assignable_to_enum(
-                    value,
-                    declared_type.as_deref(),
-                    context.provider_context,
-                    &target,
-                    &resolver,
-                    &identity,
-                )
-                .map_err(|error| enum_shadow_or_existing(&record.authored, target, error));
-            }
-            resolve_value_source_against_sink(
-                &record.authored,
-                value,
-                declared_type.as_deref(),
-                RefSink::TypeExpr(&expected),
-                context,
-                diagnostic_path,
-            )
-        }
+        } => resolve_value_source_against_sink(
+            &record.authored,
+            value,
+            declared_type.as_deref(),
+            RefSink::TypeExpr(&expected),
+            context,
+            diagnostic_path,
+        ),
         crate::parser::BareBindingSource::Structural(handle) => {
-            let existing = match check_handle_sink(handle, &resolved) {
-                Ok(()) => return Ok(()),
-                Err(error) => BindingResolutionError::Existing(error.to_string()),
-            };
-            match enum_declaration.as_ref() {
-                Some(declaration) => Err(enum_shadow_or_existing(
-                    &record.authored,
-                    ExpectedEnumTarget {
-                        attr_type: declaration,
-                        defs: crate::schema::empty_defs_for_schema_walks(),
-                        ancestry: FieldAncestry::WRITABLE,
-                        authority: EnumSinkAuthority::Annotation(&expected),
-                    },
-                    existing,
-                )),
-                None => Err(existing),
-            }
+            check_handle_sink(handle, &resolved)
+                .map_err(|error| BindingResolutionError::Existing(error.to_string()))
         }
-    }
+    };
+    result.map_err(|error| match enum_declaration.as_ref() {
+        Some(declaration) => {
+            let resolver = EnumValueResolver::new(declaration);
+            enum_shadow_or_existing(&record.authored, &resolver, error)
+        }
+        None => error,
+    })
 }
 
 fn same_authored_finding(left: &BindingUseFinding, right: &BindingUseFinding) -> bool {
@@ -1706,7 +1661,13 @@ where
                             );
                             match enum_target_from_sink(sink) {
                                 Some(target) => {
-                                    Err(enum_shadow_or_existing(&record.authored, target, existing))
+                                    let resolver =
+                                        EnumValueResolver::with_defs(target.attr_type, target.defs);
+                                    Err(enum_shadow_or_existing(
+                                        &record.authored,
+                                        &resolver,
+                                        existing,
+                                    ))
                                 }
                                 None => Err(existing),
                             }
