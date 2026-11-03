@@ -959,6 +959,7 @@ async fn provider_ready_inputs_are_infallible_and_preserve_checked_scalar_and_se
             vec![schema],
             carina_core::schema::ValidatedConfigSchema::validate(Default::default()).unwrap(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap();
         schemas.insert_provider_witness("test", &witness).unwrap();

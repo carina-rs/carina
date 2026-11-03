@@ -7990,6 +7990,76 @@ impl ProviderNormalizer for WasmProviderNormalizer {
 
 #[cfg(test)]
 mod tests {
+    mod assignability_edges_stage_a {
+        use super::*;
+        use carina_core::parser::SchemaTypeOwner;
+        use carina_core::schema::{
+            AssignabilityEdge, AttributeSchema, AttributeType, ReferenceForms, ResourceSchema,
+            SchemaRegistry,
+        };
+
+        #[test]
+        fn sdk_json_host_decode_and_factory_preserve_edges_in_loaded_catalog() {
+            let identity = |kind: &str| TypeIdentity::new(Some("semantic"), ["Bucket"], kind);
+            let resource = ["A", "B", "C"]
+                .into_iter()
+                .fold(ResourceSchema::new("test.Bucket"), |schema, kind| {
+                    schema.attribute(
+                        AttributeSchema::optional(
+                            kind,
+                            AttributeType::refined_string(Some(identity(kind)), None, None, None),
+                        )
+                        .build(),
+                    )
+                })
+                .validate()
+                .unwrap();
+            let edges = vec![
+                AssignabilityEdge::new(identity("A"), identity("B")).unwrap(),
+                AssignabilityEdge::new(identity("B"), identity("C")).unwrap(),
+            ];
+            let guest = ValidatedProviderSchemaWitness::new(
+                vec![resource],
+                ValidatedConfigSchema::default(),
+                ReferenceForms::new(),
+                edges.clone(),
+            )
+            .unwrap();
+            let json = carina_plugin_sdk::provider_schema_to_json(&guest).unwrap();
+            let decoded =
+                wasm_convert::json_to_provider_schema(&json, ValidatedConfigSchema::default())
+                    .unwrap();
+            assert_eq!(decoded.assignability_edges(), edges.as_slice());
+
+            // Use the host's real metadata factory to cross the final seam into
+            // LoadedProviderSnapshot without instantiating a WASM runtime.
+            let factory = SchemaOnlyWasmProviderFactory {
+                name: "host-owner".into(),
+                display_name: ProviderText::new("Host edge fixture"),
+                version: ProviderString::from("0.0.0"),
+                schema_witness: Arc::new(decoded),
+                cached_config_completions: Default::default(),
+                cached_identity_attributes: Vec::new(),
+            };
+            let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(factory)];
+            let loaded = carina_core::provider::loaded_provider_snapshot_from_factories(
+                Arc::new(factories),
+                SchemaRegistry::new(),
+                carina_core::EnvironmentSnapshot::empty(),
+            );
+            let catalog = &loaded.provider_context().custom_types;
+            let owner = SchemaTypeOwner::Provider("host-owner".into());
+            assert!(catalog.reachable(&owner, &identity("A"), &identity("B")));
+            assert!(catalog.reachable(&owner, &identity("A"), &identity("C")));
+            assert!(!catalog.reachable(&owner, &identity("C"), &identity("A")));
+            assert!(!catalog.reachable(
+                &SchemaTypeOwner::Provider("semantic".into()),
+                &identity("A"),
+                &identity("C"),
+            ));
+        }
+    }
+
     use super::*;
     use carina_core::provider::SentRecord;
     use carina_core::resource::{ConcreteValue, Current, DeferredValue, ModuleSource};

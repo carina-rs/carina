@@ -86,6 +86,7 @@ impl ProviderFactory for TypedRefMockFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .expect("typed reference mock witness")
     }

@@ -282,7 +282,60 @@ pub struct ReferenceFormDeclaration {
     pub form: ReferenceForm,
 }
 
-/// Resource schemas and provider-wide reference-form declarations.
+/// A directional identity declaration, with self edges rejected at construction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawAssignabilityEdgeDeclaration")]
+pub struct AssignabilityEdgeDeclaration {
+    source: String,
+    sink: String,
+}
+
+#[derive(Deserialize)]
+struct RawAssignabilityEdgeDeclaration {
+    source: String,
+    sink: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignabilityEdgeDeclarationError;
+
+impl std::fmt::Display for AssignabilityEdgeDeclarationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("assignability edge must have distinct source and sink identities")
+    }
+}
+
+impl std::error::Error for AssignabilityEdgeDeclarationError {}
+
+impl AssignabilityEdgeDeclaration {
+    pub fn new(
+        source: impl Into<String>,
+        sink: impl Into<String>,
+    ) -> Result<Self, AssignabilityEdgeDeclarationError> {
+        let source = source.into();
+        let sink = sink.into();
+        if source == sink {
+            return Err(AssignabilityEdgeDeclarationError);
+        }
+        Ok(Self { source, sink })
+    }
+
+    pub fn parts(&self) -> (&str, &str) {
+        let Self { source, sink } = self;
+        (source, sink)
+    }
+}
+
+impl TryFrom<RawAssignabilityEdgeDeclaration> for AssignabilityEdgeDeclaration {
+    type Error = AssignabilityEdgeDeclarationError;
+
+    fn try_from(raw: RawAssignabilityEdgeDeclaration) -> Result<Self, Self::Error> {
+        let RawAssignabilityEdgeDeclaration { source, sink } = raw;
+        Self::new(source, sink)
+    }
+}
+
+/// Resource schemas and provider-wide reference-form and assignability declarations.
 ///
 /// `reference_forms` is a list so core decoding can reject duplicate decoded
 /// identities explicitly. Core encoding sorts the list by its typed identity
@@ -291,6 +344,8 @@ pub struct ReferenceFormDeclaration {
 pub struct ProviderSchemaEnvelope {
     pub resources: Vec<ResourceSchema>,
     pub reference_forms: Vec<ReferenceFormDeclaration>,
+    /// Required even for providers that declare no identity edges.
+    pub assignability_edges: Vec<AssignabilityEdgeDeclaration>,
 }
 
 /// Values an initialized provider instance exposes for expanding short
@@ -2245,6 +2300,7 @@ mod tests {
                 identity: identity.clone(),
                 form: form.clone(),
             }],
+            assignability_edges: Vec::new(),
         };
 
         let json = serde_json::to_string(&envelope).expect("envelope must serialize");

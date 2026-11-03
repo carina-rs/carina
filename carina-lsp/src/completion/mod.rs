@@ -20,8 +20,8 @@ use crate::enclosing_block::{
 };
 use carina_core::paths::ResolvedPath;
 use carina_core::schema::{
-    CompiledAttributeType as AttributeType, CompletionValue, SchemaKind, SchemaRegistry, Shape,
-    ValidatedResourceSchema,
+    CompiledAttributeType as AttributeType, CompletionValue, OwnerBoundResourceSchema, SchemaKind,
+    SchemaRegistry, Shape, ValidatedResourceSchema,
 };
 
 pub struct CompletionProvider {
@@ -33,6 +33,12 @@ pub struct CompletionProvider {
     resource_type_patterns: ResourceTypePatterns,
     /// Custom type names from provider validators (e.g., "arn", "vpc_id")
     custom_type_names: Vec<String>,
+}
+
+struct StructFieldValueTarget<'a> {
+    resource_type: &'a str,
+    attribute_path: &'a [String],
+    field_name: &'a str,
 }
 
 struct CompletionTypeCheckSink {
@@ -72,23 +78,38 @@ impl CompletionProvider {
     }
 
     /// Look up a schema by `"<provider>.<resource_type>"` key, trying Managed first.
-    pub(super) fn lookup_schema(&self, key: &str) -> Option<&ValidatedResourceSchema> {
+    /// Unqualified keys must identify a unique registered owner.
+    pub(super) fn lookup_schema(&self, key: &str) -> Option<OwnerBoundResourceSchema<'_>> {
         let (provider, resource_type) = match key.split_once('.') {
             Some(parts) => parts,
             None => {
-                return self
-                    .schemas
-                    .get("", key, SchemaKind::Resource)
-                    .map(|schema| schema.schema());
+                for kind in [SchemaKind::Resource, SchemaKind::DataSource] {
+                    let mut owners =
+                        self.schemas
+                            .iter()
+                            .filter_map(|(owner, ty, entry_kind, _)| {
+                                (!owner.is_empty() && ty == key && entry_kind == kind)
+                                    .then_some(owner)
+                            });
+                    if let Some(owner) = owners.next() {
+                        if owners.next().is_some() {
+                            return None;
+                        }
+                        return self.schemas.get(owner, key, kind);
+                    }
+                }
+                return None;
             }
         };
+        if provider.is_empty() {
+            return None;
+        }
         self.schemas
             .get(provider, resource_type, SchemaKind::Resource)
             .or_else(|| {
                 self.schemas
                     .get(provider, resource_type, SchemaKind::DataSource)
             })
-            .map(|schema| schema.schema())
     }
 
     pub fn complete(
@@ -234,12 +255,15 @@ impl CompletionProvider {
                 field_name,
                 current_binding,
             } => self.value_completions_for_struct_field(
-                &resource_type,
-                &attr_path,
-                &field_name,
+                StructFieldValueTarget {
+                    resource_type: &resource_type,
+                    attribute_path: &attr_path,
+                    field_name: &field_name,
+                },
                 &text,
                 current_binding.as_deref(),
                 base_path,
+                provider_ctx,
             ),
             CompletionContext::InsideDirectivesBlock => self.directives_block_completions(),
             CompletionContext::InsideDirectivesDependsOnList { current_binding } => self
@@ -713,7 +737,7 @@ impl CompletionProvider {
 
             // Try map key completions: if the attribute type at attr_path is a Map
             // with a Enum key, provide key name completions
-            if let Some(key_type) = self.resolve_map_key_type(schema, attr_path) {
+            if let Some(key_type) = self.resolve_map_key_type(schema.schema(), attr_path) {
                 return self.map_key_completions_from_type(key_type, &trigger_suggest);
             }
         }
@@ -772,13 +796,17 @@ impl CompletionProvider {
     /// type's literal values.
     fn value_completions_for_struct_field(
         &self,
-        resource_type: &str,
-        attr_path: &[String],
-        field_name: &str,
+        target: StructFieldValueTarget<'_>,
         text: &str,
         current_binding: Option<&str>,
         base_path: Option<&carina_core::paths::ResolvedPath>,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
+        let StructFieldValueTarget {
+            resource_type,
+            attribute_path: attr_path,
+            field_name,
+        } = target;
         let mut completions = Vec::new();
         let mut field_is_enum = false;
         if let Some(schema) = self.lookup_schema(resource_type)
@@ -800,7 +828,10 @@ impl CompletionProvider {
                     .extend(self.completions_for_type(field.field_type(), Some(resource_type)));
                 completions.extend(
                     self.resource_ref_completions_for_type(
-                        field.field_type().in_schema(schema.as_schema().defs()),
+                        schema.assignment_sink(
+                            field.field_type(),
+                            &provider_ctx.catalog().custom_types,
+                        ),
                         text,
                         base_path,
                     )

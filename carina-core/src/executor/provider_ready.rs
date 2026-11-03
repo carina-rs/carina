@@ -1334,6 +1334,7 @@ mod provider_config_tests {
                 self.schemas(),
                 self.provider_config_attribute_types(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }
@@ -1428,6 +1429,7 @@ mod provider_config_tests {
                 self.schemas(),
                 self.provider_config_attribute_types(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }
@@ -2167,6 +2169,7 @@ mod provider_config_tests {
                 self.schemas(),
                 self.provider_config_attribute_types(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }
@@ -2289,6 +2292,7 @@ mod provider_config_tests {
                 self.schemas(),
                 self.provider_config_attribute_types(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }
@@ -2404,6 +2408,7 @@ mod provider_config_tests {
                     self.schemas(),
                     self.provider_config_attribute_types(),
                     Default::default(),
+                    Vec::new(),
                 )
                 .unwrap()
             }

@@ -99,6 +99,10 @@ impl CarinaProvider for MockHttpProvider {
         BTreeMap::new()
     }
 
+    fn assignability_edges(&self) -> Vec<carina_plugin_sdk::core::schema::AssignabilityEdge> {
+        Vec::new()
+    }
+
     fn provider_config_attribute_types(&self) -> CoreValidatedConfigSchema {
         CoreValidatedConfigSchema::validate(BTreeMap::from([(
             VALIDATE_EGRESS_URL_ATTRIBUTE.to_string(),

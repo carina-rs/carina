@@ -177,7 +177,7 @@ fn substituted_integer_operator_keeps_its_file_when_coordinates_coincide() {
     let findings = tree.integer_arithmetic_findings(
         resource,
         "enabled",
-        schema.effective_attribute("enabled").unwrap().value_type(),
+        schema,
         &carina_core::validation::inference::bindings_from_parsed(&consumer),
         &engine.schemas,
         &bindings,

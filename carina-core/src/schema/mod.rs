@@ -207,7 +207,7 @@ use std::sync::{Arc, OnceLock};
 use indexmap::{IndexMap, IndexSet};
 
 use crate::config_loader::UnresolvedConfigSnapshot;
-use crate::parser::display_string_literal;
+use crate::parser::{SchemaTypeOwner, display_string_literal};
 use crate::resource::{
     AbsoluteBindingAddress, BindingAddress, CanonicalEnumValue, ConcreteValue, ConcreteValueRef,
     DeferredValue, EnumValueResolver, ModuleSource, ParserPlaceholder, PlaceholderKind,
@@ -219,12 +219,15 @@ use crate::value::{
 };
 
 mod assignability;
+mod assignability_edges;
 mod fingerprint;
 mod resolved_attr_type;
 mod resolved_union_members;
 mod type_identity;
 
-pub use assignability::{TypeAssignability, TypeAssignmentDeferral};
+pub use assignability::{AssignmentSink, SinkAuthority, TypeAssignability, TypeAssignmentDeferral};
+pub(crate) use assignability_edges::AssignabilityClosure;
+pub use assignability_edges::AssignabilityEdge;
 pub use carina_provider_protocol::types::{
     DslTransform, ListElements, ReferenceForm, ReferenceTemplate, ReferenceTemplateError,
 };
@@ -404,6 +407,7 @@ where
 #[derive(Clone)]
 pub(crate) enum RefinementBinding {
     MetadataOnly(Option<TypeIdentity>),
+    Annotation(crate::parser::OwnedTypeIdentity),
     Validator {
         identity: TypeIdentity,
         callback: CustomValidator,
@@ -414,6 +418,7 @@ impl RefinementBinding {
     pub(crate) fn identity(&self) -> Option<&TypeIdentity> {
         match self {
             Self::MetadataOnly(identity) => identity.as_ref(),
+            Self::Annotation(owned) => Some(owned.identity()),
             Self::Validator {
                 identity,
                 callback: _,
@@ -423,7 +428,7 @@ impl RefinementBinding {
 
     pub(crate) fn callback(&self) -> Option<&CustomValidator> {
         match self {
-            Self::MetadataOnly(_) => None,
+            Self::MetadataOnly(_) | Self::Annotation(_) => None,
             Self::Validator {
                 identity: _,
                 callback,
@@ -433,7 +438,7 @@ impl RefinementBinding {
 
     fn validator_parts(&self) -> Option<(&TypeIdentity, &CustomValidator)> {
         match self {
-            Self::MetadataOnly(_) => None,
+            Self::MetadataOnly(_) | Self::Annotation(_) => None,
             Self::Validator { identity, callback } => Some((identity, callback)),
         }
     }
@@ -1475,6 +1480,16 @@ pub type CompiledResourceSchema = PatternResourceSchema<Compiled>;
 /// Assignability compares types from two independently-owned resource schemas.
 /// Carrying each definition map inside this wrapper prevents the source and
 /// sink maps from being exchanged as indistinguishable positional arguments.
+///
+/// Assignment requires a catalog and a sink authority bound into the sink:
+///
+/// ```compile_fail,E0308
+/// use carina_core::schema::{AttributeType, TypeInSchema};
+/// let source = AttributeType::string();
+/// let sink = AttributeType::string();
+/// let _ = TypeInSchema::schemaless(&source)
+///     .assignment_to(TypeInSchema::schemaless(&sink));
+/// ```
 #[derive(Clone, Copy)]
 pub struct TypeInSchema<'a, R: PatternForm = Draft> {
     attr: &'a PatternAttributeType<R>,
@@ -4379,7 +4394,7 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     ///    assignable to the map value type, preserving the DSL's structural
     ///    object-to-homogeneous-map coercion.
     /// 7. Custom→Custom with both `identity: Some`: the source's identity
-    ///    must be [`TypeIdentity::assignable_to`] the sink's and any length
+    ///    must structurally subsume the sink's or follow an edge admitted by its authority and any length
     ///    range must be contained by the sink's range. Enum→Enum additionally
     ///    recurses on the two base types. This is the final verdict for
     ///    identified custom types: pattern checks are subsumed by identity
@@ -4434,14 +4449,8 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     /// source would re-introduce the silent-false-positive class that #2218
     /// closed. Both exceptions above are limited to identity-less sinks and
     /// do not weaken those comparisons.
-    pub fn is_assignable_to(self, sink: TypeInSchema<'_, R>) -> bool {
+    pub fn is_assignable_to(self, sink: AssignmentSink<'_, R>) -> bool {
         matches!(self.assignment_to(sink), TypeAssignability::Assignable)
-    }
-
-    fn is_assignable_to_known(self, sink: TypeInSchema<'_, R>) -> bool {
-        let mut source_visited_refs = Vec::new();
-        let mut sink_visited_refs = Vec::new();
-        self.is_assignable_to_on_paths(sink, &mut source_visited_refs, &mut sink_visited_refs)
     }
 }
 
@@ -4507,261 +4516,150 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
         name
     }
 
-    fn is_assignable_to_on_paths<'sink>(
-        self,
-        sink: TypeInSchema<'sink, R>,
-        source_visited_refs: &mut Vec<&'source str>,
-        sink_visited_refs: &mut Vec<&'sink str>,
-    ) -> bool {
-        let Ok(source_resolution) = resolve_refs_on_path(self.attr, self.defs, source_visited_refs)
-        else {
-            return false;
-        };
-        let Ok(sink_resolution) = resolve_refs_on_path(sink.attr, sink.defs, sink_visited_refs)
-        else {
-            source_visited_refs.truncate(source_resolution.restore_len);
-            return false;
-        };
-
-        let source = TypeInSchema {
-            attr: source_resolution.attr,
-            defs: self.defs,
-        };
-        let sink = TypeInSchema {
-            attr: sink_resolution.attr,
-            defs: sink.defs,
-        };
-        let result = source.is_assignable_to_resolved(sink, source_visited_refs, sink_visited_refs);
-        source_visited_refs.truncate(source_resolution.restore_len);
-        sink_visited_refs.truncate(sink_resolution.restore_len);
-        result
-    }
-
-    fn is_assignable_to_resolved<'sink>(
-        self,
-        sink: TypeInSchema<'sink, R>,
-        source_visited_refs: &mut Vec<&'source str>,
-        sink_visited_refs: &mut Vec<&'sink str>,
-    ) -> bool {
+    /// Scalar structural rules. Nominal and recursive decisions are made by
+    /// `assignment_on_paths`, which always carries the sink's authority.
+    fn is_assignable_to_known(self, sink: AssignmentSink<'_, R>) -> bool {
         use AttrTypeKind::*;
-        if let Union(members) = &self.attr.kind {
-            return members.as_raw_slice().iter().all(|member| {
-                member.in_schema(self.defs).is_assignable_to_on_paths(
-                    sink,
-                    source_visited_refs,
-                    sink_visited_refs,
-                )
-            });
-        }
-        if let Union(members) = &sink.attr.kind {
-            return members.as_raw_slice().iter().any(|member| {
-                self.is_assignable_to_on_paths(
-                    member.in_schema(sink.defs),
-                    source_visited_refs,
-                    sink_visited_refs,
-                )
-            });
-        }
         match (&self.attr.kind, &sink.attr.kind) {
-            (UnloadedSchemaType(_), _) | (_, UnloadedSchemaType(_)) => false,
             // A resolver identity selects comparison behavior, not a different
             // wire scalar. Reference inputs accept string outputs; constraints
             // are checked on the materialized value before planning.
-            (String { .. } | Reference { .. }, Reference { .. }) => true,
-            (Reference { .. }, String { .. }) => true,
+            (
+                String {
+                    binding: _,
+                    pattern: _,
+                    length: _,
+                    to_dsl: _,
+                }
+                | Reference {
+                    identity: _,
+                    pattern: _,
+                    length: _,
+                },
+                Reference {
+                    identity: _,
+                    pattern: _,
+                    length: _,
+                },
+            ) => true,
+            (
+                Reference {
+                    identity: _,
+                    pattern: _,
+                    length: _,
+                },
+                String {
+                    binding: _,
+                    pattern: _,
+                    length: _,
+                    to_dsl: _,
+                },
+            ) => true,
 
             (
                 ResourceHandle {
                     provider: source_provider,
                     resource_type: source_resource,
-                    ..
                 },
                 ResourceHandle {
                     provider: sink_provider,
                     resource_type: sink_resource,
-                    ..
                 },
             ) => source_provider == sink_provider && source_resource == sink_resource,
-            (ResourceHandle { .. }, _) => false,
             // Literal declarations carry string evidence but not the identity
             // evidence required by a provider custom type (#2648).
             (
-                StringLiteralSet { .. },
+                StringLiteralSet { values: _ },
                 String {
                     binding: RefinementBinding::MetadataOnly(None),
-                    ..
+                    pattern: _,
+                    length: _,
+                    to_dsl: _,
                 },
             ) => true,
-            (StringLiteralSet { .. }, String { binding, .. }) if binding.identity().is_some() => {
-                false
-            }
-            (StringLiteralSet { values: source, .. }, StringLiteralSet { values: sink, .. }) => {
+            (
+                StringLiteralSet { values: _ },
+                String {
+                    binding,
+                    pattern: _,
+                    length: _,
+                    to_dsl: _,
+                },
+            ) if binding.identity().is_some() => false,
+            (StringLiteralSet { values: source }, StringLiteralSet { values: sink }) => {
                 source.iter().all(|value| sink.contains(value))
             }
             // Preserve the pre-existing declared String -> literal-union
             // behavior.
-            (String { .. }, StringLiteralSet { .. }) => true,
-            (_, ResourceHandle { .. } | StringLiteralSet { .. }) => false,
-            (
-                List {
-                    element_type: source_element,
-                    ..
-                },
-                List {
-                    element_type: sink_element,
-                    ..
-                },
-            ) => source_element
-                .in_schema(self.defs)
-                .is_assignable_to_on_paths(
-                    sink_element.in_schema(sink.defs),
-                    source_visited_refs,
-                    sink_visited_refs,
-                ),
-            (
-                Map {
-                    key: source_key,
-                    value: source_value,
-                },
-                Map {
-                    key: sink_key,
-                    value: sink_value,
-                },
-            ) => {
-                source_key.in_schema(self.defs).is_assignable_to_on_paths(
-                    sink_key.in_schema(sink.defs),
-                    source_visited_refs,
-                    sink_visited_refs,
-                ) && source_value.in_schema(self.defs).is_assignable_to_on_paths(
-                    sink_value.in_schema(sink.defs),
-                    source_visited_refs,
-                    sink_visited_refs,
-                )
-            }
-            (
-                Struct {
-                    fields: source_fields,
-                    ..
-                },
-                Struct {
-                    fields: sink_fields,
-                    ..
-                },
-            ) => {
-                source_fields.len() == sink_fields.len()
-                    && sink_fields.iter().all(|sink_field| {
-                        source_fields
-                            .iter()
-                            .find(|source_field| source_field.name == sink_field.name)
-                            .is_some_and(|source_field| {
-                                source_field
-                                    .field_type
-                                    .in_schema(self.defs)
-                                    .is_assignable_to_on_paths(
-                                        sink_field.field_type.in_schema(sink.defs),
-                                        source_visited_refs,
-                                        sink_visited_refs,
-                                    )
-                            })
-                    })
-            }
-            (Struct { fields, .. }, Map { value, .. }) => fields.iter().all(|field| {
-                field
-                    .field_type
-                    .in_schema(self.defs)
-                    .is_assignable_to_on_paths(
-                        value.in_schema(sink.defs),
-                        source_visited_refs,
-                        sink_visited_refs,
-                    )
-            }),
             (
                 String {
-                    binding: source_binding,
-                    length: s_len,
-                    ..
+                    binding: _,
+                    pattern: _,
+                    length: _,
+                    to_dsl: _,
                 },
-                String {
-                    binding: sink_binding,
-                    length: k_len,
-                    ..
-                },
-            ) if let (Some(source_identity), Some(sink_identity)) =
-                (source_binding.identity(), sink_binding.identity()) =>
-            {
-                source_identity.assignable_to(sink_identity)
-                    && length_contains(s_len.as_ref(), k_len.as_ref())
-            }
-            (Enum { identity: s_id, .. }, Enum { identity: k_id, .. })
-                if !s_id.assignable_to(k_id) =>
-            {
-                false
-            }
-            (
-                Enum {
-                    identity: s_id,
-                    base: s_base,
-                    ..
-                },
-                Enum {
-                    identity: k_id,
-                    base: k_base,
-                    ..
-                },
-            ) => {
-                s_id.assignable_to(k_id)
-                    && s_base.in_schema(self.defs).is_assignable_to_on_paths(
-                        k_base.in_schema(sink.defs),
-                        source_visited_refs,
-                        sink_visited_refs,
-                    )
-            }
+                StringLiteralSet { values: _ },
+            ) => true,
             // Anonymous source → identified sink has no proof of identity.
             (
                 String {
                     binding: RefinementBinding::MetadataOnly(None),
-                    ..
+                    pattern: _,
+                    length: _,
+                    to_dsl: _,
                 },
-                String { binding, .. },
+                String {
+                    binding,
+                    pattern: _,
+                    length: _,
+                    to_dsl: _,
+                },
             ) if binding.identity().is_some() => false,
             // An identified String may flow into an identity-less String
             // sink. Check the sink's value constraints when known at plan or
             // before provider dispatch at apply (#3805, #4230).
             (
-                String { binding, .. },
+                String {
+                    binding,
+                    pattern: _,
+                    length: _,
+                    to_dsl: _,
+                },
                 String {
                     binding: RefinementBinding::MetadataOnly(None),
-                    ..
+                    pattern: _,
+                    length: _,
+                    to_dsl: _,
                 },
             ) if binding.identity().is_some() => true,
             (
                 Int {
                     binding: RefinementBinding::MetadataOnly(None),
-                    ..
+                    range: _,
                 },
-                Int { binding, .. },
+                Int { binding, range: _ },
             ) if binding.identity().is_some() => false,
             (
                 Float {
                     binding: RefinementBinding::MetadataOnly(None),
-                    ..
+                    range: _,
                 },
-                Float { binding, .. },
+                Float { binding, range: _ },
             ) if binding.identity().is_some() => false,
             // Identified numerics defer same-kind identity-less sink ranges
             // to the resolved value, like identified Strings (#3805, #4230).
             (
-                Int { binding, .. },
+                Int { binding, range: _ },
                 Int {
                     binding: RefinementBinding::MetadataOnly(None),
-                    ..
+                    range: _,
                 },
             )
             | (
-                Float { binding, .. },
+                Float { binding, range: _ },
                 Float {
                     binding: RefinementBinding::MetadataOnly(None),
-                    ..
+                    range: _,
                 },
             ) if binding.identity().is_some() => true,
             // Numeric widening is directional: an Int source may flow into
@@ -4771,21 +4669,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 Int {
                     binding: source_binding,
                     range: source_range,
-                    ..
                 },
                 Float {
                     binding: sink_binding,
                     range: sink_range,
-                    ..
                 },
             ) => {
-                if let Some(sink_identity) = sink_binding.identity()
-                    && !source_binding
-                        .identity()
-                        .is_some_and(|source_identity| source_identity.assignable_to(sink_identity))
-                {
-                    return false;
-                }
                 if (source_binding.identity().is_some() || source_range.is_none())
                     && sink_binding.identity().is_none()
                 {
@@ -4802,45 +4691,47 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     binding: RefinementBinding::MetadataOnly(None),
                     pattern: None,
                     length: None,
-                    ..
+                    to_dsl: _,
                 },
                 String {
                     binding: RefinementBinding::MetadataOnly(None),
-                    ..
+                    pattern: _,
+                    length: _,
+                    to_dsl: _,
                 },
             ) => true,
             (
                 Int {
                     binding: RefinementBinding::MetadataOnly(None),
                     range: None,
-                    ..
                 },
                 Int {
                     binding: RefinementBinding::MetadataOnly(None),
-                    ..
+                    range: _,
                 },
             ) => true,
             (
                 Float {
                     binding: RefinementBinding::MetadataOnly(None),
                     range: None,
-                    ..
                 },
                 Float {
                     binding: RefinementBinding::MetadataOnly(None),
-                    ..
+                    range: _,
                 },
             ) => true,
             (
                 String {
                     pattern: s_pat,
                     length: s_len,
-                    ..
+                    binding: _,
+                    to_dsl: _,
                 },
                 String {
                     pattern: k_pat,
                     length: k_len,
-                    ..
+                    binding: _,
+                    to_dsl: _,
                 },
             ) => {
                 if !pattern_compatible(s_pat.as_deref(), k_pat.as_deref()) {
@@ -4853,50 +4744,365 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             }
             (
                 Int {
-                    binding: source_binding,
                     range: s_range,
-                    ..
+                    binding: _,
                 },
                 Int {
-                    binding: sink_binding,
                     range: k_range,
-                    ..
+                    binding: _,
                 },
-            ) if let (Some(source_identity), Some(sink_identity)) =
-                (source_binding.identity(), sink_binding.identity()) =>
-            {
-                source_identity.assignable_to(sink_identity)
-                    && i64_range_contains(s_range.as_ref(), k_range.as_ref())
-            }
-            (Int { range: s_range, .. }, Int { range: k_range, .. }) => {
-                i64_range_contains(s_range.as_ref(), k_range.as_ref())
-            }
+            ) => i64_range_contains(s_range.as_ref(), k_range.as_ref()),
             (
                 Float {
-                    binding: source_binding,
                     range: s_range,
-                    ..
+                    binding: _,
                 },
                 Float {
-                    binding: sink_binding,
                     range: k_range,
-                    ..
+                    binding: _,
                 },
-            ) if let (Some(source_identity), Some(sink_identity)) =
-                (source_binding.identity(), sink_binding.identity()) =>
-            {
-                source_identity.assignable_to(sink_identity)
-                    && f64_range_contains(s_range.as_ref(), k_range.as_ref())
-            }
-            (Float { range: s_range, .. }, Float { range: k_range, .. }) => {
-                f64_range_contains(s_range.as_ref(), k_range.as_ref())
-            }
-            (String { .. }, _) | (Int { .. }, _) | (Float { .. }, _)
-                if self.attr.type_name() != sink.attr.type_name() =>
-            {
-                false
-            }
-            (_a, _b) => self.attr.type_name() == sink.attr.type_name(),
+            ) => f64_range_contains(s_range.as_ref(), k_range.as_ref()),
+            (
+                String {
+                    binding: _,
+                    pattern: _,
+                    length: _,
+                    to_dsl: _,
+                }
+                | Reference {
+                    identity: _,
+                    pattern: _,
+                    length: _,
+                },
+                Int {
+                    binding: _,
+                    range: _,
+                }
+                | Float {
+                    binding: _,
+                    range: _,
+                }
+                | Enum {
+                    identity: _,
+                    base: _,
+                    values: _,
+                    dsl_aliases: _,
+                    validate: _,
+                    to_dsl: _,
+                }
+                | List {
+                    element_type: _,
+                    ordered: _,
+                    constraints: _,
+                }
+                | Map { key: _, value: _ }
+                | Struct {
+                    name: _,
+                    fields: _,
+                    field_groups: _,
+                }
+                | UnloadedSchemaType(_)
+                | Bool
+                | Duration
+                | Union(_)
+                | Ref(_),
+            ) => self.attr.type_name() == sink.attr.type_name(),
+            (
+                Int {
+                    binding: _,
+                    range: _,
+                },
+                String {
+                    binding: _,
+                    pattern: _,
+                    length: _,
+                    to_dsl: _,
+                }
+                | Enum {
+                    identity: _,
+                    base: _,
+                    values: _,
+                    dsl_aliases: _,
+                    validate: _,
+                    to_dsl: _,
+                }
+                | Reference {
+                    identity: _,
+                    pattern: _,
+                    length: _,
+                }
+                | List {
+                    element_type: _,
+                    ordered: _,
+                    constraints: _,
+                }
+                | Map { key: _, value: _ }
+                | Struct {
+                    name: _,
+                    fields: _,
+                    field_groups: _,
+                }
+                | UnloadedSchemaType(_)
+                | Bool
+                | Duration
+                | Union(_)
+                | Ref(_),
+            ) => self.attr.type_name() == sink.attr.type_name(),
+            (
+                Float {
+                    binding: _,
+                    range: _,
+                },
+                String {
+                    binding: _,
+                    pattern: _,
+                    length: _,
+                    to_dsl: _,
+                }
+                | Int {
+                    binding: _,
+                    range: _,
+                }
+                | Enum {
+                    identity: _,
+                    base: _,
+                    values: _,
+                    dsl_aliases: _,
+                    validate: _,
+                    to_dsl: _,
+                }
+                | Reference {
+                    identity: _,
+                    pattern: _,
+                    length: _,
+                }
+                | List {
+                    element_type: _,
+                    ordered: _,
+                    constraints: _,
+                }
+                | Map { key: _, value: _ }
+                | Struct {
+                    name: _,
+                    fields: _,
+                    field_groups: _,
+                }
+                | UnloadedSchemaType(_)
+                | Bool
+                | Duration
+                | Union(_)
+                | Ref(_),
+            ) => self.attr.type_name() == sink.attr.type_name(),
+            (
+                Enum {
+                    identity: _,
+                    base: _,
+                    values: _,
+                    dsl_aliases: _,
+                    validate: _,
+                    to_dsl: _,
+                }
+                | StringLiteralSet { values: _ }
+                | List {
+                    element_type: _,
+                    ordered: _,
+                    constraints: _,
+                }
+                | Map { key: _, value: _ }
+                | Struct {
+                    name: _,
+                    fields: _,
+                    field_groups: _,
+                }
+                | UnloadedSchemaType(_)
+                | Bool
+                | Duration
+                | Union(_)
+                | Ref(_),
+                String {
+                    binding: _,
+                    pattern: _,
+                    length: _,
+                    to_dsl: _,
+                }
+                | Int {
+                    binding: _,
+                    range: _,
+                }
+                | Float {
+                    binding: _,
+                    range: _,
+                }
+                | Enum {
+                    identity: _,
+                    base: _,
+                    values: _,
+                    dsl_aliases: _,
+                    validate: _,
+                    to_dsl: _,
+                }
+                | Reference {
+                    identity: _,
+                    pattern: _,
+                    length: _,
+                }
+                | List {
+                    element_type: _,
+                    ordered: _,
+                    constraints: _,
+                }
+                | Map { key: _, value: _ }
+                | Struct {
+                    name: _,
+                    fields: _,
+                    field_groups: _,
+                }
+                | UnloadedSchemaType(_)
+                | Bool
+                | Duration
+                | Union(_)
+                | Ref(_),
+            ) => self.attr.type_name() == sink.attr.type_name(),
+            (
+                ResourceHandle {
+                    provider: _,
+                    resource_type: _,
+                },
+                String {
+                    binding: _,
+                    pattern: _,
+                    length: _,
+                    to_dsl: _,
+                }
+                | Int {
+                    binding: _,
+                    range: _,
+                }
+                | Float {
+                    binding: _,
+                    range: _,
+                }
+                | Enum {
+                    identity: _,
+                    base: _,
+                    values: _,
+                    dsl_aliases: _,
+                    validate: _,
+                    to_dsl: _,
+                }
+                | Reference {
+                    identity: _,
+                    pattern: _,
+                    length: _,
+                }
+                | StringLiteralSet { values: _ }
+                | List {
+                    element_type: _,
+                    ordered: _,
+                    constraints: _,
+                }
+                | Map { key: _, value: _ }
+                | Struct {
+                    name: _,
+                    fields: _,
+                    field_groups: _,
+                }
+                | UnloadedSchemaType(_)
+                | Bool
+                | Duration
+                | Union(_)
+                | Ref(_),
+            ) => false,
+            (
+                String {
+                    binding: _,
+                    pattern: _,
+                    length: _,
+                    to_dsl: _,
+                }
+                | Int {
+                    binding: _,
+                    range: _,
+                }
+                | Float {
+                    binding: _,
+                    range: _,
+                }
+                | Enum {
+                    identity: _,
+                    base: _,
+                    values: _,
+                    dsl_aliases: _,
+                    validate: _,
+                    to_dsl: _,
+                }
+                | Reference {
+                    identity: _,
+                    pattern: _,
+                    length: _,
+                }
+                | StringLiteralSet { values: _ }
+                | List {
+                    element_type: _,
+                    ordered: _,
+                    constraints: _,
+                }
+                | Map { key: _, value: _ }
+                | Struct {
+                    name: _,
+                    fields: _,
+                    field_groups: _,
+                }
+                | UnloadedSchemaType(_)
+                | Bool
+                | Duration
+                | Union(_)
+                | Ref(_),
+                ResourceHandle {
+                    provider: _,
+                    resource_type: _,
+                },
+            ) => false,
+            (
+                Int {
+                    binding: _,
+                    range: _,
+                }
+                | Float {
+                    binding: _,
+                    range: _,
+                }
+                | Enum {
+                    identity: _,
+                    base: _,
+                    values: _,
+                    dsl_aliases: _,
+                    validate: _,
+                    to_dsl: _,
+                }
+                | Reference {
+                    identity: _,
+                    pattern: _,
+                    length: _,
+                }
+                | List {
+                    element_type: _,
+                    ordered: _,
+                    constraints: _,
+                }
+                | Map { key: _, value: _ }
+                | Struct {
+                    name: _,
+                    fields: _,
+                    field_groups: _,
+                }
+                | UnloadedSchemaType(_)
+                | Bool
+                | Duration
+                | Union(_)
+                | Ref(_),
+                StringLiteralSet { values: _ },
+            ) => false,
         }
     }
 }
@@ -9820,6 +10026,34 @@ pub enum ProviderSchemaValidationError {
         identity: TypeIdentity,
         declaration: IdentifiedDeclarationKind,
     },
+    DanglingAssignabilityEndpoint {
+        identity: TypeIdentity,
+    },
+    EnumAssignabilityEndpoint {
+        identity: TypeIdentity,
+    },
+    ReferenceAssignabilityEndpoint {
+        identity: TypeIdentity,
+    },
+    BuiltinAssignabilityEndpoint {
+        identity: TypeIdentity,
+    },
+    AssignabilityScalarKindMismatch {
+        source: Box<TypeIdentity>,
+        sink: Box<TypeIdentity>,
+        source_kind: RefinedScalarKind,
+        sink_kind: RefinedScalarKind,
+    },
+    SelfAssignabilityEdge {
+        identity: TypeIdentity,
+    },
+    DuplicateAssignabilityEdge {
+        source: Box<TypeIdentity>,
+        sink: Box<TypeIdentity>,
+    },
+    AssignabilityCycle {
+        cycle: Vec<TypeIdentity>,
+    },
 }
 
 impl fmt::Display for ProviderSchemaValidationError {
@@ -9859,13 +10093,66 @@ impl fmt::Display for ProviderSchemaValidationError {
                 "reference form identity `{identity}` is declared as {declaration}, not refined String",
                 identity = ProviderText::new(identity.to_string())
             ),
+            Self::DanglingAssignabilityEndpoint { identity } => write!(
+                formatter,
+                "assignability endpoint `{}` is not declared by this provider",
+                ProviderText::new(identity.to_string())
+            ),
+            Self::EnumAssignabilityEndpoint { identity } => write!(
+                formatter,
+                "assignability endpoint `{}` is an Enum; only provider-defined scalar String, Int, or Float identities are supported",
+                ProviderText::new(identity.to_string())
+            ),
+            Self::ReferenceAssignabilityEndpoint { identity } => write!(
+                formatter,
+                "assignability endpoint `{}` is a Reference; only provider-defined scalar String, Int, or Float identities are supported",
+                ProviderText::new(identity.to_string())
+            ),
+            Self::BuiltinAssignabilityEndpoint { identity } => write!(
+                formatter,
+                "assignability endpoint `{}` is a core built-in identity; only provider-defined scalar String, Int, or Float identities are supported",
+                ProviderText::new(identity.to_string())
+            ),
+            Self::AssignabilityScalarKindMismatch {
+                source,
+                sink,
+                source_kind,
+                sink_kind,
+            } => write!(
+                formatter,
+                "assignability edge `{} -> {}` has different scalar kinds: {source_kind} and {sink_kind}",
+                ProviderText::new(source.to_string()),
+                ProviderText::new(sink.to_string())
+            ),
+            Self::SelfAssignabilityEdge { identity } => write!(
+                formatter,
+                "assignability edge for `{}` points to itself",
+                ProviderText::new(identity.to_string())
+            ),
+            Self::DuplicateAssignabilityEdge { source, sink } => write!(
+                formatter,
+                "duplicate assignability edge `{} -> {}`",
+                ProviderText::new(source.to_string()),
+                ProviderText::new(sink.to_string())
+            ),
+            Self::AssignabilityCycle { cycle } => write!(
+                formatter,
+                "assignability cycle: {}",
+                ProviderText::new(
+                    cycle
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" -> ")
+                )
+            ),
         }
     }
 }
 
 impl std::error::Error for ProviderSchemaValidationError {}
 
-/// Resource schemas, provider config, and reference forms admitted together.
+/// Resource schemas, config, reference forms, and assignability edges admitted together.
 ///
 /// The fields are private so no consumer can pair a provider's resource
 /// schemas with a separately sourced config or reference-form table.
@@ -9874,18 +10161,48 @@ pub struct ValidatedProviderSchemaWitness {
     resources: Vec<ValidatedResourceSchema>,
     config: ValidatedConfigSchema,
     reference_forms: ReferenceForms,
+    assignability_edges: Vec<AssignabilityEdge>,
+    assignability_closure: AssignabilityClosure,
+}
+
+/// Exhaustive borrowed projection used at the protocol boundary.
+pub(crate) struct ProviderSchemaWitnessParts<'a> {
+    pub resources: &'a [ValidatedResourceSchema],
+    pub config: &'a ValidatedConfigSchema,
+    pub reference_forms: &'a ReferenceForms,
+    pub assignability_edges: &'a [AssignabilityEdge],
+    pub assignability_closure: &'a AssignabilityClosure,
 }
 
 impl ValidatedProviderSchemaWitness {
+    /// Admit provider schemas and validate their explicit assignability edges.
+    /// Pass an explicit empty collection when the provider declares no edges.
     pub fn new(
         resources: Vec<ValidatedResourceSchema>,
         config: ValidatedConfigSchema,
         reference_forms: ReferenceForms,
+        assignability_edges: Vec<AssignabilityEdge>,
     ) -> Result<Self, ProviderSchemaValidationError> {
         let declarations = identified_declarations_from_witnesses(&resources, &config);
         let mut scalar_kinds = BTreeMap::<TypeIdentity, RefinedScalarKind>::new();
         let mut declaration_kinds =
             BTreeMap::<TypeIdentity, std::collections::BTreeSet<IdentifiedDeclarationKind>>::new();
+        let edge_endpoints: std::collections::BTreeSet<_> = assignability_edges
+            .iter()
+            .flat_map(|edge| {
+                let (source, sink) = edge.parts();
+                [source, sink]
+            })
+            .collect();
+        for identity in &edge_endpoints {
+            if builtin_type_registry().contains_key(*identity) {
+                return Err(
+                    ProviderSchemaValidationError::BuiltinAssignabilityEndpoint {
+                        identity: (*identity).clone(),
+                    },
+                );
+            }
+        }
 
         for (identity, attribute_type) in &declarations {
             if let Some(builtin) = builtin_type_registry().get(identity)
@@ -9894,6 +10211,20 @@ impl ValidatedProviderSchemaWitness {
                 return Err(ProviderSchemaValidationError::BuiltinTypeCollision {
                     identity: identity.clone(),
                 });
+            }
+            if edge_endpoints.contains(identity) {
+                if matches!(attribute_type.raw_shape(), RawShape::Enum { .. }) {
+                    return Err(ProviderSchemaValidationError::EnumAssignabilityEndpoint {
+                        identity: identity.clone(),
+                    });
+                }
+                if matches!(attribute_type.raw_shape(), RawShape::Reference { .. }) {
+                    return Err(
+                        ProviderSchemaValidationError::ReferenceAssignabilityEndpoint {
+                            identity: identity.clone(),
+                        },
+                    );
+                }
             }
             let declaration = identified_declaration_kind(attribute_type)
                 .expect("identified declaration walk only yields identified scalar types");
@@ -9937,10 +10268,14 @@ impl ValidatedProviderSchemaWitness {
             }
         }
 
+        let assignability_closure =
+            AssignabilityClosure::validate(&assignability_edges, &scalar_kinds)?;
         Ok(Self {
             resources,
             config,
             reference_forms,
+            assignability_edges,
+            assignability_closure,
         })
     }
 
@@ -9954,6 +10289,31 @@ impl ValidatedProviderSchemaWitness {
 
     pub fn reference_forms(&self) -> &ReferenceForms {
         &self.reference_forms
+    }
+
+    pub fn assignability_edges(&self) -> &[AssignabilityEdge] {
+        &self.assignability_edges
+    }
+
+    pub(crate) fn assignability_closure(&self) -> &AssignabilityClosure {
+        &self.assignability_closure
+    }
+
+    pub(crate) fn parts(&self) -> ProviderSchemaWitnessParts<'_> {
+        let Self {
+            resources,
+            config,
+            reference_forms,
+            assignability_edges,
+            assignability_closure,
+        } = self;
+        ProviderSchemaWitnessParts {
+            resources,
+            config,
+            reference_forms,
+            assignability_edges,
+            assignability_closure,
+        }
     }
 
     pub(crate) fn identified_declarations(&self) -> Vec<(TypeIdentity, CompiledAttributeType)> {
@@ -13996,26 +14356,46 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 /// ```
 #[derive(Debug, Clone, Copy)]
 pub struct OwnerBoundResourceSchema<'a> {
-    owner: &'a str,
+    owner: &'a SchemaTypeOwner,
     schema: &'a ValidatedResourceSchema,
     reference_forms: &'a ReferenceForms,
+    assignability_edges: &'a [AssignabilityEdge],
 }
 
 impl<'a> OwnerBoundResourceSchema<'a> {
     pub(crate) fn new(
-        owner: &'a str,
+        owner: &'a SchemaTypeOwner,
         schema: &'a ValidatedResourceSchema,
         reference_forms: &'a ReferenceForms,
+        assignability_edges: &'a [AssignabilityEdge],
     ) -> Self {
         Self {
             owner,
             schema,
             reference_forms,
+            assignability_edges,
         }
     }
 
     pub fn owner(self) -> &'a str {
+        let SchemaTypeOwner::Provider(owner) = self.owner;
+        owner
+    }
+
+    pub fn schema_type_owner(self) -> &'a SchemaTypeOwner {
         self.owner
+    }
+
+    /// Bind an attribute sink to its registered provider owner and edge catalog.
+    pub fn assignment_sink(
+        self,
+        attr: &'a CompiledAttributeType,
+        catalog: &'a crate::parser::ProviderCustomTypes,
+    ) -> AssignmentSink<'a, Compiled> {
+        self.schema
+            .as_schema()
+            .type_in_schema(attr)
+            .with_authority(catalog, SinkAuthority::Owner(self.owner))
     }
 
     pub fn schema(self) -> &'a ValidatedResourceSchema {
@@ -14037,6 +14417,11 @@ impl<'a> OwnerBoundResourceSchema<'a> {
     /// owner. Forms are provider-wide rather than per resource occurrence.
     pub fn reference_forms(self) -> &'a ReferenceForms {
         self.reference_forms
+    }
+
+    /// Return the explicit edges declared by this schema's provider owner.
+    pub fn assignability_edges(self) -> &'a [AssignabilityEdge] {
+        self.assignability_edges
     }
 
     /// Validate authored resource values with custom-type routing derived from
@@ -14103,10 +14488,11 @@ impl std::ops::Deref for OwnerBoundResourceSchema<'_> {
 /// See `notes/specs/2026-05-02-resource-vs-data-source-design.md` (Decision 1-2).
 #[derive(Debug, Clone, Default)]
 pub struct SchemaRegistry {
-    managed: HashMap<(String, String), ValidatedResourceSchema>,
-    data_sources: HashMap<(String, String), ValidatedResourceSchema>,
+    managed: HashMap<(SchemaTypeOwner, String), ValidatedResourceSchema>,
+    data_sources: HashMap<(SchemaTypeOwner, String), ValidatedResourceSchema>,
     reference_forms: BTreeMap<String, ReferenceForms>,
     witness_backed_reference_forms: HashSet<String>,
+    assignability_closures: BTreeMap<SchemaTypeOwner, AssignabilityClosure>,
 }
 
 /// Failure to combine owner-bound schema registry declarations.
@@ -14116,6 +14502,9 @@ pub enum SchemaRegistryError {
         owner: String,
         existing: ReferenceForms,
         incoming: ReferenceForms,
+    },
+    ConflictingAssignabilityEdges {
+        owner: String,
     },
 }
 
@@ -14129,6 +14518,11 @@ impl fmt::Display for SchemaRegistryError {
             } => write!(
                 formatter,
                 "schema owner `{}` has conflicting witness-backed reference-form tables",
+                ProviderText::new(owner)
+            ),
+            Self::ConflictingAssignabilityEdges { owner } => write!(
+                formatter,
+                "schema owner `{}` has conflicting witness-backed assignability edges",
                 ProviderText::new(owner)
             ),
         }
@@ -14172,6 +14566,14 @@ impl SchemaRegistry {
         Self::default()
     }
 
+    /// Every registered owner has a complete, possibly empty edge declaration.
+    /// Supplemental witnesses retain their authority without a runtime factory.
+    pub(crate) fn assignability_closures(
+        &self,
+    ) -> &BTreeMap<SchemaTypeOwner, AssignabilityClosure> {
+        &self.assignability_closures
+    }
+
     /// Insert one validated schema for test fixtures that intentionally have
     /// no provider-wide reference forms.
     #[cfg(any(test, feature = "test-utils"))]
@@ -14179,7 +14581,13 @@ impl SchemaRegistry {
     pub fn insert(&mut self, provider: impl Into<String>, schema: ValidatedResourceSchema) {
         let provider = provider.into();
         self.reference_forms.entry(provider.clone()).or_default();
-        let key = (provider, schema.as_schema().resource_type.clone());
+        self.assignability_closures
+            .entry(SchemaTypeOwner::Provider(provider.clone()))
+            .or_default();
+        let key = (
+            SchemaTypeOwner::Provider(provider),
+            schema.as_schema().resource_type.clone(),
+        );
         match schema.as_schema().kind {
             SchemaKind::Resource => {
                 self.managed.insert(key, schema);
@@ -14190,8 +14598,8 @@ impl SchemaRegistry {
         }
     }
 
-    /// Insert every resource schema and the one provider-wide forms table from
-    /// the same validated aggregate witness.
+    /// Insert every resource schema, reference-form table, and assignability
+    /// closure from the same validated aggregate witness.
     pub fn insert_provider_witness(
         &mut self,
         provider: impl Into<String>,
@@ -14209,11 +14617,22 @@ impl SchemaRegistry {
                 incoming: incoming.clone(),
             });
         }
+        let owner = SchemaTypeOwner::Provider(provider.clone());
+        if self.witness_backed_reference_forms.contains(&provider)
+            && self.assignability_closures.get(&owner) != Some(witness.assignability_closure())
+        {
+            return Err(SchemaRegistryError::ConflictingAssignabilityEdges { owner: provider });
+        }
+        self.assignability_closures
+            .insert(owner, witness.assignability_closure().clone());
         self.reference_forms
             .insert(provider.clone(), incoming.clone());
         self.witness_backed_reference_forms.insert(provider.clone());
         for schema in witness.resources() {
-            let key = (provider.clone(), schema.as_schema().resource_type.clone());
+            let key = (
+                SchemaTypeOwner::Provider(provider.clone()),
+                schema.as_schema().resource_type.clone(),
+            );
             match schema.as_schema().kind {
                 SchemaKind::Resource => {
                     self.managed.insert(key, schema.clone());
@@ -14227,14 +14646,15 @@ impl SchemaRegistry {
     }
 
     /// Merge another registry. Incoming resource schemas win on duplicate
-    /// resource keys. Witness-backed owner form tables must be identical;
-    /// fixture-only schema insertions carry no competing forms table.
+    /// resource keys. Witness-backed owner form tables and edge closures must
+    /// be identical; fixture-only insertions carry no competing declarations.
     pub fn extend(&mut self, other: SchemaRegistry) -> Result<(), SchemaRegistryError> {
         let SchemaRegistry {
             managed,
             data_sources,
             reference_forms,
             witness_backed_reference_forms,
+            assignability_closures,
         } = other;
         for (owner, incoming) in &reference_forms {
             if witness_backed_reference_forms.contains(owner)
@@ -14248,14 +14668,32 @@ impl SchemaRegistry {
                     incoming: incoming.clone(),
                 });
             }
+            let typed_owner = SchemaTypeOwner::Provider(owner.clone());
+            if witness_backed_reference_forms.contains(owner)
+                && self.witness_backed_reference_forms.contains(owner)
+                && self.assignability_closures.get(&typed_owner)
+                    != assignability_closures.get(&typed_owner)
+            {
+                return Err(SchemaRegistryError::ConflictingAssignabilityEdges {
+                    owner: owner.clone(),
+                });
+            }
         }
         self.managed.extend(managed);
         self.data_sources.extend(data_sources);
         for (owner, forms) in reference_forms {
             if witness_backed_reference_forms.contains(&owner) {
+                let typed_owner = SchemaTypeOwner::Provider(owner.clone());
+                self.assignability_closures.insert(
+                    typed_owner.clone(),
+                    assignability_closures[&typed_owner].clone(),
+                );
                 self.reference_forms.insert(owner.clone(), forms);
                 self.witness_backed_reference_forms.insert(owner);
             } else {
+                self.assignability_closures
+                    .entry(SchemaTypeOwner::Provider(owner.clone()))
+                    .or_default();
                 self.reference_forms.entry(owner).or_insert(forms);
             }
         }
@@ -14269,18 +14707,27 @@ impl SchemaRegistry {
         resource_type: &str,
         kind: SchemaKind,
     ) -> Option<OwnerBoundResourceSchema<'_>> {
-        let key = (provider.to_string(), resource_type.to_string());
+        let key = (
+            SchemaTypeOwner::Provider(provider.to_string()),
+            resource_type.to_string(),
+        );
         let map = match kind {
             SchemaKind::Resource => &self.managed,
             SchemaKind::DataSource => &self.data_sources,
         };
         map.get_key_value(&key)
             .map(|((owner, _resource_type), schema)| {
+                let SchemaTypeOwner::Provider(provider) = owner;
                 let reference_forms = self
                     .reference_forms
-                    .get(owner)
+                    .get(provider)
                     .expect("every admitted schema owner has a reference-form table");
-                OwnerBoundResourceSchema::new(owner, schema, reference_forms)
+                let assignability_edges = self
+                    .assignability_closures
+                    .get(owner)
+                    .expect("every admitted schema owner has an assignability closure")
+                    .declared_edges();
+                OwnerBoundResourceSchema::new(owner, schema, reference_forms, assignability_edges)
             })
     }
 
@@ -14362,11 +14809,15 @@ impl SchemaRegistry {
     ) -> impl Iterator<Item = (&str, &str, SchemaKind, &ValidatedResourceSchema)> + '_ {
         self.managed
             .iter()
-            .map(|((p, t), s)| (p.as_str(), t.as_str(), SchemaKind::Resource, s))
+            .map(|((SchemaTypeOwner::Provider(p), t), s)| {
+                (p.as_str(), t.as_str(), SchemaKind::Resource, s)
+            })
             .chain(
                 self.data_sources
                     .iter()
-                    .map(|((p, t), s)| (p.as_str(), t.as_str(), SchemaKind::DataSource, s)),
+                    .map(|((SchemaTypeOwner::Provider(p), t), s)| {
+                        (p.as_str(), t.as_str(), SchemaKind::DataSource, s)
+                    }),
             )
     }
 
@@ -14980,3 +15431,16 @@ impl PatternResourceSchema<Compiled> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn assignment_catalog_without_edges_for_test()
+-> &'static crate::parser::ProviderCustomTypes {
+    static CATALOG: std::sync::LazyLock<crate::parser::ProviderCustomTypes> =
+        std::sync::LazyLock::new(|| {
+            crate::parser::ProviderCustomTypes::loaded(
+                std::collections::HashSet::new(),
+                Box::new(|_target, _value| Ok(())),
+            )
+        });
+    &CATALOG
+}

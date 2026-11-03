@@ -559,6 +559,7 @@ pub fn builtin_schema_witness() -> ValidatedProviderSchemaWitness {
         builtin_schemas(),
         ValidatedConfigSchema::default(),
         Default::default(),
+        Vec::new(),
     )
     .expect("built-in mock schemas form a valid provider-wide witness")
 }

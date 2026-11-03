@@ -2220,8 +2220,8 @@ pub(crate) fn json_to_schema_only_attribute_types(
 }
 
 /// Decode v12 resource-schema JSON into the current aggregate witness used only
-/// by the read-only migration checker. V12 had no reference-form declarations,
-/// so the compatibility envelope supplies an empty collection.
+/// by the read-only migration checker. V12 had no reference forms or
+/// assignability declarations, so the adapter supplies empty collections.
 pub(crate) fn json_to_schema_only_provider_schema(
     json: &str,
     config: CoreValidatedConfigSchema,
@@ -2237,6 +2237,7 @@ pub(crate) fn json_to_schema_only_provider_schema(
     let envelope = serde_json::json!({
         "resources": resources,
         "reference_forms": [],
+        "assignability_edges": [],
     });
     let envelope =
         serde_json::to_string(&envelope).map_err(SchemaDecodeError::schema_json_parse)?;
@@ -2379,6 +2380,38 @@ fn proto_struct_field_to_core(
 
 #[cfg(test)]
 mod tests {
+    mod assignability_edges_stage_a {
+        use super::*;
+
+        #[test]
+        fn host_rejects_current_envelope_missing_required_edges() {
+            let error = json_to_provider_schema(
+                r#"{"resources":[],"reference_forms":[]}"#,
+                CoreValidatedConfigSchema::default(),
+            )
+            .expect_err("current protocol must require assignability_edges");
+            assert!(matches!(&error, SchemaDecodeError::JsonParse(_)));
+            let rendered = carina_core::executor::render_error_chain(&error);
+            assert!(rendered.contains("assignability_edges"), "{rendered}");
+        }
+
+        #[test]
+        fn v12_migration_adapter_supplies_empty_assignability_edges() {
+            let witness = json_to_schema_only_provider_schema(
+                include_str!("../tests/fixtures/protocol-v12/released-awscc-vpc.json"),
+                CoreValidatedConfigSchema::default(),
+                12,
+            )
+            .expect("released v12 metadata must still be admitted for migration");
+            assert!(!witness.resources().is_empty());
+            assert!(witness.assignability_edges().is_empty());
+            let envelope =
+                carina_core::protocol_convert::provider_schema_to_protocol(&witness).unwrap();
+            let json = serde_json::to_value(envelope).unwrap();
+            assert_eq!(json["assignability_edges"], serde_json::json!([]));
+        }
+    }
+
     use carina_core::schema::{
         PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
     };
@@ -2958,6 +2991,7 @@ mod tests {
                 vec![schema],
                 carina_core::schema::ValidatedConfigSchema::default(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap();
             let guest_json = carina_plugin_sdk::provider_schema_to_json(&guest_witness)
@@ -3026,6 +3060,7 @@ mod tests {
                 (identity.clone(), form.clone()),
                 (reference_identity.clone(), form.clone()),
             ]),
+            Vec::new(),
         )
         .unwrap();
         let json = carina_plugin_sdk::provider_schema_to_json(&witness).unwrap();
@@ -3111,6 +3146,7 @@ mod tests {
             vec![schema],
             ValidatedConfigSchema::default(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap();
         let schema_json = carina_plugin_sdk::provider_schema_to_json(&witness).unwrap();

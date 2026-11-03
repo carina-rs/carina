@@ -190,7 +190,7 @@ impl TypeIdentity {
     ///   ways (populated segments differ).
     /// - `aws.Region` ↔ `gcp.Region`: rejected both ways (populated
     ///   providers differ).
-    pub fn assignable_to(&self, sink: &TypeIdentity) -> bool {
+    pub(super) fn structurally_assignable_to(&self, sink: &TypeIdentity) -> bool {
         if self.kind != sink.kind {
             return false;
         }
@@ -350,9 +350,9 @@ mod tests {
         let generic = TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Arn");
         let role = TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn");
         // narrower (populated segments) → wider (empty segments): OK
-        assert!(role.assignable_to(&generic));
+        assert!(role.structurally_assignable_to(&generic));
         // wider (empty segments) → narrower (populated segments): NG
-        assert!(!generic.assignable_to(&role));
+        assert!(!generic.structurally_assignable_to(&role));
     }
 
     #[test]
@@ -360,9 +360,9 @@ mod tests {
         let bare = TypeIdentity::bare("Arn");
         let scoped = TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Arn");
         // narrower (Some provider) → wider (None provider): OK
-        assert!(scoped.assignable_to(&bare));
+        assert!(scoped.structurally_assignable_to(&bare));
         // wider (None provider) → narrower (Some provider): NG
-        assert!(!bare.assignable_to(&scoped));
+        assert!(!bare.structurally_assignable_to(&scoped));
     }
 
     #[test]
@@ -370,22 +370,22 @@ mod tests {
         // aws.Region vs gcp.Region: providers differ → both directions NG.
         let aws_region = TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region");
         let gcp_region = TypeIdentity::new(Some("gcp"), Vec::<String>::new(), "Region");
-        assert!(!aws_region.assignable_to(&gcp_region));
-        assert!(!gcp_region.assignable_to(&aws_region));
+        assert!(!aws_region.structurally_assignable_to(&gcp_region));
+        assert!(!gcp_region.structurally_assignable_to(&aws_region));
 
         // aws.iam.Role.Arn vs aws.acm.Certificate.Arn: segments differ.
         let role = TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn");
         let cert = TypeIdentity::new(Some("aws"), ["acm", "Certificate"], "Arn");
-        assert!(!role.assignable_to(&cert));
-        assert!(!cert.assignable_to(&role));
+        assert!(!role.structurally_assignable_to(&cert));
+        assert!(!cert.structurally_assignable_to(&role));
     }
 
     #[test]
     fn assignable_to_kind_must_match() {
         let arn = TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Arn");
         let vpc_id = TypeIdentity::new(Some("aws"), Vec::<String>::new(), "VpcId");
-        assert!(!arn.assignable_to(&vpc_id));
-        assert!(!vpc_id.assignable_to(&arn));
+        assert!(!arn.structurally_assignable_to(&vpc_id));
+        assert!(!vpc_id.structurally_assignable_to(&arn));
     }
 
     #[test]

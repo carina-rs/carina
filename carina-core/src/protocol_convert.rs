@@ -643,7 +643,7 @@ impl Error for SchemaDecodeError {
     }
 }
 
-/// Convert a validated resource schema into its version-20 protocol record.
+/// Convert a validated resource schema into its current protocol record.
 pub fn resource_schema_to_protocol(
     schema: &ValidatedResourceSchema,
 ) -> Result<protocol::ResourceSchema, ProtocolConvertError> {
@@ -730,13 +730,19 @@ fn protocol_to_type_identity(identity: &str) -> TypeIdentity {
     TypeIdentity::from_dotted(identity)
 }
 
-/// Project one aggregate provider-schema witness onto the version-20 envelope.
+/// Project one aggregate provider-schema witness onto the version-21 envelope.
 pub fn provider_schema_to_protocol(
     witness: &ValidatedProviderSchemaWitness,
 ) -> Result<protocol::ProviderSchemaEnvelope, ProtocolConvertError> {
-    let resources = resource_schemas_to_protocol(witness.resources())?;
-    let reference_forms = witness
-        .reference_forms()
+    let crate::schema::ProviderSchemaWitnessParts {
+        resources,
+        config: _config_exported_separately,
+        reference_forms,
+        assignability_edges,
+        assignability_closure: _derived_closure,
+    } = witness.parts();
+    let resources = resource_schemas_to_protocol(resources)?;
+    let reference_forms = reference_forms
         .iter()
         .map(|(identity, form)| {
             let form = match form {
@@ -753,11 +759,42 @@ pub fn provider_schema_to_protocol(
     Ok(protocol::ProviderSchemaEnvelope {
         resources,
         reference_forms,
+        assignability_edges: assignability_edges
+            .iter()
+            .map(assignability_edge_to_protocol)
+            .collect::<Result<_, _>>()?,
     })
 }
 
-/// Decode the version-20 provider-schema envelope and jointly admit resource,
-/// config, and reference-form declarations.
+fn assignability_edge_to_protocol(
+    edge: &crate::schema::AssignabilityEdge,
+) -> Result<protocol::AssignabilityEdgeDeclaration, ProtocolConvertError> {
+    let (source, sink) = edge.parts();
+    protocol::AssignabilityEdgeDeclaration::new(
+        type_identity_to_protocol(source),
+        type_identity_to_protocol(sink),
+    )
+    .map_err(|error| {
+        ProtocolConvertError::NonWireAttributeType {
+            kind: "assignability edge with indistinguishable wire identities",
+        }
+        .context(error.to_string())
+    })
+}
+
+fn protocol_to_assignability_edge(
+    edge: &protocol::AssignabilityEdgeDeclaration,
+) -> Result<crate::schema::AssignabilityEdge, SchemaDecodeError> {
+    let (source, sink) = edge.parts();
+    crate::schema::AssignabilityEdge::new(
+        protocol_to_type_identity(source),
+        protocol_to_type_identity(sink),
+    )
+    .map_err(SchemaDecodeError::InvalidProviderSchema)
+}
+
+/// Decode the version-21 provider-schema envelope and jointly admit resource,
+/// config, reference-form, and assignability declarations.
 pub fn protocol_to_provider_schema_witness(
     envelope: &protocol::ProviderSchemaEnvelope,
     config: ValidatedConfigSchema,
@@ -765,6 +802,7 @@ pub fn protocol_to_provider_schema_witness(
     let protocol::ProviderSchemaEnvelope {
         resources,
         reference_forms,
+        assignability_edges,
     } = envelope;
     let resources = protocol_to_resource_schemas(resources)?;
     let mut forms = crate::schema::ReferenceForms::new();
@@ -780,7 +818,11 @@ pub fn protocol_to_provider_schema_witness(
             return Err(SchemaDecodeError::DuplicateReferenceForm { identity });
         }
     }
-    ValidatedProviderSchemaWitness::new(resources, config, forms)
+    let edges = assignability_edges
+        .iter()
+        .map(protocol_to_assignability_edge)
+        .collect::<Result<_, _>>()?;
+    ValidatedProviderSchemaWitness::new(resources, config, forms, edges)
         .map_err(SchemaDecodeError::InvalidProviderSchema)
 }
 
@@ -2296,7 +2338,7 @@ pub fn protocol_to_core_persisted_value_map(
 }
 
 /// Encode a core resource id. Provider-instance routing is host-local and the
-/// version-20 protocol deliberately has no corresponding field.
+/// current protocol deliberately has no corresponding field.
 pub fn resource_id_to_protocol(id: &ResourceId) -> protocol::ResourceId {
     let ResourceId {
         provider,
@@ -2315,7 +2357,7 @@ pub fn resource_id_to_protocol(id: &ResourceId) -> protocol::ResourceId {
     }
 }
 
-/// Decode a version-20 resource id. The wire's empty identity is the pending
+/// Decode a current protocol resource id. The wire's empty identity is the pending
 /// sentinel, and provider-instance routing cannot be reconstructed.
 pub fn protocol_to_resource_id(id: &protocol::ResourceId) -> ResourceId {
     let protocol::ResourceId {
@@ -3257,6 +3299,7 @@ mod tests {
                 identity: protocol_identity(identity),
                 form: reference_form(),
             }],
+            assignability_edges: Vec::new(),
         }
     }
 
@@ -3286,8 +3329,9 @@ mod tests {
             (first.clone(), reference_form()),
         ]);
         let config = ValidatedConfigSchema::default();
-        let witness = ValidatedProviderSchemaWitness::new(vec![schema], config.clone(), forms)
-            .expect("refined String forms must be admitted");
+        let witness =
+            ValidatedProviderSchemaWitness::new(vec![schema], config.clone(), forms, Vec::new())
+                .expect("refined String forms must be admitted");
 
         let wire = provider_schema_to_protocol(&witness).expect("witness must encode");
         assert_eq!(
@@ -3327,6 +3371,7 @@ mod tests {
             vec![schema],
             ValidatedConfigSchema::default(),
             ReferenceForms::from([(identity.clone(), reference_form())]),
+            Vec::new(),
         )
         .expect("the SDK-side aggregate identity is internally consistent");
 

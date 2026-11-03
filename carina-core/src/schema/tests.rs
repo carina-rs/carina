@@ -1,3 +1,28 @@
+static TEST_OWNER: std::sync::LazyLock<crate::parser::SchemaTypeOwner> =
+    std::sync::LazyLock::new(|| crate::parser::SchemaTypeOwner::Provider("test".into()));
+
+#[test]
+fn draft_assignability_preserves_invalid_patterns_and_schema_definitions() {
+    let string: PatternAttributeType =
+        PatternAttributeType::refined_string(None, Some("(?=x)".into()), None, None);
+    let catalog = crate::parser::ProviderCustomTypes::default();
+    assert!(
+        TypeInSchema::schemaless(&string).is_assignable_to(
+            TypeInSchema::schemaless(&string)
+                .with_authority(&catalog, SinkAuthority::Owner(&TEST_OWNER))
+        )
+    );
+    let schema = PatternResourceSchema::new("Draft").with_def("Text", string);
+    let reference = PatternAttributeType::ref_("Text");
+    assert!(
+        schema.type_in_schema(&reference).is_assignable_to(
+            reference
+                .in_schema(schema.defs())
+                .with_authority(&catalog, SinkAuthority::Owner(&TEST_OWNER))
+        )
+    );
+}
+
 use super::*;
 use super::{
     CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
@@ -6,6 +31,414 @@ use super::{
 use crate::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
+
+// Stage A storage/admission tests; stage B judgement tests are separate.
+mod assignability_edges_stage_a {
+    use crate::schema::{
+        AssignabilityEdge, AttributeSchema, AttributeType, ProviderSchemaValidationError,
+        ReferenceForms, RefinedScalarKind, ResourceSchema, TypeIdentity, ValidatedConfigSchema,
+        ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+    };
+
+    fn identity(kind: &str) -> TypeIdentity {
+        // The semantic prefix is deliberately unrelated to any factory owner.
+        TypeIdentity::new(Some("semantic"), ["Bucket"], kind)
+    }
+
+    fn string(kind: &str) -> AttributeType {
+        AttributeType::refined_string(Some(identity(kind)), None, None, None)
+    }
+
+    fn resource(declarations: &[AttributeType]) -> ValidatedResourceSchema {
+        declarations
+            .iter()
+            .enumerate()
+            .fold(ResourceSchema::new("test.Bucket"), |schema, (index, ty)| {
+                schema.attribute(
+                    AttributeSchema::optional(format!("value_{index}"), ty.clone()).build(),
+                )
+            })
+            .validate()
+            .expect("individual declarations must be valid")
+    }
+
+    fn edge(source: &str, sink: &str) -> AssignabilityEdge {
+        AssignabilityEdge::new(identity(source), identity(sink)).unwrap()
+    }
+
+    fn witness(
+        declarations: &[AttributeType],
+        edges: Vec<AssignabilityEdge>,
+    ) -> Result<ValidatedProviderSchemaWitness, ProviderSchemaValidationError> {
+        ValidatedProviderSchemaWitness::new(
+            vec![resource(declarations)],
+            ValidatedConfigSchema::default(),
+            ReferenceForms::new(),
+            edges,
+        )
+    }
+
+    #[test]
+    fn witness_accepts_explicitly_empty_assignability_edges() {
+        let admitted = ValidatedProviderSchemaWitness::new(
+            vec![resource(&[string("NewName"), string("Name")])],
+            ValidatedConfigSchema::default(),
+            ReferenceForms::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(admitted.assignability_edges().is_empty());
+        for (source, sink) in [("NewName", "Name"), ("Name", "NewName")] {
+            assert!(
+                !admitted
+                    .assignability_closure()
+                    .reachable(&identity(source), &identity(sink))
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_edge_between_declared_resource_identities() {
+        let edges = vec![edge("NewName", "Name")];
+        let admitted = witness(&[string("NewName"), string("Name")], edges.clone()).unwrap();
+        assert_eq!(admitted.assignability_edges(), edges.as_slice());
+    }
+
+    #[test]
+    fn accepts_endpoints_declared_only_by_config() {
+        let config = ValidatedConfigSchema::validate(std::collections::BTreeMap::from([
+            ("strict".into(), string("NewName")),
+            ("lenient".into(), string("Name")),
+        ]))
+        .unwrap();
+        let edges = vec![edge("NewName", "Name")];
+        let admitted = ValidatedProviderSchemaWitness::new(
+            Vec::new(),
+            config,
+            ReferenceForms::new(),
+            edges.clone(),
+        )
+        .unwrap();
+        assert_eq!(admitted.assignability_edges(), edges.as_slice());
+    }
+
+    #[test]
+    fn accepts_resource_to_config_edge_with_the_same_scalar_kind() {
+        let edges = vec![edge("NewName", "Name")];
+        let admitted = ValidatedProviderSchemaWitness::new(
+            vec![resource(&[string("NewName")])],
+            ValidatedConfigSchema::validate(std::collections::BTreeMap::from([(
+                "target".into(),
+                string("Name"),
+            )]))
+            .unwrap(),
+            ReferenceForms::new(),
+            edges.clone(),
+        )
+        .unwrap();
+        assert_eq!(admitted.assignability_edges(), edges.as_slice());
+    }
+
+    #[test]
+    fn rejects_unknown_source_and_sink_endpoints_with_typed_errors() {
+        for (present, missing) in [("NewName", "Name"), ("Name", "NewName")] {
+            let error = witness(&[string(present)], vec![edge("NewName", "Name")]).unwrap_err();
+            assert!(matches!(
+                error,
+                ProviderSchemaValidationError::DanglingAssignabilityEndpoint { identity: actual }
+                    if actual == identity(missing)
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_enum_source_and_sink_endpoints() {
+        for also_scalar in [false, true] {
+            let mut declarations = vec![
+                string("Name"),
+                AttributeType::enum_(
+                    identity("Mode"),
+                    Some(vec!["on".into()]),
+                    vec![],
+                    None,
+                    None,
+                ),
+            ];
+            if also_scalar {
+                declarations.push(string("Mode"));
+            }
+            for (source, sink) in [("Mode", "Name"), ("Name", "Mode")] {
+                let error = witness(&declarations, vec![edge(source, sink)])
+                    .expect_err("enum identities cannot be assignability endpoints");
+                assert_eq!(
+                    error,
+                    ProviderSchemaValidationError::EnumAssignabilityEndpoint {
+                        identity: identity("Mode"),
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_reference_source_and_sink_endpoints() {
+        for also_scalar in [false, true] {
+            let mut declarations = vec![
+                string("Name"),
+                AttributeType::reference(identity("Ref"), None, None),
+            ];
+            if also_scalar {
+                declarations.push(string("Ref"));
+            }
+            for (source, sink) in [("Ref", "Name"), ("Name", "Ref")] {
+                let error = witness(&declarations, vec![edge(source, sink)])
+                    .expect_err("reference identities cannot be assignability endpoints");
+                assert_eq!(
+                    error,
+                    ProviderSchemaValidationError::ReferenceAssignabilityEndpoint {
+                        identity: identity("Ref"),
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_builtin_source_and_sink_endpoints() {
+        let builtin = TypeIdentity::bare("PositiveInt");
+        let count = identity("Count");
+        let declarations = [
+            crate::schema::types::positive_int(),
+            AttributeType::refined_int(Some(count.clone()), None),
+        ];
+        for (source, sink) in [(builtin.clone(), count.clone()), (count, builtin.clone())] {
+            let error = witness(
+                &declarations,
+                vec![AssignabilityEdge::new(source, sink).unwrap()],
+            )
+            .expect_err("core built-in identities cannot be assignability endpoints");
+            assert_eq!(
+                error,
+                ProviderSchemaValidationError::BuiltinAssignabilityEndpoint {
+                    identity: builtin.clone(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_endpoint_declared_only_by_another_provider_witness() {
+        let other = witness(&[string("Name")], Vec::new()).unwrap();
+        let mut registry = crate::schema::SchemaRegistry::new();
+        registry
+            .insert_provider_witness("other-owner", &other)
+            .unwrap();
+        // A global declaration (even with the same semantic provider prefix)
+        // cannot supply the missing membership of this aggregate witness.
+        let error = witness(&[string("NewName")], vec![edge("NewName", "Name")]).unwrap_err();
+        assert!(matches!(
+            error,
+            ProviderSchemaValidationError::DanglingAssignabilityEndpoint { identity: actual }
+                if actual == identity("Name")
+        ));
+    }
+
+    #[test]
+    fn rejects_scalar_kind_mismatch_with_typed_endpoints_and_kinds() {
+        let error = witness(
+            &[
+                string("NewName"),
+                AttributeType::refined_int(Some(identity("Count")), None),
+            ],
+            vec![edge("NewName", "Count")],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ProviderSchemaValidationError::AssignabilityScalarKindMismatch {
+                source, sink, source_kind: RefinedScalarKind::String,
+                sink_kind: RefinedScalarKind::Int,
+            } if *source == identity("NewName") && *sink == identity("Count")
+        ));
+    }
+
+    fn assert_cycle(kinds: &[&str], edges: Vec<AssignabilityEdge>) {
+        let declarations: Vec<_> = kinds.iter().map(|kind| string(kind)).collect();
+        let error = witness(&declarations, edges).unwrap_err();
+        let expected: Vec<_> = kinds
+            .iter()
+            .chain(std::iter::once(&kinds[0]))
+            .map(|kind| identity(kind))
+            .collect();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "assignability cycle: {}",
+                expected
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
+            ),
+        );
+        let ProviderSchemaValidationError::AssignabilityCycle { cycle } = error else {
+            panic!("expected a typed cycle error, got {error:?}");
+        };
+        assert_eq!(
+            cycle, expected,
+            "the diagnostic must close the ordered cycle"
+        );
+    }
+
+    #[test]
+    fn rejects_two_cycle() {
+        assert_cycle(&["A", "B"], vec![edge("A", "B"), edge("B", "A")]);
+    }
+
+    #[test]
+    fn rejects_three_cycle() {
+        assert_cycle(
+            &["A", "B", "C"],
+            vec![edge("A", "B"), edge("B", "C"), edge("C", "A")],
+        );
+    }
+
+    #[test]
+    fn cycle_diagnostic_excludes_incoming_nodes() {
+        let error = witness(
+            &[string("A"), string("B"), string("C")],
+            vec![edge("A", "B"), edge("B", "C"), edge("C", "B")],
+        )
+        .unwrap_err();
+        let ProviderSchemaValidationError::AssignabilityCycle { cycle } = error else {
+            panic!("expected a typed cycle error, got {error:?}");
+        };
+        assert_eq!(
+            cycle.into_iter().collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([identity("B"), identity("C")]),
+        );
+    }
+
+    #[test]
+    fn rejects_trivial_self_edge() {
+        let error = AssignabilityEdge::new(identity("Name"), identity("Name")).unwrap_err();
+        assert!(matches!(
+            error,
+            ProviderSchemaValidationError::SelfAssignabilityEdge { identity: actual }
+                if actual == identity("Name")
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_edge_deterministically() {
+        let duplicate = edge("A", "B");
+        for edges in [
+            vec![duplicate.clone(), duplicate.clone(), edge("B", "C")],
+            vec![edge("B", "C"), duplicate.clone(), duplicate],
+        ] {
+            let error = witness(&[string("A"), string("B"), string("C")], edges).unwrap_err();
+            assert!(matches!(
+                error,
+                ProviderSchemaValidationError::DuplicateAssignabilityEdge { source, sink }
+                    if *source == identity("A") && *sink == identity("B")
+            ));
+        }
+    }
+
+    #[test]
+    fn witness_envelope_json_witness_round_trip_preserves_edges() {
+        let edges = vec![edge("NewName", "Name"), edge("Name", "Reference")];
+        let original = witness(
+            &[string("NewName"), string("Name"), string("Reference")],
+            edges.clone(),
+        )
+        .unwrap();
+        let envelope = crate::protocol_convert::provider_schema_to_protocol(&original).unwrap();
+        let json = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(
+            json["assignability_edges"],
+            serde_json::json!([
+                {"source": identity("NewName").to_string(), "sink": identity("Name").to_string()},
+                {"source": identity("Name").to_string(), "sink": identity("Reference").to_string()},
+            ])
+        );
+        let decoded = serde_json::from_value(json).unwrap();
+        let restored = crate::protocol_convert::protocol_to_provider_schema_witness(
+            &decoded,
+            ValidatedConfigSchema::default(),
+        )
+        .unwrap();
+        assert_eq!(restored.assignability_edges(), edges.as_slice());
+    }
+}
+
+#[test]
+fn bootstrap_catalog_defers_structural_identity_mismatches() {
+    let bootstrap = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    assert!(!bootstrap.custom_types.is_loaded());
+    assert!(bootstrap.custom_types.may_defer(None));
+    let source = AttributeType::refined_string(
+        Some(TypeIdentity::from_dotted("test.Widget.NewName")),
+        None,
+        None,
+        None,
+    );
+    let sink = AttributeType::refined_string(
+        Some(TypeIdentity::from_dotted("test.Widget.Name")),
+        None,
+        None,
+        None,
+    );
+    assert!(matches!(
+        TypeInSchema::schemaless(&source).assignment_to(
+            TypeInSchema::schemaless(&sink)
+                .with_authority(&bootstrap.custom_types, SinkAuthority::Owner(&TEST_OWNER))
+        ),
+        TypeAssignability::Unchecked(_)
+    ));
+}
+
+#[test]
+fn loaded_fixture_without_known_types_has_authoritative_empty_edges() {
+    let source = AttributeType::refined_string(
+        Some(TypeIdentity::new(
+            Some("aws"),
+            std::iter::empty::<&str>(),
+            "Region",
+        )),
+        None,
+        None,
+        None,
+    );
+    let sink = AttributeType::refined_string(
+        Some(TypeIdentity::new(
+            Some("gcp"),
+            std::iter::empty::<&str>(),
+            "Region",
+        )),
+        None,
+        None,
+        None,
+    );
+    let catalog =
+        crate::parser::ProviderCustomTypes::loaded(HashSet::new(), Box::new(|_, _| Ok(())));
+    assert_eq!(
+        TypeInSchema::schemaless(&source).assignment_to(
+            TypeInSchema::schemaless(&sink)
+                .with_authority(&catalog, SinkAuthority::Owner(&TEST_OWNER),),
+        ),
+        TypeAssignability::Mismatch,
+    );
+    let partial =
+        catalog.with_failed_providers(std::collections::BTreeSet::from(["failed".into()]));
+    assert_eq!(
+        TypeInSchema::schemaless(&source).assignment_to(
+            TypeInSchema::schemaless(&sink)
+                .with_authority(&partial, SinkAuthority::Owner(&TEST_OWNER),),
+        ),
+        TypeAssignability::Mismatch,
+    );
+}
 
 fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
     crate::resource::RootScope::new().resolve(crate::resource::RelativeBindingName::new(binding))
@@ -1657,6 +2090,7 @@ fn schema_registry_lookup_retains_the_owners_complete_reference_form_table() {
         vec![schema],
         ValidatedConfigSchema::default(),
         forms.clone(),
+        Vec::new(),
     )
     .unwrap();
     let mut registry = SchemaRegistry::new();
@@ -1697,6 +2131,7 @@ fn schema_registry_additional_schema_cannot_clear_witness_forms_when_registered_
         vec![owned_schema],
         ValidatedConfigSchema::default(),
         forms.clone(),
+        Vec::new(),
     )
     .expect("provider witness must validate");
     let additional_schema = PatternResourceSchema::new("test.Additional")
@@ -1741,6 +2176,7 @@ fn reference_form_witness(template: &str) -> (ValidatedProviderSchemaWitness, Re
         vec![schema],
         ValidatedConfigSchema::default(),
         forms.clone(),
+        Vec::new(),
     )
     .expect("fixture witness must validate");
     (witness, forms)
@@ -1791,7 +2227,10 @@ fn schema_registry_extend_rejects_conflicting_witness_forms() {
         owner,
         existing,
         incoming,
-    } = error;
+    } = error
+    else {
+        panic!("expected conflicting reference forms, got {error:?}");
+    };
     assert_eq!(owner, "actual-owner");
     assert_eq!(existing, first_forms);
     assert_eq!(incoming, second_forms);
@@ -2141,9 +2580,13 @@ fn provider_schema_rejects_conflicting_builtin_bare_declarations() {
                     ValidatedConfigSchema::default(),
                 )
             };
-            let error =
-                ValidatedProviderSchemaWitness::new(resources, config, ReferenceForms::new())
-                    .expect_err("a provider must not silently redefine a core built-in");
+            let error = ValidatedProviderSchemaWitness::new(
+                resources,
+                config,
+                ReferenceForms::new(),
+                Vec::new(),
+            )
+            .expect_err("a provider must not silently redefine a core built-in");
             let message = error.to_string();
             assert!(
                 message.contains("Email") && message.contains("built-in"),
@@ -2177,8 +2620,13 @@ fn provider_schema_accepts_shared_builtin_constructor_declarations() {
             })
             .collect();
         let config = ValidatedConfigSchema::validate(config_types).unwrap();
-        let witness = ValidatedProviderSchemaWitness::new(resources, config, ReferenceForms::new())
-            .expect("providers may reuse the core built-in constructors");
+        let witness = ValidatedProviderSchemaWitness::new(
+            resources,
+            config,
+            ReferenceForms::new(),
+            Vec::new(),
+        )
+        .expect("providers may reuse the core built-in constructors");
         schemas
             .insert_provider_witness(owner, &witness)
             .expect("shared core declarations and wire-decoded declarations remain loadable");
@@ -8718,11 +9166,19 @@ fn assignable_with_defs(
 ) -> bool {
     source
         .in_schema(source_defs)
-        .is_assignable_to(sink.in_schema(sink_defs))
+        .is_assignable_to((sink.in_schema(sink_defs)).with_authority(
+            crate::schema::assignment_catalog_without_edges_for_test(),
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+        ))
 }
 
 fn assignable(source: &AttributeType, sink: &AttributeType) -> bool {
-    TypeInSchema::schemaless(source).is_assignable_to(TypeInSchema::schemaless(sink))
+    TypeInSchema::schemaless(source).is_assignable_to(
+        (TypeInSchema::schemaless(sink)).with_authority(
+            crate::schema::assignment_catalog_without_edges_for_test(),
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+        ),
+    )
 }
 
 #[derive(Clone)]
@@ -10529,12 +10985,22 @@ fn declared_string_outputs_preserve_incompatible_anonymous_refined_evidence() {
         assert_eq!(resolved.display_type_name(), "String");
         assert!(
             resolved
-                .is_assignable_to_sink(TypeInSchema::schemaless(&evidence), &bindings)
+                .is_assignable_to_sink(
+                    (TypeInSchema::schemaless(&evidence)).with_authority(
+                        crate::schema::assignment_catalog_without_edges_for_test(),
+                        crate::schema::SinkAuthority::Owner(&TEST_OWNER)
+                    ),
+                    &bindings
+                )
                 .is_ok()
         );
-        let Err(RefTypeAssignabilityError::Mismatch(mismatch)) =
-            resolved.is_assignable_to_sink(TypeInSchema::schemaless(&sink), &bindings)
-        else {
+        let Err(RefTypeAssignabilityError::Mismatch(mismatch)) = resolved.is_assignable_to_sink(
+            (TypeInSchema::schemaless(&sink)).with_authority(
+                crate::schema::assignment_catalog_without_edges_for_test(),
+                crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+            ),
+            &bindings,
+        ) else {
             panic!("rule 8 must reject the forwarded evidence after each String boundary");
         };
         assert_eq!(mismatch.actual_type_name(), "String(len: 1..=1024)");

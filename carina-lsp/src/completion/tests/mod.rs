@@ -11,6 +11,84 @@ use carina_core::schema::{
 mod basic;
 mod extended;
 
+#[test]
+fn loaded_schema_lookup_rejects_cross_provider_identity_mismatch() {
+    let context = carina_core::parser::LoadedProviderContext::empty_for_test();
+    let source = carina_core::schema::CompiledAttributeType::refined_string(
+        Some(carina_core::schema::TypeIdentity::new(
+            Some("aws"),
+            std::iter::empty::<&str>(),
+            "Region",
+        )),
+        None,
+        None,
+        None,
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "gcp",
+        ResourceSchema::new("Cloud")
+            .attribute(
+                AttributeSchema::optional(
+                    "region",
+                    AttributeType::refined_string(
+                        Some(carina_core::schema::TypeIdentity::new(
+                            Some("gcp"),
+                            std::iter::empty::<&str>(),
+                            "Region",
+                        )),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let provider = CompletionProvider::new(Arc::new(schemas), vec!["gcp".into()], vec![], vec![]);
+    for key in ["gcp.Cloud", "Cloud"] {
+        let schema = provider
+            .lookup_schema(key)
+            .expect("registered schema must retain its owner");
+        assert_eq!(schema.owner(), "gcp");
+        let sink = schema.as_schema().attributes()["region"].attr_type();
+        assert_eq!(
+            carina_core::schema::TypeInSchema::schemaless(&source)
+                .assignment_to(schema.assignment_sink(sink, &context.custom_types))
+                .require_loaded(),
+            Ok(false),
+            "{key}: loaded cross-provider mismatches must not report ProvidersNotLoaded",
+        );
+    }
+}
+
+#[test]
+fn unqualified_schema_lookup_retains_the_registered_owner() {
+    for kind in [SchemaKind::Resource, SchemaKind::DataSource] {
+        let mut schemas = SchemaRegistry::new();
+        let schema = match kind {
+            SchemaKind::Resource => ResourceSchema::new("Cloud"),
+            SchemaKind::DataSource => ResourceSchema::new("Cloud").as_data_source(),
+        };
+        schemas.insert("gcp", schema.validate().unwrap());
+        let provider = CompletionProvider::new(Arc::new(schemas), vec![], vec![], vec![]);
+        assert_eq!(provider.lookup_schema("Cloud").unwrap().owner(), "gcp");
+    }
+}
+
+#[test]
+fn unqualified_schema_lookup_does_not_choose_between_owners() {
+    let mut schemas = SchemaRegistry::new();
+    for owner in ["aws", "gcp"] {
+        schemas.insert(owner, ResourceSchema::new("Cloud").validate().unwrap());
+    }
+    let provider = CompletionProvider::new(Arc::new(schemas), vec![], vec![], vec![]);
+    assert!(provider.lookup_schema("Cloud").is_none());
+    assert_eq!(provider.lookup_schema("gcp.Cloud").unwrap().owner(), "gcp");
+}
+
 impl CompletionProvider {
     fn complete_for_test(
         &self,
@@ -471,6 +549,7 @@ impl ProviderFactory for EnumShadowFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }

@@ -6445,6 +6445,7 @@ mod tests {
             vec![schema.validate().expect("valid schema")],
             crate::schema::ValidatedConfigSchema::default(),
             forms,
+            Vec::new(),
         )
         .expect("valid provider schema witness");
         let mut registry = SchemaRegistry::new();

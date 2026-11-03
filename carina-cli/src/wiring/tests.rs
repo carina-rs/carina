@@ -659,6 +659,7 @@ impl ProviderFactory for RawEnumStateFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .expect("raw enum test provider schema must be valid")
     }
@@ -2643,6 +2644,7 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
                 self.schemas(),
                 self.provider_config_attribute_types(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }
@@ -3645,6 +3647,7 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
                 self.schemas(),
                 self.provider_config_attribute_types(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }
@@ -3772,6 +3775,7 @@ async fn provider_progress_is_emitted_after_provider_initialization() {
                 self.schemas(),
                 self.provider_config_attribute_types(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }
@@ -3910,6 +3914,7 @@ async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
                 self.schemas(),
                 self.provider_config_attribute_types(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }
@@ -4018,6 +4023,7 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -4192,6 +4198,7 @@ impl ProviderFactory for CascadeAwsccFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -4560,6 +4567,7 @@ impl ProviderFactory for ManagedAndDataSourceFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -4949,6 +4957,7 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
                 self.schemas(),
                 self.provider_config_attribute_types(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }
@@ -5069,6 +5078,7 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
                 self.schemas(),
                 self.provider_config_attribute_types(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }
@@ -7297,6 +7307,7 @@ impl ProviderFactory for DeferredForCollisionFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .expect("deferred-for collision schemas must be valid")
     }
@@ -7433,6 +7444,7 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -10801,6 +10813,7 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -14096,6 +14109,7 @@ mod resolved_value_constraint_gate {
                 self.schemas(),
                 self.provider_config_attribute_types(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }
@@ -14201,6 +14215,7 @@ mod resolved_value_constraint_gate {
                 self.schemas(),
                 self.provider_config_attribute_types(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }
