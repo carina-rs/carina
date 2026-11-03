@@ -7864,15 +7864,15 @@ let zone = aws.route53.HostedZone {
     std::fs::write(root.join("main.crn"), source).unwrap();
 
     let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", source);
+    let unexpected_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| !diagnostic.message.starts_with("Unused let binding"))
+        .map(|diagnostic| &diagnostic.message)
+        .collect();
     assert!(
-        diagnostics
-            .iter()
-            .all(|diagnostic| !diagnostic.message.contains("Type mismatch")),
+        unexpected_diagnostics.is_empty(),
         "LSP must accept forwarded Arn evidence at an identity-less String sink, matching validate (#4230): {:?}",
-        diagnostics
-            .iter()
-            .map(|diagnostic| &diagnostic.message)
-            .collect::<Vec<_>>(),
+        unexpected_diagnostics,
     );
 }
 
