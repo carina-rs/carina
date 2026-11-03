@@ -22,7 +22,7 @@ carina-provider-hello-v0.1.0-docs.tar.gz
 
 ## Rules
 
-The registry checks every rule when a version is published and refuses a bundle that breaks one; it never repairs a bundle.
+The registry checks every rule when a version is published and refuses a bundle that breaks one; it never repairs a bundle. You can run the same checks yourself first; see [Checking the archive](#checking-the-archive).
 
 | What | Rule |
 |------|------|
@@ -57,7 +57,7 @@ The registry treats documentation as untrusted input. It renders GitHub Flavored
 
 Build the archive reproducibly: entries sorted by name, a fixed modification time, owner and group 0, and no timestamp in the gzip header. A publish that is retried compares the archive's digest, so a rebuild that produces different bytes from the same files is refused as a conflict.
 
-This script uses only the Python standard library. It packs `index.md`, `resources/*.md` and `data-sources/*.md`, following symbolic links, and skips hidden files such as `.DS_Store`. It stops when `index.md` is missing or when any other file or an invalid slug is present, which the registry would refuse. It does not check file sizes, UTF-8 or the Markdown limits in the table above. Its output depends only on the files and on the zlib that Python uses, so build the archive once and reuse that file if you retry a publish, rather than rebuilding it on another machine.
+This script uses only the Python standard library. It packs `index.md`, `resources/*.md` and `data-sources/*.md`, following symbolic links, and skips hidden files such as `.DS_Store`. It stops when `index.md` is missing or when any other file or an invalid slug is present, which the registry would refuse. It does not check file sizes, UTF-8 or the Markdown limits in the table above; the checker below does. Its output depends only on the files and on the zlib that Python uses, so build the archive once and reuse that file if you retry a publish, rather than rebuilding it on another machine.
 
 ```python
 #!/usr/bin/env python3
@@ -114,9 +114,20 @@ python3 build-docs-bundle.py docs carina-provider-hello-v0.1.0-docs.tar.gz
 
 Attach the archive to the same GitHub release as the `.wasm`. A `github.com/...` source ignores it; the registry fetches it from that URL when the version is published. Registry versions can be signed keylessly by the release workflow run that built them. When a version is signed, the same job of the same workflow run attempt must also sign the archive's digest, in the same way as the `.wasm`. The registry refuses docs signed by another run, unsigned docs on a signed version, and signed docs on an unsigned one. The registry protocol's [Documentation provenance](/reference/registry/protocol/#documentation-provenance) section has the details.
 
-If you release with [provider-release](/providers/writing/publishing/#the-release-pipeline), its build workflow packs and checks the bundle with a `scripts/docs-bundle.py` copied from carina-provider-aws instead of this script. That script expects carina-provider-aws's own source layout (generated pages as `<service>/<name>.md` with a front-matter title, and an index built from a hand-written `docs/registry/index.md` plus generated page lists), so adapt it as the provider-release README describes. It allows files up to 1 MiB where the registry allows 256 KiB, and like this script it does not check the rendering limits, so keep each page under 256 KiB and within the nesting and rendering limits yourself.
+If you release with [provider-release](/providers/writing/publishing/#the-release-pipeline), its build workflow packs the bundle with a `scripts/docs-bundle.py build` copied from carina-provider-aws instead of this script. That script expects carina-provider-aws's own source layout (generated pages as `<service>/<name>.md` with a front-matter title, and an index built from a hand-written `docs/registry/index.md` plus generated page lists), so adapt it as the provider-release README describes. The workflow then checks the archive with the checker below.
 
-There is no standalone checker for these rules yet; the registry runs them at publish.
+## Checking the archive
+
+[carina-docs-bundle](https://github.com/carina-rs/carina-docs-bundle) is the registry's own validator and renderer, packaged as a command. The registry depends on the same code, so the checker applies every rule on this page, including the rendering limits and the isolated rendering process, and gives the same verdict as a publish. Install it pinned to the revision the registry uses, which provider-release's build workflow records, and run it on the archive with the coordinates you will publish under:
+
+```bash
+cargo install --locked --git https://github.com/carina-rs/carina-docs-bundle \
+  --rev <full commit> carina-docs-bundle
+carina-docs-bundle check carina-provider-hello-v0.1.0-docs.tar.gz \
+  --namespace <your-namespace> --name hello --version 0.1.0
+```
+
+The namespace, name and version change the rendered pages and their size, so pass the ones you will publish under; without them the checker uses `local/provider/0.0.0`. Docs are accepted only for stable versions, so the checker refuses a pre-release version. It exits with `0` for a valid bundle, `1` for one the registry would refuse, and `2` for a usage, I/O or setup error. Resource limits are enforced fully on Linux, so run it there, for example in CI, when a page is close to a limit.
 
 ## Next steps
 
