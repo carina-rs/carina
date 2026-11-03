@@ -170,7 +170,11 @@ pub(crate) fn enclosing_block(
         let classified = lexed.lines()[line_index].chars();
         debug_assert_eq!(source_chars.len(), classified.len());
         let limit = if line_index == current_line {
-            (position.character as usize).min(source_chars.len())
+            crate::position::utf16_offset_to_char_offset(
+                source_lines[line_index],
+                position.character,
+            )
+            .unwrap_or(source_chars.len())
         } else {
             source_chars.len()
         };
@@ -420,7 +424,8 @@ pub(crate) fn cursor_line_segment(text: &str, position: Position) -> String {
     let source_chars: Vec<char> = source_line.chars().collect();
     let classified = lexed_line.chars();
     debug_assert_eq!(source_chars.len(), classified.len());
-    let limit = (position.character as usize).min(source_chars.len());
+    let limit = crate::position::utf16_offset_to_char_offset(source_line, position.character)
+        .unwrap_or(source_chars.len());
     scan_line_segment(&source_chars, classified, limit, SegmentScanMode::AtCursor).raw
 }
 

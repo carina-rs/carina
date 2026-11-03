@@ -579,12 +579,12 @@ fn duplicate_groups(occurrences: DeclarationGroups) -> Vec<DuplicateDeclaration>
 /// This is the degraded-mode counterpart to directory extraction for editors:
 /// it cannot diagnose cross-file collisions, but it preserves same-block
 /// diagnostics when an unrelated sibling fails to parse.
-pub fn find_duplicate_declarations_in_parsed_file(
+pub fn find_duplicate_declarations_in_analysis(
     file_name: &Path,
-    parsed: &ParsedFile,
+    tree: &parser::AnalysisTree<'_>,
 ) -> Vec<DuplicateDeclaration> {
     let mut occurrences = BTreeMap::new();
-    collect_file_declarations(file_name, parsed, &mut occurrences);
+    collect_inventory_declarations(file_name, tree.syntax(), &mut occurrences);
     duplicate_groups(occurrences)
 }
 
@@ -620,45 +620,6 @@ pub(crate) fn directory_source_overrides(
             Some((path.file_name()?.to_str()?.to_owned(), text.clone()))
         })
         .collect()
-}
-
-/// Recover declaration multiplicity from syntax when a semantic parse fails.
-/// Files with invalid grammar keep their own parse failure; inventories from
-/// other files remain usable, including the current unsaved buffer.
-pub fn find_duplicate_declarations_with_overrides(
-    base: &ResolvedPath,
-    overrides: &HashMap<String, String>,
-) -> Result<Vec<DuplicateDeclaration>, String> {
-    let mut occurrences = BTreeMap::new();
-    let files = find_crn_files_in_dir(base)?;
-    let mut seen = HashSet::new();
-    for file in files {
-        let path = file.source_label();
-        let name = path
-            .file_name()
-            .expect("source file name")
-            .to_string_lossy();
-        seen.insert(name.to_string());
-        let source = match overrides.get(name.as_ref()) {
-            Some(source) => source.clone(),
-            None => match file.read_to_string() {
-                Ok(source) => source,
-                Err(_) => continue,
-            },
-        };
-        if let Ok(inventory) = parser::parse_syntax_inventory(&source, &path) {
-            collect_inventory_declarations(Path::new(name.as_ref()), &inventory, &mut occurrences);
-        }
-    }
-    for (name, source) in overrides {
-        if !seen.contains(name) {
-            let path = base.source_label().join(name);
-            if let Ok(inventory) = parser::parse_syntax_inventory(source, &path) {
-                collect_inventory_declarations(Path::new(name), &inventory, &mut occurrences);
-            }
-        }
-    }
-    Ok(duplicate_groups(occurrences))
 }
 
 pub fn find_duplicate_declarations_in_source(

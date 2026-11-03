@@ -93,8 +93,8 @@ enum DependencyTarget<'a> {
     Handle,
     Unknown,
 }
-fn classify_operand<'a, B: BindingAddress, D>(
-    tree: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+fn classify_operand<'a, B: BindingAddress, D, E>(
+    tree: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
     bindings: &HashMap<&str, &ResourceRef<'_, D, B>>,
     argument_types: &'a ResolvedArgumentTypes,
     operand: &UnexpandedDependencyOperand<B>,
@@ -131,8 +131,8 @@ where
 /// use carina_core::{parser::ParsedFile, validation::{depends_on::validate_depends_on, ResolvedArgumentTypes}};
 /// fn analyze(file: &ParsedFile, types: &ResolvedArgumentTypes) { validate_depends_on(file, types); }
 /// ```
-pub fn validate_depends_on<B: BindingAddress, D>(
-    tree: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+pub fn validate_depends_on<B: BindingAddress, D, E>(
+    tree: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
     argument_types: &ResolvedArgumentTypes,
 ) -> Vec<Located<DependsOnDiagnostic>>
 where
@@ -270,8 +270,8 @@ where
 
 /// Use the ordering pass's node set, edges and first-cycle DFS. Each edge's
 /// origin was attached at the analysis boundary without changing membership.
-fn first_dependency_cycle<B: BindingAddress, D>(
-    tree: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+fn first_dependency_cycle<B: BindingAddress, D, E>(
+    tree: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
 ) -> Option<DependencyCycle>
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,

@@ -1,4 +1,50 @@
-//! Conversion from UTF-8 byte offsets to LSP's default UTF-16 code units.
+//! Shared conversions between text offsets and LSP's default UTF-16 code units.
+
+use tower_lsp::lsp_types::Position;
+
+/// Byte and scalar offsets at a UTF-16 column, plus whether the column is exact.
+fn column_offsets(line: &str, column: u32) -> (usize, usize, bool) {
+    let mut units = 0;
+    let mut scalars = 0;
+    for (byte, ch) in line.char_indices() {
+        if units == column {
+            return (byte, scalars, true);
+        }
+        units += ch.len_utf16() as u32;
+        if units > column {
+            return (byte, scalars, false);
+        }
+        scalars += 1;
+    }
+    (line.len(), scalars, units == column)
+}
+
+/// The text before an LSP column. Clamp columns past the line end and never
+/// split a surrogate pair if a client supplies a column inside one.
+pub fn line_prefix(line: &str, column: u32) -> &str {
+    &line[..column_offsets(line, column).0]
+}
+
+/// Convert a document position to a UTF-8 byte offset, clamping to the text.
+pub fn position_to_byte_offset(text: &str, position: Position) -> usize {
+    let mut offset = 0;
+    for (index, line) in text.split('\n').enumerate() {
+        if index == position.line as usize {
+            return offset + line_prefix(line, position.character).len();
+        }
+        offset += line.len() + 1;
+    }
+    text.len()
+}
+
+/// Convert a document byte offset to a UTF-16 position. Invalid UTF-8
+/// boundaries and offsets outside the source cannot be rendered.
+pub fn byte_offset_to_position(text: &str, offset: usize) -> Option<Position> {
+    let prefix = text.get(..offset)?;
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let tail = prefix.rsplit('\n').next().unwrap_or("");
+    Some(Position::new(line, char_len(tail)))
+}
 
 /// Convert a byte offset within a string to a UTF-16 code-unit offset.
 ///
@@ -24,19 +70,8 @@ pub fn char_offset_to_utf16_offset(s: &str, offset: usize) -> u32 {
 
 /// Convert an LSP column to a Unicode-scalar index without splitting a surrogate pair.
 pub fn utf16_offset_to_char_offset(s: &str, offset: u32) -> Option<usize> {
-    let mut units = 0;
-    let mut count = 0;
-    for ch in s.chars() {
-        if units == offset {
-            return Some(count);
-        }
-        units += ch.len_utf16() as u32;
-        count += 1;
-        if units > offset {
-            return None;
-        }
-    }
-    (units == offset).then_some(count)
+    let (_, scalars, exact) = column_offsets(s, offset);
+    exact.then_some(scalars)
 }
 
 /// Calculate the character offset of leading whitespace in a line.

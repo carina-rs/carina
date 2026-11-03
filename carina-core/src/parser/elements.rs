@@ -13,7 +13,7 @@ pub struct AttributeKeyLocation {
 }
 
 impl AttributeKeyLocation {
-    pub(in crate::parser) fn is_block(&self) -> bool {
+    pub fn is_block(&self) -> bool {
         self.block
     }
     pub fn path(&self) -> &[super::AttributePathSegment] {
@@ -26,6 +26,8 @@ impl AttributeKeyLocation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ElementKind {
+    ResourceType,
+    IgnoreChanges,
     Provider,
     WaitTarget,
     UntilLhs,
@@ -37,7 +39,67 @@ pub(crate) enum ElementKind {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ElementLocations {
     pub(crate) keys: Vec<AttributeKeyLocation>,
+    pub(crate) attribute_values: Vec<AttributeValueLocation>,
+    pub(crate) integer_operators: Vec<DeclarationLocation>,
     pub(crate) values: Vec<(ElementKind, DeclarationLocation)>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AttributeValueLocation {
+    pub(crate) path: Vec<super::AttributePathSegment>,
+    pub(crate) location: DeclarationLocation,
+    pub(crate) anchor: DeclarationLocation,
+    pub(crate) replaceable: bool,
+    pub(crate) list_literal: bool,
+    pub(crate) literal_container: bool,
+}
+
+fn value_location(
+    pair: &Pair<'_, Rule>,
+    path: &[super::AttributePathSegment],
+    file: &PreprocessedFile,
+    source: &Path,
+) -> AttributeValueLocation {
+    // Only a single string/identifier token can safely be replaced by an enum
+    // quick fix. Peeling grammar wrappers preserves complete expressions.
+    let mut token = pair.clone();
+    loop {
+        let children = token.clone().into_inner().collect::<Vec<_>>();
+        if children.len() != 1
+            || matches!(
+                token.as_rule(),
+                Rule::string | Rule::list | Rule::map | Rule::function_call
+            )
+        {
+            break;
+        }
+        token = children.into_iter().next().expect("one grammar child");
+    }
+    let token_kind = token.as_rule();
+    let bare_path = token_kind == Rule::variable_ref
+        && token
+            .clone()
+            .into_inner()
+            .all(|part| matches!(part.as_rule(), Rule::identifier | Rule::field_access));
+    let location = DeclarationLocation::from_pair(pair, file, source);
+    let replaceable = (matches!(
+        token_kind,
+        Rule::identifier | Rule::namespaced_id | Rule::string
+    ) || bare_path)
+        && location.span().start_line() == location.span().end_line()
+        && !token
+            .clone()
+            .into_inner()
+            .flatten()
+            .any(|part| part.as_rule() == Rule::interpolation);
+    AttributeValueLocation {
+        path: path.to_vec(),
+        anchor: location.clone(),
+        location,
+        replaceable,
+        list_literal: token.as_rule() == Rule::list,
+        literal_container: matches!(token.as_rule(), Rule::list | Rule::map),
+    }
 }
 
 impl ElementLocations {
@@ -57,8 +119,34 @@ impl ElementLocations {
                 block: false,
             })
             .collect();
+        let attribute_values = declarations
+            .iter()
+            .filter(|declaration| {
+                declaration.kind() == crate::config_loader::DeclarationKind::ModuleAttribute
+            })
+            .map(|declaration| {
+                // A parameter without an authored default is represented by its
+                // parser-owned name; expansion does not mint synthetic offsets.
+                let location = match declaration.value_location() {
+                    Some(value) => value.clone(),
+                    None => declaration.location().clone(),
+                };
+                AttributeValueLocation {
+                    path: vec![super::AttributePathSegment::Attribute(
+                        declaration.name().to_string(),
+                    )],
+                    anchor: location.clone(),
+                    location,
+                    replaceable: false,
+                    list_literal: false,
+                    literal_container: false,
+                }
+            })
+            .collect();
         Self {
             keys,
+            attribute_values,
+            integer_operators: Vec::new(),
             values: Vec::new(),
         }
     }
@@ -68,7 +156,30 @@ impl ElementLocations {
         file: &PreprocessedFile,
         path: &Path,
     ) -> Self {
-        let mut out = Self::default();
+        let mut out = Self {
+            integer_operators: pair
+                .clone()
+                .into_inner()
+                .flatten()
+                .filter(|pair| matches!(pair.as_rule(), Rule::add_op | Rule::multiplicative_op))
+                .map(|pair| DeclarationLocation::from_pair(&pair, file, path))
+                .collect(),
+            ..Self::default()
+        };
+        if matches!(
+            pair.as_rule(),
+            Rule::resource_expr | Rule::anonymous_resource | Rule::read_resource_expr
+        ) {
+            let resource_type = pair
+                .clone()
+                .into_inner()
+                .next()
+                .expect("resource grammar has a type");
+            out.values.push((
+                ElementKind::ResourceType,
+                DeclarationLocation::from_pair(&resource_type, file, path),
+            ));
+        }
         if pair.as_rule() == Rule::wait_expr {
             let mut inner = pair.clone().into_inner();
             let target = inner.next().expect("wait grammar has a target");
@@ -132,6 +243,7 @@ fn collect_keys(
             Rule::attribute | Rule::map_entry | Rule::nested_block | Rule::module_call_arg => {
                 let is_block = pair.as_rule() == Rule::nested_block;
                 let is_map_entry = pair.as_rule() == Rule::map_entry;
+                let syntax = pair.clone();
                 let mut inner = pair.into_inner();
                 let key_pair = inner.next().expect("attribute grammar has a key");
                 let key = super::extract_key_string(key_pair.clone()).expect("grammar key");
@@ -144,6 +256,11 @@ fn collect_keys(
                             out.values.push((
                                 ElementKind::Provider,
                                 DeclarationLocation::from_pair(&value, file, source),
+                            ));
+                        } else if name.as_str() == "ignore_changes" {
+                            out.values.push((
+                                ElementKind::IgnoreChanges,
+                                DeclarationLocation::from_pair(&name, file, source),
                             ));
                         }
                     }
@@ -166,8 +283,18 @@ fn collect_keys(
                     let index = block_indices.entry(key.clone()).or_insert(0);
                     path.push(Segment::ListIndex(*index));
                     *index += 1;
+                    out.attribute_values.push(AttributeValueLocation {
+                        path: path.clone(),
+                        location: DeclarationLocation::from_pair(&syntax, file, source),
+                        anchor: DeclarationLocation::from_pair(&key_pair, file, source),
+                        replaceable: false,
+                        list_literal: false,
+                        literal_container: true,
+                    });
                     collect_keys(inner, &path, file, source, out);
                 } else if let Some(value) = inner.next() {
+                    out.attribute_values
+                        .push(value_location(&value, &path, file, source));
                     if parent.is_empty() && key == "source" {
                         out.values.push((
                             ElementKind::Source,
@@ -196,6 +323,8 @@ fn collect_value_keys(
         for (index, value) in pair.into_inner().enumerate() {
             let mut path = parent.to_vec();
             path.push(super::AttributePathSegment::ListIndex(index));
+            out.attribute_values
+                .push(value_location(&value, &path, file, source));
             collect_value_keys(value, &path, file, source, out);
         }
     } else {

@@ -286,8 +286,7 @@ impl CompletionProvider {
         }
 
         let current_line = lines[line_idx];
-        let col = position.character as usize;
-        let prefix: String = current_line.chars().take(col).collect();
+        let prefix = crate::position::line_prefix(current_line, position.character);
         let block_context = enclosing_block(text, position, &self.resource_type_patterns);
 
         // `for <pat> in <HERE>`: offer in-scope bindings. Detected before the
@@ -1013,8 +1012,7 @@ fn detect_upstream_state_dot(
 ) -> Option<(String, String, String)> {
     let line_idx = position.line as usize;
     let current_line = text.lines().nth(line_idx)?;
-    let col = position.character as usize;
-    let prefix: String = current_line.chars().take(col).collect();
+    let prefix = crate::position::line_prefix(current_line, position.character);
     let segs = parse_trailing_dotted_segments(&prefix, 2)?;
     let [binding, partial] = segs.as_slice() else {
         unreachable!("parse_trailing_dotted_segments returns exactly the requested count");
@@ -1038,8 +1036,7 @@ fn detect_upstream_state_depth2_dot(
 ) -> Option<UpstreamDepth2Match> {
     let line_idx = position.line as usize;
     let current_line = text.lines().nth(line_idx)?;
-    let col = position.character as usize;
-    let prefix: String = current_line.chars().take(col).collect();
+    let prefix = crate::position::line_prefix(current_line, position.character);
     let segs = parse_trailing_dotted_segments(&prefix, 3)?;
     let [binding, key, partial] = segs.as_slice() else {
         unreachable!("parse_trailing_dotted_segments returns exactly the requested count");
@@ -1078,8 +1075,7 @@ fn detect_interpolation_bare_partial(text: &str, position: Position) -> Option<S
         return None;
     }
 
-    let col = position.character as usize;
-    let line_prefix: String = current_line.chars().take(col).collect();
+    let line_prefix = crate::position::line_prefix(current_line, position.character);
 
     let mut tail_start = line_prefix.len();
     for (idx, ch) in line_prefix.char_indices().rev() {
@@ -1167,7 +1163,7 @@ fn is_identifier(s: &str) -> bool {
 /// Range covering the trailing `partial` characters at `position` —
 /// what `text_edit` should replace when the editor accepts a candidate.
 fn range_for_partial(position: Position, partial: &str) -> Range {
-    let partial_chars = partial.chars().count() as u32;
+    let partial_chars = crate::position::char_len(partial);
     Range {
         start: Position {
             line: position.line,
@@ -1321,7 +1317,7 @@ mod helper_tests {
         let last = text.lines().last().unwrap_or("");
         Position {
             line: text.lines().count().saturating_sub(1) as u32,
-            character: last.chars().count() as u32,
+            character: crate::position::char_len(last),
         }
     }
 

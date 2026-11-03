@@ -82,8 +82,179 @@ impl Directory {
 
 const MAIN: &str = "provider aws {}\nlet cert = aws.acm.Certificate { domain_name = 'main' }\n";
 
+fn round3_schema_engine() -> DiagnosticEngine {
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
+    };
+    let schema = ResourceSchema::new("test.Thing")
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("enabled", AttributeType::bool()).build())
+        .attribute(
+            AttributeSchema::optional(
+                "mode",
+                AttributeType::enum_(
+                    TypeIdentity::bare("Mode"),
+                    Some(vec!["fast".into(), "slow".into()]),
+                    vec![],
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![StructField::optional("enabled", AttributeType::bool()).build()],
+                ),
+            )
+            .build(),
+        );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("mock", schema.validate().unwrap());
+    custom_engine(schemas)
+}
+
+fn assert_round3_resource_location(body: &str, message: &str, tokens: &[(&str, usize)]) {
+    // Both the buffer parse and the sibling-function semantic fallback carry
+    // the same authored spans. Test them with inline syntax and decoy text.
+    for iterable in ["['one']", "names()"] {
+        let source = format!(
+            "let decoy = '😀 mock.test.Missing enabled = mode = config typo'\nlet items = for item in {iterable} {{ {body} }}\n"
+        );
+        let directory = Directory::new(&[
+            (
+                "main.crn",
+                "provider mock {}\nfn names(): list(String) { ['one'] }\n",
+            ),
+            ("sibling.crn", &source),
+        ]);
+        let doc = create_document_at(&source, directory.root.path().join("sibling.crn"));
+        assert_eq!(
+            doc.parsed().is_none(),
+            iterable == "names()",
+            "{iterable}: {:?}",
+            doc.parse_error()
+        );
+        directory.assert_sibling_owner(&round3_schema_engine(), message, tokens);
+    }
+}
+
 #[test]
-fn review_round2_cycle_uses_main_ring_and_only_its_members_files() {
+fn review_round3_resource_type_uses_parser_header() {
+    assert_round3_resource_location(
+        "mock.test.Missing {}",
+        "No schema for mock.test.Missing",
+        &[("mock.test.Missing", 1)],
+    );
+}
+
+#[test]
+fn review_round3_attribute_type_uses_parser_key() {
+    assert_round3_resource_location(
+        "mock.test.Thing { enabled = 'bad' }",
+        "expected Bool",
+        &[("enabled", 1)],
+    );
+}
+
+#[test]
+fn review_round3_enum_uses_parser_value() {
+    assert_round3_resource_location(
+        "mock.test.Thing { mode = 'bad' }",
+        "string literal",
+        &[("'bad'", 0)],
+    );
+}
+
+#[test]
+fn review_round3_unknown_attribute_uses_parser_key() {
+    assert_round3_resource_location(
+        "mock.test.Thing { typo = true }",
+        "Unknown attribute",
+        &[("typo", 1)],
+    );
+}
+
+#[test]
+fn review_round3_block_syntax_uses_each_parser_key() {
+    assert_round3_resource_location(
+        "mock.test.Thing { config { enabled = true } }",
+        "cannot use block syntax",
+        &[("config", 1)],
+    );
+}
+
+#[test]
+fn review_round3_nested_schema_uses_parser_field() {
+    assert_round3_resource_location(
+        "mock.test.Thing { config = { typo = true } }",
+        "Unknown field",
+        &[("typo", 1)],
+    );
+}
+
+#[test]
+fn review_round3_degraded_duplicates_keep_only_buffer_findings() {
+    let directory = Directory::new(&[
+        ("main.crn", "let same = 'first'\n"),
+        (
+            "sibling.crn",
+            "let same = provider mock {}\nlet same = provider mock {}\n",
+        ),
+    ]);
+    let engine = test_engine();
+    directory.assert_ranges(&engine, "main.crn", "duplicate binding", &[]);
+    directory.assert_ranges(
+        &engine,
+        "sibling.crn",
+        "duplicate binding",
+        &[("same", 0), ("same", 1)],
+    );
+}
+
+#[test]
+fn review_round3_module_call_findings_are_computed_once() {
+    let directory = Directory::new(&[
+        ("main.crn", "let service = use { source = './module' }\n"),
+        ("sibling.crn", "service {}\n"),
+        ("module/main.crn", "arguments { required_name: String }\n"),
+    ]);
+    let path = directory.root.path().join("sibling.crn");
+    let doc = create_document_at("service {}\n", path.clone());
+    let (findings, work) = carina_core::parser::analysis_test_support::measure(|| {
+        test_engine().analyze(&doc, Some(&path))
+    });
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.message.contains("required_name")),
+        "{findings:#?}"
+    );
+    assert_eq!(
+        work.module_call_checks, 1,
+        "reuse findings for resolution and publication: {work:?}"
+    );
+}
+
+#[test]
+fn review_round3_cached_module_findings_keep_upstream_type_authority() {
+    let directory = Directory::new(&[
+        (
+            "main.crn",
+            "let up = upstream_state { source = './upstream' }\nlet service = use { source = './module' }\nlet broken = use { source = './missing' }\nbroken {}\n",
+        ),
+        ("sibling.crn", "service { count = up.value }\n"),
+        ("module/main.crn", "arguments { count: Int }\n"),
+        ("upstream/main.crn", "exports { value: String = 'wrong' }\n"),
+    ]);
+    directory.assert_sibling_owner(&test_engine(), "expected Int", &[("up.value", 0)]);
+}
+
+#[test]
+fn review_round3_cycle_reports_once_per_member_file_in_ring_order() {
     let directory = Directory::new(&[
         ("main.crn", MAIN),
         (
@@ -98,12 +269,7 @@ fn review_round2_cycle_uses_main_ring_and_only_its_members_files() {
     let engine = test_engine_with_wait_target();
     let message = "Circular dependency detected: a -> c -> b -> a";
     directory.assert_sibling_owner(&engine, message, &[("c", 3)]);
-    directory.assert_ranges(
-        &engine,
-        "values.crn",
-        message,
-        &[("a.domain_name", 0), ("b.domain_name", 0)],
-    );
+    directory.assert_ranges(&engine, "values.crn", message, &[("b.domain_name", 0)]);
 }
 
 #[test]
@@ -353,7 +519,7 @@ fn review_4220_module_reload_uses_the_unsaved_buffer() {
     );
     let merged = test_engine()
         .with_run_for_test(|run| {
-            run.parse_merged_with_buffer(
+            run.parse_and_resolve_merged_with_buffer(
                 &document,
                 Some("main.crn"),
                 &carina_core::paths::ResolvedPath::new(directory.root.path()).unwrap(),
@@ -361,6 +527,7 @@ fn review_4220_module_reload_uses_the_unsaved_buffer() {
         })
         .unwrap();
     let errors = match &merged.module_resolution {
+        checks::MergedModuleResolution::Unanalyzed => panic!("module analysis must run"),
         checks::MergedModuleResolution::Unowned { errors }
         | checks::MergedModuleResolution::ConstraintFailed { errors, .. } => errors,
         checks::MergedModuleResolution::Expanded { .. } => panic!("self-import must fail"),
@@ -763,7 +930,7 @@ fn expanded_module_diagnostic_keeps_its_authored_file()
     let document = create_document_at(&root_source, root_path);
     let merged = engine
         .with_run_for_test(|run| {
-            run.parse_merged_with_buffer(
+            run.parse_and_resolve_merged_with_buffer(
                 &document,
                 Some("main.crn"),
                 &carina_core::paths::ResolvedPath::new(directory.root.path()).unwrap(),
@@ -875,7 +1042,7 @@ fn cycle_from_exports_uses_the_sibling_lets_reference_location() {
         &engine,
         "main.crn",
         "Circular dependency",
-        &[("b", 0), ("a.domain_name", 0)],
+        &[("a.domain_name", 0)],
     );
     directory.assert_ranges(&engine, "exports.crn", "Circular dependency", &[]);
     directory.assert_ranges(&engine, "unrelated.crn", "Circular dependency", &[]);

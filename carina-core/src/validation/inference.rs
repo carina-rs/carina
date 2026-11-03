@@ -1328,9 +1328,17 @@ impl<B: BindingAddress> ExportParamsInferredWithLoadedProviderSchemas<B> {
 }
 
 /// Infer export parameters using schemas proven to come from provider loading.
+/// The input has already crossed the parser provenance boundary.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{parser::{ParsedFile, ProviderContext}, provider::ProviderLoadedSchemaRegistry, validation::inference::infer_export_params_with_loaded_provider_schemas};
+/// fn infer(file: &ParsedFile, schemas: &ProviderLoadedSchemaRegistry, context: &ProviderContext) {
+///     infer_export_params_with_loaded_provider_schemas(file, schemas, context);
+/// }
+/// ```
 pub fn infer_export_params_with_loaded_provider_schemas<D, B: BindingAddress>(
-    parsed: &crate::parser::File<
-        crate::parser::ParsedExportParam<crate::resource::ParserPlaceholder, B>,
+    tree: &crate::parser::AnalysisTree<
+        '_,
         crate::resource::ParserPlaceholder,
         crate::resource::ParserPlaceholder,
         D,
@@ -1338,7 +1346,7 @@ pub fn infer_export_params_with_loaded_provider_schemas<D, B: BindingAddress>(
     >,
     schemas: &ProviderLoadedSchemaRegistry,
     provider_context: &crate::parser::ProviderContext,
-) -> Result<ExportParamsInferredWithLoadedProviderSchemas<B>, crate::parser::AnalysisTreeError>
+) -> ExportParamsInferredWithLoadedProviderSchemas<B>
 where
     D: crate::parser::DeferredForPhaseTraversal<
             crate::resource::ParserPlaceholder,
@@ -1346,13 +1354,10 @@ where
             B,
         >,
 {
-    Ok(ExportParamsInferredWithLoadedProviderSchemas {
-        declarations: crate::parser::AnalysisTree::try_from_file(parsed)?
-            .syntax()
-            .declarations()
-            .to_vec(),
-        inferred: infer_export_params(parsed, schemas.schemas(), provider_context),
-    })
+    ExportParamsInferredWithLoadedProviderSchemas {
+        declarations: tree.syntax().declarations().to_vec(),
+        inferred: infer_export_params(tree.file(), schemas.schemas(), provider_context),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1502,21 +1507,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn review_round3_export_inference_reuses_sealed_tree() {
+        let parsed = crate::parser::parse_and_resolve("exports { answer = 'ready' }\n").unwrap();
+        let tree = crate::parser::AnalysisTree::try_from_file(&parsed).unwrap();
+        let schemas = ProviderLoadedSchemaRegistry::for_test(SchemaRegistry::new());
+        let (inferred, work) = crate::parser::analysis_test_support::measure(|| {
+            infer_export_params_with_loaded_provider_schemas(
+                &tree,
+                &schemas,
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+        });
+        assert_eq!(inferred.parameters()[0].name, "answer");
+        assert_eq!(
+            work.tree_builds, 0,
+            "inference must reuse the sealed input: {work:?}"
+        );
+    }
+
+    #[test]
     fn review_round2_loaded_export_inference_rejects_missing_provenance_without_panicking() {
         let mut parsed =
             crate::parser::parse_and_resolve("let source = mock.test.Resource {}\n").unwrap();
         parsed.resources[0].declaration = Default::default();
-        let schemas = ProviderLoadedSchemaRegistry::for_test(SchemaRegistry::new());
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            infer_export_params_with_loaded_provider_schemas(
-                &parsed,
-                &schemas,
-                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-            )
-        }));
-        let error = outcome
-            .expect("must not panic")
-            .expect_err("reject missing provenance");
+        let error = match crate::parser::AnalysisTree::try_from_file(&parsed) {
+            Ok(_) => panic!("reject missing provenance before inference"),
+            Err(error) => error,
+        };
         assert!(matches!(
             error.kind(),
             crate::parser::AnalysisTreeErrorKind::MissingResourceProvenance { .. }

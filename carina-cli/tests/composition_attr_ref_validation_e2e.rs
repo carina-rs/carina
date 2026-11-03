@@ -681,13 +681,13 @@ fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validatio
 
     // Exercise the same post-expansion inference + ref-validation seam used by
     // CLI validation, where both stages can otherwise report this one typo.
+    let analysis = carina_core::parser::AnalysisTree::try_from_file(&parsed).unwrap();
     let inferred_exports =
         carina_core::validation::inference::infer_export_params_with_loaded_provider_schemas(
-            &parsed,
+            &analysis,
             schemas,
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-        )
-        .unwrap();
+        );
     let bindings = carina_core::binding_index::BindingIndex::from_parsed(
         &parsed,
         schemas.schemas(),

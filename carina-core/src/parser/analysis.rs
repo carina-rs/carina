@@ -110,6 +110,9 @@ impl DeclarationLocation {
                 | Rule::if_expr
                 | Rule::resource_address
                 | Rule::function_call
+                | Rule::nested_block
+                | Rule::add_op
+                | Rule::multiplicative_op
         ));
         Self {
             file: SourceFileId::new(source_file.to_path_buf()),
@@ -474,6 +477,10 @@ pub struct AnalysisResourceRef<
     location: &'a DeclarationLocation,
     attribute_locations: std::collections::HashMap<String, &'a DeclarationLocation>,
     attribute_keys: &'a [super::AttributeKeyLocation],
+    attribute_values: &'a [super::elements::AttributeValueLocation],
+    integer_operators: &'a [DeclarationLocation],
+    type_location: &'a DeclarationLocation,
+    ignore_changes_location: Option<&'a DeclarationLocation>,
     references: Vec<AnalysisReference<B>>,
     dependencies: Vec<AnalysisDependencyRef<'a, B>>,
     dependency_edges: DependencyEdges<B>,
@@ -759,6 +766,14 @@ fn attribute_provenance<'a, P: ValueKind, B: BindingAddress>(
                 })
             })?
             .location();
+        if !provenance.elements().attribute_values.iter().any(|value| {
+            matches!(value.path.first(), Some(super::AttributePathSegment::Attribute(name)) if name == key)
+        }) {
+            return Err(AnalysisTreeError::new(AnalysisTreeErrorKind::MissingElementProvenance {
+                declaration: location.clone(),
+                element: format!("attribute value {key}"),
+            }));
+        }
         keys.insert(key.clone(), key_location);
         let mut result = Ok(());
         value.visit_resource_refs(&mut |path| match path.reference_locations_shared() {
@@ -952,6 +967,156 @@ where
     pub fn attribute_keys(&self) -> &'a [super::AttributeKeyLocation] {
         self.attribute_keys
     }
+    pub fn type_location(&self) -> &'a DeclarationLocation {
+        self.type_location
+    }
+
+    pub fn attribute_key_location(&self, name: &str) -> &'a DeclarationLocation {
+        self.attribute_locations[name]
+    }
+
+    pub fn attribute_block_keys<'s>(
+        &'s self,
+        name: &'s str,
+    ) -> impl Iterator<Item = &'a DeclarationLocation> + 's {
+        self.attribute_keys.iter().filter(move |key| {
+            key.is_block() && matches!(key.path(), [super::AttributePathSegment::Attribute(attr)] if attr == name)
+        }).map(|key| key.location())
+    }
+
+    fn matches_attribute_path(
+        path: &[super::AttributePathSegment],
+        name: &str,
+        steps: &[crate::schema::FieldPathStep],
+    ) -> bool {
+        use super::AttributePathSegment as Segment;
+        use crate::schema::FieldPathStep as Step;
+        matches!(path.first(), Some(Segment::Attribute(attr)) if attr == name)
+            && path.len() == steps.len() + 1
+            && path[1..]
+                .iter()
+                .zip(steps)
+                .all(|(segment, step)| match (segment, step) {
+                    (Segment::StructField(a) | Segment::Key(a), Step::Field(b)) => a == b,
+                    (Segment::ListIndex(a), Step::Index(b)) => a == b,
+                    _ => false,
+                })
+    }
+
+    /// Computed containers may have no authored leaf. Use their closest
+    /// authored parent, whose location was sealed with the resource.
+    fn computed_parent_location(
+        &self,
+        name: &str,
+        path: &crate::schema::FieldPath,
+    ) -> Option<&'a DeclarationLocation> {
+        for depth in 0..path.steps().len() {
+            let steps = &path.steps()[..depth];
+            if let Some(parent) = self
+                .attribute_values
+                .iter()
+                .rev()
+                .find(|value| Self::matches_attribute_path(&value.path, name, steps))
+            {
+                if !parent.literal_container {
+                    return Some(if depth == 0 {
+                        self.attribute_key_location(name)
+                    } else {
+                        &parent.anchor
+                    });
+                }
+            } else if !self
+                .attribute_keys
+                .iter()
+                .any(|key| key.is_block() && Self::matches_attribute_path(key.path(), name, steps))
+            {
+                return Some(self.attribute_key_location(name));
+            }
+        }
+        None
+    }
+
+    pub fn attribute_value_location(
+        &self,
+        name: &str,
+        path: &crate::schema::FieldPath,
+    ) -> &'a DeclarationLocation {
+        if let Some(parent) = self.computed_parent_location(name, path) {
+            return parent;
+        }
+        let mut steps = path.steps();
+        loop {
+            if let Some(value) = self
+                .attribute_values
+                .iter()
+                .rev()
+                .find(|value| Self::matches_attribute_path(&value.path, name, steps))
+            {
+                return &value.location;
+            }
+            let Some((_, parent)) = steps.split_last() else {
+                return self.attribute_key_location(name);
+            };
+            steps = parent;
+        }
+    }
+
+    pub fn attribute_path_location(
+        &self,
+        name: &str,
+        path: &crate::schema::FieldPath,
+    ) -> &'a DeclarationLocation {
+        if let Some(parent) = self.computed_parent_location(name, path) {
+            return parent;
+        }
+        if let Some(key) = self
+            .attribute_keys
+            .iter()
+            .rev()
+            .find(|key| Self::matches_attribute_path(key.path(), name, path.steps()))
+        {
+            return key.location();
+        }
+        if let Some(value) = self
+            .attribute_values
+            .iter()
+            .rev()
+            .find(|value| Self::matches_attribute_path(&value.path, name, path.steps()))
+        {
+            return &value.anchor;
+        }
+        self.attribute_key_location(name)
+    }
+
+    pub fn replaceable_attribute_value(&self, name: &str) -> Option<&'a DeclarationLocation> {
+        self.attribute_values
+            .iter()
+            .rev()
+            .find(|value| Self::matches_attribute_path(&value.path, name, &[]) && value.replaceable)
+            .map(|value| &value.location)
+    }
+
+    pub fn is_list_literal(&self, name: &str) -> bool {
+        self.attribute_values
+            .iter()
+            .any(|value| Self::matches_attribute_path(&value.path, name, &[]) && value.list_literal)
+    }
+
+    pub fn schema<'s>(
+        &self,
+        schemas: &'s crate::schema::SchemaRegistry,
+    ) -> Option<crate::schema::OwnerBoundResourceSchema<'s>> {
+        match self.resource {
+            ResourceRef::Resource(resource) => schemas.get_for(resource),
+            ResourceRef::Deferred { resource, .. } => schemas.get_for(resource.as_resource()),
+            ResourceRef::DataSource(source) => schemas.get_for_data_source(source),
+            ResourceRef::LiveComposition(_) => None,
+        }
+    }
+
+    pub fn quoted_string_attrs(&self) -> &'a std::collections::HashSet<String> {
+        self.resource.quoted_string_attrs()
+    }
     pub fn provider_location(&self) -> &'a DeclarationLocation {
         self.provider_location
     }
@@ -1006,6 +1171,33 @@ where
             .into_iter()
             .map(|(key, value)| Located::new(self.attribute_locations[&key].clone(), (key, value)))
             .collect()
+    }
+
+    pub fn resolved_attributes(&self) -> std::collections::HashMap<String, Value<P, B>> {
+        self.resource.resolved_attributes()
+    }
+
+    pub fn ignore_changes_findings(
+        &self,
+        schema: &crate::schema::ValidatedResourceSchema,
+    ) -> Vec<Located<crate::resource::IgnoreChangeError>> {
+        let resource = match self.resource {
+            ResourceRef::Resource(resource) => resource,
+            ResourceRef::Deferred { resource, .. } => resource.as_resource(),
+            _ => return Vec::new(),
+        };
+        match crate::resource::resolve_ignore_changes(resource, schema) {
+            Ok(_) => Vec::new(),
+            Err(errors) => {
+                let location = self.ignore_changes_location.expect(
+                    "ignore_changes directive provenance validated at the analysis boundary",
+                );
+                errors
+                    .into_iter()
+                    .map(|error| Located::new(location.clone(), error))
+                    .collect()
+            }
+        }
     }
 
     pub fn directives(&self) -> Option<&'a Directives<B, P>> {
@@ -1080,9 +1272,11 @@ pub struct AnalysisTree<
     T: ValueKind = P,
     D = ParsedDeferredForPhase<P, RelativeBindingName>,
     B: BindingAddress = RelativeBindingName,
+    E = super::ParsedExportParam<P, B>,
 > where
     D: DeferredForPhaseTraversal<P, T, B> + 'a,
 {
+    file: &'a File<E, P, T, D, B>,
     resources: Vec<AnalysisResourceRef<'a, P, T, D, B>>,
     top_level_resource_count: usize,
     waits: Vec<AnalysisWaitRef<'a, B>>,
@@ -1105,16 +1299,19 @@ pub struct AnalysisTree<
     backend_location: Option<&'a DeclarationLocation>,
 }
 
-impl<'a, P, T, D, B> AnalysisTree<'a, P, T, D, B>
+impl<'a, P, T, D, B, E> AnalysisTree<'a, P, T, D, B, E>
 where
     P: ValueKind,
     T: ValueKind,
     B: BindingAddress,
     D: DeferredForPhaseTraversal<P, T, B>,
 {
-    pub fn try_from_file<E: super::ExportParamLike<P, B>>(
-        file: &'a File<E, P, T, D, B>,
-    ) -> Result<Self, AnalysisTreeError> {
+    pub fn try_from_file(file: &'a File<E, P, T, D, B>) -> Result<Self, AnalysisTreeError>
+    where
+        E: super::ExportParamLike<P, B>,
+    {
+        #[cfg(any(test, feature = "test-utils"))]
+        super::analysis_test_support::tree_built();
         let mut value_references = Vec::new();
         let resource_refs = file
             .resources
@@ -1326,6 +1523,32 @@ where
                     provider_location,
                     iterable,
                     attribute_keys: &provenance.elements().keys,
+                    attribute_values: &provenance.elements().attribute_values,
+                    integer_operators: &provenance.elements().integer_operators,
+                    type_location: if matches!(resource, ResourceRef::LiveComposition(_)) {
+                        location
+                    } else {
+                        required_element(provenance, super::elements::ElementKind::ResourceType)?
+                    },
+                    ignore_changes_location: match resource {
+                        ResourceRef::Resource(resource)
+                            if !resource.directives.ignore_changes.is_empty() =>
+                        {
+                            Some(required_element(
+                                provenance,
+                                super::elements::ElementKind::IgnoreChanges,
+                            )?)
+                        }
+                        ResourceRef::Deferred { resource, .. }
+                            if !resource.as_resource().directives.ignore_changes.is_empty() =>
+                        {
+                            Some(required_element(
+                                provenance,
+                                super::elements::ElementKind::IgnoreChanges,
+                            )?)
+                        }
+                        _ => None,
+                    },
                 })
             })
             .collect::<Result<_, AnalysisTreeError>>()?;
@@ -1898,6 +2121,7 @@ where
             }
         }
         Ok(Self {
+            file,
             resources,
             top_level_resource_count: file.resources.len()
                 + file.compositions.len()
@@ -1931,6 +2155,11 @@ where
                 .chain(file.structural_bindings.iter().map(ToString::to_string))
                 .collect(),
         })
+    }
+
+    /// Core transformations can only clone the same input that was sealed.
+    pub(crate) fn file(&self) -> &'a File<E, P, T, D, B> {
+        self.file
     }
 
     pub fn providers(&self) -> &'a [super::ProviderConfig<P, B>] {
@@ -2057,7 +2286,7 @@ where
     }
 }
 
-impl<'a, E, P, T, D, B> TryFrom<&'a File<E, P, T, D, B>> for AnalysisTree<'a, P, T, D, B>
+impl<'a, E, P, T, D, B> TryFrom<&'a File<E, P, T, D, B>> for AnalysisTree<'a, P, T, D, B, E>
 where
     E: super::ExportParamLike<P, B>,
     P: ValueKind,
@@ -2072,10 +2301,45 @@ where
     }
 }
 
-impl<D, B: BindingAddress> AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>
+impl<D, B: BindingAddress, E> AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>
 where
     D: DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
+    pub fn integer_arithmetic_findings(
+        &self,
+        resource: &AnalysisResourceRef<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+        name: &str,
+        sink: crate::schema::EffectiveType<'_>,
+        bindings: &crate::validation::inference::InferenceBindings<ParserPlaceholder, B>,
+        schemas: &crate::schema::SchemaRegistry,
+        binding_index: &crate::binding_index::BindingIndex<'_, B>,
+    ) -> Vec<Located<crate::validation::IntegerArithmeticTypeFinding>> {
+        let attributes = resource.attributes();
+        crate::validation::check_integer_arithmetic_types(
+            &attributes[name],
+            sink,
+            bindings,
+            schemas,
+            binding_index,
+        )
+        .into_iter()
+        .map(|finding| {
+            let span = finding.operator_span();
+            let location = resource
+                .integer_operators
+                .iter()
+                .find(|location| {
+                    Some(location.span().start_line()) == span.line()
+                        && Some(location.span().start_column()) == span.column()
+                })
+                .unwrap_or_else(|| {
+                    resource.attribute_value_location(name, &crate::schema::FieldPath::new())
+                });
+            Located::new(location.clone(), finding)
+        })
+        .collect()
+    }
+
     pub(crate) fn visit_function_values(
         &self,
         visit: &mut impl FnMut(Located<FunctionValidationValue<'_, ParserPlaceholder, B>>),
@@ -2202,5 +2466,30 @@ where
             });
         }
         bindings
+    }
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::*;
+
+    #[test]
+    fn review_round3_missing_attribute_value_provenance_fails_at_seal() {
+        let mut parsed = super::super::parse_file(
+            "mock.test.Resource { enabled = true }\n",
+            Path::new("sibling.crn"),
+            &super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        Arc::make_mut(&mut parsed.resources[0].declaration.elements)
+            .attribute_values
+            .clear();
+        let error = match AnalysisTree::try_from_file(&parsed) {
+            Ok(_) => panic!("missing value provenance must fail before any analysis runs"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error.kind(), AnalysisTreeErrorKind::MissingElementProvenance { element, .. } if element == "attribute value enabled")
+        );
     }
 }

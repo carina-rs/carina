@@ -67,7 +67,8 @@ pub type UpstreamExportEntries = HashMap<String, UpstreamExportEntry>;
 /// completion, future doc tools) read the body without re-parsing
 /// the upstream directory.
 pub type UpstreamExports<B = RelativeBindingName> = HashMap<B, UpstreamExportEntries>;
-type UpstreamAnalysis<'a, D, B> = AnalysisTree<'a, ParserPlaceholder, ParserPlaceholder, D, B>;
+type UpstreamAnalysis<'a, D, B, E> =
+    AnalysisTree<'a, ParserPlaceholder, ParserPlaceholder, D, B, E>;
 
 /// A diagnostic about a `binding.field` reference whose downstream usage
 /// doesn't fit the upstream's exports.
@@ -208,9 +209,9 @@ impl UpstreamRefDiagnostic for UpstreamFieldError {
 ///
 /// An empty directory (no `.crn` files) is treated as "exports nothing"
 /// rather than a parse failure; the user may be mid-setup.
-pub fn resolve_upstream_exports<D, B: BindingAddress>(
+pub fn resolve_upstream_exports<D, B: BindingAddress, E>(
     base_dir: &ResolvedPath,
-    tree: &UpstreamAnalysis<'_, D, B>,
+    tree: &UpstreamAnalysis<'_, D, B, E>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<
     (UpstreamExports<B>, Vec<Located<UpstreamResolveError>>),
@@ -222,9 +223,9 @@ where
     resolve_upstream_exports_with_schemas(base_dir, tree, config, None)
 }
 
-pub fn resolve_upstream_exports_with_schemas<D, B: BindingAddress>(
+pub fn resolve_upstream_exports_with_schemas<D, B: BindingAddress, E>(
     base_dir: &ResolvedPath,
-    tree: &UpstreamAnalysis<'_, D, B>,
+    tree: &UpstreamAnalysis<'_, D, B, E>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
 ) -> Result<
@@ -243,9 +244,9 @@ where
     )
 }
 
-pub fn resolve_upstream_exports_with_schemas_and_overrides<D, B: BindingAddress>(
+pub fn resolve_upstream_exports_with_schemas_and_overrides<D, B: BindingAddress, E>(
     base_dir: &ResolvedPath,
-    tree: &UpstreamAnalysis<'_, D, B>,
+    tree: &UpstreamAnalysis<'_, D, B, E>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
     overrides: &crate::config_loader::SourceOverrides,
@@ -283,9 +284,9 @@ pub struct MissingUpstreamDirectory {
     source_path: String,
 }
 
-pub fn check_upstream_state_sources<D, B: BindingAddress>(
+pub fn check_upstream_state_sources<D, B: BindingAddress, E>(
     base: &ResolvedPath,
-    tree: &UpstreamAnalysis<'_, D, B>,
+    tree: &UpstreamAnalysis<'_, D, B, E>,
 ) -> Vec<Located<MissingUpstreamDirectory>>
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -551,8 +552,9 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
 pub fn check_upstream_state_field_references<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     B: BindingAddress,
+    E,
 >(
-    parsed: &UpstreamAnalysis<'_, D, B>,
+    parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
 ) -> Vec<Located<UpstreamFieldError>> {
     check_upstream_state_field_references_inner(parsed, exports, true)
@@ -566,8 +568,9 @@ pub fn check_upstream_state_field_references<
 pub fn check_upstream_state_untyped_field_references<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     B: BindingAddress,
+    E,
 >(
-    parsed: &UpstreamAnalysis<'_, D, B>,
+    parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
 ) -> Vec<Located<UpstreamFieldError>> {
     check_upstream_state_field_references_inner(parsed, exports, false)
@@ -576,8 +579,9 @@ pub fn check_upstream_state_untyped_field_references<
 fn check_upstream_state_field_references_inner<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     B: BindingAddress,
+    E,
 >(
-    parsed: &UpstreamAnalysis<'_, D, B>,
+    parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
     include_typed_consumers: bool,
 ) -> Vec<Located<UpstreamFieldError>> {
@@ -784,8 +788,8 @@ impl UpstreamRefDiagnostic for UpstreamForIterableShapeError {
 /// Both flag `(ForBinding × shape)` mismatches; this one fires at
 /// validate time off the upstream's *declared* type, the parser-side
 /// one fires at expansion time off the *resolved* `Value`.
-pub fn check_upstream_state_for_iterable_shapes<D, B>(
-    parsed: &UpstreamAnalysis<'_, D, B>,
+pub fn check_upstream_state_for_iterable_shapes<D, B, E>(
+    parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
 ) -> Vec<Located<UpstreamForIterableShapeError>>
 where
@@ -980,8 +984,9 @@ impl UpstreamRefDiagnostic for UpstreamAttributeAccessShapeError {
 pub fn check_upstream_state_attribute_access_shapes<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     B: BindingAddress,
+    E,
 >(
-    parsed: &UpstreamAnalysis<'_, D, B>,
+    parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
 ) -> Vec<Located<UpstreamAttributeAccessShapeError>> {
     check_upstream_state_attribute_access_shapes_inner(parsed, exports, true)
@@ -997,8 +1002,9 @@ pub fn check_upstream_state_attribute_access_shapes<
 pub fn check_upstream_state_attribute_access_shape_fallbacks<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     B: BindingAddress,
+    E,
 >(
-    parsed: &UpstreamAnalysis<'_, D, B>,
+    parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
 ) -> Vec<Located<UpstreamAttributeAccessShapeError>> {
     check_upstream_state_attribute_access_shapes_inner(parsed, exports, false)
@@ -1007,8 +1013,9 @@ pub fn check_upstream_state_attribute_access_shape_fallbacks<
 fn check_upstream_state_attribute_access_shapes_inner<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     B: BindingAddress,
+    E,
 >(
-    parsed: &UpstreamAnalysis<'_, D, B>,
+    parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
     include_resolver_struct_errors: bool,
 ) -> Vec<Located<UpstreamAttributeAccessShapeError>> {
@@ -1200,8 +1207,9 @@ impl UpstreamRefDiagnostic for UpstreamSubscriptShapeError {
 pub fn check_upstream_state_subscript_shapes<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     B: BindingAddress,
+    E,
 >(
-    parsed: &UpstreamAnalysis<'_, D, B>,
+    parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
 ) -> Vec<Located<UpstreamSubscriptShapeError>> {
     let mut errors: Vec<Located<UpstreamSubscriptShapeError>> = Vec::new();

@@ -32,11 +32,13 @@ type ResolvedBindings = GenericResolvedBindings<ParserPlaceholder, RelativeBindi
 /// Directory parse plus the typed module-resolution outcome.
 pub(super) struct MergedParseResult {
     pub(super) analysis_errors: Vec<carina_core::parser::AnalysisTreeError>,
-    pub(super) directory: DirectoryParseResult,
+    pub(super) authored_module_findings: Vec<carina_core::validation::ModuleCallFinding>,
+    pub(super) directory: std::sync::Arc<DirectoryParseResult>,
     pub(super) module_resolution: MergedModuleResolution,
 }
 
 pub(super) enum MergedModuleResolution {
+    Unanalyzed,
     Expanded {
         graph: Box<carina_core::parser::ModuleResolvedParsedFile>,
     },
@@ -855,71 +857,11 @@ impl DiagnosticRun<'_> {
         None
     }
 
-    /// Build the typed call findings that may claim resolver backstops.
-    fn module_call_findings_for_resolution(
-        &self,
-        parsed: &ParsedFile,
-        base_path: &carina_core::paths::ResolvedPath,
-        overrides: &carina_core::config_loader::SourceOverrides,
-    ) -> Result<
-        Vec<carina_core::validation::ModuleCallFinding>,
-        carina_core::parser::AnalysisTreeError,
-    > {
-        let pinned_base = Some(base_path.clone());
-        let signatures = pinned_base
-            .as_ref()
-            .map(|base| {
-                carina_core::module_resolver::load_resolved_module_signatures_with_overrides(
-                    parsed,
-                    base,
-                    self.provider_context.catalog(),
-                    overrides,
-                )
-            })
-            .unwrap_or_default();
-        let validation_context = carina_core::validation::ValidationTypeContext::in_session(
-            parsed,
-            &self.schemas,
-            self.provider_context,
-            &signatures,
-        );
-        let binding_use_report =
-            carina_core::validation::check_bare_binding_uses(parsed, &validation_context);
-        let bindings =
-            BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
-                parsed,
-                &self.schemas,
-                None,
-                &signatures,
-                self.provider_context,
-            );
-        carina_core::validation::check_module_calls_with_overrides(
-            carina_core::validation::ModuleCallCheckInput {
-                authored: parsed,
-                semantic: Some(parsed),
-                base_dir: pinned_base.as_ref(),
-                imported_signatures: &signatures,
-                provider_context: self.provider_context,
-                schemas: &self.schemas,
-                binding_use_report: &binding_use_report,
-                bindings: &bindings,
-                reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
-            },
-            overrides,
-        )
-    }
-
     /// Run a directory-scoped parse with the current editor buffer substituted
     /// for its on-disk copy, so diagnostics that need cross-file context
     /// (upstream-state exports, for-iterable bindings) update on keystrokes.
     ///
-    /// After the directory parse, run module expansion +
-    /// `resolve_provider_unresolved_attributes` + `finalize_provider_configs`
-    /// so deferred provider attributes (e.g. `default_tags = mod.tags`) reach
-    /// their typed fields and the LSP catches the same errors `carina validate`
-    /// would (#2717). A finalize error is non-fatal here: the merged parse is
-    /// still returned so identifier-scope and other diagnostics keep running;
-    /// the error itself surfaces via [`Self::finalize_provider_diagnostic`].
+    /// Module analysis follows after sealing and upstream type resolution.
     pub(super) fn parse_merged_with_buffer(
         &self,
         doc: &Document,
@@ -935,36 +877,49 @@ impl DiagnosticRun<'_> {
             self.provider_context.catalog(),
             &overrides,
         )?;
-        let source_overrides = carina_core::config_loader::SourceOverrides::from([(
-            doc.source_file().to_path_buf(),
-            doc.text(),
-        )]);
-        let (covered_findings, analysis_errors) = match self.module_call_findings_for_resolution(
-            &result.parsed,
+        Ok(MergedParseResult {
+            directory: std::sync::Arc::new(result),
+            module_resolution: MergedModuleResolution::Unanalyzed,
+            analysis_errors: Vec::new(),
+            authored_module_findings: Vec::new(),
+        })
+    }
+
+    /// Compute the canonical authored findings once, then reuse them to claim
+    /// resolver backstops and to publish source-owned diagnostics.
+    pub(super) fn resolve_merged_modules(
+        &self,
+        result: &mut MergedParseResult,
+        tree: &carina_core::parser::AnalysisTree<'_>,
+        base_path: &carina_core::paths::ResolvedPath,
+        upstream_exports: &carina_core::upstream_exports::UpstreamExports,
+        source_overrides: &carina_core::config_loader::SourceOverrides,
+    ) {
+        let covered_findings = match carina_core::validation::check_module_calls_from_analysis(
+            tree,
             base_path,
-            &source_overrides,
+            self.provider_context,
+            &self.schemas,
+            upstream_exports,
+            source_overrides,
         ) {
-            Ok(findings) => (findings, Vec::new()),
-            Err(error) => (Vec::new(), vec![error]),
+            Ok(findings) => findings,
+            Err(error) => {
+                result.analysis_errors.push(error);
+                return;
+            }
         };
-        if !analysis_errors.is_empty() {
-            return Ok(MergedParseResult {
-                directory: result,
-                module_resolution: MergedModuleResolution::Unowned { errors: Vec::new() },
-                analysis_errors,
-            });
-        }
         // Module expansion is a no-op for configs without `module_call`.
         // Failures retain the authored parse for source-level checks; only the
         // successful outcome can replace it with the expanded graph.
         let module_resolution =
             carina_core::module_resolver::resolve_modules_with_diagnostics_and_overrides(
-                &result.parsed,
+                &result.directory.parsed,
                 base_path,
                 self.provider_context,
                 &self.schemas,
                 &covered_findings,
-                &source_overrides,
+                source_overrides,
             );
         let module_resolution = match module_resolution {
             carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded {
@@ -985,11 +940,39 @@ impl DiagnosticRun<'_> {
                 MergedModuleResolution::Unowned { errors }
             }
         };
-        Ok(MergedParseResult {
-            directory: result,
-            module_resolution,
-            analysis_errors,
-        })
+        result.module_resolution = module_resolution;
+        result.authored_module_findings = covered_findings;
+    }
+
+    #[cfg(test)]
+    pub(super) fn parse_and_resolve_merged_with_buffer(
+        &self,
+        doc: &Document,
+        current_file_name: Option<&str>,
+        base_path: &carina_core::paths::ResolvedPath,
+    ) -> Result<MergedParseResult, carina_core::config_loader::DirectoryParseFailure> {
+        let mut result = self.parse_merged_with_buffer(doc, current_file_name, base_path)?;
+        let directory = std::sync::Arc::clone(&result.directory);
+        let overrides = carina_core::config_loader::SourceOverrides::from([(
+            doc.source_file().to_path_buf(),
+            doc.text(),
+        )]);
+        match carina_core::parser::AnalysisTree::try_from_file(directory.parsed.parsed()) {
+            Ok(tree) => {
+                match self.resolve_diagnostic_upstream_exports(base_path, &tree, &overrides) {
+                    Ok((exports, _)) => self.resolve_merged_modules(
+                        &mut result,
+                        &tree,
+                        base_path,
+                        &exports,
+                        &overrides,
+                    ),
+                    Err(error) => result.analysis_errors.push(error),
+                }
+            }
+            Err(error) => result.analysis_errors.push(error),
+        }
+        Ok(result)
     }
 
     pub(super) fn module_resolver_error_diagnostics(
@@ -1726,14 +1709,10 @@ impl DiagnosticRun<'_> {
         let inferred_export_params = if let Some(loaded_providers) = &self.loaded_providers {
             let provider_inferred = carina_core::validation::inference::
                 infer_export_params_with_loaded_provider_schemas(
-                    inference_input,
+                    tree,
                     loaded_providers.schemas(),
                     self.provider_context.catalog(),
                 );
-            let provider_inferred = match provider_inferred {
-                Ok(inferred) => inferred,
-                Err(error) => return render_analysis_invariant(doc, &error).into_iter().collect(),
-            };
             // Surface inference failures as "type annotation required"
             // diagnostics, anchored at the export name. Errors for
             // exports declared in sibling `.crn` files (visible only via
@@ -2044,13 +2023,15 @@ impl DiagnosticRun<'_> {
                     DependsOnDiagnosticKind::Cycle { cycle } => cycle
                         .members
                         .iter()
-                        .filter_map(|member| {
+                        .find(|member| member.location.file().path() == doc.source_file())
+                        .and_then(|member| {
                             let member = carina_core::parser::Located::new(
                                 member.location.clone(),
                                 &finding.message,
                             );
                             render_merged(doc, &member, severity, finding.message.clone())
                         })
+                        .into_iter()
                         .collect::<Vec<_>>(),
                     DependsOnDiagnosticKind::Element { .. } => {
                         render_merged(doc, &finding, severity, finding.message.clone())

@@ -3029,8 +3029,8 @@ pub fn validate_resources_with_ctx<
 /// `AppError::Validation`. Warnings are emitted to stderr (no
 /// AppError::Warning variant exists today) so they don't fail the
 /// command but remain visible.
-pub fn validate_depends_on_with_ctx<B, D>(
-    tree: &carina_core::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+pub fn validate_depends_on_with_ctx<B, D, E>(
+    tree: &carina_core::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
     argument_types: &validation::ResolvedArgumentTypes,
 ) -> Vec<AppError>
 where
@@ -3051,9 +3051,9 @@ where
 /// Surface `wait <target> { ... }` diagnostics as `AppError::Validation`.
 /// Shared with the LSP via the underlying
 /// `carina_core::validation::wait::validate_wait_bindings` pass.
-pub fn validate_wait_bindings_with_ctx<D, B>(
+pub fn validate_wait_bindings_with_ctx<D, B, E>(
     ctx: &WiringContext,
-    tree: &carina_core::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+    tree: &carina_core::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
 ) -> Vec<AppError>
 where
     B: BindingAddress,
@@ -3071,11 +3071,12 @@ where
 /// `carina_core::validation::deferred_populate::validate_deferred_populate_refs`
 /// pass. carina#3034.
 pub fn validate_deferred_populate_refs_with_ctx<
+    E,
     B: BindingAddress,
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     ctx: &WiringContext,
-    tree: &carina_core::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+    tree: &carina_core::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
 ) -> Vec<AppError> {
     carina_core::validation::deferred_populate::validate_deferred_populate_refs(tree, ctx.schemas())
         .into_iter()

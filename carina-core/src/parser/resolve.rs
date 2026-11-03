@@ -685,6 +685,33 @@ pub fn resolve_resource_refs_in_session<E: ExportParamLike>(
         .map_err(AnalysisResolutionError::from_parse_failure)
 }
 
+/// Resolve a copy of the already sealed input. The original remains a valid
+/// read-only analysis view; no independently supplied raw file can bypass it.
+///
+/// ```compile_fail,E0308
+/// use carina_core::parser::{ParsedFile, resolve_resource_refs_from_analysis};
+/// use carina_core::validation::deferred_types::ProviderTypeCheckContext;
+/// fn resolve(file: &ParsedFile, session: &dyn ProviderTypeCheckContext) {
+///     resolve_resource_refs_from_analysis(file, session);
+/// }
+/// ```
+pub fn resolve_resource_refs_from_analysis<E: ExportParamLike + Clone>(
+    tree: &super::AnalysisTree<
+        '_,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        super::ParsedDeferredForPhase<ParserPlaceholder, RelativeBindingName>,
+        RelativeBindingName,
+        E,
+    >,
+    session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+) -> Result<File<E>, AnalysisResolutionError> {
+    let mut parsed = tree.file().clone();
+    resolve_resource_refs_with_policy(&mut parsed, session.catalog(), Some(session), false, false)
+        .map_err(AnalysisResolutionError::from_parse_failure)?;
+    Ok(parsed)
+}
+
 /// Parser/module-loader evaluation before the analysis boundary is sealed.
 pub(crate) fn resolve_resource_refs_in_session_unsealed<E: ExportParamLike>(
     parsed: &mut File<E>,

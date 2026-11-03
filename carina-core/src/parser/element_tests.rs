@@ -9,6 +9,44 @@ fn slice<'a>(source: &'a str, location: &DeclarationLocation) -> &'a str {
 }
 
 #[test]
+fn review_round3_resolution_reuses_sealed_tree() {
+    let config = context();
+    let parsed = parse_file("let value = 'ready'\n", Path::new("sibling.crn"), &config).unwrap();
+    let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+    crate::validation::deferred_types::with_session_for_test(&config, |session| {
+        let (result, work) =
+            analysis_test_support::measure(|| resolve_resource_refs_from_analysis(&tree, session));
+        result.unwrap();
+        assert_eq!(
+            work.tree_builds, 0,
+            "resolution must reuse the sealed input: {work:?}"
+        );
+    });
+}
+
+#[test]
+fn review_round3_type_resolution_reuses_sealed_tree() {
+    let config = context();
+    let parsed = parse_file(
+        "arguments { value: String }\n",
+        Path::new("sibling.crn"),
+        &config,
+    )
+    .unwrap();
+    let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+    crate::validation::deferred_types::with_session_for_test(&config, |session| {
+        let (result, work) = analysis_test_support::measure(|| {
+            crate::validation::resolve_file_type_exprs_from_analysis(&tree, session, None)
+        });
+        assert!(result.1.diagnostics().is_empty());
+        assert_eq!(
+            work.tree_builds, 0,
+            "type resolution must reuse the sealed input: {work:?}"
+        );
+    });
+}
+
+#[test]
 fn nested_keys_and_repeated_blocks_keep_occurrence_paths()
 -> Result<(), crate::parser::AnalysisTreeError> {
     let source = "mock.test.Resource {\n  settings = { inner = [{ label = 'a' }, { label = 'b' }] }\n  rule { name = 'first' }\n  rule { name = 'second' }\n}\n";

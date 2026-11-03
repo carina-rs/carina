@@ -239,16 +239,15 @@ fn round7_duplicate_binding_ignores_if_local_binding() {
 }
 
 #[test]
-fn round7_second_pass_range_ends_at_indented_content_end() {
-    let (source, diagnostics) =
+fn round3_second_pass_range_owns_only_the_attribute_key() {
+    let (_source, diagnostics) =
         unique_list_declaration_scope_fixture("tag_list = \"\u{65e5}\u{672c}\u{8a9e}\"   ", true);
     let error = only_message_diagnostic(&diagnostics, "Unknown attribute");
-    let line = source.lines().nth(2).unwrap();
     assert_eq!(
         error.range,
         Range::new(
             Position::new(2, 2),
-            Position::new(2, line.trim_end().chars().count() as u32),
+            Position::new(2, 2 + "tag_list".len() as u32),
         ),
         "{diagnostics:#?}"
     );
@@ -579,6 +578,28 @@ fn round5_indexed_list_errors_keep_paths_without_element_spans() {
 }
 
 #[test]
+fn review_round3_computed_container_does_not_borrow_argument_element_spans() {
+    let (source, diagnostics) =
+        unique_list_declaration_scope_fixture("tags_list = concat([5], [6])", true);
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("expected String"))
+        .collect();
+    assert_eq!(errors.len(), 2, "{diagnostics:#?}");
+    let start = source.lines().nth(2).unwrap().find("tags_list").unwrap() as u32;
+    for diagnostic in errors {
+        assert_eq!(
+            diagnostic.range,
+            Range::new(
+                Position::new(2, start),
+                Position::new(2, start + "tags_list".len() as u32)
+            ),
+            "{diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
 fn non_unique_lists_continue_to_allow_duplicate_elements() {
     for body in [
         "tags_list = [\"ok\", \"ok\"]",
@@ -643,15 +664,14 @@ fn unique_list_count_error_stays_in_the_second_resource() {
         .nth(1)
         .unwrap();
     let attributes = resource.attributes();
-    let text = document.text();
-    let source = DiagnosticSource::new(&document, &text);
+    let tree =
+        carina_core::parser::AnalysisTree::try_from_file(document.parsed().unwrap()).unwrap();
     let (diagnostics, reported_duplicate) = test_engine().validate_container_value(
-        &source,
+        &document,
+        tree.project_resources().nth(1).unwrap(),
         "values",
         attributes.get("values").unwrap(),
         &effective_type,
-        None,
-        Some((3, 6)),
     );
     let diagnostic = only_message_diagnostic(&diagnostics, "outside allowed range");
     assert_eq!(diagnostic.range.start.line, 4, "{diagnostics:?}");
@@ -731,15 +751,14 @@ fn unique_list_item_error_does_not_mark_a_duplicate_as_reported() {
     let effective_attribute = schema.effective_attribute("matrix").unwrap();
     let effective_type = effective_attribute.value_type();
     let engine = test_engine();
-    let text = document.text();
-    let source = DiagnosticSource::new(&document, &text);
+    let tree =
+        carina_core::parser::AnalysisTree::try_from_file(document.parsed().unwrap()).unwrap();
     let (diagnostics, reported_duplicate) = engine.validate_container_value(
-        &source,
+        &document,
+        tree.project_resources().next().unwrap(),
         "matrix",
         value,
         &effective_type,
-        None,
-        Some((0, 3)),
     );
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert!(diagnostics[0].message.contains("expected String"));
@@ -15224,7 +15243,7 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position()
     );
     let merged = engine
         .with_run_for_test(|run| {
-            run.parse_merged_with_buffer(
+            run.parse_and_resolve_merged_with_buffer(
                 &call_doc,
                 Some("call.crn"),
                 &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
@@ -15232,6 +15251,7 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position()
         })
         .expect("root directory parses before module expansion");
     let errors = match &merged.module_resolution {
+        checks::MergedModuleResolution::Unanalyzed => panic!("module analysis must run"),
         crate::diagnostics::checks::MergedModuleResolution::ConstraintFailed {
             findings: _,
             errors,

@@ -4663,10 +4663,11 @@ where
 }
 
 fn validate_deferred_for_iterable_types_with_bindings<
+    E,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
-    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
     schemas: &SchemaRegistry,
     bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
     provider_context: &ProviderContext,
@@ -6075,10 +6076,29 @@ fn resolve_file_type_exprs_impl<
     ),
     crate::parser::AnalysisTreeError,
 > {
-    use deferred_types::ProviderTypeCheckSite;
     let annotations = crate::parser::AnalysisTree::try_from_file(parsed)?
         .type_annotations()
         .to_vec();
+    Ok(resolve_file_type_exprs_with_annotations(
+        parsed,
+        config,
+        &annotations,
+    ))
+}
+
+fn resolve_file_type_exprs_with_annotations<
+    E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+>(
+    parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    annotations: &[crate::parser::Located<TypeResolutionContext>],
+) -> (
+    Vec<crate::parser::Located<TypeResolutionDiagnostic>>,
+    ResolvedArgumentTypes,
+) {
+    use deferred_types::ProviderTypeCheckSite;
     let mut occurrences = std::collections::HashMap::<TypeResolutionContext, usize>::new();
     let mut annotation = |kind, name: &str| {
         let context = TypeResolutionContext::Declaration {
@@ -6217,12 +6237,12 @@ fn resolve_file_type_exprs_impl<
             config.fail_function_declaration(source, &function.name);
         }
     }
-    Ok((
+    (
         errors,
         ResolvedArgumentTypes {
             types: argument_types,
         },
-    ))
+    )
 }
 
 /// Resolve a signature snapshot when the consumer's provider catalog may be
@@ -6279,6 +6299,41 @@ pub fn resolve_file_type_exprs_report<
         covered_parser_error,
         resolved_argument_types,
     })
+}
+
+/// Resolve a copy of a sealed input using its already validated annotations.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{parser::ParsedFile, validation::{resolve_file_type_exprs_from_analysis, deferred_types::ProviderTypeCheckContext}};
+/// fn resolve(file: &ParsedFile, session: &dyn ProviderTypeCheckContext) {
+///     resolve_file_type_exprs_from_analysis(file, session, None);
+/// }
+/// ```
+pub fn resolve_file_type_exprs_from_analysis<
+    E: crate::parser::ExportParamLike<ParserPlaceholder, B> + Clone,
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B> + Clone,
+>(
+    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    parser_error: Option<TypeResolutionParserError<'_>>,
+) -> (
+    crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    FileTypeResolutionReport,
+) {
+    let mut parsed = tree.file().clone();
+    let (diagnostics, resolved_argument_types) =
+        resolve_file_type_exprs_with_annotations(&mut parsed, config, tree.type_annotations());
+    let covered_parser_error = parser_error
+        .is_some_and(|error| type_resolution_parser_error_is_covered(&diagnostics, error));
+    (
+        parsed,
+        FileTypeResolutionReport {
+            diagnostics,
+            resolved_argument_types,
+            covered_parser_error,
+        },
+    )
 }
 
 /// Resolve declarations with an intentionally incomplete provider context.
@@ -8392,10 +8447,61 @@ pub fn check_module_calls<E>(
     check_module_calls_with_overrides(input, &Default::default())
 }
 
+/// Check a sealed directory with its authoritative upstream facts. The same
+/// findings can then be reused for module-resolution ownership and publication.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{parser::ParsedFile, validation::{check_module_calls_from_analysis, deferred_types::ProviderTypeCheckContext}, paths::ResolvedPath, schema::SchemaRegistry, upstream_exports::UpstreamExports, config_loader::SourceOverrides};
+/// fn reject_raw(file: &ParsedFile, base: &ResolvedPath, context: &dyn ProviderTypeCheckContext, schemas: &SchemaRegistry, exports: &UpstreamExports, overrides: &SourceOverrides) {
+///     check_module_calls_from_analysis(file, base, context, schemas, exports, overrides);
+/// }
+/// ```
+pub fn check_module_calls_from_analysis(
+    tree: &crate::parser::AnalysisTree<'_>,
+    base: &crate::paths::ResolvedPath,
+    provider_context: &dyn deferred_types::ProviderTypeCheckContext,
+    schemas: &SchemaRegistry,
+    upstream_exports: &crate::upstream_exports::UpstreamExports,
+    overrides: &crate::config_loader::SourceOverrides,
+) -> Result<Vec<ModuleCallFinding>, crate::parser::AnalysisTreeError> {
+    let parsed = tree.file();
+    let signatures = crate::module_resolver::load_resolved_module_signatures_with_overrides(
+        parsed,
+        base,
+        provider_context.catalog(),
+        overrides,
+    );
+    let context = ValidationTypeContext::in_session(parsed, schemas, provider_context, &signatures);
+    let binding_use_report = check_bare_binding_uses(parsed, &context);
+    let bindings = BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
+        parsed,
+        schemas,
+        Some(upstream_exports),
+        &signatures,
+        provider_context,
+    );
+    check_module_calls_with_overrides(
+        ModuleCallCheckInput {
+            authored: parsed,
+            semantic: Some(parsed),
+            base_dir: Some(base),
+            imported_signatures: &signatures,
+            provider_context,
+            schemas,
+            binding_use_report: &binding_use_report,
+            bindings: &bindings,
+            reference_checks: ModuleCallReferenceChecks::Enabled,
+        },
+        overrides,
+    )
+}
+
 pub fn check_module_calls_with_overrides<E>(
     input: ModuleCallCheckInput<'_, '_, E, dyn deferred_types::ProviderTypeCheckContext + '_>,
     overrides: &crate::config_loader::SourceOverrides,
 ) -> Result<Vec<ModuleCallFinding>, crate::parser::AnalysisTreeError> {
+    #[cfg(any(test, feature = "test-utils"))]
+    crate::parser::analysis_test_support::module_calls_checked();
     let provider_context = typecheck::TypecheckProviderContext::for_session(input.provider_context);
     check_module_calls_with_provider_context(input, provider_context, overrides)
 }

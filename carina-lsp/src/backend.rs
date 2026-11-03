@@ -22,15 +22,9 @@ use crate::workspace;
 
 /// Calculate the end position (line, character) of a text document.
 pub fn document_end_position(text: &str) -> (u32, u32) {
-    let line_count = text.chars().filter(|&c| c == '\n').count();
-    let last_line = line_count as u32;
-    let last_char = text
-        .lines()
-        .last()
-        .map(crate::position::char_len)
-        .unwrap_or(0);
-    let last_char = if text.ends_with('\n') { 0 } else { last_char };
-    (last_line, last_char)
+    let end = crate::position::byte_offset_to_position(text, text.len())
+        .expect("the end of a string is a UTF-8 boundary");
+    (end.line, end.character)
 }
 
 fn format_document_with_schemas(

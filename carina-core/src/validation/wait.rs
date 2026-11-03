@@ -58,13 +58,14 @@ impl std::fmt::Display for WaitDiagnostic {
 ///     validate_wait_bindings(file, &SchemaRegistry::new());
 /// }
 /// ```
-pub fn validate_wait_bindings<D, B>(
+pub fn validate_wait_bindings<D, B, E>(
     parsed: &AnalysisTree<
         '_,
         crate::resource::ParserPlaceholder,
         crate::resource::ParserPlaceholder,
         D,
         B,
+        E,
     >,
     schemas: &SchemaRegistry,
 ) -> Vec<Located<WaitDiagnostic>>
