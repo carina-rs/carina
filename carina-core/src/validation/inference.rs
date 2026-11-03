@@ -1178,7 +1178,7 @@ fn infer_function_call<P: PlaceholderKind, B: BindingAddress>(
 /// Phase transition (#2360 stage 2): attach declared/inferred origin and any
 /// typed unchecked reason to every export.
 pub fn apply_inference<D, B: BindingAddress>(
-    mut parsed: crate::parser::File<
+    parsed: crate::parser::File<
         crate::parser::ParsedExportParam<crate::resource::ParserPlaceholder, B>,
         crate::resource::ParserPlaceholder,
         crate::resource::ParserPlaceholder,
@@ -1201,13 +1201,6 @@ where
             B,
         >,
 {
-    for export in &parsed.export_params {
-        parsed.parser_binding_metadata.insert_export_type_source(
-            export.name.clone(),
-            export.source_file().to_path_buf(),
-            export.source_span(),
-        );
-    }
     let inferred_exports =
         infer_export_params(&parsed, schemas, provider_context).into_parameters();
     // Single phase-axis surface (carina#3126): only `export_params`
@@ -1312,6 +1305,7 @@ where
 #[derive(Debug, Clone)]
 pub struct ExportParamsInferredWithLoadedProviderSchemas<B: BindingAddress = RelativeBindingName> {
     inferred: SchemaCheckedExportParams<B>,
+    declarations: Vec<crate::parser::Located<crate::parser::DeclarationRecord>>,
 }
 
 impl<B: BindingAddress> ExportParamsInferredWithLoadedProviderSchemas<B> {
@@ -1324,6 +1318,7 @@ impl<B: BindingAddress> ExportParamsInferredWithLoadedProviderSchemas<B> {
     pub fn checked_exports(&self) -> ExportsInferredWithLoadedProviderSchemas<'_, B> {
         ExportsInferredWithLoadedProviderSchemas {
             parameters: self.parameters(),
+            declarations: self.declarations.clone(),
         }
     }
 
@@ -1333,9 +1328,17 @@ impl<B: BindingAddress> ExportParamsInferredWithLoadedProviderSchemas<B> {
 }
 
 /// Infer export parameters using schemas proven to come from provider loading.
+/// The input has already crossed the parser provenance boundary.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{parser::{ParsedFile, ProviderContext}, provider::ProviderLoadedSchemaRegistry, validation::inference::infer_export_params_with_loaded_provider_schemas};
+/// fn infer(file: &ParsedFile, schemas: &ProviderLoadedSchemaRegistry, context: &ProviderContext) {
+///     infer_export_params_with_loaded_provider_schemas(file, schemas, context);
+/// }
+/// ```
 pub fn infer_export_params_with_loaded_provider_schemas<D, B: BindingAddress>(
-    parsed: &crate::parser::File<
-        crate::parser::ParsedExportParam<crate::resource::ParserPlaceholder, B>,
+    tree: &crate::parser::AnalysisTree<
+        '_,
         crate::resource::ParserPlaceholder,
         crate::resource::ParserPlaceholder,
         D,
@@ -1352,7 +1355,8 @@ where
         >,
 {
     ExportParamsInferredWithLoadedProviderSchemas {
-        inferred: infer_export_params(parsed, schemas.schemas(), provider_context),
+        declarations: tree.syntax().declarations().to_vec(),
+        inferred: infer_export_params(tree.file(), schemas.schemas(), provider_context),
     }
 }
 
@@ -1362,19 +1366,26 @@ pub struct AttachedInferenceFailure<'a> {
     pub error: &'a InferenceError,
 }
 
+impl std::fmt::Display for AttachedInferenceFailure<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&format_inference_error(self.name, self.error))
+    }
+}
+
 /// Proof-bearing export view whose inference ran against loaded provider schemas.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ExportsInferredWithLoadedProviderSchemas<'a, B: BindingAddress = RelativeBindingName> {
     parameters: &'a [crate::parser::InferredExportParam<crate::resource::ParserPlaceholder, B>],
+    declarations: Vec<crate::parser::Located<crate::parser::DeclarationRecord>>,
 }
 
 pub fn attached_inference_failures<'a, B: BindingAddress>(
     checked: ExportsInferredWithLoadedProviderSchemas<'a, B>,
-) -> impl Iterator<Item = AttachedInferenceFailure<'a>> + 'a {
+) -> impl Iterator<Item = crate::parser::Located<AttachedInferenceFailure<'a>>> + 'a {
     checked
         .parameters
         .iter()
-        .filter_map(|parameter| match &parameter.static_type {
+        .filter_map(move |parameter| match &parameter.static_type {
             ExportStaticType::Declared(_type_expr) => None,
             ExportStaticType::Inferred(StaticType::Known(_type_expr)) => None,
             ExportStaticType::Inferred(StaticType::Unchecked(
@@ -1382,10 +1393,27 @@ pub fn attached_inference_failures<'a, B: BindingAddress>(
             )) => None,
             ExportStaticType::Inferred(StaticType::Unchecked(
                 InferredUncheckedReason::InferenceFailed(error),
-            )) => Some(AttachedInferenceFailure {
-                name: &parameter.name,
-                error,
-            }),
+            )) => {
+                let declaration = checked
+                    .declarations
+                    .iter()
+                    .find(|declaration| {
+                        declaration.kind() == crate::config_loader::DeclarationKind::Export
+                            && declaration.name() == parameter.name
+                            && declaration.location().file().path() == parameter.source_file()
+                            && parameter
+                                .source_span()
+                                .contains(declaration.location().span())
+                    })
+                    .expect("every inferred export has a parser-owned name location");
+                Some(crate::parser::Located::new(
+                    declaration.location().clone(),
+                    AttachedInferenceFailure {
+                        name: &parameter.name,
+                        error,
+                    },
+                ))
+            }
         })
 }
 
@@ -1402,7 +1430,7 @@ pub fn retry_unchecked_export_inference<'a, D, B: BindingAddress>(
     >,
     schemas: &ProviderLoadedSchemaRegistry,
     provider_context: &crate::parser::ProviderContext,
-) -> ExportsInferredWithLoadedProviderSchemas<'a, B>
+) -> Result<ExportsInferredWithLoadedProviderSchemas<'a, B>, crate::parser::AnalysisTreeError>
 where
     D: crate::parser::DeferredForPhaseTraversal<
             crate::resource::ParserPlaceholder,
@@ -1410,6 +1438,10 @@ where
             B,
         >,
 {
+    let declarations = crate::parser::AnalysisTree::try_from_file(parsed)?
+        .syntax()
+        .declarations()
+        .to_vec();
     let bindings = bindings_from_parsed(parsed);
 
     for parameter in &mut parsed.export_params {
@@ -1451,9 +1483,10 @@ where
         }
     }
 
-    ExportsInferredWithLoadedProviderSchemas {
+    Ok(ExportsInferredWithLoadedProviderSchemas {
         parameters: &parsed.export_params,
-    }
+        declarations,
+    })
 }
 
 /// Format an inference error pointing at the offending export. The shared CLI
@@ -1472,6 +1505,59 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn export_inference_returns_inferred_type() {
+        let parsed = crate::parser::parse_and_resolve("exports { answer = 'ready' }\n").unwrap();
+        let tree = crate::parser::AnalysisTree::try_from_file(&parsed).unwrap();
+        let schemas = ProviderLoadedSchemaRegistry::for_test(SchemaRegistry::new());
+        let inferred = infer_export_params_with_loaded_provider_schemas(
+            &tree,
+            &schemas,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
+        assert_eq!(inferred.parameters().len(), 1);
+        assert_eq!(inferred.parameters()[0].name, "answer");
+        assert_eq!(
+            inferred.parameters()[0].static_type,
+            ExportStaticType::Inferred(StaticType::Known(TypeExpr::String))
+        );
+    }
+
+    #[test]
+    fn loaded_export_inference_rejects_missing_provenance_without_panicking() {
+        let mut parsed =
+            crate::parser::parse_and_resolve("let source = mock.test.Resource {}\n").unwrap();
+        parsed.resources[0].declaration = Default::default();
+        let error = match crate::parser::AnalysisTree::try_from_file(&parsed) {
+            Ok(_) => panic!("reject missing provenance before inference"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error.kind(),
+            crate::parser::AnalysisTreeErrorKind::MissingResourceProvenance { .. }
+        ));
+    }
+
+    #[test]
+    fn export_inference_retry_rejects_missing_provenance_without_panicking() {
+        let mut parsed =
+            crate::parser::parse_and_resolve("let source = mock.test.Resource {}\n").unwrap();
+        parsed.resources[0].declaration = Default::default();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let mut inferred = apply_inference(parsed, &SchemaRegistry::new(), &context);
+        let schemas = ProviderLoadedSchemaRegistry::for_test(SchemaRegistry::new());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            retry_unchecked_export_inference(&mut inferred, &schemas, &context).map(|_| ())
+        }));
+        let error = outcome
+            .expect("must not panic")
+            .expect_err("reject missing provenance");
+        assert!(matches!(
+            error.kind(),
+            crate::parser::AnalysisTreeErrorKind::MissingResourceProvenance { .. }
+        ));
+    }
     use crate::parser::{ModuleCall, ProviderContext};
     use crate::resource::{
         AuthoredAccessPath as AccessPath, AuthoredConcreteValue as ConcreteValue,
@@ -1585,11 +1671,18 @@ mod tests {
     fn integer_arithmetic_requires_proven_operands_but_accepts_typed_deferred_ints() {
         use crate::integer_arithmetic::{IntegerOp, IntegerOperatorSpan, evaluate_integer_values};
 
-        let source = format!("\n{}+", " ".repeat(19));
-        let preprocessed = crate::parser::preprocess_file(&source).expect("test source");
-        let operator_span = IntegerOperatorSpan::from_original_position(
-            preprocessed.original_position(source.len() - 1),
-        );
+        let parsed = crate::parser::parse_file(
+            "arguments { source: Int }\nlet value = source + 1",
+            std::path::Path::new("sibling.crn"),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let Value::Deferred(DeferredValue::IntegerArithmetic(expression)) =
+            &parsed.variables["value"]
+        else {
+            panic!("deferred integer expression")
+        };
+        let operator_span = expression.operator_span();
 
         let bare = evaluate_integer_values(
             Value::Deferred(DeferredValue::BindingRef {
@@ -2659,7 +2752,7 @@ exports {
             .expect("handle export fixture resolves declared resource types");
         assert!(
             crate::validation::deferred_types::with_session_for_test(&context, |session| {
-                crate::validation::resolve_file_type_exprs(&mut parsed, session)
+                crate::validation::resolve_file_type_exprs(&mut parsed, session).unwrap()
             })
             .is_empty(),
             "handle export fixture resolves its declaration types",
@@ -2783,21 +2876,12 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
             ExportStaticType, InferredUncheckedReason, NotInferableReason, StaticType,
         };
 
-        let mut parsed = crate::parser::ParsedFile::default();
-        let resource = crate::resource::Resource::with_provider("awscc", "ec2.Vpc", "main", None)
-            .with_binding("main");
-        parsed.resources.push(resource); // allow: direct — fixture test inspection
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "vpc_id".to_string(),
-                None,
-                Some(Value::resource_ref(
-                    "main".to_string(),
-                    "vpc_i".to_string(),
-                    vec![],
-                )),
-            ));
+        let parsed = crate::parser::parse_file(
+            "let main = awscc.ec2.Vpc {}\nexports { vpc_id = main.vpc_i }\n",
+            std::path::Path::new("test.crn"),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
 
         let mut inferred = apply_inference(
             parsed,
@@ -2818,7 +2902,8 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
             &mut inferred,
             &loaded_schemas,
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        );
+        )
+        .unwrap();
         let failures = attached_inference_failures(schema_checked)
             .map(|failure| (failure.name.to_string(), failure.error.clone()))
             .collect::<Vec<_>>();
@@ -2836,21 +2921,12 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
             ExportStaticType, InferredUncheckedReason, NotInferableReason, StaticType,
         };
 
-        let mut parsed = crate::parser::ParsedFile::default();
-        let resource = crate::resource::Resource::with_provider("awscc", "ec2.Vpc", "main", None)
-            .with_binding("main");
-        parsed.resources.push(resource); // allow: direct — fixture test inspection
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "vpc_id".to_string(),
-                None,
-                Some(Value::resource_ref(
-                    "main".to_string(),
-                    "vpc_id".to_string(),
-                    vec![],
-                )),
-            ));
+        let parsed = crate::parser::parse_file(
+            "let main = awscc.ec2.Vpc {}\nexports { vpc_id = main.vpc_id }\n",
+            std::path::Path::new("test.crn"),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
 
         let mut inferred = apply_inference(
             parsed,
@@ -2862,7 +2938,8 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
             &mut inferred,
             &loaded_schemas,
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        );
+        )
+        .unwrap();
         assert_eq!(attached_inference_failures(schema_checked).count(), 0);
 
         assert_eq!(
@@ -2967,6 +3044,7 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
                 },
             ),
             quoted_string_attrs: std::collections::HashSet::new(),
+            declaration: Default::default(),
         };
         parsed.compositions.push(virt); // allow: direct — fixture test inspection
         parsed

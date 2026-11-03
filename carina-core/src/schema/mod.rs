@@ -12205,7 +12205,7 @@ fn resolve_block_names_in_map<P: PlaceholderKind, B: BindingAddress, AB: Binding
     authored_map: Option<&IndexMap<String, Value<P, AB>>>,
     fields: &[BlockFieldRef<'_>],
     context: BlockNameResolutionContext<'_>,
-    parent_path: &str,
+    parent_path: BlockNamePath<'_>,
     conflicts: &mut Vec<BlockNameConflict>,
 ) {
     // Preserve the source map's order, matching the pre-walker resolver: each
@@ -12227,13 +12227,23 @@ fn resolve_block_names_in_map<P: PlaceholderKind, B: BindingAddress, AB: Binding
         if map.contains_key(field.name) {
             conflicts.push(block_name_conflict(
                 context.resource_id,
-                parent_path,
+                parent_path.display,
                 &key,
                 field.name,
             ));
             continue;
         }
         if let Some(value) = map.shift_remove(&key) {
+            let mut path = parent_path.attributes.to_vec();
+            path.push(if path.is_empty() {
+                crate::parser::AttributePathSegment::Attribute(key.clone())
+            } else {
+                crate::parser::AttributePathSegment::StructField(key.clone())
+            });
+            context
+                .renames
+                .borrow_mut()
+                .push((path, field.name.to_string()));
             map.insert(field.name.to_string(), value);
         }
     }
@@ -12244,13 +12254,22 @@ fn resolve_block_names_in_map<P: PlaceholderKind, B: BindingAddress, AB: Binding
         let Some(value) = map.get_mut(field.name) else {
             continue;
         };
+        let mut child_path = parent_path.attributes.to_vec();
+        child_path.push(if child_path.is_empty() {
+            crate::parser::AttributePathSegment::Attribute(field.name.to_string())
+        } else {
+            crate::parser::AttributePathSegment::StructField(field.name.to_string())
+        });
         resolve_block_names_in_value(
             value,
             authored_value,
             field.field_type,
             field.child_ancestry,
             context,
-            &nested_path(parent_path, field.name),
+            BlockNamePath {
+                display: &nested_path(parent_path.display, field.name),
+                attributes: &child_path,
+            },
             conflicts,
         );
     }
@@ -12262,7 +12281,7 @@ fn resolve_block_names_in_value<P: PlaceholderKind, B: BindingAddress, AB: Bindi
     attr_type: &PatternAttributeType<Compiled>,
     ancestry: FieldAncestry,
     context: BlockNameResolutionContext<'_>,
-    path: &str,
+    path: BlockNamePath<'_>,
     conflicts: &mut Vec<BlockNameConflict>,
 ) {
     match attr_type.shape_with_defs(context.defs) {
@@ -12324,12 +12343,17 @@ fn resolve_block_names_in_value<P: PlaceholderKind, B: BindingAddress, AB: Bindi
                         Value::Concrete(ConcreteValue::Map(map)) => Some(map),
                         _ => None,
                     });
+                let mut item_path = path.attributes.to_vec();
+                item_path.push(crate::parser::AttributePathSegment::ListIndex(index));
                 resolve_block_names_in_map(
                     map,
                     authored_map,
                     &fields,
                     context,
-                    &format!("{path}[{index}]"),
+                    BlockNamePath {
+                        display: &format!("{}[{index}]", path.display),
+                        attributes: &item_path,
+                    },
                     conflicts,
                 );
             }
@@ -12339,10 +12363,19 @@ fn resolve_block_names_in_value<P: PlaceholderKind, B: BindingAddress, AB: Bindi
 }
 
 #[derive(Clone, Copy)]
+struct BlockNamePath<'a> {
+    display: &'a str,
+    attributes: &'a [crate::parser::AttributePathSegment],
+}
+
+#[derive(Clone, Copy)]
 struct BlockNameResolutionContext<'a> {
     defs: &'a BTreeMap<String, CompiledAttributeType>,
     resource_id: &'a str,
+    renames: &'a std::cell::RefCell<Vec<AttributePathRename>>,
 }
+
+type AttributePathRename = (Vec<crate::parser::AttributePathSegment>, String);
 
 fn block_fields(schema: &CompiledResourceSchema) -> Vec<BlockFieldRef<'_>> {
     schema
@@ -12360,24 +12393,17 @@ fn block_fields(schema: &CompiledResourceSchema) -> Vec<BlockFieldRef<'_>> {
 fn resolve_attribute_block_names<P: PlaceholderKind, B: BindingAddress>(
     resource_id: &ResourceId,
     attributes: &mut IndexMap<String, Value<P, B>>,
+    declaration: &mut crate::parser::DeclarationProvenance,
     authored_attributes: Option<&IndexMap<String, Value<P, B>>>,
     schema: &CompiledResourceSchema,
 ) -> Vec<BlockNameConflict> {
-    let fields = block_fields(schema);
-    let mut conflicts = Vec::new();
-    let resource_id = resource_id.to_string();
-    resolve_block_names_in_map::<P, B, B>(
+    resolve_attribute_block_names_with_authored(
+        resource_id,
         attributes,
+        declaration,
         authored_attributes,
-        &fields,
-        BlockNameResolutionContext {
-            defs: &schema.defs,
-            resource_id: &resource_id,
-        },
-        "",
-        &mut conflicts,
-    );
-    conflicts
+        schema,
+    )
 }
 
 fn resolve_attribute_block_names_with_authored<
@@ -12387,11 +12413,13 @@ fn resolve_attribute_block_names_with_authored<
 >(
     resource_id: &ResourceId,
     attributes: &mut IndexMap<String, Value<P, B>>,
+    declaration: &mut crate::parser::DeclarationProvenance,
     authored_attributes: Option<&IndexMap<String, Value<P, AB>>>,
     schema: &CompiledResourceSchema,
 ) -> Vec<BlockNameConflict> {
     let fields = block_fields(schema);
     let mut conflicts = Vec::new();
+    let renames = std::cell::RefCell::new(Vec::new());
     let resource_id = resource_id.to_string();
     resolve_block_names_in_map(
         attributes,
@@ -12400,10 +12428,17 @@ fn resolve_attribute_block_names_with_authored<
         BlockNameResolutionContext {
             defs: &schema.defs,
             resource_id: &resource_id,
+            renames: &renames,
         },
-        "",
+        BlockNamePath {
+            display: "",
+            attributes: &[],
+        },
         &mut conflicts,
     );
+    for (path, name) in renames.into_inner() {
+        declaration.rename_attribute_path(&path, &name);
+    }
     conflicts
 }
 
@@ -12527,6 +12562,7 @@ fn resolve_block_names_detailed<S, P: PlaceholderKind, B: BindingAddress>(
             resolve_managed_attribute_block_names(
                 &resource.id,
                 &mut resource.attributes,
+                &mut resource.declaration,
                 None::<&IndexMap<String, Value<P, B>>>,
                 registry,
             )
@@ -12541,6 +12577,7 @@ fn resolve_managed_attribute_block_names<
 >(
     id: &ResourceId,
     attributes: &mut IndexMap<String, Value<P, B>>,
+    declaration: &mut crate::parser::DeclarationProvenance,
     authored_attributes: Option<&IndexMap<String, Value<P, AB>>>,
     registry: &SchemaRegistry,
 ) -> Vec<BlockNameConflict> {
@@ -12550,6 +12587,7 @@ fn resolve_managed_attribute_block_names<
     resolve_attribute_block_names_with_authored(
         id,
         attributes,
+        declaration,
         authored_attributes,
         schema.as_schema(),
     )
@@ -12575,6 +12613,7 @@ fn resolve_block_names_detailed_with_authored<
             resolve_managed_attribute_block_names(
                 &resource.id,
                 &mut resource.attributes,
+                &mut resource.declaration,
                 authored_attributes,
                 registry,
             )
@@ -12618,10 +12657,15 @@ fn resolve_file_block_names<
                     registry,
                 ));
             }
-            crate::parser::ResourceMut::Deferred { id, attributes } => {
+            crate::parser::ResourceMut::Deferred {
+                id,
+                attributes,
+                declaration,
+            } => {
                 conflicts.extend(resolve_managed_attribute_block_names(
                     id,
                     attributes,
+                    declaration,
                     None::<&IndexMap<String, Value<T, B>>>,
                     registry,
                 ));
@@ -12631,6 +12675,7 @@ fn resolve_file_block_names<
                     conflicts.extend(resolve_attribute_block_names(
                         &data_source.id,
                         &mut data_source.attributes,
+                        &mut data_source.declaration,
                         None,
                         schema.as_schema(),
                     ));
@@ -12719,12 +12764,17 @@ where
                     registry,
                 ));
             }
-            crate::parser::ResourceMut::Deferred { id, attributes } => {
+            crate::parser::ResourceMut::Deferred {
+                id,
+                attributes,
+                declaration,
+            } => {
                 let authored_attributes =
                     managed_resource_by_id(authored, id).map(|resource| &resource.attributes);
                 conflicts.extend(resolve_managed_attribute_block_names(
                     id,
                     attributes,
+                    declaration,
                     authored_attributes,
                     registry,
                 ));
@@ -12739,6 +12789,7 @@ where
                     conflicts.extend(resolve_attribute_block_names_with_authored(
                         &data_source.id,
                         &mut data_source.attributes,
+                        &mut data_source.declaration,
                         authored_attributes,
                         schema.as_schema(),
                     ));

@@ -50,6 +50,8 @@ pub enum ModuleErrorCallSource<'a> {
 /// Module resolution error
 #[derive(Debug, thiserror::Error)]
 pub enum ModuleError {
+    #[error(transparent)]
+    AnalysisInvariant(#[from] crate::parser::AnalysisTreeError),
     /// Terminal providerless failure together with every unresolved type site.
     #[error("{error}\n{}", render_provider_type_warnings(.warnings))]
     WithProviderTypeWarnings {
@@ -88,7 +90,7 @@ pub enum ModuleError {
     InvalidArgumentType {
         module: String,
         argument: String,
-        mismatch: TypeExprValueError,
+        mismatch: Box<TypeExprValueError>,
     },
 
     #[error(
@@ -102,12 +104,21 @@ pub enum ModuleError {
         message: String,
     },
 
-    #[error("module '{module}' ({source_path}) at line {line}: {message}")]
+    /// Expansion diagnostics require a parser-owned location immediately.
+    ///
+    /// ```compile_fail,E0308
+    /// use carina_core::module_resolver::ModuleError;
+    /// let _ = ModuleError::ArgumentValueAccess {
+    ///     module: "child".into(), source_path: "sibling.crn".into(), line: 1,
+    ///     diagnostic: Box::new(None),
+    /// };
+    /// ```
+    #[error("module '{module}' ({source_path}) at line {line}: {}", .diagnostic.detail())]
     ArgumentValueAccess {
         module: String,
         source_path: String,
         line: usize,
-        message: String,
+        diagnostic: Box<crate::parser::Located<String>>,
     },
 
     #[error(
@@ -146,7 +157,7 @@ pub enum ModuleError {
     /// loading so the CLI/LSP finding can cover this resolver backstop without
     /// comparing rendered parse-error text.
     #[error(transparent)]
-    TypeResolution(Box<crate::validation::TypeResolutionDiagnostic>),
+    TypeResolution(Box<crate::parser::Located<crate::validation::TypeResolutionDiagnostic>>),
 
     #[error("Unknown argument '{argument}' for module '{module}'")]
     UnknownArgument { module: String, argument: String },
@@ -291,6 +302,7 @@ impl ModuleError {
             | Self::DroppedConditionalBinding { .. }
             | Self::UnexpandedModuleTemplate { .. }
             | Self::ReferenceType(_)
+            | Self::AnalysisInvariant(_)
             | Self::TypeResolution(_)
             | Self::Io(_)
             | Self::Parse(_)
@@ -335,7 +347,7 @@ impl ModuleError {
                 module: _,
                 source_path: _,
                 line: _,
-                message: _,
+                diagnostic: _,
             }
             | Self::DroppedConditionalBinding {
                 binding: _,
@@ -345,6 +357,7 @@ impl ModuleError {
             }
             | Self::UnexpandedModuleTemplate { context: _ }
             | Self::ReferenceType(_)
+            | Self::AnalysisInvariant(_)
             | Self::TypeResolution(_)
             | Self::Io(_)
             | Self::Parse(_)
@@ -380,6 +393,7 @@ impl ModuleError {
             | Self::DroppedConditionalBinding { .. }
             | Self::UnexpandedModuleTemplate { .. }
             | Self::ReferenceType(_)
+            | Self::AnalysisInvariant(_)
             | Self::TypeResolution(_)
             | Self::Io(_)
             | Self::Parse(_)
@@ -454,10 +468,11 @@ impl ModuleError {
                 module,
                 source_path,
                 line,
-                message,
+                diagnostic,
             } => format!(
-                "module '{module}' ({}) at line {line}: {message}",
+                "module '{module}' ({}) at line {line}: {}",
                 display_source_path_relative_to(Path::new(source_path), root),
+                diagnostic.detail(),
             ),
             Self::DroppedConditionalBinding {
                 binding,
@@ -476,20 +491,22 @@ impl ModuleError {
                 display_source_path_relative_to(path, root),
                 display_parse_error_relative_to(error, root),
             ),
-            Self::Parse(error) => format!("Parse error: {error}"),
+            Self::Parse(error) => format!(
+                "Parse error: {}",
+                display_parse_error_relative_to(error, root)
+            ),
             Self::ParseInFile { path, error } => format!(
                 "Parse error in {}: {}",
                 display_source_path_relative_to(path, root),
                 display_parse_error_relative_to(error, root),
             ),
-            Self::TypeResolution(diagnostic) => diagnostic.source_location().map_or_else(
-                || diagnostic.to_string(),
-                |source| {
-                    format!(
-                        "{}: {diagnostic}",
-                        display_source_path_relative_to(source.source_file().path(), root),
-                    )
-                },
+            Self::AnalysisInvariant(error) => error.to_string(),
+            Self::TypeResolution(diagnostic) => format!(
+                "{}:{}:{}: {}",
+                display_source_path_relative_to(diagnostic.location().file().path(), root),
+                diagnostic.location().span().start_line(),
+                diagnostic.location().span().start_column(),
+                diagnostic.detail()
             ),
             Self::NotFound(_)
             | Self::CircularImport(_)
@@ -530,6 +547,7 @@ impl ModuleError {
             | Self::DroppedConditionalBinding { .. }
             | Self::UnexpandedModuleTemplate { .. }
             | Self::ReferenceType(_)
+            | Self::AnalysisInvariant(_)
             | Self::TypeResolution(_)
             | Self::Io(_)
             | Self::UnknownArgument { .. }
@@ -565,6 +583,9 @@ fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
         ParseError::DeferredForBodyUnsupported(_)
         | ParseError::UndefinedDeferredIterable { .. } => true,
         ParseError::Located { path: _, error } => parse_error_is_deferred_for_body_rejection(error),
+        ParseError::AtElement(finding) => {
+            parse_error_is_deferred_for_body_rejection(finding.detail())
+        }
         ParseError::DeferredForBodyTemplate {
             line: _,
             header: _,
@@ -597,6 +618,17 @@ fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
 
 fn display_parse_error_relative_to(error: &ParseError, root: &Path) -> String {
     match error {
+        ParseError::AtElement(finding) => {
+            let location = finding.location();
+            let span = location.span();
+            format!(
+                "{}:{}:{}: {}",
+                display_source_path_relative_to(location.file().path(), root),
+                span.start_line(),
+                span.start_column(),
+                display_parse_error_relative_to(finding.detail(), root)
+            )
+        }
         ParseError::Located { path, error } => format!(
             "{}: {}",
             display_source_path_relative_to(path, root),
@@ -615,6 +647,13 @@ fn display_source_path_relative_to(path: &Path, root: &Path) -> String {
 mod tests {
     use super::*;
     use crate::parser::ProviderContext;
+
+    #[test]
+    fn module_errors_stay_below_clippy_large_error_threshold() {
+        let size = size_of::<ModuleError>();
+        println!("ModuleError: {size} bytes");
+        assert!(size < 128, "ModuleError is {size} bytes");
+    }
 
     #[test]
     fn spanned_generic_undefined_identifier_is_not_a_deferred_for_rejection() {

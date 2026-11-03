@@ -189,6 +189,7 @@ fn resolved_fixture_resources_with_wait(
         timeout_secs: None,
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     });
     let (resources, data_sources) = resolved_fixture_graph_with_parsed(parsed, &resources, &[]);
     assert!(data_sources.is_empty());
@@ -2209,10 +2210,7 @@ async fn unsettled_loaded_type_check_blocks_create_dispatch() {
         async |type_checks| {
             type_checks.record(
                 &crate::parser::TypeExpr::String,
-                crate::validation::deferred_types::ProviderTypeCheckSite::at_line(
-                    std::path::Path::new("main.crn"),
-                    1,
-                    1,
+                crate::validation::deferred_types::ProviderTypeCheckSite::directory_scoped(
                     "pending runtime check",
                 ),
             );
@@ -4623,6 +4621,7 @@ fn pending_module_composition(
         instance: instance.to_string(),
         call_path: Default::default(),
         quoted_string_attrs: HashSet::new(),
+        declaration: Default::default(),
     }
 }
 
@@ -8896,9 +8895,9 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
     let mut parent = tag_update_resource("vpc", None);
     let mut child = tag_update_resource("child", None);
     if unknown_read {
-        child.dependencies.depends_on.push(
+        child.dependencies.depends_on = crate::parser::UnexpandedDependencies::new_for_test(vec![
             crate::parser::UnexpandedDependencyOperand::BareBinding(absolute_binding("vpc")),
-        );
+        ]);
     } else {
         child.set_attr("vpc_id", Value::root_resource_ref("vpc", "id", vec![]));
     }

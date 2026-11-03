@@ -321,10 +321,7 @@ impl CompletionProvider {
         provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Option<Vec<CompletionItem>> {
         let line = text.lines().nth(position.line as usize)?;
-        let prefix = line
-            .chars()
-            .take(position.character as usize)
-            .collect::<String>();
+        let prefix = crate::position::line_prefix(line, position.character);
         let token_start = prefix
             .char_indices()
             .rev()
@@ -397,7 +394,7 @@ impl CompletionProvider {
                 )
                 | None => None,
             })?;
-        let start_character = prefix[..token_start].chars().count() as u32;
+        let start_character = crate::position::byte_offset_to_char_offset(prefix, token_start);
         Some(self.binding_attribute_completions(
             &format!("{call_binding}.{output_name}"),
             &resource_type,
@@ -823,8 +820,7 @@ impl CompletionProvider {
             return None;
         }
 
-        let col = position.character as usize;
-        let prefix: String = lines[line_idx].chars().take(col).collect();
+        let prefix = crate::position::line_prefix(lines[line_idx], position.character);
 
         // Extract the value part after "="
         let after_eq = prefix.rsplit('=').next()?.trim();
@@ -891,15 +887,14 @@ impl CompletionProvider {
     fn compute_value_prefix_range(&self, text: &str, position: Position) -> Range {
         let lines: Vec<&str> = text.lines().collect();
         let line_idx = position.line as usize;
-        let col = position.character as usize;
 
         let start_col = if line_idx < lines.len() {
-            let prefix: String = lines[line_idx].chars().take(col).collect();
+            let prefix = crate::position::line_prefix(lines[line_idx], position.character);
             // Find the position after "= " (the value start)
             if let Some(eq_pos) = prefix.rfind('=') {
                 let after_eq = &prefix[eq_pos + 1..];
                 let whitespace_len = after_eq.len() - after_eq.trim_start().len();
-                (eq_pos + 1 + whitespace_len) as u32
+                crate::position::byte_offset_to_char_offset(prefix, eq_pos + 1 + whitespace_len)
             } else {
                 position.character
             }
@@ -1336,8 +1331,7 @@ impl CompletionProvider {
             return out;
         }
         let line = lines[line_idx];
-        let col = position.character as usize;
-        let prefix_chars: String = line.chars().take(col).collect();
+        let prefix_chars = crate::position::line_prefix(line, position.character);
         let Some(open) = prefix_chars.rfind('[') else {
             return out;
         };
@@ -1532,7 +1526,7 @@ impl CompletionProvider {
         // Replace just `<partial>` (the characters after the dot), so
         // accepting a suggestion slots into the existing `<binding>.` prefix
         // instead of duplicating it.
-        let partial_chars = partial.chars().count() as u32;
+        let partial_chars = crate::position::char_len(partial);
         let range = Range {
             start: Position {
                 line: position.line,
@@ -1598,7 +1592,7 @@ impl CompletionProvider {
             return Vec::new();
         };
         let type_expr = structural_type.type_expr();
-        let partial_chars = partial.chars().count() as u32;
+        let partial_chars = crate::position::char_len(partial);
         let range = Range {
             start: Position {
                 line: position.line,
@@ -1746,7 +1740,7 @@ impl CompletionProvider {
         // the client to infer the replacement range via word boundaries, which
         // splits on `/` and `.` and produces `../../foo` when the user typed
         // `../or` — an explicit TextEdit avoids that.
-        let partial_chars = partial_path.chars().count() as u32;
+        let partial_chars = crate::position::char_len(partial_path);
         let range = Range {
             start: Position {
                 line: position.line,
@@ -2180,20 +2174,28 @@ impl CompletionProvider {
         // without duplication from LSP word-boundary-based insertion.
         let lines: Vec<&str> = text.lines().collect();
         let line_idx = position.line as usize;
-        let col = position.character as usize;
 
         let (type_start, inside_generic) = if line_idx < lines.len() {
-            let prefix: String = lines[line_idx].chars().take(col).collect();
+            let prefix = crate::position::line_prefix(lines[line_idx], position.character);
             // Check if cursor is inside list() or map() — find last open paren after colon
             if let Some(colon_pos) = prefix.rfind(':') {
                 let after_colon = &prefix[colon_pos + 1..];
                 if let Some(paren_pos) = after_colon.rfind('(') {
                     // Inside list() or map(): start after the open paren
                     let abs_paren = colon_pos + 1 + paren_pos + 1;
-                    (abs_paren as u32, true)
+                    (
+                        crate::position::byte_offset_to_char_offset(prefix, abs_paren),
+                        true,
+                    )
                 } else {
                     let whitespace_len = after_colon.len() - after_colon.trim_start().len();
-                    ((colon_pos + 1 + whitespace_len) as u32, false)
+                    (
+                        crate::position::byte_offset_to_char_offset(
+                            prefix,
+                            colon_pos + 1 + whitespace_len,
+                        ),
+                        false,
+                    )
                 }
             } else {
                 (position.character, false)
@@ -2417,13 +2419,12 @@ fn resolve_upstream_export_keys(
         binding: carina_core::resource::RelativeBindingName::new(binding),
         source: std::path::PathBuf::from(source),
     };
-    let (mut exports, _errors) =
-        carina_core::upstream_exports::resolve_upstream_exports_providerless_with_schemas(
-            base,
-            &[upstream],
-            provider_ctx,
-            Some(schemas),
-        );
+    let mut exports = carina_core::upstream_exports::discover_upstream_exports(
+        base,
+        &[upstream],
+        provider_ctx,
+        Some(schemas),
+    );
     exports.remove(binding)
 }
 
@@ -2497,13 +2498,12 @@ fn infer_for_binding_type(
                 binding: binding.clone(),
                 source: std::path::PathBuf::from(source),
             };
-            let (mut resolved, _errors) =
-                carina_core::upstream_exports::resolve_upstream_exports_providerless_with_schemas(
-                    base,
-                    &[upstream],
-                    provider_ctx,
-                    Some(schemas),
-                );
+            let mut resolved = carina_core::upstream_exports::discover_upstream_exports(
+                base,
+                &[upstream],
+                provider_ctx,
+                Some(schemas),
+            );
             // Move the entry out of `resolved` rather than cloning so we
             // don't pay a deep `Value` clone on the per-keystroke path.
             resolved.remove(&binding).unwrap_or_default()

@@ -4937,6 +4937,7 @@ fn wait_binding_lowers_to_wait_effect() {
         timeout_secs: Some(75 * 60),
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     };
 
     let mut schemas = SchemaRegistry::new();
@@ -5014,6 +5015,7 @@ fn unresolved_wait_enum_identifier_is_a_plan_error() {
         timeout_secs: None,
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     };
 
     let mut schemas = SchemaRegistry::new();
@@ -5077,6 +5079,7 @@ fn nested_wait_enum_resolves_and_matches_provider_state() {
         timeout_secs: None,
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     };
     let renewal_status = PatternAttributeType::enum_(
         TypeIdentity::new(Some("aws"), ["acm", "Certificate"], "RenewalStatus"),
@@ -5163,6 +5166,7 @@ fn quoted_wait_value_traverses_a_string_map_when_planning() {
         timeout_secs: None,
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     };
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -5238,6 +5242,7 @@ fn typed_enum_wait_value_traverses_an_enum_map_when_planning() {
         timeout_secs: None,
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     };
     let status = PatternAttributeType::enum_(
         TypeIdentity::new(Some("test"), ["job", "Job"], "Status"),
@@ -5298,7 +5303,8 @@ fn typed_enum_wait_value_traverses_an_enum_map_when_planning() {
 }
 
 #[test]
-fn nested_wait_resolution_error_matches_validation_message() {
+fn nested_wait_resolution_error_matches_validation_message()
+-> Result<(), crate::parser::AnalysisTreeError> {
     use crate::parser::{ProviderContext, UntilPredicateAst, WaitBinding, parse};
     use crate::schema::TypeIdentity;
 
@@ -5333,7 +5339,10 @@ let renewed = wait cert {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("fixture must parse");
-    let validation = crate::validation::wait::validate_wait_bindings(&parsed, &schemas);
+    let validation = crate::validation::wait::validate_wait_bindings(
+        &crate::parser::AnalysisTree::try_from_file(&parsed)?,
+        &schemas,
+    );
     assert_eq!(validation.len(), 1);
 
     let cert =
@@ -5359,6 +5368,7 @@ let renewed = wait cert {
         timeout_secs: None,
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     };
     let plan = create_plan(
         &[cert, consumer],
@@ -5389,6 +5399,7 @@ let renewed = wait cert {
             .message
             .contains("cert.renewal_summary.renewal_status")
     );
+    Ok(())
 }
 
 #[test]
@@ -5420,6 +5431,7 @@ fn data_source_wait_is_rejected_at_the_expanded_graph_boundary() {
         timeout_secs: None,
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     };
 
     let resources = vec![identity_collision, consumer];
@@ -5471,6 +5483,7 @@ fn create_plan_records_error_for_empty_predicate_attr_path() {
         timeout_secs: None,
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     };
 
     let plan = create_plan(
@@ -5619,6 +5632,7 @@ fn wait_user_depends_on_conflict_with_provider_hint_deduplicates() {
         timeout_secs: None,
         depends_on: vec![absolute_binding("something")].into(),
         line: 1,
+        declaration: Default::default(),
     };
     let provider = HintProvider {
         hints: vec![BindingPattern::Exact("something".to_string())],
@@ -5705,6 +5719,7 @@ fn wait_uses_schema_default_timeout_when_omitted() {
         timeout_secs: None,
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     };
 
     let plan = create_plan(
@@ -5754,6 +5769,7 @@ fn wait_with_unknown_target_is_rejected_at_the_expanded_graph_boundary() {
         timeout_secs: None,
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     };
 
     let mut parsed: crate::parser::ExpandedParsedFile = Default::default();
@@ -5823,6 +5839,7 @@ fn wait_omitted_when_all_consumers_unchanged() {
         timeout_secs: Some(60),
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     };
 
     let plan = create_plan(
@@ -5879,6 +5896,7 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
         timeout_secs: Some(60),
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     };
     let schemas = string_wait_schemas("");
 
@@ -5960,6 +5978,7 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
         timeout_secs: Some(60),
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     };
 
     let mut schemas = SchemaRegistry::new();
@@ -6044,6 +6063,7 @@ fn wait_emitted_when_target_is_changing_even_if_cached_state_satisfies() {
         timeout_secs: Some(60),
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     };
     let schemas = string_wait_schemas("");
 
@@ -6128,6 +6148,7 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
         timeout_secs: Some(60),
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     };
     let schemas = string_wait_schemas("");
 

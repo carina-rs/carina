@@ -2,12 +2,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use carina_core::config_loader::load_configuration_with_config;
-use carina_core::parser::{InferredFile, ProviderConfig, ProviderContext, UpstreamState};
+use carina_core::parser::{InferredFile, ProviderContext};
 use carina_core::provider::{BoxFuture, ProviderFactory, ProviderResult};
-use carina_core::resource::{AuthoredResource as Resource, RelativeBindingName, Value};
+use carina_core::resource::Value;
 use carina_core::schema::SchemaRegistry;
 use carina_state::StateFile;
-use indexmap::IndexMap;
 
 pub(crate) struct ProviderConfigCaptureFactory {
     pub(crate) received_role_arn: Arc<Mutex<Option<Value>>>,
@@ -126,23 +125,9 @@ pub(crate) fn provider_default_tags_local_resource_fixture()
 -> (tempfile::TempDir, PathBuf, InferredFile) {
     let temp = tempfile::tempdir().unwrap();
     let base_dir = temp.path().to_path_buf();
-    let mut parsed = InferredFile::default();
-    parsed.providers.push(ProviderConfig {
-        name: "mock".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::from([(
-            "Account".to_string(),
-            Value::resource_ref("acct", "account_id", vec![]),
-        )]),
-        source: None,
-        version: None,
-        revision: None,
-        unresolved_attributes: IndexMap::new(),
-        binding: None,
-    });
-    let mut account = Resource::with_provider("mock", "test.resource", "acct", None);
-    account.binding = Some(RelativeBindingName::new("acct"));
-    parsed.resources.push(account); // allow: direct — fixture test inspection
+    let parsed = crate::test_support::inferred_fixture(
+        "provider mock { default_tags = { Account = acct.account_id } }\nlet acct = mock.test.resource {}\n",
+    );
     (temp, base_dir, parsed)
 }
 
@@ -158,23 +143,8 @@ pub(crate) fn provider_default_tags_missing_upstream_fixture()
     )
     .unwrap();
 
-    let mut parsed = InferredFile::default();
-    parsed.providers.push(ProviderConfig {
-        name: "mock".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::from([(
-            "Owner".to_string(),
-            Value::resource_ref("mgmt", "owner", vec![]),
-        )]),
-        source: None,
-        version: None,
-        revision: None,
-        unresolved_attributes: IndexMap::new(),
-        binding: None,
-    });
-    parsed.upstream_states.push(UpstreamState {
-        binding: RelativeBindingName::new("mgmt"),
-        source: PathBuf::from("missing-upstream"),
-    });
+    let parsed = crate::test_support::inferred_fixture(
+        "provider mock { default_tags = { Owner = mgmt.owner } }\nlet mgmt = upstream_state { source = 'missing-upstream' }\n",
+    );
     (temp, base_dir, parsed)
 }

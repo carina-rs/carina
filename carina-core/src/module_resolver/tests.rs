@@ -189,6 +189,7 @@ impl ModuleResolutionFixture {
                 .unwrap(),
                 session,
                 &crate::schema::SchemaRegistry::new(),
+                &Default::default(),
             )
         })
     }
@@ -2296,6 +2297,7 @@ fn create_test_module() -> ParsedFile {
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
+            declaration: Default::default(),
         }],
         variables: IndexMap::new(),
         uses: vec![],
@@ -2531,6 +2533,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
+            declaration: Default::default(),
         }],
         variables: IndexMap::new(),
         uses: vec![],
@@ -2742,6 +2745,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
+            declaration: Default::default(),
         }],
         variables: IndexMap::new(),
         uses: vec![],
@@ -2866,6 +2870,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
         default_tag_keys: Default::default(),
         loop_provenance: Default::default(),
         quoted_string_attrs: std::collections::HashSet::new(),
+        declaration: Default::default(),
     }];
     let mut resources: Vec<
         crate::resource::Resource<ModuleSource, ParserPlaceholder, AbsoluteBindingAddress>,
@@ -2919,6 +2924,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 default_tag_keys: Default::default(),
                 loop_provenance: Default::default(),
                 quoted_string_attrs: std::collections::HashSet::new(),
+                declaration: Default::default(),
             },
             Resource {
                 id: ResourceId::with_identity("ec2.Subnet", "sub"),
@@ -2939,6 +2945,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 default_tag_keys: Default::default(),
                 loop_provenance: Default::default(),
                 quoted_string_attrs: std::collections::HashSet::new(),
+                declaration: Default::default(),
             },
         ],
         variables: IndexMap::new(),
@@ -3103,6 +3110,7 @@ fn create_module_with_attributes() -> ParsedFile {
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
+            declaration: Default::default(),
         }],
         variables: IndexMap::new(),
         uses: vec![],
@@ -4594,6 +4602,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
+            declaration: Default::default(),
         });
         m.wait_bindings.push(WaitBinding {
             binding: "cert_issued".into(),
@@ -4605,13 +4614,16 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
                 rhs: Value::Concrete(ConcreteValue::String("available".into())),
             },
             timeout_secs: Some(300),
-            depends_on: UnexpandedDependencies::new(vec![UnexpandedDependencyOperand::Handle(
-                crate::eval_value::UnexpandedResourceHandle::new(
-                    "subnet",
-                    ResourceTypePath::new("", "ec2.Subnet"),
+            depends_on: UnexpandedDependencies::new_for_test(vec![
+                UnexpandedDependencyOperand::Handle(
+                    crate::eval_value::UnexpandedResourceHandle::new(
+                        "subnet",
+                        ResourceTypePath::new("", "ec2.Subnet"),
+                    ),
                 ),
-            )]),
+            ]),
             line: 1,
+            declaration: Default::default(),
         });
         m
     };
@@ -4924,6 +4936,7 @@ fn create_module_with_interpolation() -> ParsedFile {
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
+            declaration: Default::default(),
         }],
         variables: IndexMap::new(),
         uses: vec![],
@@ -5863,6 +5876,7 @@ let root = outer { outer_port = producer.port }
         instance: "inner".to_string(),
         call_path: CompositionCallPath::direct(inner_call),
         quoted_string_attrs: HashSet::new(),
+        declaration: Default::default(),
     };
     let outer = ParsedFile {
         providers: vec![],
@@ -8925,6 +8939,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
+            declaration: Default::default(),
         });
         m.parsed_deferred_for_expressions_mut()
             .push(parsed_deferred_resource(DeferredForExpression::new(
@@ -8962,6 +8977,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
                     default_tag_keys: Default::default(),
                     loop_provenance: Default::default(),
                     quoted_string_attrs: std::collections::HashSet::new(),
+                    declaration: Default::default(),
                 },
             )));
         m
@@ -9172,6 +9188,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
                     default_tag_keys: Default::default(),
                     loop_provenance: Default::default(),
                     quoted_string_attrs: std::collections::HashSet::new(),
+                    declaration: Default::default(),
                 },
             )));
         m

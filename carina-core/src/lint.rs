@@ -515,6 +515,50 @@ pub fn find_mixed_tag_key_styles(entries: &[TagKeyEntry]) -> Vec<TagKeyWarning> 
         .collect()
 }
 
+pub fn located_mixed_tag_key_styles<D, B: crate::resource::BindingAddress>(
+    tree: &crate::parser::AnalysisTree<
+        '_,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+        B,
+    >,
+    entries: &[TagKeyEntry],
+) -> Vec<crate::parser::Located<TagKeyWarning>>
+where
+    D: crate::parser::DeferredForPhaseTraversal<
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            B,
+        >,
+{
+    use crate::parser::AttributePathSegment;
+    let warnings = find_mixed_tag_key_styles(entries);
+    tree.resources()
+        .flat_map(|resource| resource.attribute_keys())
+        .chain(tree.syntax().attribute_keys())
+        .filter_map(|key| {
+            let [
+                AttributePathSegment::Attribute(attribute),
+                AttributePathSegment::Key(name),
+            ] = key.path()
+            else {
+                return None;
+            };
+            if attribute != "tags" {
+                return None;
+            }
+            warnings
+                .iter()
+                .find(|warning| {
+                    warning.key == *name
+                        && warning.file.as_deref() == Some(key.location().file().path())
+                })
+                .map(|warning| crate::parser::Located::new(key.location().clone(), warning.clone()))
+        })
+        .collect()
+}
+
 /// Format the shared CLI/LSP message for a mixed tag-key style warning.
 pub fn mixed_tag_key_style_message(warning: &TagKeyWarning) -> String {
     let style_name = match warning.expected_style {

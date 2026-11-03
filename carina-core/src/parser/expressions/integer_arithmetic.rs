@@ -73,7 +73,7 @@ pub(crate) fn parse_integer_operator(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
 ) -> Result<(IntegerOp, IntegerOperatorSpan), ParseError> {
-    let original_position = ctx.original_position(&pair)?;
+    let location = ctx.declaration_location(&pair);
     let context = match pair.as_rule() {
         Rule::add_op => "additive operator",
         Rule::multiplicative_op => "multiplicative operator",
@@ -105,10 +105,7 @@ pub(crate) fn parse_integer_operator(
             context: context.to_string(),
         });
     }
-    Ok((
-        op,
-        IntegerOperatorSpan::from_original_position(original_position),
-    ))
+    Ok((op, IntegerOperatorSpan::authored(location)))
 }
 
 pub(crate) fn combine_integer_operands(
@@ -117,9 +114,9 @@ pub(crate) fn combine_integer_operands(
     rhs: EvalValue,
     span: IntegerOperatorSpan,
 ) -> Result<EvalValue, ParseError> {
-    let (lhs, lhs_metadata) = lower_integer_operand(lhs, span)?;
-    let (rhs, rhs_metadata) = lower_integer_operand(rhs, span)?;
-    let value = evaluate_integer_values(lhs, op, rhs, span)
+    let (lhs, lhs_metadata) = lower_integer_operand(lhs, span.clone())?;
+    let (rhs, rhs_metadata) = lower_integer_operand(rhs, span.clone())?;
+    let value = evaluate_integer_values(lhs, op, rhs, span.clone())
         .map_err(|error| arithmetic_error(op, span, error.to_string()))?;
     Ok(EvalValue::computed(
         value,

@@ -163,11 +163,13 @@ fn record_deferred_for_expression(
     source_file: &std::path::Path,
     line: usize,
     span: SourceSpan,
+    iterable_location: crate::parser::DeclarationLocation,
+    declaration: crate::parser::DeclarationProvenance,
     header: String,
     iterable: Value,
     iterable_state: ParsedDeferredForIterableState,
 ) -> Result<(), ParseError> {
-    let body = match parse_deferred_for_body_template(
+    let mut body = match parse_deferred_for_body_template(
         body_pair,
         binding,
         ctx,
@@ -195,7 +197,14 @@ fn record_deferred_for_expression(
         },
     };
 
-    let parsed = ParsedDeferredForExpression::new(
+    match &mut body {
+        DeferredForBody::Resource(resource) => resource
+            .declaration_mut()
+            .set_iterable(iterable_location.clone()),
+        DeferredForBody::Read(source) => source.declaration.set_iterable(iterable_location.clone()),
+        DeferredForBody::ModuleCall(_) => {}
+    }
+    let mut parsed = ParsedDeferredForExpression::new(
         (None, line, span, header),
         target.deferred_target(),
         iterable,
@@ -204,6 +213,7 @@ fn record_deferred_for_expression(
         body,
     );
 
+    parsed.record_iterable_location(iterable_location, declaration);
     ctx.parsed_deferred_for_expressions.push(parsed);
     Ok(())
 }
@@ -340,6 +350,8 @@ pub(crate) fn parse_for_expr(
 ) -> Result<(Vec<Resource>, Vec<DataSource>, Vec<ModuleCall>), ParseError> {
     let for_line = pair.as_span().start_pos().line_col().0;
     let for_span = SourceSpan::from_pest(&pair, preprocessed_file);
+    let declaration =
+        crate::parser::DeclarationProvenance::from_pair(&pair, preprocessed_file, source_file);
     let mut inner = pair.into_inner();
 
     // Parse the binding pattern
@@ -348,6 +360,7 @@ pub(crate) fn parse_for_expr(
 
     // Parse the iterable expression
     let iterable_pair = next_pair(&mut inner, "iterable", "for expression")?;
+    let iterable_location = ctx.declaration_location(&iterable_pair);
     let iterable_surface = iterable_pair.as_str().trim().to_string();
     let ParsedForIterable {
         value: iterable,
@@ -566,6 +579,8 @@ pub(crate) fn parse_for_expr(
                 source_file,
                 for_line,
                 for_span,
+                iterable_location.clone(),
+                declaration.clone(),
                 header,
                 iterable.clone(),
                 ParsedDeferredForIterableState::Deferred,
@@ -596,6 +611,8 @@ pub(crate) fn parse_for_expr(
                     source_file,
                     for_line,
                     for_span,
+                    iterable_location.clone(),
+                    declaration.clone(),
                     header,
                     Value::Deferred(DeferredValue::BindingRef {
                         binding: RelativeBindingName::new(s.clone()),

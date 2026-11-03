@@ -98,6 +98,7 @@ impl LegacyLoopAddress {
 
 #[derive(Debug, Clone)]
 struct LoopAuthoring {
+    file: crate::parser::SourceFileId,
     span: SourceSpan,
     source_text: Arc<str>,
     binding_scope: Arc<BTreeSet<String>>,
@@ -159,6 +160,7 @@ impl LoopSource {
             kind,
             system_identity,
             authoring: Some(LoopAuthoring {
+                file: crate::parser::SourceFileId::new(source_file.to_path_buf()),
                 span,
                 source_text: source_text.into(),
                 binding_scope: Arc::new(BTreeSet::new()),
@@ -222,6 +224,10 @@ impl LoopSource {
 
     pub(crate) fn source_span(&self) -> Option<SourceSpan> {
         self.authoring.as_ref().map(|authoring| authoring.span)
+    }
+
+    pub(crate) fn source_file(&self) -> Option<&crate::parser::SourceFileId> {
+        self.authoring.as_ref().map(|authoring| &authoring.file)
     }
 
     pub(crate) fn binding_scope(&self) -> Option<&BTreeSet<String>> {
@@ -322,6 +328,10 @@ impl LoopElementOrigin {
     /// Deserialized historical provenance may not retain an authored span.
     pub fn source_span(&self) -> Option<SourceSpan> {
         self.source.source_span()
+    }
+
+    pub(crate) fn source_file(&self) -> Option<&crate::parser::SourceFileId> {
+        self.source.source_file()
     }
 
     pub fn display_suffix(&self) -> String {

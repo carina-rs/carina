@@ -5,6 +5,53 @@ use carina_core::schema::{
 use tower_lsp::lsp_types::{InsertTextFormat, TextEdit};
 
 #[test]
+fn completion_interpolation_after_non_bmp_uses_utf16() {
+    let source = "let helper = test.foo.bar { attr = 'value' }\nlet role = test.foo.bar {\n  attr = \"😀 ${hel}\"\n}\n";
+    let line = source.lines().nth(2).unwrap();
+    let start = line.find("hel").unwrap();
+    let position = Position::new(2, line[..start + 3].encode_utf16().count() as u32);
+    let items =
+        test_provider_single_attr().complete_for_test(&create_document(source), position, None);
+    let item = find_completion(&items, "helper");
+    let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = &item.text_edit else {
+        panic!("expected replacement edit: {item:?}");
+    };
+    assert_eq!(
+        edit.range,
+        Range::new(
+            Position::new(2, line[..start].encode_utf16().count() as u32),
+            position
+        )
+    );
+    assert_eq!(edit.new_text, "helper");
+}
+
+#[test]
+fn completion_inline_reference_edit_after_non_bmp_uses_utf16() {
+    let source = "let helper = test.foo.bar { attr = 'value' }\nlet role = test.foo.bar { name = '😀' attr = helper.at}\n";
+    let line = source.lines().nth(1).unwrap();
+    let start = line.find("helper.at").unwrap();
+    let position = Position::new(
+        1,
+        line[..start + "helper.at".len()].encode_utf16().count() as u32,
+    );
+    let items =
+        test_provider_single_attr().complete_for_test(&create_document(source), position, None);
+    let item = find_completion(&items, "helper.attr");
+    let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = &item.text_edit else {
+        panic!("expected replacement edit: {item:?}");
+    };
+    assert_eq!(
+        edit.range,
+        Range::new(
+            Position::new(1, line[..start].encode_utf16().count() as u32),
+            position
+        )
+    );
+    assert_eq!(edit.new_text, "helper.attr");
+}
+
+#[test]
 fn provider_text_completion_display_preserves_raw_insertion_and_filtering() {
     use carina_core::schema::TypeIdentity;
     let attack = "\x1b]52;c;ZXZpbA==\x07\x1b[2J";

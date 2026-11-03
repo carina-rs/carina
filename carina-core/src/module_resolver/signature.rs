@@ -85,6 +85,15 @@ pub fn load_resolved_module_signatures<E, B: crate::resource::BindingAddress, D>
     base_dir: &ResolvedPath,
     config: &ProviderContext,
 ) -> ResolvedModuleSignatures {
+    load_resolved_module_signatures_with_overrides(parsed, base_dir, config, &Default::default())
+}
+
+pub fn load_resolved_module_signatures_with_overrides<E, B: crate::resource::BindingAddress, D>(
+    parsed: &File<E, crate::resource::ParserPlaceholder, crate::resource::ParserPlaceholder, D, B>,
+    base_dir: &ResolvedPath,
+    config: &ProviderContext,
+    overrides: &crate::config_loader::SourceOverrides,
+) -> ResolvedModuleSignatures {
     let base_dir = base_dir.clone();
     parsed
         .uses
@@ -97,11 +106,12 @@ pub fn load_resolved_module_signatures<E, B: crate::resource::BindingAddress, D>
             // retain the providerless declaration snapshot: call-site
             // arguments still need the signature so their independent
             // boundary errors are reported alongside the body diagnostic.
-            super::loader::load_module_with_config(&path, config)
+            super::loader::load_module_with_overrides(&path, config, overrides)
                 .or_else(|| {
-                    super::loader::load_module(
+                    super::loader::load_module_with_overrides(
                         &path,
                         &ProviderContext::new(config.environment.clone()),
+                        overrides,
                     )
                 })
                 .map(|module| (import.alias.clone(), resolved_signature(&module, config)))

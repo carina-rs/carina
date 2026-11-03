@@ -184,6 +184,7 @@ mod tests {
             instance: "i".to_string(),
             call_path: Default::default(),
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         }
     }
 
@@ -267,6 +268,7 @@ mod tests {
     ///     instance: "i".to_string(),
     ///     call_path: Default::default(),
     ///     quoted_string_attrs: HashSet::new(),
+    ///     declaration: Default::default(),
     /// };
     /// // No `From<LiveComposition> for LeafNode` impl exists. This must
     /// // fail to type-check.

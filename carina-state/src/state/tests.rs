@@ -27,7 +27,7 @@ fn exact_comparison_context() -> carina_core::differ::ObservationComparison<'sta
 }
 
 #[test]
-fn round3_carried_reference_list_keeps_removal_provenance_across_alias_and_arn() {
+fn carried_reference_list_keeps_removal_provenance_across_alias_and_arn() {
     use carina_core::explicit::ExplicitFields;
     use carina_core::schema::{
         AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,

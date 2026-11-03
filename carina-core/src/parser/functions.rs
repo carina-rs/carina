@@ -25,6 +25,8 @@ pub(super) fn parse_fn_def(
     warnings: &mut Vec<ParseWarning>,
     preprocessed_file: &super::PreprocessedFile,
 ) -> Result<UserFunction, ParseError> {
+    let type_annotations =
+        super::elements::function_type_annotations(&pair, preprocessed_file, ctx.source_file());
     let mut inner = pair.into_inner();
     let name = next_pair(&mut inner, "function name", "fn_def")?
         .as_str()
@@ -147,6 +149,11 @@ pub(super) fn parse_fn_def(
                 // This should be the expression (the body)
                 let source_line = body_ctx.original_position(&body_inner)?.line();
                 body = Some(UserFunctionBody {
+                    location: super::DeclarationLocation::from_pair(
+                        &body_inner,
+                        preprocessed_file,
+                        body_ctx.source_file(),
+                    ),
                     value: parse_expression(body_inner, &body_ctx)?,
                     source_line,
                     source_file: None,
@@ -161,6 +168,7 @@ pub(super) fn parse_fn_def(
     })?;
 
     Ok(UserFunction {
+        type_annotations,
         name,
         params,
         return_type,
@@ -291,6 +299,7 @@ fn prepare_user_function_call<'cfg, Source: Clone>(
 
     if has_deferred_type_check {
         ctx.record_pending_function_type_check(PendingFunctionTypeCheck {
+            location: func.body.location.clone(),
             function_name: fn_name.clone(),
             arguments: effective_args.clone(),
             source_line: call_line,
@@ -792,6 +801,13 @@ fn check_fn_arg_type<Source: Clone>(
                 }
                 None => ParseError::UserFunctionError(error.to_string()),
             };
+            if let Some(annotation) = function
+                .type_annotations
+                .iter()
+                .find(|annotation| Some(annotation.location().span()) == parameter.type_span)
+            {
+                return Err(error.at(annotation.location()));
+            }
             return Err(match &function.annotation_source_file {
                 Some(path) => error.in_file(path.clone()),
                 None => error,
@@ -936,6 +952,7 @@ pub(super) fn record_deferred_function_type_check<Source: Clone>(
     ctx: &ParseContext<'_, Source>,
     source_line: usize,
     source_column: Option<usize>,
+    location: super::DeclarationLocation,
 ) {
     if function
         .params
@@ -944,6 +961,7 @@ pub(super) fn record_deferred_function_type_check<Source: Clone>(
         || function.return_type.is_some()
     {
         ctx.record_pending_function_type_check(PendingFunctionTypeCheck {
+            location,
             function_name: function.name.clone(),
             arguments: function
                 .params
@@ -1022,13 +1040,8 @@ pub(crate) fn validate_pending_function_type_check(
             &ctx,
             check.source_line,
             Some(
-                crate::validation::deferred_types::ProviderTypeCheckSite::at_line(
-                    check
-                        .source_file
-                        .as_deref()
-                        .unwrap_or_else(|| std::path::Path::new("<config>")),
-                    check.source_line,
-                    check.source_column.unwrap_or(1),
+                crate::validation::deferred_types::ProviderTypeCheckSite::new(
+                    check.location.clone(),
                     format!(
                         "function '{}' parameter '{}'",
                         function.name, parameter.name
@@ -1157,6 +1170,7 @@ pub(crate) fn evaluate_user_function<Source: Clone>(
         };
         if retain_check {
             ctx.record_pending_function_type_check(PendingFunctionTypeCheck {
+                location: func.body.location.clone(),
                 function_name: func.name.clone(),
                 arguments: func
                     .params
@@ -1210,10 +1224,7 @@ pub(crate) fn evaluate_resolved_user_function(
 }
 
 fn locate_function_body_error(func: &UserFunction, error: ParseError) -> ParseError {
-    match &func.body.source_file {
-        Some(path) => error.in_file(path.clone()),
-        None => error,
-    }
+    error.at(&func.body.location)
 }
 
 pub fn contains_function_call(value: &Value) -> bool {

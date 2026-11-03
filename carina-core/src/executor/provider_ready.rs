@@ -83,7 +83,7 @@ impl<T: ResourceWirePayload> ProviderReady<T> {
         if !diagnostics.is_empty() {
             let messages = diagnostics.into_iter().map(|diagnostic| match diagnostic {
                 crate::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning)
-                | crate::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(warning) => warning.message,
+                | crate::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(warning) => warning.into_warning().message,
             }).collect::<Vec<_>>();
             return Err(ProviderPreparationError::Provider(
                 crate::provider::ProviderError::invalid_input(messages.join("\n")),

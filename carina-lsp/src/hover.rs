@@ -670,7 +670,10 @@ fn is_in_type_annotation_position(doc: &Document, position: Position, word: &str
         Some(l) => l,
         None => return false,
     };
-    let col = position.character as usize;
+    let Some(col) = crate::position::utf16_offset_to_char_offset(&line_str, position.character)
+    else {
+        return false;
+    };
     let chars: Vec<char> = line_str.chars().collect();
     if col > chars.len() {
         return false;
@@ -731,6 +734,27 @@ mod tests {
     use super::*;
     use carina_core::parser::ProviderContext;
     use carina_core::schema::{AttributeSchema, AttributeType, StructField};
+
+    #[test]
+    fn hover_type_annotation_after_non_bmp_uses_utf16() {
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
+        let source = "exports { note: String = '😀' accounts: map(String) = {} }";
+        let doc = Document::new(
+            source.into(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        let end = source.find("map(").unwrap() + "map".len();
+        let hover = provider.hover(
+            &doc,
+            Position::new(0, source[..end].encode_utf16().count() as u32),
+        );
+        assert!(
+            hover.is_none(),
+            "type constructors must not show function hover: {hover:?}"
+        );
+    }
 
     #[test]
     fn format_value_for_hover_uses_canonical_string_literals() {

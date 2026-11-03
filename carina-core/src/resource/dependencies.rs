@@ -369,15 +369,41 @@ impl ResolvedDependencyReads {
 mod deferred_phase {
     use super::*;
     pub trait Sealed<B: BindingAddress> {
-        fn retain(&mut self, bindings: BTreeSet<B>);
+        fn retain(
+            &mut self,
+            bindings: BTreeSet<B>,
+            origin: Option<&crate::parser::DeclarationLocation>,
+        );
     }
     impl<B: BindingAddress> Sealed<B> for UnexpandedDependencyFields<B> {
-        fn retain(&mut self, bindings: BTreeSet<B>) {
+        fn retain(
+            &mut self,
+            bindings: BTreeSet<B>,
+            origin: Option<&crate::parser::DeclarationLocation>,
+        ) {
+            // Runtime constructors can lack parser metadata. The AnalysisTree
+            // boundary rejects those inputs; parsed children retain the
+            // iterable origin along with every dependency it contributed.
+            if let Some(origin) = origin {
+                let mut origins = self.depends_on.binding_reference_origins().to_vec();
+                origins.extend(
+                    bindings
+                        .iter()
+                        .cloned()
+                        .map(|binding| crate::parser::Located::new(origin.clone(), binding)),
+                );
+                self.depends_on.set_binding_reference_origins(origins);
+            }
             self.value_bindings.extend(bindings);
         }
     }
     impl<B: BindingAddress> Sealed<B> for () {
-        fn retain(&mut self, _bindings: BTreeSet<B>) {}
+        fn retain(
+            &mut self,
+            _bindings: BTreeSet<B>,
+            _origin: Option<&crate::parser::DeclarationLocation>,
+        ) {
+        }
     }
 }
 pub trait DeferredDependencyPhase<B: BindingAddress>: Clone + deferred_phase::Sealed<B> {}
@@ -389,8 +415,9 @@ pub(crate) fn retain_deferred_iterable_dependencies<
 >(
     dependencies: &mut D,
     bindings: BTreeSet<B>,
+    origin: Option<&crate::parser::DeclarationLocation>,
 ) {
-    deferred_phase::Sealed::retain(dependencies, bindings);
+    deferred_phase::Sealed::retain(dependencies, bindings, origin);
 }
 
 /// Compiled graph metadata for children that will materialize during apply.

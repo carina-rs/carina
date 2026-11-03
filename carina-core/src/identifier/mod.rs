@@ -3,6 +3,12 @@
 //! Functions for generating random suffixes, resolving attribute prefixes,
 //! reconciling prefixed names with state, and computing anonymous resource identifiers.
 
+mod diagnostics;
+pub use diagnostics::{
+    anonymous_identity_diagnostics, attribute_derived_conflict_diagnostics,
+    legacy_loop_move_target_diagnostics,
+};
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -1498,6 +1504,10 @@ pub fn resolve_attr_prefixes<P: PlaceholderKind, B: BindingAddress>(
             // `swap_remove`) preserves the source-order of the rest of
             // the attributes, which is the whole point of #2222.
             resource.attributes.shift_remove(&prefix_key);
+            resource.declaration.rename_attribute_path(
+                &[crate::parser::AttributePathSegment::Attribute(prefix_key)],
+                &base_attr,
+            );
 
             // Store prefix
             resource.prefixes.insert(

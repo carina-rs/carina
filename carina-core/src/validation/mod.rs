@@ -3,6 +3,7 @@
 pub mod deferred_populate;
 pub mod deferred_types;
 pub mod depends_on;
+pub mod routing;
 pub mod typecheck;
 pub mod wait;
 
@@ -525,6 +526,10 @@ pub struct BindingUseFinding {
 }
 
 impl BindingUseFinding {
+    pub fn diagnostic(&self) -> crate::parser::Located<&Self> {
+        crate::parser::Located::new(self.use_site.location().clone(), self)
+    }
+
     fn error(use_site: crate::parser::BareBindingUse, error: BindingResolutionError) -> Self {
         Self { use_site, error }
     }
@@ -1080,8 +1085,7 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
                 value,
                 typecheck::TypecheckInference::Unavailable,
                 deferred_types::ProviderTypeCheckSite::new(
-                    use_site.source_file.path(),
-                    use_site.span,
+                    use_site.location().clone(),
                     format!("binding '{}'", use_site.name),
                 ),
             )
@@ -1897,35 +1901,37 @@ impl DeferredAccessTypeError {
     /// Return the authored operator span when this computed-expression error
     /// came from integer arithmetic. Frontends use this only for source
     /// anchoring; the diagnostic text and validity decision remain in core.
-    pub const fn integer_operator_span(
-        &self,
-    ) -> Option<crate::integer_arithmetic::IntegerOperatorSpan> {
+    fn integer_operator_span(&self) -> Option<crate::integer_arithmetic::IntegerOperatorSpan> {
         match self {
             Self::InvalidAccess {
                 error:
                     inference::InferenceError::InvalidIntegerArithmeticOperand { operator_span, .. },
-            } => Some(*operator_span),
+            } => Some(operator_span.clone()),
             Self::InvalidAccess { .. } | Self::TypeMismatch { .. } => None,
         }
     }
 }
 
 /// One arithmetic-specific failure found while walking a computed value.
-/// The error text and validity decision come from the shared core checker;
-/// frontends only use the span to anchor that finding in authored source.
+/// The shared checker returns this detail inside `Located`; coordinate-only
+/// arithmetic checks are not an external diagnostic API.
+///
+/// ```compile_fail,E0603
+/// use carina_core::validation::check_integer_arithmetic_types;
+/// ```
+///
+/// ```compile_fail,E0599
+/// use carina_core::validation::IntegerArithmeticTypeFinding;
+/// fn fabricate(finding: IntegerArithmeticTypeFinding) { let span = finding.operator_span(); }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntegerArithmeticTypeFinding {
     error: DeferredAccessTypeError,
-    operator_span: crate::integer_arithmetic::IntegerOperatorSpan,
 }
 
 impl IntegerArithmeticTypeFinding {
     pub fn error(&self) -> &DeferredAccessTypeError {
         &self.error
-    }
-
-    pub const fn operator_span(&self) -> crate::integer_arithmetic::IntegerOperatorSpan {
-        self.operator_span
     }
 }
 
@@ -2265,7 +2271,7 @@ fn check_integer_arithmetic_types_with_sink<'a, B: BindingAddress>(
     bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
     schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
-) -> Vec<IntegerArithmeticTypeFinding> {
+) -> Vec<crate::parser::Located<IntegerArithmeticTypeFinding>> {
     let mut findings = Vec::new();
     visit_computed_accesses_with_sink(value, sink, &mut |candidate, candidate_sink| {
         let GenericValue::Deferred(crate::resource::DeferredValue::IntegerArithmetic(expression)) =
@@ -2298,34 +2304,61 @@ fn check_integer_arithmetic_types_with_sink<'a, B: BindingAddress>(
         let operator_span = error
             .integer_operator_span()
             .unwrap_or_else(|| expression.operator_span());
-        let duplicate = findings
-            .iter()
-            .any(|finding: &IntegerArithmeticTypeFinding| {
-                finding.to_string() == error.to_string()
-                    && finding.operator_span.line() == operator_span.line()
-                    && finding.operator_span.column() == operator_span.column()
-            });
+        let duplicate = findings.iter().any(
+            |finding: &crate::parser::Located<IntegerArithmeticTypeFinding>| {
+                finding.detail().to_string() == error.to_string()
+                    && Some(finding.location()) == operator_span.location()
+            },
+        );
         if !duplicate {
-            findings.push(IntegerArithmeticTypeFinding {
-                error,
-                operator_span,
-            });
+            findings.push(crate::parser::Located::new(
+                operator_span
+                    .location()
+                    .expect("integer operator validated at the analysis boundary")
+                    .clone(),
+                IntegerArithmeticTypeFinding { error },
+            ));
         }
     });
     findings
+}
+
+impl<D, B: BindingAddress, E>
+    crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    pub fn integer_arithmetic_findings(
+        &self,
+        resource: &crate::parser::AnalysisResourceRef<
+            '_,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            B,
+        >,
+        name: &str,
+        sink: crate::schema::EffectiveType<'_>,
+        bindings: &crate::validation::inference::InferenceBindings<ParserPlaceholder, B>,
+        schemas: &crate::schema::SchemaRegistry,
+        binding_index: &crate::binding_index::BindingIndex<'_, B>,
+    ) -> Vec<crate::parser::Located<crate::validation::IntegerArithmeticTypeFinding>> {
+        let attributes = resource.attributes();
+        check_integer_arithmetic_types(&attributes[name], sink, bindings, schemas, binding_index)
+    }
 }
 
 /// Validate every integer-arithmetic node in a value tree against both its
 /// authored resource sink and its invariant Int operand sinks. This is the
 /// shared source for CLI and LSP arithmetic diagnostics; callers add only
 /// their surrounding resource context and source-range conversion.
-pub fn check_integer_arithmetic_types<B: BindingAddress>(
+fn check_integer_arithmetic_types<B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     sink: crate::schema::EffectiveType<'_>,
     bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
     schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
-) -> Vec<IntegerArithmeticTypeFinding> {
+) -> Vec<crate::parser::Located<IntegerArithmeticTypeFinding>> {
     check_integer_arithmetic_types_with_sink(
         value,
         Some(RefSink::from_effective_type(sink)),
@@ -2335,26 +2368,8 @@ pub fn check_integer_arithmetic_types<B: BindingAddress>(
     )
 }
 
-/// Validate arithmetic in a value that has no external declared sink, such as
-/// a top-level `let`. The expression's own result is Int, and every nested
-/// arithmetic node must independently prove both operands are Int.
-pub fn check_integer_arithmetic_value<B: BindingAddress>(
-    value: &GenericValue<ParserPlaceholder, B>,
-    bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
-    schemas: &SchemaRegistry,
-    binding_index: &BindingIndex<'_, B>,
-) -> Vec<IntegerArithmeticTypeFinding> {
-    check_integer_arithmetic_types_with_sink(
-        value,
-        Some(RefSink::TypeExpr(&INT_REF_SINK)),
-        bindings,
-        schemas,
-        binding_index,
-    )
-}
-
 fn append_unique_integer_arithmetic_findings<B: BindingAddress>(
-    findings: &mut Vec<IntegerArithmeticTypeFinding>,
+    findings: &mut Vec<crate::parser::Located<IntegerArithmeticTypeFinding>>,
     value: &GenericValue<ParserPlaceholder, B>,
     sink: Option<RefSink<'_>>,
     bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
@@ -2364,12 +2379,8 @@ fn append_unique_integer_arithmetic_findings<B: BindingAddress>(
     for finding in
         check_integer_arithmetic_types_with_sink(value, sink, bindings, schemas, binding_index)
     {
-        let span = finding.operator_span();
         let duplicate = findings.iter().any(|existing| {
-            let existing_span = existing.operator_span();
-            existing.to_string() == finding.to_string()
-                && existing_span.line() == span.line()
-                && existing_span.column() == span.column()
+            existing.to_string() == finding.to_string() && existing.location() == finding.location()
         });
         if !duplicate {
             findings.push(finding);
@@ -2379,19 +2390,28 @@ fn append_unique_integer_arithmetic_findings<B: BindingAddress>(
 
 /// Validate arithmetic in every non-resource value declaration in a parsed
 /// file. Resource attributes retain their external schema sink and are checked
-/// separately by [`check_integer_arithmetic_types`]; this pass covers values
+/// separately by [`crate::parser::AnalysisTree::integer_arithmetic_findings`]; this pass covers values
 /// that may otherwise be unused, including module attributes, provider/backend
 /// values, deferred iterables, and user-function bodies.
+/// A raw file cannot bypass the boundary that requires operator provenance.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{parser::ParsedFile, validation::{check_file_integer_arithmetic_values, inference::InferenceBindings}, schema::SchemaRegistry, binding_index::BindingIndex};
+/// fn analyze(file: &ParsedFile, bindings: &BindingIndex<'_>) {
+///     check_file_integer_arithmetic_values(file, &InferenceBindings::new(), &SchemaRegistry::new(), bindings);
+/// }
+/// ```
 pub fn check_file_integer_arithmetic_values<
     B: BindingAddress,
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
-    parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
     bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
     schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
-) -> Vec<IntegerArithmeticTypeFinding> {
+) -> Vec<crate::parser::Located<IntegerArithmeticTypeFinding>> {
+    let parsed = tree.file();
     let mut findings = Vec::new();
     let mut check =
         |value: &GenericValue<ParserPlaceholder, B>,
@@ -3145,21 +3165,26 @@ pub fn validate_user_function_ref_types_with_bindings<
     validate_user_function_ref_types_inner(parsed, bindings, UnknownReferencePolicy::Report)
 }
 
-fn validate_user_function_ref_types_inner<
-    E: crate::parser::ExportParamLike,
-    D: crate::parser::DeferredForPhaseTraversal,
->(
-    parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
-    bindings: &BindingIndex<'_>,
-    unknown_policy: UnknownReferencePolicy,
-) -> Result<(), String> {
-    fn check_refs(
+mod user_function_refs {
+    use super::*;
+    pub(super) enum FunctionRefFinding {
+        Reference(crate::resource::AccessPath<RelativeBindingName>, String),
+        Boundary(String),
+    }
+    impl FunctionRefFinding {
+        pub(super) fn into_message(self) -> String {
+            match self {
+                Self::Reference(_, message) | Self::Boundary(message) => message,
+            }
+        }
+    }
+    pub(super) fn check_refs(
         value: &Value,
         sink: Option<RefSink<'_>>,
         context: &str,
         bindings: &BindingIndex<'_>,
         unknown_policy: UnknownReferencePolicy,
-        errors: &mut Vec<String>,
+        errors: &mut Vec<FunctionRefFinding>,
     ) {
         visit_refs_with_sink(value, sink, &mut |path, sink, usage, _candidate| {
             let Some(sink) = sink else {
@@ -3193,7 +3218,14 @@ fn validate_user_function_ref_types_inner<
                     format!("{context}: {reason}")
                 }
             };
-            errors.push(message);
+            errors.push(match path {
+                ReferencePathRef::Access(path) => {
+                    FunctionRefFinding::Reference(path.clone(), message)
+                }
+                ReferencePathRef::Binding(_) | ReferencePathRef::BindingAccess { .. } => {
+                    FunctionRefFinding::Boundary(message)
+                }
+            });
         });
     }
 
@@ -3264,13 +3296,13 @@ fn validate_user_function_ref_types_inner<
         }
     }
 
-    fn check_function_calls(
+    pub(super) fn check_function_calls(
         value: &Value,
         result_sink: Option<&TypeExpr>,
         context: Option<&str>,
         bindings: &BindingIndex<'_>,
         unknown_policy: UnknownReferencePolicy,
-        errors: &mut Vec<String>,
+        errors: &mut Vec<FunctionRefFinding>,
     ) {
         fn check_call(
             name: &str,
@@ -3279,18 +3311,18 @@ fn validate_user_function_ref_types_inner<
             result_context: Option<(&TypeExpr, &str)>,
             bindings: &BindingIndex<'_>,
             unknown_policy: UnknownReferencePolicy,
-            errors: &mut Vec<String>,
+            errors: &mut Vec<FunctionRefFinding>,
         ) {
             if let (Some(source), Some((sink, context))) = (
                 function.and_then(|function| function.return_type.as_ref()),
                 result_context,
             ) {
                 match declared_result_mismatch(source, sink, bindings) {
-                    Ok(Some((expected, actual))) => errors.push(format!(
+                    Ok(Some((expected, actual))) => errors.push(FunctionRefFinding::Boundary(format!(
                         "{context}: expected {expected}, got {actual} (from function '{name}' return type)"
-                    )),
+                    ))),
                     Ok(None) => {},
-                    Err(error) => errors.push(format!("{context}: function '{name}' return type: {error}")),
+                    Err(error) => errors.push(FunctionRefFinding::Boundary(format!("{context}: function '{name}' return type: {error}"))),
                 }
             }
             for (index, argument) in args.iter().enumerate() {
@@ -3494,7 +3526,67 @@ fn validate_user_function_ref_types_inner<
             | crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(_)) => {}
         }
     }
+}
 
+/// Function boundary findings use the exact reference occurrence recorded by the parser.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{parser::ParsedFile, binding_index::BindingIndex, validation::user_function_reference_diagnostics};
+/// fn analyze(file: &ParsedFile, bindings: &BindingIndex<'_>) {
+///     user_function_reference_diagnostics(file, bindings);
+/// }
+/// ```
+pub fn user_function_reference_diagnostics(
+    tree: &crate::parser::AnalysisTree<'_>,
+    bindings: &BindingIndex<'_>,
+) -> Vec<crate::parser::Located<String>> {
+    use user_function_refs::{FunctionRefFinding, check_function_calls, check_refs};
+    let mut diagnostics = Vec::new();
+    tree.visit_function_values(&mut |input| {
+        let value = input.value;
+        let expected = input.expected;
+        let context = input.context.as_deref();
+        let mut findings = Vec::new();
+        if input.check_return {
+            check_refs(
+                value,
+                expected.map(RefSink::TypeExpr),
+                context.expect("function return context"),
+                bindings,
+                UnknownReferencePolicy::Report,
+                &mut findings,
+            );
+        }
+        check_function_calls(
+            value,
+            expected,
+            context,
+            bindings,
+            UnknownReferencePolicy::Report,
+            &mut findings,
+        );
+        for finding in findings {
+            let (location, message) = match finding {
+                FunctionRefFinding::Reference(path, message) => {
+                    (tree.reference_for_path(&path).location().clone(), message)
+                }
+                FunctionRefFinding::Boundary(message) => (input.location().clone(), message),
+            };
+            diagnostics.push(crate::parser::Located::new(location, message));
+        }
+    });
+    diagnostics
+}
+
+fn validate_user_function_ref_types_inner<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
+    bindings: &BindingIndex<'_>,
+    unknown_policy: UnknownReferencePolicy,
+) -> Result<(), String> {
+    use user_function_refs::{check_function_calls, check_refs};
     let mut errors = Vec::new();
 
     // Calls can appear in any value-bearing top-level construct. Ordinary
@@ -3625,7 +3717,11 @@ fn validate_user_function_ref_types_inner<
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(errors.join("\n"))
+        Err(errors
+            .into_iter()
+            .map(user_function_refs::FunctionRefFinding::into_message)
+            .collect::<Vec<_>>()
+            .join("\n"))
     }
 }
 
@@ -4090,6 +4186,15 @@ pub fn validate_resources<
 ///
 /// For example, if `ipv4_ipam_pool_id` expects `IpamPoolId` type,
 /// a reference like `vpc.vpc_id` (which is `AwsResourceId`) should be an error.
+/// Resource reference findings remain distinct from a rejected analysis input.
+#[derive(Debug, thiserror::Error)]
+pub enum ResourceRefTypeValidationError {
+    #[error(transparent)]
+    AnalysisInvariant(#[from] crate::parser::AnalysisTreeError),
+    #[error("{0}")]
+    Validation(String),
+}
+
 pub fn validate_resource_ref_types<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
@@ -4099,7 +4204,7 @@ pub fn validate_resource_ref_types<
     registry: &SchemaRegistry,
     _argument_names: &HashSet<String>,
     bindings: &BindingIndex<'_, B>,
-) -> Result<(), String> {
+) -> Result<(), ResourceRefTypeValidationError> {
     validate_resource_ref_types_inner(parsed, registry, bindings)
 }
 
@@ -4159,7 +4264,7 @@ fn validate_resource_ref_types_inner<
     parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     registry: &SchemaRegistry,
     bindings: &BindingIndex<'_, B>,
-) -> Result<(), String> {
+) -> Result<(), ResourceRefTypeValidationError> {
     let mut all_errors = Vec::new();
     let inference_bindings = inference::bindings_from_parsed(parsed);
 
@@ -4168,12 +4273,14 @@ fn validate_resource_ref_types_inner<
     // operator keys so a let substituted into an attribute is not reported a
     // second time by the schema-sink pass below.
     let mut declaration_arithmetic_findings = HashSet::new();
-    for finding in
-        check_file_integer_arithmetic_values(parsed, &inference_bindings, registry, bindings)
-    {
-        let span = finding.operator_span();
+    for finding in check_file_integer_arithmetic_values(
+        &crate::parser::AnalysisTree::try_from_file(parsed)?,
+        &inference_bindings,
+        registry,
+        bindings,
+    ) {
         let message = finding.to_string();
-        declaration_arithmetic_findings.insert((span.line(), span.column(), message.clone()));
+        declaration_arithmetic_findings.insert((finding.location().clone(), message.clone()));
         all_errors.push(message);
     }
 
@@ -4338,12 +4445,9 @@ fn validate_resource_ref_types_inner<
                         registry,
                         bindings,
                     ) {
-                        let span = finding.operator_span();
-                        if declaration_arithmetic_findings.contains(&(
-                            span.line(),
-                            span.column(),
-                            finding.to_string(),
-                        )) {
+                        if declaration_arithmetic_findings
+                            .contains(&(finding.location().clone(), finding.to_string()))
+                        {
                             continue;
                         }
                         match finding.error() {
@@ -4404,21 +4508,25 @@ fn validate_resource_ref_types_inner<
         );
     }
 
-    all_errors.extend(
-        validate_deferred_for_iterable_types_with_bindings(
-            parsed,
-            registry,
-            &inference_bindings,
-            bindings.provider_context(),
-        )
-        .into_iter()
-        .map(|diagnostic| diagnostic.to_string()),
-    );
+    if parsed.deferred_for_sites().next().is_some() {
+        all_errors.extend(
+            validate_deferred_for_iterable_types_with_bindings(
+                &crate::parser::AnalysisTree::try_from_file(parsed)?,
+                registry,
+                &inference_bindings,
+                bindings.provider_context(),
+            )
+            .into_iter()
+            .map(|diagnostic| diagnostic.to_string()),
+        );
+    }
 
     if all_errors.is_empty() {
         Ok(())
     } else {
-        Err(all_errors.join("\n"))
+        Err(ResourceRefTypeValidationError::Validation(
+            all_errors.join("\n"),
+        ))
     }
 }
 
@@ -4526,8 +4634,6 @@ fn infer_type_from_value_to_iterable_shape<B: BindingAddress>(
 /// anchoring only diagnostics owned by the current editor buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeferredForIterableTypeDiagnostic {
-    pub file: Option<String>,
-    pub line: usize,
     pub expression: String,
     pub message: String,
 }
@@ -4536,8 +4642,8 @@ impl std::fmt::Display for DeferredForIterableTypeDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "deferred-for iterable `{}` at line {}: {}",
-            self.expression, self.line, self.message
+            "deferred-for iterable `{}`: {}",
+            self.expression, self.message
         )
     }
 }
@@ -4547,13 +4653,27 @@ impl std::fmt::Display for DeferredForIterableTypeDiagnostic {
 /// Coalesce operands are checked independently: even while the left remains
 /// unresolved, a statically known scalar fallback cannot be allowed to reach
 /// apply for a loop that requires a list or map.
-pub fn validate_deferred_for_iterable_types<E>(
-    parsed: &crate::parser::File<E>,
+///
+/// ```compile_fail,E0308
+/// use carina_core::{parser::{ParsedFile, ProviderContext}, schema::SchemaRegistry, validation::validate_deferred_for_iterable_types};
+/// fn analyze(file: &ParsedFile, context: &ProviderContext) {
+///     validate_deferred_for_iterable_types(file, &SchemaRegistry::new(), context);
+/// }
+/// ```
+pub fn validate_deferred_for_iterable_types<D, B: BindingAddress>(
+    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
     schemas: &SchemaRegistry,
     provider_context: &ProviderContext,
-) -> Vec<DeferredForIterableTypeDiagnostic> {
-    let bindings = inference::bindings_from_parsed(parsed);
-    validate_deferred_for_iterable_types_with_bindings(parsed, schemas, &bindings, provider_context)
+) -> Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    validate_deferred_for_iterable_types_with_bindings(
+        tree,
+        schemas,
+        &tree.inference_bindings(),
+        provider_context,
+    )
 }
 
 fn validate_deferred_for_iterable_types_with_bindings<
@@ -4561,32 +4681,76 @@ fn validate_deferred_for_iterable_types_with_bindings<
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
-    parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
     schemas: &SchemaRegistry,
     bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
     provider_context: &ProviderContext,
-) -> Vec<DeferredForIterableTypeDiagnostic> {
+) -> Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>> {
     let mut diagnostics = Vec::new();
-    for deferred in parsed.deferred_for_sites() {
-        let expected = match deferred.binding {
+    for deferred in tree.for_iterables() {
+        let expected = match deferred.binding() {
             ForBinding::Simple(_) | ForBinding::Indexed(_, _) => DeferredIterableKind::List,
             ForBinding::Map(_, _) => DeferredIterableKind::Map,
         };
         validate_deferred_iterable_operand(
-            deferred.iterable,
+            deferred.iterable(),
             DeferredIterableValidationContext {
                 expected,
                 bindings,
                 schemas,
                 provider_context,
-                file: deferred.file,
-                line: deferred.line,
-                expression: deferred.iterable,
+                location: deferred.location(),
+                expression: deferred.iterable(),
             },
             &mut diagnostics,
         );
     }
     diagnostics
+}
+
+/// Unknown roots in deferred iterables are owned by their authored occurrence.
+pub fn validate_for_iterable_bindings<D, B: BindingAddress>(
+    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+) -> Vec<crate::parser::Located<crate::parser::ParseError>>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    let mut findings = Vec::new();
+    let mut in_scope: Vec<_> = tree.binding_names().iter().cloned().collect();
+    in_scope.sort();
+    for deferred in tree
+        .for_iterables()
+        .iter()
+        .filter(|deferred| deferred.checks_scope())
+    {
+        for root in deferred.iterable().root_bindings() {
+            if tree.binding_names().contains(root.as_str()) {
+                continue;
+            }
+            let occurrences: Vec<_> = deferred
+                .references()
+                .iter()
+                .filter(|reference| reference.path().binding_address() == &root)
+                .map(|reference| reference.prefix_location())
+                .collect();
+            let locations = if occurrences.is_empty() {
+                vec![deferred.location()]
+            } else {
+                occurrences
+            };
+            for location in locations {
+                findings.push(crate::parser::Located::new(
+                    location.clone(),
+                    crate::parser::ParseError::undefined_identifier(
+                        root.to_string(),
+                        location.span().start_line(),
+                        in_scope.clone(),
+                    ),
+                ));
+            }
+        }
+    }
+    findings
 }
 
 impl std::fmt::Display for DeferredIterableKind {
@@ -4603,8 +4767,7 @@ struct DeferredIterableValidationContext<'a, B: BindingAddress> {
     bindings: &'a inference::InferenceBindings<ParserPlaceholder, B>,
     schemas: &'a SchemaRegistry,
     provider_context: &'a ProviderContext,
-    file: Option<&'a str>,
-    line: usize,
+    location: &'a crate::parser::DeclarationLocation,
     expression: &'a GenericValue<ParserPlaceholder, B>,
 }
 
@@ -4619,7 +4782,7 @@ impl<B: BindingAddress> Clone for DeferredIterableValidationContext<'_, B> {
 fn validate_deferred_iterable_operand<B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     context: DeferredIterableValidationContext<'_, B>,
-    diagnostics: &mut Vec<DeferredForIterableTypeDiagnostic>,
+    diagnostics: &mut Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>>,
 ) {
     match value {
         GenericValue::Deferred(crate::resource::DeferredValue::Coalesce { value, default }) => {
@@ -4708,13 +4871,14 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
 fn deferred_iterable_diagnostic<B: BindingAddress>(
     context: DeferredIterableValidationContext<'_, B>,
     message: String,
-) -> DeferredForIterableTypeDiagnostic {
-    DeferredForIterableTypeDiagnostic {
-        file: context.file.map(str::to_string),
-        line: context.line,
-        expression: crate::value::format_value(context.expression),
-        message,
-    }
+) -> crate::parser::Located<DeferredForIterableTypeDiagnostic> {
+    crate::parser::Located::new(
+        context.location.clone(),
+        DeferredForIterableTypeDiagnostic {
+            expression: crate::value::format_value(context.expression),
+            message,
+        },
+    )
 }
 
 /// Validate that attribute parameter ResourceRef values name attributes on
@@ -4932,6 +5096,27 @@ impl ExportBoundaryError {
             source: param.declaration_source(),
             message,
         }
+    }
+
+    pub fn diagnostic<'a, D, B: BindingAddress>(
+        &'a self,
+        tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+    ) -> crate::parser::Located<&'a Self>
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        let declaration = tree
+            .syntax()
+            .declarations()
+            .iter()
+            .find(|declaration| {
+                declaration.kind() == crate::config_loader::DeclarationKind::Export
+                    && declaration.name() == self.name
+                    && declaration.location().file().path() == self.source_file()
+                    && self.source_span().contains(declaration.location().span())
+            })
+            .expect("export boundary provenance validated by analysis");
+        crate::parser::Located::new(declaration.location().clone(), self)
     }
 
     pub fn source_file(&self) -> &std::path::Path {
@@ -5723,32 +5908,19 @@ impl std::fmt::Display for TypeResolutionContext {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TypeResolutionSource {
-    source_file: SourceFileId,
-    span: SourceSpan,
-}
-
-impl TypeResolutionSource {
-    fn new(source_file: SourceFileId, span: SourceSpan) -> Self {
-        Self { source_file, span }
-    }
-
-    pub fn source_file(&self) -> &SourceFileId {
-        &self.source_file
-    }
-
-    pub fn span(&self) -> SourceSpan {
-        self.span
-    }
-}
-
+/// Details are always delivered inside `Located`; location is mandatory.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{parser::{DeclarationLocation, Located}, validation::TypeResolutionDiagnostic};
+/// fn location(finding: &Located<TypeResolutionDiagnostic>) {
+///     let _: Option<&DeclarationLocation> = finding.location();
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{context}: {error}")]
 pub struct TypeResolutionDiagnostic {
     context: TypeResolutionContext,
     error: TypeResolutionError,
-    location: Option<TypeResolutionSource>,
 }
 
 impl TypeResolutionDiagnostic {
@@ -5756,51 +5928,43 @@ impl TypeResolutionDiagnostic {
         kind: TypeResolutionDeclarationKind,
         name: String,
         error: TypeResolutionError,
-        location: Option<TypeResolutionSource>,
-    ) -> Self {
-        Self {
-            context: TypeResolutionContext::Declaration { kind, name },
-            error,
+        location: crate::parser::DeclarationLocation,
+    ) -> crate::parser::Located<Self> {
+        crate::parser::Located::new(
             location,
-        }
+            Self {
+                context: TypeResolutionContext::Declaration { kind, name },
+                error,
+            },
+        )
     }
-
     fn description(
         description: String,
         error: TypeResolutionError,
-        location: Option<TypeResolutionSource>,
-    ) -> Self {
-        Self {
-            context: TypeResolutionContext::Description(description),
-            error,
+        location: crate::parser::DeclarationLocation,
+    ) -> crate::parser::Located<Self> {
+        crate::parser::Located::new(
             location,
-        }
+            Self {
+                context: TypeResolutionContext::Description(description),
+                error,
+            },
+        )
     }
+}
 
-    pub fn source_location(&self) -> Option<&TypeResolutionSource> {
-        self.location.as_ref()
-    }
-
-    /// Whether this typed declaration failure supersedes the parser's
-    /// location-only backstop for the same unresolved type.
+impl crate::parser::Located<TypeResolutionDiagnostic> {
     fn covers_parser_error(
         &self,
         source_file: &std::path::Path,
         parse_error: &crate::parser::ParseError,
     ) -> bool {
-        let crate::parser::ParseError::UnresolvedDeclarationType {
-            token,
-            line: _line,
-            message: _message,
-        } = parse_error
-        else {
+        let crate::parser::ParseError::UnresolvedDeclarationType { token, .. } = parse_error else {
             return false;
         };
-        self.location.as_ref().is_some_and(|location| {
-            location.source_file.path() == source_file
-                && location.span.contains(token.span())
-                && self.error.unresolved_type_name() == token.name()
-        })
+        self.location().file().path() == source_file
+            && self.location().span().contains(token.span())
+            && self.detail().error.unresolved_type_name() == token.name()
     }
 }
 
@@ -5821,7 +5985,7 @@ impl<'a> TypeResolutionParserError<'a> {
 /// The sole decision point for replacing a parser backstop with typed
 /// declaration diagnostics. Both resolver/CLI and LSP paths use this gate.
 pub(crate) fn type_resolution_parser_error_is_covered<'a>(
-    diagnostics: impl IntoIterator<Item = &'a TypeResolutionDiagnostic>,
+    diagnostics: impl IntoIterator<Item = &'a crate::parser::Located<TypeResolutionDiagnostic>>,
     parser_error: TypeResolutionParserError<'_>,
 ) -> bool {
     diagnostics.into_iter().any(|diagnostic| {
@@ -5836,7 +6000,7 @@ pub(crate) fn type_resolution_parser_error_is_covered<'a>(
 /// source span.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileTypeResolutionReport {
-    diagnostics: Vec<TypeResolutionDiagnostic>,
+    diagnostics: Vec<crate::parser::Located<TypeResolutionDiagnostic>>,
     covered_parser_error: bool,
     resolved_argument_types: ResolvedArgumentTypes,
 }
@@ -5865,11 +6029,11 @@ impl FileTypeResolutionReport {
         &self.resolved_argument_types
     }
 
-    pub fn diagnostics(&self) -> &[TypeResolutionDiagnostic] {
+    pub fn diagnostics(&self) -> &[crate::parser::Located<TypeResolutionDiagnostic>] {
         &self.diagnostics
     }
 
-    pub fn into_diagnostics(self) -> Vec<TypeResolutionDiagnostic> {
+    pub fn into_diagnostics(self) -> Vec<crate::parser::Located<TypeResolutionDiagnostic>> {
         self.diagnostics
     }
 
@@ -5915,169 +6079,167 @@ fn resolve_declaration_type(
 fn resolve_file_type_exprs_impl<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
-    D,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> (Vec<TypeResolutionDiagnostic>, ResolvedArgumentTypes) {
+) -> Result<
+    (
+        Vec<crate::parser::Located<TypeResolutionDiagnostic>>,
+        ResolvedArgumentTypes,
+    ),
+    crate::parser::AnalysisTreeError,
+> {
+    let annotations = crate::parser::AnalysisTree::try_from_file(parsed)?
+        .type_annotations()
+        .to_vec();
+    Ok(resolve_file_type_exprs_with_annotations(
+        parsed,
+        config,
+        &annotations,
+    ))
+}
+
+fn resolve_file_type_exprs_with_annotations<
+    E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+>(
+    parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    annotations: &[crate::parser::Located<TypeResolutionContext>],
+) -> (
+    Vec<crate::parser::Located<TypeResolutionDiagnostic>>,
+    ResolvedArgumentTypes,
+) {
     use deferred_types::ProviderTypeCheckSite;
+    let mut occurrences = std::collections::HashMap::<TypeResolutionContext, usize>::new();
+    let mut annotation = |kind, name: &str| {
+        let context = TypeResolutionContext::Declaration {
+            kind,
+            name: name.to_string(),
+        };
+        let occurrence = occurrences.entry(context.clone()).or_default();
+        let location = annotations
+            .iter()
+            .filter(|annotation| annotation.detail() == &context)
+            .nth(*occurrence)
+            .expect("type annotation validated at the analysis boundary")
+            .location()
+            .clone();
+        *occurrence += 1;
+        location
+    };
     let mut errors = Vec::new();
-    let argument_sources = parsed
-        .arguments
-        .iter()
-        .filter_map(|argument| {
-            parsed
-                .parser_binding_metadata
-                .argument_type_source(&argument.name)
-                .map(|(source_file, span)| {
-                    (
-                        argument.name.clone(),
-                        TypeResolutionSource::new(source_file.clone(), span),
-                    )
-                })
-        })
-        .collect::<IndexMap<_, _>>();
     let mut argument_types = IndexMap::new();
-    for arg in &mut parsed.arguments {
-        let source = argument_sources.get(&arg.name).cloned();
-        let context = format!("argument '{}'", arg.name);
-        let site = source
-            .as_ref()
-            .map(|source| {
-                ProviderTypeCheckSite::new(source.source_file.path(), source.span, &context)
-            })
-            .unwrap_or_else(|| {
-                ProviderTypeCheckSite::at_line(std::path::Path::new("<config>"), 1, 1, &context)
-            });
-        let argument_errors = resolve_declaration_type(&mut arg.static_type, config, &site);
-        let resolution = if argument_errors.is_empty() {
-            let classification = match &arg.static_type {
+    for argument in &mut parsed.arguments {
+        let location = annotation(TypeResolutionDeclarationKind::Argument, &argument.name);
+        let context = format!("argument '{}'", argument.name);
+        let site = ProviderTypeCheckSite::new(location.clone(), context);
+        let failures = resolve_declaration_type(&mut argument.static_type, config, &site);
+        let resolution = if failures.is_empty() {
+            DependencyArgumentResolution::Resolved(match &argument.static_type {
                 TypeExpr::Ref(_) => ResolvedDependencyArgumentType::ManagedHandle,
                 value => ResolvedDependencyArgumentType::Value(value.to_string()),
-            };
-            DependencyArgumentResolution::Resolved(classification)
+            })
         } else {
             DependencyArgumentResolution::Unresolved
         };
-        argument_types.insert(arg.name.clone(), resolution);
-        for error in argument_errors {
+        argument_types.insert(argument.name.clone(), resolution);
+        for error in failures {
             errors.push(TypeResolutionDiagnostic::declaration(
                 TypeResolutionDeclarationKind::Argument,
-                arg.name.clone(),
+                argument.name.clone(),
                 error,
-                source.clone(),
+                location.clone(),
             ));
         }
     }
-    for ap in &mut parsed.attribute_params {
-        let source = TypeResolutionSource::new(
-            SourceFileId::new(ap.source_file().to_path_buf()),
-            ap.source_span(),
-        );
-        let site = ProviderTypeCheckSite::new(
-            ap.source_file(),
-            ap.source_span(),
-            format!("attribute '{}'", ap.name),
-        );
-        if let Some(ty) = &mut ap.static_type {
+    for attribute in &mut parsed.attribute_params {
+        // Declaration and runtime checks share the parser-owned annotation
+        // token, so deduplication never reconstructs a site from coordinates.
+        if let Some(ty) = &mut attribute.static_type {
+            let location = annotation(TypeResolutionDeclarationKind::Attribute, &attribute.name);
+            let site = ProviderTypeCheckSite::new(
+                location.clone(),
+                format!("attribute '{}'", attribute.name),
+            );
             for error in resolve_declaration_type(ty, config, &site) {
                 errors.push(TypeResolutionDiagnostic::declaration(
                     TypeResolutionDeclarationKind::Attribute,
-                    ap.name.clone(),
+                    attribute.name.clone(),
                     error,
-                    Some(source.clone()),
+                    location.clone(),
                 ));
             }
         }
     }
-    for ep in &mut parsed.export_params {
-        let export_name = ep.name().to_string();
-        let source = ep
-            .source_location()
-            .map(|(path, span)| {
-                TypeResolutionSource::new(SourceFileId::new(path.to_path_buf()), span)
-            })
-            .or_else(|| {
-                parsed
-                    .parser_binding_metadata
-                    .export_type_source(&export_name)
-                    .map(|(file, span)| TypeResolutionSource::new(file.clone(), span))
-            });
-        let context = format!("export '{export_name}'");
-        let site = source
-            .as_ref()
-            .map(|source| {
-                ProviderTypeCheckSite::new(source.source_file.path(), source.span, &context)
-            })
-            .unwrap_or_else(|| {
-                ProviderTypeCheckSite::at_line(std::path::Path::new("<config>"), 1, 1, &context)
-            });
-        if let Some(ty) = ep.type_expr_opt_mut() {
+    for export in &mut parsed.export_params {
+        let name = export.name().to_string();
+        if let Some(ty) = export.type_expr_opt_mut() {
+            let location = annotation(TypeResolutionDeclarationKind::Export, &name);
+            let site = ProviderTypeCheckSite::new(location.clone(), format!("export '{name}'"));
             for error in resolve_declaration_type(ty, config, &site) {
                 errors.push(TypeResolutionDiagnostic::declaration(
                     TypeResolutionDeclarationKind::Export,
-                    export_name.clone(),
+                    name.clone(),
                     error,
-                    source.clone(),
+                    location.clone(),
                 ));
             }
         }
     }
-    // Definitions are checked whether or not a call survives evaluation.
     for function in parsed.user_functions.values_mut() {
         let previous_errors = errors.len();
-        let path = function
-            .annotation_source_file
-            .as_deref()
-            .or(function.body.source_file.as_deref())
-            .unwrap_or_else(|| std::path::Path::new("<config>"));
         for parameter in &mut function.params {
             if let Some(ty) = &mut parameter.param_type {
-                let context = format!(
-                    "function '{}' parameter '{}'",
-                    function.name, parameter.name
+                let name = format!("{}' parameter '{}", function.name, parameter.name);
+                let location = annotation(TypeResolutionDeclarationKind::FunctionParameter, &name);
+                let site = ProviderTypeCheckSite::new(
+                    location.clone(),
+                    format!(
+                        "function '{}' parameter '{}'",
+                        function.name, parameter.name
+                    ),
                 );
-                let source = parameter.type_span.map(|span| {
-                    TypeResolutionSource::new(SourceFileId::new(path.to_path_buf()), span)
-                });
-                let site = source
-                    .as_ref()
-                    .map(|source| ProviderTypeCheckSite::new(path, source.span, &context))
-                    .unwrap_or_else(|| {
-                        ProviderTypeCheckSite::at_line(path, function.body.source_line, 1, &context)
-                    });
                 for error in resolve_declaration_type(ty, config, &site) {
                     errors.push(TypeResolutionDiagnostic::declaration(
                         TypeResolutionDeclarationKind::FunctionParameter,
-                        format!("{}' parameter '{}", function.name, parameter.name),
+                        name.clone(),
                         error,
-                        source.clone(),
+                        location.clone(),
                     ));
                 }
             }
         }
         if let Some(ty) = &mut function.return_type {
-            let context = format!("function '{}' return value", function.name);
-            let source = function
-                .return_type_span
-                .map(|span| TypeResolutionSource::new(SourceFileId::new(path.to_path_buf()), span));
-            let site = source
-                .as_ref()
-                .map(|source| ProviderTypeCheckSite::new(path, source.span, &context))
-                .unwrap_or_else(|| {
-                    ProviderTypeCheckSite::at_line(path, function.body.source_line, 1, &context)
-                });
+            let location = annotation(
+                TypeResolutionDeclarationKind::FunctionReturn,
+                &function.name,
+            );
+            let site = ProviderTypeCheckSite::new(
+                location.clone(),
+                format!("function '{}' return value", function.name),
+            );
             for error in resolve_declaration_type(ty, config, &site) {
                 errors.push(TypeResolutionDiagnostic::declaration(
                     TypeResolutionDeclarationKind::FunctionReturn,
                     function.name.clone(),
                     error,
-                    source.clone(),
+                    location.clone(),
                 ));
             }
         }
         if errors.len() != previous_errors {
-            config.fail_function_declaration(path, &function.name);
+            // This is the function-check session's semantic key, shared with
+            // function_declaration_failed. Rendering still uses the mandatory
+            // parser-owned annotation locations above.
+            let source = function
+                .annotation_source_file
+                .as_deref()
+                .or(function.body.source_file.as_deref())
+                .unwrap_or_else(|| std::path::Path::new("<config>"));
+            config.fail_function_declaration(source, &function.name);
         }
     }
     (
@@ -6104,34 +6266,79 @@ pub fn resolve_consumer_static_type_for_signature(
 pub fn resolve_file_type_exprs<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
-    D,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Vec<TypeResolutionDiagnostic> {
-    resolve_file_type_exprs_report(parsed, config, None).into_diagnostics()
+) -> Result<Vec<crate::parser::Located<TypeResolutionDiagnostic>>, crate::parser::AnalysisTreeError>
+{
+    Ok(resolve_file_type_exprs_report(parsed, config, None)?.into_diagnostics())
 }
 
 /// Resolve declarations and decide in core whether a typed finding supersedes
 /// an optional parser backstop for the same authored type token.
+///
+/// Boundary failures cannot be mistaken for a successful empty report:
+///
+/// ```compile_fail,E0308
+/// use carina_core::{parser::ParsedFile, validation::{FileTypeResolutionReport, resolve_file_type_exprs_report, deferred_types::ProviderTypeCheckContext}};
+/// fn analyze(file: &mut ParsedFile, context: &dyn ProviderTypeCheckContext) -> FileTypeResolutionReport {
+///     resolve_file_type_exprs_report(file, context, None)
+/// }
+/// ```
 pub fn resolve_file_type_exprs_report<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
-    D,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     parser_error: Option<TypeResolutionParserError<'_>>,
-) -> FileTypeResolutionReport {
-    let (diagnostics, resolved_argument_types) = resolve_file_type_exprs_impl(parsed, config);
+) -> Result<FileTypeResolutionReport, crate::parser::AnalysisTreeError> {
+    let (diagnostics, resolved_argument_types) = resolve_file_type_exprs_impl(parsed, config)?;
     let covered_parser_error = parser_error.is_some_and(|parser_error| {
         type_resolution_parser_error_is_covered(&diagnostics, parser_error)
     });
-    FileTypeResolutionReport {
+    Ok(FileTypeResolutionReport {
         diagnostics,
         covered_parser_error,
         resolved_argument_types,
-    }
+    })
+}
+
+/// Resolve a copy of a sealed input using its already validated annotations.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{parser::ParsedFile, validation::{resolve_file_type_exprs_from_analysis, deferred_types::ProviderTypeCheckContext}};
+/// fn resolve(file: &ParsedFile, session: &dyn ProviderTypeCheckContext) {
+///     resolve_file_type_exprs_from_analysis(file, session, None);
+/// }
+/// ```
+pub fn resolve_file_type_exprs_from_analysis<
+    E: crate::parser::ExportParamLike<ParserPlaceholder, B> + Clone,
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B> + Clone,
+>(
+    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    parser_error: Option<TypeResolutionParserError<'_>>,
+) -> (
+    crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    FileTypeResolutionReport,
+) {
+    let mut parsed = tree.file().clone();
+    let (diagnostics, resolved_argument_types) =
+        resolve_file_type_exprs_with_annotations(&mut parsed, config, tree.type_annotations());
+    let covered_parser_error = parser_error
+        .is_some_and(|error| type_resolution_parser_error_is_covered(&diagnostics, error));
+    (
+        parsed,
+        FileTypeResolutionReport {
+            diagnostics,
+            resolved_argument_types,
+            covered_parser_error,
+        },
+    )
 }
 
 /// Resolve declarations with an intentionally incomplete provider context.
@@ -6201,12 +6408,13 @@ pub fn resolve_attribute_static_types_for_consumer(
 pub fn resolve_file_type_exprs_best_effort<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
-    D,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) {
-    let _diagnostics = resolve_file_type_exprs_impl(parsed, config);
+) -> Result<(), crate::parser::AnalysisTreeError> {
+    resolve_file_type_exprs_impl(parsed, config)?;
+    Ok(())
 }
 
 pub fn resolve_export_static_type_for_consumer(
@@ -6248,6 +6456,30 @@ pub fn is_module_definition<
     parsed: &crate::parser::File<E, P, T, D, B>,
 ) -> bool {
     !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty()
+}
+
+/// Report root-only blocks in modules and argument blocks in root configurations.
+pub fn configuration_placement_diagnostics<
+    P: crate::resource::PlaceholderKind,
+    T: crate::resource::PlaceholderKind,
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
+>(
+    tree: &crate::parser::AnalysisTree<'_, P, T, D, B>,
+) -> Vec<crate::parser::Located<&'static str>> {
+    use crate::parser::ConfigurationBlock;
+    tree.syntax().configuration_blocks().iter().filter_map(|block| {
+        let message = match block.detail() {
+            ConfigurationBlock::Arguments if tree.is_root_configuration() => "arguments blocks are only valid inside module definitions, not in root configurations.",
+            ConfigurationBlock::Provider if tree.is_module_definition() => "provider blocks are not allowed inside modules. Define providers at the root configuration level.",
+            ConfigurationBlock::State if tree.is_module_definition() => "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
+            ConfigurationBlock::Backend if tree.is_module_definition() => "backend blocks are not allowed inside modules. Define the backend at the root configuration level.",
+            ConfigurationBlock::UpstreamState if tree.is_module_definition() => "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
+            ConfigurationBlock::Exports if tree.is_module_definition() => "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
+            _ => return None,
+        };
+        Some(crate::parser::Located::new(block.location().clone(), message))
+    }).collect()
 }
 
 /// Check that a module file does not contain provider blocks.
@@ -6410,8 +6642,22 @@ pub enum ModuleCallFindingKind {
 /// coordinates.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ModuleCallFindingAnchor {
+    location: crate::parser::DeclarationLocation,
     pub source_file: SourceFileId,
     pub span: SourceSpan,
+}
+
+impl ModuleCallFindingAnchor {
+    fn new(location: crate::parser::DeclarationLocation) -> Self {
+        Self {
+            source_file: location.file().clone(),
+            span: location.span(),
+            location,
+        }
+    }
+    pub fn location(&self) -> &crate::parser::DeclarationLocation {
+        &self.location
+    }
 }
 
 /// Authored source identity that owns a module-graph diagnostic.
@@ -6430,6 +6676,13 @@ impl ModuleCallFindingOwnerSource {
         match self {
             Self::ModuleCall(call) => call.source_file_id(),
             Self::Authored(anchor) => &anchor.source_file,
+        }
+    }
+
+    pub fn location(&self) -> &crate::parser::DeclarationLocation {
+        match self {
+            Self::ModuleCall(call) => call.declaration_location(),
+            Self::Authored(anchor) => anchor.location(),
         }
     }
 
@@ -6522,7 +6775,7 @@ pub enum ModuleCallFindingMessage {
     },
     NestedResourceBindingUse(Box<BindingUseFinding>),
     ReferenceType(Box<ModuleCallReferenceDiagnostic>),
-    TypeResolution(Box<TypeResolutionDiagnostic>),
+    TypeResolution(Box<crate::parser::Located<TypeResolutionDiagnostic>>),
     AttributeReference(Box<CompositionAttributeRefError>),
     Constraint(Box<crate::module_resolver::ModuleConstraintDiagnostic>),
 }
@@ -6533,7 +6786,17 @@ impl ModuleCallFindingMessage {
         Self::TypeResolution(Box::new(TypeResolutionDiagnostic::description(
             context,
             error.into(),
-            None,
+            crate::parser::parse_file(
+                "let diagnostic = 1",
+                std::path::Path::new("<test>"),
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .unwrap()
+            .parser_binding_metadata
+            .syntax()
+            .declarations()[0]
+                .location()
+                .clone(),
         )))
     }
 
@@ -6746,7 +7009,9 @@ impl ModuleCallFindingMessage {
         }
     }
 
-    pub(crate) fn type_resolution_diagnostic(&self) -> Option<&TypeResolutionDiagnostic> {
+    pub(crate) fn type_resolution_diagnostic(
+        &self,
+    ) -> Option<&crate::parser::Located<TypeResolutionDiagnostic>> {
         match self {
             Self::TypeResolution(diagnostic) => Some(diagnostic),
             Self::UnknownArgument {
@@ -6829,7 +7094,7 @@ impl std::fmt::Display for ModuleCallFindingMessage {
                 finding.use_site.span.start_line(),
             ),
             Self::ReferenceType(error) => error.fmt(formatter),
-            Self::TypeResolution(error) => error.fmt(formatter),
+            Self::TypeResolution(error) => error.detail().fmt(formatter),
             Self::AttributeReference(error) => error.fmt(formatter),
             Self::Constraint(diagnostic) => diagnostic.fmt(formatter),
         }
@@ -6839,7 +7104,7 @@ impl std::fmt::Display for ModuleCallFindingMessage {
 impl std::error::Error for ModuleCallFindingMessage {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::TypeResolution(error) => Some(error.as_ref()),
+            Self::TypeResolution(error) => Some(error.detail()),
             Self::AttributeReference(error) => Some(error.as_ref()),
             Self::UnknownArgument {
                 module: _module,
@@ -6898,33 +7163,48 @@ impl ModuleCallFinding {
         kind: ModuleCallFindingKind,
         owner: ModuleCallFindingOwner,
         call: &ModuleCallId,
-        value_span: SourceSpan,
         message: ModuleCallFindingMessage,
         identity: Option<ModuleCallFindingIdentity>,
     ) -> Self {
         Self {
             kind,
             owners: vec![owner],
-            anchor: module_argument_value_anchor(call, value_span),
+            anchor: ModuleCallFindingAnchor::new(
+                match &message {
+                    ModuleCallFindingMessage::ValueType { argument, .. }
+                    | ModuleCallFindingMessage::HandleSink { argument, .. }
+                    | ModuleCallFindingMessage::BindingUse { argument, .. } => call
+                        .argument_value_location(argument)
+                        .unwrap_or_else(|| call.declaration_location()),
+                    ModuleCallFindingMessage::ReferenceType(error) => call
+                        .argument_value_location(&error.identity.argument)
+                        .unwrap_or_else(|| call.declaration_location()),
+                    ModuleCallFindingMessage::Constraint(diagnostic) => match &diagnostic.kind {
+                        crate::module_resolver::ModuleConstraintKind::ArgumentValidation {
+                            argument,
+                        } => call
+                            .argument_value_location(argument)
+                            .unwrap_or_else(|| call.declaration_location()),
+                        crate::module_resolver::ModuleConstraintKind::Require => {
+                            call.declaration_location()
+                        }
+                    },
+                    _ => call.declaration_location(),
+                }
+                .clone(),
+            ),
             message,
             identity,
         }
     }
 
-    pub fn try_from_type_resolution(
-        diagnostic: TypeResolutionDiagnostic,
-    ) -> Result<Self, Box<TypeResolutionDiagnostic>> {
-        let Some(location) = diagnostic.source_location().cloned() else {
-            return Err(Box::new(diagnostic));
-        };
-        let anchor = ModuleCallFindingAnchor {
-            source_file: SourceFileId::new(crate::utils::normalize_source_path(
-                location.source_file().path(),
-            )),
-            span: location.span(),
-        };
+    pub fn from_type_resolution(
+        diagnostic: crate::parser::Located<TypeResolutionDiagnostic>,
+    ) -> Self {
+        let location = diagnostic.location();
+        let anchor = ModuleCallFindingAnchor::new(location.clone());
         let owner = ModuleCallFindingOwnerSource::Authored(anchor.clone());
-        Ok(Self {
+        Self {
             kind: ModuleCallFindingKind::TypeResolution,
             owners: vec![ModuleCallFindingOwner {
                 root: owner.clone(),
@@ -6933,24 +7213,16 @@ impl ModuleCallFinding {
             anchor,
             message: ModuleCallFindingMessage::TypeResolution(Box::new(diagnostic)),
             identity: None,
-        })
+        }
     }
 
     fn reference_type(
         call_label: &str,
         identity: ModuleCallReferenceIdentity,
         owner: ModuleCallFindingOwner,
-        value_span: SourceSpan,
     ) -> Self {
         let display_path = identity.path.clone();
-        Self::reference_type_with_display_path(
-            call_label,
-            identity,
-            display_path,
-            owner,
-            value_span,
-            false,
-        )
+        Self::reference_type_with_display_path(call_label, identity, display_path, owner, false)
     }
 
     fn reference_type_with_display_path(
@@ -6958,7 +7230,6 @@ impl ModuleCallFinding {
         identity: ModuleCallReferenceIdentity,
         display_path: ModuleCallDiagnosticPath,
         owner: ModuleCallFindingOwner,
-        value_span: SourceSpan,
         declared_constraint: bool,
     ) -> Self {
         let call = identity.call.clone();
@@ -6966,7 +7237,6 @@ impl ModuleCallFinding {
             ModuleCallFindingKind::ReferenceType,
             owner,
             &call,
-            value_span,
             ModuleCallFindingMessage::ReferenceType(Box::new(ModuleCallReferenceDiagnostic {
                 call_label: call_label.to_string(),
                 identity: identity.clone(),
@@ -6981,7 +7251,6 @@ impl ModuleCallFinding {
         call_label: &str,
         call: &ModuleCallId,
         argument: &str,
-        value_span: SourceSpan,
         finding: &BindingUseFinding,
         owner: ModuleCallFindingOwner,
     ) -> Self {
@@ -7014,7 +7283,6 @@ impl ModuleCallFinding {
                     },
                     error.path.clone(),
                     owner,
-                    value_span,
                     error.declared_constraint,
                 );
             }
@@ -7034,7 +7302,6 @@ impl ModuleCallFinding {
             kind,
             owner,
             call,
-            value_span,
             message,
             Some(ModuleCallFindingIdentity::BindingUse {
                 call: call.clone(),
@@ -7069,6 +7336,22 @@ impl ModuleCallFinding {
         &self.owners
     }
 
+    pub fn diagnostics(&self) -> Vec<crate::parser::Located<&Self>> {
+        let mut locations = vec![self.anchor.location().clone()];
+        for owner in &self.owners {
+            let location = owner.root.location();
+            // The primary anchor represents this file. Additional root-call
+            // owners retain diagnostics for callers in other files.
+            if location.file() != self.anchor.location().file() && !locations.contains(location) {
+                locations.push(location.clone());
+            }
+        }
+        locations
+            .into_iter()
+            .map(|location| crate::parser::Located::new(location, self))
+            .collect()
+    }
+
     pub fn anchor(&self) -> &ModuleCallFindingAnchor {
         &self.anchor
     }
@@ -7093,7 +7376,7 @@ impl std::fmt::Display for ModuleCallFinding {
 impl std::error::Error for ModuleCallFinding {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.message {
-            ModuleCallFindingMessage::TypeResolution(error) => Some(error.as_ref()),
+            ModuleCallFindingMessage::TypeResolution(error) => Some(error.detail()),
             ModuleCallFindingMessage::AttributeReference(error) => Some(error.as_ref()),
             ModuleCallFindingMessage::UnknownArgument {
                 module: _module,
@@ -7169,6 +7452,7 @@ pub enum ExpandedModuleCallCheckInput<'a, 'bindings, P: PlaceholderKind = Parser
 }
 
 struct ModuleCallChecker<'a> {
+    source_overrides: crate::config_loader::SourceOverrides,
     provider_context: typecheck::TypecheckProviderContext<'a>,
     schemas: &'a SchemaRegistry,
     findings: Vec<ModuleCallFinding>,
@@ -7240,7 +7524,7 @@ impl ModuleCallChecker<'_> {
         &mut self,
         authored: &crate::parser::File<E>,
         context: ModuleFileCheckContext<'_, '_, E>,
-    ) {
+    ) -> Result<(), crate::parser::AnalysisTreeError> {
         let ModuleFileCheckContext {
             semantic,
             base_dir,
@@ -7304,7 +7588,7 @@ impl ModuleCallChecker<'_> {
                             owner: owner.clone(),
                         },
                     );
-                    self.check_nested_module(authority_file, checked_call, base_dir, &owner.root);
+                    self.check_nested_module(authority_file, checked_call, base_dir, &owner.root)?;
                 }
                 ModuleCallReferenceChecks::Skipped => {}
             }
@@ -7320,10 +7604,11 @@ impl ModuleCallChecker<'_> {
                     let root = root_owner.cloned().unwrap_or_else(|| {
                         ModuleCallFindingOwnerSource::Authored(module_use_anchor(import))
                     });
-                    self.check_nested_import(import, base_dir, &root);
+                    self.check_nested_import(import, base_dir, &root)?;
                 }
             }
         }
+        Ok(())
     }
 
     fn check_binding_use_findings(
@@ -7336,7 +7621,7 @@ impl ModuleCallChecker<'_> {
             let crate::parser::BindingUseOwner::ModuleArgument {
                 call: finding_call,
                 argument,
-                value_span,
+                value_span: _,
             } = &finding.use_site.owner
             else {
                 continue;
@@ -7349,7 +7634,6 @@ impl ModuleCallChecker<'_> {
                 &module_call_label(call),
                 finding_call,
                 argument,
-                *value_span,
                 finding,
                 owner,
             );
@@ -7361,7 +7645,6 @@ impl ModuleCallChecker<'_> {
         call_label: &str,
         call: &ModuleCallId,
         argument: &str,
-        value_span: SourceSpan,
         finding: &BindingUseFinding,
         owner: &ModuleCallFindingOwner,
     ) {
@@ -7369,7 +7652,6 @@ impl ModuleCallChecker<'_> {
             call_label,
             call,
             argument,
-            value_span,
             finding,
             owner.clone(),
         ));
@@ -7407,7 +7689,13 @@ impl ModuleCallChecker<'_> {
                 self.push(
                     ModuleCallFindingKind::UnknownArgument,
                     owner.clone(),
-                    module_call_anchor(authored_call.id(), authored.key_span()),
+                    ModuleCallFindingAnchor::new(
+                        authored_call
+                            .id()
+                            .argument_key_location(argument)
+                            .expect("authored argument key provenance")
+                            .clone(),
+                    ),
                     ModuleCallFindingMessage::UnknownArgument {
                         module: authored_call.module_name.clone(),
                         argument: argument.to_string(),
@@ -7445,7 +7733,13 @@ impl ModuleCallChecker<'_> {
                 Err(error) => {
                     let source_file = authored_call.id().source_file();
                     let line = authored.value_span().start_line();
-                    let anchor = module_call_anchor(authored_call.id(), authored.key_span());
+                    let anchor = ModuleCallFindingAnchor::new(
+                        authored_call
+                            .id()
+                            .argument_key_location(argument)
+                            .expect("authored argument key provenance")
+                            .clone(),
+                    );
                     let diagnostic = TypeResolutionDiagnostic::description(
                         format!(
                             "module {} argument '{}' in {} at line {line}",
@@ -7454,10 +7748,11 @@ impl ModuleCallChecker<'_> {
                             source_file.display(),
                         ),
                         error.into(),
-                        Some(TypeResolutionSource::new(
-                            anchor.source_file.clone(),
-                            anchor.span,
-                        )),
+                        authored_call
+                            .id()
+                            .argument_key_location(argument)
+                            .expect("authored argument key provenance")
+                            .clone(),
                     );
                     self.push(
                         ModuleCallFindingKind::TypeResolution,
@@ -7476,7 +7771,6 @@ impl ModuleCallChecker<'_> {
                         ModuleCallFindingKind::HandleSink,
                         owner.clone(),
                         authored_call.id(),
-                        authored.value_span(),
                         ModuleCallFindingMessage::HandleSink {
                             call_label: call_label.clone(),
                             argument: argument.to_string(),
@@ -7539,7 +7833,6 @@ impl ModuleCallChecker<'_> {
                     ModuleCallFindingKind::HandleSink,
                     owner.clone(),
                     authored_call.id(),
-                    authored.value_span(),
                     ModuleCallFindingMessage::HandleSink {
                         call_label: call_label.clone(),
                         argument: argument.to_string(),
@@ -7562,8 +7855,11 @@ impl ModuleCallChecker<'_> {
                 value,
                 inference,
                 deferred_types::ProviderTypeCheckSite::new(
-                    authored_call.id().source_file(),
-                    authored.value_span(),
+                    authored_call
+                        .id()
+                        .argument_value_location(argument)
+                        .expect("parser-owned argument value")
+                        .clone(),
                     format!("{call_label} argument '{argument}'"),
                 ),
             ) {
@@ -7571,7 +7867,6 @@ impl ModuleCallChecker<'_> {
                     ModuleCallFindingKind::ValueType,
                     owner.clone(),
                     authored_call.id(),
-                    authored.value_span(),
                     ModuleCallFindingMessage::ValueType {
                         call_label: call_label.clone(),
                         argument: argument.to_string(),
@@ -7594,7 +7889,7 @@ impl ModuleCallChecker<'_> {
                 self.push(
                     ModuleCallFindingKind::MissingRequiredArgument,
                     owner.clone(),
-                    module_call_anchor(authored_call.id(), authored_call.source_span()),
+                    ModuleCallFindingAnchor::new(authored_call.id().declaration_location().clone()),
                     ModuleCallFindingMessage::MissingRequiredArgument {
                         module: authored_call.module_name.clone(),
                         argument: parameter.name.clone(),
@@ -7662,16 +7957,10 @@ impl ModuleCallChecker<'_> {
             {
                 continue;
             }
-            let argument_span = authored_call
-                .arguments_with_source_spans()
-                .find(|argument| argument.name() == error.identity.argument)
-                .map(|argument| argument.value_span())
-                .unwrap_or(error.argument_span);
             self.push_finding(ModuleCallFinding::reference_type(
                 &module_call_label(authored_call),
                 error.identity,
                 owner.clone(),
-                argument_span,
             ));
         }
     }
@@ -7682,15 +7971,16 @@ impl ModuleCallChecker<'_> {
         call: &ModuleCall,
         base_dir: Option<&crate::paths::ResolvedPath>,
         root_owner: &ModuleCallFindingOwnerSource,
-    ) {
+    ) -> Result<(), crate::parser::AnalysisTreeError> {
         let Some(import) = file
             .uses
             .iter()
             .find(|import| import.alias == call.module_name)
         else {
-            return;
+            return Ok(());
         };
-        self.check_nested_import(import, base_dir, root_owner);
+        self.check_nested_import(import, base_dir, root_owner)?;
+        Ok(())
     }
 
     fn check_nested_import(
@@ -7698,16 +7988,16 @@ impl ModuleCallChecker<'_> {
         import: &crate::parser::UseStatement,
         base_dir: Option<&crate::paths::ResolvedPath>,
         root_owner: &ModuleCallFindingOwnerSource,
-    ) {
+    ) -> Result<(), crate::parser::AnalysisTreeError> {
         let Some(base_dir) = base_dir else {
-            return;
+            return Ok(());
         };
         let Ok(module_dir) = base_dir.join(&import.path) else {
-            return;
+            return Ok(());
         };
         let guard = module_dir.identity();
         if !self.active_modules.insert(guard.clone()) {
-            return;
+            return Ok(());
         }
 
         // An enriched parse intentionally rejects an unknown bare type before
@@ -7716,12 +8006,13 @@ impl ModuleCallChecker<'_> {
         // typed resolver below own the error. The strict expansion pass still
         // rejects the same declaration; its parser backstop is deduplicated
         // against this source-anchored finding.
-        if let Some(mut module) = crate::module_resolver::load_module_with_config(
+        if let Some(mut module) = crate::module_resolver::loader::load_module_with_overrides(
             &module_dir,
             self.provider_context.as_provider_context(),
+            &self.source_overrides,
         )
         .or_else(|| {
-            crate::module_resolver::load_module(
+            crate::module_resolver::loader::load_module_with_overrides(
                 &module_dir,
                 &ProviderContext::new(
                     self.provider_context
@@ -7729,6 +8020,7 @@ impl ModuleCallChecker<'_> {
                         .environment
                         .clone(),
                 ),
+                &self.source_overrides,
             )
         }) {
             let resolution_errors = resolve_file_type_exprs(
@@ -7736,11 +8028,12 @@ impl ModuleCallChecker<'_> {
                 self.provider_context
                     .session()
                     .expect("module checks borrow their run session"),
-            );
-            let signatures = crate::module_resolver::load_resolved_module_signatures(
+            )?;
+            let signatures = crate::module_resolver::load_resolved_module_signatures_with_overrides(
                 &module,
                 &module_dir,
                 self.provider_context.as_provider_context(),
+                &self.source_overrides,
             );
             let bindings = BindingIndex::from_parsed_with_module_signatures(
                 &module,
@@ -7758,12 +8051,7 @@ impl ModuleCallChecker<'_> {
                 ),
             );
             for finding in binding_use_report.resource_findings() {
-                let anchor = ModuleCallFindingAnchor {
-                    source_file: SourceFileId::new(crate::utils::normalize_source_path(
-                        finding.use_site.source_file.path(),
-                    )),
-                    span: finding.use_site.span,
-                };
+                let anchor = ModuleCallFindingAnchor::new(finding.use_site.location().clone());
                 self.push(
                     ModuleCallFindingKind::BindingUse,
                     ModuleCallFindingOwner {
@@ -7775,15 +8063,7 @@ impl ModuleCallChecker<'_> {
                 );
             }
             for error in resolution_errors {
-                let anchor = error
-                    .source_location()
-                    .map(|source| ModuleCallFindingAnchor {
-                        source_file: SourceFileId::new(crate::utils::normalize_source_path(
-                            source.source_file().path(),
-                        )),
-                        span: source.span(),
-                    })
-                    .unwrap_or_else(|| module_use_anchor(import));
+                let anchor = ModuleCallFindingAnchor::new(error.location().clone());
                 self.push(
                     ModuleCallFindingKind::TypeResolution,
                     ModuleCallFindingOwner {
@@ -7805,10 +8085,11 @@ impl ModuleCallChecker<'_> {
                     root_owner: Some(root_owner),
                     reference_checks: ModuleCallReferenceChecks::Enabled,
                 },
-            );
+            )?;
         }
 
         self.active_modules.remove(&guard);
+        Ok(())
     }
 
     fn check_expanded<P: PlaceholderKind>(
@@ -7821,7 +8102,7 @@ impl ModuleCallChecker<'_> {
             let root = call_path.root();
             let immediate = call_path.immediate();
             for (argument_name, argument) in &composition.signature.arguments {
-                let (declared_type, origin) = argument.validation_metadata();
+                let (declared_type, _) = argument.validation_metadata();
                 let Some(TypeExpr::Ref(expected)) = declared_type.known() else {
                     continue;
                 };
@@ -7882,13 +8163,6 @@ impl ModuleCallChecker<'_> {
                 let Some(error) = error else {
                     continue;
                 };
-                let value_span = match origin {
-                    crate::parser::ArgumentOrigin::Authored {
-                        key_span: _key_span,
-                        value_span,
-                    } => value_span,
-                    crate::parser::ArgumentOrigin::Defaulted => immediate.id.call_span(),
-                };
                 self.push_finding(ModuleCallFinding::argument_value(
                     ModuleCallFindingKind::HandleSink,
                     ModuleCallFindingOwner {
@@ -7896,7 +8170,6 @@ impl ModuleCallChecker<'_> {
                         immediate: ModuleCallFindingOwnerSource::ModuleCall(immediate.id.clone()),
                     },
                     &immediate.id,
-                    value_span,
                     ModuleCallFindingMessage::HandleSink {
                         call_label: immediate.display_label(),
                         argument: argument_name.clone(),
@@ -7912,13 +8185,6 @@ impl ModuleCallChecker<'_> {
                 CompositionRefError::ModuleCall(error) => {
                     let root = error.call_path.root();
                     let immediate = error.call_path.immediate();
-                    let span = match *error.origin {
-                        crate::parser::ArgumentOrigin::Authored {
-                            key_span: _key_span,
-                            value_span,
-                        } => value_span,
-                        crate::parser::ArgumentOrigin::Defaulted => immediate.id.call_span(),
-                    };
                     let display_path = ModuleCallDiagnosticPath::Expanded(error.path.clone());
                     self.push_finding(ModuleCallFinding::reference_type_with_display_path(
                         &immediate.display_label(),
@@ -7937,7 +8203,6 @@ impl ModuleCallChecker<'_> {
                                 immediate.id.clone(),
                             ),
                         },
-                        span,
                         false,
                     ));
                 }
@@ -7946,8 +8211,9 @@ impl ModuleCallChecker<'_> {
                         unreachable!("expanded attribute errors retain their call path")
                     };
                     let first_immediate = first_path.immediate();
-                    let anchor =
-                        module_call_anchor(&first_immediate.id, first_immediate.id.call_span());
+                    let anchor = ModuleCallFindingAnchor::new(
+                        first_immediate.id.declaration_location().clone(),
+                    );
                     for call_path in &error.call_paths {
                         self.push(
                             ModuleCallFindingKind::ReferenceType,
@@ -7977,7 +8243,7 @@ impl ModuleCallChecker<'_> {
             let crate::parser::BindingUseOwner::ModuleArgument {
                 call,
                 argument,
-                value_span,
+                value_span: _,
             } = &finding.use_site.owner
             else {
                 continue;
@@ -8005,14 +8271,7 @@ impl ModuleCallChecker<'_> {
                 ));
             }
             for (owner, call_label) in owners {
-                self.push_binding_use_finding(
-                    &call_label,
-                    call,
-                    argument,
-                    *value_span,
-                    finding,
-                    &owner,
-                );
+                self.push_binding_use_finding(&call_label, call, argument, finding, &owner);
             }
         }
     }
@@ -8031,18 +8290,12 @@ impl ModuleCallChecker<'_> {
                 else {
                     continue;
                 };
-                let argument_value_span = match origin {
+                let authored_argument = matches!(
+                    origin,
                     crate::module_resolver::ResolvedModuleConstraintOrigin::Argument(
-                        crate::parser::ArgumentOrigin::Authored {
-                            key_span: _key_span,
-                            value_span,
-                        },
-                    ) => Some(*value_span),
-                    crate::module_resolver::ResolvedModuleConstraintOrigin::Argument(
-                        crate::parser::ArgumentOrigin::Defaulted,
+                        crate::parser::ArgumentOrigin::Authored { .. }
                     )
-                    | crate::module_resolver::ResolvedModuleConstraintOrigin::Call => None,
-                };
+                );
                 let mut owners = compositions
                     .iter()
                     .filter_map(|composition| {
@@ -8071,19 +8324,20 @@ impl ModuleCallChecker<'_> {
                 }
                 for owner in owners {
                     let message = ModuleCallFindingMessage::Constraint(diagnostic.clone());
-                    match argument_value_span {
-                        Some(value_span) => self.push_finding(ModuleCallFinding::argument_value(
+                    match authored_argument {
+                        true => self.push_finding(ModuleCallFinding::argument_value(
                             ModuleCallFindingKind::Constraint,
                             owner,
                             &report.source.id,
-                            value_span,
                             message,
                             None,
                         )),
-                        None => self.push(
+                        false => self.push(
                             ModuleCallFindingKind::Constraint,
                             owner,
-                            module_call_anchor(&report.source.id, report.source.call_span()),
+                            ModuleCallFindingAnchor::new(
+                                report.source.id.declaration_location().clone(),
+                            ),
                             message,
                         ),
                     }
@@ -8105,25 +8359,8 @@ fn constraint_report_instance_matches(expanded: &str, reported: &str) -> bool {
             .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
-fn module_call_anchor(call: &ModuleCallId, span: SourceSpan) -> ModuleCallFindingAnchor {
-    ModuleCallFindingAnchor {
-        source_file: SourceFileId::new(crate::utils::normalize_source_path(call.source_file())),
-        span,
-    }
-}
-
-fn module_argument_value_anchor(
-    call: &ModuleCallId,
-    value_span: SourceSpan,
-) -> ModuleCallFindingAnchor {
-    module_call_anchor(call, value_span)
-}
-
 fn module_use_anchor(import: &crate::parser::UseStatement) -> ModuleCallFindingAnchor {
-    ModuleCallFindingAnchor {
-        source_file: SourceFileId::new(crate::utils::normalize_source_path(import.source_file())),
-        span: import.source_span(),
-    }
+    ModuleCallFindingAnchor::new(import.declaration_location().clone())
 }
 
 fn module_call_label(call: &ModuleCall) -> String {
@@ -8214,9 +8451,65 @@ fn module_call_value_is_context_free(value: &Value) -> bool {
 /// Collect module-call findings from authored source and its imported graph.
 pub fn check_module_calls<E>(
     input: ModuleCallCheckInput<'_, '_, E, dyn deferred_types::ProviderTypeCheckContext + '_>,
-) -> Vec<ModuleCallFinding> {
+) -> Result<Vec<ModuleCallFinding>, crate::parser::AnalysisTreeError> {
+    check_module_calls_with_overrides(input, &Default::default())
+}
+
+/// Check a sealed directory with its authoritative upstream facts. The same
+/// findings can then be reused for module-resolution ownership and publication.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{parser::ParsedFile, validation::{check_module_calls_from_analysis, deferred_types::ProviderTypeCheckContext}, paths::ResolvedPath, schema::SchemaRegistry, upstream_exports::UpstreamExports, config_loader::SourceOverrides};
+/// fn reject_raw(file: &ParsedFile, base: &ResolvedPath, context: &dyn ProviderTypeCheckContext, schemas: &SchemaRegistry, exports: &UpstreamExports, overrides: &SourceOverrides) {
+///     check_module_calls_from_analysis(file, base, context, schemas, exports, overrides);
+/// }
+/// ```
+pub fn check_module_calls_from_analysis(
+    tree: &crate::parser::AnalysisTree<'_>,
+    base: &crate::paths::ResolvedPath,
+    provider_context: &dyn deferred_types::ProviderTypeCheckContext,
+    schemas: &SchemaRegistry,
+    upstream_exports: &crate::upstream_exports::UpstreamExports,
+    overrides: &crate::config_loader::SourceOverrides,
+) -> Result<Vec<ModuleCallFinding>, crate::parser::AnalysisTreeError> {
+    let parsed = tree.file();
+    let signatures = crate::module_resolver::load_resolved_module_signatures_with_overrides(
+        parsed,
+        base,
+        provider_context.catalog(),
+        overrides,
+    );
+    let context = ValidationTypeContext::in_session(parsed, schemas, provider_context, &signatures);
+    let binding_use_report = check_bare_binding_uses(parsed, &context);
+    let bindings = BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
+        parsed,
+        schemas,
+        Some(upstream_exports),
+        &signatures,
+        provider_context,
+    );
+    check_module_calls_with_overrides(
+        ModuleCallCheckInput {
+            authored: parsed,
+            semantic: Some(parsed),
+            base_dir: Some(base),
+            imported_signatures: &signatures,
+            provider_context,
+            schemas,
+            binding_use_report: &binding_use_report,
+            bindings: &bindings,
+            reference_checks: ModuleCallReferenceChecks::Enabled,
+        },
+        overrides,
+    )
+}
+
+pub fn check_module_calls_with_overrides<E>(
+    input: ModuleCallCheckInput<'_, '_, E, dyn deferred_types::ProviderTypeCheckContext + '_>,
+    overrides: &crate::config_loader::SourceOverrides,
+) -> Result<Vec<ModuleCallFinding>, crate::parser::AnalysisTreeError> {
     let provider_context = typecheck::TypecheckProviderContext::for_session(input.provider_context);
-    check_module_calls_with_provider_context(input, provider_context)
+    check_module_calls_with_provider_context(input, provider_context, overrides)
 }
 
 /// Providerless module-call diagnostics for bootstrap and orphan-editor
@@ -8224,15 +8517,16 @@ pub fn check_module_calls<E>(
 /// sent to an unloaded resolver.
 pub fn check_module_calls_providerless<E>(
     input: ModuleCallCheckInput<'_, '_, E, dyn deferred_types::ProviderTypeCheckContext + '_>,
-) -> Vec<ModuleCallFinding> {
+) -> Result<Vec<ModuleCallFinding>, crate::parser::AnalysisTreeError> {
     let provider_context = typecheck::TypecheckProviderContext::for_session(input.provider_context);
-    check_module_calls_with_provider_context(input, provider_context)
+    check_module_calls_with_provider_context(input, provider_context, &Default::default())
 }
 
 fn check_module_calls_with_provider_context<'a, 'bindings, E, C: ?Sized>(
     input: ModuleCallCheckInput<'a, 'bindings, E, C>,
     provider_context: typecheck::TypecheckProviderContext<'a>,
-) -> Vec<ModuleCallFinding> {
+    overrides: &crate::config_loader::SourceOverrides,
+) -> Result<Vec<ModuleCallFinding>, crate::parser::AnalysisTreeError> {
     let ModuleCallCheckInput {
         authored,
         semantic,
@@ -8245,6 +8539,7 @@ fn check_module_calls_with_provider_context<'a, 'bindings, E, C: ?Sized>(
         reference_checks,
     } = input;
     let mut checker = ModuleCallChecker {
+        source_overrides: overrides.clone(),
         provider_context,
         schemas,
         findings: Vec::new(),
@@ -8261,8 +8556,8 @@ fn check_module_calls_with_provider_context<'a, 'bindings, E, C: ?Sized>(
             root_owner: None,
             reference_checks,
         },
-    );
-    checker.findings
+    )?;
+    Ok(checker.findings)
 }
 
 /// Collect only findings whose authoritative inputs exist after expansion.
@@ -8271,7 +8566,9 @@ pub fn check_expanded_module_calls<P: PlaceholderKind>(
     provider_context: &ProviderContext,
 ) -> Vec<ModuleCallFinding> {
     let schemas = SchemaRegistry::new();
+    let overrides = Default::default();
     let mut checker = ModuleCallChecker {
+        source_overrides: overrides,
         provider_context: typecheck::TypecheckProviderContext::providerless(provider_context),
         schemas: &schemas,
         findings: Vec::new(),
@@ -8422,23 +8719,15 @@ where
                         (resolved_param.type_expr_opt(), resolved_param.value())
                     {
                         let provider = typecheck::TypecheckProviderContext::for_session(config);
-                        let check = match param.source_location() {
-                            Some((source, span)) => provider.check_at(
-                                type_expr,
-                                value,
-                                typecheck::TypecheckInference::Unavailable,
-                                deferred_types::ProviderTypeCheckSite::new(
-                                    source,
-                                    span,
-                                    format!("export '{}'", param.name()),
-                                ),
+                        let check = provider.check_at(
+                            type_expr,
+                            value,
+                            typecheck::TypecheckInference::Unavailable,
+                            deferred_types::ProviderTypeCheckSite::new(
+                                param.type_check_location().clone(),
+                                format!("export '{}'", param.name()),
                             ),
-                            None => provider.check(
-                                type_expr,
-                                value,
-                                typecheck::TypecheckInference::Unavailable,
-                            ),
-                        };
+                        );
                         if let Err(error) = check {
                             errors.push(format!("export '{}': {error}", param.name()));
                         }
@@ -8584,8 +8873,7 @@ fn validate_attribute_params_impl<P: PlaceholderKind, B: BindingAddress>(
                     value,
                     typecheck::TypecheckInference::Unavailable,
                     deferred_types::ProviderTypeCheckSite::new(
-                        param.source_file(),
-                        param.source_span(),
+                        param.type_check_location().clone(),
                         format!("attribute '{}'", param.name),
                     ),
                 ) {
@@ -8832,6 +9120,32 @@ pub fn check_unused_bindings_with_identity_requirements(
     check_unused_bindings(view)
         .into_iter()
         .filter(|binding| !identity_required.contains(binding))
+        .collect()
+}
+
+/// Attach unused authored names to the declaration inventory. Generated loop
+/// members have no separate name declaration and receive no independent warning.
+pub fn locate_unused_bindings<D, B: BindingAddress>(
+    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+    names: impl IntoIterator<Item = String>,
+) -> Vec<crate::parser::Located<String>>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    let names: HashSet<_> = names.into_iter().collect();
+    tree.syntax()
+        .declarations()
+        .iter()
+        .filter(|declaration| {
+            declaration.kind() == crate::config_loader::DeclarationKind::Binding
+                && names.contains(declaration.name())
+        })
+        .map(|declaration| {
+            crate::parser::Located::new(
+                declaration.location().clone(),
+                declaration.name().to_string(),
+            )
+        })
         .collect()
 }
 

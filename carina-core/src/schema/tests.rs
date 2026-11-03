@@ -10738,6 +10738,7 @@ fn declared_string_outputs_preserve_incompatible_anonymous_refined_evidence() {
             id: ResolvedResourceId::new(crate::resource::ResourceId::with_identity(
                 "_virtual", binding,
             )),
+            declaration: Default::default(),
             signature: AuthoredLiveCompositionSignature {
                 arguments: Default::default(),
                 attributes: indexmap::indexmap! {

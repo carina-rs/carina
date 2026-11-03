@@ -81,7 +81,7 @@ impl SemanticTokensProvider {
     }
 
     /// Tokenize a line whose non-code lexical regions have already been masked.
-    /// Positions remain character offsets.
+    /// Positions use UTF-16 code units.
     fn tokenize_masked_line(&self, masked: &MaskedCode) -> Vec<(u32, u32, u32)> {
         let line = masked.as_str();
         let mut tokens = Vec::new();
@@ -110,7 +110,11 @@ impl SemanticTokensProvider {
                 let name = &after_trimmed[..name_end];
                 if !name.is_empty() {
                     let name_pos = name_start + 9 + leading_spaces;
-                    tokens.push((name_pos as u32, name.len() as u32, 1)); // TYPE
+                    tokens.push((
+                        position::byte_offset_to_char_offset(line, name_pos),
+                        name.len() as u32,
+                        1,
+                    )); // TYPE
                 }
             }
         } else if trimmed.starts_with("backend ")
@@ -123,7 +127,11 @@ impl SemanticTokensProvider {
                 let name = &after_trimmed[..name_end];
                 if !name.is_empty() {
                     let name_pos = name_start + 8 + leading_spaces;
-                    tokens.push((name_pos as u32, name.len() as u32, 1)); // TYPE
+                    tokens.push((
+                        position::byte_offset_to_char_offset(line, name_pos),
+                        name.len() as u32,
+                        1,
+                    )); // TYPE
                 }
             }
         } else if trimmed.starts_with("let ")
@@ -136,7 +144,11 @@ impl SemanticTokensProvider {
                 let name = &after_let_trimmed[..name_end];
                 if !name.is_empty() {
                     let name_start = let_start + 4 + leading_spaces;
-                    tokens.push((name_start as u32, name.len() as u32, 2)); // VARIABLE
+                    tokens.push((
+                        position::byte_offset_to_char_offset(line, name_start),
+                        name.len() as u32,
+                        2,
+                    )); // VARIABLE
                 }
             }
         } else if trimmed.starts_with("fn ")
@@ -149,7 +161,11 @@ impl SemanticTokensProvider {
                 let name = &after_fn_trimmed[..name_end];
                 if !name.is_empty() {
                     let name_pos = fn_start + 3 + leading_spaces;
-                    tokens.push((name_pos as u32, name.len() as u32, 8)); // FUNCTION
+                    tokens.push((
+                        position::byte_offset_to_char_offset(line, name_pos),
+                        name.len() as u32,
+                        8,
+                    )); // FUNCTION
                 }
             }
         } else if trimmed.starts_with("wait ")
@@ -165,7 +181,11 @@ impl SemanticTokensProvider {
                 let name = &after_wait_trimmed[..name_end];
                 if !name.is_empty() {
                     let name_pos = wait_start + 5 + leading_spaces;
-                    tokens.push((name_pos as u32, name.len() as u32, 2)); // VARIABLE
+                    tokens.push((
+                        position::byte_offset_to_char_offset(line, name_pos),
+                        name.len() as u32,
+                        2,
+                    )); // VARIABLE
                 }
             }
         }
@@ -234,8 +254,7 @@ impl SemanticTokensProvider {
                 )); // PROPERTY
             }
             if prop_name == "ignore_changes" {
-                let rhs_start =
-                    position::byte_offset_to_char_offset(line, eq_byte_pos) as usize + 1;
+                let rhs_start = line[..eq_byte_pos].chars().count() + 1;
                 Self::find_ignore_change_path_identifiers(masked, rhs_start, &mut tokens);
             }
         }
@@ -265,7 +284,7 @@ impl SemanticTokensProvider {
                 let next_is_word =
                     next_char.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
 
-                let char_pos = char_idx as u32;
+                let char_pos = position::char_offset_to_utf16_offset(line, char_idx);
 
                 if !prev_is_word && !next_is_word {
                     // Single digit number
@@ -355,7 +374,11 @@ impl SemanticTokensProvider {
             {
                 index += 1;
             }
-            tokens.push((start as u32, (index - start) as u32, 3)); // PROPERTY
+            tokens.push((
+                position::char_offset_to_utf16_offset(masked.as_str(), start),
+                (index - start) as u32,
+                3,
+            )); // PROPERTY
         }
     }
 
@@ -408,7 +431,11 @@ impl SemanticTokensProvider {
                         || chars[end] == '\n';
 
                     if after_ok {
-                        tokens.push((i as u32, pattern.len() as u32, 1));
+                        tokens.push((
+                            position::char_offset_to_utf16_offset(line, i),
+                            pattern.len() as u32,
+                            1,
+                        ));
                         i = end;
                         continue;
                     }
@@ -482,7 +509,9 @@ fn lexical_tokens(line: &LexedLine) -> Vec<(u32, u32, u32)> {
         while end < classes.len() && token_type(classes[end]) == Some(kind) {
             end += 1;
         }
-        tokens.push((start as u32, (end - start) as u32, kind));
+        let utf16_start = position::char_offset_to_utf16_offset(line.text(), start);
+        let utf16_end = position::char_offset_to_utf16_offset(line.text(), end);
+        tokens.push((utf16_start, utf16_end - utf16_start, kind));
         start = end;
     }
     tokens

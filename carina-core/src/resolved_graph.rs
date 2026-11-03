@@ -1608,6 +1608,7 @@ impl ExpandedBindingIndex {
                     default_tag_keys: resource.default_tag_keys.clone(),
                     loop_provenance: resource.loop_provenance.clone(),
                     quoted_string_attrs: resource.quoted_string_attrs.clone(),
+                    declaration: resource.declaration.clone(),
                 })
                 .collect(),
         );

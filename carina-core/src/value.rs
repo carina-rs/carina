@@ -12214,6 +12214,7 @@ mod tests {
             instance: "module_instance".to_string(),
             call_path: Default::default(),
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         };
 
         let redacted = redact_secrets_in_live_composition(&virt).expect("redact virtual");
@@ -14132,6 +14133,7 @@ mod tests {
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         }
     }
 

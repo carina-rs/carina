@@ -61,7 +61,7 @@ fn settlement_fixture_a_failed_provider_defers_attribute_once() {
         "{text}"
     );
     assert!(!text.contains("unknown custom type"), "{text}");
-    assert!(text.contains("main.crn:3:3:"), "{text}");
+    assert!(text.contains("main.crn:3:6:"), "{text}");
 }
 
 #[test]
@@ -131,7 +131,7 @@ fn lint_deferred_provider_checks_keep_the_authored_column() {
     assert_eq!(output.status.code(), Some(1), "{text}");
     assert!(text.contains("main.crn:2:9:"), "{text}");
     assert!(text.contains("main.crn:3:9:"), "{text}");
-    assert!(text.contains("main.crn:5:3:"), "{text}");
+    assert!(text.contains("main.crn:5:6:"), "{text}");
 }
 
 #[test]

@@ -286,14 +286,13 @@ impl CompletionProvider {
         }
 
         let current_line = lines[line_idx];
-        let col = position.character as usize;
-        let prefix: String = current_line.chars().take(col).collect();
+        let prefix = crate::position::line_prefix(current_line, position.character);
         let block_context = enclosing_block(text, position, &self.resource_type_patterns);
 
         // `for <pat> in <HERE>`: offer in-scope bindings. Detected before the
         // block-context walk because a `for` header sits at brace_depth 0 and
         // would otherwise fall through to `TopLevel`.
-        if let Some(partial) = extract_for_iterable_partial(&prefix) {
+        if let Some(partial) = extract_for_iterable_partial(prefix) {
             return CompletionContext::ForIterable { partial };
         }
 
@@ -444,7 +443,7 @@ impl CompletionProvider {
                 && let Some(open) = after_eq.rfind('[')
                 && !after_eq[open..].contains(']')
             {
-                let attr_name = self.extract_attr_name(&prefix);
+                let attr_name = self.extract_attr_name(prefix);
                 if attr_name == "depends_on" {
                     return CompletionContext::InsideDirectivesDependsOnList {
                         current_binding: directives_binding.cloned(),
@@ -460,7 +459,7 @@ impl CompletionProvider {
             // The value position takes a bare binding identifier — the name
             // of a `let <name> = provider <kind> { ... }` instance.
             if prefix.contains('=') {
-                let attr_name = self.extract_attr_name(&prefix);
+                let attr_name = self.extract_attr_name(prefix);
                 if attr_name == "provider" {
                     return CompletionContext::InsideDirectivesProviderValue;
                 }
@@ -514,7 +513,7 @@ impl CompletionProvider {
         // Check if cursor is inside `source = '...'` within an upstream_state block
         if in_upstream_state_block
             && brace_depth > 0
-            && let Some(partial) = extract_upstream_source_partial(&prefix)
+            && let Some(partial) = extract_upstream_source_partial(prefix)
         {
             return CompletionContext::InsideUpstreamStateSource {
                 partial_path: partial,
@@ -528,7 +527,7 @@ impl CompletionProvider {
         // prefix, not just its trimmed start, for the attribute.
         if in_use_block
             && brace_depth > 0
-            && let Some(partial) = extract_source_partial_anywhere(&prefix)
+            && let Some(partial) = extract_source_partial_anywhere(prefix)
         {
             return CompletionContext::InsideImportPath {
                 partial_path: partial,
@@ -1013,9 +1012,8 @@ fn detect_upstream_state_dot(
 ) -> Option<(String, String, String)> {
     let line_idx = position.line as usize;
     let current_line = text.lines().nth(line_idx)?;
-    let col = position.character as usize;
-    let prefix: String = current_line.chars().take(col).collect();
-    let segs = parse_trailing_dotted_segments(&prefix, 2)?;
+    let prefix = crate::position::line_prefix(current_line, position.character);
+    let segs = parse_trailing_dotted_segments(prefix, 2)?;
     let [binding, partial] = segs.as_slice() else {
         unreachable!("parse_trailing_dotted_segments returns exactly the requested count");
     };
@@ -1038,9 +1036,8 @@ fn detect_upstream_state_depth2_dot(
 ) -> Option<UpstreamDepth2Match> {
     let line_idx = position.line as usize;
     let current_line = text.lines().nth(line_idx)?;
-    let col = position.character as usize;
-    let prefix: String = current_line.chars().take(col).collect();
-    let segs = parse_trailing_dotted_segments(&prefix, 3)?;
+    let prefix = crate::position::line_prefix(current_line, position.character);
+    let segs = parse_trailing_dotted_segments(prefix, 3)?;
     let [binding, key, partial] = segs.as_slice() else {
         unreachable!("parse_trailing_dotted_segments returns exactly the requested count");
     };
@@ -1078,8 +1075,7 @@ fn detect_interpolation_bare_partial(text: &str, position: Position) -> Option<S
         return None;
     }
 
-    let col = position.character as usize;
-    let line_prefix: String = current_line.chars().take(col).collect();
+    let line_prefix = crate::position::line_prefix(current_line, position.character);
 
     let mut tail_start = line_prefix.len();
     for (idx, ch) in line_prefix.char_indices().rev() {
@@ -1095,7 +1091,7 @@ fn detect_interpolation_bare_partial(text: &str, position: Position) -> Option<S
     if line_idx > 0 {
         cursor_prefix.push('\n');
     }
-    cursor_prefix.push_str(&line_prefix);
+    cursor_prefix.push_str(line_prefix);
     let lexed = crate::lex::lex(&cursor_prefix);
     if !lexed.at_end_inside_interpolation_code() {
         return None;
@@ -1167,7 +1163,7 @@ fn is_identifier(s: &str) -> bool {
 /// Range covering the trailing `partial` characters at `position` —
 /// what `text_edit` should replace when the editor accepts a candidate.
 fn range_for_partial(position: Position, partial: &str) -> Range {
-    let partial_chars = partial.chars().count() as u32;
+    let partial_chars = crate::position::char_len(partial);
     Range {
         start: Position {
             line: position.line,
@@ -1321,7 +1317,7 @@ mod helper_tests {
         let last = text.lines().last().unwrap_or("");
         Position {
             line: text.lines().count().saturating_sub(1) as u32,
-            character: last.chars().count() as u32,
+            character: crate::position::char_len(last),
         }
     }
 

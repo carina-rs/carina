@@ -1535,7 +1535,7 @@ outer {{}}
 
 #[test]
 fn execution_minting_checks_load_completeness_after_skipped_validation_in_provider_name_order() {
-    let provider_configs = || {
+    let provider_configs = || -> Vec<ProviderConfig<ParserPlaceholder>> {
         ["zeta", "alpha"]
             .into_iter()
             .map(|name| ProviderConfig {
@@ -1567,16 +1567,9 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
         )
     };
     let invalid_config = || {
-        let mut parsed = carina_core::parser::InferredFile::default();
-        parsed.providers = provider_configs();
-        parsed.arguments = vec![carina_core::parser::ArgumentParameter {
-            name: "unrelated".to_string(),
-            static_type: carina_core::parser::TypeExpr::String,
-            default: None,
-            description: None,
-            validations: Vec::new(),
-        }];
-        parsed
+        crate::test_support::inferred_fixture(
+            "provider zeta { source = 'file:///definitely-missing/zeta.wasm' }\nprovider alpha { source = 'file:///definitely-missing/alpha.wasm' }\narguments { unrelated: String }\n",
+        )
     };
 
     let evaluated_error = match incomplete_load().validate_evaluated_config(
@@ -1674,7 +1667,20 @@ fn settlement_includes_checks_from_binding_readiness() {
         |_parsed, catalog| {
             catalog.record(
                 &expected,
-                ProviderTypeCheckSite::at_line(Path::new("main.crn"), 1, 1, "binding readiness"),
+                ProviderTypeCheckSite::new(
+                    carina_core::parser::parse_file(
+                        "attributes { value: Missing = 'id' }",
+                        Path::new("main.crn"),
+                        &carina_core::parser::ProviderContext::new(
+                            carina_core::EnvironmentSnapshot::empty(),
+                        ),
+                    )
+                    .unwrap()
+                    .attribute_params[0]
+                        .type_check_location()
+                        .clone(),
+                    "binding readiness",
+                ),
             );
             Ok(())
         },
@@ -1749,15 +1755,9 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors(
         std::slice::from_ref(&provider),
         HashMap::from([("broken".to_string(), "broken provider failed".to_string())]),
     );
-    let mut parsed = carina_core::parser::InferredFile::default();
-    parsed.providers = vec![provider];
-    parsed.arguments = vec![carina_core::parser::ArgumentParameter {
-        name: "unrelated".to_string(),
-        static_type: carina_core::parser::TypeExpr::String,
-        default: None,
-        description: None,
-        validations: Vec::new(),
-    }];
+    let parsed = crate::test_support::inferred_fixture(
+        "provider broken { source = 'file:///definitely-missing/broken.wasm' }\narguments { unrelated: String }\n",
+    );
 
     let unresolved = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
         carina_core::parser::ParsedFile::default(),
@@ -4074,24 +4074,9 @@ fn resolved_invalid_provider_config() -> (
     carina_core::parser::InferredFile,
     carina_core::parser::ResolvedProviderConfigs,
 ) {
-    let mut attributes = IndexMap::new();
-    attributes.insert(
-        "role_arn".to_string(),
-        Value::Deferred(DeferredValue::ResourceRef {
-            path: carina_core::resource::AccessPath::new("net", "role_arn"),
-        }),
+    let parsed = crate::test_support::inferred_fixture(
+        "provider test { role_arn = net.role_arn }\nlet net = upstream_state { source = './net' }\n",
     );
-    let mut parsed = carina_core::parser::InferredFile::default();
-    parsed.providers.push(ProviderConfig {
-        name: "test".to_string(),
-        attributes,
-        default_tags: IndexMap::new(),
-        source: None,
-        version: None,
-        revision: None,
-        unresolved_attributes: IndexMap::new(),
-        binding: None,
-    });
     let remote = HashMap::from([(
         "net".to_string(),
         HashMap::from([(
@@ -10285,10 +10270,11 @@ fn validate_resources_with_ctx_returns_each_error_as_app_error() {
     // Empty provider string sidesteps the "unknown provider, skip"
     // escape hatch (`known_providers` is empty), so each bad resource
     // produces its own "Unknown resource type" entry.
-    let r1 = Resource::new("foo.nothing", "first");
-    let r2 = Resource::new("bar.nothing", "second");
-    let mut parsed = ParsedFile::default();
-    parsed.resources = vec![r1, r2];
+    let mut parsed = crate::test_support::parsed_fixture(
+        "let first = foo.nothing {}\nlet second = bar.nothing {}\n",
+    );
+    parsed.resources[0].id = ResourceId::with_identity("foo.nothing", "first");
+    parsed.resources[1].id = ResourceId::with_identity("bar.nothing", "second");
     let parsed = resolve_file_for_test(parsed);
 
     let provider_ctx = ctx.provider_context();
@@ -10350,44 +10336,11 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
         &[],
         [("test".to_string(), schema)],
     );
-    let rule: Value<
-        carina_core::resource::ParserPlaceholder,
-        carina_core::resource::RelativeBindingName,
-    > = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-        ConcreteValue::Map(IndexMap::from([(
-            "action".to_string(),
-            Value::Concrete(ConcreteValue::String("allow".into())),
-        )])),
-    )]));
-    let resource = Resource::with_provider("test", "thing", "direct", None)
-        .with_attribute("rule", rule.clone());
-    let template_resource = Resource::with_provider("test", "thing", "deferred", None)
-        .with_attribute("rule", rule.clone())
-        .resolve_root_for_test();
-    let deferred =
-        carina_core::parser::DeferredForExpression::new(
-            Some("main.crn".to_string()),
-            4,
-            "for item in pending.items".to_string(),
-            carina_core::parser::DeferredForTarget::bound(
-                carina_core::resource::absolute_binding_address_for_test("items"),
-            )
-            .expect("fixture binding is valid"),
-            Value::<
-                carina_core::resource::ParserPlaceholder,
-                carina_core::resource::RelativeBindingName,
-            >::resource_ref("pending", "items", Vec::new())
-            .resolve_root_for_test(),
-            carina_core::parser::ForBinding::Simple("item".to_string()),
-            template_resource,
-        );
-    let mut evaluated = carina_core::parser::ParsedFile::default();
-    evaluated.resources = vec![resource];
-    let unresolved = evaluated.clone();
-    let mut evaluated = resolve_file_for_test(evaluated);
-    evaluated.replace_deferred_for_expressions(
-        carina_core::parser::ResolvedDeferredForExpressions::from_expressions_for_test([deferred]),
+    let evaluated = crate::test_support::parsed_fixture(
+        "let direct = test.thing { rule { action = 'allow' } }\nlet items = for item in direct.items { test.thing { rule { action = 'allow' } } }\n",
     );
+    let unresolved = evaluated.clone();
+    let evaluated = resolve_file_for_test(evaluated);
 
     let canonical_unresolved = resolve_config_names_with_ctx(
         &ValidationPipelineAccess::new(),
@@ -10443,12 +10396,8 @@ fn paired_block_name_resolution_reports_shared_conflict_once() {
         &[],
         [("test".to_string(), schema)],
     );
-    let rules = Value::Concrete(ConcreteValue::List(Vec::new()));
-    let resource = Resource::with_provider("test", "thing", "direct", None)
-        .with_attribute("rule", rules.clone())
-        .with_attribute("rules", rules);
-    let mut evaluated = carina_core::parser::ParsedFile::default();
-    evaluated.resources = vec![resource];
+    let evaluated =
+        crate::test_support::parsed_fixture("let direct = test.thing { rule = [] rules = [] }\n");
     let unresolved = evaluated.clone();
     let evaluated = resolve_file_for_test(evaluated);
 
@@ -10545,13 +10494,8 @@ fn paired_name_resolution_retains_post_alias_prefix_changes_in_owned_file() {
         &[],
         [("test".to_string(), schema)],
     );
-    let mut evaluated = carina_core::parser::ParsedFile::default();
-    evaluated.resources = vec![
-        Resource::with_provider("test", "thing", "direct", None).with_attribute(
-            "name_prefix",
-            Value::Concrete(ConcreteValue::String("owned-".into())),
-        ),
-    ];
+    let evaluated =
+        crate::test_support::parsed_fixture("let direct = test.thing { name_prefix = 'owned-' }\n");
     let unresolved = evaluated.clone();
     let evaluated = resolve_file_for_test(evaluated);
 
@@ -11658,6 +11602,7 @@ fn module_checker_and_provider_wrappers_accept_empty_input() {
                     reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
                 },
             )
+            .unwrap()
         });
     assert!(findings.is_empty(), "module_calls: got {findings:?}");
 
@@ -14502,6 +14447,7 @@ mod resolved_value_constraint_gate {
             instance: "root.checked".to_string(),
             call_path: crate::test_composition_call_path(),
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         }
     }
 
@@ -15103,7 +15049,20 @@ fn settlement_loaded_validation_report_cannot_hide_pending_evidence() {
         .unwrap();
         checks.record(
             &expected,
-            ProviderTypeCheckSite::at_line(Path::new("/project/main.crn"), 2, 3, "attribute 'x'"),
+            ProviderTypeCheckSite::new(
+                carina_core::parser::parse_file(
+                    "\n  attributes { value: Missing = 'id' }",
+                    Path::new("/project/main.crn"),
+                    &carina_core::parser::ProviderContext::new(
+                        carina_core::EnvironmentSnapshot::empty(),
+                    ),
+                )
+                .unwrap()
+                .attribute_params[0]
+                    .type_check_location()
+                    .clone(),
+                "attribute 'x'",
+            ),
         );
         Ok(Default::default())
     });

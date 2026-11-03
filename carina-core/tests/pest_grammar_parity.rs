@@ -34,6 +34,15 @@ const FMT_GRAMMAR: &str = "src/formatter/carina_fmt.pest";
 /// comment — the default response to drift should be to add the rule
 /// to the formatter, not to allow-list it here.
 const ALLOWED_MISSING: &[&str] = &[
+    // Parser-only capture of the first two segments of `namespaced_id` for
+    // diagnostic provenance. The formatter's atomic `namespaced_id` already
+    // accepts the same identifier/numeric-tail segments and preserves the
+    // entire spelling; it needs no separate CST node for this prefix. This
+    // rule changes only the parser tree, not the accepted DSL syntax.
+    "reference_prefix",
+    // The same parser-only capture for each selected field. The formatter
+    // preserves these segments inside its existing atomic `namespaced_id`.
+    "reference_field",
     // pest built-ins with matching semantics but different spellings —
     // the formatter uses explicit `trivia` / `ws` / `newline` / `comment`
     // productions instead of the implicit `WHITESPACE` / `COMMENT` hooks.

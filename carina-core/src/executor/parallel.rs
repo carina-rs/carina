@@ -1934,6 +1934,7 @@ mod tests {
                         timeout_secs: None,
                         depends_on: Default::default(),
                         line: 1,
+                        declaration: Default::default(),
                     }],
                     ..Default::default()
                 };
@@ -2111,9 +2112,9 @@ mod tests {
             Effect::Update { to, .. } => to.into_inner().into_unexpanded_for_test(),
             _ => unreachable!(),
         };
-        child.dependencies.depends_on.push(
+        child.dependencies.depends_on = crate::parser::UnexpandedDependencies::new_for_test(vec![
             crate::parser::UnexpandedDependencyOperand::BareBinding(absolute("parent")),
-        );
+        ]);
         let child = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("id"),
             from: Box::new((state_for(&child.id)).to_snapshot()),
@@ -2227,6 +2228,7 @@ mod tests {
             instance: "module".to_string(),
             call_path: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
+            declaration: Default::default(),
         };
 
         let child_id = child.id.clone();
@@ -2351,6 +2353,7 @@ mod tests {
             instance: "bootstrap".to_string(),
             call_path: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
+            declaration: Default::default(),
         };
 
         let mut role_policy: Resource =

@@ -240,6 +240,105 @@ fn cli_validate(fixture: &TempDir) -> Vec<String> {
     )
 }
 
+#[test]
+fn migrated_diagnostics_render_parser_owned_sibling_locations() {
+    for (source, message, token, last) in [
+        (
+            "aws.acm.Certificate { domain_name = 'consumer'\n  directives { depends_on = [missing] }\n}\n",
+            "binding 'missing' is not declared",
+            "missing",
+            false,
+        ),
+        (
+            "let ready = wait absent {\n  until = absent.status == 'ready'\n}\n",
+            "not a known resource",
+            "absent",
+            false,
+        ),
+        (
+            "let ready = wait cert {\n  until = cert.statu == 'ready'\n}\n",
+            "unknown attribute",
+            "cert.statu",
+            false,
+        ),
+        (
+            "let ready = wait cert {\n  until = cert.status == ready\n}\n",
+            "cannot resolve `ready`",
+            "ready",
+            true,
+        ),
+        (
+            "aws.acm.Certificate { domain_name = 'consumer'\n  directives { provider = typo }\n}\n",
+            "`typo` is not a known provider instance",
+            "typo",
+            false,
+        ),
+    ] {
+        let fixture = write_fixture(&[
+            ("providers.crn", "provider aws {}\n"),
+            (
+                "resources.crn",
+                "let cert = aws.acm.Certificate { domain_name = 'example.com' }\n",
+            ),
+            ("sibling.crn", source),
+        ]);
+        let errors = cli_validate(&fixture);
+        let matching: Vec<_> = errors
+            .iter()
+            .filter(|error| error.contains(message))
+            .collect();
+        assert_eq!(matching.len(), 1, "{message}: {errors:#?}");
+        let start = if last {
+            source.rfind(token)
+        } else {
+            source.find(token)
+        }
+        .unwrap();
+        let prefix = &source[..start];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let column = prefix.rsplit('\n').next().unwrap().chars().count() + 1;
+        assert!(
+            matching[0].contains(&format!("sibling.crn:{line}:{column}:")),
+            "{message}: {errors:#?}"
+        );
+    }
+}
+
+#[test]
+fn module_wait_diagnostic_renders_the_authored_file_after_expansion() {
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider aws {}\n"),
+        (
+            "main.crn",
+            "let module = use { source = './child' }\nlet instance = module {}\n",
+        ),
+    ]);
+    std::fs::create_dir(fixture.path().join("child")).unwrap();
+    std::fs::write(
+        fixture.path().join("child/main.crn"),
+        "arguments { label: String = 'module' }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.path().join("child/resources.crn"),
+        "let cert = aws.acm.Certificate { domain_name = 'module.example.com' }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.path().join("child/wait.crn"),
+        "let ready = wait cert {\n  until = cert.statu == 'ready'\n}\n",
+    )
+    .unwrap();
+    let errors = cli_validate(&fixture);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("child/wait.crn:2:11: wait")
+                && error.contains("unknown attribute `instance.cert.statu`")),
+        "{errors:#?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -470,9 +569,12 @@ fn validate_rejects_data_source_wait_target_from_sibling_file() {
     ]);
 
     let diagnostics = cli_validate(&fixture);
+    let expected = format!(
+        "{}:1:18: wait `found`: target binding `lookup` is a data source; wait targets must be managed resources",
+        fixture.path().join("main.crn").display(),
+    );
     assert!(
-        diagnostics.iter().any(|diagnostic| diagnostic
-            == "wait `found`: target binding `lookup` is a data source; wait targets must be managed resources"),
+        diagnostics.iter().any(|diagnostic| diagnostic == &expected),
         "validate must reject a sibling data source as a wait target; got: {diagnostics:?}"
     );
 }

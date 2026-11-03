@@ -3389,7 +3389,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_provider_resolution_ignores_unrelated_missing_upstream_state() {
-        let (_temp, downstream, mut parsed) = provider_upstream_fixture();
+        let (_temp, downstream, _) = provider_upstream_fixture();
         let unrelated = downstream.parent().unwrap().join("unrelated");
         std::fs::create_dir_all(&unrelated).unwrap();
         std::fs::write(
@@ -3397,12 +3397,19 @@ mod tests {
             "backend local { path = \"carina.state.json\" }\n",
         )
         .unwrap();
-        parsed
-            .upstream_states
-            .push(carina_core::parser::UpstreamState {
-                binding: carina_core::resource::RelativeBindingName::new("unrelated"),
-                source: PathBuf::from("../unrelated"),
-            });
+        std::fs::write(
+            downstream.join("unrelated.crn"),
+            "let unrelated = upstream_state { source = '../unrelated' }\n",
+        )
+        .unwrap();
+        let parsed = load_configuration_with_config(
+            &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .unwrap()
+        .parsed
+        .into_parsed();
         let parsed = resolve_authored_file_for_test(
             parsed,
             &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
@@ -3681,8 +3688,10 @@ mod tests {
 
     #[tokio::test]
     async fn state_bucket_delete_ignores_upstream_referenced_only_by_default_tags() {
-        let (_temp, base_dir, mut parsed) = provider_default_tags_missing_upstream_fixture();
-        parsed.providers[0].name = "test".to_string();
+        let (_temp, base_dir, _) = provider_default_tags_missing_upstream_fixture();
+        let parsed = crate::test_support::inferred_fixture(
+            "provider test { default_tags = { Owner = mgmt.owner } }\nlet mgmt = upstream_state { source = 'missing-upstream' }\n",
+        );
         let parsed = resolve_authored_file_for_test(
             parsed,
             &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
@@ -4163,6 +4172,7 @@ mod tests {
             instance: "root.checked".to_string(),
             call_path: crate::test_composition_call_path(),
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         };
         let data_source = <DataSource>::with_provider("test", "lookup", "unrelated", None)
             .with_attribute(
@@ -4252,6 +4262,7 @@ mod tests {
             instance: "root.checked".to_string(),
             call_path: crate::test_composition_call_path(),
             quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
         };
         let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(carina_core::parser::ProviderConfig {

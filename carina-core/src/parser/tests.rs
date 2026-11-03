@@ -17,6 +17,114 @@ use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
 #[test]
+fn declaration_location_and_envelope_keep_parser_span() {
+    let source = "// sibling declaration\nlet bucket = mock.test.Resource { name = '東京' }\n";
+    let file = preprocess_file(source).unwrap();
+    let pair = file
+        .parse()
+        .unwrap()
+        .flatten()
+        .find(|pair| pair.as_rule() == Rule::resource_expr)
+        .unwrap();
+    let location =
+        DeclarationLocation::from_pair(&pair, &file, std::path::Path::new("sibling.crn"));
+    assert_eq!(location.file().path(), std::path::Path::new("sibling.crn"));
+    assert_eq!(location.span().start_line(), 2);
+    assert_eq!(
+        &source[location.span().start_byte()..location.span().end_byte()],
+        "mock.test.Resource { name = '東京' }",
+    );
+
+    let diagnostic = Located::new(location.clone(), "example finding");
+    assert_eq!(diagnostic.location(), &location);
+    assert_eq!(diagnostic.detail(), &"example finding");
+    assert_eq!(diagnostic.into_parts(), (location, "example finding"));
+}
+
+#[test]
+fn analysis_tree_rejects_unlocated_data_wait_and_nested_declarations() {
+    let source = "arguments { flag: Bool names: list(String) }\n\
+        let named = mock.test.Resource { name = 'named' }\n\
+        let lookup = read mock.test.Lookup { name = 'lookup' }\n\
+        let ready = wait named { until = named.status == 'ready' }\n\
+        let items = for n in names { mock.test.Resource { name = n } }\n\
+        let reads = for n in names { read mock.test.Lookup { name = n } }\n\
+        let selected = if flag { mock.test.Resource { name = 'then' } } else { mock.test.Resource { name = 'else' } }\n\
+        let selected_read = if flag { read mock.test.Lookup { name = 'then' } } else { read mock.test.Lookup { name = 'else' } }\n";
+    for case in 0..7 {
+        let mut parsed = parse(
+            source,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        assert!(AnalysisTree::try_from_file(&parsed).is_ok());
+        let expected = match case {
+            0 => {
+                parsed.data_sources[0].declaration = Default::default();
+                AnalysisItemKind::DataSource
+            }
+            1 => {
+                parsed.wait_bindings[0].declaration = Default::default();
+                AnalysisItemKind::Wait
+            }
+            2 => {
+                parsed.parsed_deferred_for_expressions_mut()[0].body =
+                    DeferredForBody::resource(GenericResource::new("test.Resource", "synthetic"));
+                AnalysisItemKind::DeferredResource
+            }
+            3 => {
+                let DeferredForBody::Read(data) =
+                    &mut parsed.parsed_deferred_for_expressions_mut()[1].body
+                else {
+                    panic!("read template")
+                };
+                data.declaration = Default::default();
+                AnalysisItemKind::DataSource
+            }
+            4 | 5 => {
+                let deferred = &mut parsed.deferred_module_ifs[0];
+                let branch = if case == 4 {
+                    &mut deferred.then_branch
+                } else {
+                    deferred.else_branch.as_mut().unwrap()
+                };
+                let DeferredIfBody::Resource(resource) = branch else {
+                    panic!("resource branch")
+                };
+                resource.declaration = Default::default();
+                AnalysisItemKind::Resource
+            }
+            6 => {
+                let DeferredIfBody::DataSource(data) =
+                    &mut parsed.deferred_module_ifs[1].then_branch
+                else {
+                    panic!("read branch")
+                };
+                data.declaration = Default::default();
+                AnalysisItemKind::DataSource
+            }
+            _ => unreachable!(),
+        };
+        let error = match AnalysisTree::try_from_file(&parsed) {
+            Ok(_) => panic!("case {case} admitted unlocated {expected:?}"),
+            Err(error) => error,
+        };
+        match error.kind() {
+            AnalysisTreeErrorKind::MissingResourceProvenance { kind, .. } => {
+                assert_eq!(*kind, expected)
+            }
+            AnalysisTreeErrorKind::MissingWaitProvenance { .. } => {
+                assert_eq!(expected, AnalysisItemKind::Wait)
+            }
+            error @ (AnalysisTreeErrorKind::MissingElementProvenance { .. }
+            | AnalysisTreeErrorKind::MissingSyntaxProvenance { .. }) => {
+                panic!("unexpected element invariant: {error}")
+            }
+        }
+    }
+}
+
+#[test]
 fn attribute_value_source_span_ignores_names_in_earlier_nested_maps() {
     let source = "mock.test.Resource {\n  nested = { values = [\"a\"] }\n  values = [\"repo\", \"repo\"]\n}\n";
     let path = crate::schema::FieldPath::new().push_index(1);
@@ -991,6 +1099,7 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
         timeout_secs: None,
         depends_on: Default::default(),
         line: 1,
+        declaration: Default::default(),
     });
     file.requires.push(RequireBlock::dummy(
         ValidateExpr::BoundArgument {
@@ -2974,6 +3083,14 @@ fn secret_derived_backend_attribute_error_carries_the_attribute_span() {
     )
     .expect_err("secret-derived backend attributes must be rejected");
 
+    let ParseError::AtElement(finding) = error else {
+        panic!("backend validation must retain its parser-owned location: {error:?}")
+    };
+    let (location, error) = (*finding).into_parts();
+    assert_eq!(
+        &input[location.span().start_byte()..location.span().end_byte()],
+        "path"
+    );
     match error {
         ParseError::SecretDerivedBackendAttribute {
             backend_type,
@@ -5145,28 +5262,10 @@ fn resolve_provider_attributes_with_remote_preserves_function_call_line() {
 #[test]
 fn provider_default_tags_remain_deferred_and_saved_plan_validation_accepts_them() {
     use crate::parser::resolve_provider_attributes_with_remote;
-    use crate::resource::AuthoredAccessPath as AccessPath;
-
-    let mut parsed = InferredFile::default();
-    parsed.providers.push(ProviderConfig {
-        name: "aws".to_string(),
-        attributes: IndexMap::new(),
-        default_tags: IndexMap::from([(
-            "Owner".to_string(),
-            Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::new("mgmt", "owner"),
-            }),
-        )]),
-        source: None,
-        version: None,
-        revision: None,
-        unresolved_attributes: IndexMap::new(),
-        binding: None,
-    });
-    parsed.upstream_states.push(UpstreamState {
-        binding: "mgmt".into(),
-        source: "../mgmt".into(),
-    });
+    let parsed = parse(
+        "let mgmt = upstream_state { source = '../mgmt' }\nprovider aws { default_tags = { Owner = mgmt.owner } }",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).unwrap();
     let remote: HashMap<String, HashMap<String, crate::resource::ExpandedValue>> = HashMap::new();
 
     let parsed = cross_deferred_for_resolution_seam(parsed)
@@ -10771,7 +10870,15 @@ fn user_fn_return_type_mismatch_value() {
     let msg = format!("{err}");
     assert_eq!(
         msg,
-        "User-defined function error: function 'bad': return value: expected String, got int (42)"
+        "test.crn:3:13: User-defined function error: function 'bad': return value: expected String, got int (42)"
+    );
+    let finding = err
+        .element_diagnostic()
+        .expect("parser-owned return expression");
+    assert_eq!(finding.location().span().start_line(), 3);
+    assert_eq!(
+        &input[finding.location().span().start_byte()..finding.location().span().end_byte()],
+        "42"
     );
 }
 
@@ -18272,7 +18379,8 @@ fn extract_directives_reads_provider_in_anonymous_resource() {
 }
 
 #[test]
-fn check_provider_instance_routing_accepts_named_instance() {
+fn check_provider_instance_routing_accepts_named_instance()
+-> Result<(), crate::parser::AnalysisTreeError> {
     let src = r#"
         provider aws {
             source = "github.com/carina-rs/carina-provider-aws"
@@ -18290,15 +18398,18 @@ fn check_provider_instance_routing_accepts_named_instance() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let errs = crate::parser::check_provider_instance_routing(&parsed);
+    let errs =
+        crate::parser::check_provider_instance_routing(&AnalysisTree::try_from_file(&parsed)?);
     assert!(
         errs.is_empty(),
         "valid named-instance routing must not produce errors, got: {errs:?}"
     );
+    Ok(())
 }
 
 #[test]
-fn check_provider_instance_routing_accepts_default_when_none() {
+fn check_provider_instance_routing_accepts_default_when_none()
+-> Result<(), crate::parser::AnalysisTreeError> {
     let src = r#"
         provider aws {
             source = "github.com/carina-rs/carina-provider-aws"
@@ -18314,15 +18425,18 @@ fn check_provider_instance_routing_accepts_default_when_none() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let errs = crate::parser::check_provider_instance_routing(&parsed);
+    let errs =
+        crate::parser::check_provider_instance_routing(&AnalysisTree::try_from_file(&parsed)?);
     assert!(
         errs.is_empty(),
         "default-instance routing must not produce errors, got: {errs:?}"
     );
+    Ok(())
 }
 
 #[test]
-fn check_provider_instance_routing_rejects_unknown_binding() {
+fn check_provider_instance_routing_rejects_unknown_binding()
+-> Result<(), crate::parser::AnalysisTreeError> {
     let src = r#"
         provider aws {
             source = "github.com/carina-rs/carina-provider-aws"
@@ -18338,7 +18452,8 @@ fn check_provider_instance_routing_rejects_unknown_binding() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let errs = crate::parser::check_provider_instance_routing(&parsed);
+    let errs =
+        crate::parser::check_provider_instance_routing(&AnalysisTree::try_from_file(&parsed)?);
     assert_eq!(
         errs.len(),
         1,
@@ -18349,10 +18464,12 @@ fn check_provider_instance_routing_rejects_unknown_binding() {
         msg.contains("nope") && msg.contains("provider instance"),
         "error should name the unknown binding, got: {msg}"
     );
+    Ok(())
 }
 
 #[test]
-fn check_provider_instance_routing_rejects_kind_mismatch() {
+fn check_provider_instance_routing_rejects_kind_mismatch()
+-> Result<(), crate::parser::AnalysisTreeError> {
     let src = r#"
         provider aws {
             source = "github.com/carina-rs/carina-provider-aws"
@@ -18373,7 +18490,8 @@ fn check_provider_instance_routing_rejects_kind_mismatch() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let errs = crate::parser::check_provider_instance_routing(&parsed);
+    let errs =
+        crate::parser::check_provider_instance_routing(&AnalysisTree::try_from_file(&parsed)?);
     assert_eq!(
         errs.len(),
         1,
@@ -18384,10 +18502,12 @@ fn check_provider_instance_routing_rejects_kind_mismatch() {
         msg.contains("us") && msg.contains("awscc") && msg.contains("aws"),
         "error should name the binding and both kinds, got: {msg}"
     );
+    Ok(())
 }
 
 #[test]
-fn check_provider_instance_routing_rejects_missing_default_instance() {
+fn check_provider_instance_routing_rejects_missing_default_instance()
+-> Result<(), crate::parser::AnalysisTreeError> {
     // No top-level `provider aws { ... }` block — only a named
     // instance is declared. A resource that omits the directive
     // resolves to "the kind's default", which does not exist here,
@@ -18404,7 +18524,8 @@ fn check_provider_instance_routing_rejects_missing_default_instance() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let errs = crate::parser::check_provider_instance_routing(&parsed);
+    let errs =
+        crate::parser::check_provider_instance_routing(&AnalysisTree::try_from_file(&parsed)?);
     assert_eq!(
         errs.len(),
         1,
@@ -18415,10 +18536,12 @@ fn check_provider_instance_routing_rejects_missing_default_instance() {
         msg.contains("aws") && msg.contains("default"),
         "error should mention the kind and default-instance absence, got: {msg}"
     );
+    Ok(())
 }
 
 #[test]
-fn check_provider_instance_routing_multi_file_named_instance() {
+fn check_provider_instance_routing_multi_file_named_instance()
+-> Result<(), crate::parser::AnalysisTreeError> {
     use crate::config_loader::parse_directory;
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -18448,11 +18571,13 @@ fn check_provider_instance_routing_multi_file_named_instance() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("multi-file directory parse must succeed");
-    let errs = crate::parser::check_provider_instance_routing(&parsed);
+    let errs =
+        crate::parser::check_provider_instance_routing(&AnalysisTree::try_from_file(&parsed)?);
     assert!(
         errs.is_empty(),
         "cross-file named-instance routing must validate cleanly, got: {errs:?}"
     );
+    Ok(())
 }
 
 #[test]

@@ -453,6 +453,7 @@ impl Orphan {
                     default_tag_keys: Default::default(),
                     loop_provenance: Default::default(),
                     quoted_string_attrs: Default::default(),
+                    declaration: Default::default(),
                 };
             }
             Current::CreateOutcomeUnknown(_unknown) => {
@@ -468,6 +469,7 @@ impl Orphan {
                     default_tag_keys: Default::default(),
                     loop_provenance: Default::default(),
                     quoted_string_attrs: Default::default(),
+                    declaration: Default::default(),
                 };
             }
             Current::MissingIdentifier(state) => &state.state().attributes,
@@ -487,6 +489,7 @@ impl Orphan {
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
             quoted_string_attrs: Default::default(),
+            declaration: Default::default(),
         }
     }
 

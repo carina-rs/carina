@@ -20,21 +20,18 @@ impl CompletionProvider {
         // Find where the current word/prefix starts on this line
         let lines: Vec<&str> = text.lines().collect();
         let line_idx = position.line as usize;
-        let col = position.character as usize;
 
         let prefix_start = if line_idx < lines.len() {
             let line = lines[line_idx];
-            let before_cursor: String = line.chars().take(col).collect();
-            // Find where the identifier starts (going backwards from cursor)
-            // Stop at whitespace, but continue through dots
-            let mut start = col;
-            for (i, c) in before_cursor.chars().rev().enumerate() {
-                if c.is_whitespace() {
-                    break;
-                }
-                start = col - i - 1;
-            }
-            start as u32
+            let before_cursor = crate::position::line_prefix(line, position.character);
+            let token = before_cursor
+                .rsplit(char::is_whitespace)
+                .next()
+                .unwrap_or("");
+            crate::position::byte_offset_to_char_offset(
+                before_cursor,
+                before_cursor.len() - token.len(),
+            )
         } else {
             position.character
         };
@@ -49,7 +46,7 @@ impl CompletionProvider {
 
         // Avoid emitting a duplicate `let` when the line already has `let <name> =`.
         let after_let_binding =
-            line_idx < lines.len() && is_after_let_binding(lines[line_idx], prefix_start as usize);
+            line_idx < lines.len() && is_after_let_binding(lines[line_idx], prefix_start);
 
         let read_snippet = if after_let_binding {
             "read ${1:aws.s3.Bucket} {\n    name = \"${2:existing-resource}\"\n}"
@@ -823,14 +820,9 @@ impl CompletionProvider {
 }
 
 /// Return true when `line[..prefix_start]` already forms a `let <name> =` binding header.
-/// `prefix_start` is a char offset, converted to a byte offset for slicing.
-fn is_after_let_binding(line: &str, prefix_start: usize) -> bool {
-    let byte_end = line
-        .char_indices()
-        .nth(prefix_start)
-        .map(|(i, _)| i)
-        .unwrap_or(line.len());
-    crate::let_parse::parse_let_header(&line[..byte_end]).is_some()
+/// `prefix_start` is an LSP UTF-16 column.
+fn is_after_let_binding(line: &str, prefix_start: u32) -> bool {
+    crate::let_parse::parse_let_header(crate::position::line_prefix(line, prefix_start)).is_some()
 }
 
 /// Which slot of a `for` header introduced a given binding. Encodes the
@@ -887,23 +879,7 @@ pub(super) fn extract_for_bindings_in_scope(
     position: tower_lsp::lsp_types::Position,
 ) -> Vec<ForScopeBinding> {
     // Byte offset of the cursor inside `text`.
-    let cursor_byte_offset: usize = {
-        let mut offset = 0usize;
-        for (i, line) in text.split('\n').enumerate() {
-            if i as u32 == position.line {
-                let char_col = position.character as usize;
-                let byte_col = line
-                    .char_indices()
-                    .nth(char_col)
-                    .map(|(b, _)| b)
-                    .unwrap_or(line.len());
-                offset += byte_col;
-                break;
-            }
-            offset += line.len() + 1; // +1 for the `\n`
-        }
-        offset
-    };
+    let cursor_byte_offset = crate::position::position_to_byte_offset(text, position);
 
     // Each frame on the stack represents one open `for` body: the bindings
     // it introduced plus a depth counter of *nested* `{` inside it. The
