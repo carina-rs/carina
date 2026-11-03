@@ -4396,8 +4396,9 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     ///    pattern (literal equality) and length containment (source ⊆ sink),
     ///    then recurse on base. Exception: an identity-bearing String, Int, or
     ///    Float source is assignable to an identity-less sink of the same
-    ///    primitive kind regardless of its own pattern/length/range. The
-    ///    sink's value constraints are checked when known
+    ///    primitive kind, and an identity-bearing Int source is also assignable
+    ///    to an identity-less Float sink, regardless of the source's own
+    ///    pattern/length/range. The sink's value constraints are checked when known
     ///    at plan or before provider dispatch at apply (carina#3805). Rule 7
     ///    and rule 8's identity-less refined-source comparisons are unchanged.
     /// 9. Custom source → non-Custom sink: recurse on `source.base`.
@@ -4765,7 +4766,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             ) if binding.identity().is_some() => true,
             // Numeric widening is directional: an Int source may flow into
             // a Float sink, matching concrete-value validation. Preserve
-            // identity and range evidence when either side carries it.
+            // sink identity and identity-less source range evidence.
             (
                 Int {
                     binding: source_binding,
@@ -4785,7 +4786,9 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 {
                     return false;
                 }
-                if source_range.is_none() && sink_binding.identity().is_none() {
+                if (source_binding.identity().is_some() || source_range.is_none())
+                    && sink_binding.identity().is_none()
+                {
                     return true;
                 }
                 i64_range_assignable_to_f64(source_range.as_ref(), sink_range.as_ref())

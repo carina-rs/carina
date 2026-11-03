@@ -10614,6 +10614,28 @@ fn typed_ref_anonymous_refined_numeric_preserves_identity_range_and_primitive_ru
     );
 
     let named_float = AttributeType::refined_float(Some(TypeIdentity::bare("Ratio")), None);
+    let ranged_named_int = AttributeType::refined_int(
+        Some(TypeIdentity::bare("Count")),
+        Some((Some(0), Some(100))),
+    );
+    for source in [&named_int, &ranged_named_int] {
+        assert!(
+            !assignable(source, &named_float),
+            "Int to Float widening still requires compatible identities"
+        );
+    }
+
+    let narrow_float = AttributeType::refined_float(None, Some((Some(25.0), Some(75.0))));
+    assert!(
+        !assignable(&wide_int, &narrow_float),
+        "Int to Float widening still requires identity-less source range containment"
+    );
+    assert!(assignable(&named_int, &narrow_float));
+    assert!(
+        assignable(&ranged_named_int, &narrow_float),
+        "identified ranged Int must defer the identity-less Float sink's range check"
+    );
+
     for source in [AttributeType::float(), named_float.clone()] {
         assert!(
             !assignable(&source, &narrow_int),

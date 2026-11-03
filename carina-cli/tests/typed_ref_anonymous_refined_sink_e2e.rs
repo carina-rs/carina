@@ -17,8 +17,9 @@ use carina_cli::wiring::LoadedProviderFactory;
 use carina_core::binding_index::ResolvedBindings;
 use carina_core::data_source_value::ExecutableDataSourceValues;
 use carina_core::executor::{
-    Applied, ExecutionCheckpointSink, ExecutionObserver, ExecutionOutcome, ExecutionResult,
-    LiveExecutionInput, ProviderCheckInputs, execute_live_plan_for_test,
+    Applied, EffectFailureKind, ExecutionCheckpointSink, ExecutionObserver, ExecutionOutcome,
+    ExecutionResult, LiveExecutionInput, ProviderCheckInputs, ProviderPreparationError,
+    execute_live_plan_for_test,
 };
 use carina_core::plan::PlanErrorKind;
 use carina_core::provider::{
@@ -29,7 +30,7 @@ use carina_core::provider::{
 };
 use carina_core::resource::{ConcreteValue, Current, DeferredValue, ResourceId, State, Value};
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
+    AttributeSchema, AttributeType, ResourceSchema, StructField, TypeError, TypeIdentity,
     ValidatedResourceSchema,
 };
 use carina_state::{ResourceState, StateFile};
@@ -643,6 +644,22 @@ fn typed_ref_int_apply_rejects_unknown_out_of_range_output_before_consumer_creat
         let error = result.failures()[0].to_string();
         assert!(error.contains(CONSUMER), "{error}");
         assert!(error.contains("outside allowed range"), "{error}");
+        let EffectFailureKind::Execution { error: cause } = result.failures()[0].kind() else {
+            panic!("expected a provider preparation failure: {error}");
+        };
+        let Some(ProviderPreparationError::ValueConstraint { errors, .. }) =
+            cause.as_error().downcast_ref::<ProviderPreparationError>()
+        else {
+            panic!("expected value constraint errors: {error}");
+        };
+        assert!(
+            matches!(
+                errors.errors(),
+                [TypeError::ResourceValidationFailed { attribute: Some(attribute), .. }]
+                    if attribute == "port"
+            ),
+            "{errors:?}"
+        );
         assert!(
             !error.contains("cannot assign"),
             "must reach the resolved value gate: {error}"
