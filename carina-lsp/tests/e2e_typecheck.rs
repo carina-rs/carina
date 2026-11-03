@@ -427,6 +427,92 @@ let upstream = test.r.producer {
 // Scenario 6: Unknown attribute with `suggestion`
 // ---------------------------------------------------------------
 
+fn typed_ref_anonymous_refined_string_schemas() -> SchemaRegistry {
+    use carina_core::schema::TypeIdentity;
+
+    let named = AttributeType::refined_string(
+        Some(TypeIdentity::new(Some("test"), Vec::<String>::new(), "Arn")),
+        None,
+        None,
+        None,
+    );
+    let refined = AttributeType::refined_string(
+        None,
+        Some(r"^[ -~]+$".to_string()),
+        Some((Some(1), Some(1024))),
+        None,
+    );
+    let mut schemas = SchemaRegistry::new();
+    for schema in [
+        ResourceSchema::new("r.TypedProducer")
+            .attribute(AttributeSchema::provider_populated("typed_out", named).build()),
+        ResourceSchema::new("r.RefinedConsumer")
+            .attribute(AttributeSchema::optional("x", refined.clone()).build())
+            .attribute(AttributeSchema::optional("xs", AttributeType::list(refined)).build()),
+        ResourceSchema::new("r.NamedConsumer").attribute(
+            AttributeSchema::required(
+                "arn",
+                AttributeType::refined_string(
+                    Some(TypeIdentity::new(Some("test"), ["iam", "Role"], "Arn")),
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        ),
+    ] {
+        schemas.insert("test", schema.validate().expect("typed reference schema"));
+    }
+    schemas
+}
+
+#[test]
+fn typed_ref_anonymous_refined_string_has_no_type_mismatch_diagnostic() {
+    let engine = engine_with_schemas(typed_ref_anonymous_refined_string_schemas());
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider test {}\n"),
+        ("producer.crn", "let producer = test.r.TypedProducer {}\n"),
+        (
+            "consumer.crn",
+            "test.r.RefinedConsumer {\n  x = producer.typed_out\n  xs = [producer.typed_out]\n}\n",
+        ),
+    ]);
+    let diags = analyze(&engine, &fixture, "consumer.crn");
+    assert!(
+        diags.is_empty(),
+        "typed references must defer anonymous String constraints to resolution; got: {:?}",
+        messages_of(&diags),
+    );
+}
+
+#[test]
+fn typed_ref_anonymous_refined_string_named_mismatch_keeps_diagnostic() {
+    let engine = engine_with_schemas(typed_ref_anonymous_refined_string_schemas());
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider test {}\n"),
+        ("producer.crn", "let producer = test.r.TypedProducer {}\n"),
+        (
+            "consumer.crn",
+            "test.r.NamedConsumer {\n  arn = producer.typed_out\n}\n",
+        ),
+    ]);
+    let diags = analyze(&engine, &fixture, "consumer.crn");
+    assert_eq!(diags.len(), 1, "{:?}", messages_of(&diags));
+    for expected in [
+        "Type mismatch:",
+        "got test.Arn",
+        "test.iam.Role.Arn",
+        "producer.typed_out",
+    ] {
+        assert!(
+            diags[0].message.contains(expected),
+            "{:?}",
+            messages_of(&diags)
+        );
+    }
+}
+
 #[test]
 fn unknown_attribute_emits_suggestion() {
     let engine = engine_with_schemas(single_schema_map(

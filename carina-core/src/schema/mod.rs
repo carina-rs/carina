@@ -4394,7 +4394,11 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     ///    rejected both ways (populated providers differ). Closes carina#3218.
     /// 8. Custom→Custom where at least one side has `identity: None`: check
     ///    pattern (literal equality) and length containment (source ⊆ sink),
-    ///    then recurse on base. For both-identified pairs, see rule 7.
+    ///    then recurse on base. Exception: an identity-bearing String source
+    ///    is assignable to an identity-less String sink regardless of its own
+    ///    pattern/length. The sink's value constraints are checked when known
+    ///    at plan or before provider dispatch at apply (carina#3805). Rule 7
+    ///    and rule 8's identity-less refined-source comparisons are unchanged.
     /// 9. Custom source → non-Custom sink: recurse on `source.base`.
     /// 10. A plain, unrefined primitive source → refined sink is split by
     ///     the sink's identity. An identified sink (including every Enum) is
@@ -4403,13 +4407,16 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     ///     pattern/length/range is a value constraint, enforced when the
     ///     concrete value is known (carina#3805). Rules 4–6 make the same
     ///     leaf decision recursively inside List/Map/Struct, and rules 2–3
-    ///     preserve their normal all/any Union semantics.
+    ///     preserve their normal all/any Union semantics. For String only,
+    ///     rule 8 also accepts identity-bearing sources into identity-less
+    ///     sinks, with the same value checks at plan or before provider
+    ///     dispatch at apply.
     /// 11. Otherwise: same primitive type names.
     ///
     /// # Conservative pattern/length policy
     ///
-    /// Rule 8 remains evidence-preserving for a source that carries any
-    /// refinement of its own. A populated sink pattern requires literal
+    /// Rule 8 remains evidence-preserving for an identity-less refined
+    /// String source. A populated sink pattern requires literal
     /// string equality; regex-language containment is not inferred. A sink
     /// length range requires the source range to be a subset (`sink.min ≤
     /// source.min` and `source.max ≤ sink.max`, with absent bounds treated
@@ -4417,16 +4424,24 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     /// wider, or whose other refinement evidence does not establish the
     /// sink's constraint is rejected.
     ///
+    /// An identity-bearing String source is assignable to an identity-less
+    /// String sink regardless of the source's pattern/length. This exception
+    /// is limited to identity-less sinks; rule 7's identity and length
+    /// comparisons and rule 8's identity-less refined-source evidence
+    /// comparisons are unchanged. The sink's constraints are checked on the
+    /// value when known at plan or before provider dispatch at apply (#3805).
+    ///
     /// A completely unrefined source is intentionally different: it makes
     /// no refinement claim that can conflict with the sink. Rule 10 accepts
     /// its assignable primitive base only into an identity-less sink, then
     /// leaves the sink's pattern/length value check to carina#3805. It never
     /// supplies evidence for an identified custom type or Enum.
     ///
-    /// **Do not loosen rule 8's evidence comparisons.** Accepting a wider or
-    /// differently refined source would re-introduce the silent-false-positive
-    /// class that #2218 closed. Rule 10's no-evidence exception is limited to
-    /// identity-less sinks and does not weaken those comparisons.
+    /// **Do not loosen rule 8's identity-less refined-source evidence
+    /// comparisons.** Accepting a wider or differently refined identity-less
+    /// source would re-introduce the silent-false-positive class that #2218
+    /// closed. Both exceptions above are limited to identity-less sinks and
+    /// do not weaken those comparisons.
     pub fn is_assignable_to(self, sink: TypeInSchema<'_, R>) -> bool {
         matches!(self.assignment_to(sink), TypeAssignability::Assignable)
     }
@@ -4717,6 +4732,16 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 },
                 String { binding, .. },
             ) if binding.identity().is_some() => false,
+            // An identified String may flow into an identity-less String
+            // sink. Check the sink's value constraints when known at plan or
+            // before provider dispatch at apply (#3805, #4230).
+            (
+                String { binding, .. },
+                String {
+                    binding: RefinementBinding::MetadataOnly(None),
+                    ..
+                },
+            ) if binding.identity().is_some() => true,
             (
                 Int {
                     binding: RefinementBinding::MetadataOnly(None),

@@ -7864,15 +7864,11 @@ let zone = aws.route53.HostedZone {
     std::fs::write(root.join("main.crn"), source).unwrap();
 
     let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", source);
-    let mismatch = diagnostics.iter().find(|diagnostic| {
-        diagnostic.message.contains("Type mismatch")
-            && diagnostic.message.contains("expected String(len: ..=1024)")
-            && diagnostic.message.contains("got aws.logs.LogGroup.Arn")
-            && diagnostic.message.contains("from m.x, declared String")
-    });
     assert!(
-        mismatch.is_some(),
-        "LSP must retain the same inferred evidence as validate: {:?}",
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity != Some(DiagnosticSeverity::ERROR)),
+        "LSP must accept forwarded Arn evidence at an identity-less String sink, matching validate (#4230): {:?}",
         diagnostics
             .iter()
             .map(|diagnostic| &diagnostic.message)

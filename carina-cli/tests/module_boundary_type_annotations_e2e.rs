@@ -844,12 +844,8 @@ let zone = aws.route53.HostedZone {
 
     let diagnostics = fixture.validate();
     assert!(
-        diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains("cannot assign aws.logs.LogGroup.Arn to 'name'")
-                && diagnostic.contains("got aws.logs.LogGroup.Arn")
-                && diagnostic.contains("from m.x, declared String")
-        }),
-        "the declared String contract must not erase the forwarded Arn evidence: {diagnostics:#?}",
+        diagnostics.is_empty(),
+        "forwarded Arn evidence may flow into an identity-less String sink; length is checked when the value is known (#4230): {diagnostics:#?}",
     );
 }
 
@@ -943,12 +939,8 @@ let zone = aws.route53.HostedZone {
         factories(),
     );
     assert!(
-        diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains("cannot assign aws.logs.LogGroup.Arn to 'name'")
-                && diagnostic.contains("got aws.logs.LogGroup.Arn")
-                && diagnostic.contains("from outer_instance.x, declared String")
-        }),
-        "both declared String boundaries must retain the original Arn evidence: {diagnostics:#?}",
+        diagnostics.is_empty(),
+        "forwarded Arn evidence across both String boundaries may flow into an identity-less sink (#4230): {diagnostics:#?}",
     );
 }
 
