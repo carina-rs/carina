@@ -1618,6 +1618,7 @@ mod tests {
             resources: Vec::new(),
             forms: BTreeMap::new(),
             reference_form_calls: Cell::new(0),
+            ..Default::default()
         };
         let requests = ["First", "Second"]
             .into_iter()
@@ -1639,10 +1640,13 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
     struct TestProvider {
         resources: Vec<ValidatedResourceSchema>,
         forms: carina_core::schema::ReferenceForms,
         reference_form_calls: Cell<usize>,
+        edges: Vec<carina_core::schema::AssignabilityEdge>,
+        assignability_edge_calls: Cell<usize>,
     }
 
     impl CarinaProvider for TestProvider {
@@ -1671,6 +1675,12 @@ mod tests {
             self.reference_form_calls
                 .set(self.reference_form_calls.get() + 1);
             self.forms.clone()
+        }
+
+        fn assignability_edges(&self) -> Vec<carina_core::schema::AssignabilityEdge> {
+            self.assignability_edge_calls
+                .set(self.assignability_edge_calls.get() + 1);
+            self.edges.clone()
         }
 
         fn validate_config(&self, _attrs: &BTreeMap<String, Value>) -> Result<(), String> {
@@ -1786,6 +1796,137 @@ mod tests {
         }
     }
 
+    mod assignability_edges_stage_a {
+        use super::*;
+        use carina_core::schema::{
+            AssignabilityEdge, AttributeSchema, AttributeType, ResourceSchema,
+            TypeIdentity as CoreTypeIdentity,
+        };
+
+        fn identity(kind: &str) -> CoreTypeIdentity {
+            CoreTypeIdentity::new(Some("semantic"), ["Bucket"], kind)
+        }
+
+        fn provider() -> TestProvider {
+            let schema = ["A", "B", "C"]
+                .into_iter()
+                .fold(ResourceSchema::new("test.Bucket"), |schema, kind| {
+                    schema.attribute(
+                        AttributeSchema::optional(
+                            kind,
+                            AttributeType::refined_string(Some(identity(kind)), None, None, None),
+                        )
+                        .build(),
+                    )
+                })
+                .validate()
+                .unwrap();
+            TestProvider {
+                resources: vec![schema],
+                edges: vec![
+                    AssignabilityEdge {
+                        source: identity("A"),
+                        sink: identity("B"),
+                    },
+                    AssignabilityEdge {
+                        source: identity("B"),
+                        sink: identity("C"),
+                    },
+                ],
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn cache_captures_required_edge_declaration_once_and_serializes_it() {
+            let provider = provider();
+            let cache = ProviderSchemaCache::from_provider(&provider).unwrap();
+            assert_eq!(provider.assignability_edge_calls.get(), 1);
+            assert_eq!(
+                cache.witness().assignability_edges(),
+                provider.edges.as_slice()
+            );
+            for _ in 0..2 {
+                let json: serde_json::Value =
+                    serde_json::from_str(&provider_schema_to_json(cache.witness()).unwrap())
+                        .unwrap();
+                assert_eq!(json["assignability_edges"].as_array().unwrap().len(), 2);
+                assert!(json["assignability_edges"].as_array().unwrap().contains(
+                    &serde_json::json!({
+                        "source": identity("A").to_string(), "sink": identity("B").to_string(),
+                    })
+                ));
+            }
+            assert_eq!(
+                provider.assignability_edge_calls.get(),
+                1,
+                "serialization must project the captured witness instead of re-reading the provider"
+            );
+        }
+
+        struct CachedFactory(ProviderSchemaCache);
+
+        impl carina_core::provider::ProviderFactory for CachedFactory {
+            fn name(&self) -> &str {
+                "sdk-owner"
+            }
+            fn display_name(&self) -> &str {
+                "SDK cache fixture"
+            }
+            fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+                self.0.schemas().to_vec()
+            }
+            fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+                self.0.config().clone()
+            }
+            fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
+                self.0.witness().clone()
+            }
+            fn validate_config(
+                &self,
+                _: &carina_core::provider::CanonicalProviderConfigAttributes,
+            ) -> carina_core::provider::ProviderResult<()> {
+                Ok(())
+            }
+            fn create_provider(
+                &self,
+                _: Option<&str>,
+                _: &carina_core::provider::ProviderReadyConfig,
+                _: carina_core::provider::InitializeOutcomeMint,
+            ) -> carina_core::provider::BoxFuture<
+                '_,
+                carina_core::provider::ProviderResult<
+                    carina_core::provider::ProviderInitialization,
+                >,
+            > {
+                Box::pin(async {
+                    Err(carina_core::provider::ProviderError::internal(
+                        "schema-only test",
+                    ))
+                })
+            }
+        }
+
+        #[test]
+        fn sdk_cache_edges_surface_in_loaded_provider_custom_types() {
+            let provider = provider();
+            let cache = ProviderSchemaCache::from_provider(&provider).unwrap();
+            let factories: Vec<Box<dyn carina_core::provider::ProviderFactory>> =
+                vec![Box::new(CachedFactory(cache))];
+            let loaded = carina_core::provider::loaded_provider_snapshot_from_factories(
+                std::sync::Arc::new(factories),
+                carina_core::schema::SchemaRegistry::new(),
+                carina_core::EnvironmentSnapshot::empty(),
+            );
+            let catalog = &loaded.provider_context().custom_types;
+            assert!(catalog.reachable("sdk-owner", &identity("A"), &identity("B")));
+            assert!(catalog.reachable("sdk-owner", &identity("A"), &identity("C")));
+            assert!(!catalog.reachable("sdk-owner", &identity("C"), &identity("A")));
+            assert!(!catalog.reachable("semantic", &identity("A"), &identity("C")));
+            assert_eq!(provider.assignability_edge_calls.get(), 1);
+        }
+    }
+
     fn reference_identity() -> carina_core::schema::TypeIdentity {
         carina_core::schema::TypeIdentity::new(Some("test"), ["widget"], "Name")
     }
@@ -1806,6 +1947,7 @@ mod tests {
             resources: Vec::new(),
             forms: BTreeMap::from([(identity.clone(), reference_form())]),
             reference_form_calls: Cell::new(0),
+            ..Default::default()
         };
 
         let error = match ProviderSchemaCache::from_provider(&provider) {
@@ -1842,6 +1984,7 @@ mod tests {
             resources: vec![schema],
             forms: BTreeMap::from([(identity, reference_form())]),
             reference_form_calls: Cell::new(0),
+            ..Default::default()
         };
 
         let cache = ProviderSchemaCache::from_provider(&provider).unwrap();
@@ -2132,6 +2275,7 @@ mod tests {
             resources: Vec::new(),
             forms: ReferenceForms::new(),
             reference_form_calls: Cell::new(0),
+            ..Default::default()
         };
         let resource = crud_resource(BTreeMap::new());
         let id = resource.id.clone();
@@ -2181,6 +2325,7 @@ mod tests {
             resources: Vec::new(),
             forms: ReferenceForms::new(),
             reference_form_calls: Cell::new(0),
+            ..Default::default()
         };
         let resource = crud_resource(BTreeMap::new());
         let id = resource.id.clone();
@@ -2217,6 +2362,7 @@ mod tests {
             resources: Vec::new(),
             forms: ReferenceForms::new(),
             reference_form_calls: Cell::new(0),
+            ..Default::default()
         };
         let resource = crud_resource(BTreeMap::new());
         let id = resource.id.clone();
@@ -2252,6 +2398,7 @@ mod tests {
             resources: Vec::new(),
             forms: ReferenceForms::new(),
             reference_form_calls: Cell::new(0),
+            ..Default::default()
         };
         let resource = crud_resource(BTreeMap::new());
         let id = resource.id.clone();
@@ -2290,6 +2437,7 @@ mod tests {
             resources: Vec::new(),
             forms: ReferenceForms::new(),
             reference_form_calls: Cell::new(0),
+            ..Default::default()
         };
         let resource = crud_resource(BTreeMap::new());
         let id = resource.id.clone();
@@ -2377,6 +2525,7 @@ mod tests {
             resources: Vec::new(),
             forms: ReferenceForms::new(),
             reference_form_calls: Cell::new(0),
+            ..Default::default()
         };
         let resource = crud_resource(BTreeMap::new());
         let id = resource.id.clone();
@@ -2413,6 +2562,7 @@ mod tests {
             resources: Vec::new(),
             forms: ReferenceForms::new(),
             reference_form_calls: Cell::new(0),
+            ..Default::default()
         };
         let resource = crud_resource(BTreeMap::new());
         let id = resource.id.clone();

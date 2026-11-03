@@ -2379,6 +2379,38 @@ fn proto_struct_field_to_core(
 
 #[cfg(test)]
 mod tests {
+    mod assignability_edges_stage_a {
+        use super::*;
+
+        #[test]
+        fn host_rejects_current_envelope_missing_required_edges() {
+            let error = json_to_provider_schema(
+                r#"{"resources":[],"reference_forms":[]}"#,
+                CoreValidatedConfigSchema::default(),
+            )
+            .expect_err("current protocol must require assignability_edges");
+            assert!(matches!(&error, SchemaDecodeError::JsonParse(_)));
+            let rendered = carina_core::executor::render_error_chain(&error);
+            assert!(rendered.contains("assignability_edges"), "{rendered}");
+        }
+
+        #[test]
+        fn v12_migration_adapter_supplies_empty_assignability_edges() {
+            let witness = json_to_schema_only_provider_schema(
+                include_str!("../tests/fixtures/protocol-v12/released-awscc-vpc.json"),
+                CoreValidatedConfigSchema::default(),
+                12,
+            )
+            .expect("released v12 metadata must still be admitted for migration");
+            assert!(!witness.resources().is_empty());
+            assert!(witness.assignability_edges().is_empty());
+            let envelope =
+                carina_core::protocol_convert::provider_schema_to_protocol(&witness).unwrap();
+            let json = serde_json::to_value(envelope).unwrap();
+            assert_eq!(json["assignability_edges"], serde_json::json!([]));
+        }
+    }
+
     use carina_core::schema::{
         PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
     };

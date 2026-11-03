@@ -8100,6 +8100,186 @@ impl Provider for Box<dyn Provider> {
 
 #[cfg(test)]
 mod tests {
+    mod assignability_edges_stage_a {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        use crate::provider::{
+            BoxFuture, CanonicalProviderConfigAttributes, InitializeOutcomeMint, ProviderError,
+            ProviderFactory, ProviderInitialization, ProviderReadyConfig, ProviderResult,
+            loaded_provider_snapshot_from_factories,
+        };
+        use crate::schema::{
+            AssignabilityEdge, AttributeSchema, AttributeType, ReferenceForms, ResourceSchema,
+            SchemaRegistry, TypeIdentity, TypeInSchema, ValidatedConfigSchema,
+            ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+        };
+
+        fn identity(kind: &str) -> TypeIdentity {
+            TypeIdentity::new(Some("semantic"), ["Bucket"], kind)
+        }
+
+        fn string(kind: &str) -> AttributeType {
+            AttributeType::refined_string(Some(identity(kind)), None, None, None)
+        }
+
+        struct EdgeFactory {
+            owner: &'static str,
+            witness: ValidatedProviderSchemaWitness,
+            captures: Arc<AtomicUsize>,
+        }
+
+        impl ProviderFactory for EdgeFactory {
+            fn name(&self) -> &str {
+                self.owner
+            }
+            fn display_name(&self) -> &str {
+                self.owner
+            }
+            fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
+                self.captures.fetch_add(1, Ordering::SeqCst);
+                self.witness.clone()
+            }
+            fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+                panic!("snapshot must use the aggregate witness")
+            }
+            fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+                panic!("snapshot must use the aggregate witness")
+            }
+            fn validate_config(&self, _: &CanonicalProviderConfigAttributes) -> ProviderResult<()> {
+                Ok(())
+            }
+            fn create_provider(
+                &self,
+                _: Option<&str>,
+                _: &ProviderReadyConfig,
+                _: InitializeOutcomeMint,
+            ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
+                Box::pin(async { Err(ProviderError::internal("schema-only test")) })
+            }
+        }
+
+        fn factory(
+            owner: &'static str,
+            edges: &[(&str, &str)],
+            captures: Arc<AtomicUsize>,
+        ) -> Box<dyn ProviderFactory> {
+            let resource = ["A", "B", "C", "Unrelated"]
+                .into_iter()
+                .fold(ResourceSchema::new("test.Bucket"), |schema, kind| {
+                    schema.attribute(AttributeSchema::optional(kind, string(kind)).build())
+                })
+                .validate()
+                .unwrap();
+            let witness = ValidatedProviderSchemaWitness::new(
+                vec![resource],
+                ValidatedConfigSchema::default(),
+                ReferenceForms::new(),
+                edges
+                    .iter()
+                    .map(|(source, sink)| AssignabilityEdge {
+                        source: identity(source),
+                        sink: identity(sink),
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            Box::new(EdgeFactory {
+                owner,
+                witness,
+                captures,
+            })
+        }
+
+        fn snapshot(
+            factories: Vec<Box<dyn ProviderFactory>>,
+        ) -> crate::provider::LoadedProviderSnapshot {
+            loaded_provider_snapshot_from_factories(
+                Arc::new(factories),
+                SchemaRegistry::new(),
+                crate::EnvironmentSnapshot::empty(),
+            )
+        }
+
+        #[test]
+        fn native_factory_edges_reach_loaded_catalog_from_one_witness_capture() {
+            let captures = Arc::new(AtomicUsize::new(0));
+            let loaded = snapshot(vec![factory(
+                "actual-owner",
+                &[("A", "B")],
+                Arc::clone(&captures),
+            )]);
+            let catalog = &loaded.provider_context().custom_types;
+            assert!(catalog.reachable("actual-owner", &identity("A"), &identity("B")));
+            assert!(
+                !catalog.reachable("semantic", &identity("A"), &identity("B")),
+                "TypeIdentity::provider is not the declaration owner"
+            );
+            assert!(!catalog.reachable("actual-owner", &identity("B"), &identity("A")));
+            assert_eq!(captures.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn reachability_is_transitive_and_directional_within_one_provider() {
+            let loaded = snapshot(vec![factory(
+                "owner",
+                &[("A", "B"), ("B", "C")],
+                Arc::default(),
+            )]);
+            let catalog = &loaded.provider_context().custom_types;
+            assert!(catalog.reachable("owner", &identity("A"), &identity("B")));
+            assert!(catalog.reachable("owner", &identity("B"), &identity("C")));
+            assert!(catalog.reachable("owner", &identity("A"), &identity("C")));
+            assert!(!catalog.reachable("owner", &identity("C"), &identity("A")));
+            assert!(!catalog.reachable("owner", &identity("A"), &identity("Unrelated")));
+            assert!(!catalog.reachable("missing-owner", &identity("A"), &identity("C")));
+        }
+
+        #[test]
+        fn reachability_never_composes_edges_from_two_providers() {
+            // Both owners declare all endpoints. Only the edges differ, so a
+            // global union of edge sets would incorrectly manufacture A -> C.
+            let loaded = snapshot(vec![
+                factory("first", &[("A", "B")], Arc::default()),
+                factory("second", &[("B", "C")], Arc::default()),
+            ]);
+            let catalog = &loaded.provider_context().custom_types;
+            assert!(catalog.reachable("first", &identity("A"), &identity("B")));
+            assert!(catalog.reachable("second", &identity("B"), &identity("C")));
+            for owner in ["first", "second"] {
+                assert!(!catalog.reachable(owner, &identity("A"), &identity("C")));
+            }
+            assert!(!catalog.reachable("first", &identity("B"), &identity("C")));
+            assert!(!catalog.reachable("second", &identity("A"), &identity("B")));
+        }
+
+        #[test]
+        fn stage_a_stores_edges_without_changing_assignability_judgement() {
+            let loaded = snapshot(vec![factory("owner", &[("A", "B")], Arc::default())]);
+            assert!(loaded.provider_context().custom_types.reachable(
+                "owner",
+                &identity("A"),
+                &identity("B")
+            ));
+            let source = string("A");
+            let sink = string("B");
+            assert!(
+                !TypeInSchema::schemaless(&source)
+                    .is_assignable_to(TypeInSchema::schemaless(&sink))
+            );
+            assert!(
+                !TypeInSchema::schemaless(&sink)
+                    .is_assignable_to(TypeInSchema::schemaless(&source))
+            );
+            assert!(
+                TypeInSchema::schemaless(&source)
+                    .is_assignable_to(TypeInSchema::schemaless(&source))
+            );
+        }
+    }
+
     #[test]
     fn provider_text_persisted_attribute_error_labels_are_capped_with_safe_sources() {
         let raw = format!("\x1b[2J\u{9b}{}", "x".repeat(20 * 1024));

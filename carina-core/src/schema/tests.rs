@@ -7,6 +7,226 @@ use crate::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
 
+// Stage A deliberately specifies storage/admission only. Edges do not change
+// TypeInSchema's assignability judgement until the next stage of carina#4233.
+mod assignability_edges_stage_a {
+    use crate::schema::{
+        AssignabilityEdge, AttributeSchema, AttributeType, ProviderSchemaValidationError,
+        ReferenceForms, RefinedScalarKind, ResourceSchema, TypeIdentity, ValidatedConfigSchema,
+        ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+    };
+
+    fn identity(kind: &str) -> TypeIdentity {
+        // The semantic prefix is deliberately unrelated to any factory owner.
+        TypeIdentity::new(Some("semantic"), ["Bucket"], kind)
+    }
+
+    fn string(kind: &str) -> AttributeType {
+        AttributeType::refined_string(Some(identity(kind)), None, None, None)
+    }
+
+    fn resource(declarations: &[AttributeType]) -> ValidatedResourceSchema {
+        declarations
+            .iter()
+            .enumerate()
+            .fold(ResourceSchema::new("test.Bucket"), |schema, (index, ty)| {
+                schema.attribute(
+                    AttributeSchema::optional(format!("value_{index}"), ty.clone()).build(),
+                )
+            })
+            .validate()
+            .expect("individual declarations must be valid")
+    }
+
+    fn edge(source: &str, sink: &str) -> AssignabilityEdge {
+        AssignabilityEdge {
+            source: identity(source),
+            sink: identity(sink),
+        }
+    }
+
+    fn witness(
+        declarations: &[AttributeType],
+        edges: Vec<AssignabilityEdge>,
+    ) -> Result<ValidatedProviderSchemaWitness, ProviderSchemaValidationError> {
+        ValidatedProviderSchemaWitness::new(
+            vec![resource(declarations)],
+            ValidatedConfigSchema::default(),
+            ReferenceForms::new(),
+            edges,
+        )
+    }
+
+    #[test]
+    fn accepts_edge_between_declared_resource_identities() {
+        let edges = vec![edge("NewName", "Name")];
+        let admitted = witness(&[string("NewName"), string("Name")], edges.clone()).unwrap();
+        assert_eq!(admitted.assignability_edges(), edges.as_slice());
+    }
+
+    #[test]
+    fn accepts_endpoints_declared_only_by_config() {
+        let config = ValidatedConfigSchema::validate(std::collections::BTreeMap::from([
+            ("strict".into(), string("NewName")),
+            ("lenient".into(), string("Name")),
+        ]))
+        .unwrap();
+        let edges = vec![edge("NewName", "Name")];
+        let admitted = ValidatedProviderSchemaWitness::new(
+            Vec::new(),
+            config,
+            ReferenceForms::new(),
+            edges.clone(),
+        )
+        .unwrap();
+        assert_eq!(admitted.assignability_edges(), edges.as_slice());
+    }
+
+    #[test]
+    fn accepts_resource_to_config_edge_with_the_same_scalar_kind() {
+        let edges = vec![edge("NewName", "Name")];
+        let admitted = ValidatedProviderSchemaWitness::new(
+            vec![resource(&[string("NewName")])],
+            ValidatedConfigSchema::validate(std::collections::BTreeMap::from([(
+                "target".into(),
+                string("Name"),
+            )]))
+            .unwrap(),
+            ReferenceForms::new(),
+            edges.clone(),
+        )
+        .unwrap();
+        assert_eq!(admitted.assignability_edges(), edges.as_slice());
+    }
+
+    #[test]
+    fn rejects_unknown_source_and_sink_endpoints_with_typed_errors() {
+        for (present, missing) in [("NewName", "Name"), ("Name", "NewName")] {
+            let error = witness(&[string(present)], vec![edge("NewName", "Name")]).unwrap_err();
+            assert!(matches!(
+                error,
+                ProviderSchemaValidationError::DanglingAssignabilityEndpoint { identity: actual }
+                    if actual == identity(missing)
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_endpoint_declared_only_by_another_provider_witness() {
+        let other = witness(&[string("Name")], Vec::new()).unwrap();
+        let mut registry = crate::schema::SchemaRegistry::new();
+        registry
+            .insert_provider_witness("other-owner", &other)
+            .unwrap();
+        // A global declaration (even with the same semantic provider prefix)
+        // cannot supply the missing membership of this aggregate witness.
+        let error = witness(&[string("NewName")], vec![edge("NewName", "Name")]).unwrap_err();
+        assert!(matches!(
+            error,
+            ProviderSchemaValidationError::DanglingAssignabilityEndpoint { identity: actual }
+                if actual == identity("Name")
+        ));
+    }
+
+    #[test]
+    fn rejects_scalar_kind_mismatch_with_typed_endpoints_and_kinds() {
+        let error = witness(
+            &[
+                string("NewName"),
+                AttributeType::refined_int(Some(identity("Count")), None),
+            ],
+            vec![edge("NewName", "Count")],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ProviderSchemaValidationError::AssignabilityScalarKindMismatch {
+                source, sink, source_kind: RefinedScalarKind::String,
+                sink_kind: RefinedScalarKind::Int,
+            } if source == identity("NewName") && sink == identity("Count")
+        ));
+    }
+
+    fn assert_cycle(kinds: &[&str], edges: Vec<AssignabilityEdge>) {
+        let declarations: Vec<_> = kinds.iter().map(|kind| string(kind)).collect();
+        let error = witness(&declarations, edges).unwrap_err();
+        let ProviderSchemaValidationError::AssignabilityCycle { cycle } = error else {
+            panic!("expected a typed cycle error, got {error:?}");
+        };
+        let actual: std::collections::BTreeSet<_> = cycle.into_iter().collect();
+        let expected = kinds.iter().map(|kind| identity(kind)).collect();
+        assert_eq!(
+            actual, expected,
+            "the diagnostic must identify the cycle members"
+        );
+    }
+
+    #[test]
+    fn rejects_two_cycle() {
+        assert_cycle(&["A", "B"], vec![edge("A", "B"), edge("B", "A")]);
+    }
+
+    #[test]
+    fn rejects_three_cycle() {
+        assert_cycle(
+            &["A", "B", "C"],
+            vec![edge("A", "B"), edge("B", "C"), edge("C", "A")],
+        );
+    }
+
+    #[test]
+    fn rejects_trivial_self_edge() {
+        let error = witness(&[string("Name")], vec![edge("Name", "Name")]).unwrap_err();
+        assert!(matches!(
+            error,
+            ProviderSchemaValidationError::SelfAssignabilityEdge { identity: actual }
+                if actual == identity("Name")
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_edge_deterministically() {
+        let duplicate = edge("A", "B");
+        for edges in [
+            vec![duplicate.clone(), duplicate.clone(), edge("B", "C")],
+            vec![edge("B", "C"), duplicate.clone(), duplicate],
+        ] {
+            let error = witness(&[string("A"), string("B"), string("C")], edges).unwrap_err();
+            assert!(matches!(
+                error,
+                ProviderSchemaValidationError::DuplicateAssignabilityEdge { source, sink }
+                    if source == identity("A") && sink == identity("B")
+            ));
+        }
+    }
+
+    #[test]
+    fn witness_envelope_json_witness_round_trip_preserves_edges() {
+        let edges = vec![edge("NewName", "Name"), edge("Name", "Reference")];
+        let original = witness(
+            &[string("NewName"), string("Name"), string("Reference")],
+            edges.clone(),
+        )
+        .unwrap();
+        let envelope = crate::protocol_convert::provider_schema_to_protocol(&original).unwrap();
+        let json = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(
+            json["assignability_edges"],
+            serde_json::json!([
+                {"source": identity("NewName").to_string(), "sink": identity("Name").to_string()},
+                {"source": identity("Name").to_string(), "sink": identity("Reference").to_string()},
+            ])
+        );
+        let decoded = serde_json::from_value(json).unwrap();
+        let restored = crate::protocol_convert::protocol_to_provider_schema_witness(
+            &decoded,
+            ValidatedConfigSchema::default(),
+        )
+        .unwrap();
+        assert_eq!(restored.assignability_edges(), edges.as_slice());
+    }
+}
+
 fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
     crate::resource::RootScope::new().resolve(crate::resource::RelativeBindingName::new(binding))
 }
