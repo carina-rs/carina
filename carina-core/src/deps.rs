@@ -14,7 +14,7 @@ use crate::resource::{AbsoluteBindingAddress, BindingAddress, Resource, Value};
 ///
 /// Both sources are always merged because partial resolution can cause
 /// ResourceRef bindings to differ from the original direct dependencies.
-pub fn get_resource_dependencies<S, P: crate::resource::PlaceholderKind, B: BindingAddress>(
+pub fn get_resource_dependencies<S, P: crate::resource::ValueKind, B: BindingAddress>(
     resource: &Resource<S, P, B>,
 ) -> HashSet<B> {
     let mut deps = HashSet::new();
@@ -95,7 +95,7 @@ pub fn get_data_source_dependencies<S, P: crate::resource::PlaceholderKind, B: B
 /// resource depends on the named binding. The two parse to different
 /// `Value` variants since #2847 (`ResourceRef` vs. `BindingRef`), so
 /// the walker visits both forms here.
-pub(crate) fn collect_dependencies<P: crate::resource::PlaceholderKind, B: BindingAddress>(
+pub(crate) fn collect_dependencies<P: crate::resource::ValueKind, B: BindingAddress>(
     value: &Value<P, B>,
     deps: &mut HashSet<B>,
 ) {
@@ -162,96 +162,102 @@ pub fn sort_resources_by_dependencies<
 fn topological_sort<S: Clone, P: crate::resource::PlaceholderKind, B: BindingAddress>(
     resources: &[Resource<S, P, B>],
 ) -> Result<Vec<Resource<S, P, B>>, String> {
-    // Build binding name to input index mapping. Graph membership is indexed
-    // by declaration position so two anonymous resources cannot collapse.
-    let mut binding_to_index: HashMap<B, usize> = HashMap::new();
-    for (index, resource) in resources.iter().enumerate() {
-        if let Some(ref binding_name) = resource.binding {
-            binding_to_index.insert(binding_name.clone(), index);
+    let bindings: Vec<_> = resources
+        .iter()
+        .map(|resource| resource.binding.as_ref())
+        .collect();
+    match dependency_order(&bindings, |index| {
+        get_resource_dependencies(&resources[index])
+    }) {
+        Ok(order) => Ok(order
+            .into_iter()
+            .map(|index| resources[index].clone())
+            .collect()),
+        Err(cycle) => {
+            let labels = cycle
+                .into_iter()
+                .map(|index| {
+                    let resource = &resources[index];
+                    resource
+                        .binding
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| resource.id.to_string())
+                })
+                .collect::<Vec<_>>();
+            Err(format!(
+                "Circular dependency detected: {}",
+                labels.join(" -> ")
+            ))
         }
     }
+}
 
-    // Build dependency graph
+/// The shared DFS for ordering and located validation. Return the first ring,
+/// including its closing node, in the same order as the ordering error.
+pub(crate) fn dependency_order<B: BindingAddress>(
+    bindings: &[Option<&B>],
+    mut dependencies: impl FnMut(usize) -> HashSet<B>,
+) -> Result<Vec<usize>, Vec<usize>> {
+    let binding_to_index: HashMap<_, _> = bindings
+        .iter()
+        .enumerate()
+        .filter_map(|(index, binding)| binding.map(|binding| (binding.clone(), index)))
+        .collect();
     let mut sorted = Vec::new();
-    let mut visited: HashSet<usize> = HashSet::new();
-    let mut visiting: Vec<usize> = Vec::new();
+    let mut visited = HashSet::new();
+    let mut visiting = Vec::new();
 
-    fn label<S, P: crate::resource::PlaceholderKind, B: BindingAddress>(
-        resource: &Resource<S, P, B>,
-    ) -> String {
-        resource
-            .binding
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| resource.id.to_string())
-    }
-
-    fn visit<S: Clone, P: crate::resource::PlaceholderKind, B: BindingAddress>(
+    fn visit<B: BindingAddress>(
         index: usize,
-        resources: &[Resource<S, P, B>],
-        binding_to_index: &HashMap<B, usize>,
+        bindings: &HashMap<B, usize>,
+        dependencies: &mut impl FnMut(usize) -> HashSet<B>,
         visited: &mut HashSet<usize>,
         visiting: &mut Vec<usize>,
-        sorted: &mut Vec<Resource<S, P, B>>,
-    ) -> Result<(), String> {
+        sorted: &mut Vec<usize>,
+    ) -> Result<(), Vec<usize>> {
         if visited.contains(&index) {
             return Ok(());
         }
-        if let Some(pos) = visiting
-            .iter()
-            .position(|visiting_index| *visiting_index == index)
-        {
-            let cycle = visiting[pos..]
+        if let Some(pos) = visiting.iter().position(|visiting| *visiting == index) {
+            return Err(visiting[pos..]
                 .iter()
                 .copied()
                 .chain(std::iter::once(index))
-                .map(|cycle_index| label(&resources[cycle_index]))
-                .collect::<Vec<_>>();
-            return Err(format!(
-                "Circular dependency detected: {}",
-                cycle.join(" -> ")
-            ));
+                .collect());
         }
-
         visiting.push(index);
-
-        // Visit dependencies first
-        let resource = &resources[index];
-        let deps = get_resource_dependencies(resource);
-        let mut dependency_indices = deps
+        let mut dependency_indices = dependencies(index)
             .iter()
-            .filter_map(|dep| binding_to_index.get(dep).copied())
+            .filter_map(|dependency| bindings.get(dependency).copied())
             .collect::<Vec<_>>();
         dependency_indices.sort_unstable();
         dependency_indices.dedup();
-        for dep_index in dependency_indices {
+        for dependency in dependency_indices {
             visit(
-                dep_index,
-                resources,
-                binding_to_index,
+                dependency,
+                bindings,
+                dependencies,
                 visited,
                 visiting,
                 sorted,
             )?;
         }
-
         visiting.pop();
         visited.insert(index);
-        sorted.push(resource.clone());
+        sorted.push(index);
         Ok(())
     }
-
-    for index in 0..resources.len() {
+    for index in 0..bindings.len() {
         visit(
             index,
-            resources,
             &binding_to_index,
+            &mut dependencies,
             &mut visited,
             &mut visiting,
             &mut sorted,
         )?;
     }
-
     Ok(sorted)
 }
 

@@ -1338,7 +1338,7 @@ pub fn infer_export_params_with_loaded_provider_schemas<D, B: BindingAddress>(
     >,
     schemas: &ProviderLoadedSchemaRegistry,
     provider_context: &crate::parser::ProviderContext,
-) -> ExportParamsInferredWithLoadedProviderSchemas<B>
+) -> Result<ExportParamsInferredWithLoadedProviderSchemas<B>, crate::parser::AnalysisTreeError>
 where
     D: crate::parser::DeferredForPhaseTraversal<
             crate::resource::ParserPlaceholder,
@@ -1346,14 +1346,13 @@ where
             B,
         >,
 {
-    ExportParamsInferredWithLoadedProviderSchemas {
-        declarations: crate::parser::AnalysisTree::try_from_file(parsed)
-            .expect("parser/expansion provenance invariant")
+    Ok(ExportParamsInferredWithLoadedProviderSchemas {
+        declarations: crate::parser::AnalysisTree::try_from_file(parsed)?
             .syntax()
             .declarations()
             .to_vec(),
         inferred: infer_export_params(parsed, schemas.schemas(), provider_context),
-    }
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1426,7 +1425,7 @@ pub fn retry_unchecked_export_inference<'a, D, B: BindingAddress>(
     >,
     schemas: &ProviderLoadedSchemaRegistry,
     provider_context: &crate::parser::ProviderContext,
-) -> ExportsInferredWithLoadedProviderSchemas<'a, B>
+) -> Result<ExportsInferredWithLoadedProviderSchemas<'a, B>, crate::parser::AnalysisTreeError>
 where
     D: crate::parser::DeferredForPhaseTraversal<
             crate::resource::ParserPlaceholder,
@@ -1434,8 +1433,7 @@ where
             B,
         >,
 {
-    let declarations = crate::parser::AnalysisTree::try_from_file(parsed)
-        .expect("parser/expansion provenance invariant")
+    let declarations = crate::parser::AnalysisTree::try_from_file(parsed)?
         .syntax()
         .declarations()
         .to_vec();
@@ -1480,10 +1478,10 @@ where
         }
     }
 
-    ExportsInferredWithLoadedProviderSchemas {
+    Ok(ExportsInferredWithLoadedProviderSchemas {
         parameters: &parsed.export_params,
         declarations,
-    }
+    })
 }
 
 /// Format an inference error pointing at the offending export. The shared CLI
@@ -1502,6 +1500,48 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn review_round2_loaded_export_inference_rejects_missing_provenance_without_panicking() {
+        let mut parsed =
+            crate::parser::parse_and_resolve("let source = mock.test.Resource {}\n").unwrap();
+        parsed.resources[0].declaration = Default::default();
+        let schemas = ProviderLoadedSchemaRegistry::for_test(SchemaRegistry::new());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            infer_export_params_with_loaded_provider_schemas(
+                &parsed,
+                &schemas,
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+        }));
+        let error = outcome
+            .expect("must not panic")
+            .expect_err("reject missing provenance");
+        assert!(matches!(
+            error.kind(),
+            crate::parser::AnalysisTreeErrorKind::MissingResourceProvenance { .. }
+        ));
+    }
+
+    #[test]
+    fn review_round2_export_inference_retry_rejects_missing_provenance_without_panicking() {
+        let mut parsed =
+            crate::parser::parse_and_resolve("let source = mock.test.Resource {}\n").unwrap();
+        parsed.resources[0].declaration = Default::default();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let mut inferred = apply_inference(parsed, &SchemaRegistry::new(), &context);
+        let schemas = ProviderLoadedSchemaRegistry::for_test(SchemaRegistry::new());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            retry_unchecked_export_inference(&mut inferred, &schemas, &context).map(|_| ())
+        }));
+        let error = outcome
+            .expect("must not panic")
+            .expect_err("reject missing provenance");
+        assert!(matches!(
+            error.kind(),
+            crate::parser::AnalysisTreeErrorKind::MissingResourceProvenance { .. }
+        ));
+    }
     use crate::parser::{ModuleCall, ProviderContext};
     use crate::resource::{
         AuthoredAccessPath as AccessPath, AuthoredConcreteValue as ConcreteValue,
@@ -2689,7 +2729,7 @@ exports {
             .expect("handle export fixture resolves declared resource types");
         assert!(
             crate::validation::deferred_types::with_session_for_test(&context, |session| {
-                crate::validation::resolve_file_type_exprs(&mut parsed, session)
+                crate::validation::resolve_file_type_exprs(&mut parsed, session).unwrap()
             })
             .is_empty(),
             "handle export fixture resolves its declaration types",
@@ -2839,7 +2879,8 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
             &mut inferred,
             &loaded_schemas,
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        );
+        )
+        .unwrap();
         let failures = attached_inference_failures(schema_checked)
             .map(|failure| (failure.name.to_string(), failure.error.clone()))
             .collect::<Vec<_>>();
@@ -2874,7 +2915,8 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
             &mut inferred,
             &loaded_schemas,
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        );
+        )
+        .unwrap();
         assert_eq!(attached_inference_failures(schema_checked).count(), 0);
 
         assert_eq!(

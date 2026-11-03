@@ -8721,6 +8721,7 @@ fn build_expanded_child<
     crate::resource::retain_deferred_iterable_dependencies(
         &mut resource.dependencies,
         deferred.root_bindings(),
+        deferred.site().iterable_location,
     );
     let resource = substitute_attrs(
         resource,

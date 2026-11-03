@@ -18371,7 +18371,8 @@ fn extract_directives_reads_provider_in_anonymous_resource() {
 }
 
 #[test]
-fn check_provider_instance_routing_accepts_named_instance() {
+fn check_provider_instance_routing_accepts_named_instance()
+-> Result<(), crate::parser::AnalysisTreeError> {
     let src = r#"
         provider aws {
             source = "github.com/carina-rs/carina-provider-aws"
@@ -18389,17 +18390,18 @@ fn check_provider_instance_routing_accepts_named_instance() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let errs = crate::parser::check_provider_instance_routing(
-        &AnalysisTree::try_from_file(&parsed).expect("parser routing provenance"),
-    );
+    let errs =
+        crate::parser::check_provider_instance_routing(&AnalysisTree::try_from_file(&parsed)?);
     assert!(
         errs.is_empty(),
         "valid named-instance routing must not produce errors, got: {errs:?}"
     );
+    Ok(())
 }
 
 #[test]
-fn check_provider_instance_routing_accepts_default_when_none() {
+fn check_provider_instance_routing_accepts_default_when_none()
+-> Result<(), crate::parser::AnalysisTreeError> {
     let src = r#"
         provider aws {
             source = "github.com/carina-rs/carina-provider-aws"
@@ -18415,17 +18417,18 @@ fn check_provider_instance_routing_accepts_default_when_none() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let errs = crate::parser::check_provider_instance_routing(
-        &AnalysisTree::try_from_file(&parsed).expect("parser routing provenance"),
-    );
+    let errs =
+        crate::parser::check_provider_instance_routing(&AnalysisTree::try_from_file(&parsed)?);
     assert!(
         errs.is_empty(),
         "default-instance routing must not produce errors, got: {errs:?}"
     );
+    Ok(())
 }
 
 #[test]
-fn check_provider_instance_routing_rejects_unknown_binding() {
+fn check_provider_instance_routing_rejects_unknown_binding()
+-> Result<(), crate::parser::AnalysisTreeError> {
     let src = r#"
         provider aws {
             source = "github.com/carina-rs/carina-provider-aws"
@@ -18441,9 +18444,8 @@ fn check_provider_instance_routing_rejects_unknown_binding() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let errs = crate::parser::check_provider_instance_routing(
-        &AnalysisTree::try_from_file(&parsed).expect("parser routing provenance"),
-    );
+    let errs =
+        crate::parser::check_provider_instance_routing(&AnalysisTree::try_from_file(&parsed)?);
     assert_eq!(
         errs.len(),
         1,
@@ -18454,10 +18456,12 @@ fn check_provider_instance_routing_rejects_unknown_binding() {
         msg.contains("nope") && msg.contains("provider instance"),
         "error should name the unknown binding, got: {msg}"
     );
+    Ok(())
 }
 
 #[test]
-fn check_provider_instance_routing_rejects_kind_mismatch() {
+fn check_provider_instance_routing_rejects_kind_mismatch()
+-> Result<(), crate::parser::AnalysisTreeError> {
     let src = r#"
         provider aws {
             source = "github.com/carina-rs/carina-provider-aws"
@@ -18478,9 +18482,8 @@ fn check_provider_instance_routing_rejects_kind_mismatch() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let errs = crate::parser::check_provider_instance_routing(
-        &AnalysisTree::try_from_file(&parsed).expect("parser routing provenance"),
-    );
+    let errs =
+        crate::parser::check_provider_instance_routing(&AnalysisTree::try_from_file(&parsed)?);
     assert_eq!(
         errs.len(),
         1,
@@ -18491,10 +18494,12 @@ fn check_provider_instance_routing_rejects_kind_mismatch() {
         msg.contains("us") && msg.contains("awscc") && msg.contains("aws"),
         "error should name the binding and both kinds, got: {msg}"
     );
+    Ok(())
 }
 
 #[test]
-fn check_provider_instance_routing_rejects_missing_default_instance() {
+fn check_provider_instance_routing_rejects_missing_default_instance()
+-> Result<(), crate::parser::AnalysisTreeError> {
     // No top-level `provider aws { ... }` block — only a named
     // instance is declared. A resource that omits the directive
     // resolves to "the kind's default", which does not exist here,
@@ -18511,9 +18516,8 @@ fn check_provider_instance_routing_rejects_missing_default_instance() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let errs = crate::parser::check_provider_instance_routing(
-        &AnalysisTree::try_from_file(&parsed).expect("parser routing provenance"),
-    );
+    let errs =
+        crate::parser::check_provider_instance_routing(&AnalysisTree::try_from_file(&parsed)?);
     assert_eq!(
         errs.len(),
         1,
@@ -18524,10 +18528,12 @@ fn check_provider_instance_routing_rejects_missing_default_instance() {
         msg.contains("aws") && msg.contains("default"),
         "error should mention the kind and default-instance absence, got: {msg}"
     );
+    Ok(())
 }
 
 #[test]
-fn check_provider_instance_routing_multi_file_named_instance() {
+fn check_provider_instance_routing_multi_file_named_instance()
+-> Result<(), crate::parser::AnalysisTreeError> {
     use crate::config_loader::parse_directory;
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -18557,13 +18563,13 @@ fn check_provider_instance_routing_multi_file_named_instance() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("multi-file directory parse must succeed");
-    let errs = crate::parser::check_provider_instance_routing(
-        &AnalysisTree::try_from_file(&parsed).expect("parser routing provenance"),
-    );
+    let errs =
+        crate::parser::check_provider_instance_routing(&AnalysisTree::try_from_file(&parsed)?);
     assert!(
         errs.is_empty(),
         "cross-file named-instance routing must validate cleanly, got: {errs:?}"
     );
+    Ok(())
 }
 
 #[test]

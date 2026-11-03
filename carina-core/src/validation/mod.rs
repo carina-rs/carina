@@ -4171,6 +4171,15 @@ pub fn validate_resources<
 ///
 /// For example, if `ipv4_ipam_pool_id` expects `IpamPoolId` type,
 /// a reference like `vpc.vpc_id` (which is `AwsResourceId`) should be an error.
+/// Resource reference findings remain distinct from a rejected analysis input.
+#[derive(Debug, thiserror::Error)]
+pub enum ResourceRefTypeValidationError {
+    #[error(transparent)]
+    AnalysisInvariant(#[from] crate::parser::AnalysisTreeError),
+    #[error("{0}")]
+    Validation(String),
+}
+
 pub fn validate_resource_ref_types<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
@@ -4180,7 +4189,7 @@ pub fn validate_resource_ref_types<
     registry: &SchemaRegistry,
     _argument_names: &HashSet<String>,
     bindings: &BindingIndex<'_, B>,
-) -> Result<(), String> {
+) -> Result<(), ResourceRefTypeValidationError> {
     validate_resource_ref_types_inner(parsed, registry, bindings)
 }
 
@@ -4240,7 +4249,7 @@ fn validate_resource_ref_types_inner<
     parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     registry: &SchemaRegistry,
     bindings: &BindingIndex<'_, B>,
-) -> Result<(), String> {
+) -> Result<(), ResourceRefTypeValidationError> {
     let mut all_errors = Vec::new();
     let inference_bindings = inference::bindings_from_parsed(parsed);
 
@@ -4488,8 +4497,7 @@ fn validate_resource_ref_types_inner<
     if parsed.deferred_for_sites().next().is_some() {
         all_errors.extend(
             validate_deferred_for_iterable_types_with_bindings(
-                &crate::parser::AnalysisTree::try_from_file(parsed)
-                    .expect("parser/expansion provenance invariant"),
+                &crate::parser::AnalysisTree::try_from_file(parsed)?,
                 registry,
                 &inference_bindings,
                 bindings.provider_context(),
@@ -4502,7 +4510,9 @@ fn validate_resource_ref_types_inner<
     if all_errors.is_empty() {
         Ok(())
     } else {
-        Err(all_errors.join("\n"))
+        Err(ResourceRefTypeValidationError::Validation(
+            all_errors.join("\n"),
+        ))
     }
 }
 
@@ -6058,13 +6068,15 @@ fn resolve_file_type_exprs_impl<
 >(
     parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> (
-    Vec<crate::parser::Located<TypeResolutionDiagnostic>>,
-    ResolvedArgumentTypes,
-) {
+) -> Result<
+    (
+        Vec<crate::parser::Located<TypeResolutionDiagnostic>>,
+        ResolvedArgumentTypes,
+    ),
+    crate::parser::AnalysisTreeError,
+> {
     use deferred_types::ProviderTypeCheckSite;
-    let annotations = crate::parser::AnalysisTree::try_from_file(parsed)
-        .expect("parser/expansion provenance invariant")
+    let annotations = crate::parser::AnalysisTree::try_from_file(parsed)?
         .type_annotations()
         .to_vec();
     let mut occurrences = std::collections::HashMap::<TypeResolutionContext, usize>::new();
@@ -6194,17 +6206,23 @@ fn resolve_file_type_exprs_impl<
             }
         }
         if errors.len() != previous_errors {
-            let declaration = annotations.iter().find(|annotation| matches!(annotation.detail(), TypeResolutionContext::Declaration { kind: TypeResolutionDeclarationKind::FunctionReturn, name } if name == &function.name) || matches!(annotation.detail(), TypeResolutionContext::Declaration { kind: TypeResolutionDeclarationKind::FunctionParameter, name } if name.starts_with(&format!("{}' parameter '", function.name))))
-                .expect("failed function annotation provenance");
-            config.fail_function_declaration(declaration.location().file().path(), &function.name);
+            // This is the function-check session's semantic key, shared with
+            // function_declaration_failed. Rendering still uses the mandatory
+            // parser-owned annotation locations above.
+            let source = function
+                .annotation_source_file
+                .as_deref()
+                .or(function.body.source_file.as_deref())
+                .unwrap_or_else(|| std::path::Path::new("<config>"));
+            config.fail_function_declaration(source, &function.name);
         }
     }
-    (
+    Ok((
         errors,
         ResolvedArgumentTypes {
             types: argument_types,
         },
-    )
+    ))
 }
 
 /// Resolve a signature snapshot when the consumer's provider catalog may be
@@ -6227,12 +6245,22 @@ pub fn resolve_file_type_exprs<
 >(
     parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Vec<crate::parser::Located<TypeResolutionDiagnostic>> {
-    resolve_file_type_exprs_report(parsed, config, None).into_diagnostics()
+) -> Result<Vec<crate::parser::Located<TypeResolutionDiagnostic>>, crate::parser::AnalysisTreeError>
+{
+    Ok(resolve_file_type_exprs_report(parsed, config, None)?.into_diagnostics())
 }
 
 /// Resolve declarations and decide in core whether a typed finding supersedes
 /// an optional parser backstop for the same authored type token.
+///
+/// Boundary failures cannot be mistaken for a successful empty report:
+///
+/// ```compile_fail,E0308
+/// use carina_core::{parser::ParsedFile, validation::{FileTypeResolutionReport, resolve_file_type_exprs_report, deferred_types::ProviderTypeCheckContext}};
+/// fn analyze(file: &mut ParsedFile, context: &dyn ProviderTypeCheckContext) -> FileTypeResolutionReport {
+///     resolve_file_type_exprs_report(file, context, None)
+/// }
+/// ```
 pub fn resolve_file_type_exprs_report<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
@@ -6241,16 +6269,16 @@ pub fn resolve_file_type_exprs_report<
     parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     parser_error: Option<TypeResolutionParserError<'_>>,
-) -> FileTypeResolutionReport {
-    let (diagnostics, resolved_argument_types) = resolve_file_type_exprs_impl(parsed, config);
+) -> Result<FileTypeResolutionReport, crate::parser::AnalysisTreeError> {
+    let (diagnostics, resolved_argument_types) = resolve_file_type_exprs_impl(parsed, config)?;
     let covered_parser_error = parser_error.is_some_and(|parser_error| {
         type_resolution_parser_error_is_covered(&diagnostics, parser_error)
     });
-    FileTypeResolutionReport {
+    Ok(FileTypeResolutionReport {
         diagnostics,
         covered_parser_error,
         resolved_argument_types,
-    }
+    })
 }
 
 /// Resolve declarations with an intentionally incomplete provider context.
@@ -6324,8 +6352,9 @@ pub fn resolve_file_type_exprs_best_effort<
 >(
     parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) {
-    let _diagnostics = resolve_file_type_exprs_impl(parsed, config);
+) -> Result<(), crate::parser::AnalysisTreeError> {
+    resolve_file_type_exprs_impl(parsed, config)?;
+    Ok(())
 }
 
 pub fn resolve_export_static_type_for_consumer(
@@ -7435,7 +7464,7 @@ impl ModuleCallChecker<'_> {
         &mut self,
         authored: &crate::parser::File<E>,
         context: ModuleFileCheckContext<'_, '_, E>,
-    ) {
+    ) -> Result<(), crate::parser::AnalysisTreeError> {
         let ModuleFileCheckContext {
             semantic,
             base_dir,
@@ -7499,7 +7528,7 @@ impl ModuleCallChecker<'_> {
                             owner: owner.clone(),
                         },
                     );
-                    self.check_nested_module(authority_file, checked_call, base_dir, &owner.root);
+                    self.check_nested_module(authority_file, checked_call, base_dir, &owner.root)?;
                 }
                 ModuleCallReferenceChecks::Skipped => {}
             }
@@ -7515,10 +7544,11 @@ impl ModuleCallChecker<'_> {
                     let root = root_owner.cloned().unwrap_or_else(|| {
                         ModuleCallFindingOwnerSource::Authored(module_use_anchor(import))
                     });
-                    self.check_nested_import(import, base_dir, &root);
+                    self.check_nested_import(import, base_dir, &root)?;
                 }
             }
         }
+        Ok(())
     }
 
     fn check_binding_use_findings(
@@ -7878,15 +7908,16 @@ impl ModuleCallChecker<'_> {
         call: &ModuleCall,
         base_dir: Option<&crate::paths::ResolvedPath>,
         root_owner: &ModuleCallFindingOwnerSource,
-    ) {
+    ) -> Result<(), crate::parser::AnalysisTreeError> {
         let Some(import) = file
             .uses
             .iter()
             .find(|import| import.alias == call.module_name)
         else {
-            return;
+            return Ok(());
         };
-        self.check_nested_import(import, base_dir, root_owner);
+        self.check_nested_import(import, base_dir, root_owner)?;
+        Ok(())
     }
 
     fn check_nested_import(
@@ -7894,16 +7925,16 @@ impl ModuleCallChecker<'_> {
         import: &crate::parser::UseStatement,
         base_dir: Option<&crate::paths::ResolvedPath>,
         root_owner: &ModuleCallFindingOwnerSource,
-    ) {
+    ) -> Result<(), crate::parser::AnalysisTreeError> {
         let Some(base_dir) = base_dir else {
-            return;
+            return Ok(());
         };
         let Ok(module_dir) = base_dir.join(&import.path) else {
-            return;
+            return Ok(());
         };
         let guard = module_dir.identity();
         if !self.active_modules.insert(guard.clone()) {
-            return;
+            return Ok(());
         }
 
         // An enriched parse intentionally rejects an unknown bare type before
@@ -7934,7 +7965,7 @@ impl ModuleCallChecker<'_> {
                 self.provider_context
                     .session()
                     .expect("module checks borrow their run session"),
-            );
+            )?;
             let signatures = crate::module_resolver::load_resolved_module_signatures_with_overrides(
                 &module,
                 &module_dir,
@@ -7991,10 +8022,11 @@ impl ModuleCallChecker<'_> {
                     root_owner: Some(root_owner),
                     reference_checks: ModuleCallReferenceChecks::Enabled,
                 },
-            );
+            )?;
         }
 
         self.active_modules.remove(&guard);
+        Ok(())
     }
 
     fn check_expanded<P: PlaceholderKind>(
@@ -8356,14 +8388,14 @@ fn module_call_value_is_context_free(value: &Value) -> bool {
 /// Collect module-call findings from authored source and its imported graph.
 pub fn check_module_calls<E>(
     input: ModuleCallCheckInput<'_, '_, E, dyn deferred_types::ProviderTypeCheckContext + '_>,
-) -> Vec<ModuleCallFinding> {
+) -> Result<Vec<ModuleCallFinding>, crate::parser::AnalysisTreeError> {
     check_module_calls_with_overrides(input, &Default::default())
 }
 
 pub fn check_module_calls_with_overrides<E>(
     input: ModuleCallCheckInput<'_, '_, E, dyn deferred_types::ProviderTypeCheckContext + '_>,
     overrides: &crate::config_loader::SourceOverrides,
-) -> Vec<ModuleCallFinding> {
+) -> Result<Vec<ModuleCallFinding>, crate::parser::AnalysisTreeError> {
     let provider_context = typecheck::TypecheckProviderContext::for_session(input.provider_context);
     check_module_calls_with_provider_context(input, provider_context, overrides)
 }
@@ -8373,7 +8405,7 @@ pub fn check_module_calls_with_overrides<E>(
 /// sent to an unloaded resolver.
 pub fn check_module_calls_providerless<E>(
     input: ModuleCallCheckInput<'_, '_, E, dyn deferred_types::ProviderTypeCheckContext + '_>,
-) -> Vec<ModuleCallFinding> {
+) -> Result<Vec<ModuleCallFinding>, crate::parser::AnalysisTreeError> {
     let provider_context = typecheck::TypecheckProviderContext::for_session(input.provider_context);
     check_module_calls_with_provider_context(input, provider_context, &Default::default())
 }
@@ -8382,7 +8414,7 @@ fn check_module_calls_with_provider_context<'a, 'bindings, E, C: ?Sized>(
     input: ModuleCallCheckInput<'a, 'bindings, E, C>,
     provider_context: typecheck::TypecheckProviderContext<'a>,
     overrides: &crate::config_loader::SourceOverrides,
-) -> Vec<ModuleCallFinding> {
+) -> Result<Vec<ModuleCallFinding>, crate::parser::AnalysisTreeError> {
     let ModuleCallCheckInput {
         authored,
         semantic,
@@ -8412,8 +8444,8 @@ fn check_module_calls_with_provider_context<'a, 'bindings, E, C: ?Sized>(
             root_owner: None,
             reference_checks,
         },
-    );
-    checker.findings
+    )?;
+    Ok(checker.findings)
 }
 
 /// Collect only findings whose authoritative inputs exist after expansion.

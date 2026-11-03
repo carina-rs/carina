@@ -65,6 +65,7 @@ pub(crate) fn parse_resource_for_target(
     };
     let declaration =
         crate::parser::DeclarationProvenance::from_pair(&pair, preprocessed_file, source_file);
+    let syntax = pair.clone();
     let mut iter = pair.into_inner();
     let namespaced_type = next_pair(&mut iter, "resource type", context)?
         .as_str()
@@ -109,6 +110,13 @@ pub(crate) fn parse_resource_for_target(
         mut depends_on,
     } = parsed_contents.directives.unwrap_or_default();
     depends_on.record_reference_origins(&attributes);
+    depends_on.record_binding_reference_origins(
+        &attributes,
+        &syntax,
+        preprocessed_file,
+        source_file,
+        ctx,
+    )?;
 
     let (id, binding, loop_provenance) = match target {
         ResourceParseTarget::Pending { origin } => (

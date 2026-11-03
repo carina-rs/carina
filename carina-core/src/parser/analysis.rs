@@ -470,11 +470,13 @@ pub struct AnalysisResourceRef<
     D: DeferredForPhaseTraversal<P, T, B> + 'a,
 {
     resource: ResourceRef<'a, ModuleSource, P, T, D, B>,
+    in_project_walk: bool,
     location: &'a DeclarationLocation,
     attribute_locations: std::collections::HashMap<String, &'a DeclarationLocation>,
     attribute_keys: &'a [super::AttributeKeyLocation],
     references: Vec<AnalysisReference<B>>,
     dependencies: Vec<AnalysisDependencyRef<'a, B>>,
+    dependency_edges: DependencyEdges<B>,
     provider_location: &'a DeclarationLocation,
     iterable: AnalysisIterableRef<'a, P, B>,
 }
@@ -499,7 +501,16 @@ pub struct AnalysisValueReference<B: BindingAddress = RelativeBindingName> {
     reference: AnalysisReference<B>,
     context: String,
     usage: crate::resource::ResourceRefUsage,
-    typed_consumer: bool,
+    scope: AnalysisValueScope,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnalysisValueScope {
+    Project,
+    AttributeParameter,
+    Variable,
+    Function,
+    ReadTemplate,
 }
 impl<B: BindingAddress> AnalysisValueReference<B> {
     pub fn reference(&self) -> &AnalysisReference<B> {
@@ -512,7 +523,7 @@ impl<B: BindingAddress> AnalysisValueReference<B> {
         self.usage
     }
     pub fn typed_consumer(&self) -> bool {
-        self.typed_consumer
+        self.scope != AnalysisValueScope::Variable
     }
 }
 
@@ -528,6 +539,8 @@ pub struct AnalysisForRef<'a, P: ValueKind, B: BindingAddress> {
     site: super::DeferredForSite<'a, P, B>,
     location: &'a DeclarationLocation,
     references: Vec<AnalysisReference<B>>,
+    reference_usages: Vec<crate::resource::ResourceRefUsage>,
+    result_references: Vec<AnalysisReference<B>>,
 }
 impl<'a, P: ValueKind, B: BindingAddress> AnalysisForRef<'a, P, B> {
     pub fn location(&self) -> &'a DeclarationLocation {
@@ -545,18 +558,16 @@ impl<'a, P: ValueKind, B: BindingAddress> AnalysisForRef<'a, P, B> {
     pub fn references(&self) -> &[AnalysisReference<B>] {
         &self.references
     }
-    pub fn reference_for_path(
+    pub fn reference_occurrences(
         &self,
-        path: &crate::resource::AccessPath<B>,
-    ) -> &AnalysisReference<B> {
+    ) -> impl Iterator<Item = (&AnalysisReference<B>, crate::resource::ResourceRefUsage)> {
         self.references
             .iter()
-            .find(|reference| {
-                reference.path() == path
-                    && reference.path().reference_locations_shared()
-                        == path.reference_locations_shared()
-            })
-            .expect("every iterable reference was validated at the analysis boundary")
+            .zip(self.reference_usages.iter().copied())
+    }
+    /// References constraining the iterable result, excluding function arguments.
+    pub fn result_references(&self) -> &[AnalysisReference<B>] {
+        &self.result_references
     }
     pub fn checks_scope(&self) -> bool {
         self.site.checks_scope
@@ -566,7 +577,7 @@ impl<'a, P: ValueKind, B: BindingAddress> AnalysisForRef<'a, P, B> {
 fn collect_value_references<P: ValueKind, B: BindingAddress>(
     value: &Value<P, B>,
     context: &str,
-    typed_consumer: bool,
+    scope: AnalysisValueScope,
     references: &mut Vec<AnalysisValueReference<B>>,
 ) -> Result<(), AnalysisTreeError> {
     let mut result = Ok(());
@@ -579,7 +590,7 @@ fn collect_value_references<P: ValueKind, B: BindingAddress>(
                 },
                 context: context.to_string(),
                 usage,
-                typed_consumer,
+                scope,
             }),
             None => {
                 result = Err(AnalysisTreeError::new(
@@ -592,6 +603,53 @@ fn collect_value_references<P: ValueKind, B: BindingAddress>(
     );
     result
 }
+fn collect_iterable_result_references<P, B>(
+    value: &Value<P, B>,
+    context: &str,
+    references: &mut Vec<AnalysisValueReference<B>>,
+) -> Result<(), AnalysisTreeError>
+where
+    P: ValueKind,
+    B: BindingAddress,
+{
+    use crate::resource::DeferredValue;
+    match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            for value in deferred.values() {
+                collect_iterable_result_references(value, context, references)?;
+            }
+        }
+        Value::Deferred(DeferredValue::ResourceRef { .. }) => {
+            collect_value_references(value, context, AnalysisValueScope::Project, references)?
+        }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            collect_iterable_result_references(value, context, references)?;
+            collect_iterable_result_references(default, context, references)?;
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            collect_iterable_result_references(expression.lhs(), context, references)?;
+            collect_iterable_result_references(expression.rhs(), context, references)?;
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            collect_iterable_result_references(inner, context, references)?
+        }
+        // References inside a function argument constrain that argument,
+        // not the function result used as the iterable.
+        Value::Concrete(_)
+        | Value::Deferred(
+            DeferredValue::BindingRef { .. }
+            | DeferredValue::Interpolation(_)
+            | DeferredValue::FunctionCall { .. }
+            | DeferredValue::Unavailable { .. }
+            | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::Access(_)
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_),
+        ) => {}
+    }
+    Ok(())
+}
+
 impl<B: BindingAddress> AnalysisReference<B> {
     pub fn path(&self) -> &crate::resource::AccessPath<B> {
         &self.path
@@ -722,6 +780,109 @@ fn attribute_provenance<'a, P: ValueKind, B: BindingAddress>(
     Ok((keys, references))
 }
 
+type DependencyEdges<B> =
+    std::collections::HashMap<B, Located<crate::validation::depends_on::DependencyEdgeOrigin>>;
+
+fn managed_dependency_origins<E, P, T, D, B>(
+    file: &File<E, P, T, D, B>,
+    managed: &crate::resource::Resource<ModuleSource, P, B>,
+    dependencies: &[AnalysisDependencyRef<'_, B>],
+    references: &[AnalysisReference<B>],
+    location: &DeclarationLocation,
+) -> Result<DependencyEdges<B>, AnalysisTreeError>
+where
+    E: super::ExportParamLike<P, B>,
+    P: ValueKind,
+    T: ValueKind,
+    B: BindingAddress,
+    D: DeferredForPhaseTraversal<P, T, B>,
+{
+    use crate::validation::depends_on::DependencyEdgeOrigin;
+    let mut dependency_edges = std::collections::HashMap::new();
+    // Graph membership comes from the ordering pass's exact
+    // dependency computation. Provenance only anchors those
+    // edges; retained references never add graph edges.
+    for binding in crate::deps::get_resource_dependencies(managed) {
+        let explicit = dependencies
+            .iter()
+            .find(|dependency| dependency.operand().binding_reference() == binding);
+        let (origin, edge_location) = if let Some(explicit) = explicit {
+            (
+                DependencyEdgeOrigin::ExplicitDependency,
+                explicit.location(),
+            )
+        } else if let Some(reference) = references
+            .iter()
+            .find(|reference| reference.path().binding_address() == &binding)
+        {
+            (DependencyEdgeOrigin::ValueReference, reference.location())
+        } else if let Some(origin) = managed
+            .dependencies
+            .depends_on
+            .binding_reference_origins()
+            .iter()
+            .find(|origin| origin.detail() == &binding)
+        {
+            (DependencyEdgeOrigin::ValueReference, origin.location())
+        } else if let Some(reference) = references.iter().find(|reference| {
+            // Inlining a referenced attribute can introduce a
+            // deferred call's bare handle dependencies. Keep
+            // the authored reference that performed that inline.
+            file.iter_top_level_resources()
+                .find(|source| source.binding_address() == Some(reference.path().binding_address()))
+                .is_some_and(|source| {
+                    source.dependency_bindings().contains(&binding)
+                        || source
+                            .attributes()
+                            .get(reference.path().attribute())
+                            .is_some_and(|value| {
+                                let mut found = false;
+                                value.visit_binding_refs(&mut |target| found |= target == &binding);
+                                found
+                            })
+                })
+        }) {
+            (DependencyEdgeOrigin::ValueReference, reference.location())
+        } else {
+            let bare = file
+                .bare_binding_uses()
+                .records()
+                .iter()
+                .find(|record| {
+                    let owns_resource = match &record.authored.owner {
+                        super::BindingUseOwner::Resource(owner) => {
+                            owner.resource_id() == &managed.id
+                        }
+                        super::BindingUseOwner::ModuleArgument { .. } => false,
+                    };
+                    let references_binding = match &record.source {
+                        super::BareBindingSource::Structural(handle) => {
+                            handle.canonical_binding_name() == binding.as_str()
+                        }
+                        super::BareBindingSource::Value { value, .. } => {
+                            let mut found = false;
+                            value.visit_binding_refs(&mut |name| found |= name == &binding);
+                            found
+                        }
+                    };
+                    owns_resource && references_binding
+                })
+                .ok_or_else(|| {
+                    AnalysisTreeError::new(AnalysisTreeErrorKind::MissingElementProvenance {
+                        declaration: location.clone(),
+                        element: format!("dependency edge to {binding}"),
+                    })
+                })?;
+            (
+                DependencyEdgeOrigin::ValueReference,
+                bare.authored.location(),
+            )
+        };
+        dependency_edges.insert(binding, Located::new(edge_location.clone(), origin));
+    }
+    Ok(dependency_edges)
+}
+
 impl<'a, P, T, D, B> AnalysisResourceRef<'a, P, T, D, B>
 where
     P: ValueKind,
@@ -778,6 +939,12 @@ where
     }
     pub fn dependencies(&self) -> &[AnalysisDependencyRef<'a, B>] {
         &self.dependencies
+    }
+    pub(crate) fn dependency_edges(
+        &self,
+    ) -> &std::collections::HashMap<B, Located<crate::validation::depends_on::DependencyEdgeOrigin>>
+    {
+        &self.dependency_edges
     }
     pub fn references(&self) -> &[AnalysisReference<B>] {
         &self.references
@@ -917,6 +1084,7 @@ pub struct AnalysisTree<
     D: DeferredForPhaseTraversal<P, T, B> + 'a,
 {
     resources: Vec<AnalysisResourceRef<'a, P, T, D, B>>,
+    top_level_resource_count: usize,
     waits: Vec<AnalysisWaitRef<'a, B>>,
     providers: &'a [super::ProviderConfig<P, B>],
     upstream_names: std::collections::HashSet<&'a str>,
@@ -954,21 +1122,39 @@ where
             .map(ResourceRef::Resource)
             .chain(file.compositions.iter().map(ResourceRef::LiveComposition))
             .chain(file.data_sources.iter().map(ResourceRef::DataSource))
-            .chain(file.deferred_for_phase.analysis_resource_refs())
+            .map(|resource| (resource, true))
+            .chain(
+                file.deferred_for_phase
+                    .analysis_resource_refs()
+                    .map(|resource| {
+                        // File::iter_all_resources intentionally omits parser-side
+                        // read templates. Other analyses still need their locations.
+                        let in_project_walk = !matches!(resource, ResourceRef::DataSource(_));
+                        (resource, in_project_walk)
+                    }),
+            )
             .chain(file.deferred_module_ifs.iter().flat_map(|deferred| {
-                deferred.branches().filter_map(|branch| match branch {
-                    super::DeferredIfBody::Resource(resource) => {
-                        Some(ResourceRef::Resource(resource))
-                    }
-                    super::DeferredIfBody::DataSource(source) => {
-                        Some(ResourceRef::DataSource(source))
-                    }
-                    // Calls already have mandatory parser-owned locations by type.
-                    super::DeferredIfBody::ModuleCall(_) => None,
-                })
+                deferred
+                    .branches()
+                    .filter_map(|branch| match branch {
+                        super::DeferredIfBody::Resource(resource) => {
+                            Some(ResourceRef::Resource(resource))
+                        }
+                        super::DeferredIfBody::DataSource(source) => {
+                            Some(ResourceRef::DataSource(source))
+                        }
+                        // Calls already have mandatory parser-owned locations by type.
+                        super::DeferredIfBody::ModuleCall(_) => None,
+                    })
+                    .map(|resource| (resource, true))
             }));
         let resources: Vec<AnalysisResourceRef<'a, P, T, D, B>> = resource_refs
-            .map(|resource| {
+            .map(|(resource, in_project_walk)| {
+                let value_scope = if in_project_walk {
+                    AnalysisValueScope::Project
+                } else {
+                    AnalysisValueScope::ReadTemplate
+                };
                 let (provenance, kind) = match resource {
                     ResourceRef::Resource(item) => (&item.declaration, AnalysisItemKind::Resource),
                     ResourceRef::DataSource(item) => {
@@ -995,7 +1181,7 @@ where
                                 collect_value_references(
                                     value,
                                     &format!("{} attribute `{key}`", item.id),
-                                    true,
+                                    value_scope,
                                     &mut value_references,
                                 )?;
                             }
@@ -1026,7 +1212,7 @@ where
                                 collect_value_references(
                                     value,
                                     &format!("{} attribute `{key}`", item.id),
-                                    true,
+                                    value_scope,
                                     &mut value_references,
                                 )?;
                             }
@@ -1066,7 +1252,7 @@ where
                                 collect_value_references(
                                     value,
                                     &format!("{} attribute `{key}`", item.id),
-                                    true,
+                                    value_scope,
                                     &mut value_references,
                                 )?;
                             }
@@ -1082,7 +1268,7 @@ where
                                         D::deferred_header(deferred),
                                         item.id
                                     ),
-                                    true,
+                                    value_scope,
                                     &mut value_references,
                                 )?;
                             }
@@ -1119,12 +1305,24 @@ where
                     },
                     _ => AnalysisIterableRef::Direct,
                 };
+                let dependency_edges = match resource {
+                    ResourceRef::Resource(managed) => managed_dependency_origins(
+                        file,
+                        managed,
+                        &dependencies,
+                        &references,
+                        location,
+                    )?,
+                    _ => std::collections::HashMap::new(),
+                };
                 Ok(AnalysisResourceRef {
                     resource,
+                    in_project_walk,
                     location,
                     attribute_locations,
                     references,
                     dependencies,
+                    dependency_edges,
                     provider_location,
                     iterable,
                     attribute_keys: &provenance.elements().keys,
@@ -1184,7 +1382,7 @@ where
                 collect_value_references(
                     value,
                     &format!("exports.{}", export.name()),
-                    true,
+                    AnalysisValueScope::Project,
                     &mut value_references,
                 )?;
             }
@@ -1194,13 +1392,18 @@ where
                 collect_value_references(
                     value,
                     &format!("attributes.{}", attribute.name),
-                    true,
+                    AnalysisValueScope::AttributeParameter,
                     &mut value_references,
                 )?;
             }
         }
         for (name, value) in &file.variables {
-            collect_value_references(value, &format!("let {name}"), false, &mut value_references)?;
+            collect_value_references(
+                value,
+                &format!("let {name}"),
+                AnalysisValueScope::Variable,
+                &mut value_references,
+            )?;
         }
         for call in &file.module_calls {
             let caller = call
@@ -1212,7 +1415,7 @@ where
                 collect_value_references(
                     value.walker_value(),
                     &format!("module `{caller}` argument `{name}`"),
-                    true,
+                    AnalysisValueScope::Project,
                     &mut value_references,
                 )?;
             }
@@ -1401,7 +1604,7 @@ where
                 collect_value_references(
                     value,
                     &format!("function {}", function.name),
-                    true,
+                    AnalysisValueScope::Function,
                     &mut value_references,
                 )?;
             }
@@ -1511,10 +1714,27 @@ where
                     })
                 })?;
                 let mut refs = Vec::new();
-                collect_value_references(site.iterable, site.header, false, &mut refs)?;
+                collect_value_references(
+                    site.iterable,
+                    site.header,
+                    AnalysisValueScope::Project,
+                    &mut refs,
+                )?;
+                let reference_usages = refs.iter().map(|reference| reference.usage()).collect();
+                let mut result_references = Vec::new();
+                collect_iterable_result_references(
+                    site.iterable,
+                    site.header,
+                    &mut result_references,
+                )?;
                 Ok(AnalysisForRef {
                     site,
                     location,
+                    reference_usages,
+                    result_references: result_references
+                        .into_iter()
+                        .map(|reference| reference.reference)
+                        .collect(),
                     references: refs
                         .into_iter()
                         .map(|reference| reference.reference)
@@ -1533,7 +1753,12 @@ where
                              context|
          -> Result<(), AnalysisTreeError> {
             let mut references = Vec::new();
-            collect_value_references(value, "function boundary", true, &mut references)?;
+            collect_value_references(
+                value,
+                "function boundary",
+                AnalysisValueScope::Function,
+                &mut references,
+            )?;
             value_references.extend(
                 references
                     .into_iter()
@@ -1674,6 +1899,9 @@ where
         }
         Ok(Self {
             resources,
+            top_level_resource_count: file.resources.len()
+                + file.compositions.len()
+                + file.data_sources.len(),
             waits,
             providers: &file.providers,
             upstream_names: file
@@ -1759,6 +1987,27 @@ where
     pub fn value_references(&self) -> &[AnalysisValueReference<B>] {
         &self.value_references
     }
+
+    /// Resource attributes, exports, and module-call arguments, matching the
+    /// project-value walk used by upstream shape validation.
+    pub fn project_value_references(&self) -> impl Iterator<Item = &AnalysisValueReference<B>> {
+        self.value_references
+            .iter()
+            .filter(|value| value.scope == AnalysisValueScope::Project)
+    }
+
+    pub(crate) fn upstream_field_references(
+        &self,
+    ) -> impl Iterator<Item = &AnalysisValueReference<B>> {
+        self.value_references.iter().filter(|value| {
+            matches!(
+                value.scope,
+                AnalysisValueScope::Project
+                    | AnalysisValueScope::AttributeParameter
+                    | AnalysisValueScope::Variable
+            )
+        })
+    }
     pub fn reference_for_path(
         &self,
         path: &crate::resource::AccessPath<B>,
@@ -1785,6 +2034,22 @@ where
 
     pub fn resources(&self) -> impl Iterator<Item = &AnalysisResourceRef<'a, P, T, D, B>> {
         self.resources.iter()
+    }
+
+    /// The general project walk, matching `File::iter_all_resources`.
+    pub fn project_resources(&self) -> impl Iterator<Item = &AnalysisResourceRef<'a, P, T, D, B>> {
+        self.resources
+            .iter()
+            .filter(|resource| resource.in_project_walk)
+    }
+
+    /// Materialized resources, compositions and data sources in declaration
+    /// order, matching `File::iter_top_level_resources` and excluding templates
+    /// and deferred conditional branches.
+    pub fn top_level_resources(
+        &self,
+    ) -> impl Iterator<Item = &AnalysisResourceRef<'a, P, T, D, B>> {
+        self.resources.iter().take(self.top_level_resource_count)
     }
 
     pub fn waits(&self) -> impl Iterator<Item = &AnalysisWaitRef<'a, B>> {

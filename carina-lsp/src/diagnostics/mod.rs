@@ -70,6 +70,24 @@ where
     }
 }
 
+fn analysis_result<T>(
+    doc: &Document,
+    result: Result<T, carina_core::parser::AnalysisTreeError>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            if let Some(diagnostic) = render_analysis_invariant(doc, &error)
+                && !diagnostics.contains(&diagnostic)
+            {
+                diagnostics.push(diagnostic);
+            }
+            None
+        }
+    }
+}
+
 fn render_analysis_invariant(
     doc: &Document,
     error: &carina_core::parser::AnalysisTreeError,
@@ -545,10 +563,13 @@ impl DiagnosticRun<'_> {
         base: &carina_core::paths::ResolvedPath,
         tree: &carina_core::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
         overrides: &carina_core::config_loader::SourceOverrides,
-    ) -> (
-        carina_core::upstream_exports::UpstreamExports<B>,
-        Vec<carina_core::parser::Located<carina_core::upstream_exports::UpstreamResolveError>>,
-    )
+    ) -> Result<
+        (
+            carina_core::upstream_exports::UpstreamExports<B>,
+            Vec<carina_core::parser::Located<carina_core::upstream_exports::UpstreamResolveError>>,
+        ),
+        carina_core::parser::AnalysisTreeError,
+    >
     where
         D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
@@ -683,20 +704,21 @@ impl DiagnosticRun<'_> {
             // retains that declaration and the typed resolver below can attach
             // its context and exact token span. In that case the typed finding
             // covers this coarse parser backstop.
-            let type_resolution =
-                doc.parsed()
-                    .filter(|_| buffer_analysis.is_some())
-                    .map(|parsed| {
-                        let mut parsed = parsed.clone();
-                        carina_core::validation::resolve_file_type_exprs_report(
-                            &mut parsed,
-                            self.provider_context,
-                            Some(carina_core::validation::TypeResolutionParserError::new(
-                                current_file_path,
-                                parse_error,
-                            )),
-                        )
-                    });
+            let type_resolution = doc
+                .parsed()
+                .filter(|_| buffer_analysis.is_some())
+                .map(|parsed| {
+                    let mut parsed = parsed.clone();
+                    carina_core::validation::resolve_file_type_exprs_report(
+                        &mut parsed,
+                        self.provider_context,
+                        Some(carina_core::validation::TypeResolutionParserError::new(
+                            current_file_path,
+                            parse_error,
+                        )),
+                    )
+                })
+                .and_then(|result| analysis_result(doc, result, &mut diagnostics));
             let covered_by_typed_resolution = type_resolution
                 .as_ref()
                 .is_some_and(|report| report.covered_parser_error());
@@ -841,10 +863,17 @@ impl DiagnosticRun<'_> {
                 ));
             }
         }
-        let upstream_resolution = match (base_path, merged_analysis.as_ref()) {
-            (Some(base), Some(merged)) => {
-                Some(self.resolve_diagnostic_upstream_exports(base, merged, &overrides))
+        if let Some(result) = merged_result.as_ref() {
+            for error in &result.analysis_errors {
+                diagnostics.extend(render_analysis_invariant(doc, error));
             }
+        }
+        let upstream_resolution = match (base_path, merged_analysis.as_ref()) {
+            (Some(base), Some(merged)) => analysis_result(
+                doc,
+                self.resolve_diagnostic_upstream_exports(base, merged, &overrides),
+                &mut diagnostics,
+            ),
             (Some(_base), None) => None,
             (None, Some(_merged)) => None,
             (None, None) => None,
@@ -909,13 +938,16 @@ impl DiagnosticRun<'_> {
         // the coarser directory parser backstop, avoiding a frontend-specific
         // duplicate decision.
         let mut type_resolved_parsed = merged.or(current_parsed).cloned();
-        let type_resolution = type_resolved_parsed.as_mut().map(|parsed| {
-            carina_core::validation::resolve_file_type_exprs_report(
-                parsed,
-                self.provider_context,
-                None,
-            )
-        });
+        let type_resolution = type_resolved_parsed
+            .as_mut()
+            .map(|parsed| {
+                carina_core::validation::resolve_file_type_exprs_report(
+                    parsed,
+                    self.provider_context,
+                    None,
+                )
+            })
+            .and_then(|result| analysis_result(doc, result, &mut diagnostics));
         // The diagnostic directory parse deliberately preserves a user-function
         // call when evaluating its body fails, so the rest of the editor checks
         // can still inspect the authored call. Run the strict resolver on a
@@ -1144,10 +1176,13 @@ impl DiagnosticRun<'_> {
             let validation_inputs =
                 self.validation_inputs(pre_expansion_input, upstream_exports, &module_signatures);
             let expanded_upstream_exports = match (base_path, expanded_analysis.as_ref()) {
-                (Some(base), Some(graph)) => {
-                    self.resolve_diagnostic_upstream_exports(base, graph, &overrides)
-                        .0
-                }
+                (Some(base), Some(graph)) => analysis_result(
+                    doc,
+                    self.resolve_diagnostic_upstream_exports(base, graph, &overrides),
+                    &mut diagnostics,
+                )
+                .map(|(exports, _)| exports)
+                .unwrap_or_default(),
                 (Some(_base), None) => Default::default(),
                 (None, Some(_graph)) => Default::default(),
                 (None, None) => Default::default(),
@@ -1290,6 +1325,8 @@ impl DiagnosticRun<'_> {
                 },
                 &overrides,
             );
+            let authored_findings =
+                analysis_result(doc, authored_findings, &mut diagnostics).unwrap_or_default();
             let expanded_binding_findings = match expanded_compositions {
                 Some(compositions) => carina_core::validation::check_expanded_module_calls(
                     carina_core::validation::ExpandedModuleCallCheckInput::BindingUses {

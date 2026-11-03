@@ -15191,7 +15191,8 @@ fn module_parameter_dependency_and_ref_attribute_are_valid_in_module_scope() {
 }
 
 #[test]
-fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() {
+fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position()
+-> Result<(), carina_core::parser::AnalysisTreeError> {
     let root = tempfile::tempdir().unwrap();
     let module = root.path().join("modules/bad");
     std::fs::create_dir_all(&module).unwrap();
@@ -15257,11 +15258,11 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() 
         });
     let sibling_doc =
         create_document_at("let unrelated = 'unrelated'\n", module.join("sibling.crn"));
+    let tree = carina_core::parser::AnalysisTree::try_from_file(merged.directory.parsed.parsed())?;
     let sibling_diagnostics = engine.with_run_for_test(|run| {
         run.module_resolver_error_diagnostics(
             &sibling_doc,
-            &carina_core::parser::AnalysisTree::try_from_file(merged.directory.parsed.parsed())
-                .unwrap(),
+            &tree,
             error,
             &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
         )
@@ -15277,8 +15278,7 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() 
     let diagnostics = engine.with_run_for_test(|run| {
         run.module_resolver_error_diagnostics(
             &module_doc,
-            &carina_core::parser::AnalysisTree::try_from_file(merged.directory.parsed.parsed())
-                .unwrap(),
+            &tree,
             error,
             &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
         )
@@ -15300,6 +15300,7 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() 
             .contains("modules/bad/resource.crn) at line 5"),
         "CLI/LSP must render the same authored location: {diagnostic:#?}",
     );
+    Ok(())
 }
 
 #[test]
@@ -16497,7 +16498,9 @@ fn providerless_orphan_reports_deferred_function_and_attribute_type_checks() {
         |context| {
             let mut parsed = doc.parsed().unwrap().clone();
             assert!(
-                carina_core::validation::resolve_file_type_exprs(&mut parsed, context).is_empty()
+                carina_core::validation::resolve_file_type_exprs(&mut parsed, context)
+                    .unwrap()
+                    .is_empty()
             );
             carina_core::parser::resolve_resource_refs_in_session(&mut parsed, context).unwrap();
         },

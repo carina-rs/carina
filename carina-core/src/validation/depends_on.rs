@@ -2,7 +2,6 @@
 //! All findings have parser-owned locations, including one outgoing edge per
 //! cycle member. Directory/whole-file failures do not belong to this family.
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use super::{DependencyArgumentResolution, ResolvedArgumentTypes, ResolvedDependencyArgumentType};
 use crate::deps::collect_dependencies;
@@ -53,29 +52,11 @@ pub struct DependencyCycle {
 impl std::fmt::Display for DependencyCycle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Circular dependency detected: ")?;
-        let ring = self
-            .members
-            .windows(2)
-            .all(|pair| pair[0].target == pair[1].binding)
-            && self
-                .members
-                .first()
-                .zip(self.members.last())
-                .is_some_and(|(first, last)| last.target == first.binding);
-        if ring {
-            for member in &self.members {
-                write!(f, "{} -> ", member.binding)?;
-            }
-            if let Some(first) = self.members.first() {
-                f.write_str(&first.binding)?;
-            }
-        } else {
-            for (index, member) in self.members.iter().enumerate() {
-                if index > 0 {
-                    f.write_str("; ")?;
-                }
-                write!(f, "{} -> {}", member.binding, member.target)?;
-            }
+        for member in &self.members {
+            write!(f, "{} -> ", member.binding)?;
+        }
+        if let Some(first) = self.members.first() {
+            f.write_str(&first.binding)?;
         }
         Ok(())
     }
@@ -88,8 +69,7 @@ pub enum DependsOnDiagnosticKind {
         dependency: String,
     },
     Cycle {
-        cycle: Arc<DependencyCycle>,
-        member: usize,
+        cycle: DependencyCycle,
     },
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,13 +139,13 @@ where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
     let resources_have_dependencies = tree
-        .resources()
+        .project_resources()
         .any(|resource| !resource.dependencies().is_empty());
     if !resources_have_dependencies && tree.waits().all(|wait| wait.dependencies().is_empty()) {
         return Vec::new();
     }
     let bindings: HashMap<_, _> = tree
-        .resources()
+        .project_resources()
         .filter_map(|r| r.binding().map(|binding| (binding, r)))
         .collect();
     let mut out = Vec::new();
@@ -254,7 +234,7 @@ where
             }
         }
     };
-    for resource in tree.resources() {
+    for resource in tree.project_resources() {
         let mut value_deps = HashSet::new();
         for value in resource.attributes().values() {
             collect_dependencies(value, &mut value_deps);
@@ -275,159 +255,64 @@ where
             &HashSet::new(),
         );
     }
-    if resources_have_dependencies {
-        for cycle in dependency_cycles(tree) {
-            let cycle = Arc::new(cycle);
-            for (member, edge) in cycle.members.iter().enumerate() {
-                out.push(Located::new(
-                    edge.location.clone(),
-                    DependsOnDiagnostic {
-                        severity: Severity::Error,
-                        message: cycle.to_string(),
-                        kind: DependsOnDiagnosticKind::Cycle {
-                            cycle: Arc::clone(&cycle),
-                            member,
-                        },
-                    },
-                ));
-            }
-        }
+    if resources_have_dependencies && let Some(cycle) = first_dependency_cycle(tree) {
+        out.push(Located::new(
+            cycle.members[0].location.clone(),
+            DependsOnDiagnostic {
+                severity: Severity::Error,
+                message: cycle.to_string(),
+                kind: DependsOnDiagnosticKind::Cycle { cycle },
+            },
+        ));
     }
     out
 }
 
-/// Find cycles using authored edge origins rather than rendered cycle strings.
-/// Edges and traversal follow declaration/occurrence order for deterministic anchors.
-fn dependency_cycles<B: BindingAddress, D>(
+/// Use the ordering pass's node set, edges and first-cycle DFS. Each edge's
+/// origin was attached at the analysis boundary without changing membership.
+fn first_dependency_cycle<B: BindingAddress, D>(
     tree: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
-) -> Vec<DependencyCycle>
+) -> Option<DependencyCycle>
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
     let resources: Vec<_> = tree
-        .resources()
-        .filter(|resource| {
-            matches!(
-                resource.kind(),
-                AnalysisItemKind::Resource | AnalysisItemKind::DeferredResource
-            )
+        .top_level_resources()
+        .filter(|resource| resource.kind() == AnalysisItemKind::Resource)
+        .collect();
+    let bindings: Vec<_> = resources
+        .iter()
+        .map(|resource| resource.binding_address())
+        .collect();
+    let cycle = crate::deps::dependency_order(&bindings, |index| {
+        resources[index]
+            .dependency_edges()
+            .keys()
+            .cloned()
+            .collect()
+    })
+    .err()?;
+    let members = cycle
+        .windows(2)
+        .map(|edge| {
+            let source = resources[edge[0]];
+            let target = resources[edge[1]];
+            let binding = target
+                .binding_address()
+                .expect("cycle targets are named resources");
+            let origin = &source.dependency_edges()[binding];
+            DependencyCycleMember {
+                binding: source
+                    .binding()
+                    .expect("cycle members are named resources")
+                    .to_string(),
+                target: binding.to_string(),
+                origin: *origin.detail(),
+                location: origin.location().clone(),
+            }
         })
         .collect();
-    let bindings: HashMap<_, _> = resources
-        .iter()
-        .enumerate()
-        .filter_map(|(index, r)| r.binding_address().map(|binding| (binding.clone(), index)))
-        .collect();
-    let mut edges = vec![Vec::<(usize, DependencyCycleMember)>::new(); resources.len()];
-    for (index, resource) in resources.iter().enumerate() {
-        let name = resource
-            .binding()
-            .map(str::to_string)
-            .unwrap_or_else(|| resource.id().to_string());
-        for dependency in resource.dependencies() {
-            if let Some(&target) = bindings.get(&dependency.operand().binding_reference()) {
-                edges[index].push((
-                    target,
-                    DependencyCycleMember {
-                        binding: name.clone(),
-                        target: resources[target]
-                            .binding()
-                            .expect("indexed named resource")
-                            .to_string(),
-                        origin: DependencyEdgeOrigin::ExplicitDependency,
-                        location: dependency.location().clone(),
-                    },
-                ));
-            }
-        }
-        for reference in resource.references() {
-            if let Some(&target) = bindings.get(reference.path().binding_address()) {
-                edges[index].push((
-                    target,
-                    DependencyCycleMember {
-                        binding: name.clone(),
-                        target: resources[target]
-                            .binding()
-                            .expect("indexed named resource")
-                            .to_string(),
-                        origin: DependencyEdgeOrigin::ValueReference,
-                        location: reference.location().clone(),
-                    },
-                ));
-            }
-        }
-    }
-    // Strongly connected components retain all participants in overlapping
-    // cycles. A back-edge-only DFS can omit members reached after a sibling
-    // branch has already finished, or emit the same member more than once.
-    fn finish(
-        index: usize,
-        edges: &[Vec<(usize, DependencyCycleMember)>],
-        visited: &mut [bool],
-        order: &mut Vec<usize>,
-    ) {
-        if visited[index] {
-            return;
-        }
-        visited[index] = true;
-        for (target, _) in &edges[index] {
-            finish(*target, edges, visited, order);
-        }
-        order.push(index);
-    }
-    fn collect(
-        index: usize,
-        reverse: &[Vec<usize>],
-        visited: &mut [bool],
-        members: &mut Vec<usize>,
-    ) {
-        if visited[index] {
-            return;
-        }
-        visited[index] = true;
-        members.push(index);
-        for source in &reverse[index] {
-            collect(*source, reverse, visited, members);
-        }
-    }
-    let mut reverse = vec![Vec::new(); resources.len()];
-    for (source, outgoing) in edges.iter().enumerate() {
-        for (target, _) in outgoing {
-            reverse[*target].push(source);
-        }
-    }
-    let mut visited = vec![false; resources.len()];
-    let mut order = Vec::new();
-    for index in 0..resources.len() {
-        finish(index, &edges, &mut visited, &mut order);
-    }
-    visited.fill(false);
-    let mut cycles = Vec::new();
-    for index in order.into_iter().rev() {
-        if visited[index] {
-            continue;
-        }
-        let mut component = Vec::new();
-        collect(index, &reverse, &mut visited, &mut component);
-        if component.len() == 1 && !edges[index].iter().any(|(target, _)| *target == index) {
-            continue;
-        }
-        component.sort_unstable();
-        let membership: HashSet<_> = component.iter().copied().collect();
-        let members = component
-            .iter()
-            .map(|index| {
-                edges[*index]
-                    .iter()
-                    .find(|(target, _)| membership.contains(target))
-                    .expect("cyclic component has an internal outgoing edge")
-                    .1
-                    .clone()
-            })
-            .collect();
-        cycles.push(DependencyCycle { members });
-    }
-    cycles
+    Some(DependencyCycle { members })
 }
 
 #[cfg(test)]
@@ -445,21 +330,21 @@ mod tests {
             crate::resource::ParserPlaceholder,
             D,
         >,
-    ) -> Vec<Located<DependsOnDiagnostic>> {
+    ) -> Result<Vec<Located<DependsOnDiagnostic>>, crate::parser::AnalysisTreeError> {
         let mut parsed = parsed.clone();
         let report = crate::validation::deferred_types::with_session_for_test(
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| super::super::resolve_file_type_exprs_report(&mut parsed, session, None),
-        );
+        )?;
         assert!(
             report.diagnostics().is_empty(),
             "{:?}",
             report.diagnostics()
         );
-        validate_depends_on(
-            &AnalysisTree::try_from_file(&parsed).expect("parsed analysis provenance"),
+        Ok(validate_depends_on(
+            &AnalysisTree::try_from_file(&parsed)?,
             report.resolved_argument_types(),
-        )
+        ))
     }
 
     fn diag_messages(diags: &[Located<DependsOnDiagnostic>], sev: Severity) -> Vec<String> {
@@ -479,7 +364,7 @@ mod tests {
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         let errors = diag_messages(&diags, Severity::Error);
         assert!(
             errors
@@ -512,7 +397,7 @@ let lookup = read aws.acm.Certificate { domain_name = "lookup.example.com" }
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("multi-file wait fixture must parse");
-        check(parsed.parsed())
+        check(parsed.parsed()).unwrap()
     }
 
     #[test]
@@ -564,11 +449,11 @@ let lookup = read aws.acm.Certificate { domain_name = "lookup.example.com" }
             "upstream",
             r#"let upstream = upstream_state { source = "../upstream" }"#,
         );
-        let wait_errors = diag_messages(&check(&parsed), Severity::Error);
+        let wait_errors = diag_messages(&check(&parsed).unwrap(), Severity::Error);
         // Compare the same retained operand on the resource path.
         parsed.resources[0].dependencies.depends_on =
             std::mem::take(&mut parsed.wait_bindings[0].depends_on);
-        let resource_errors = diag_messages(&check(&parsed), Severity::Error);
+        let resource_errors = diag_messages(&check(&parsed).unwrap(), Severity::Error);
         assert_eq!(resource_errors.len(), 1, "{resource_errors:?}");
         assert_eq!(
             wait_errors,
@@ -594,7 +479,7 @@ let lookup = read aws.acm.Certificate { domain_name = "lookup.example.com" }
             ),
         ] {
             let parsed = forward_wait_dependency(dependency, declaration);
-            let errors = diag_messages(&check(&parsed), Severity::Error);
+            let errors = diag_messages(&check(&parsed).unwrap(), Severity::Error);
             actual.push((dependency, errors));
             expected.push((dependency, vec![format!(
                 "wait.depends_on on 'ready': binding '{dependency}' is not declared in this scope"
@@ -604,7 +489,8 @@ let lookup = read aws.acm.Certificate { domain_name = "lookup.example.com" }
     }
 
     #[test]
-    fn wait_depends_on_rejects_resolved_value_argument_like_resources() {
+    fn wait_depends_on_rejects_resolved_value_argument_like_resources()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let mut parsed = parse(
             "arguments { rec: aws.iam.Policy.Arn }\n\
              let cert = aws.acm.Certificate { directives { depends_on = [rec] } }\n\
@@ -625,7 +511,7 @@ let lookup = read aws.acm.Certificate { domain_name = "lookup.example.com" }
         };
         let report =
             crate::validation::deferred_types::with_session_for_test(&context, |session| {
-                super::super::resolve_file_type_exprs_report(&mut parsed, session, None)
+                super::super::resolve_file_type_exprs_report(&mut parsed, session, None).unwrap()
             });
         assert!(
             report.diagnostics().is_empty(),
@@ -634,7 +520,7 @@ let lookup = read aws.acm.Certificate { domain_name = "lookup.example.com" }
         );
         let errors = diag_messages(
             &validate_depends_on(
-                &AnalysisTree::try_from_file(&parsed).expect("parsed analysis provenance"),
+                &AnalysisTree::try_from_file(&parsed)?,
                 report.resolved_argument_types(),
             ),
             Severity::Error,
@@ -646,12 +532,13 @@ let lookup = read aws.acm.Certificate { domain_name = "lookup.example.com" }
                 "wait.depends_on: expected a managed resource handle; got aws.iam.Policy.Arn",
             ],
         );
+        Ok(())
     }
 
     #[test]
     fn wait_depends_on_warns_once_for_duplicates_without_redundant_edges() {
         let parsed = forward_wait_dependency("cert, cert, cert", "");
-        let diagnostics = check(&parsed);
+        let diagnostics = check(&parsed).unwrap();
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(diagnostics[0].severity, Severity::Warning);
         assert_eq!(
@@ -714,7 +601,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
         .expect("fixture must parse");
         assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
 
-        let errors = diag_messages(&check(&parsed), Severity::Error);
+        let errors = diag_messages(&check(&parsed).unwrap(), Severity::Error);
         assert!(
             errors
                 .iter()
@@ -732,7 +619,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         let errors = diag_messages(&diags, Severity::Error);
         assert!(
             errors
@@ -756,7 +643,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         let warnings = diag_messages(&diags, Severity::Warning);
         assert!(
             warnings
@@ -780,7 +667,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         let warnings = diag_messages(&diags, Severity::Warning);
         let role_warnings: Vec<_> = warnings
             .iter()
@@ -806,7 +693,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let errors = diag_messages(&check(&parsed), Severity::Error);
+        let errors = diag_messages(&check(&parsed).unwrap(), Severity::Error);
         assert!(
             errors.is_empty(),
             "expanded managed groups are valid dependency targets: {errors:?}",
@@ -833,7 +720,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             .expect("authored operand") =
             UnexpandedDependencyOperand::BareBinding("records".into());
 
-        let diagnostics = check(&parsed);
+        let diagnostics = check(&parsed).unwrap();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
@@ -850,7 +737,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         let warnings = diag_messages(&diags, Severity::Warning);
         assert!(
             warnings
@@ -874,7 +761,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         let errors = diag_messages(&diags, Severity::Error);
         assert!(
             errors
@@ -886,28 +773,56 @@ let other = wait cert { until = cert.status == "ISSUED" }
     }
 
     #[test]
-    fn overlapping_cycles_report_every_member_once_with_typed_outgoing_origins() {
+    fn review_round2_overlapping_cycles_report_only_main_first_ring() {
         let parsed = parse_and_resolve("let a = mock.test.Resource { value = c.output directives { depends_on = [b] } }\nlet b = mock.test.Resource { directives { depends_on = [a] } }\nlet c = mock.test.Resource { directives { depends_on = [b] } }\n").unwrap();
-        let diagnostics = check(&parsed);
-        let members: Vec<_> = diagnostics
+        let diagnostics = check(&parsed).unwrap();
+        let cycles: Vec<_> = diagnostics
             .iter()
             .filter_map(|diagnostic| match &diagnostic.kind {
-                DependsOnDiagnosticKind::Cycle { cycle, member } => Some(&cycle.members[*member]),
+                DependsOnDiagnosticKind::Cycle { cycle } => Some(cycle),
                 _ => None,
             })
             .collect();
-        assert_eq!(members.len(), 3, "{diagnostics:#?}");
+        assert_eq!(cycles.len(), 1, "{diagnostics:#?}");
+        let members = &cycles[0].members;
+        assert_eq!(members.len(), 2, "{diagnostics:#?}");
         assert_eq!(
             members
                 .iter()
                 .map(|member| member.binding.as_str())
                 .collect::<HashSet<_>>(),
-            HashSet::from(["a", "b", "c"])
+            HashSet::from(["a", "b"])
         );
         assert!(
             members
                 .iter()
                 .all(|member| member.origin == DependencyEdgeOrigin::ExplicitDependency)
+        );
+    }
+
+    #[test]
+    fn review_round2_cycles_ignore_deferred_if_branches() {
+        let parsed = parse_and_resolve("arguments { enabled: Bool }\nlet a = if enabled { mock.test.Resource { value = 'a' directives { depends_on = [b] } } }\nlet b = mock.test.Resource { value = a.output }\n").unwrap();
+        let diagnostics = check(&parsed).unwrap();
+        assert!(
+            diagnostics.iter().all(|diagnostic| !matches!(
+                diagnostic.kind,
+                DependsOnDiagnosticKind::Cycle { .. }
+            )),
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn review_round2_read_template_depends_on_does_not_enable_cycle_checks() {
+        let parsed = parse_and_resolve("let a = mock.test.Resource { value = b.output }\nlet b = mock.test.Resource { value = a.output }\nlet up = upstream_state { source = './up' }\nlet copies = for item in up.items { read mock.test.Resource { name = item directives { depends_on = [a] } } }\n").unwrap();
+        let diagnostics = check(&parsed).unwrap();
+        assert!(
+            diagnostics.iter().all(|diagnostic| !matches!(
+                diagnostic.kind,
+                DependsOnDiagnosticKind::Cycle { .. }
+            )),
+            "{diagnostics:#?}"
         );
     }
 
@@ -942,7 +857,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         let errors = diag_messages(&diags, Severity::Error);
         assert!(
             errors
@@ -969,7 +884,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         let warnings = diag_messages(&diags, Severity::Warning);
         assert!(
             warnings
@@ -997,7 +912,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         let warnings = diag_messages(&diags, Severity::Warning);
         assert!(
             warnings
@@ -1033,7 +948,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         let errors = diag_messages(&diags, Severity::Error);
         assert!(
             errors
@@ -1057,7 +972,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
             }
         "#;
         let parsed = parse_and_resolve(src).unwrap();
-        let diags = check(&parsed);
+        let diags = check(&parsed).unwrap();
         assert!(
             diags.is_empty(),
             "expected zero diagnostics for valid depends_on, got {:?}",

@@ -686,7 +686,8 @@ fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validatio
             &parsed,
             schemas,
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-        );
+        )
+        .unwrap();
     let bindings = carina_core::binding_index::BindingIndex::from_parsed(
         &parsed,
         schemas.schemas(),

@@ -1511,6 +1511,17 @@ fn resolve_directive_dependencies(
         value.visit_resource_refs(&mut |path| origins.push(path.clone()));
     }
     resolved.set_reference_origins(origins);
+    let mut binding_origins = Vec::new();
+    for origin in dependencies.binding_reference_origins() {
+        let bindings =
+            resolve_dependency_bindings(&BTreeSet::from([origin.detail().clone()]), resolver)?;
+        binding_origins.extend(
+            bindings
+                .into_iter()
+                .map(|binding| crate::parser::Located::new(origin.location().clone(), binding)),
+        );
+    }
+    resolved.set_binding_reference_origins(binding_origins);
     Ok(resolved)
 }
 

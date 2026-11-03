@@ -194,12 +194,20 @@ impl ResidualModuleResolutionError {
         findings
     }
 
+    pub fn analysis_invariant(&self) -> Option<&crate::parser::AnalysisTreeError> {
+        match self.0.root_cause() {
+            ModuleError::AnalysisInvariant(error) => Some(error),
+            _ => None,
+        }
+    }
+
     pub fn is_constraint(&self) -> bool {
         matches!(self.0.root_cause(), ModuleError::Constraint(_diagnostic))
     }
 
     pub fn diagnostic(&self) -> Option<ResidualModuleResolutionDiagnostic<'_>> {
         match self.0.root_cause() {
+            ModuleError::AnalysisInvariant(_) => None,
             ModuleError::WithProviderTypeWarnings { .. } => {
                 unreachable!("root_cause removes diagnostic wrappers")
             }
@@ -308,6 +316,7 @@ impl ResidualModuleResolutionError {
     fn is_covered_by(&self, findings: &[crate::validation::ModuleCallFinding]) -> bool {
         let root_cause = self.0.root_cause();
         match root_cause {
+            ModuleError::AnalysisInvariant(_) => false,
             ModuleError::WithProviderTypeWarnings { .. } => {
                 unreachable!("root_cause removes diagnostic wrappers")
             }
@@ -566,6 +575,7 @@ fn without_covered_reference_type_members(
         | ModuleError::Io(_)
         | ModuleError::Parse(_)
         | ModuleError::ParseInFile { path: _, error: _ }
+        | ModuleError::AnalysisInvariant(_)
         | ModuleError::TypeResolution(_)
         | ModuleError::UnknownArgument {
             module: _,
@@ -722,6 +732,7 @@ mod diagnostic_status_tests {
                                     crate::validation::ModuleCallReferenceChecks::Skipped,
                             },
                         )
+                        .unwrap()
                     },
                 );
                 let error = ModuleError::MissingArgument {
@@ -835,7 +846,7 @@ impl TypeResolutionPolicy for StrictTypeResolution {
         parsed: &mut crate::parser::File<E>,
         config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<(), ModuleError> {
-        let type_errors = crate::validation::resolve_file_type_exprs(parsed, config);
+        let type_errors = crate::validation::resolve_file_type_exprs(parsed, config)?;
         if let Some(first) = type_errors.into_iter().next() {
             return Err(ModuleError::TypeResolution(Box::new(first)));
         }
@@ -861,7 +872,7 @@ impl TypeResolutionPolicy for DeferredUpstreamTypeResolution {
         parsed: &mut crate::parser::File<E>,
         config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<(), ModuleError> {
-        crate::validation::resolve_file_type_exprs_best_effort(parsed, config);
+        crate::validation::resolve_file_type_exprs_best_effort(parsed, config)?;
         Ok(())
     }
 

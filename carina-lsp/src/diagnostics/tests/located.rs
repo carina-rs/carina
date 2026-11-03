@@ -83,6 +83,112 @@ impl Directory {
 const MAIN: &str = "provider aws {}\nlet cert = aws.acm.Certificate { domain_name = 'main' }\n";
 
 #[test]
+fn review_round2_cycle_uses_main_ring_and_only_its_members_files() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        (
+            "sibling.crn",
+            "let a = aws.acm.Certificate { domain_name = 'a' directives { depends_on = [c] } }\n",
+        ),
+        (
+            "values.crn",
+            "let b = aws.acm.Certificate { domain_name = a.domain_name }\nlet c = aws.acm.Certificate { domain_name = b.domain_name }\n",
+        ),
+    ]);
+    let engine = test_engine_with_wait_target();
+    let message = "Circular dependency detected: a -> c -> b -> a";
+    directory.assert_sibling_owner(&engine, message, &[("c", 3)]);
+    directory.assert_ranges(
+        &engine,
+        "values.crn",
+        message,
+        &[("a.domain_name", 0), ("b.domain_name", 0)],
+    );
+}
+
+#[test]
+fn review_round2_wait_does_not_resolve_deferred_if_target() {
+    let directory = Directory::new(&[
+        (
+            "main.crn",
+            "provider aws {}\narguments { enabled: Bool }\nlet selected = if enabled { aws.acm.Certificate { domain_name = 'conditional' } }\n",
+        ),
+        (
+            "sibling.crn",
+            "let ready = wait selected { until = selected.status == 'ISSUED' }\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine_with_wait_target(),
+        "target binding `selected` is not a known resource",
+        &[("selected", 0)],
+    );
+}
+
+#[test]
+fn review_round2_type_resolution_invariant_renders_in_each_directory_buffer() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        (
+            "sibling.crn",
+            "let other = aws.acm.Certificate { domain_name = 'sibling' }\n",
+        ),
+    ]);
+    let config =
+        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let mut parsed = carina_core::config_loader::parse_directory(
+        &carina_core::paths::ResolvedPath::new(directory.root.path()).unwrap(),
+        &config,
+    )
+    .unwrap()
+    .into_parsed();
+    parsed.resources[0].declaration = Default::default();
+    let error =
+        carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
+            carina_core::validation::resolve_file_type_exprs_report(&mut parsed, session, None)
+        })
+        .expect_err("return the typed boundary failure");
+    for name in ["main.crn", "sibling.crn"] {
+        let path = directory.root.path().join(name);
+        let source = std::fs::read_to_string(&path).unwrap();
+        let doc = create_document_at(&source, path);
+        let diagnostic = render_analysis_invariant(&doc, &error).unwrap();
+        assert_eq!(diagnostic.range, Range::default());
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+        assert!(
+            diagnostic
+                .message
+                .contains("missing declaration provenance")
+        );
+    }
+}
+
+#[test]
+fn review_round2_failed_function_annotation_keeps_main_finding_set() {
+    let directory = Directory::new(&[
+        (
+            "main.crn",
+            "provider aws {}\nprovider broken { source = 'file:///definitely-missing/broken.wasm' }\n",
+        ),
+        (
+            "sibling.crn",
+            "fn bad(x: aws.Missing) { x }\nfn echo(x: Arn): String { 'ok' }\nexports { failed: String = bad('id') x = echo('id') }\n",
+        ),
+    ]);
+    let engine =
+        test_engine_with_wait_target().with_provider_errors(std::collections::HashMap::from([(
+            "broken".to_string(),
+            "fixture provider unavailable".to_string(),
+        )]));
+    directory.assert_sibling_owner(
+        &engine,
+        "unknown custom type 'aws.Missing'",
+        &[("aws.Missing", 0)],
+    );
+    directory.assert_sibling_owner(&engine, "export 'failed'", &[]);
+}
+
+#[test]
 fn review_round1_merged_function_error_uses_parser_owned_body_location() {
     let directory = Directory::new(&[
         (
@@ -197,16 +303,15 @@ fn review_4220_routing_waits_for_the_directory_parse() {
 }
 
 #[test]
-fn review_4220_unmappable_span_drops_only_that_finding() {
+fn review_4220_unmappable_span_drops_only_that_finding()
+-> Result<(), carina_core::parser::AnalysisTreeError> {
     let directory = Directory::new(&[("main.crn", MAIN), ("sibling.crn", "let live = 'live'\n")]);
     let path = directory.root.path().join("sibling.crn");
     let document = create_document_at("let live = 'live'\n", path.clone());
     let stale_source = format!("{}let stale = 'disk'\n", "\n".repeat(80));
     let stale = create_document_at(&stale_source, path);
-    let live_tree =
-        carina_core::parser::AnalysisTree::try_from_file(document.parsed().unwrap()).unwrap();
-    let stale_tree =
-        carina_core::parser::AnalysisTree::try_from_file(stale.parsed().unwrap()).unwrap();
+    let live_tree = carina_core::parser::AnalysisTree::try_from_file(document.parsed().unwrap())?;
+    let stale_tree = carina_core::parser::AnalysisTree::try_from_file(stale.parsed().unwrap())?;
     let findings = [
         &stale_tree.syntax().declarations()[0],
         &live_tree.syntax().declarations()[0],
@@ -227,6 +332,7 @@ fn review_4220_unmappable_span_drops_only_that_finding() {
         diagnostics[0].range,
         Range::new(Position::new(0, 4), Position::new(0, 8))
     );
+    Ok(())
 }
 
 #[test]
@@ -635,7 +741,8 @@ fn deferred_if_body_diagnostics_belong_to_sibling() {
 }
 
 #[test]
-fn expanded_module_diagnostic_keeps_its_authored_file() {
+fn expanded_module_diagnostic_keeps_its_authored_file()
+-> Result<(), carina_core::parser::AnalysisTreeError> {
     let directory = Directory::new(&[
         (
             "main.crn",
@@ -668,7 +775,7 @@ fn expanded_module_diagnostic_keeps_its_authored_file() {
     else {
         panic!("fixture must exercise a genuinely expanded module")
     };
-    let tree = carina_core::parser::AnalysisTree::try_from_file(graph.as_ref()).unwrap();
+    let tree = carina_core::parser::AnalysisTree::try_from_file(graph.as_ref())?;
     let waits = engine.with_run_for_test(|run| {
         carina_core::validation::wait::validate_wait_bindings(&tree, &run.schemas)
     });
@@ -698,6 +805,7 @@ fn expanded_module_diagnostic_keeps_its_authored_file() {
         "listed multiple times",
         &[("cert", 3)],
     );
+    Ok(())
 }
 
 #[test]
@@ -870,7 +978,7 @@ fn upstream_attribute_shape_owns_reference_prefix() {
         ),
         (
             "sibling.crn",
-            "let first = orgs.accounts.name\nlet second = orgs.accounts.name\n",
+            "exports {\n  first = orgs.accounts.name\n  second = orgs.accounts.name\n}\n",
         ),
         (
             "upstream/exports.crn",
@@ -893,7 +1001,7 @@ fn upstream_subscript_shape_owns_reference_prefix() {
         ),
         (
             "sibling.crn",
-            "let first = orgs.accounts['bad']\nlet second = orgs.accounts['bad']\n",
+            "exports {\n  first = orgs.accounts['bad']\n  second = orgs.accounts['bad']\n}\n",
         ),
         (
             "upstream/exports.crn",

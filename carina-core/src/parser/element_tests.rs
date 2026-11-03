@@ -9,10 +9,11 @@ fn slice<'a>(source: &'a str, location: &DeclarationLocation) -> &'a str {
 }
 
 #[test]
-fn nested_keys_and_repeated_blocks_keep_occurrence_paths() {
+fn nested_keys_and_repeated_blocks_keep_occurrence_paths()
+-> Result<(), crate::parser::AnalysisTreeError> {
     let source = "mock.test.Resource {\n  settings = { inner = [{ label = 'a' }, { label = 'b' }] }\n  rule { name = 'first' }\n  rule { name = 'second' }\n}\n";
     let parsed = parse_file(source, Path::new("sibling.crn"), &context()).unwrap();
-    let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+    let tree = AnalysisTree::try_from_file(&parsed)?;
     let resource = tree.resources().next().unwrap();
     let keys = resource.attribute_keys();
     assert_eq!(
@@ -51,13 +52,15 @@ fn nested_keys_and_repeated_blocks_keep_occurrence_paths() {
         ])
     );
     assert_ne!(keys[5].location(), keys[7].location());
+    Ok(())
 }
 
 #[test]
-fn reference_occurrences_and_prefixes_preserve_interpolation_postfix_and_heredocs() {
+fn reference_occurrences_and_prefixes_preserve_interpolation_postfix_and_heredocs()
+-> Result<(), crate::parser::AnalysisTreeError> {
     let source = "let target = mock.test.Resource {}\nlet holder = mock.test.Resource {\n  note = <<-EOT\n    😀 unicode\n  EOT\n  values = [target.items[0].name, (target.items)[1].name, \"${target.items[2].name}\", target.items.123]\n}\n";
     let parsed = parse_file(source, Path::new("sibling.crn"), &context()).unwrap();
-    let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+    let tree = AnalysisTree::try_from_file(&parsed)?;
     let holder = tree
         .resources()
         .find(|resource| resource.binding() == Some("holder"))
@@ -83,6 +86,7 @@ fn reference_occurrences_and_prefixes_preserve_interpolation_postfix_and_heredoc
         refs.iter()
             .all(|reference| reference.location().file().path() == Path::new("sibling.crn"))
     );
+    Ok(())
 }
 
 #[test]
@@ -170,10 +174,11 @@ fn exports_consuming_sibling_let_keep_the_reference_owners_file() {
 }
 
 #[test]
-fn parenthesized_handle_postfix_keeps_the_whole_occurrence() {
+fn parenthesized_handle_postfix_keeps_the_whole_occurrence()
+-> Result<(), crate::parser::AnalysisTreeError> {
     let source = "let target = mock.test.Resource {}\nmock.test.Resource { value = (target).items[0].name }\n";
     let parsed = parse_file(source, Path::new("sibling.crn"), &context()).unwrap();
-    let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+    let tree = AnalysisTree::try_from_file(&parsed)?;
     let holder = tree
         .resources()
         .find(|resource| resource.binding().is_none())
@@ -182,10 +187,12 @@ fn parenthesized_handle_postfix_keeps_the_whole_occurrence() {
         slice(source, holder.references()[0].location()),
         "(target).items[0].name"
     );
+    Ok(())
 }
 
 #[test]
-fn function_body_access_occurrence_survives_argument_substitution() {
+fn function_body_access_occurrence_survives_argument_substitution()
+-> Result<(), crate::parser::AnalysisTreeError> {
     let functions =
         "// original function source\nfn name_of(r: mock.test.Resource): String { r.status }\n";
     let main =
@@ -227,7 +234,7 @@ fn function_body_access_occurrence_survives_argument_substitution() {
     parsed.resources[1]
         .attributes
         .insert("value".into(), substituted);
-    let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+    let tree = AnalysisTree::try_from_file(&parsed)?;
     let holder = tree
         .resources()
         .find(|resource| resource.binding().is_none())
@@ -239,13 +246,15 @@ fn function_body_access_occurrence_survives_argument_substitution() {
     );
     assert_eq!(slice(functions, reference.location()), "r.status");
     assert_eq!(slice(functions, reference.prefix_location()), "r.status");
+    Ok(())
 }
 
 #[test]
-fn single_nested_block_key_paths_match_parser_sink_paths() {
+fn single_nested_block_key_paths_match_parser_sink_paths()
+-> Result<(), crate::parser::AnalysisTreeError> {
     let source = "mock.test.Resource { rule { value = 'one' } }";
     let parsed = parse_file(source, Path::new("sibling.crn"), &context()).unwrap();
-    let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+    let tree = AnalysisTree::try_from_file(&parsed)?;
     let resource = tree.resources().next().unwrap();
     assert_eq!(
         resource.attribute_keys()[1].path(),
@@ -255,6 +264,7 @@ fn single_nested_block_key_paths_match_parser_sink_paths() {
             AttributePathSegment::StructField("value".into()),
         ]
     );
+    Ok(())
 }
 
 #[test]

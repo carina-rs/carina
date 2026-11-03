@@ -86,7 +86,7 @@ where
     // composition targets remain distinct from a missing binding. Both are
     // rejected explicitly before managed-resource predicate validation.
     let mut by_binding: std::collections::HashMap<B, WaitTarget> = std::collections::HashMap::new();
-    for rref in parsed.resources() {
+    for rref in parsed.top_level_resources() {
         if let Some(b) = rref.binding_address() {
             let id = rref.id();
             let target = match rref.kind() {
@@ -214,7 +214,8 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_wait_enum_identifiers_require_string_quotes() {
+    fn unresolved_wait_enum_identifiers_require_string_quotes()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let parsed = parse(
             r#"
 let cert = aws.acm.Certificate {}
@@ -229,20 +230,20 @@ let status_ready = wait cert {
         )
         .expect("fixture must parse");
 
-        let diagnostics = validate_wait_bindings(
-            &AnalysisTree::try_from_file(&parsed).expect("parsed wait provenance"),
-            &wait_schemas(),
-        );
+        let diagnostics =
+            validate_wait_bindings(&AnalysisTree::try_from_file(&parsed)?, &wait_schemas());
         let messages = diagnostics
             .iter()
             .map(|diagnostic| diagnostic.message.as_str())
             .collect::<Vec<_>>();
         assert!(messages.contains(&"wait `state_ready`: cannot resolve `ready` as an enum value of `cert.state`; quote it to compare as a string"));
         assert!(messages.contains(&"wait `status_ready`: cannot resolve `aws.acm.Certificate.Status.bogus` as an enum value of `cert.status`; quote it to compare as a string"));
+        Ok(())
     }
 
     #[test]
-    fn quoted_string_and_known_enum_wait_values_are_accepted() {
+    fn quoted_string_and_known_enum_wait_values_are_accepted()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let parsed = parse(
             r#"
 let cert = aws.acm.Certificate {}
@@ -258,16 +259,15 @@ let status_ready = wait cert {
         .expect("fixture must parse");
 
         assert!(
-            validate_wait_bindings(
-                &AnalysisTree::try_from_file(&parsed).expect("parsed wait provenance"),
-                &wait_schemas()
-            )
-            .is_empty()
+            validate_wait_bindings(&AnalysisTree::try_from_file(&parsed)?, &wait_schemas())
+                .is_empty()
         );
+        Ok(())
     }
 
     #[test]
-    fn nested_struct_enum_wait_value_is_resolved_at_the_full_lhs_path() {
+    fn nested_struct_enum_wait_value_is_resolved_at_the_full_lhs_path()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let renewal_status = PatternAttributeType::enum_(
             TypeIdentity::new(Some("aws"), ["acm", "Certificate"], "RenewalStatus"),
             Some(vec!["SUCCESS".to_string()]),
@@ -300,16 +300,15 @@ let renewed = wait cert {
         .expect("fixture must parse");
 
         assert_eq!(
-            validate_wait_bindings(
-                &AnalysisTree::try_from_file(&parsed).expect("parsed wait provenance"),
-                &schemas
-            ),
+            validate_wait_bindings(&AnalysisTree::try_from_file(&parsed)?, &schemas),
             Vec::new()
         );
+        Ok(())
     }
 
     #[test]
-    fn quoted_wait_value_can_traverse_a_string_map() {
+    fn quoted_wait_value_can_traverse_a_string_map() -> Result<(), crate::parser::AnalysisTreeError>
+    {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "test",
@@ -335,16 +334,15 @@ let ready = wait job {
         .expect("fixture must parse");
 
         assert_eq!(
-            validate_wait_bindings(
-                &AnalysisTree::try_from_file(&parsed).expect("parsed wait provenance"),
-                &schemas
-            ),
+            validate_wait_bindings(&AnalysisTree::try_from_file(&parsed)?, &schemas),
             Vec::new()
         );
+        Ok(())
     }
 
     #[test]
-    fn typed_enum_wait_value_can_traverse_an_enum_map() {
+    fn typed_enum_wait_value_can_traverse_an_enum_map()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let status = PatternAttributeType::enum_(
             TypeIdentity::new(Some("test"), ["job", "Job"], "Status"),
             Some(vec!["READY".to_string()]),
@@ -374,16 +372,14 @@ let ready = wait job {
         .expect("fixture must parse");
 
         assert_eq!(
-            validate_wait_bindings(
-                &AnalysisTree::try_from_file(&parsed).expect("parsed wait provenance"),
-                &schemas
-            ),
+            validate_wait_bindings(&AnalysisTree::try_from_file(&parsed)?, &schemas),
             Vec::new()
         );
+        Ok(())
     }
 
     #[test]
-    fn quoted_wait_value_cannot_traverse_a_list() {
+    fn quoted_wait_value_cannot_traverse_a_list() -> Result<(), crate::parser::AnalysisTreeError> {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "test",
@@ -408,19 +404,18 @@ let ready = wait job {
         )
         .expect("fixture must parse");
 
-        let diagnostics = validate_wait_bindings(
-            &AnalysisTree::try_from_file(&parsed).expect("parsed wait provenance"),
-            &schemas,
-        );
+        let diagnostics = validate_wait_bindings(&AnalysisTree::try_from_file(&parsed)?, &schemas);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(
             diagnostics[0].message,
             "wait `ready`: cannot resolve wait attribute path `job.states.first`: `job.states` has type List<String>; only struct fields and map values can be traversed"
         );
+        Ok(())
     }
 
     #[test]
-    fn data_source_wait_is_rejected_while_managed_wait_is_accepted() {
+    fn data_source_wait_is_rejected_while_managed_wait_is_accepted()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let managed_status = PatternAttributeType::enum_(
             TypeIdentity::new(Some("test"), ["lookup", "Job"], "Status"),
             Some(vec!["READY".to_string()]),
@@ -452,12 +447,13 @@ let found = wait lookup {
         .expect("fixture must parse");
 
         assert_eq!(
-            validate_wait_bindings(&AnalysisTree::try_from_file(&parsed).expect("parsed wait provenance"), &schemas).into_iter().map(|diagnostic| diagnostic.into_parts().1).collect::<Vec<_>>(),
+            validate_wait_bindings(&AnalysisTree::try_from_file(&parsed)?, &schemas).into_iter().map(|diagnostic| diagnostic.into_parts().1).collect::<Vec<_>>(),
             vec![WaitDiagnostic {
                 message: "wait `found`: target binding `lookup` is a data source; wait targets must be managed resources".to_string(),
                 binding_name: "found".to_string(),
                 target: "lookup".to_string(),
             }]
         );
+        Ok(())
     }
 }

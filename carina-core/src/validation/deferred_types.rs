@@ -873,7 +873,7 @@ mod partial_catalog_tests {
                 &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .unwrap();
-            let errors = crate::validation::resolve_file_type_exprs(&mut parsed, session);
+            let errors = crate::validation::resolve_file_type_exprs(&mut parsed, session).unwrap();
             assert_eq!(errors.len(), 1, "{errors:#?}");
             assert!(
                 errors[0]
@@ -894,7 +894,8 @@ mod partial_catalog_tests {
                     &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
                 .unwrap();
-                let errors = crate::validation::resolve_file_type_exprs(&mut parsed, session);
+                let errors =
+                    crate::validation::resolve_file_type_exprs(&mut parsed, session).unwrap();
                 assert_eq!(errors.len(), 1, "{errors:#?}");
                 assert!(errors[0].to_string().contains("ready.Missing"));
                 crate::parser::resolve_resource_refs_in_session(&mut parsed, session)
@@ -919,7 +920,9 @@ mod partial_catalog_tests {
             )
             .unwrap();
             assert_eq!(
-                crate::validation::resolve_file_type_exprs(&mut failed, session).len(),
+                crate::validation::resolve_file_type_exprs(&mut failed, session)
+                    .unwrap()
+                    .len(),
                 1
             );
             let mut other = parse_file(
@@ -928,7 +931,11 @@ mod partial_catalog_tests {
                 &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .unwrap();
-            assert!(crate::validation::resolve_file_type_exprs(&mut other, session).is_empty());
+            assert!(
+                crate::validation::resolve_file_type_exprs(&mut other, session)
+                    .unwrap()
+                    .is_empty()
+            );
             crate::parser::resolve_resource_refs_in_session(&mut other, session).unwrap();
         });
         assert_eq!(result.diagnostics().len(), 2);
@@ -959,7 +966,9 @@ mod partial_catalog_tests {
                 )
                 .unwrap();
                 assert!(
-                    crate::validation::resolve_file_type_exprs(&mut parsed, context).is_empty()
+                    crate::validation::resolve_file_type_exprs(&mut parsed, context)
+                        .unwrap()
+                        .is_empty()
                 );
                 assert!(
                     crate::validation::validate_attribute_params_with_context(
@@ -994,7 +1003,8 @@ mod partial_catalog_tests {
                     &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
                 .unwrap();
-                let errors = crate::validation::resolve_file_type_exprs(&mut parsed, context);
+                let errors =
+                    crate::validation::resolve_file_type_exprs(&mut parsed, context).unwrap();
                 assert_eq!(errors.len(), expected_errors, "{source}: {errors:#?}");
                 if errors.is_empty() {
                     crate::validation::validate_attribute_params_with_context(
@@ -1077,7 +1087,11 @@ mod producer_tests {
         parsed: &mut crate::parser::File<E>,
         context: &TypeCheckSession<'_>,
     ) {
-        assert!(crate::validation::resolve_file_type_exprs(parsed, context).is_empty());
+        assert!(
+            crate::validation::resolve_file_type_exprs(parsed, context)
+                .unwrap()
+                .is_empty()
+        );
         crate::parser::resolve_resource_refs_in_session(parsed, context).unwrap();
     }
 
@@ -1256,7 +1270,9 @@ mod producer_tests {
             &crate::parser::LoadedProviderContext::empty_for_test(),
             |loaded| {
                 assert_eq!(
-                    crate::validation::resolve_file_type_exprs(&mut parsed, loaded).len(),
+                    crate::validation::resolve_file_type_exprs(&mut parsed, loaded)
+                        .unwrap()
+                        .len(),
                     1
                 );
             },
@@ -1331,7 +1347,11 @@ mod round6_session_tests {
                 &catalog,
             )
             .unwrap();
-            assert!(crate::validation::resolve_file_type_exprs(&mut parsed, session).is_empty());
+            assert!(
+                crate::validation::resolve_file_type_exprs(&mut parsed, session)
+                    .unwrap()
+                    .is_empty()
+            );
             let TypeExpr::UnloadedSchemaType(unloaded) = parsed.user_functions["f"].params[0]
                 .param_type
                 .as_ref()

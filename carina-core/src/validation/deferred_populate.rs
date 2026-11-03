@@ -306,10 +306,11 @@ mod tests {
     }
 
     #[test]
-    fn list_wrapped_chained_ref_to_deferred_inner_field_is_flagged() {
+    fn list_wrapped_chained_ref_to_deferred_inner_field_is_flagged()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let parsed = parsed_with_unsynchronized_chained_ref();
         let diags = validate_deferred_populate_refs(
-            &AnalysisTree::try_from_file(&parsed).expect("parsed deferred-populate provenance"),
+            &AnalysisTree::try_from_file(&parsed)?,
             &registry_for_acm(),
         );
         assert_eq!(diags.len(), 1, "got: {diags:?}");
@@ -323,59 +324,65 @@ mod tests {
             d.unresolved_path
         );
         assert!(d.message.contains("wait cert"), "got: {}", d.message);
+        Ok(())
     }
 
     #[test]
-    fn parser_side_deferred_resource_body_is_checked() {
+    fn parser_side_deferred_resource_body_is_checked()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let parsed = fixture(
             "arguments { names: list(String) }\nlet cert = aws.acm.Certificate {}\nlet records = for name in names { aws.route53.RecordSet { name = name resource_records = [cert.domain_validation_options[0].resource_record_value] } }\n",
         );
         let diags = validate_deferred_populate_refs(
-            &AnalysisTree::try_from_file(&parsed).expect("parsed deferred-populate provenance"),
+            &AnalysisTree::try_from_file(&parsed)?,
             &registry_for_acm(),
         );
         assert_eq!(diags.len(), 1, "got: {diags:?}");
         assert_eq!(diags[0].target_binding, "cert");
+        Ok(())
     }
 
     #[test]
-    fn wait_block_on_target_binding_satisfies_the_rule() {
+    fn wait_block_on_target_binding_satisfies_the_rule()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let parsed = fixture(
             "let cert = aws.acm.Certificate {}\nlet record = aws.route53.RecordSet { resource_records = [cert.domain_validation_options[0].resource_record_value] }\nlet ready = wait cert { until = cert.status == 'ISSUED' }\n",
         );
         let diags = validate_deferred_populate_refs(
-            &AnalysisTree::try_from_file(&parsed).expect("parsed deferred-populate provenance"),
+            &AnalysisTree::try_from_file(&parsed)?,
             &registry_for_acm(),
         );
         assert!(diags.is_empty(), "got: {diags:?}");
+        Ok(())
     }
 
     #[test]
-    fn chained_ref_to_non_deferred_inner_field_is_not_flagged() {
+    fn chained_ref_to_non_deferred_inner_field_is_not_flagged()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let p = fixture(
             "let cert = aws.acm.Certificate {}\nlet record = aws.route53.RecordSet { name = cert.domain_validation_options[0].domain_name }\n",
         );
-        let diags = validate_deferred_populate_refs(
-            &AnalysisTree::try_from_file(&p).expect("parsed deferred-populate provenance"),
-            &registry_for_acm(),
-        );
+        let diags =
+            validate_deferred_populate_refs(&AnalysisTree::try_from_file(&p)?, &registry_for_acm());
         assert!(diags.is_empty(), "got: {diags:?}");
+        Ok(())
     }
 
     #[test]
-    fn unknown_target_binding_does_not_emit_double_diagnostic() {
+    fn unknown_target_binding_does_not_emit_double_diagnostic()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let p = fixture(
             "let record = aws.route53.RecordSet { resource_records = [typo_cert.domain_validation_options[0].resource_record_value] }\n",
         );
-        let diags = validate_deferred_populate_refs(
-            &AnalysisTree::try_from_file(&p).expect("parsed deferred-populate provenance"),
-            &registry_for_acm(),
-        );
+        let diags =
+            validate_deferred_populate_refs(&AnalysisTree::try_from_file(&p)?, &registry_for_acm());
         assert!(diags.is_empty(), "got: {diags:?}");
+        Ok(())
     }
 
     #[test]
-    fn top_level_attribute_marked_deferred_flags_any_segment_chain() {
+    fn top_level_attribute_marked_deferred_flags_any_segment_chain()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // Mirror RDS DBInstance.endpoint shape: the whole attribute
         // is undefined immediately post-Create.
         let schema = PatternResourceSchema::new("rds.DBInstance").attribute(
@@ -411,25 +418,22 @@ mod tests {
         let p = fixture(
             "let db = aws.rds.DBInstance {}\nlet i = aws.ec2.Instance { user_data = db.endpoint.address }\n",
         );
-        let diags = validate_deferred_populate_refs(
-            &AnalysisTree::try_from_file(&p).expect("parsed deferred-populate provenance"),
-            &r,
-        );
+        let diags = validate_deferred_populate_refs(&AnalysisTree::try_from_file(&p)?, &r);
         assert_eq!(diags.len(), 1, "got: {diags:?}");
         assert_eq!(diags[0].target_binding, "db");
+        Ok(())
     }
 
     #[test]
-    fn schema_lookup_miss_does_not_panic_or_emit() {
+    fn schema_lookup_miss_does_not_panic_or_emit() -> Result<(), crate::parser::AnalysisTreeError> {
         let p = fixture(
             "let x = aws.unknown.thing {}\nlet record = aws.route53.RecordSet { resource_records = [x.domain_validation_options[0].resource_record_value] }\n",
         );
-        let diags = validate_deferred_populate_refs(
-            &AnalysisTree::try_from_file(&p).expect("parsed deferred-populate provenance"),
-            &registry_for_acm(),
-        );
+        let diags =
+            validate_deferred_populate_refs(&AnalysisTree::try_from_file(&p)?, &registry_for_acm());
         // Schema for "unknown.thing" missing means nothing to check;
         // crucially no panic.
         assert!(diags.is_empty(), "got: {diags:?}");
+        Ok(())
     }
 }

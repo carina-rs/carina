@@ -1273,7 +1273,7 @@ pub enum AppError {
 
     /// Invalid parser/expansion provenance at the sealed analysis boundary.
     #[error(transparent)]
-    AnalysisInvariant(carina_core::parser::AnalysisTreeError),
+    AnalysisInvariant(#[from] carina_core::parser::AnalysisTreeError),
 
     #[error("{0}")]
     DependsOn(

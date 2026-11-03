@@ -36,7 +36,8 @@ fn assert_location(location: &DeclarationLocation, file: &Path, source: &str, de
 }
 
 #[test]
-fn directory_declaration_provenance_covers_named_anonymous_static_and_deferred_bodies() {
+fn directory_declaration_provenance_covers_named_anonymous_static_and_deferred_bodies()
+-> Result<(), carina_core::parser::AnalysisTreeError> {
     let main = "arguments { enabled: Bool names: list(String) }\nlet names_now = ['a', 'b']\nlet remote = upstream_state { source = '../remote' }\n";
     let sibling = "\
 let named = mock.test.Resource { name = 'named' }
@@ -68,7 +69,7 @@ let selected_read = if enabled { read mock.test.Lookup { name = 'then read' } } 
         .unwrap()
         .1
         .into_inner();
-    let analysis = AnalysisTree::try_from_file(&parsed).expect("complete parser provenance");
+    let analysis = AnalysisTree::try_from_file(&parsed)?;
     let declarations = [
         ("mock.test.Resource { name = 'named' }", 1),
         ("mock.test.Resource { name = 'anonymous' }", 1),
@@ -106,6 +107,7 @@ let selected_read = if enabled { read mock.test.Lookup { name = 'then read' } } 
         sibling,
         "wait named { until = named.status == 'ready' }",
     );
+    Ok(())
 }
 
 struct NoTypeErrors;
@@ -129,7 +131,8 @@ fn expand_directory(root: &Path) -> carina_core::parser::ExpandedParsedFile {
 }
 
 #[test]
-fn review_round1_module_private_bindings_do_not_enter_root_iterable_scope() {
+fn review_round1_module_private_bindings_do_not_enter_root_iterable_scope()
+-> Result<(), carina_core::parser::AnalysisTreeError> {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("module")).unwrap();
     let sibling = "for x in vpc.ids { mock.test.Resource { name = x } }\n";
@@ -156,7 +159,7 @@ fn review_round1_module_private_bindings_do_not_enter_root_iterable_scope() {
         resolve_modules_providerless(parsed, &path, session).unwrap()
     })
     .publish(&mut NoTypeErrors);
-    let tree = AnalysisTree::try_from_file(&expanded).unwrap();
+    let tree = AnalysisTree::try_from_file(&expanded)?;
     let findings = carina_core::validation::validate_for_iterable_bindings(&tree);
     assert_eq!(
         findings.len(),
@@ -174,10 +177,12 @@ fn review_round1_module_private_bindings_do_not_enter_root_iterable_scope() {
             .to_string()
             .contains("Undefined identifier `vpc`")
     );
+    Ok(())
 }
 
 #[test]
-fn review_round1_root_and_module_loops_at_the_same_span_keep_distinct_files() {
+fn review_round1_root_and_module_loops_at_the_same_span_keep_distinct_files()
+-> Result<(), carina_core::parser::AnalysisTreeError> {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("module")).unwrap();
     let loop_source = "for x in ['one'] { mock.test.Resource { name = x } }\n";
@@ -193,7 +198,7 @@ fn review_round1_root_and_module_loops_at_the_same_span_keep_distinct_files() {
     )
     .unwrap();
     let expanded = expand_directory(root.path());
-    let tree = AnalysisTree::try_from_file(&expanded).unwrap();
+    let tree = AnalysisTree::try_from_file(&expanded)?;
     let loops: Vec<_> = tree
         .resources()
         .filter(|item| item.kind() != AnalysisItemKind::Composition)
@@ -213,10 +218,12 @@ fn review_round1_root_and_module_loops_at_the_same_span_keep_distinct_files() {
         .into_iter()
         .collect()
     );
+    Ok(())
 }
 
 #[test]
-fn directory_declaration_provenance_survives_module_expansion_and_renamed_ids() {
+fn directory_declaration_provenance_survives_module_expansion_and_renamed_ids()
+-> Result<(), carina_core::parser::AnalysisTreeError> {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("child")).unwrap();
     let main = "let child = use { source = './child' }\nlet remote = upstream_state { source = '../remote' }\n";
@@ -243,7 +250,7 @@ let selected_read = if enabled { read mock.test.Lookup { name = 'then read' } } 
     }
     let config = context();
     let expanded = expand_directory(root.path());
-    let analysis = AnalysisTree::try_from_file(&expanded).expect("expanded provenance");
+    let analysis = AnalysisTree::try_from_file(&expanded)?;
     assert_eq!(analysis.resources().count(), 20);
     let child_path = root.path().join("child/sibling.crn");
     let caller_path = root.path().join("sibling.crn");
@@ -343,7 +350,7 @@ let selected_read = if enabled { read mock.test.Lookup { name = 'then read' } } 
         .publish(&mut NoTypeErrors);
         let mut child_tree = carina_core::parser::ExpandedParsedFile::default();
         child_tree.resources = children;
-        let analysis = AnalysisTree::try_from_file(&child_tree).unwrap();
+        let analysis = AnalysisTree::try_from_file(&child_tree)?;
         let item = analysis.resources().next().unwrap();
         assert_ne!(item.id(), deferred.template_resource_id());
         let declaration = if item.binding().unwrap().contains(".generated[") {
@@ -368,10 +375,12 @@ let selected_read = if enabled { read mock.test.Lookup { name = 'then read' } } 
         }
     ));
     assert_eq!(unlocated.compositions, expanded.compositions);
+    Ok(())
 }
 
 #[test]
-fn directory_declaration_provenance_preserves_nested_composition_call_sites() {
+fn directory_declaration_provenance_preserves_nested_composition_call_sites()
+-> Result<(), carina_core::parser::AnalysisTreeError> {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(root.path().join("outer/inner")).unwrap();
     let caller = "let inst = outer {}\n";
@@ -391,7 +400,7 @@ fn directory_declaration_provenance_preserves_nested_composition_call_sites() {
         std::fs::write(root.path().join(file), source).unwrap();
     }
     let expanded = expand_directory(root.path());
-    let analysis = AnalysisTree::try_from_file(&expanded).unwrap();
+    let analysis = AnalysisTree::try_from_file(&expanded)?;
     assert_eq!(analysis.resources().count(), 3);
     for item in analysis.resources() {
         match item.binding() {
@@ -416,10 +425,12 @@ fn directory_declaration_provenance_preserves_nested_composition_call_sites() {
             binding => panic!("unexpected binding {binding:?}"),
         }
     }
+    Ok(())
 }
 
 #[test]
-fn directory_declaration_provenance_uses_original_unicode_crlf_and_heredoc_spans() {
+fn directory_declaration_provenance_uses_original_unicode_crlf_and_heredoc_spans()
+-> Result<(), carina_core::parser::AnalysisTreeError> {
     let source = "// 東京\r\nlet named = mock.test.Resource {\r\n  doc = <<EOT\r\n日本語\r\nsecond line\r\nEOT\r\n}\r\nlet ready = wait named { until = named.status == 'ready' }\r\nlet lookup = read mock.test.Lookup { name = 'after' }\r\n";
     let sibling_path = PathBuf::from("/fixture/sibling.crn");
     let files = parse_directory_files(
@@ -436,7 +447,7 @@ fn directory_declaration_provenance_uses_original_unicode_crlf_and_heredoc_spans
         .unwrap()
         .1
         .into_inner();
-    let analysis = AnalysisTree::try_from_file(&parsed).unwrap();
+    let analysis = AnalysisTree::try_from_file(&parsed)?;
     for item in analysis.resources() {
         let declaration = match item.binding() {
             Some("named") => {
@@ -457,10 +468,12 @@ fn directory_declaration_provenance_uses_original_unicode_crlf_and_heredoc_spans
         source,
         "wait named { until = named.status == 'ready' }",
     );
+    Ok(())
 }
 
 #[test]
-fn declaration_provenance_is_semantically_neutral_and_not_serialized() {
+fn declaration_provenance_is_semantically_neutral_and_not_serialized()
+-> Result<(), carina_core::parser::AnalysisTreeError> {
     let source = "let named = mock.test.Resource { name = 'same' }\nlet lookup = read mock.test.Lookup { name = 'same' }\n";
     let files = parse_directory_files(
         &[
@@ -494,7 +507,7 @@ fn declaration_provenance_is_semantically_neutral_and_not_serialized() {
     assert_eq!(hashes[0], hashes[1]);
     let sibling = parsed.pop().unwrap();
     parsed[0].resources.extend(sibling.resources);
-    let analysis = AnalysisTree::try_from_file(&parsed[0]).unwrap();
+    let analysis = AnalysisTree::try_from_file(&parsed[0])?;
     let locations: Vec<_> = analysis
         .resources()
         .filter(|item| item.kind() == AnalysisItemKind::Resource)
@@ -505,6 +518,7 @@ fn declaration_provenance_is_semantically_neutral_and_not_serialized() {
         locations[0], locations[1],
         "equal infrastructure ids retain both declarations"
     );
+    Ok(())
 }
 
 #[test]
@@ -527,7 +541,8 @@ fn analysis_tree_rejects_missing_declaration_provenance() {
 }
 
 #[test]
-fn element_provenance_survives_module_expansion_and_deferred_phase_changes() {
+fn element_provenance_survives_module_expansion_and_deferred_phase_changes()
+-> Result<(), carina_core::parser::AnalysisTreeError> {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("child")).unwrap();
     let main = "let child = use { source = './child' }\nlet remote = upstream_state { source = '../remote' }\nlet instance = child { names = remote.items }\n";
@@ -536,7 +551,7 @@ fn element_provenance_survives_module_expansion_and_deferred_phase_changes() {
     let child_path = root.path().join("child/main.crn");
     std::fs::write(&child_path, child).unwrap();
     let expanded = expand_directory(root.path());
-    let tree = AnalysisTree::try_from_file(&expanded).expect("expanded element provenance");
+    let tree = AnalysisTree::try_from_file(&expanded)?;
     let consumer = tree
         .resources()
         .find(|resource| {
@@ -610,10 +625,12 @@ fn element_provenance_survives_module_expansion_and_deferred_phase_changes() {
         })
         .unwrap();
     assert_location(output.location(), &child_path, child, "output");
+    Ok(())
 }
 
 #[test]
-fn module_argument_forwarding_preserves_reference_occurrences() {
+fn module_argument_forwarding_preserves_reference_occurrences()
+-> Result<(), carina_core::parser::AnalysisTreeError> {
     let root = tempfile::tempdir().unwrap();
     for directory in ["outer", "inner"] {
         std::fs::create_dir(root.path().join(directory)).unwrap();
@@ -642,7 +659,7 @@ fn module_argument_forwarding_preserves_reference_occurrences() {
     .publish(&mut NoTypeErrors)
     .into_expanded(&carina_core::schema::SchemaRegistry::new(), &config)
     .unwrap();
-    let tree = AnalysisTree::try_from_file(&expanded).expect("forwarded reference provenance");
+    let tree = AnalysisTree::try_from_file(&expanded)?;
     let composition = tree
         .resources()
         .find(|item| item.binding() == Some("instance.nested"))
@@ -673,4 +690,5 @@ fn module_argument_forwarding_preserves_reference_occurrences() {
         );
     }
     assert_ne!(references[1].location(), references[2].location());
+    Ok(())
 }

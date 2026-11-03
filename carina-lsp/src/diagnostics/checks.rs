@@ -22,7 +22,8 @@ use carina_core::schema::suggest_similar_name;
 use carina_core::validation::typecheck::{self, TypecheckInference};
 
 use super::{
-    DiagnosticRun, ProviderValidationDeduplicator, carina_diagnostic, render_merged, render_parse,
+    DiagnosticRun, ProviderValidationDeduplicator, carina_diagnostic, render_analysis_invariant,
+    render_merged, render_parse,
 };
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
@@ -30,6 +31,7 @@ type ResolvedBindings = GenericResolvedBindings<ParserPlaceholder, RelativeBindi
 
 /// Directory parse plus the typed module-resolution outcome.
 pub(super) struct MergedParseResult {
+    pub(super) analysis_errors: Vec<carina_core::parser::AnalysisTreeError>,
     pub(super) directory: DirectoryParseResult,
     pub(super) module_resolution: MergedModuleResolution,
 }
@@ -859,7 +861,10 @@ impl DiagnosticRun<'_> {
         parsed: &ParsedFile,
         base_path: &carina_core::paths::ResolvedPath,
         overrides: &carina_core::config_loader::SourceOverrides,
-    ) -> Vec<carina_core::validation::ModuleCallFinding> {
+    ) -> Result<
+        Vec<carina_core::validation::ModuleCallFinding>,
+        carina_core::parser::AnalysisTreeError,
+    > {
         let pinned_base = Some(base_path.clone());
         let signatures = pinned_base
             .as_ref()
@@ -934,8 +939,21 @@ impl DiagnosticRun<'_> {
             doc.source_file().to_path_buf(),
             doc.text(),
         )]);
-        let covered_findings =
-            self.module_call_findings_for_resolution(&result.parsed, base_path, &source_overrides);
+        let (covered_findings, analysis_errors) = match self.module_call_findings_for_resolution(
+            &result.parsed,
+            base_path,
+            &source_overrides,
+        ) {
+            Ok(findings) => (findings, Vec::new()),
+            Err(error) => (Vec::new(), vec![error]),
+        };
+        if !analysis_errors.is_empty() {
+            return Ok(MergedParseResult {
+                directory: result,
+                module_resolution: MergedModuleResolution::Unowned { errors: Vec::new() },
+                analysis_errors,
+            });
+        }
         // Module expansion is a no-op for configs without `module_call`.
         // Failures retain the authored parse for source-level checks; only the
         // successful outcome can replace it with the expanded graph.
@@ -970,6 +988,7 @@ impl DiagnosticRun<'_> {
         Ok(MergedParseResult {
             directory: result,
             module_resolution,
+            analysis_errors,
         })
     }
 
@@ -980,6 +999,9 @@ impl DiagnosticRun<'_> {
         residual: &carina_core::module_resolver::ResidualModuleResolutionError,
         base: &carina_core::paths::ResolvedPath,
     ) -> Vec<Diagnostic> {
+        if let Some(error) = residual.analysis_invariant() {
+            return render_analysis_invariant(doc, error).into_iter().collect();
+        }
         let message = residual.display_relative_to(&base.source_label());
         let element = residual.element_diagnostic();
         let mut diagnostics = element
@@ -1708,6 +1730,10 @@ impl DiagnosticRun<'_> {
                     loaded_providers.schemas(),
                     self.provider_context.catalog(),
                 );
+            let provider_inferred = match provider_inferred {
+                Ok(inferred) => inferred,
+                Err(error) => return render_analysis_invariant(doc, &error).into_iter().collect(),
+            };
             // Surface inference failures as "type annotation required"
             // diagnostics, anchored at the export name. Errors for
             // exports declared in sibling `.crn` files (visible only via
@@ -2004,15 +2030,34 @@ impl DiagnosticRun<'_> {
         tree: &carina_core::parser::AnalysisTree<'_>,
         argument_types: &carina_core::validation::ResolvedArgumentTypes,
     ) -> Vec<Diagnostic> {
-        use carina_core::validation::depends_on::{Severity, validate_depends_on};
+        use carina_core::validation::depends_on::{
+            DependsOnDiagnosticKind, Severity, validate_depends_on,
+        };
         validate_depends_on(tree, argument_types)
             .into_iter()
-            .filter_map(|finding| {
+            .flat_map(|finding| {
                 let severity = match finding.severity {
                     Severity::Error => DiagnosticSeverity::ERROR,
                     Severity::Warning => DiagnosticSeverity::WARNING,
                 };
-                render_merged(doc, &finding, severity, finding.message.clone())
+                match &finding.kind {
+                    DependsOnDiagnosticKind::Cycle { cycle } => cycle
+                        .members
+                        .iter()
+                        .filter_map(|member| {
+                            let member = carina_core::parser::Located::new(
+                                member.location.clone(),
+                                &finding.message,
+                            );
+                            render_merged(doc, &member, severity, finding.message.clone())
+                        })
+                        .collect::<Vec<_>>(),
+                    DependsOnDiagnosticKind::Element { .. } => {
+                        render_merged(doc, &finding, severity, finding.message.clone())
+                            .into_iter()
+                            .collect()
+                    }
+                }
             })
             .collect()
     }

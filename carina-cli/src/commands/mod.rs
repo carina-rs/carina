@@ -463,6 +463,10 @@ fn extend_module_resolution_errors(
     let base_label = base_dir.source_label();
     let base_dir = base_label.as_path();
     for residual in residuals {
+        if let Some(error) = residual.analysis_invariant() {
+            errors.push(AppError::AnalysisInvariant(error.clone()));
+            continue;
+        }
         let message = if residual.is_constraint() {
             residual.display_relative_to(base_dir)
         } else {
@@ -562,10 +566,16 @@ pub(crate) fn validate_and_resolve_errors_inner(
     }
 
     if !skip_resource_validation {
-        let schema_checked_exports = parsed.retry_unchecked_export_inference(
+        let schema_checked_exports = match parsed.retry_unchecked_export_inference(
             ctx.loaded_provider_schemas(),
             enriched_context.catalog(),
-        );
+        ) {
+            Ok(checked) => checked,
+            Err(error) => {
+                errors.push(AppError::AnalysisInvariant(error));
+                return Err(non_empty_validation_failure(errors));
+            }
+        };
         errors.extend(
             carina_core::validation::inference::attached_inference_failures(schema_checked_exports)
                 .map(|failure| AppError::Validation(failure.to_string())),
@@ -602,7 +612,13 @@ pub(crate) fn validate_and_resolve_errors_inner(
     // removed type cannot ride into apply. The recursive module-call checker
     // below runs this same typed resolver over every imported module.
     let mut root_type_resolution_findings = Vec::new();
-    let type_resolution = parsed.resolve_type_exprs_report(enriched_context);
+    let type_resolution = match parsed.resolve_type_exprs_report(enriched_context) {
+        Ok(report) => report,
+        Err(error) => {
+            errors.push(AppError::AnalysisInvariant(error));
+            return Err(non_empty_validation_failure(errors));
+        }
+    };
     let resolved_argument_types = type_resolution.resolved_argument_types().clone();
     for diagnostic in type_resolution.into_diagnostics() {
         root_type_resolution_findings
@@ -674,6 +690,14 @@ pub(crate) fn validate_and_resolve_errors_inner(
             bindings: &module_call_bindings,
             reference_checks,
         })
+    };
+
+    let authored_module_call_findings = match authored_module_call_findings {
+        Ok(findings) => findings,
+        Err(error) => {
+            errors.push(AppError::AnalysisInvariant(error));
+            return Err(non_empty_validation_failure(errors));
+        }
     };
 
     // User-facing checks for root-owned blocks inside modules run on the
@@ -872,12 +896,18 @@ pub(crate) fn validate_and_resolve_errors_inner(
         None
     };
     let (upstream_exports, upstream_resolve_errors) = if let Some(analysis) = &expanded_analysis {
-        carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
+        match carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
             base_dir,
             analysis,
             enriched_context,
             Some(ctx.schemas()),
-        )
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                errors.push(AppError::AnalysisInvariant(error));
+                return Err(non_empty_validation_failure(errors));
+            }
+        }
     } else {
         (Default::default(), Vec::new())
     };
@@ -939,7 +969,14 @@ pub(crate) fn validate_and_resolve_errors_inner(
             &HashSet::new(),
             &bindings,
         ) {
-            errors.extend(split_validation_message(&message));
+            match message {
+                carina_core::validation::ResourceRefTypeValidationError::Validation(message) => {
+                    errors.extend(split_validation_message(&message))
+                }
+                carina_core::validation::ResourceRefTypeValidationError::AnalysisInvariant(
+                    error,
+                ) => errors.push(AppError::AnalysisInvariant(error)),
+            }
         }
         if let Err(message) =
             carina_core::validation::validate_attribute_param_ref_types_with_bindings(

@@ -84,6 +84,7 @@ pub struct UnexpandedDependencies<B: BindingAddress = RelativeBindingName> {
     // Value-reference origins survive eager value resolution alongside the
     // explicit operands. They do not contribute to len/is_empty or semantics.
     reference_origins: Vec<crate::resource::AccessPath<B>>,
+    binding_reference_origins: Vec<super::Located<B>>,
 }
 
 impl<B: BindingAddress> Default for UnexpandedDependencies<B> {
@@ -91,6 +92,7 @@ impl<B: BindingAddress> Default for UnexpandedDependencies<B> {
         Self {
             operands: Vec::new(),
             reference_origins: Vec::new(),
+            binding_reference_origins: Vec::new(),
         }
     }
 }
@@ -101,6 +103,7 @@ impl<B: BindingAddress> UnexpandedDependencies<B> {
         Self {
             operands,
             reference_origins: Vec::new(),
+            binding_reference_origins: Vec::new(),
         }
     }
 
@@ -126,6 +129,12 @@ impl<B: BindingAddress> UnexpandedDependencies<B> {
     }
     pub(crate) fn set_reference_origins(&mut self, origins: Vec<crate::resource::AccessPath<B>>) {
         self.reference_origins = origins;
+    }
+    pub(crate) fn binding_reference_origins(&self) -> &[super::Located<B>] {
+        &self.binding_reference_origins
+    }
+    pub(crate) fn set_binding_reference_origins(&mut self, origins: Vec<super::Located<B>>) {
+        self.binding_reference_origins = origins;
     }
     pub(in crate::parser) fn record_reference_origins<P: crate::resource::ValueKind>(
         &mut self,
@@ -158,6 +167,7 @@ impl<B: BindingAddress> UnexpandedDependencies<B> {
         Ok(UnexpandedDependencies {
             operands,
             reference_origins: Vec::new(),
+            binding_reference_origins: Vec::new(),
         })
     }
 
@@ -203,10 +213,87 @@ impl<B: BindingAddress> UnexpandedDependencies<B> {
                 .into_iter()
                 .map(|path| path.map_bindings(map))
                 .collect(),
+            binding_reference_origins: self
+                .binding_reference_origins
+                .into_iter()
+                .map(|origin| {
+                    let (location, binding) = origin.into_parts();
+                    super::Located::new(location, map(binding))
+                })
+                .collect(),
         }
     }
 }
 impl UnexpandedDependencies<RelativeBindingName> {
+    pub(in crate::parser) fn record_binding_reference_origins<P: crate::resource::ValueKind>(
+        &mut self,
+        attributes: &indexmap::IndexMap<String, crate::resource::Value<P, RelativeBindingName>>,
+        syntax: &pest::iterators::Pair<'_, super::Rule>,
+        file: &super::PreprocessedFile,
+        source: &std::path::Path,
+        context: &super::context::ParseContext<'_>,
+    ) -> Result<(), super::ParseError> {
+        use crate::resource::{PathSegment, Subscript, binding_address};
+        let mut bindings = std::collections::HashSet::new();
+        for value in attributes.values() {
+            value.visit_binding_refs(&mut |binding| {
+                bindings.insert(binding.clone());
+            });
+        }
+        if bindings.is_empty() {
+            return Ok(());
+        }
+        for reference in syntax
+            .clone()
+            .into_inner()
+            .flatten()
+            .filter(|pair| pair.as_rule() == super::Rule::variable_ref)
+        {
+            let mut parts = reference.clone().into_inner();
+            let Some(name) = parts.next() else {
+                continue;
+            };
+            let mut binding = match context.lookup_binding(name.as_str()) {
+                super::context::ParseBindingRef::Structural(handle) => {
+                    handle.canonical_binding().clone()
+                }
+                super::context::ParseBindingRef::Value { .. }
+                | super::context::ParseBindingRef::Unbound => {
+                    RelativeBindingName::new(name.as_str())
+                }
+            };
+            let selected_prefix = format!("{}[", binding.as_str());
+            if !bindings.contains(&binding)
+                && !bindings
+                    .iter()
+                    .any(|binding| binding.as_str().starts_with(&selected_prefix))
+            {
+                continue;
+            }
+            for step in parts {
+                binding =
+                    match super::expressions::primary::parse_postfix_path_segment(step, context)? {
+                        PathSegment::Subscript {
+                            index: Subscript::Int { index },
+                        } => binding_address::binding_with_index(&binding, index),
+                        PathSegment::Subscript {
+                            index: Subscript::Str { key },
+                        } => binding_address::binding_with_map_key(&binding, &key),
+                        PathSegment::Field { name } => {
+                            binding_address::binding_selected_attribute(&binding, &name)
+                        }
+                    };
+            }
+            if bindings.contains(&binding) {
+                self.binding_reference_origins.push(super::Located::new(
+                    super::DeclarationLocation::from_pair(&reference, file, source),
+                    binding,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn resolve_bindings(
         self,
         resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,

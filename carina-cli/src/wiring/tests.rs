@@ -11658,6 +11658,7 @@ fn module_checker_and_provider_wrappers_accept_empty_input() {
                     reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
                 },
             )
+            .unwrap()
         });
     assert!(findings.is_empty(), "module_calls: got {findings:?}");
 

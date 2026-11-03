@@ -62,15 +62,16 @@ impl LintFile {
     fn resolve_type_exprs_best_effort(
         &mut self,
         context: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
-    ) {
+    ) -> Result<(), carina_core::parser::AnalysisTreeError> {
         match self {
             Self::Blocked(parsed) => {
-                parsed.resolve_type_exprs_report(context);
+                parsed.resolve_type_exprs_report(context)?;
             }
             Self::Resolved(parsed) => {
-                carina_core::validation::resolve_file_type_exprs_best_effort(parsed, context);
+                carina_core::validation::resolve_file_type_exprs_best_effort(parsed, context)?;
             }
         }
+        Ok(())
     }
     fn export_handle_errors(&self) -> Option<Vec<carina_core::validation::ExportBoundaryError>> {
         match self {
@@ -318,7 +319,7 @@ fn lint_result(
         &authority,
         |catalog| {
             let mut type_findings = parsed
-                .resolve_type_exprs_report(catalog)
+                .resolve_type_exprs_report(catalog)?
                 .into_diagnostics()
                 .into_iter()
                 .map(|error| error.to_string())
@@ -341,7 +342,7 @@ fn lint_result(
                     carina_core::validation::resolve_file_type_exprs(
                         &mut module.loaded().parsed.clone(),
                         catalog,
-                    )
+                    )?
                     .into_iter()
                     .map(|error| error.to_string()),
                 );
@@ -371,7 +372,7 @@ fn lint_result(
                 LintFile::Blocked(parsed)
             };
 
-            parsed.resolve_type_exprs_best_effort(catalog);
+            parsed.resolve_type_exprs_best_effort(catalog)?;
             let export_handle_errors = parsed.export_handle_errors();
 
             // Collect source texts for each .crn file

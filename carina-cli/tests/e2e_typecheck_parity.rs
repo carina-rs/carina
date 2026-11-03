@@ -676,7 +676,8 @@ fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &Schema
                 bindings: &bindings,
                 reference_checks: carina_core::validation::ModuleCallReferenceChecks::Enabled,
             },
-        );
+        )
+        .unwrap();
         match carina_core::module_resolver::resolve_modules_with_diagnostics(
             &directory.parsed,
             &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),

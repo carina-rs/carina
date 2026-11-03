@@ -25,8 +25,8 @@ use crate::parser::{AnalysisReference, AnalysisTree, Located, TypeExpr, Upstream
 #[cfg(test)]
 use crate::parser::{LoadedProviderContext, ProviderContext};
 use crate::resource::{
-    AbsoluteBindingAddress, BindingAddress, DeferredValue, ParserPlaceholder, RelativeBindingName,
-    Subscript, Value,
+    AbsoluteBindingAddress, BindingAddress, ParserPlaceholder, RelativeBindingName, Subscript,
+    Value,
 };
 use crate::schema::suggest_similar_name;
 use crate::static_type::ConsumerExportStaticType;
@@ -212,7 +212,10 @@ pub fn resolve_upstream_exports<D, B: BindingAddress>(
     base_dir: &ResolvedPath,
     tree: &UpstreamAnalysis<'_, D, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> (UpstreamExports<B>, Vec<Located<UpstreamResolveError>>)
+) -> Result<
+    (UpstreamExports<B>, Vec<Located<UpstreamResolveError>>),
+    crate::parser::AnalysisTreeError,
+>
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
@@ -224,7 +227,10 @@ pub fn resolve_upstream_exports_with_schemas<D, B: BindingAddress>(
     tree: &UpstreamAnalysis<'_, D, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
-) -> (UpstreamExports<B>, Vec<Located<UpstreamResolveError>>)
+) -> Result<
+    (UpstreamExports<B>, Vec<Located<UpstreamResolveError>>),
+    crate::parser::AnalysisTreeError,
+>
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
@@ -243,7 +249,10 @@ pub fn resolve_upstream_exports_with_schemas_and_overrides<D, B: BindingAddress>
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
     overrides: &crate::config_loader::SourceOverrides,
-) -> (UpstreamExports<B>, Vec<Located<UpstreamResolveError>>)
+) -> Result<
+    (UpstreamExports<B>, Vec<Located<UpstreamResolveError>>),
+    crate::parser::AnalysisTreeError,
+>
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
@@ -256,7 +265,7 @@ where
             config,
             schemas,
             overrides,
-        );
+        )?;
         exports.extend(resolved);
         findings.extend(
             errors
@@ -264,7 +273,7 @@ where
                 .map(|error| Located::new(state.location().clone(), error)),
         );
     }
-    (exports, findings)
+    Ok((exports, findings))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -311,7 +320,8 @@ pub fn discover_upstream_exports<B: BindingAddress>(
         schemas,
         &Default::default(),
     )
-    .0
+    .map(|(exports, _)| exports)
+    .unwrap_or_default()
 }
 
 fn resolve_upstream_exports_with_context<B: BindingAddress>(
@@ -320,7 +330,7 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
     overrides: &crate::config_loader::SourceOverrides,
-) -> (UpstreamExports<B>, Vec<UpstreamResolveError>) {
+) -> Result<(UpstreamExports<B>, Vec<UpstreamResolveError>), crate::parser::AnalysisTreeError> {
     let provider_context =
         crate::validation::typecheck::TypecheckProviderContext::for_session(config);
     let mut out: UpstreamExports<B> = HashMap::new();
@@ -356,7 +366,7 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
                 // structural TypeExpr values it receives, so leaving one
                 // declaration as DottedUnresolved while an equivalent schema
                 // projection is already SchemaType creates a false mismatch.
-                crate::validation::resolve_file_type_exprs_best_effort(&mut parsed, config);
+                crate::validation::resolve_file_type_exprs_best_effort(&mut parsed, config)?;
                 // Expand module calls before inference so that
                 // `attributes { ... }`-typed `Virtual` resources land in
                 // `parsed.resources` (#2493). Without this the inferer
@@ -392,6 +402,11 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
                 let parsed = match module_resolution {
                     Ok(parsed) => parsed,
                     Err(reason) => {
+                        if let crate::module_resolver::ModuleError::AnalysisInvariant(error) =
+                            reason.root_cause()
+                        {
+                            return Err(error.clone());
+                        }
                         errors.push(UpstreamResolveError {
                             binding: us.binding.to_string(),
                             source: us.source.clone(),
@@ -516,7 +531,7 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
             }
         }
     }
-    (out, errors)
+    Ok((out, errors))
 }
 
 /// Walk a parsed project and return an error for every reference whose root
@@ -602,7 +617,7 @@ fn check_upstream_state_field_references_inner<
             },
         ));
     };
-    for occurrence in parsed.value_references() {
+    for occurrence in parsed.upstream_field_references() {
         if include_typed_consumers || !occurrence.typed_consumer() {
             check(
                 occurrence.reference(),
@@ -613,11 +628,9 @@ fn check_upstream_state_field_references_inner<
     }
     for deferred in parsed.for_iterables() {
         let context = format!("for-expression `{}`", deferred.header());
-        deferred
-            .iterable()
-            .visit_resource_refs_with_usage(&mut |path, usage| {
-                check(deferred.reference_for_path(path), usage, &context);
-            });
+        for (reference, usage) in deferred.reference_occurrences() {
+            check(reference, usage, &context);
+        }
     }
 
     // HashMap-backed walks (parsed.variables, resource.attributes,
@@ -635,14 +648,6 @@ fn check_upstream_state_field_references_inner<
                 b.binding.as_str(),
                 b.field.as_str(),
             ))
-    });
-    let mut seen = std::collections::HashSet::new();
-    errors.retain(|error| {
-        seen.insert((
-            error.location().clone(),
-            error.binding.clone(),
-            error.field.clone(),
-        ))
     });
     errors
 }
@@ -787,58 +792,19 @@ where
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    fn visit_possible_iterables<P, B>(
-        value: &Value<P, B>,
-        f: &mut impl FnMut(&crate::resource::AccessPath<B>),
-    ) where
-        P: crate::resource::PlaceholderKind,
-        B: BindingAddress,
-    {
-        match value {
-            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
-                deferred
-                    .values()
-                    .into_iter()
-                    .for_each(|value| visit_possible_iterables(value, f));
-            }
-            Value::Deferred(DeferredValue::ResourceRef { path }) => f(path),
-            Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-                visit_possible_iterables(value, f);
-                visit_possible_iterables(default, f);
-            }
-            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-                visit_possible_iterables(expression.lhs(), f);
-                visit_possible_iterables(expression.rhs(), f);
-            }
-            Value::Deferred(DeferredValue::Secret(inner)) => visit_possible_iterables(inner, f),
-            // References inside a function argument constrain that argument,
-            // not the function result used as the iterable.
-            Value::Concrete(_)
-            | Value::Deferred(
-                DeferredValue::BindingRef { .. }
-                | DeferredValue::Interpolation(_)
-                | DeferredValue::FunctionCall { .. }
-                | DeferredValue::Unavailable { .. }
-                | DeferredValue::ResolvedFunctionCall { .. }
-                | DeferredValue::Access(_)
-                | DeferredValue::Unknown(_)
-                | DeferredValue::Placeholder(_),
-            ) => {}
-        }
-    }
-
     let mut errors: Vec<Located<UpstreamForIterableShapeError>> = Vec::new();
     for deferred in parsed.for_iterables() {
         let binding_kind = ForIterableBindingKind::from_for_binding(deferred.binding());
-        visit_possible_iterables(deferred.iterable(), &mut |path| {
+        for reference in deferred.result_references() {
+            let path = reference.path();
             let Some(fields) = exports.get(path.binding_address()) else {
-                return;
+                continue;
             };
             let Some(entry) = fields.get(path.attribute()) else {
-                return;
+                continue;
             };
             let Some(export_type) = entry.static_type.declared_known() else {
-                return;
+                continue;
             };
             let export_kind = match export_type {
                 TypeExpr::List(_) => Some(ForIterableBindingKind::List),
@@ -860,10 +826,10 @@ where
             // Scalars feeding a `for` are a different kind of bug; the
             // shape-check fires on them too because no kind matches.
             if export_kind == Some(binding_kind) {
-                return;
+                continue;
             }
             errors.push(Located::new(
-                deferred.reference_for_path(path).prefix_location().clone(),
+                reference.prefix_location().clone(),
                 UpstreamForIterableShapeError {
                     location: format!("for-expression `{}`", deferred.header()),
                     binding: path.binding().to_string(),
@@ -872,7 +838,7 @@ where
                     binding_kind,
                 },
             ));
-        });
+        }
     }
     errors.sort_by(|a, b| {
         (
@@ -885,14 +851,6 @@ where
                 b.binding.as_str(),
                 b.field.as_str(),
             ))
-    });
-    let mut seen = std::collections::HashSet::new();
-    errors.retain(|error| {
-        seen.insert((
-            error.location().clone(),
-            error.binding.clone(),
-            error.field.clone(),
-        ))
     });
     errors
 }
@@ -1055,7 +1013,7 @@ fn check_upstream_state_attribute_access_shapes_inner<
     include_resolver_struct_errors: bool,
 ) -> Vec<Located<UpstreamAttributeAccessShapeError>> {
     let mut errors: Vec<Located<UpstreamAttributeAccessShapeError>> = Vec::new();
-    for occurrence in parsed.value_references() {
+    for occurrence in parsed.project_value_references() {
         visit_attribute_access(
             occurrence.reference(),
             exports,
@@ -1086,14 +1044,6 @@ fn check_upstream_state_attribute_access_shapes_inner<
                 b.binding.as_str(),
                 b.field.as_str(),
             ))
-    });
-    let mut seen = std::collections::HashSet::new();
-    errors.retain(|error| {
-        seen.insert((
-            error.location().clone(),
-            error.binding.clone(),
-            error.field.clone(),
-        ))
     });
     errors
 }
@@ -1255,7 +1205,7 @@ pub fn check_upstream_state_subscript_shapes<
     exports: &UpstreamExports<B>,
 ) -> Vec<Located<UpstreamSubscriptShapeError>> {
     let mut errors: Vec<Located<UpstreamSubscriptShapeError>> = Vec::new();
-    for occurrence in parsed.value_references() {
+    for occurrence in parsed.project_value_references() {
         visit_subscript_access(
             occurrence.reference(),
             exports,
@@ -1284,14 +1234,6 @@ pub fn check_upstream_state_subscript_shapes<
                 b.binding.as_str(),
                 b.field.as_str(),
             ))
-    });
-    let mut seen = std::collections::HashSet::new();
-    errors.retain(|error| {
-        seen.insert((
-            error.location().clone(),
-            error.binding.clone(),
-            error.field.clone(),
-        ))
     });
     errors
 }
@@ -1443,10 +1385,13 @@ mod tests {
         base: &ResolvedPath,
         states: &[UpstreamState],
         config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-    ) -> (UpstreamExports, Vec<Located<UpstreamResolveError>>) {
+    ) -> Result<
+        (UpstreamExports, Vec<Located<UpstreamResolveError>>),
+        crate::parser::AnalysisTreeError,
+    > {
         super::resolve_upstream_exports(
             base,
-            &AnalysisTree::try_from_file(&upstream_project(states)).unwrap(),
+            &AnalysisTree::try_from_file(&upstream_project(states))?,
             config,
         )
     }
@@ -1455,10 +1400,13 @@ mod tests {
         states: &[UpstreamState],
         config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
         schemas: Option<&SchemaRegistry>,
-    ) -> (UpstreamExports, Vec<Located<UpstreamResolveError>>) {
+    ) -> Result<
+        (UpstreamExports, Vec<Located<UpstreamResolveError>>),
+        crate::parser::AnalysisTreeError,
+    > {
         super::resolve_upstream_exports_with_schemas(
             base,
-            &AnalysisTree::try_from_file(&upstream_project(states)).unwrap(),
+            &AnalysisTree::try_from_file(&upstream_project(states))?,
             config,
             schemas,
         )
@@ -1468,7 +1416,10 @@ mod tests {
         states: &[UpstreamState],
         config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
         schemas: Option<&SchemaRegistry>,
-    ) -> (UpstreamExports, Vec<Located<UpstreamResolveError>>) {
+    ) -> Result<
+        (UpstreamExports, Vec<Located<UpstreamResolveError>>),
+        crate::parser::AnalysisTreeError,
+    > {
         resolve_upstream_exports_with_schemas(base, states, config, schemas)
     }
 
@@ -1521,6 +1472,7 @@ mod tests {
                     session,
                     Some(&SchemaRegistry::new()),
                 )
+                .unwrap()
             });
 
         assert!(errors.is_empty(), "unexpected resolve errors: {errors:?}");
@@ -1573,7 +1525,8 @@ mod tests {
                         schemas,
                         &Default::default(),
                     )
-                });
+                })
+                .unwrap();
             assert!(
                 !exports.contains_key("up"),
                 "handle exports leaked: {exports:?}"
@@ -1635,6 +1588,7 @@ mod tests {
                     &[upstream("orgs", "../organizations")],
                     session,
                 )
+                .unwrap()
             });
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         assert!(got.get("orgs").unwrap().contains_key("accounts"));
@@ -1649,6 +1603,7 @@ mod tests {
                     &[upstream("orgs", "../organizations")],
                     session,
                 )
+                .unwrap()
             });
         assert!(errs2.is_empty());
         assert_eq!(got, got2);
@@ -1677,6 +1632,7 @@ mod tests {
                     &[upstream("orgs", "../organizations")],
                     session,
                 )
+                .unwrap()
             });
 
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
@@ -1708,6 +1664,7 @@ mod tests {
                     &[upstream("orgs", "../organizations")],
                     session,
                 )
+                .unwrap()
             });
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let keys = got.get("orgs").expect("resolved");
@@ -1748,6 +1705,7 @@ mod tests {
                     &[upstream("orgs", "../organizations")],
                     session,
                 )
+                .unwrap()
             });
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let keys = got.get("orgs").expect("resolved");
@@ -1801,6 +1759,7 @@ mod tests {
                     &[upstream("orgs", "../organizations")],
                     session,
                 )
+                .unwrap()
             });
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let keys = got.get("orgs").expect("resolved");
@@ -1847,6 +1806,7 @@ mod tests {
                     &[upstream("orgs", "../organizations")],
                     session,
                 )
+                .unwrap()
             });
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let entries = got.get("orgs").expect("resolved");
@@ -1885,6 +1845,7 @@ mod tests {
                     &[upstream("orgs", "../missing")],
                     session,
                 )
+                .unwrap()
             });
         assert!(got.is_empty());
         assert!(errs.is_empty());
@@ -1912,6 +1873,7 @@ mod tests {
                     &[upstream("orgs", "../organizations")],
                     session,
                 )
+                .unwrap()
             });
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let keys = got.get("orgs").expect("binding should be resolved");
@@ -1934,6 +1896,7 @@ mod tests {
                     &[upstream("orgs", "../organizations")],
                     session,
                 )
+                .unwrap()
             });
         assert!(errs.is_empty());
         assert!(got.get("orgs").expect("resolved").is_empty());
@@ -1957,6 +1920,7 @@ mod tests {
                     &[upstream("orgs", "../organizations")],
                     session,
                 )
+                .unwrap()
             });
         assert!(!got.contains_key("orgs"));
         assert_eq!(errs.len(), 1);
@@ -1998,6 +1962,7 @@ mod tests {
                     &[upstream("orgs", "../organizations")],
                     session,
                 )
+                .unwrap()
             });
         assert!(!got.contains_key("orgs"));
         assert_eq!(errs.len(), 1);
@@ -2015,7 +1980,8 @@ mod tests {
     }
 
     #[test]
-    fn check_rejects_unexported_field_with_suggestion() {
+    fn check_rejects_unexported_field_with_suggestion()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let parsed = parse_project(
             r#"
             let orgs = upstream_state { source = "../organizations" }
@@ -2027,10 +1993,8 @@ mod tests {
         );
         let exports = mk_exports(&[("orgs", &["accounts"])]);
 
-        let errs = check_upstream_state_field_references(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_field_references(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert_eq!(errs.len(), 1, "got: {errs:?}");
         assert_eq!(errs[0].binding, "orgs");
         assert_eq!(errs[0].field, "account");
@@ -2041,10 +2005,11 @@ mod tests {
                 .diagnostic_message()
                 .contains("Did you mean `accounts`?")
         );
+        Ok(())
     }
 
     #[test]
-    fn check_accepts_exported_field() {
+    fn check_accepts_exported_field() -> Result<(), crate::parser::AnalysisTreeError> {
         let parsed = parse_project(
             r#"
             let orgs = upstream_state { source = "../organizations" }
@@ -2055,15 +2020,15 @@ mod tests {
             "#,
         );
         let exports = mk_exports(&[("orgs", &["accounts"])]);
-        let errs = check_upstream_state_field_references(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_field_references(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert!(errs.is_empty(), "got: {errs:?}");
+        Ok(())
     }
 
     #[test]
-    fn coalesce_lhs_suppresses_only_missing_export_existence_diagnostic() {
+    fn coalesce_lhs_suppresses_only_missing_export_existence_diagnostic()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let parsed = parse_project(
             r#"
             let orgs = upstream_state { source = "../organizations" }
@@ -2075,16 +2040,16 @@ mod tests {
         );
         let exports = mk_exports(&[("orgs", &[])]);
 
-        let errs = check_upstream_state_field_references(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_field_references(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert_eq!(errs.len(), 1, "got: {errs:?}");
         assert_eq!(errs[0].field, "required");
+        Ok(())
     }
 
     #[test]
-    fn coalesce_lhs_nested_references_remain_required() {
+    fn coalesce_lhs_nested_references_remain_required()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let parsed = parse_project(
             r#"
             let orgs = upstream_state { source = "../organizations" }
@@ -2098,10 +2063,8 @@ mod tests {
         );
         let exports = mk_exports(&[("orgs", &[])]);
 
-        let errs = check_upstream_state_field_references(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_field_references(&AnalysisTree::try_from_file(&parsed)?, &exports);
         let fields = errs
             .iter()
             .map(|error| error.field.as_str())
@@ -2111,10 +2074,11 @@ mod tests {
             std::collections::BTreeSet::from(["in_function", "in_interpolation", "in_list",]),
             "only a direct reference/access-chain on the left of ?? is optional: {errs:?}",
         );
+        Ok(())
     }
 
     #[test]
-    fn deferred_for_coalesce_lhs_may_be_absent() {
+    fn deferred_for_coalesce_lhs_may_be_absent() -> Result<(), crate::parser::AnalysisTreeError> {
         let parsed = parse_project(
             r#"
             let orgs = upstream_state { source = "../organizations" }
@@ -2126,15 +2090,15 @@ mod tests {
         );
         let exports = mk_exports(&[("orgs", &[])]);
 
-        let errs = check_upstream_state_field_references(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_field_references(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert!(errs.is_empty(), "got: {errs:?}");
+        Ok(())
     }
 
     #[test]
-    fn deferred_for_coalesce_default_keeps_iterable_shape_validation() {
+    fn deferred_for_coalesce_default_keeps_iterable_shape_validation()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let parsed = parse_project(
             r#"
             let orgs = upstream_state { source = "../organizations" }
@@ -2153,15 +2117,17 @@ mod tests {
         )]);
 
         let errs = check_upstream_state_for_iterable_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert_eq!(errs.len(), 1, "got: {errs:?}");
         assert_eq!(errs[0].field, "fallback");
+        Ok(())
     }
 
     #[test]
-    fn deferred_for_coalesce_value_keeps_access_shape_validation() {
+    fn deferred_for_coalesce_value_keeps_access_shape_validation()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let parsed = parse_project(
             r#"
             let orgs = upstream_state { source = "../organizations" }
@@ -2182,15 +2148,17 @@ mod tests {
         )]);
 
         let errs = check_upstream_state_attribute_access_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert_eq!(errs.len(), 1, "got: {errs:?}");
         assert_eq!(errs[0].bad_segment, "missing");
+        Ok(())
     }
 
     #[test]
-    fn check_rejects_any_field_when_upstream_declares_no_exports() {
+    fn check_rejects_any_field_when_upstream_declares_no_exports()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // Empty key set → every ref is invalid. Provable statically.
         let parsed = parse_project(
             r#"
@@ -2203,17 +2171,17 @@ mod tests {
         );
         let exports = mk_exports(&[("orgs", &[])]);
 
-        let errs = check_upstream_state_field_references(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_field_references(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].field, "anything");
         assert!(errs[0].suggestion.is_none());
+        Ok(())
     }
 
     #[test]
-    fn check_skips_bindings_without_resolved_exports() {
+    fn check_skips_bindings_without_resolved_exports()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // Binding absent from exports map → checker ignores it.
         let parsed = parse_project(
             r#"
@@ -2227,16 +2195,15 @@ mod tests {
         );
         let exports = mk_exports(&[("orgs", &["accounts"])]);
         assert!(
-            check_upstream_state_field_references(
-                &AnalysisTree::try_from_file(&parsed).unwrap(),
-                &exports
-            )
-            .is_empty()
+            check_upstream_state_field_references(&AnalysisTree::try_from_file(&parsed)?, &exports)
+                .is_empty()
         );
+        Ok(())
     }
 
     #[test]
-    fn check_rejects_unexported_field_in_let_binding() {
+    fn check_rejects_unexported_field_in_let_binding()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // `let x = orgs.acc` stores the ref in `variables`, not in
         // `resources` — walker must cover that surface too.
         let parsed = parse_project(
@@ -2247,17 +2214,17 @@ mod tests {
             "#,
         );
         let exports = mk_exports(&[("orgs", &["accounts"])]);
-        let errs = check_upstream_state_field_references(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_field_references(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert_eq!(errs.len(), 1, "got: {errs:?}");
         assert_eq!(errs[0].field, "acc");
         assert!(errs[0].location.contains("let"));
+        Ok(())
     }
 
     #[test]
-    fn upstream_state_sibling_reference_no_empty_export_error() {
+    fn upstream_state_sibling_reference_no_empty_export_error()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // Regression: #2847. `bootstrap` declared in `backend.crn`,
         // referenced from `main.crn`. Pre-fix the seeded placeholder
         // surfaced as a `ResourceRef { attribute: "" }` and tripped the
@@ -2299,19 +2266,19 @@ mod tests {
              BindingRef, got: {bootstrap_var:?}"
         );
         let exports = mk_exports(&[("bootstrap", &["oidc_provider_arn"])]);
-        let errs = check_upstream_state_field_references(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_field_references(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert!(
             errs.is_empty(),
             "consumer-only sibling reference must not synthesize an \
              empty-field error, got: {errs:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn check_rejects_unexported_field_in_for_expression_body() {
+    fn check_rejects_unexported_field_in_for_expression_body()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // The iterable is valid (`orgs.accounts`) but a ref inside the body
         // points at a non-exported field. Must still be flagged — body refs
         // don't reach `parsed.resources` until plan-time expansion.
@@ -2328,18 +2295,18 @@ mod tests {
             "#,
         );
         let exports = mk_exports(&[("orgs", &["accounts"])]);
-        let errs = check_upstream_state_field_references(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_field_references(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert!(
             errs.iter().any(|e| e.field == "NONEXISTENT"),
             "for-body ref to non-exported field must be flagged, got: {errs:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn for_body_field_error_reported_once_not_twice() {
+    fn for_body_field_error_reported_once_not_twice() -> Result<(), crate::parser::AnalysisTreeError>
+    {
         // Regression: the old duplicate display projection could cause the
         // canonical deferred template attribute to be reported twice.
         let parsed = parse_project(
@@ -2353,16 +2320,16 @@ mod tests {
             "#,
         );
         let exports = mk_exports(&[("orgs", &["accounts"])]);
-        let errs = check_upstream_state_field_references(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_field_references(&AnalysisTree::try_from_file(&parsed)?, &exports);
         let missing: Vec<_> = errs.iter().filter(|e| e.field == "missing").collect();
         assert_eq!(missing.len(), 1, "must not double-report, got: {missing:?}");
+        Ok(())
     }
 
     #[test]
-    fn check_rejects_unexported_field_in_for_expression_iterable() {
+    fn check_rejects_unexported_field_in_for_expression_iterable()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // `for name, _ in orgs.account` — issue #1990's canonical repro.
         let parsed = parse_project(
             r#"
@@ -2378,15 +2345,14 @@ mod tests {
         );
         let exports = mk_exports(&[("orgs", &["accounts"])]);
 
-        let errs = check_upstream_state_field_references(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_field_references(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].binding, "orgs");
         assert_eq!(errs[0].field, "account");
         assert_eq!(errs[0].suggestion.as_deref(), Some("accounts"));
         assert!(errs[0].location.contains("for"));
+        Ok(())
     }
 
     // ================================================================
@@ -2407,6 +2373,69 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn review_round2_upstream_expanded_field_and_subscript_findings_keep_context()
+    -> Result<(), crate::parser::AnalysisTreeError> {
+        for (expression, field_error) in [("up.missing", true), ("up.names['bad']", false)] {
+            let parsed = parse_project_with_provider(
+                &format!(
+                    "let up = upstream_state {{ source = './up' }}\nlet copies = for n in [1, 2] {{ test.r.res {{ name = {expression} }} }}\n"
+                ),
+                "test",
+            );
+            let tree = AnalysisTree::try_from_file(&parsed)?;
+            let exports = mk_typed_exports(&[(
+                "up",
+                &[("names", TypeExpr::List(Box::new(TypeExpr::String)))],
+            )]);
+            let contexts = if field_error {
+                check_upstream_state_field_references(&tree, &exports)
+                    .into_iter()
+                    .map(|finding| finding.detail().location.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                check_upstream_state_subscript_shapes(&tree, &exports)
+                    .into_iter()
+                    .map(|finding| finding.detail().location.clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(contexts.len(), 2, "{expression}: {contexts:?}");
+            assert_ne!(contexts[0], contexts[1]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn review_round2_upstream_iterable_aliases_preserve_each_occurrence()
+    -> Result<(), crate::parser::AnalysisTreeError> {
+        let parsed = parse_project_with_provider(
+            "let up = upstream_state { source = './up' }\nlet values = up.scalar\nlet copies = for n in (values ?? values) { test.r.res { name = n } }\n",
+            "test",
+        );
+        let tree = AnalysisTree::try_from_file(&parsed)?;
+        let exports = mk_typed_exports(&[("up", &[("scalar", TypeExpr::String)])]);
+        let findings = check_upstream_state_for_iterable_shapes(&tree, &exports);
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn review_round2_upstream_shapes_keep_main_project_value_scope()
+    -> Result<(), crate::parser::AnalysisTreeError> {
+        let parsed = parse_project_with_provider(
+            "let up = upstream_state { source = './up' }\nlet copies = for n in up.names { read test.r.res { name = up.names.bad } }\n",
+            "test",
+        );
+        let tree = AnalysisTree::try_from_file(&parsed)?;
+        let exports = mk_typed_exports(&[(
+            "up",
+            &[("names", TypeExpr::List(Box::new(TypeExpr::String)))],
+        )]);
+        let findings = check_upstream_state_attribute_access_shapes(&tree, &exports);
+        assert!(findings.is_empty(), "{findings:?}");
+        Ok(())
     }
 
     /// Minimal schema registry for test resources: `test.r.res` with a single
@@ -2459,7 +2488,7 @@ mod tests {
                     &bindings,
                 )
                 .err()
-                .map(|joined| joined.lines().map(str::to_string).collect())
+                .map(|joined| joined.to_string().lines().map(str::to_string).collect())
                 .unwrap_or_default()
             },
         )
@@ -3198,7 +3227,8 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn for_iterable_simple_binding_against_list_export_is_ok() {
+    fn for_iterable_simple_binding_against_list_export_is_ok()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // `for x in orgs.accounts` over a `list(...)` export — fine.
         let parsed = parse_project_with_provider(
             r#"
@@ -3222,17 +3252,19 @@ mod tests {
             )],
         )]);
         let errs = check_upstream_state_for_iterable_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert!(
             errs.is_empty(),
             "list export + simple binding must pass, got: {errs:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn for_iterable_map_binding_against_map_export_is_ok() {
+    fn for_iterable_map_binding_against_map_export_is_ok()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // `for k, v in orgs.accounts` over a `map(...)` export — fine.
         let parsed = parse_project_with_provider(
             r#"
@@ -3256,17 +3288,19 @@ mod tests {
             )],
         )]);
         let errs = check_upstream_state_for_iterable_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert!(
             errs.is_empty(),
             "map export + map binding must pass, got: {errs:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn for_iterable_simple_binding_against_map_export_flags_mismatch() {
+    fn for_iterable_simple_binding_against_map_export_flags_mismatch()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // Upstream changed `accounts: list(_)` to `map(_)`. Downstream
         // still iterates as `for x in ...` — old shape. The check must
         // flag this so the cross-directory refactor surfaces in the
@@ -3294,7 +3328,7 @@ mod tests {
             )],
         )]);
         let errs = check_upstream_state_for_iterable_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert_eq!(
@@ -3314,10 +3348,12 @@ mod tests {
             msg.contains("for k, v in"),
             "message must suggest the map binding form: {msg}"
         );
+        Ok(())
     }
 
     #[test]
-    fn for_iterable_map_binding_against_list_export_flags_mismatch() {
+    fn for_iterable_map_binding_against_list_export_flags_mismatch()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // Inverse of the above: downstream uses `for k, v in ...` but
         // upstream still exports a list. Same class of bug.
         let parsed = parse_project_with_provider(
@@ -3342,7 +3378,7 @@ mod tests {
             )],
         )]);
         let errs = check_upstream_state_for_iterable_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert_eq!(
@@ -3361,10 +3397,12 @@ mod tests {
             msg.contains("for x in"),
             "message must suggest the list binding form: {msg}"
         );
+        Ok(())
     }
 
     #[test]
-    fn for_iterable_skipped_when_export_has_no_declared_type() {
+    fn for_iterable_skipped_when_export_has_no_declared_type()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // `accounts` declared without `: T` annotation — nothing to
         // compare against, the field-name check still runs but the
         // shape check stays silent.
@@ -3385,14 +3423,15 @@ mod tests {
         fields.insert("accounts".to_string(), inference_not_run_entry());
         exports.insert(RelativeBindingName::new("orgs"), fields);
         let errs = check_upstream_state_for_iterable_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert!(errs.is_empty(), "no annotation → silent, got: {errs:?}");
+        Ok(())
     }
 
     #[test]
-    fn for_iterable_skipped_when_binding_unknown() {
+    fn for_iterable_skipped_when_binding_unknown() -> Result<(), crate::parser::AnalysisTreeError> {
         // The binding isn't in `exports` at all (resolve failed
         // upstream). Field-name check handles that case via
         // UpstreamFieldError; the shape check stays silent so the
@@ -3411,14 +3450,16 @@ mod tests {
         );
         let exports = mk_typed_exports(&[]);
         let errs = check_upstream_state_for_iterable_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert!(errs.is_empty(), "missing binding → silent, got: {errs:?}");
+        Ok(())
     }
 
     #[test]
-    fn for_iterable_shape_check_against_real_directory_fixture() {
+    fn for_iterable_shape_check_against_real_directory_fixture()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // Directory-scoped acceptance: upstream's `exports.crn` lives in
         // a sibling directory and `resolve_upstream_exports` parses it
         // off disk, then the shape check fires when downstream's
@@ -3469,13 +3510,14 @@ mod tests {
                     &parsed.upstream_states,
                     session,
                 )
+                .unwrap()
             });
         assert!(
             resolve_errs.is_empty(),
             "unexpected resolve errors: {resolve_errs:?}"
         );
         let errs = check_upstream_state_for_iterable_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert_eq!(
@@ -3485,10 +3527,12 @@ mod tests {
         );
         assert_eq!(errs[0].field, "accounts");
         assert_eq!(errs[0].binding_kind, ForIterableBindingKind::List);
+        Ok(())
     }
 
     #[test]
-    fn for_iterable_against_scalar_export_flags_mismatch() {
+    fn for_iterable_against_scalar_export_flags_mismatch()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // Upstream exports a scalar (e.g. `accounts: String`); downstream
         // tries to iterate. There is no valid binding form to suggest —
         // the upstream contract has to change first. The check fires
@@ -3507,7 +3551,7 @@ mod tests {
         );
         let exports = mk_typed_exports(&[("orgs", &[("accounts", TypeExpr::String)])]);
         let errs = check_upstream_state_for_iterable_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert_eq!(
@@ -3528,10 +3572,12 @@ mod tests {
             !msg.contains("for k, v in") && !msg.contains("for x in"),
             "scalar export must not suggest a binding form: {msg}"
         );
+        Ok(())
     }
 
     #[test]
-    fn for_iterable_indexed_binding_classified_as_list() {
+    fn for_iterable_indexed_binding_classified_as_list()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // `for (i, x) in orgs.accounts` is a *list* iterable — the
         // 2-name binding pattern is `(index, value)`, not `(key, value)`.
         // The kind classifier must collapse Simple+Indexed into List.
@@ -3559,7 +3605,7 @@ mod tests {
         )]);
         assert!(
             check_upstream_state_for_iterable_shapes(
-                &AnalysisTree::try_from_file(&parsed).unwrap(),
+                &AnalysisTree::try_from_file(&parsed)?,
                 &list_exports
             )
             .is_empty(),
@@ -3576,7 +3622,7 @@ mod tests {
             )],
         )]);
         let errs = check_upstream_state_for_iterable_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &map_exports,
         );
         assert_eq!(
@@ -3585,10 +3631,11 @@ mod tests {
             "indexed binding + map export must fail, got: {errs:?}"
         );
         assert_eq!(errs[0].binding_kind, ForIterableBindingKind::List);
+        Ok(())
     }
 
     #[test]
-    fn for_iterable_errors_sort_stably() {
+    fn for_iterable_errors_sort_stably() -> Result<(), crate::parser::AnalysisTreeError> {
         // Two `for` expressions in a single project produce errors in
         // a deterministic order regardless of the underlying parse order.
         // Mirrors the existing sort guarantee on `UpstreamFieldError`.
@@ -3628,16 +3675,18 @@ mod tests {
             ],
         )]);
         let errs = check_upstream_state_for_iterable_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert_eq!(errs.len(), 2, "expected two errors, got: {errs:?}");
         assert_eq!(errs[0].field, "alpha_accounts");
         assert_eq!(errs[1].field, "beta_accounts");
+        Ok(())
     }
 
     #[test]
-    fn for_iterable_skipped_when_field_not_exported() {
+    fn for_iterable_skipped_when_field_not_exported() -> Result<(), crate::parser::AnalysisTreeError>
+    {
         // The binding exists but the iterable field isn't exported.
         // `UpstreamFieldError` already surfaces this; shape check
         // stays silent to avoid duplicate diagnostics.
@@ -3663,10 +3712,11 @@ mod tests {
             )],
         )]);
         let errs = check_upstream_state_for_iterable_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert!(errs.is_empty(), "missing field → silent, got: {errs:?}");
+        Ok(())
     }
 
     // ================================================================
@@ -3675,7 +3725,8 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn attribute_access_struct_with_known_field_is_ok() {
+    fn attribute_access_struct_with_known_field_is_ok()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // Upstream exports `account: struct { id: String, region: String }`,
         // downstream writes `orgs.account.id` — the `id` field is declared,
         // shape check stays silent.
@@ -3701,17 +3752,19 @@ mod tests {
             )],
         )]);
         let errs = check_upstream_state_attribute_access_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert!(
             errs.is_empty(),
             "known struct field must pass, got: {errs:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn list_field_access_keeps_the_dedicated_upstream_shape_diagnostic() {
+    fn list_field_access_keeps_the_dedicated_upstream_shape_diagnostic()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -3735,7 +3788,7 @@ mod tests {
         );
 
         let errors = check_upstream_state_attribute_access_shape_fallbacks(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert_eq!(errors.len(), 1);
@@ -3743,10 +3796,12 @@ mod tests {
             errors[0].detail().to_string(),
             "test.r.res.consumer attribute `name`: upstream_state `orgs.names` is declared as `list(String)` but `.foo` reads it as a struct; iterate the list with `for x in orgs.names` to access elements"
         );
+        Ok(())
     }
 
     #[test]
-    fn attribute_access_struct_with_unknown_field_flags_mismatch() {
+    fn attribute_access_struct_with_unknown_field_flags_mismatch()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // `orgs.account.region` against a struct that doesn't declare
         // `region` is the canonical "downstream depends on upstream's
         // schema and the upstream changed" failure.
@@ -3769,7 +3824,7 @@ mod tests {
             )],
         )]);
         let errs = check_upstream_state_attribute_access_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert_eq!(
@@ -3785,10 +3840,12 @@ mod tests {
             msg.contains("region"),
             "message must name the missing field: {msg}"
         );
+        Ok(())
     }
 
     #[test]
-    fn attribute_access_against_list_export_flags_mismatch() {
+    fn attribute_access_against_list_export_flags_mismatch()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // `orgs.accounts.foo` against `accounts: list(_)` is a category
         // error — the user has to iterate first.
         let parsed = parse_project_with_provider(
@@ -3810,7 +3867,7 @@ mod tests {
             )],
         )]);
         let errs = check_upstream_state_attribute_access_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert_eq!(
@@ -3823,10 +3880,12 @@ mod tests {
             msg.contains("list"),
             "message must mention list shape: {msg}"
         );
+        Ok(())
     }
 
     #[test]
-    fn attribute_access_against_map_export_resolves_as_key_access() {
+    fn attribute_access_against_map_export_resolves_as_key_access()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // `orgs.accounts.alpha` against `accounts: map(_)` is valid
         // map-key access, equivalent to `orgs.accounts['alpha']`. The
         // shape walk descends `map(T).k → T` for the dot form, the
@@ -3851,17 +3910,19 @@ mod tests {
             )],
         )]);
         let errs = check_upstream_state_attribute_access_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert!(
             errs.is_empty(),
             "dot-notation against map must be accepted as key access, got: {errs:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn attribute_access_against_scalar_export_flags_mismatch() {
+    fn attribute_access_against_scalar_export_flags_mismatch()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // `orgs.region.foo` against `region: String` — scalars have no
         // fields.
         let parsed = parse_project_with_provider(
@@ -3875,7 +3936,7 @@ mod tests {
         );
         let exports = mk_typed_exports(&[("orgs", &[("region", TypeExpr::String)])]);
         let errs = check_upstream_state_attribute_access_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert_eq!(
@@ -3888,10 +3949,12 @@ mod tests {
             msg.contains("String"),
             "message must show scalar export type: {msg}"
         );
+        Ok(())
     }
 
     #[test]
-    fn attribute_access_skipped_when_export_has_no_declared_type() {
+    fn attribute_access_skipped_when_export_has_no_declared_type()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -3906,14 +3969,16 @@ mod tests {
         fields.insert("account".to_string(), inference_not_run_entry());
         exports.insert(RelativeBindingName::new("orgs"), fields);
         let errs = check_upstream_state_attribute_access_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert!(errs.is_empty(), "no annotation → silent, got: {errs:?}");
+        Ok(())
     }
 
     #[test]
-    fn attribute_access_skipped_when_binding_unknown() {
+    fn attribute_access_skipped_when_binding_unknown()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -3925,14 +3990,16 @@ mod tests {
         );
         let exports = mk_typed_exports(&[]);
         let errs = check_upstream_state_attribute_access_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert!(errs.is_empty(), "missing binding → silent, got: {errs:?}");
+        Ok(())
     }
 
     #[test]
-    fn attribute_access_skipped_when_field_not_exported() {
+    fn attribute_access_skipped_when_field_not_exported()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // `orgs.NONEXISTENT.id` — field-name check already surfaces
         // the missing top-level export; the shape check stays silent.
         let parsed = parse_project_with_provider(
@@ -3954,14 +4021,16 @@ mod tests {
             )],
         )]);
         let errs = check_upstream_state_attribute_access_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert!(errs.is_empty(), "missing field → silent, got: {errs:?}");
+        Ok(())
     }
 
     #[test]
-    fn attribute_access_skipped_when_field_path_empty() {
+    fn attribute_access_skipped_when_field_path_empty()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // `orgs.account` (no `.foo`) — that's just a top-level field
         // ref, handled by the typed consumer through `BindingIndex::ref_type`.
         let parsed = parse_project_with_provider(
@@ -3983,14 +4052,16 @@ mod tests {
             )],
         )]);
         let errs = check_upstream_state_attribute_access_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert!(errs.is_empty(), "no field_path → silent, got: {errs:?}");
+        Ok(())
     }
 
     #[test]
-    fn attribute_access_nested_struct_field_walks_path() {
+    fn attribute_access_nested_struct_field_walks_path()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // `orgs.account.network.vpc_id` against
         // `account: struct { network: struct { vpc_id: String } }` — the
         // walker must descend into nested structs.
@@ -4011,17 +4082,19 @@ mod tests {
         };
         let exports = mk_typed_exports(&[("orgs", &[("account", outer)])]);
         let errs = check_upstream_state_attribute_access_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert!(
             errs.is_empty(),
             "nested struct path must pass, got: {errs:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn attribute_access_nested_struct_unknown_field_flagged() {
+    fn attribute_access_nested_struct_unknown_field_flagged()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // Same fixture but the deep field is wrong — must still be
         // caught.
         let parsed = parse_project_with_provider(
@@ -4041,7 +4114,7 @@ mod tests {
         };
         let exports = mk_typed_exports(&[("orgs", &[("account", outer)])]);
         let errs = check_upstream_state_attribute_access_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert_eq!(
@@ -4059,10 +4132,12 @@ mod tests {
             msg.contains("bad_field"),
             "message must name the missing leaf: {msg}"
         );
+        Ok(())
     }
 
     #[test]
-    fn attribute_access_struct_containing_list_flags_at_list_position() {
+    fn attribute_access_struct_containing_list_flags_at_list_position()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // `account: struct { tags: list(String) }` — `orgs.account.tags`
         // resolves cleanly (struct → list, no further `.field`); but
         // `orgs.account.tags.foo` walks past the list and must flag
@@ -4084,7 +4159,7 @@ mod tests {
         };
         let exports = mk_typed_exports(&[("orgs", &[("account", outer)])]);
         let errs = check_upstream_state_attribute_access_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert_eq!(errs.len(), 1, "list-at-depth must flag, got: {errs:?}");
@@ -4099,10 +4174,12 @@ mod tests {
             msg.contains("list") && msg.contains("for x in"),
             "message must mention list and suggest iteration: {msg}"
         );
+        Ok(())
     }
 
     #[test]
-    fn attribute_access_shape_check_against_real_directory_fixture() {
+    fn attribute_access_shape_check_against_real_directory_fixture()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // Directory-scoped acceptance: upstream's `exports.crn` lives
         // in a sibling directory and `resolve_upstream_exports` parses
         // it off disk. Mirrors the parity test for the for-iterable
@@ -4148,13 +4225,14 @@ mod tests {
                     &parsed.upstream_states,
                     session,
                 )
+                .unwrap()
             });
         assert!(
             resolve_errs.is_empty(),
             "unexpected resolve errors: {resolve_errs:?}"
         );
         let errs = check_upstream_state_attribute_access_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &AnalysisTree::try_from_file(&parsed)?,
             &exports,
         );
         assert_eq!(
@@ -4165,6 +4243,7 @@ mod tests {
         assert_eq!(errs[0].field, "accounts");
         assert_eq!(errs[0].bad_segment, "foo");
         assert!(matches!(errs[0].mismatched_at, TypeExpr::List(_)));
+        Ok(())
     }
 
     // ================================================================
@@ -4173,7 +4252,7 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn subscript_int_against_list_export_is_ok() {
+    fn subscript_int_against_list_export_is_ok() -> Result<(), crate::parser::AnalysisTreeError> {
         // `orgs.accounts[0]` against `accounts: list(String)` — integer
         // subscripts read list elements; shape check stays silent.
         let parsed = parse_project_with_provider(
@@ -4189,15 +4268,14 @@ mod tests {
             "orgs",
             &[("accounts", TypeExpr::List(Box::new(TypeExpr::String)))],
         )]);
-        let errs = check_upstream_state_subscript_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_subscript_shapes(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert!(errs.is_empty(), "[int] on list(_) must pass, got: {errs:?}");
+        Ok(())
     }
 
     #[test]
-    fn subscript_str_against_map_export_is_ok() {
+    fn subscript_str_against_map_export_is_ok() -> Result<(), crate::parser::AnalysisTreeError> {
         // `orgs.accounts["alpha"]` against `accounts: map(String)` —
         // string subscripts read map entries; shape check stays silent.
         let parsed = parse_project_with_provider(
@@ -4213,18 +4291,18 @@ mod tests {
             "orgs",
             &[("accounts", TypeExpr::Map(Box::new(TypeExpr::String)))],
         )]);
-        let errs = check_upstream_state_subscript_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_subscript_shapes(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert!(
             errs.is_empty(),
             "[\"k\"] on map(_) must pass, got: {errs:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn subscript_int_against_map_export_flags_mismatch() {
+    fn subscript_int_against_map_export_flags_mismatch()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // `orgs.accounts[0]` against `accounts: map(String)` — wrong
         // syntax; should fire with a hint to use `["k"]`.
         let parsed = parse_project_with_provider(
@@ -4240,10 +4318,8 @@ mod tests {
             "orgs",
             &[("accounts", TypeExpr::Map(Box::new(TypeExpr::String)))],
         )]);
-        let errs = check_upstream_state_subscript_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_subscript_shapes(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert_eq!(errs.len(), 1, "[int] on map must fail, got: {errs:?}");
         assert_eq!(errs[0].binding, "orgs");
         assert_eq!(errs[0].field, "accounts");
@@ -4254,10 +4330,12 @@ mod tests {
             msg.contains("[0]"),
             "message must echo the user's literal subscript, got: {msg}"
         );
+        Ok(())
     }
 
     #[test]
-    fn subscript_str_against_list_export_flags_mismatch() {
+    fn subscript_str_against_list_export_flags_mismatch()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // `orgs.accounts["alpha"]` against `accounts: list(String)` —
         // wrong syntax; should fire with a hint to use `[i]`.
         let parsed = parse_project_with_provider(
@@ -4273,10 +4351,8 @@ mod tests {
             "orgs",
             &[("accounts", TypeExpr::List(Box::new(TypeExpr::String)))],
         )]);
-        let errs = check_upstream_state_subscript_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_subscript_shapes(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert_eq!(errs.len(), 1, "[\"k\"] on list must fail, got: {errs:?}");
         assert!(matches!(errs[0].bad_subscript, Subscript::Str { .. }));
         let msg = errs[0].diagnostic_message();
@@ -4284,10 +4360,12 @@ mod tests {
             msg.contains("list"),
             "message must mention list shape: {msg}"
         );
+        Ok(())
     }
 
     #[test]
-    fn postfix_access_on_upstream_ref_participates_in_subscript_shape_checks() {
+    fn postfix_access_on_upstream_ref_participates_in_subscript_shape_checks()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -4304,10 +4382,8 @@ mod tests {
             &[("accounts", TypeExpr::List(Box::new(TypeExpr::String)))],
         )]);
 
-        let errs = check_upstream_state_subscript_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_subscript_shapes(&AnalysisTree::try_from_file(&parsed)?, &exports);
 
         assert_eq!(
             errs.len(),
@@ -4317,10 +4393,12 @@ mod tests {
         assert!(matches!(errs[0].bad_subscript, Subscript::Str { .. }));
         assert_eq!(errs[0].binding, "orgs");
         assert_eq!(errs[0].field, "accounts");
+        Ok(())
     }
 
     #[test]
-    fn subscript_against_struct_export_flags_mismatch() {
+    fn subscript_against_struct_export_flags_mismatch()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // `orgs.account[0]` against `account: struct {...}` — structs
         // don't host any subscript form. The diagnostic stays silent on
         // the "use the other syntax" hint because neither would help.
@@ -4342,19 +4420,19 @@ mod tests {
                 },
             )],
         )]);
-        let errs = check_upstream_state_subscript_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_subscript_shapes(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert_eq!(
             errs.len(),
             1,
             "subscript on struct must fail, got: {errs:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn subscript_against_scalar_export_flags_mismatch() {
+    fn subscript_against_scalar_export_flags_mismatch()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         // `orgs.region[0]` against `region: String` — scalars are not
         // subscriptable.
         let parsed = parse_project_with_provider(
@@ -4367,10 +4445,8 @@ mod tests {
             "test",
         );
         let exports = mk_typed_exports(&[("orgs", &[("region", TypeExpr::String)])]);
-        let errs = check_upstream_state_subscript_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_subscript_shapes(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert_eq!(
             errs.len(),
             1,
@@ -4381,10 +4457,11 @@ mod tests {
             msg.contains("String"),
             "message must show scalar export type: {msg}"
         );
+        Ok(())
     }
 
     #[test]
-    fn subscript_after_struct_field_walks_path() {
+    fn subscript_after_struct_field_walks_path() -> Result<(), crate::parser::AnalysisTreeError> {
         // `orgs.account.children[0]` against
         // `account: struct { children: list(String) }` — the walker
         // must descend through the struct field before checking the
@@ -4405,18 +4482,18 @@ mod tests {
             )],
         };
         let exports = mk_typed_exports(&[("orgs", &[("account", outer)])]);
-        let errs = check_upstream_state_subscript_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_subscript_shapes(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert!(
             errs.is_empty(),
             "subscript after struct field walks path, got: {errs:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn subscript_skipped_when_export_has_no_declared_type() {
+    fn subscript_skipped_when_export_has_no_declared_type()
+    -> Result<(), crate::parser::AnalysisTreeError> {
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -4430,15 +4507,14 @@ mod tests {
         let mut fields = HashMap::new();
         fields.insert("accounts".to_string(), inference_not_run_entry());
         exports.insert(RelativeBindingName::new("orgs"), fields);
-        let errs = check_upstream_state_subscript_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_subscript_shapes(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert!(errs.is_empty(), "no annotation → silent, got: {errs:?}");
+        Ok(())
     }
 
     #[test]
-    fn subscript_skipped_when_binding_unknown() {
+    fn subscript_skipped_when_binding_unknown() -> Result<(), crate::parser::AnalysisTreeError> {
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -4449,15 +4525,15 @@ mod tests {
             "test",
         );
         let exports = mk_typed_exports(&[]);
-        let errs = check_upstream_state_subscript_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_subscript_shapes(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert!(errs.is_empty(), "missing binding → silent, got: {errs:?}");
+        Ok(())
     }
 
     #[test]
-    fn subscript_skipped_when_field_path_mismatches() {
+    fn subscript_skipped_when_field_path_mismatches() -> Result<(), crate::parser::AnalysisTreeError>
+    {
         // `orgs.account.bad[0]` — the `.bad` already mismatches the
         // declared struct type. Don't double-fire on the subscript;
         // the attribute-access check owns that diagnostic.
@@ -4479,18 +4555,18 @@ mod tests {
                 },
             )],
         )]);
-        let errs = check_upstream_state_subscript_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_subscript_shapes(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert!(
             errs.is_empty(),
             "field-path mismatch is the attribute-access check's job, got: {errs:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn subscript_chained_descends_into_inner_type() {
+    fn subscript_chained_descends_into_inner_type() -> Result<(), crate::parser::AnalysisTreeError>
+    {
         // `orgs.matrix[0][1]` against `matrix: list(list(String))` —
         // each integer subscript peels one `list(_)` layer.
         let parsed = parse_project_with_provider(
@@ -4509,18 +4585,17 @@ mod tests {
                 TypeExpr::List(Box::new(TypeExpr::List(Box::new(TypeExpr::String)))),
             )],
         )]);
-        let errs = check_upstream_state_subscript_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_subscript_shapes(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert!(
             errs.is_empty(),
             "list(list(_))[0][1] must pass, got: {errs:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn subscript_chained_flags_inner_mismatch() {
+    fn subscript_chained_flags_inner_mismatch() -> Result<(), crate::parser::AnalysisTreeError> {
         // `orgs.matrix[0]["k"]` against `matrix: list(list(String))` —
         // first `[0]` peels to `list(String)`; second `["k"]` then
         // mismatches.
@@ -4540,16 +4615,15 @@ mod tests {
                 TypeExpr::List(Box::new(TypeExpr::List(Box::new(TypeExpr::String)))),
             )],
         )]);
-        let errs = check_upstream_state_subscript_shapes(
-            &AnalysisTree::try_from_file(&parsed).unwrap(),
-            &exports,
-        );
+        let errs =
+            check_upstream_state_subscript_shapes(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert_eq!(
             errs.len(),
             1,
             "second subscript mismatch must fire, got: {errs:?}"
         );
         assert!(matches!(errs[0].bad_subscript, Subscript::Str { .. }));
+        Ok(())
     }
 
     // ================================================================
@@ -4665,6 +4739,7 @@ mod tests {
                     session,
                     Some(&crate::schema::SchemaRegistry::new()),
                 )
+                .unwrap()
             });
         let region_entry = exports
             .get("ups")
@@ -4732,6 +4807,7 @@ mod tests {
                     session,
                     Some(&schemas),
                 )
+                .unwrap()
             });
 
         assert!(errors.is_empty(), "unexpected resolve errors: {errors:?}");
@@ -4771,6 +4847,7 @@ exports { out: Int = instance.out }
                     session,
                     Some(&crate::schema::SchemaRegistry::new()),
                 )
+                .unwrap()
             });
 
         assert!(
@@ -4816,6 +4893,7 @@ exports { out: String = instance.out }
                     session,
                     Some(&crate::schema::SchemaRegistry::new()),
                 )
+                .unwrap()
             },
         );
 

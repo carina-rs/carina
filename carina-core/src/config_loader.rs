@@ -368,7 +368,10 @@ impl RootDirectoryParse<crate::parser::InferredExportParam> {
         &mut self,
         schemas: &crate::provider::ProviderLoadedSchemaRegistry,
         context: &ProviderContext,
-    ) -> crate::validation::inference::ExportsInferredWithLoadedProviderSchemas<'_> {
+    ) -> Result<
+        crate::validation::inference::ExportsInferredWithLoadedProviderSchemas<'_>,
+        crate::parser::AnalysisTreeError,
+    > {
         crate::validation::inference::retry_unchecked_export_inference(
             &mut self.parsed,
             schemas,
@@ -380,7 +383,7 @@ impl RootDirectoryParse<crate::parser::InferredExportParam> {
     pub fn resolve_type_exprs_report(
         &mut self,
         config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-    ) -> crate::validation::FileTypeResolutionReport {
+    ) -> Result<crate::validation::FileTypeResolutionReport, crate::parser::AnalysisTreeError> {
         crate::validation::resolve_file_type_exprs_report(&mut self.parsed, config, None)
     }
 

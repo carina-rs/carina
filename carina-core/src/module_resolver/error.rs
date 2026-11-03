@@ -50,6 +50,8 @@ pub enum ModuleErrorCallSource<'a> {
 /// Module resolution error
 #[derive(Debug, thiserror::Error)]
 pub enum ModuleError {
+    #[error(transparent)]
+    AnalysisInvariant(#[from] crate::parser::AnalysisTreeError),
     /// Terminal providerless failure together with every unresolved type site.
     #[error("{error}\n{}", render_provider_type_warnings(.warnings))]
     WithProviderTypeWarnings {
@@ -300,6 +302,7 @@ impl ModuleError {
             | Self::DroppedConditionalBinding { .. }
             | Self::UnexpandedModuleTemplate { .. }
             | Self::ReferenceType(_)
+            | Self::AnalysisInvariant(_)
             | Self::TypeResolution(_)
             | Self::Io(_)
             | Self::Parse(_)
@@ -354,6 +357,7 @@ impl ModuleError {
             }
             | Self::UnexpandedModuleTemplate { context: _ }
             | Self::ReferenceType(_)
+            | Self::AnalysisInvariant(_)
             | Self::TypeResolution(_)
             | Self::Io(_)
             | Self::Parse(_)
@@ -389,6 +393,7 @@ impl ModuleError {
             | Self::DroppedConditionalBinding { .. }
             | Self::UnexpandedModuleTemplate { .. }
             | Self::ReferenceType(_)
+            | Self::AnalysisInvariant(_)
             | Self::TypeResolution(_)
             | Self::Io(_)
             | Self::Parse(_)
@@ -495,6 +500,7 @@ impl ModuleError {
                 display_source_path_relative_to(path, root),
                 display_parse_error_relative_to(error, root),
             ),
+            Self::AnalysisInvariant(error) => error.to_string(),
             Self::TypeResolution(diagnostic) => format!(
                 "{}:{}:{}: {}",
                 display_source_path_relative_to(diagnostic.location().file().path(), root),
@@ -541,6 +547,7 @@ impl ModuleError {
             | Self::DroppedConditionalBinding { .. }
             | Self::UnexpandedModuleTemplate { .. }
             | Self::ReferenceType(_)
+            | Self::AnalysisInvariant(_)
             | Self::TypeResolution(_)
             | Self::Io(_)
             | Self::UnknownArgument { .. }

@@ -1282,6 +1282,12 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                 RuntimeContext::Projection(_context) => return Ok(value.clone()),
             };
 
+            // Declaration resolution already owns this failure. Preserve the
+            // call just as the parser's pending-function path does.
+            if session.function_declaration_failed(function) {
+                return Ok(value.clone());
+            }
+
             let resolved_args = match resolve_function_arguments(args, bindings, config)? {
                 FunctionArgumentResolution::FullyResolved(args) => args,
                 FunctionArgumentResolution::Deferred(args) => {

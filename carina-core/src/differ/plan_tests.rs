@@ -5303,7 +5303,8 @@ fn typed_enum_wait_value_traverses_an_enum_map_when_planning() {
 }
 
 #[test]
-fn nested_wait_resolution_error_matches_validation_message() {
+fn nested_wait_resolution_error_matches_validation_message()
+-> Result<(), crate::parser::AnalysisTreeError> {
     use crate::parser::{ProviderContext, UntilPredicateAst, WaitBinding, parse};
     use crate::schema::TypeIdentity;
 
@@ -5339,7 +5340,7 @@ let renewed = wait cert {
     )
     .expect("fixture must parse");
     let validation = crate::validation::wait::validate_wait_bindings(
-        &crate::parser::AnalysisTree::try_from_file(&parsed).expect("parser wait provenance"),
+        &crate::parser::AnalysisTree::try_from_file(&parsed)?,
         &schemas,
     );
     assert_eq!(validation.len(), 1);
@@ -5398,6 +5399,7 @@ let renewed = wait cert {
             .message
             .contains("cert.renewal_summary.renewal_status")
     );
+    Ok(())
 }
 
 #[test]

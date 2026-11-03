@@ -67,6 +67,50 @@ fn rendered_typecheck_result(
 }
 
 #[test]
+fn review_round2_type_resolution_rejects_missing_provenance_without_panicking() {
+    let mut parsed =
+        crate::parser::parse_and_resolve("let source = mock.test.Resource {}\n").unwrap();
+    parsed.resources[0].declaration = Default::default();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        deferred_types::with_session_for_test(
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            |session| resolve_file_type_exprs_report(&mut parsed, session, None),
+        )
+    }));
+    let error = outcome
+        .expect("must not panic")
+        .expect_err("reject missing provenance");
+    assert!(matches!(
+        error.kind(),
+        crate::parser::AnalysisTreeErrorKind::MissingResourceProvenance { .. }
+    ));
+}
+
+#[test]
+fn review_round2_ref_validation_rejects_missing_provenance_without_panicking() {
+    let mut parsed = crate::parser::parse_and_resolve("let source = mock.test.Resource {}\nlet up = upstream_state { source = './up' }\nlet copies = for item in up.items { mock.test.Resource {} }\n").unwrap();
+    parsed.resources[0].declaration = Default::default();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        deferred_types::with_session_for_test(
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            |session| {
+                let schemas = SchemaRegistry::new();
+                let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+                let bindings = BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(&parsed, &schemas, None, &signatures, session);
+                validate_resource_ref_types(&parsed, &schemas, &HashSet::new(), &bindings)
+            },
+        )
+    }));
+    let error = outcome
+        .expect("must not panic")
+        .expect_err("reject missing provenance");
+    assert!(matches!(
+        error,
+        ResourceRefTypeValidationError::AnalysisInvariant(_)
+    ));
+}
+
+#[test]
 fn deferred_iterable_shape_classifies_concrete_list_without_placeholder_type() {
     let shape = deferred_iterable_shape(
         &Value::Concrete(ConcreteValue::List(Vec::new())),
@@ -319,6 +363,7 @@ fn module_call_findings_for_test(
             bindings: &bindings,
             reference_checks: ModuleCallReferenceChecks::Enabled,
         })
+        .unwrap()
     })
 }
 
@@ -370,6 +415,7 @@ fn validate_resource_ref_types_for_test<
                 .map(|argument| argument.name.clone())
                 .collect();
             super::validate_resource_ref_types(parsed, schemas, &argument_names, &bindings)
+                .map_err(|error| error.to_string())
         },
     )
 }
@@ -4858,6 +4904,7 @@ fn check_module_calls_providerless_defers_unloaded_bare_count_argument() {
             bindings: &bindings,
             reference_checks: ModuleCallReferenceChecks::Enabled,
         })
+        .unwrap()
     });
     assert!(findings.is_empty(), "{findings:#?}");
 }
@@ -5103,6 +5150,7 @@ fn check_module_calls_reports_nested_file_type_resolution_errors() {
                 bindings: &bindings,
                 reference_checks: ModuleCallReferenceChecks::Enabled,
             })
+            .unwrap()
         });
 
     assert_eq!(findings.len(), 1, "unexpected findings: {findings:#?}");
@@ -5453,6 +5501,7 @@ let child = child_module { value = forwarded }
                 bindings: &bindings,
                 reference_checks: ModuleCallReferenceChecks::Enabled,
             })
+            .unwrap()
         },
     );
     let expanded = check_expanded_module_calls::<crate::resource::ParserPlaceholder>(
@@ -9259,7 +9308,7 @@ fn resolve_file_type_exprs_rejects_unknown_in_arguments() {
 
     let findings = crate::validation::deferred_types::with_session_for_test(
         &enriched_context_with_iam_policy_arn(),
-        |session| resolve_file_type_exprs(&mut parsed, session),
+        |session| resolve_file_type_exprs(&mut parsed, session).unwrap(),
     );
 
     assert_eq!(findings.len(), 1, "expected one finding, got {findings:?}");
@@ -9307,6 +9356,7 @@ fn file_type_resolution_parser_error_coverage_ignores_rendered_wording() {
                 session,
                 Some(TypeResolutionParserError::new(source_file, &parser_error)),
             )
+            .unwrap()
         },
     );
     assert!(bootstrap_report.diagnostics().is_empty());
@@ -9319,6 +9369,7 @@ fn file_type_resolution_parser_error_coverage_ignores_rendered_wording() {
                 session,
                 Some(TypeResolutionParserError::new(source_file, &parser_error)),
             )
+            .unwrap()
         });
 
     assert_eq!(report.diagnostics().len(), 1);
@@ -9340,7 +9391,7 @@ fn resolve_file_type_exprs_accepts_registered_bare_identity() {
 
     let findings = crate::validation::deferred_types::with_session_for_test(
         &enriched_context_with_iam_policy_arn(),
-        |session| resolve_file_type_exprs(&mut parsed, session),
+        |session| resolve_file_type_exprs(&mut parsed, session).unwrap(),
     );
     assert!(
         findings.is_empty(),
@@ -9362,7 +9413,7 @@ fn resolve_file_type_exprs_walks_into_list_map_union_struct() {
 
     let findings = crate::validation::deferred_types::with_session_for_test(
         &enriched_context_with_iam_policy_arn(),
-        |session| resolve_file_type_exprs(&mut parsed, session),
+        |session| resolve_file_type_exprs(&mut parsed, session).unwrap(),
     );
 
     let joined = findings
@@ -9393,7 +9444,7 @@ fn resolve_file_type_exprs_defers_unknown_bare_types_until_the_catalog_is_loaded
     assert!(!ctx.custom_types_loaded());
     assert!(ctx.known_custom_types().is_empty());
     let findings = crate::validation::deferred_types::with_session_for_test(&ctx, |session| {
-        resolve_file_type_exprs(&mut parsed, session)
+        resolve_file_type_exprs(&mut parsed, session).unwrap()
     });
     assert!(findings.is_empty());
 
@@ -9401,7 +9452,7 @@ fn resolve_file_type_exprs_defers_unknown_bare_types_until_the_catalog_is_loaded
     // unknown custom type.
     let findings = crate::validation::deferred_types::with_session_for_test(
         &enriched_context_with_iam_policy_arn(),
-        |session| resolve_file_type_exprs(&mut parsed, session),
+        |session| resolve_file_type_exprs(&mut parsed, session).unwrap(),
     );
     assert_eq!(
         findings.len(),
@@ -9793,7 +9844,8 @@ fn deferred_loop_placeholder_access_checks_after_materialization() {
 }
 
 #[test]
-fn file_type_resolution_report_mints_resolved_dependency_argument_types() {
+fn file_type_resolution_report_mints_resolved_dependency_argument_types()
+-> Result<(), crate::parser::AnalysisTreeError> {
     let context = ProviderContext {
         resource_types: HashSet::from([("mock".to_string(), "test.resource".to_string())]),
         custom_types: crate::parser::ProviderCustomTypes::loaded(
@@ -9815,7 +9867,7 @@ fn file_type_resolution_report_mints_resolved_dependency_argument_types() {
         TypeExpr::DottedUnresolved(_)
     ));
     let report = crate::validation::deferred_types::with_session_for_test(&context, |session| {
-        resolve_file_type_exprs_report(&mut parsed, session, None)
+        resolve_file_type_exprs_report(&mut parsed, session, None).unwrap()
     });
     assert!(
         report.diagnostics().is_empty(),
@@ -9823,7 +9875,7 @@ fn file_type_resolution_report_mints_resolved_dependency_argument_types() {
         report.diagnostics()
     );
     let diagnostics = depends_on::validate_depends_on(
-        &crate::parser::AnalysisTree::try_from_file(&parsed).expect("parser dependency provenance"),
+        &crate::parser::AnalysisTree::try_from_file(&parsed)?,
         report.resolved_argument_types(),
     );
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
@@ -9832,10 +9884,12 @@ fn file_type_resolution_report_mints_resolved_dependency_argument_types() {
         diagnostics[0].message,
         "directives.depends_on: expected a managed resource handle; got aws.iam.Policy.Arn"
     );
+    Ok(())
 }
 
 #[test]
-fn file_type_resolution_failure_classifies_each_dependency_argument_independently() {
+fn file_type_resolution_failure_classifies_each_dependency_argument_independently()
+-> Result<(), crate::parser::AnalysisTreeError> {
     let mut parsed = crate::parser::parse(
         r#"arguments {
   bad: aws.route53.Missing.Id
@@ -9862,12 +9916,12 @@ let consumer = mock.test.resource {
         ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     };
     let report = crate::validation::deferred_types::with_session_for_test(&context, |session| {
-        resolve_file_type_exprs_report(&mut parsed, session, None)
+        resolve_file_type_exprs_report(&mut parsed, session, None).unwrap()
     });
     assert!(!report.diagnostics().is_empty());
     let argument_types = report.resolved_argument_types();
     let diagnostics = depends_on::validate_depends_on(
-        &crate::parser::AnalysisTree::try_from_file(&parsed).expect("parser dependency provenance"),
+        &crate::parser::AnalysisTree::try_from_file(&parsed)?,
         argument_types,
     );
     for expected in [
@@ -9893,6 +9947,7 @@ let consumer = mock.test.resource {
         }),
         "only the unresolved argument's handle-kind check must be skipped: {diagnostics:#?}"
     );
+    Ok(())
 }
 
 fn parser_test_location(path: &std::path::Path) -> crate::parser::DeclarationLocation {

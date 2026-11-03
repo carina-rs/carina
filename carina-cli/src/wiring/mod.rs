@@ -893,7 +893,7 @@ pub(crate) fn failed_configuration_report<T>(
                     )
                 {
                     errors.extend(
-                        validation::resolve_file_type_exprs(&mut parsed, session)
+                        validation::resolve_file_type_exprs(&mut parsed, session)?
                             .into_iter()
                             .map(|error| error.to_string()),
                     );
@@ -3097,12 +3097,16 @@ pub fn validate_resource_ref_types_with_ctx<
         ctx.schemas(),
         ctx.provider_context().as_provider_context(),
     );
-    lift_validation_result(validation::validate_resource_ref_types(
-        parsed,
-        ctx.schemas(),
-        argument_names,
-        &bindings,
-    ))
+    match validation::validate_resource_ref_types(parsed, ctx.schemas(), argument_names, &bindings)
+    {
+        Ok(()) => Vec::new(),
+        Err(validation::ResourceRefTypeValidationError::Validation(message)) => {
+            split_validation_message(&message)
+        }
+        Err(validation::ResourceRefTypeValidationError::AnalysisInvariant(error)) => {
+            vec![AppError::AnalysisInvariant(error)]
+        }
+    }
 }
 
 pub fn validate_composition_ref_types_with_ctx<
@@ -4461,7 +4465,14 @@ pub(crate) fn validate_module_attribute_refs_after_expansion_failure(
     let mut errors = Vec::new();
     for module in module_walk.iter() {
         let mut parsed = module.loaded().parsed.clone();
-        for finding in validation::resolve_file_type_exprs(&mut parsed, config) {
+        let findings = match validation::resolve_file_type_exprs(&mut parsed, config) {
+            Ok(findings) => findings,
+            Err(error) => {
+                errors.push(AppError::AnalysisInvariant(error));
+                continue;
+            }
+        };
+        for finding in findings {
             errors.push(AppError::Validation(format!(
                 "{}: {finding}",
                 module.diagnostic_label()
@@ -4500,7 +4511,14 @@ pub(crate) fn validate_module_internal_ref_types(
         // Module expansion retains the established diagnostic for malformed
         // declarations. This pass only needs successful resolution so valid
         // dotted argument types can act as sources before expansion.
-        if !validation::resolve_file_type_exprs(&mut parsed, config).is_empty() {
+        let findings = match validation::resolve_file_type_exprs(&mut parsed, config) {
+            Ok(findings) => findings,
+            Err(error) => {
+                errors.push(AppError::AnalysisInvariant(error));
+                continue;
+            }
+        };
+        if !findings.is_empty() {
             // The module resolver owns declaration errors, including their
             // declaration range. This preflight cannot compare references
             // until those declarations resolve. Deferrals are already retained
@@ -4528,7 +4546,14 @@ pub(crate) fn validate_module_internal_ref_types(
             &HashSet::new(),
             &bindings,
         ) {
-            errors.extend(prefixed_validation_messages(&joined, &prefix));
+            match joined {
+                validation::ResourceRefTypeValidationError::Validation(message) => {
+                    errors.extend(prefixed_validation_messages(&message, &prefix))
+                }
+                validation::ResourceRefTypeValidationError::AnalysisInvariant(error) => {
+                    errors.push(AppError::AnalysisInvariant(error))
+                }
+            }
         }
         if let Err(joined) = validation::validate_attribute_param_ref_types_with_bindings(
             &parsed.attribute_params,
