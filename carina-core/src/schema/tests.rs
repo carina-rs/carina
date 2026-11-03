@@ -10297,15 +10297,15 @@ fn assignable_int_custom_rejects_string_custom() {
 
 // -- Custom-pattern and Custom-length assignability matrix (#2218) --
 //
-// Expected rules for String pattern/length assignability (#2218, #4230):
+// Expected rules for primitive refinement assignability (#2218, #4230):
 //
-// - An identity-bearing String source may flow into an anonymous refined
-//   String sink regardless of its own pattern/length evidence. The sink's
-//   constraints are checked on the value when known at plan or before
-//   provider dispatch at apply (#3805). This exception is limited to
-//   identity-less sinks. Rule 7's identity and length comparisons and rule
-//   8's identity-less refined-source evidence comparisons are unchanged,
-//   as are Enum and numeric assignment rules.
+// - An identity-bearing String, Int, or Float source may flow into an
+//   anonymous refined sink of the same primitive kind regardless of its own
+//   pattern/length/range evidence. The sink's constraints are checked on the
+//   value when known at plan or before provider dispatch at apply (#3805).
+//   This exception is limited to identity-less sinks. Rule 7's identity and
+//   constraint comparisons and rule 8's identity-less refined-source evidence
+//   comparisons are unchanged, as are Enum and Int-to-Float widening rules.
 // - Between anonymous refined Strings, the conservative rules below remain:
 //
 // - pattern: differing literal strings are conservatively *incompatible*
@@ -10562,22 +10562,80 @@ fn typed_ref_anonymous_refined_string_rejects_enum_sink() {
 }
 
 #[test]
-fn typed_ref_anonymous_refined_string_preserves_numeric_range_rules() {
-    for range in [None, Some((Some(0), Some(100)))] {
+fn typed_ref_anonymous_refined_int_defers_range_constraints() {
+    for range in [
+        None,
+        Some((Some(30), Some(60))),
+        Some((Some(0), Some(100))),
+        Some((Some(100), Some(200))),
+    ] {
         let source = AttributeType::refined_int(Some(TypeIdentity::bare("Count")), range);
         let sink = AttributeType::refined_int(None, Some((Some(25), Some(75))));
+        let actual = assignable(&source, &sink);
         assert!(
-            !assignable(&source, &sink),
-            "named Int must still prove range containment"
+            actual,
+            "identified Int with range {range:?} must defer the sink's range check; assignability was {actual}"
         );
     }
-    for range in [None, Some((Some(0.0), Some(100.0)))] {
+}
+
+#[test]
+fn typed_ref_anonymous_refined_float_defers_range_constraints() {
+    for range in [
+        None,
+        Some((Some(30.0), Some(60.0))),
+        Some((Some(0.0), Some(100.0))),
+        Some((Some(100.0), Some(200.0))),
+    ] {
         let source = AttributeType::refined_float(Some(TypeIdentity::bare("Ratio")), range);
         let sink = AttributeType::refined_float(None, Some((Some(25.0), Some(75.0))));
+        let actual = assignable(&source, &sink);
         assert!(
-            !assignable(&source, &sink),
-            "named Float must still prove range containment"
+            actual,
+            "identified Float with range {range:?} must defer the sink's range check; assignability was {actual}"
         );
+    }
+}
+
+#[test]
+fn typed_ref_anonymous_refined_numeric_preserves_identity_range_and_primitive_rules() {
+    let named_int = AttributeType::refined_int(Some(TypeIdentity::bare("Count")), None);
+    let other_int = AttributeType::refined_int(Some(TypeIdentity::bare("Port")), None);
+    assert!(
+        !assignable(&named_int, &other_int),
+        "rule 7 still requires compatible identities"
+    );
+
+    let wide_int = AttributeType::refined_int(None, Some((Some(0), Some(100))));
+    let narrow_int = AttributeType::refined_int(None, Some((Some(25), Some(75))));
+    assert!(
+        !assignable(&wide_int, &narrow_int),
+        "rule 8 still requires identity-less source range containment"
+    );
+
+    let named_float = AttributeType::refined_float(Some(TypeIdentity::bare("Ratio")), None);
+    for source in [AttributeType::float(), named_float.clone()] {
+        assert!(
+            !assignable(&source, &narrow_int),
+            "Float must not narrow to Int"
+        );
+    }
+
+    let status = AttributeType::enum_(
+        TypeIdentity::bare("Status"),
+        Some(vec!["Enabled".to_string(), "Disabled".to_string()]),
+        vec![],
+        None,
+        None,
+    );
+    let refined_string = make_custom_anon_len(1, 1024);
+    for source in [named_int, named_float] {
+        for sink in [&status, &AttributeType::string(), &refined_string] {
+            assert!(
+                !assignable(&source, sink),
+                "identified numerics must not assign to Enum or String: {source:?} -> {sink:?}"
+            );
+        }
     }
 }
 

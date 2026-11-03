@@ -4394,9 +4394,10 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     ///    rejected both ways (populated providers differ). Closes carina#3218.
     /// 8. Custom→Custom where at least one side has `identity: None`: check
     ///    pattern (literal equality) and length containment (source ⊆ sink),
-    ///    then recurse on base. Exception: an identity-bearing String source
-    ///    is assignable to an identity-less String sink regardless of its own
-    ///    pattern/length. The sink's value constraints are checked when known
+    ///    then recurse on base. Exception: an identity-bearing String, Int, or
+    ///    Float source is assignable to an identity-less sink of the same
+    ///    primitive kind regardless of its own pattern/length/range. The
+    ///    sink's value constraints are checked when known
     ///    at plan or before provider dispatch at apply (carina#3805). Rule 7
     ///    and rule 8's identity-less refined-source comparisons are unchanged.
     /// 9. Custom source → non-Custom sink: recurse on `source.base`.
@@ -4746,6 +4747,22 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 },
                 Float { binding, .. },
             ) if binding.identity().is_some() => false,
+            // Identified numerics defer same-kind identity-less sink ranges
+            // to the resolved value, like identified Strings (#3805, #4230).
+            (
+                Int { binding, .. },
+                Int {
+                    binding: RefinementBinding::MetadataOnly(None),
+                    ..
+                },
+            )
+            | (
+                Float { binding, .. },
+                Float {
+                    binding: RefinementBinding::MetadataOnly(None),
+                    ..
+                },
+            ) if binding.identity().is_some() => true,
             // Numeric widening is directional: an Int source may flow into
             // a Float sink, matching concrete-value validation. Preserve
             // identity and range evidence when either side carries it.

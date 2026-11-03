@@ -1,7 +1,7 @@
-//! carina#4230: named String references defer anonymous sink constraints.
+//! carina#4230: named primitive references defer anonymous sink constraints.
 //!
-//! The built-in mock catalog has no named String output / anonymous refined
-//! String input pair. Use the existing caller-supplied factory seam instead
+//! The built-in mock catalog has no named output / anonymous refined input
+//! pairs for these cases. Use the existing caller-supplied factory seam instead
 //! of changing that production catalog. Like the #3825 plan-display fixture,
 //! runtime tests skip resource type checking in the fixture planner so they
 //! independently pin #3805. The validate tests cover the authored boundary,
@@ -72,6 +72,7 @@ impl ProviderFactory for TypedRefMockFactory {
                 carina_core::provider::InitializeOutcome::unavailable().with_provider(Box::new(
                     OutputMock {
                         output: Value::Concrete(ConcreteValue::String("good-value".into())),
+                        port: 80,
                         creates: Mutex::new(Vec::new()),
                     },
                 )),
@@ -103,9 +104,30 @@ impl ProviderFactory for TypedRefMockFactory {
         );
         [
             ResourceSchema::new(PRODUCER)
-                .attribute(AttributeSchema::provider_populated("typed_out", named).build()),
+                .attribute(AttributeSchema::provider_populated("typed_out", named).build())
+                .attribute(
+                    AttributeSchema::provider_populated(
+                        "typed_port",
+                        AttributeType::refined_int(
+                            Some(TypeIdentity::new(
+                                Some("mock"),
+                                Vec::<String>::new(),
+                                "Port",
+                            )),
+                            None,
+                        ),
+                    )
+                    .build(),
+                ),
             ResourceSchema::new(CONSUMER)
                 .attribute(AttributeSchema::optional("x", refined.clone()).build())
+                .attribute(
+                    AttributeSchema::optional(
+                        "port",
+                        AttributeType::refined_int(None, Some((Some(1), Some(1024)))),
+                    )
+                    .build(),
+                )
                 .attribute(
                     AttributeSchema::optional("xs", AttributeType::list(refined.clone())).build(),
                 )
@@ -168,9 +190,13 @@ impl Scenario {
     }
 
     fn seed_output(&self, value: &str) {
+        self.seed_producer_output("typed_out", serde_json::json!(value));
+    }
+
+    fn seed_producer_output(&self, attribute: &str, value: serde_json::Value) {
         let mut producer = ResourceState::try_applied(PRODUCER, "producer", "mock", "producer-id")
             .unwrap()
-            .with_attribute("typed_out", serde_json::json!(value));
+            .with_attribute(attribute, value);
         producer.binding = Some(carina_core::resource::absolute_binding_address_for_test(
             "producer",
         ));
@@ -196,6 +222,12 @@ impl Scenario {
 #[test]
 fn typed_ref_validate_accepts_anonymous_refined_scalar_sink() {
     let errors = Scenario::new("  x = producer.typed_out").validate();
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
+
+#[test]
+fn typed_ref_int_validate_accepts_anonymous_ranged_sink() {
+    let errors = Scenario::new("  port = producer.typed_port").validate();
     assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
 
@@ -299,6 +331,34 @@ fn typed_ref_plan_rejects_known_output_with_resolved_value_constraint() {
     }
 }
 
+#[test]
+fn typed_ref_int_plan_rejects_known_out_of_range_output() {
+    for value in [0, 1025] {
+        let scenario = Scenario::new("  port = producer.typed_port");
+        scenario.seed_producer_output("typed_port", serde_json::json!(value));
+        let fixture = scenario.plan();
+        let errors = fixture.plan.errors();
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        let error = &errors[0];
+        assert_eq!(error.resource_id.resource_type, CONSUMER);
+        assert_eq!(error.resource_id.identity_str(), Some("consumer"));
+        let PlanErrorKind::ResolvedValueConstraint {
+            attributes,
+            origins,
+            message,
+        } = &error.kind
+        else {
+            panic!("expected ResolvedValueConstraint, got {error:#?}");
+        };
+        assert_eq!(attributes, &["port"]);
+        assert_eq!(origins, &["producer.typed_port"]);
+        assert!(
+            message.as_str().contains("outside allowed range"),
+            "{error:#?}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn typed_ref_plan_command_validates_references_and_rejects_known_invalid_outputs() {
     for (value, valid) in [
@@ -339,6 +399,7 @@ async fn typed_ref_plan_command_validates_references_and_rejects_known_invalid_o
 /// provider-ready boundary and publishes a configurable producer output.
 struct OutputMock {
     output: Value,
+    port: i64,
     creates: Mutex<Vec<ResourceId>>,
 }
 
@@ -373,6 +434,10 @@ impl Provider for OutputMock {
         let mut attributes = request.resource().as_resource().resolved_attributes();
         if id.resource_type == PRODUCER {
             attributes.insert("typed_out".to_string(), self.output.clone());
+            attributes.insert(
+                "typed_port".to_string(),
+                Value::Concrete(ConcreteValue::Int(self.port)),
+            );
         }
         Box::pin(async move {
             Ok(attempt
@@ -424,6 +489,10 @@ impl ExecutionObserver for Observer {
 }
 
 fn apply_unknown_output(attributes: &str, output: Value) -> ExecutionResult {
+    apply_unknown_outputs(attributes, output, 80)
+}
+
+fn apply_unknown_outputs(attributes: &str, output: Value, port: i64) -> ExecutionResult {
     let scenario = Scenario::new(attributes);
     let fixture = scenario.plan();
     assert!(
@@ -454,6 +523,7 @@ fn apply_unknown_output(attributes: &str, output: Value) -> ExecutionResult {
     let published = Arc::clone(&checkpoints);
     let provider = OutputMock {
         output,
+        port,
         creates: Mutex::new(Vec::new()),
     };
     let input = LiveExecutionInput {
@@ -517,6 +587,7 @@ fn apply_unknown_output(attributes: &str, output: Value) -> ExecutionResult {
         assert!(state.exists);
         assert_eq!(state.identifier.as_deref(), Some("fixture-id"));
         assert!(state.attributes.contains_key("typed_out"));
+        assert!(state.attributes.contains_key("typed_port"));
         assert!(
             !checkpoint
                 .applied_states
@@ -558,6 +629,24 @@ fn typed_ref_apply_rejects_unknown_output_before_consumer_create() {
                 "must reach the resolved value gate: {error}"
             );
         }
+    }
+}
+
+#[test]
+fn typed_ref_int_apply_rejects_unknown_out_of_range_output_before_consumer_create() {
+    for value in [0, 1025] {
+        let result = apply_unknown_outputs(
+            "  port = producer.typed_port",
+            Value::Concrete(ConcreteValue::String("good-value".into())),
+            value,
+        );
+        let error = result.failures()[0].to_string();
+        assert!(error.contains(CONSUMER), "{error}");
+        assert!(error.contains("outside allowed range"), "{error}");
+        assert!(
+            !error.contains("cannot assign"),
+            "must reach the resolved value gate: {error}"
+        );
     }
 }
 

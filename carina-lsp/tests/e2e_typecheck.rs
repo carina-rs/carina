@@ -487,6 +487,56 @@ fn typed_ref_anonymous_refined_string_has_no_type_mismatch_diagnostic() {
 }
 
 #[test]
+fn typed_ref_anonymous_ranged_int_has_no_type_mismatch_diagnostic() {
+    use carina_core::schema::TypeIdentity;
+
+    let mut schemas = SchemaRegistry::new();
+    for schema in [
+        ResourceSchema::new("r.TypedProducer").attribute(
+            AttributeSchema::provider_populated(
+                "typed_port",
+                AttributeType::refined_int(
+                    Some(TypeIdentity::new(
+                        Some("test"),
+                        Vec::<String>::new(),
+                        "Port",
+                    )),
+                    None,
+                ),
+            )
+            .build(),
+        ),
+        ResourceSchema::new("r.RefinedConsumer").attribute(
+            AttributeSchema::optional(
+                "port",
+                AttributeType::refined_int(None, Some((Some(1), Some(1024)))),
+            )
+            .build(),
+        ),
+    ] {
+        schemas.insert(
+            "test",
+            schema.validate().expect("typed reference Int schema"),
+        );
+    }
+    let engine = engine_with_schemas(schemas);
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider test {}\n"),
+        ("producer.crn", "let producer = test.r.TypedProducer {}\n"),
+        (
+            "consumer.crn",
+            "test.r.RefinedConsumer {\n  port = producer.typed_port\n}\n",
+        ),
+    ]);
+    let diags = analyze(&engine, &fixture, "consumer.crn");
+    assert!(
+        diags.is_empty(),
+        "typed references must defer anonymous Int constraints to resolution; got: {:?}",
+        messages_of(&diags),
+    );
+}
+
+#[test]
 fn typed_ref_anonymous_refined_string_named_mismatch_keeps_diagnostic() {
     let engine = engine_with_schemas(typed_ref_anonymous_refined_string_schemas());
     let fixture = write_fixture(&[
