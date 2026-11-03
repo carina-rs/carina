@@ -281,6 +281,7 @@ let net = network {
 }
 
 awscc.ec2.SecurityGroup {
+  group_description = 'Example security group'
   vpc_id = net.vpc.vpc_id
 }
 ```
@@ -305,11 +306,12 @@ modules/network/
   attributes.crn
 ```
 
-The merged module must declare at least one `arguments` or `attributes`
-block; a directory with neither is not treated as a module.
+The merged module must declare at least one argument parameter or output
+attribute. Empty `arguments` or `attributes` blocks do not make a directory a module.
 
 Single-file sources (`use { source = "./modules/network.crn" }`) are **not supported**:
-the loader returns `NotADirectory` for any path that is not a directory.
+the loader returns `NotADirectory` for an existing file source. A missing or
+inaccessible source returns its underlying I/O error.
 If your module is currently a single `.crn` file, move it into a directory of
 its own.
 

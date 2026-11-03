@@ -21,7 +21,7 @@ interpreted as interpolation — it is kept verbatim.
 ```crn
 let name = 'my-vpc'
 let region = 'ap-northeast-1'
-let literal = 'price is ${amount}'   # the six characters ${amount} stay as-is
+let literal = 'price is ${amount}'   # the nine characters ${amount} stay as-is
 ```
 
 The only escape sequences recognized inside single quotes are `\'` (single
@@ -228,6 +228,7 @@ provider awscc {
 }
 
 awscc.ec2.Vpc {
+  cidr_block = '10.0.0.0/16'
   instance_tenancy = aws.ec2.Vpc.InstanceTenancy.default
 }
 ```
@@ -279,7 +280,6 @@ let network = vpc
 
 let subnet = awscc.ec2.Subnet {
   vpc_id = network.vpc_id # Valid: selects an attribute.
-  name   = network.name   # Valid: selects an attribute.
   parent = network        # Invalid: network is still a bare handle.
 }
 ```
