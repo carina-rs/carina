@@ -143,6 +143,7 @@ The closed `current.kind` set in schema version 1 is:
 | `applied` | A completed current resource instance with a provider identifier. |
 | `none` | The row has no current instance, but may retain deposed generations. |
 | `create_in_flight` | The provider accepted a create that has not completed. |
+| `create_outcome_unknown` | The create may have reached the provider, but no provider identifier or resumable token is known. Its `identifier` is `null` and `attributes` is `{}`. |
 | `missing_identifier` | A legacy or malformed current instance has attributes but no provider identifier. |
 
 Strings, numbers, booleans, lists, and maps are emitted as ordinary JSON.
@@ -277,9 +278,11 @@ metadata-only checker does not receive credentials. Released protocol-v12
 provider artifacts are supported on this command's metadata-only path; normal
 plan/apply provider loading remains on the current protocol.
 
-A successful check reports the number of classified rows and any
-orphan/deposed warnings, followed by `no state was written`. A missing or
-ambiguous dependency on a row still present in configuration is an error. For
+A successful legacy-state check reports the number of classified rows and any
+orphan/deposed warnings, followed by `no state was written`. Already-current
+state prints `State dependency migration check passed: state is already version 21.`
+and exits successfully. A missing or ambiguous dependency on a row still present
+in configuration is an error. For
 an orphan or deposed row, known ordering edges remain usable and every
 unresolved legacy name is printed as a warning.
 
@@ -363,7 +366,7 @@ Carina stores state in `carina.state.json` (local backend) or in an S3 bucket (r
 
 - **lineage** -- unique identifier for the state, used for drift detection
 - **serial** -- incrementing version number
-- **resources** -- list of managed resources with their provider, type, identity, binding, attributes, and dependency bindings
+- **resources** -- list of managed resources with their provider, type, identity, binding, attributes, and complete resolved dependency addresses (including provider-instance routing)
 - **exports** -- values published by the `exports` block
 - **exports_version** -- version of the exports encoding, independent of the state format version, so older Carina versions can still read exports from a newer state file
 
