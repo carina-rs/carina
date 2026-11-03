@@ -66,10 +66,10 @@ carina apply plan.json
 ```
 
 If the configured backend differs from `carina-backend.lock`, `plan`
-prints a backend-drift warning, reads state from the locked old backend,
-and includes a migration-pending note before the plan summary. A saved
-plan produced in this state records the locked backend that supplied the
-state; run `carina init --migrate-state` before applying.
+prints a backend-drift warning to stderr and reads state from the locked old
+backend. In ordinary text output, the migration-pending note follows the plan
+summary. A saved plan produced in this state records the locked backend that
+supplied the state; run `carina init --migrate-state` before applying.
 
 ### `--detailed-exitcode`
 
@@ -77,17 +77,17 @@ Change the exit code behavior:
 
 | Exit code | Meaning |
 |-----------|---------|
-| `0` | No changes needed |
+| `0` | No mutating execution-plan effects; export/directive-only changes may still exist |
 | `1` | Error occurred |
-| `2` | Changes are present (only with `--detailed-exitcode`) |
+| `2` | Mutating execution-plan effects are present (only with `--detailed-exitcode`) |
 
-This is useful in CI pipelines to detect whether changes exist without parsing output.
+This is useful in CI pipelines to detect mutating execution-plan effects without parsing output.
 
 ### `--refresh <BOOL>`
 
 Refresh managed-resource state from the cloud provider before planning. Defaults to `true`.
 
-When set to `false`, Carina uses cached state for managed resources and prints a warning. Data sources are queries rather than managed objects, so Carina always reads them regardless of this flag. The plan may not reflect the actual managed infrastructure.
+When set to `false`, Carina uses cached state for managed resources and prints a warning. Data-source reads are independent of this flag: available inputs are queried, while reads depending on new or unresolved resources are deferred to apply. The plan may not reflect the actual managed infrastructure.
 
 ```bash
 carina plan --refresh=false
@@ -254,7 +254,7 @@ carina plan --image-theme dark --image plan-dark.png
 
 ### `--check-iam`
 
-Before showing the plan, check whether the AWS caller identity (the role that will run `apply`) has the IAM actions the providers declare for the planned effects. Carina uses `iam:SimulatePrincipalPolicy`, and falls back to reading the role's policies (`iam:GetRolePolicy`, `iam:ListAttachedRolePolicies`) when simulation is denied. Missing actions are reported per effect as warnings; the plan does not fail. If the caller identity or its policies cannot be read, the check is skipped with a warning.
+Before showing the plan, check whether the AWS identity from the host's default credential chain has the IAM actions the providers declare for the planned effects. Provider-instance `assume_role` identities are not selected by this check, so its caller may differ from the identity executing `apply`. Carina uses `iam:SimulatePrincipalPolicy`, and falls back to reading the role's policies (`iam:GetRolePolicy`, `iam:ListAttachedRolePolicies`) when simulation is denied. Missing actions are reported per effect as warnings; the plan does not fail. If the caller identity or its policies cannot be read, the check is skipped with a warning.
 
 ### `--strict-iam`
 
