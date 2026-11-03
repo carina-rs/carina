@@ -13,7 +13,10 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::Document;
 use crate::position;
-use carina_core::parser::{ParseError, SourceSpan, WarningKind, contains_function_call};
+use carina_core::parser::{
+    ParseError, ProviderConfig, SourceSpan, WarningKind, contains_function_call,
+};
+use carina_core::paths::PathIdentity;
 use carina_core::provider::{
     HostErrorCause, LoadedProviderSnapshot, ProviderError, ProviderFactory, SuspendedValidationId,
 };
@@ -392,6 +395,10 @@ impl std::ops::Deref for DiagnosticProviderContext {
 pub struct DiagnosticEngine {
     schemas: Arc<SchemaRegistry>,
     loaded_providers: Option<Arc<LoadedProviderSnapshot>>,
+    /// Declarations and directory that produced this engine's loaded snapshot.
+    /// Ancestor, imported, and empty states cannot establish authority for a
+    /// different directory when its declarations fail to parse.
+    directory_providers: Option<DirectoryProviderDeclarations>,
     provider_names: Vec<String>,
     known_provider_names: HashSet<String>,
     factories: Arc<Vec<Box<dyn ProviderFactory>>>,
@@ -399,6 +406,11 @@ pub struct DiagnosticEngine {
     provider_errors: HashMap<String, String>,
     /// Cached provider context with custom type validators from schemas.
     provider_context: DiagnosticProviderContext,
+}
+
+struct DirectoryProviderDeclarations {
+    directory: PathIdentity,
+    providers: Vec<ProviderConfig>,
 }
 
 struct LspTypeCheckSink<'a> {
@@ -2082,6 +2094,7 @@ impl DiagnosticEngine {
         Self {
             schemas: Arc::clone(&schemas),
             loaded_providers: None,
+            directory_providers: None,
             provider_names: Vec::new(),
             known_provider_names: HashSet::new(),
             factories: Arc::new(Vec::new()),
@@ -2104,6 +2117,7 @@ impl DiagnosticEngine {
         Self {
             schemas,
             loaded_providers: Some(loaded_providers),
+            directory_providers: None,
             provider_names,
             known_provider_names,
             factories,
@@ -2118,6 +2132,18 @@ impl DiagnosticEngine {
 
     pub fn with_provider_errors(mut self, errors: HashMap<String, String>) -> Self {
         self.provider_errors = errors;
+        self
+    }
+
+    pub(crate) fn with_directory_providers(
+        mut self,
+        directory: PathIdentity,
+        providers: Vec<ProviderConfig>,
+    ) -> Self {
+        self.directory_providers = Some(DirectoryProviderDeclarations {
+            directory,
+            providers,
+        });
         self
     }
 
@@ -2174,14 +2200,17 @@ impl DiagnosticEngine {
                 .ok()
                 .and_then(|directory| self.directory_catalog(doc, &directory))
                 .unwrap_or_else(|| {
-                    // Editing a resource must not discard already loaded provider
-                    // authority. Until declarations parse again, retain the last
-                    // loaded snapshot, including its provider-load failures.
-                    let mut catalog = (*self.provider_context).clone();
-                    catalog.custom_types = catalog
-                        .custom_types
-                        .with_failed_providers(self.provider_errors.keys().cloned().collect());
-                    catalog
+                    if let Some(scope) = &self.directory_providers
+                        && scope.directory == PathIdentity::new(directory)
+                    {
+                        // A resource edit may break declaration parsing without
+                        // invalidating this directory's loaded provider snapshot.
+                        self.catalog_for_provider_declarations(&scope.providers)
+                    } else {
+                        carina_core::parser::ProviderContext::new(
+                            doc.provider_context().environment.clone(),
+                        )
+                    }
                 }),
             None => (*self.provider_context).clone(),
         };
@@ -2241,6 +2270,15 @@ impl DiagnosticEngine {
                 .ok()?,
             );
         }
+        Some(self.catalog_for_provider_declarations(&providers))
+    }
+
+    /// Apply the same default-provider failure policy to freshly parsed
+    /// declarations and the declarations retained with an exact-directory state.
+    fn catalog_for_provider_declarations<P: carina_core::resource::PlaceholderKind>(
+        &self,
+        providers: &[ProviderConfig<P>],
+    ) -> carina_core::parser::ProviderContext {
         let mut loaded = self
             .provider_names
             .iter()
@@ -2263,7 +2301,7 @@ impl DiagnosticEngine {
             loaded.insert(carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string());
         }
         let failed = carina_core::parser::unavailable_provider_kinds(
-            &providers,
+            providers,
             &loaded,
             &self.provider_errors,
         );
@@ -2276,7 +2314,7 @@ impl DiagnosticEngine {
                 carina_core::provider::provider_custom_types_from_factories(Arc::new(Vec::new()))
             });
         catalog.custom_types = loaded_catalog.with_failed_providers(failed);
-        Some(catalog)
+        catalog
     }
 }
 

@@ -1,11 +1,13 @@
 #[path = "../../carina-core/tests/support/identity_edges.rs"]
 pub mod identity_edges;
+mod support;
 
 use carina_core::parser::ProviderContext;
 use carina_lsp::{
     Backend, backend::FactoryBuilder, diagnostics::DiagnosticEngine, document::Document,
 };
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::Path, path::PathBuf, sync::Arc};
+use support::TestClient;
 use tempfile::TempDir;
 use tower_lsp::{LanguageServer, LspService, lsp_types::*};
 
@@ -58,9 +60,9 @@ impl Scenario {
         engine.analyze(&doc, Some(&path))
     }
 
-    async fn complete(&self, text: &str, position: Position) -> Vec<CompletionItem> {
+    fn factory_builder(&self, errors: HashMap<String, String>) -> FactoryBuilder {
         let owners = self.owners.clone();
-        let builder: FactoryBuilder = Arc::new(move |_| {
+        Arc::new(move |_| {
             let factories = owners
                 .iter()
                 .map(|&(owner, edges)| {
@@ -68,8 +70,31 @@ impl Scenario {
                         as Box<dyn carina_core::provider::ProviderFactory>
                 })
                 .collect();
-            (factories, Default::default(), Vec::new())
-        });
+            (factories, errors.clone(), Vec::new())
+        })
+    }
+
+    async fn client_with_errors(&self, errors: HashMap<String, String>) -> TestClient {
+        let mut client = TestClient::with_factory_builder(Some(self.factory_builder(errors))).await;
+        let root = Url::from_directory_path(self.directory.path()).unwrap();
+        client.initialize_with_root(Some(root.as_str())).await;
+        let has_providers = !self.owners.is_empty();
+        client
+            .wait_for_server_notification("window/logMessage", |params| {
+                params["message"].as_str().is_some_and(|message| {
+                    if has_providers {
+                        message.starts_with("Loaded providers for ")
+                    } else {
+                        message == "Carina LSP server initialized"
+                    }
+                })
+            })
+            .await;
+        client
+    }
+
+    async fn complete(&self, text: &str, position: Position) -> Vec<CompletionItem> {
+        let builder = self.factory_builder(HashMap::new());
         let (service, socket) = LspService::new(|client| {
             Backend::new(
                 client,
@@ -123,6 +148,162 @@ impl Scenario {
     }
 }
 
+async fn open_diagnostics(client: &mut TestClient, path: &Path, text: &str) -> Vec<Diagnostic> {
+    let uri = Url::from_file_path(path).unwrap();
+    client.open_document(uri.as_str(), text).await;
+    let notification = client.wait_for_diagnostics(uri.as_str()).await;
+    serde_json::from_value(notification["params"]["diagnostics"].clone()).unwrap()
+}
+
+async fn request_completions(
+    client: &mut TestClient,
+    path: &Path,
+    text: &str,
+    position: Position,
+) -> Vec<CompletionItem> {
+    open_diagnostics(client, path, text).await;
+    let response = client
+        ._request_completion(
+            Url::from_file_path(path).unwrap().as_str(),
+            position.line,
+            position.character,
+        )
+        .await;
+    match serde_json::from_value(response["result"].clone()).unwrap() {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => list.items,
+    }
+}
+
+fn subdirectory_with_broken_providers(scenario: &Scenario) -> PathBuf {
+    let sub = scenario.directory.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("providers.crn"), "provider mock {\n").unwrap();
+    std::fs::write(sub.join("main.crn"), "").unwrap();
+    std::fs::write(sub.join("producer.crn"), "let producer = mock.Bucket {}\n").unwrap();
+    sub.join("main.crn")
+}
+
+#[tokio::test]
+async fn broken_subdirectory_providers_defer_instead_of_using_ancestor_catalog() {
+    let scenario = Scenario::new(&[("mock", true)]);
+    let path = subdirectory_with_broken_providers(&scenario);
+    let mut client = scenario.client_with_errors(HashMap::new()).await;
+    let diagnostics = open_diagnostics(
+        &mut client,
+        &path,
+        "fn check(value: BareUnknown) { value }\n",
+    )
+    .await;
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unknown custom type")),
+        "{diagnostics:#?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("BareUnknown")
+                && diagnostic.message.contains("was deferred")
+                && diagnostic.severity == Some(DiagnosticSeverity::WARNING)),
+        "{diagnostics:#?}"
+    );
+}
+
+#[tokio::test]
+async fn broken_subdirectory_providers_do_not_apply_ancestor_completion_edges() {
+    let scenario = Scenario::new(&[("mock", true)]);
+    let path = subdirectory_with_broken_providers(&scenario);
+    let mut client = scenario.client_with_errors(HashMap::new()).await;
+    let items = request_completions(
+        &mut client,
+        &path,
+        "let consumer = mock.Bucket {\n  bucket = \n}\n",
+        Position::new(1, 11),
+    )
+    .await;
+    assert!(
+        items.iter().any(|item| item.label == "producer.old_name"),
+        "structurally matching identities remain available: {items:#?}"
+    );
+    assert!(
+        !items.iter().any(|item| item.label == "producer.new_name"),
+        "an unchecked assignment cannot use an ancestor's forward edge: {items:#?}"
+    );
+}
+
+#[tokio::test]
+async fn broken_subdirectory_providers_defer_instead_of_using_empty_catalog() {
+    let scenario = Scenario::new(&[]);
+    let path = subdirectory_with_broken_providers(&scenario);
+    let mut client = scenario.client_with_errors(HashMap::new()).await;
+    let diagnostics = open_diagnostics(
+        &mut client,
+        &path,
+        "fn check(value: BareUnknown) { value }\n",
+    )
+    .await;
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unknown custom type")),
+        "{diagnostics:#?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("BareUnknown")
+                && diagnostic.message.contains("was deferred")
+                && diagnostic.severity == Some(DiagnosticSeverity::WARNING)),
+        "{diagnostics:#?}"
+    );
+}
+
+#[tokio::test]
+async fn named_provider_errors_do_not_make_the_exact_directory_fallback_partial() {
+    let scenario = Scenario::new(&[("mock", true)]);
+    std::fs::write(
+        scenario.directory.path().join("named.crn"),
+        "let secondary = provider other {}\n",
+    )
+    .unwrap();
+    let mut client = scenario
+        .client_with_errors(HashMap::from([(
+            "other".into(),
+            "unavailable named instance".into(),
+        )]))
+        .await;
+    for broken_sibling in [false, true] {
+        if broken_sibling {
+            std::fs::write(scenario.directory.path().join("draft.crn"), "let =\n").unwrap();
+        }
+        let diagnostics = open_diagnostics(
+            &mut client,
+            &scenario.consumer_path(),
+            "fn check(value: BareUnknown) { value }\n",
+        )
+        .await;
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic
+                    .message
+                    .contains("unknown custom type 'BareUnknown'")
+                    && diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+                .count(),
+            1,
+            "broken_sibling={broken_sibling}: {diagnostics:#?}"
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("was deferred")),
+            "broken_sibling={broken_sibling}: {diagnostics:#?}"
+        );
+    }
+}
+
 #[test]
 fn identity_edge_diagnostics_match_validation() {
     let scenario = Scenario::new(&[("mock", true)]);
@@ -170,15 +351,21 @@ async fn identity_edge_completion_offers_forward_output_and_excludes_reverse() {
     }
 }
 
-#[test]
-fn identity_edge_diagnostics_retain_loaded_catalog_with_incomplete_sibling() {
+#[tokio::test]
+async fn identity_edge_diagnostics_retain_loaded_catalog_with_incomplete_sibling() {
     let scenario = Scenario::new(&[("mock", true)]);
     std::fs::write(
         scenario.directory.path().join("draft.crn"),
         "let draft = mock.Bucket {\n  bucket = \n}\n",
     )
     .unwrap();
-    let diagnostics = scenario.analyze("fn check(value: BareUnknown) { value }\n");
+    let mut client = scenario.client_with_errors(HashMap::new()).await;
+    let diagnostics = open_diagnostics(
+        &mut client,
+        &scenario.consumer_path(),
+        "fn check(value: BareUnknown) { value }\n",
+    )
+    .await;
     let unknown = diagnostics
         .iter()
         .filter(|diagnostic| {
@@ -199,6 +386,26 @@ fn identity_edge_diagnostics_retain_loaded_catalog_with_incomplete_sibling() {
             .any(|diagnostic| diagnostic.message.contains("was deferred")),
         "{diagnostics:#?}"
     );
+    for (attribute, excluded) in [
+        ("bucket", "producer.unrelated"),
+        ("new_bucket", "producer.old_name"),
+    ] {
+        let items = request_completions(
+            &mut client,
+            &scenario.consumer_path(),
+            &format!("let consumer = mock.Bucket {{\n  {attribute} = \n}}\n"),
+            Position::new(1, (attribute.len() + 5) as u32),
+        )
+        .await;
+        assert!(
+            items.iter().any(|item| item.label == "producer.new_name"),
+            "{items:#?}"
+        );
+        assert!(
+            !items.iter().any(|item| item.label == excluded),
+            "{items:#?}"
+        );
+    }
 }
 
 #[tokio::test]
