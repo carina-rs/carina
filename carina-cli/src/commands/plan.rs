@@ -13,11 +13,9 @@ use carina_core::data_source_value::DataSourceValue;
 use carina_core::detail_rows::HistoricalDisplayAttributes;
 use carina_core::differ::rebind_current_for_move;
 use carina_core::effect::{Effect, EffectGeneration, UnresolvedSavedEffect};
-#[cfg(test)]
-use carina_core::parser::ProviderConfig;
 use carina_core::parser::{
-    ExpandedBackendConfig as BackendConfig, ProviderContext, ResolvedProviderConfigs,
-    SavedProviderConfigs, UpstreamState,
+    ExpandedBackendConfig as BackendConfig, ProviderConfig, ProviderContext,
+    ResolvedProviderConfigs, SavedProviderConfigs, UpstreamState,
 };
 use carina_core::paths::ResolvedPath;
 use carina_core::paths::{CanonicalPath, PersistedPath};
@@ -28,9 +26,9 @@ use carina_core::provider_source::ProviderSource;
 use carina_core::resource::DeferredValue;
 use carina_core::resource::{
     AbsoluteBindingAddress, CompositionSourceIdentityResolver, ConcreteValue, Current,
-    ModuleSource, NoPlaceholder, PlanValueKind, Resource, ResourceId, SavedComposition,
-    SavedDataSource, SavedModuleSource, SavedResource, SnapshotLeaf, SnapshotState, SnapshotValue,
-    State, StateValueLeaf, Value,
+    ModuleSource, NoPlaceholder, ParserPlaceholder, PlanValueKind, Resource, ResourceId,
+    SavedComposition, SavedDataSource, SavedModuleSource, SavedResource, SnapshotLeaf,
+    SnapshotState, SnapshotValue, State, StateValueLeaf, Value,
 };
 
 #[cfg(test)]
@@ -5658,6 +5656,45 @@ pub async fn run_plan(
     strict_iam: bool,
     provider_context: &ProviderContext,
 ) -> Result<bool, AppError> {
+    run_plan_using(
+        runtime,
+        path,
+        out,
+        image,
+        inline_image,
+        detail,
+        tui,
+        refresh,
+        json,
+        check_iam,
+        strict_iam,
+        provider_context,
+        ProviderLoad::load,
+    )
+    .await
+}
+
+/// The full plan command body, with only provider loading supplied by the caller.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_plan_using(
+    runtime: &crate::runtime::CommandRuntime,
+    path: &Path,
+    out: Option<&Path>,
+    image: Option<&ResolvedPlanImageTarget>,
+    inline_image: Option<InlineImageRequest>,
+    detail: DetailLevel,
+    tui: bool,
+    refresh: bool,
+    json: bool,
+    check_iam: bool,
+    strict_iam: bool,
+    provider_context: &ProviderContext,
+    load_providers: impl FnOnce(
+        &crate::runtime::CommandRuntime,
+        &[ProviderConfig<ParserPlaceholder>],
+        &ResolvedPath,
+    ) -> Result<ProviderLoad, AppError>,
+) -> Result<bool, AppError> {
     let color_mode = runtime.color_mode();
     let progress_sink = if json || tui {
         ProgressSink::MachineStdout
@@ -5678,7 +5715,7 @@ pub async fn run_plan(
     let parsed = loaded.parsed;
 
     let base_dir = &project;
-    let providers = ProviderLoad::load(runtime, &parsed.providers, base_dir)?;
+    let providers = load_providers(runtime, &parsed.providers, base_dir)?;
     let mut validated_config = providers.validate_config_pair(
         parsed,
         loaded.unresolved_parsed,

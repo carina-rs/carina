@@ -84,6 +84,34 @@ impl std::ops::Deref for TestCommandRuntime {
     }
 }
 
+/// Run the full plan command with injected factories and `--refresh=false`.
+pub async fn run_plan_with_factories(
+    runtime: &CommandRuntime,
+    path: &std::path::Path,
+    factories: Vec<crate::wiring::LoadedProviderFactory>,
+) -> Result<bool, crate::error::AppError> {
+    crate::commands::plan::run_plan_using(
+        runtime,
+        path,
+        None,
+        None,
+        None,
+        crate::DetailLevel::None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
+        |runtime, providers, _| {
+            Ok(crate::wiring::ProviderLoad::for_test_with_provider_phase(
+                runtime, factories, providers,
+            ))
+        },
+    )
+    .await
+}
+
 #[cfg(test)]
 pub(crate) use graph_fixtures::{compiled_loop, compiled_replace, persisted, resolved};
 
