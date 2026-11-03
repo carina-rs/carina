@@ -468,14 +468,11 @@ impl CompletionProvider {
                 .unwrap_or_else(|_| arg_type.clone());
         if let parser::TypeExpr::SchemaType { owned } = &resolved_type
             && let Ok(Some(declaration)) = provider_ctx.catalog().enum_declaration(owned)
+            && let Some(lifted) = carina_core::validation::lift_type_expr(&resolved_type)
         {
-            return self.value_completions_for_attribute_type(
-                declaration
-                    .in_schema(&std::collections::BTreeMap::new())
-                    .with_authority(
-                        &provider_ctx.catalog().custom_types,
-                        carina_core::schema::SinkAuthority::Owners(owned.owners()),
-                    ),
+            return self.value_completions_with_declaration(
+                lifted.assignment_sink(&provider_ctx.catalog().custom_types),
+                &declaration,
                 text,
                 base_path,
                 provider_ctx,

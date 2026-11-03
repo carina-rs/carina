@@ -249,8 +249,8 @@ impl DeclaredValueSource {
         sink: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
         bindings: &BindingIndex<'_, B>,
     ) -> DeclaredValueAssignment {
-        // Judge the original at every sink, regardless of the declaration.
-        let original = self.original.is_assignable_to_sink(sink, bindings);
+        // A rejected declaration owns the mismatch. Its original source is
+        // relevant only after the declaration passes at this sink.
         let declaration = TypeInSchema::schemaless(&self.declaration);
         match bindings.check_type_assignment(declaration, sink) {
             Err(error) => {
@@ -268,22 +268,27 @@ impl DeclaredValueSource {
             }
             Ok(true) => {}
         }
-        match original {
+        match self.original.is_assignable_to_sink(sink, bindings) {
             Ok(()) => DeclaredValueAssignment::Assignable,
             Err(error @ RefTypeAssignabilityError::Mismatch(_)) => {
                 let incoming = self
                     .declaration
                     .assignment_sink(&bindings.provider_context().custom_types);
-                match self.original.is_assignable_to_sink(incoming, bindings) {
-                    Ok(()) => DeclaredValueAssignment::Rejected(error),
-                    Err(RefTypeAssignabilityError::Mismatch(_)) => {
-                        DeclaredValueAssignment::IncomingBoundaryMismatch
-                    }
-                    Err(RefTypeAssignabilityError::Unchecked(error)) => {
-                        DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Unchecked(
-                            error,
-                        ))
-                    }
+                // The incoming boundary already owns a proven rejection.
+                // Inspect that relation without recording another deferral:
+                // unknown incoming edges cannot explain this sink's mismatch.
+                let incoming_mismatch = std::iter::once(self.original.authoritative.constraint())
+                    .chain(&self.original.evidence)
+                    .any(|source| {
+                        matches!(
+                            source.type_in_schema().assignment_to(incoming),
+                            crate::schema::TypeAssignability::Mismatch,
+                        )
+                    });
+                if incoming_mismatch {
+                    DeclaredValueAssignment::IncomingBoundaryMismatch
+                } else {
+                    DeclaredValueAssignment::Rejected(error)
                 }
             }
             Err(error @ RefTypeAssignabilityError::Unchecked(_)) => {
@@ -3304,6 +3309,108 @@ mod tests {
         std::sync::LazyLock::new(|| crate::parser::SchemaTypeOwner::Provider("test".into()));
 
     use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
+    #[test]
+    fn declaration_mismatch_in_unloaded_session_reports_only_the_mismatch() {
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let terminal = crate::validation::deferred_types::TypeCheckSession::run(
+            &context,
+            |session| {
+                let parsed = crate::parser::ParsedFile::default();
+                let schemas = SchemaRegistry::new();
+                let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+                let index = BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
+                &parsed, &schemas, None, &signatures, session,
+            );
+                let source = ResolvedRefType::new(
+                    AttributeType::refined_string(
+                        Some(TypeIdentity::bare("Source")),
+                        None,
+                        None,
+                        None,
+                    ),
+                    BTreeMap::new(),
+                )
+                .with_value_declaration(&TypeExpr::Int, &index)
+                .unwrap();
+                let sink = AttributeType::refined_string(
+                    Some(TypeIdentity::bare("Sink")),
+                    None,
+                    None,
+                    None,
+                );
+                source.assignment_to_sink(
+                    TypeInSchema::schemaless(&sink).with_authority(
+                        &session.catalog().custom_types,
+                        crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+                    ),
+                    &index,
+                )
+            },
+        );
+        let mut deferred = Vec::new();
+        let result = terminal.publish(&mut deferred);
+        assert!(
+            matches!(result, DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Mismatch(ref mismatch)) if mismatch.actual_type_name() == "Int")
+        );
+        assert_eq!(
+            1 + deferred.len(),
+            1,
+            "only the declaration mismatch should be diagnosed: {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn original_mismatch_does_not_record_an_incoming_boundary_deferral() {
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let terminal = crate::validation::deferred_types::TypeCheckSession::run(
+            &context,
+            |session| {
+                let parsed = crate::parser::ParsedFile::default();
+                let schemas = SchemaRegistry::new();
+                let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+                let index = BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
+                &parsed, &schemas, None, &signatures, session,
+            );
+                let declaration = crate::parser::parse_type_expr_str("Declared", &context).unwrap();
+                let source = ResolvedRefType::new(
+                    AttributeType::refined_string(
+                        Some(TypeIdentity::bare("Sink")),
+                        None,
+                        Some((Some(1), Some(20))),
+                        None,
+                    ),
+                    BTreeMap::new(),
+                )
+                .with_value_declaration(&declaration, &index)
+                .unwrap();
+                let sink = AttributeType::refined_string(
+                    Some(TypeIdentity::bare("Sink")),
+                    None,
+                    Some((Some(1), Some(10))),
+                    None,
+                );
+                source.assignment_to_sink(
+                    TypeInSchema::schemaless(&sink).with_authority(
+                        &session.catalog().custom_types,
+                        crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+                    ),
+                    &index,
+                )
+            },
+        );
+        let mut deferred = Vec::new();
+        let result = terminal.publish(&mut deferred);
+        assert!(matches!(
+            result,
+            DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Mismatch(_))
+        ));
+        assert_eq!(
+            deferred.len(),
+            1,
+            "only declaration-to-sink evidence should be deferred: {deferred:?}"
+        );
+    }
+
     #[test]
     fn value_declaration_resolves_the_catalog_scalar_kind_before_lifting() {
         let declaration = crate::parser::parse_type_expr_str(

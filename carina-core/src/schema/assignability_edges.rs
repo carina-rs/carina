@@ -92,13 +92,15 @@ impl AssignabilityClosure {
                 };
                 for sink in sinks {
                     if sink == source {
-                        let mut cycle = vec![source.clone()];
+                        let mut cycle = Vec::new();
                         let mut member = current;
                         while member != source {
                             cycle.push(member.clone());
                             member = parents[member];
                         }
+                        cycle.push(source.clone());
                         cycle.reverse();
+                        cycle.push(source.clone());
                         return Err(ProviderSchemaValidationError::AssignabilityCycle { cycle });
                     }
                     if reached.insert(sink.clone()) {

@@ -962,7 +962,6 @@ awscc.ec2.Subnet {
 
 #[test]
 fn type_based_completion_resolves_ref_typed_source_attribute() {
-    let owner = carina_core::parser::SchemaTypeOwner::Provider("test".into());
     let source_schema = PatternResourceSchema::new("source.Item")
         .attribute(
             PatternAttributeSchema::optional(
@@ -981,16 +980,13 @@ fn type_based_completion_resolves_ref_typed_source_attribute() {
     );
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
-    let target = PatternAttributeType::string();
-    let target_defs = std::collections::BTreeMap::new();
+    let target =
+        carina_core::validation::lift_type_expr(&carina_core::parser::TypeExpr::String).unwrap();
     let completions = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             provider.value_completions_for_attribute_type(
-                target.in_schema(&target_defs).with_authority(
-                    &session.catalog().custom_types,
-                    carina_core::schema::SinkAuthority::Owner(&owner),
-                ),
+                target.assignment_sink(&session.catalog().custom_types),
                 "let source = test.source.Item {}\n",
                 None,
                 session,

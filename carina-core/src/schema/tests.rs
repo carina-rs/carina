@@ -1,6 +1,28 @@
 static TEST_OWNER: std::sync::LazyLock<crate::parser::SchemaTypeOwner> =
     std::sync::LazyLock::new(|| crate::parser::SchemaTypeOwner::Provider("test".into()));
 
+#[test]
+fn draft_assignability_preserves_invalid_patterns_and_schema_definitions() {
+    let string: PatternAttributeType =
+        PatternAttributeType::refined_string(None, Some("(?=x)".into()), None, None);
+    let catalog = crate::parser::ProviderCustomTypes::default();
+    assert!(
+        TypeInSchema::schemaless(&string).is_assignable_to(
+            TypeInSchema::schemaless(&string)
+                .with_authority(&catalog, SinkAuthority::Owner(&TEST_OWNER))
+        )
+    );
+    let schema = PatternResourceSchema::new("Draft").with_def("Text", string);
+    let reference = PatternAttributeType::ref_("Text");
+    assert!(
+        schema.type_in_schema(&reference).is_assignable_to(
+            reference
+                .in_schema(schema.defs())
+                .with_authority(&catalog, SinkAuthority::Owner(&TEST_OWNER))
+        )
+    );
+}
+
 use super::*;
 use super::{
     CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
@@ -168,14 +190,28 @@ mod assignability_edges_stage_a {
     fn assert_cycle(kinds: &[&str], edges: Vec<AssignabilityEdge>) {
         let declarations: Vec<_> = kinds.iter().map(|kind| string(kind)).collect();
         let error = witness(&declarations, edges).unwrap_err();
+        let expected: Vec<_> = kinds
+            .iter()
+            .chain(std::iter::once(&kinds[0]))
+            .map(|kind| identity(kind))
+            .collect();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "assignability cycle: {}",
+                expected
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
+            ),
+        );
         let ProviderSchemaValidationError::AssignabilityCycle { cycle } = error else {
             panic!("expected a typed cycle error, got {error:?}");
         };
-        let actual: std::collections::BTreeSet<_> = cycle.into_iter().collect();
-        let expected = kinds.iter().map(|kind| identity(kind)).collect();
         assert_eq!(
-            actual, expected,
-            "the diagnostic must identify the cycle members"
+            cycle, expected,
+            "the diagnostic must close the ordered cycle"
         );
     }
 
@@ -259,6 +295,48 @@ mod assignability_edges_stage_a {
         .unwrap();
         assert_eq!(restored.assignability_edges(), edges.as_slice());
     }
+}
+
+#[test]
+fn loaded_fixture_without_known_types_has_authoritative_empty_edges() {
+    let source = AttributeType::refined_string(
+        Some(TypeIdentity::new(
+            Some("aws"),
+            std::iter::empty::<&str>(),
+            "Region",
+        )),
+        None,
+        None,
+        None,
+    );
+    let sink = AttributeType::refined_string(
+        Some(TypeIdentity::new(
+            Some("gcp"),
+            std::iter::empty::<&str>(),
+            "Region",
+        )),
+        None,
+        None,
+        None,
+    );
+    let catalog =
+        crate::parser::ProviderCustomTypes::loaded(HashSet::new(), Box::new(|_, _| Ok(())));
+    assert_eq!(
+        TypeInSchema::schemaless(&source).assignment_to(
+            TypeInSchema::schemaless(&sink)
+                .with_authority(&catalog, SinkAuthority::Owner(&TEST_OWNER),),
+        ),
+        TypeAssignability::Mismatch,
+    );
+    let partial =
+        catalog.with_failed_providers(std::collections::BTreeSet::from(["failed".into()]));
+    assert_eq!(
+        TypeInSchema::schemaless(&source).assignment_to(
+            TypeInSchema::schemaless(&sink)
+                .with_authority(&partial, SinkAuthority::Owner(&TEST_OWNER),),
+        ),
+        TypeAssignability::Mismatch,
+    );
 }
 
 fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {

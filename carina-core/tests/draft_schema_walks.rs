@@ -1,12 +1,9 @@
-static TEST_OWNER: std::sync::LazyLock<carina_core::parser::SchemaTypeOwner> =
-    std::sync::LazyLock::new(|| carina_core::parser::SchemaTypeOwner::Provider("test".into()));
-
 use std::collections::HashSet;
 
 use carina_core::resource::{ConcreteValue, EnumValueResolver, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, LeafPath, LeafPathSegment, ListElements, ResourceSchema, Shape,
-    ShapeWalkBudget, StructField, TypeInSchema, enum_identity, schema_write_only_keys, types,
+    ShapeWalkBudget, StructField, enum_identity, schema_write_only_keys, types,
 };
 use indexmap::IndexMap;
 
@@ -58,14 +55,6 @@ fn draft_ref_free_walks_preserve_patterns_and_budget() {
             ..
         }
     ));
-    let context: TypeInSchema<'_> = TypeInSchema::schemaless(&string);
-    assert!(
-        context.is_assignable_to(TypeInSchema::schemaless(&string).with_authority(
-            &carina_core::parser::ProviderCustomTypes::default(),
-            carina_core::schema::SinkAuthority::Owner(&TEST_OWNER)
-        ))
-    );
-
     let structure =
         AttributeType::struct_("Draft", vec![StructField::optional("name", string).build()]);
     let mut budget = ShapeWalkBudget::new(1);
@@ -150,12 +139,6 @@ fn draft_schema_walks_resolve_definitions() {
         "Struct(Credentials)"
     );
     let secret = struct_field_type(&schema, &reference, "secret").unwrap();
-    assert!(schema.type_in_schema(secret).is_assignable_to(
-        secret.in_schema(schema.defs()).with_authority(
-            &carina_core::parser::ProviderCustomTypes::default(),
-            carina_core::schema::SinkAuthority::Owner(&TEST_OWNER)
-        )
-    ));
     assert!(matches!(
         secret.shape_ref_free().unwrap(),
         Shape::String {

@@ -78,13 +78,32 @@ impl CompletionProvider {
     }
 
     /// Look up a schema by `"<provider>.<resource_type>"` key, trying Managed first.
+    /// Unqualified keys must identify a unique registered owner.
     pub(super) fn lookup_schema(&self, key: &str) -> Option<OwnerBoundResourceSchema<'_>> {
         let (provider, resource_type) = match key.split_once('.') {
             Some(parts) => parts,
             None => {
-                return self.schemas.get("", key, SchemaKind::Resource);
+                for kind in [SchemaKind::Resource, SchemaKind::DataSource] {
+                    let mut owners =
+                        self.schemas
+                            .iter()
+                            .filter_map(|(owner, ty, entry_kind, _)| {
+                                (!owner.is_empty() && ty == key && entry_kind == kind)
+                                    .then_some(owner)
+                            });
+                    if let Some(owner) = owners.next() {
+                        if owners.next().is_some() {
+                            return None;
+                        }
+                        return self.schemas.get(owner, key, kind);
+                    }
+                }
+                return None;
             }
         };
+        if provider.is_empty() {
+            return None;
+        }
         self.schemas
             .get(provider, resource_type, SchemaKind::Resource)
             .or_else(|| {

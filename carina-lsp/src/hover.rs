@@ -510,10 +510,10 @@ impl HoverProvider {
         // Falling back to a global scan would return a lookalike attribute from
         // an unrelated schema (nondeterministic via HashMap iteration order) —
         // see #1988.
-        let key = resource_type;
-        // Try splitting on the first dot first (`provider.resource_type`); if that
-        // doesn't resolve, fall back to treating the whole key as the resource type
-        // under the empty provider — some test fixtures register schemas that way.
+        let (provider, resource_type) = resource_type.split_once('.')?;
+        if provider.is_empty() {
+            return None;
+        }
         let lookup = |provider: &str, resource_type: &str| {
             self.schemas
                 .get(
@@ -529,11 +529,7 @@ impl HoverProvider {
                     )
                 })
         };
-        let schema = if let Some((provider, rest)) = key.split_once('.') {
-            lookup(provider, rest).or_else(|| lookup("", key))
-        } else {
-            lookup("", key)
-        }?;
+        let schema = lookup(provider, resource_type)?;
         let mut path = struct_path.to_vec();
         path.push(word.to_string());
         let attribute = schema.effective_node_at_authored_path(&path)?;
@@ -696,9 +692,34 @@ fn is_in_type_annotation_position(doc: &Document, position: Position, word: &str
 #[cfg(test)]
 mod tests {
     #[test]
+    fn attribute_hover_does_not_fall_back_to_an_empty_owner() {
+        let mut schemas = carina_core::schema::SchemaRegistry::new();
+        // A legacy, unowned fixture must not supply a provider attribute.
+        schemas.insert(
+            "",
+            carina_core::schema::ResourceSchema::new("gcp.Cloud")
+                .attribute(
+                    carina_core::schema::AttributeSchema::optional(
+                        "region",
+                        carina_core::schema::AttributeType::string(),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let provider = super::HoverProvider::new(std::sync::Arc::new(schemas), vec![]);
+        assert!(
+            provider
+                .attribute_hover("region", "gcp.Cloud", &[])
+                .is_none()
+        );
+    }
+
+    #[test]
     fn provider_text_hover_sanitizes_schema_type_metadata_at_publication() {
         let raw = format!("Mode\x1b[2J\u{9b}{}", "x".repeat(20 * 1024));
-        let schema = carina_core::schema::PatternResourceSchema::new("test.Widget").attribute(
+        let schema = carina_core::schema::PatternResourceSchema::new("Widget").attribute(
             carina_core::schema::PatternAttributeSchema::optional(
                 "mode",
                 carina_core::schema::PatternAttributeType::enum_(
@@ -712,7 +733,7 @@ mod tests {
             .build(),
         );
         let mut schemas = carina_core::schema::SchemaRegistry::new();
-        schemas.insert("", schema.validate().unwrap());
+        schemas.insert("test", schema.validate().unwrap());
         let provider = super::HoverProvider::new(std::sync::Arc::new(schemas), vec![]);
         let doc = crate::document::Document::new(
             "test.Widget {\n  mode = ready\n}\n".into(),
@@ -785,8 +806,12 @@ mod tests {
         description: &str,
     ) -> HoverProvider {
         let mut schemas = SchemaRegistry::new();
+        let (owner, resource_type) = resource_type.split_once('.').unwrap();
         let schema = ResourceSchema::new(resource_type).with_description(description);
-        schemas.insert("", schema.validate().expect("schema fixture must be valid"));
+        schemas.insert(
+            owner,
+            schema.validate().expect("schema fixture must be valid"),
+        );
         HoverProvider::new(Arc::new(schemas), vec![])
     }
 
@@ -796,12 +821,16 @@ mod tests {
         attr_description: &str,
     ) -> HoverProvider {
         let mut schemas = SchemaRegistry::new();
+        let (owner, resource_type) = resource_type.split_once('.').unwrap();
         let schema = ResourceSchema::new(resource_type).attribute(
             AttributeSchema::optional(attr_name, AttributeType::string())
                 .with_description(attr_description)
                 .build(),
         );
-        schemas.insert("", schema.validate().expect("schema fixture must be valid"));
+        schemas.insert(
+            owner,
+            schema.validate().expect("schema fixture must be valid"),
+        );
         HoverProvider::new(Arc::new(schemas), vec![])
     }
 
@@ -1042,7 +1071,7 @@ mod tests {
         let provider = create_hover_provider_with_description("ec2.Vpc", desc);
         let schema = provider
             .schemas
-            .get("", "ec2.Vpc", carina_core::schema::SchemaKind::Resource)
+            .get("ec2", "Vpc", carina_core::schema::SchemaKind::Resource)
             .unwrap();
         let hover = provider.schema_hover("ec2.Vpc", schema.schema()).unwrap();
 

@@ -201,6 +201,16 @@ enum SinkScope<'a> {
 /// A sink's type, edge catalog, and authority travel together through every
 /// recursive comparison. Only a lifted annotation may create annotation scope;
 /// its identified leaves retain their complete owner sets.
+///
+/// Arbitrary types cannot publicly choose a sink authority.
+/// ```compile_fail,E0624
+/// use carina_core::parser::{ProviderCustomTypes, SchemaTypeOwner};
+/// use carina_core::schema::{AttributeType, SinkAuthority, TypeInSchema};
+/// let ty: AttributeType = AttributeType::string();
+/// let catalog = ProviderCustomTypes::default();
+/// let owner = SchemaTypeOwner::Provider("test".into());
+/// let _ = TypeInSchema::schemaless(&ty).with_authority(&catalog, SinkAuthority::Owner(&owner));
+/// ```
 #[derive(Clone, Copy)]
 pub struct AssignmentSink<'a, R: PatternForm = super::Draft> {
     pub(super) ty: TypeInSchema<'a, R>,
@@ -367,7 +377,7 @@ impl<'a> AssignmentSink<'a, super::Compiled> {
 
 impl<'a, R: PatternForm> TypeInSchema<'a, R> {
     /// Bind the mandatory edge catalog and sink authority before assignment.
-    pub fn with_authority(
+    pub(crate) fn with_authority(
         self,
         catalog: &'a crate::parser::ProviderCustomTypes,
         authority: SinkAuthority<'a>,
@@ -467,11 +477,12 @@ fn nominal_scalar_constraints<'a, R: PatternForm>(
 
 impl<'source, R: PatternForm> TypeInSchema<'source, R> {
     /// Prove assignment, prove a mismatch, or defer for the existing
-    /// `ProvidersNotLoaded` reason. Identified types use the shared directional
-    /// identity relation, including provider and segments, even when a schema
-    /// is unloaded. A source without identity cannot satisfy a nominal sink.
-    /// Comparisons needing an unavailable scalar kind or the sink authority's
-    /// edge declaration are unchecked.
+    /// `ProvidersNotLoaded` reason. Identified types first compare structural
+    /// identities; a mismatch also needs the sink authority's edge declaration.
+    /// Unloaded catalogs and failed owners in partial catalogs defer those
+    /// identity mismatches because their edges are unknown. Comparisons needing
+    /// an unavailable scalar kind are also unchecked. A source without identity
+    /// cannot satisfy a nominal sink.
     pub fn assignment_to<'query>(self, sink: AssignmentSink<'query, R>) -> TypeAssignability<'query>
     where
         'source: 'query,

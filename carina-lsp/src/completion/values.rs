@@ -1843,7 +1843,25 @@ impl CompletionProvider {
         base_path: Option<&carina_core::paths::ResolvedPath>,
         provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
-        let attr_type = target.as_type();
+        self.value_completions_with_declaration(
+            target,
+            target.as_type(),
+            text,
+            base_path,
+            provider_ctx,
+        )
+    }
+
+    /// Enum annotations retain their declaration for member suggestions while
+    /// reference compatibility uses the lifted annotation's complete owners.
+    pub(super) fn value_completions_with_declaration(
+        &self,
+        target: AssignmentSink<'_, carina_core::schema::Compiled>,
+        attr_type: &AttributeType,
+        text: &str,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
+        provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Vec<CompletionItem> {
         let mut items = self.completions_for_type(attr_type, None);
         items.extend(Self::builtin_function_completions_for_type(attr_type));
         items.extend(self.resource_ref_completions_for_type(target, text, base_path));
@@ -2723,7 +2741,7 @@ mod return_type_fits_tests {
     use super::*;
 
     #[test]
-    fn unloaded_module_export_candidates_use_nominal_identity() {
+    fn unloaded_module_export_candidates_defer_mismatches_because_edges_are_unknown() {
         let context =
             carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
         let nominal = |name: &str| {
@@ -2747,6 +2765,8 @@ mod return_type_fits_tests {
                 )
             )
         );
+        // Different nominal identities defer (Unchecked) while the catalog is
+        // unloaded because provider assignability edges are unknown.
         assert!(
             carina_core::validation::deferred_types::with_session_for_test(
                 &carina_core::parser::ProviderContext::new(

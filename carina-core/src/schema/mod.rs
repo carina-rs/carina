@@ -15332,11 +15332,7 @@ pub(crate) fn assignment_catalog_without_edges_for_test()
     static CATALOG: std::sync::LazyLock<crate::parser::ProviderCustomTypes> =
         std::sync::LazyLock::new(|| {
             crate::parser::ProviderCustomTypes::loaded(
-                std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
-                    "test",
-                    TypeIdentity::bare("Fixture"),
-                    RefinedScalarKind::String,
-                )]),
+                std::collections::HashSet::new(),
                 Box::new(|_target, _value| Ok(())),
             )
         });
