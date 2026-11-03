@@ -114,6 +114,23 @@ fn resource_and_data_source_sinks_retain_registered_typed_owners() {
 }
 
 #[test]
+fn scalar_identity_edges_never_relax_enum_comparisons() {
+    let loaded = snapshot(&[("p", true)]);
+    let bootstrap = ProviderCustomTypes::default();
+    let enum_type =
+        |kind| AttributeType::enum_(identity(kind), Some(vec!["on".into()]), vec![], None, None);
+    for catalog in [&loaded.provider_context().custom_types, &bootstrap] {
+        for (source, sink) in [
+            (enum_type("NewName"), enum_type("Name")),
+            (string("NewName"), enum_type("Name")),
+            (enum_type("NewName"), string("Name")),
+        ] {
+            assert_eq!(assignment(&source, &sink, catalog, &P_OWNER), Ok(false));
+        }
+    }
+}
+
+#[test]
 fn identity_edges_are_directional_and_do_not_admit_unrelated_types() {
     let loaded = snapshot(&[("p", true)]);
     let catalog = &loaded.provider_context().custom_types;
@@ -215,17 +232,13 @@ fn identity_edges_preserve_rule_seven_length_containment() {
 }
 
 #[test]
-fn identity_edges_apply_to_int_float_and_enum() {
+fn identity_edges_apply_to_int_and_float() {
     let loaded = snapshot(&[("p", true)]);
     let schema = loaded
         .schema_registry()
         .get("p", "Bucket", SchemaKind::Resource)
         .unwrap();
-    for (source, sink) in [
-        ("new_count", "count"),
-        ("new_ratio", "ratio"),
-        ("new_mode", "mode"),
-    ] {
+    for (source, sink) in [("new_count", "count"), ("new_ratio", "ratio")] {
         let source = schema.as_schema().attributes()[source].attr_type();
         let sink = schema.as_schema().attributes()[sink].attr_type();
         assert!(
@@ -393,143 +406,6 @@ fn identity_edges_preserve_union_all_and_any_rules() {
     let sink = AttributeType::union(vec![string("Other"), string("Name")]);
     assert_eq!(
         assignment(&string("NewName"), &sink, catalog, &P_OWNER),
-        Ok(true)
-    );
-}
-
-#[test]
-fn identity_edges_between_scalar_annotations_and_enums_preserve_length_containment() {
-    let loaded = snapshot(&[("p", true)]);
-    let catalog = &loaded.provider_context().custom_types;
-    let bounded = |kind, maximum| {
-        AttributeType::refined_string(
-            Some(identity(kind)),
-            None,
-            Some((Some(1), Some(maximum))),
-            None,
-        )
-    };
-    let enum_type = |kind, maximum| {
-        AttributeType::enum_with_base(
-            identity(kind),
-            AttributeType::refined_string(None, None, Some((Some(1), Some(maximum))), None),
-            None,
-            vec![],
-            None,
-            None,
-        )
-    };
-    let sink = enum_type("Mode", 10);
-    assert_eq!(
-        assignment(&bounded("NewMode", 5), &sink, catalog, &P_OWNER),
-        Ok(true)
-    );
-    assert_eq!(
-        assignment(&bounded("NewMode", 20), &sink, catalog, &P_OWNER),
-        Ok(false)
-    );
-    let sink = bounded("Mode", 10);
-    assert_eq!(
-        assignment(&enum_type("NewMode", 5), &sink, catalog, &P_OWNER),
-        Ok(true)
-    );
-    assert_eq!(
-        assignment(&enum_type("NewMode", 20), &sink, catalog, &P_OWNER),
-        Ok(false)
-    );
-    assert_eq!(
-        assignment(
-            &enum_type("Mode", 5),
-            &bounded("NewMode", 10),
-            catalog,
-            &P_OWNER
-        ),
-        Ok(false)
-    );
-}
-
-#[test]
-fn identity_edges_between_numeric_annotations_and_enums_preserve_ranges() {
-    let loaded = snapshot(&[("p", true)]);
-    let catalog = &loaded.provider_context().custom_types;
-    let integer = |kind, maximum| {
-        AttributeType::refined_int(Some(identity(kind)), Some((Some(0), Some(maximum))))
-    };
-    let enum_integer = |kind, maximum| {
-        AttributeType::enum_with_base(
-            identity(kind),
-            AttributeType::refined_int(None, Some((Some(0), Some(maximum)))),
-            None,
-            vec![],
-            None,
-            None,
-        )
-    };
-    assert_eq!(
-        assignment(
-            &integer("NewCount", 5),
-            &enum_integer("Count", 10),
-            catalog,
-            &P_OWNER
-        ),
-        Ok(true)
-    );
-    assert_eq!(
-        assignment(
-            &integer("NewCount", 20),
-            &enum_integer("Count", 10),
-            catalog,
-            &P_OWNER
-        ),
-        Ok(false)
-    );
-    assert_eq!(
-        assignment(
-            &enum_integer("NewCount", 5),
-            &integer("Count", 10),
-            catalog,
-            &P_OWNER
-        ),
-        Ok(true)
-    );
-    let float = |kind, maximum| {
-        AttributeType::refined_float(Some(identity(kind)), Some((Some(0.0), Some(maximum))))
-    };
-    let enum_float = |kind, maximum| {
-        AttributeType::enum_with_base(
-            identity(kind),
-            AttributeType::refined_float(None, Some((Some(0.0), Some(maximum)))),
-            None,
-            vec![],
-            None,
-            None,
-        )
-    };
-    assert_eq!(
-        assignment(
-            &float("NewRatio", 5.0),
-            &enum_float("Ratio", 10.0),
-            catalog,
-            &P_OWNER
-        ),
-        Ok(true)
-    );
-    assert_eq!(
-        assignment(
-            &float("NewRatio", 20.0),
-            &enum_float("Ratio", 10.0),
-            catalog,
-            &P_OWNER
-        ),
-        Ok(false)
-    );
-    assert_eq!(
-        assignment(
-            &enum_float("NewRatio", 5.0),
-            &float("Ratio", 10.0),
-            catalog,
-            &P_OWNER
-        ),
         Ok(true)
     );
 }

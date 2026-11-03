@@ -7664,7 +7664,6 @@ fn enum_definition_signature(attribute_type: &AttributeType) -> Option<EnumDefin
 struct OwnerCustomTypeIndex {
     factory_index: usize,
     declarations: BTreeMap<TypeIdentity, Vec<AttributeType>>,
-    assignability_closure: crate::schema::AssignabilityClosure,
 }
 
 struct ProviderFactorySchemaSnapshot {
@@ -7682,6 +7681,17 @@ fn capture_provider_factory_schema_snapshot(
             witness: factory.schema_witness(),
         })
         .collect()
+}
+
+fn register_provider_factory_schemas(
+    schemas: &mut SchemaRegistry,
+    snapshot: &[ProviderFactorySchemaSnapshot],
+) {
+    for factory in snapshot {
+        schemas
+            .insert_provider_witness(&factory.name, &factory.witness)
+            .expect("each schema owner must expose one consistent validated witness");
+    }
 }
 
 pub(crate) trait ProviderFactorySource: Send + Sync {
@@ -7706,6 +7716,8 @@ impl ProviderFactorySource for &[Box<dyn ProviderFactory>] {
 pub(crate) struct FactoryCustomTypeResolver<F> {
     factories: F,
     index: BTreeMap<String, OwnerCustomTypeIndex>,
+    assignability_closures:
+        BTreeMap<crate::parser::SchemaTypeOwner, crate::schema::AssignabilityClosure>,
 }
 
 impl<F> FactoryCustomTypeResolver<F>
@@ -7715,11 +7727,21 @@ where
     pub(crate) fn new(factories: F) -> Self {
         let snapshot = capture_provider_factory_schema_snapshot(factories.as_factories());
         let index = build_owner_custom_type_index(&snapshot);
-        Self { factories, index }
+        let mut schemas = SchemaRegistry::new();
+        register_provider_factory_schemas(&mut schemas, &snapshot);
+        Self::with_index(factories, index, &schemas)
     }
 
-    fn with_index(factories: F, index: BTreeMap<String, OwnerCustomTypeIndex>) -> Self {
-        Self { factories, index }
+    fn with_index(
+        factories: F,
+        index: BTreeMap<String, OwnerCustomTypeIndex>,
+        schemas: &SchemaRegistry,
+    ) -> Self {
+        Self {
+            factories,
+            index,
+            assignability_closures: schemas.assignability_closures().clone(),
+        }
     }
 
     fn known_custom_types(&self) -> BTreeSet<crate::parser::OwnedTypeIdentity> {
@@ -7829,15 +7851,7 @@ where
     fn assignability_closures(
         &self,
     ) -> BTreeMap<crate::parser::SchemaTypeOwner, crate::schema::AssignabilityClosure> {
-        self.index
-            .iter()
-            .map(|(owner, index)| {
-                (
-                    crate::parser::SchemaTypeOwner::Provider(owner.clone()),
-                    index.assignability_closure.clone(),
-                )
-            })
-            .collect()
+        self.assignability_closures.clone()
     }
 }
 
@@ -7857,7 +7871,6 @@ fn build_owner_custom_type_index(
                 OwnerCustomTypeIndex {
                     factory_index,
                     declarations,
-                    assignability_closure: factory.witness.assignability_closure().clone(),
                 },
             )
         })
@@ -7885,15 +7898,12 @@ pub fn loaded_provider_snapshot_from_factories(
     environment: crate::EnvironmentSnapshot,
 ) -> LoadedProviderSnapshot {
     let snapshot = capture_provider_factory_schema_snapshot(&factories);
-    for factory in &snapshot {
-        schemas
-            .insert_provider_witness(&factory.name, &factory.witness)
-            .expect("each schema owner must expose one consistent validated witness");
-    }
+    register_provider_factory_schemas(&mut schemas, &snapshot);
     let custom_types =
         crate::parser::ProviderCustomTypes::from_source(FactoryCustomTypeResolver::with_index(
             std::sync::Arc::clone(&factories),
             build_owner_custom_type_index(&snapshot),
+            &schemas,
         ));
     let provider_context =
         crate::parser::LoadedProviderContext::new(crate::parser::ProviderContext {
@@ -8221,6 +8231,122 @@ mod tests {
                 SchemaRegistry::new(),
                 crate::EnvironmentSnapshot::empty(),
             )
+        }
+
+        #[test]
+        fn registry_witness_edges_reach_loaded_catalog_without_a_factory() {
+            let mut registry = SchemaRegistry::new();
+            registry
+                .insert_provider_witness(
+                    "builtin",
+                    &factory("builtin", &[("A", "B")], Arc::default()).schema_witness(),
+                )
+                .unwrap();
+            // Registry merges must preserve the witness's edge authority too.
+            let mut merged = SchemaRegistry::new();
+            merged.extend(registry).unwrap();
+            let loaded = loaded_provider_snapshot_from_factories(
+                Arc::default(),
+                merged,
+                crate::EnvironmentSnapshot::empty(),
+            );
+            let catalog = &loaded.provider_context().custom_types;
+            assert!(catalog.is_loaded());
+            assert!(
+                loaded
+                    .schema_registry()
+                    .assignability_closures()
+                    .contains_key(&owner("builtin"))
+            );
+            assert!(catalog.reachable(&owner("builtin"), &identity("A"), &identity("B")));
+            let schema = loaded
+                .schema_registry()
+                .get(
+                    "builtin",
+                    "test.Bucket",
+                    crate::schema::SchemaKind::Resource,
+                )
+                .unwrap();
+            assert!(matches!(
+                TypeInSchema::schemaless(schema.as_schema().attributes()["A"].attr_type())
+                    .assignment_to(schema.assignment_sink(
+                        schema.as_schema().attributes()["B"].attr_type(),
+                        catalog
+                    )),
+                crate::schema::TypeAssignability::Assignable,
+            ));
+        }
+
+        #[test]
+        fn registry_witness_without_edges_proves_mismatch_without_a_factory() {
+            let mut registry = SchemaRegistry::new();
+            registry
+                .insert_provider_witness(
+                    "builtin",
+                    &factory("builtin", &[], Arc::default()).schema_witness(),
+                )
+                .unwrap();
+            let loaded = loaded_provider_snapshot_from_factories(
+                Arc::default(),
+                registry,
+                crate::EnvironmentSnapshot::empty(),
+            );
+            let catalog = &loaded.provider_context().custom_types;
+            assert!(catalog.is_loaded());
+            assert!(
+                loaded
+                    .schema_registry()
+                    .assignability_closures()
+                    .contains_key(&owner("builtin"))
+            );
+            assert!(catalog.assignability_edges_available(&owner("builtin")));
+            let schema = loaded
+                .schema_registry()
+                .get(
+                    "builtin",
+                    "test.Bucket",
+                    crate::schema::SchemaKind::Resource,
+                )
+                .unwrap();
+            assert!(matches!(
+                TypeInSchema::schemaless(schema.as_schema().attributes()["A"].attr_type())
+                    .assignment_to(schema.assignment_sink(
+                        schema.as_schema().attributes()["B"].attr_type(),
+                        catalog
+                    )),
+                crate::schema::TypeAssignability::Mismatch,
+            ));
+        }
+
+        #[test]
+        fn registry_rejects_conflicting_witness_edges_on_insert_and_merge() {
+            let with_edges = factory("builtin", &[("A", "B")], Arc::default()).schema_witness();
+            let without_edges = factory("builtin", &[], Arc::default()).schema_witness();
+            for merge in [false, true] {
+                let mut registry = SchemaRegistry::new();
+                registry
+                    .insert_provider_witness("builtin", &with_edges)
+                    .unwrap();
+                let result = if merge {
+                    let mut incoming = SchemaRegistry::new();
+                    incoming
+                        .insert_provider_witness("builtin", &without_edges)
+                        .unwrap();
+                    registry.extend(incoming)
+                } else {
+                    registry.insert_provider_witness("builtin", &without_edges)
+                };
+                assert_eq!(
+                    result.expect_err("one owner cannot have conflicting witness-backed edges"),
+                    crate::schema::SchemaRegistryError::ConflictingAssignabilityEdges {
+                        owner: "builtin".into()
+                    },
+                );
+                assert!(
+                    registry.assignability_closures()[&owner("builtin")]
+                        .reachable(&identity("A"), &identity("B"))
+                );
+            }
         }
 
         #[test]
@@ -8820,6 +8946,7 @@ mod tests {
         let resolver = FactoryCustomTypeResolver::with_index(
             factories,
             build_owner_custom_type_index(&snapshots),
+            &SchemaRegistry::new(),
         );
         let known = resolver.known_custom_types();
         assert_eq!(known.len(), 2, "only owners with the same kind are grouped");

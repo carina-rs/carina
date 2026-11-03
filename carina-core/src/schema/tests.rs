@@ -32,8 +32,7 @@ use crate::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
 
-// Stage A deliberately specifies storage/admission only. Edges do not change
-// TypeInSchema's assignability judgement until the next stage of carina#4233.
+// Stage A storage/admission tests; stage B judgement tests are separate.
 mod assignability_edges_stage_a {
     use crate::schema::{
         AssignabilityEdge, AttributeSchema, AttributeType, ProviderSchemaValidationError,
@@ -148,6 +147,81 @@ mod assignability_edges_stage_a {
                 ProviderSchemaValidationError::DanglingAssignabilityEndpoint { identity: actual }
                     if actual == identity(missing)
             ));
+        }
+    }
+
+    #[test]
+    fn rejects_enum_source_and_sink_endpoints() {
+        for also_scalar in [false, true] {
+            let mut declarations = vec![
+                string("Name"),
+                AttributeType::enum_(
+                    identity("Mode"),
+                    Some(vec!["on".into()]),
+                    vec![],
+                    None,
+                    None,
+                ),
+            ];
+            if also_scalar {
+                declarations.push(string("Mode"));
+            }
+            for (source, sink) in [("Mode", "Name"), ("Name", "Mode")] {
+                let error = witness(&declarations, vec![edge(source, sink)])
+                    .expect_err("enum identities cannot be assignability endpoints");
+                assert_eq!(
+                    error,
+                    ProviderSchemaValidationError::EnumAssignabilityEndpoint {
+                        identity: identity("Mode"),
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_reference_source_and_sink_endpoints() {
+        for also_scalar in [false, true] {
+            let mut declarations = vec![
+                string("Name"),
+                AttributeType::reference(identity("Ref"), None, None),
+            ];
+            if also_scalar {
+                declarations.push(string("Ref"));
+            }
+            for (source, sink) in [("Ref", "Name"), ("Name", "Ref")] {
+                let error = witness(&declarations, vec![edge(source, sink)])
+                    .expect_err("reference identities cannot be assignability endpoints");
+                assert_eq!(
+                    error,
+                    ProviderSchemaValidationError::ReferenceAssignabilityEndpoint {
+                        identity: identity("Ref"),
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_builtin_source_and_sink_endpoints() {
+        let builtin = TypeIdentity::bare("PositiveInt");
+        let count = identity("Count");
+        let declarations = [
+            crate::schema::types::positive_int(),
+            AttributeType::refined_int(Some(count.clone()), None),
+        ];
+        for (source, sink) in [(builtin.clone(), count.clone()), (count, builtin.clone())] {
+            let error = witness(
+                &declarations,
+                vec![AssignabilityEdge::new(source, sink).unwrap()],
+            )
+            .expect_err("core built-in identities cannot be assignability endpoints");
+            assert_eq!(
+                error,
+                ProviderSchemaValidationError::BuiltinAssignabilityEndpoint {
+                    identity: builtin.clone(),
+                }
+            );
         }
     }
 
@@ -295,6 +369,32 @@ mod assignability_edges_stage_a {
         .unwrap();
         assert_eq!(restored.assignability_edges(), edges.as_slice());
     }
+}
+
+#[test]
+fn bootstrap_catalog_defers_structural_identity_mismatches() {
+    let bootstrap = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    assert!(!bootstrap.custom_types.is_loaded());
+    assert!(bootstrap.custom_types.may_defer(None));
+    let source = AttributeType::refined_string(
+        Some(TypeIdentity::from_dotted("test.Widget.NewName")),
+        None,
+        None,
+        None,
+    );
+    let sink = AttributeType::refined_string(
+        Some(TypeIdentity::from_dotted("test.Widget.Name")),
+        None,
+        None,
+        None,
+    );
+    assert!(matches!(
+        TypeInSchema::schemaless(&source).assignment_to(
+            TypeInSchema::schemaless(&sink)
+                .with_authority(&bootstrap.custom_types, SinkAuthority::Owner(&TEST_OWNER))
+        ),
+        TypeAssignability::Unchecked(_)
+    ));
 }
 
 #[test]
@@ -2123,7 +2223,10 @@ fn schema_registry_extend_rejects_conflicting_witness_forms() {
         owner,
         existing,
         incoming,
-    } = error;
+    } = error
+    else {
+        panic!("expected conflicting reference forms, got {error:?}");
+    };
     assert_eq!(owner, "actual-owner");
     assert_eq!(existing, first_forms);
     assert_eq!(incoming, second_forms);

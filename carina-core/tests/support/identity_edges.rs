@@ -98,36 +98,6 @@ impl ProviderFactory for EdgeFactory {
                     .build(),
                 )
             });
-        let schema = [("NewMode", "new_mode"), ("Mode", "mode")]
-            .into_iter()
-            .fold(schema, |schema, (kind, attr)| {
-                schema.attribute(
-                    AttributeSchema::provider_populated(
-                        attr,
-                        AttributeType::enum_(
-                            identity(kind),
-                            Some(vec!["good-mode".into()]),
-                            vec![],
-                            None,
-                            None,
-                        ),
-                    )
-                    .build(),
-                )
-            });
-        let schema = schema.attribute(
-            AttributeSchema::optional(
-                "mode_input",
-                AttributeType::enum_(
-                    identity("Mode"),
-                    Some(vec!["good-mode".into()]),
-                    vec![],
-                    None,
-                    None,
-                ),
-            )
-            .build(),
-        );
         vec![
             schema.validate().unwrap(),
             ResourceSchema::new("Lookup")
@@ -150,7 +120,6 @@ impl ProviderFactory for EdgeFactory {
                     ("B", "C"),
                     ("NewCount", "Count"),
                     ("NewRatio", "Ratio"),
-                    ("NewMode", "Mode"),
                 ]
                 .into_iter()
                 .map(|(source, sink)| {

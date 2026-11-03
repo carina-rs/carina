@@ -22,10 +22,17 @@ The SDK's `CarinaProvider::assignability_edges` method is required; return an
 empty vector when the provider declares none.
 
 The aggregate schema witness admits both endpoints only when its resource or
-config schemas declare them with the same scalar kind. Self edges, duplicate
-edges, and cycles are rejected. Transitive closure is computed separately per
-provider; paths never combine different providers' declarations. This stage
-stores and transports the declarations without changing assignment checks.
+config schemas declare them as scalar String, Int, or Float identities with the
+same scalar kind. Enum, Reference, and core built-in identities cannot be
+endpoints. Self edges, duplicate edges, and cycles are rejected. Transitive
+closure is computed separately per provider; paths never combine different
+providers' declarations.
+
+Assignment first checks structural identity. When identities differ, a provider
+attribute uses its sink owner's edges. Type annotations and module boundaries
+require a path declared by every owner of the sink identity. Edges permit the
+identity conversion; the existing length and range checks still apply, and sink
+validators still run on values during validation, planning, and apply.
 
 `PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION` are both 21. Hosts and
 providers must rebuild together. The read-only protocol-v12 migration adapter

@@ -314,6 +314,10 @@ impl<'a, R: PatternForm> AssignmentSink<'a, R> {
         if source.structurally_assignable_to(sink) {
             return Assignable;
         }
+        // Enums retain structural identity matching, including at bootstrap.
+        if matches!(leaf, IdentityLeaf::Enum(_)) {
+            return Mismatch;
+        }
         let authority = match (self.scope, leaf) {
             (SinkScope::Authority(authority), _) => authority,
             (
@@ -722,7 +726,15 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 identity_leaf(&target.attr.kind),
             ) {
                 (Some(left), Some(right)) => {
-                    sink.rebind(target.attr).identity_assignment(left, right)
+                    if matches!(source.attr.kind, Enum { .. }) {
+                        TypeAssignability::from_bool(
+                            right
+                                .identity()
+                                .is_some_and(|sink| left.structurally_assignable_to(sink)),
+                        )
+                    } else {
+                        sink.rebind(target.attr).identity_assignment(left, right)
+                    }
                 }
                 (None, Some(_)) => Mismatch,
                 (Some(_) | None, None) => Unchecked(TypeAssignmentDeferral::new(
@@ -902,7 +914,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     to_dsl: _,
                 },
             ) if let Some(source) = source.identity() => TypeAssignability::all([
-                right.identity_assignment(source, IdentityLeaf::Enum(target)),
+                TypeAssignability::from_bool(source.structurally_assignable_to(target)),
                 TypeAssignability::from_bool(
                     match (
                         nominal_scalar_constraints(left, source_refs),
@@ -937,7 +949,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     range: _,
                 },
             ) if target.identity().is_some() => TypeAssignability::all([
-                right.identity_assignment(source, IdentityLeaf::Scalar(target)),
+                TypeAssignability::from_bool(
+                    target
+                        .identity()
+                        .is_some_and(|target| source.structurally_assignable_to(target)),
+                ),
                 TypeAssignability::from_bool(
                     match (
                         nominal_scalar_constraints(left, source_refs),
@@ -966,7 +982,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     to_dsl: _,
                 },
             ) => TypeAssignability::all([
-                right.identity_assignment(source, IdentityLeaf::Enum(target)),
+                TypeAssignability::from_bool(source.structurally_assignable_to(target)),
                 source_base.in_schema(self.defs).assignment_on_paths(
                     sink.rebind(sink_base),
                     source_refs,

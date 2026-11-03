@@ -10029,6 +10029,15 @@ pub enum ProviderSchemaValidationError {
     DanglingAssignabilityEndpoint {
         identity: TypeIdentity,
     },
+    EnumAssignabilityEndpoint {
+        identity: TypeIdentity,
+    },
+    ReferenceAssignabilityEndpoint {
+        identity: TypeIdentity,
+    },
+    BuiltinAssignabilityEndpoint {
+        identity: TypeIdentity,
+    },
     AssignabilityScalarKindMismatch {
         source: Box<TypeIdentity>,
         sink: Box<TypeIdentity>,
@@ -10087,6 +10096,21 @@ impl fmt::Display for ProviderSchemaValidationError {
             Self::DanglingAssignabilityEndpoint { identity } => write!(
                 formatter,
                 "assignability endpoint `{}` is not declared by this provider",
+                ProviderText::new(identity.to_string())
+            ),
+            Self::EnumAssignabilityEndpoint { identity } => write!(
+                formatter,
+                "assignability endpoint `{}` is an Enum; only provider-defined scalar String, Int, or Float identities are supported",
+                ProviderText::new(identity.to_string())
+            ),
+            Self::ReferenceAssignabilityEndpoint { identity } => write!(
+                formatter,
+                "assignability endpoint `{}` is a Reference; only provider-defined scalar String, Int, or Float identities are supported",
+                ProviderText::new(identity.to_string())
+            ),
+            Self::BuiltinAssignabilityEndpoint { identity } => write!(
+                formatter,
+                "assignability endpoint `{}` is a core built-in identity; only provider-defined scalar String, Int, or Float identities are supported",
                 ProviderText::new(identity.to_string())
             ),
             Self::AssignabilityScalarKindMismatch {
@@ -10171,6 +10195,22 @@ impl ValidatedProviderSchemaWitness {
         let mut scalar_kinds = BTreeMap::<TypeIdentity, RefinedScalarKind>::new();
         let mut declaration_kinds =
             BTreeMap::<TypeIdentity, std::collections::BTreeSet<IdentifiedDeclarationKind>>::new();
+        let edge_endpoints: std::collections::BTreeSet<_> = assignability_edges
+            .iter()
+            .flat_map(|edge| {
+                let (source, sink) = edge.parts();
+                [source, sink]
+            })
+            .collect();
+        for identity in &edge_endpoints {
+            if builtin_type_registry().contains_key(*identity) {
+                return Err(
+                    ProviderSchemaValidationError::BuiltinAssignabilityEndpoint {
+                        identity: (*identity).clone(),
+                    },
+                );
+            }
+        }
 
         for (identity, attribute_type) in &declarations {
             if let Some(builtin) = builtin_type_registry().get(identity)
@@ -10179,6 +10219,20 @@ impl ValidatedProviderSchemaWitness {
                 return Err(ProviderSchemaValidationError::BuiltinTypeCollision {
                     identity: identity.clone(),
                 });
+            }
+            if edge_endpoints.contains(identity) {
+                if matches!(attribute_type.raw_shape(), RawShape::Enum { .. }) {
+                    return Err(ProviderSchemaValidationError::EnumAssignabilityEndpoint {
+                        identity: identity.clone(),
+                    });
+                }
+                if matches!(attribute_type.raw_shape(), RawShape::Reference { .. }) {
+                    return Err(
+                        ProviderSchemaValidationError::ReferenceAssignabilityEndpoint {
+                            identity: identity.clone(),
+                        },
+                    );
+                }
             }
             let declaration = identified_declaration_kind(attribute_type)
                 .expect("identified declaration walk only yields identified scalar types");
@@ -14438,6 +14492,7 @@ pub struct SchemaRegistry {
     data_sources: HashMap<(SchemaTypeOwner, String), ValidatedResourceSchema>,
     reference_forms: BTreeMap<String, ReferenceForms>,
     witness_backed_reference_forms: HashSet<String>,
+    assignability_closures: BTreeMap<SchemaTypeOwner, AssignabilityClosure>,
 }
 
 /// Failure to combine owner-bound schema registry declarations.
@@ -14447,6 +14502,9 @@ pub enum SchemaRegistryError {
         owner: String,
         existing: ReferenceForms,
         incoming: ReferenceForms,
+    },
+    ConflictingAssignabilityEdges {
+        owner: String,
     },
 }
 
@@ -14460,6 +14518,11 @@ impl fmt::Display for SchemaRegistryError {
             } => write!(
                 formatter,
                 "schema owner `{}` has conflicting witness-backed reference-form tables",
+                ProviderText::new(owner)
+            ),
+            Self::ConflictingAssignabilityEdges { owner } => write!(
+                formatter,
+                "schema owner `{}` has conflicting witness-backed assignability edges",
                 ProviderText::new(owner)
             ),
         }
@@ -14503,6 +14566,14 @@ impl SchemaRegistry {
         Self::default()
     }
 
+    /// Every registered owner has a complete, possibly empty edge declaration.
+    /// Supplemental witnesses retain their authority without a runtime factory.
+    pub(crate) fn assignability_closures(
+        &self,
+    ) -> &BTreeMap<SchemaTypeOwner, AssignabilityClosure> {
+        &self.assignability_closures
+    }
+
     /// Insert one validated schema for test fixtures that intentionally have
     /// no provider-wide reference forms.
     #[cfg(any(test, feature = "test-utils"))]
@@ -14510,6 +14581,9 @@ impl SchemaRegistry {
     pub fn insert(&mut self, provider: impl Into<String>, schema: ValidatedResourceSchema) {
         let provider = provider.into();
         self.reference_forms.entry(provider.clone()).or_default();
+        self.assignability_closures
+            .entry(SchemaTypeOwner::Provider(provider.clone()))
+            .or_default();
         let key = (
             SchemaTypeOwner::Provider(provider),
             schema.as_schema().resource_type.clone(),
@@ -14524,8 +14598,8 @@ impl SchemaRegistry {
         }
     }
 
-    /// Insert every resource schema and the one provider-wide forms table from
-    /// the same validated aggregate witness.
+    /// Insert every resource schema, reference-form table, and assignability
+    /// closure from the same validated aggregate witness.
     pub fn insert_provider_witness(
         &mut self,
         provider: impl Into<String>,
@@ -14543,6 +14617,14 @@ impl SchemaRegistry {
                 incoming: incoming.clone(),
             });
         }
+        let owner = SchemaTypeOwner::Provider(provider.clone());
+        if self.witness_backed_reference_forms.contains(&provider)
+            && self.assignability_closures.get(&owner) != Some(witness.assignability_closure())
+        {
+            return Err(SchemaRegistryError::ConflictingAssignabilityEdges { owner: provider });
+        }
+        self.assignability_closures
+            .insert(owner, witness.assignability_closure().clone());
         self.reference_forms
             .insert(provider.clone(), incoming.clone());
         self.witness_backed_reference_forms.insert(provider.clone());
@@ -14564,14 +14646,15 @@ impl SchemaRegistry {
     }
 
     /// Merge another registry. Incoming resource schemas win on duplicate
-    /// resource keys. Witness-backed owner form tables must be identical;
-    /// fixture-only schema insertions carry no competing forms table.
+    /// resource keys. Witness-backed owner form tables and edge closures must
+    /// be identical; fixture-only insertions carry no competing declarations.
     pub fn extend(&mut self, other: SchemaRegistry) -> Result<(), SchemaRegistryError> {
         let SchemaRegistry {
             managed,
             data_sources,
             reference_forms,
             witness_backed_reference_forms,
+            assignability_closures,
         } = other;
         for (owner, incoming) in &reference_forms {
             if witness_backed_reference_forms.contains(owner)
@@ -14585,14 +14668,32 @@ impl SchemaRegistry {
                     incoming: incoming.clone(),
                 });
             }
+            let typed_owner = SchemaTypeOwner::Provider(owner.clone());
+            if witness_backed_reference_forms.contains(owner)
+                && self.witness_backed_reference_forms.contains(owner)
+                && self.assignability_closures.get(&typed_owner)
+                    != assignability_closures.get(&typed_owner)
+            {
+                return Err(SchemaRegistryError::ConflictingAssignabilityEdges {
+                    owner: owner.clone(),
+                });
+            }
         }
         self.managed.extend(managed);
         self.data_sources.extend(data_sources);
         for (owner, forms) in reference_forms {
             if witness_backed_reference_forms.contains(&owner) {
+                let typed_owner = SchemaTypeOwner::Provider(owner.clone());
+                self.assignability_closures.insert(
+                    typed_owner.clone(),
+                    assignability_closures[&typed_owner].clone(),
+                );
                 self.reference_forms.insert(owner.clone(), forms);
                 self.witness_backed_reference_forms.insert(owner);
             } else {
+                self.assignability_closures
+                    .entry(SchemaTypeOwner::Provider(owner.clone()))
+                    .or_default();
                 self.reference_forms.entry(owner).or_insert(forms);
             }
         }

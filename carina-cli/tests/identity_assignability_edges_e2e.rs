@@ -229,22 +229,6 @@ impl ProviderFactory for ForwardFactory {
                 )
                 .validate()
                 .unwrap(),
-            ResourceSchema::new("EnumReceiver")
-                .attribute(
-                    AttributeSchema::optional(
-                        "mode",
-                        AttributeType::enum_(
-                            TypeIdentity::bare("Mode"),
-                            Some(vec!["good-mode".into()]),
-                            vec![],
-                            None,
-                            None,
-                        ),
-                    )
-                    .build(),
-                )
-                .validate()
-                .unwrap(),
         ]
     }
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
@@ -517,69 +501,4 @@ fn identity_edges_use_the_data_source_input_owner() {
             );
         }
     }
-}
-
-#[test]
-fn identity_edges_apply_to_enum_references() {
-    let scenario = Scenario::new("mode_input = producer.new_mode", "mock");
-    let errors = scenario.validate();
-    assert!(errors.is_empty(), "{errors:#?}");
-}
-
-#[test]
-fn identity_edges_compare_a_declared_enum_binding_through_the_same_relation() {
-    let scenario = Scenario::new("", "mock");
-    fs::create_dir(scenario.project.path().join("child")).unwrap();
-    fs::write(scenario.project.path().join("consumer.crn"), "let child = use { source = './child' }\nlet instance = child { mode = producer.new_mode }\n").unwrap();
-    fs::write(
-        scenario.project.path().join("child/arguments.crn"),
-        "arguments { mode: mock.Bucket.NewMode }\n",
-    )
-    .unwrap();
-    fs::write(
-        scenario.project.path().join("child/resources.crn"),
-        "let consumer = mock.Bucket { mode_input = mode }\n",
-    )
-    .unwrap();
-    let errors = scenario.validate();
-    assert!(errors.is_empty(), "{errors:#?}");
-}
-
-#[test]
-fn identity_edges_forwarded_enum_argument_rejudges_the_original_at_each_module_boundary() {
-    let scenario = Scenario::new("", "other");
-    fs::create_dir(scenario.project.path().join("child")).unwrap();
-    fs::create_dir(scenario.project.path().join("grandchild")).unwrap();
-    for (file, source) in [
-        (
-            "consumer.crn",
-            "let child = use { source = './child' }\nlet instance = child { mode = producer.new_mode }\n",
-        ),
-        (
-            "child/arguments.crn",
-            "arguments { mode: mock.Bucket.Mode }\n",
-        ),
-        (
-            "child/calls.crn",
-            "let grandchild = use { source = '../grandchild' }\nlet instance = grandchild { mode = mode }\n",
-        ),
-        ("grandchild/arguments.crn", "arguments { mode: Mode }\n"),
-    ] {
-        fs::write(scenario.project.path().join(file), source).unwrap();
-    }
-    let errors = carina_cli::commands::validate::validate_with_factories(
-        &carina_core::paths::ResolvedPath::new(scenario.project.path()).unwrap(),
-        LoadedProviderFactory::for_test(vec![
-            Box::new(RuntimeEdgeFactory),
-            Box::new(ForwardFactory),
-        ]),
-    );
-    assert!(
-        errors
-            .iter()
-            .any(|error| error.contains("mock.Bucket.NewMode")
-                && error.contains("Mode")
-                && error.contains("child/calls.crn")),
-        "the second annotation must judge NewMode with its own owners: {errors:#?}"
-    );
 }

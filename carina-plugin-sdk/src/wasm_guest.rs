@@ -216,9 +216,9 @@ pub fn wit_to_proto_applied_identifier(
     proto::AppliedIdentifier::new(identifier)
 }
 
-/// Return the honest directive default for protocol-20 WIT resource records.
+/// Return the honest directive default for current WIT resource records.
 ///
-/// Protocol 20 does not transport directives on create, poll-create,
+/// The current protocol does not transport directives on create, poll-create,
 /// resume-create, or read-data-source requests. Providers
 /// therefore receive all-false directives on those paths (see carina#4151).
 /// Desired normalization uses a separate record without directive fields.

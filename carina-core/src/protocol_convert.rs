@@ -643,7 +643,7 @@ impl Error for SchemaDecodeError {
     }
 }
 
-/// Convert a validated resource schema into its version-20 protocol record.
+/// Convert a validated resource schema into its current protocol record.
 pub fn resource_schema_to_protocol(
     schema: &ValidatedResourceSchema,
 ) -> Result<protocol::ResourceSchema, ProtocolConvertError> {
@@ -2338,7 +2338,7 @@ pub fn protocol_to_core_persisted_value_map(
 }
 
 /// Encode a core resource id. Provider-instance routing is host-local and the
-/// version-20 protocol deliberately has no corresponding field.
+/// current protocol deliberately has no corresponding field.
 pub fn resource_id_to_protocol(id: &ResourceId) -> protocol::ResourceId {
     let ResourceId {
         provider,
@@ -2357,7 +2357,7 @@ pub fn resource_id_to_protocol(id: &ResourceId) -> protocol::ResourceId {
     }
 }
 
-/// Decode a version-20 resource id. The wire's empty identity is the pending
+/// Decode a current protocol resource id. The wire's empty identity is the pending
 /// sentinel, and provider-instance routing cannot be reconstructed.
 pub fn protocol_to_resource_id(id: &protocol::ResourceId) -> ResourceId {
     let protocol::ResourceId {

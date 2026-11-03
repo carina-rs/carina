@@ -4,6 +4,7 @@ use super::{ProviderSchemaValidationError, RefinedScalarKind, TypeIdentity};
 
 /// A provider's directional assertion that `source` is assignable to `sink`.
 /// Endpoint membership and scalar kinds are checked by the aggregate witness.
+/// Only provider-defined scalar String, Int, and Float identities are admitted.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AssignabilityEdge {
     source: TypeIdentity,
@@ -30,7 +31,7 @@ impl AssignabilityEdge {
 }
 
 /// Transitive closure of one admitted provider's explicit edges.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AssignabilityClosure {
     sinks: BTreeMap<TypeIdentity, BTreeSet<TypeIdentity>>,
 }
