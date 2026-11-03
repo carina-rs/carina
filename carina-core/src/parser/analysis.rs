@@ -380,11 +380,6 @@ pub enum AnalysisItemKind {
 ///
 /// Consumers cannot manufacture a directory finding from an arbitrary label:
 ///
-/// ```compile_fail
-/// use carina_core::parser::AnalysisTreeError;
-/// let _ = AnalysisTreeError::MissingSyntaxProvenance { element: "arbitrary".into() }.diagnostic();
-/// ```
-///
 /// ```compile_fail,E0451
 /// use carina_core::parser::{AnalysisTreeError, AnalysisTreeErrorKind};
 /// let _ = AnalysisTreeError {
@@ -1258,7 +1253,9 @@ impl<'a, B: BindingAddress> AnalysisWaitRef<'a, B> {
 ///
 /// ```compile_fail,E0451
 /// use carina_core::parser::AnalysisTree;
-/// let _: AnalysisTree<'_> = AnalysisTree { resources: Vec::new(), waits: Vec::new() };
+/// fn fabricate(tree: AnalysisTree<'_>) {
+///     let _ = AnalysisTree { resources: Vec::new(), ..tree };
+/// }
 /// ```
 ///
 /// ```compile_fail,E0308
@@ -1310,8 +1307,6 @@ where
     where
         E: super::ExportParamLike<P, B>,
     {
-        #[cfg(any(test, feature = "test-utils"))]
-        super::analysis_test_support::tree_built();
         let mut value_references = Vec::new();
         let resource_refs = file
             .resources

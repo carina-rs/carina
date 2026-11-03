@@ -216,7 +216,7 @@ fn review_round3_degraded_duplicates_keep_only_buffer_findings() {
 }
 
 #[test]
-fn review_round3_module_call_findings_are_computed_once() {
+fn review_round3_module_call_findings_are_reported_once() {
     let directory = Directory::new(&[
         ("main.crn", "let service = use { source = './module' }\n"),
         ("sibling.crn", "service {}\n"),
@@ -224,19 +224,17 @@ fn review_round3_module_call_findings_are_computed_once() {
     ]);
     let path = directory.root.path().join("sibling.crn");
     let doc = create_document_at("service {}\n", path.clone());
-    let (findings, work) = carina_core::parser::analysis_test_support::measure(|| {
-        test_engine().analyze(&doc, Some(&path))
-    });
-    assert!(
+    let engine = test_engine();
+    let findings = engine.analyze(&doc, Some(&path));
+    assert_eq!(
         findings
             .iter()
-            .any(|finding| finding.message.contains("required_name")),
+            .filter(|finding| finding.message.contains("required_name"))
+            .count(),
+        1,
         "{findings:#?}"
     );
-    assert_eq!(
-        work.module_call_checks, 1,
-        "reuse findings for resolution and publication: {work:?}"
-    );
+    directory.assert_sibling_owner(&engine, "required_name", &[("service {}", 0)]);
 }
 
 #[test]

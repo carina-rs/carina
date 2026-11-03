@@ -73,13 +73,23 @@ impl UnresolvedTypeToken {
 ///
 /// Consumers cannot convert hand-built line numbers into a scoped finding:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0624
 /// use carina_core::parser::ParseError;
 /// let error = ParseError::InvalidExpression { line: 42, message: "error".into() };
-/// let _ = error.file_diagnostic();
+/// let _ = error.in_file("arbitrary.crn");
 /// ```
 ///
-/// ```compile_fail
+/// Only the parser can attach an existing element location to an error:
+///
+/// ```compile_fail,E0624
+/// use carina_core::parser::{DeclarationLocation, ParseError};
+/// fn fabricate(location: &DeclarationLocation) {
+///     let error = ParseError::InvalidExpression { line: 42, message: "error".into() };
+///     let _ = error.at(location);
+/// }
+/// ```
+///
+/// ```compile_fail,E0639
 /// use carina_core::parser::ParseError;
 /// let _ = ParseError::Located {
 ///     path: "arbitrary.crn".into(),

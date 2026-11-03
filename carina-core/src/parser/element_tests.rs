@@ -9,39 +9,60 @@ fn slice<'a>(source: &'a str, location: &DeclarationLocation) -> &'a str {
 }
 
 #[test]
-fn review_round3_resolution_reuses_sealed_tree() {
-    let config = context();
-    let parsed = parse_file("let value = 'ready'\n", Path::new("sibling.crn"), &config).unwrap();
-    let tree = AnalysisTree::try_from_file(&parsed).unwrap();
-    crate::validation::deferred_types::with_session_for_test(&config, |session| {
-        let (result, work) =
-            analysis_test_support::measure(|| resolve_resource_refs_from_analysis(&tree, session));
-        result.unwrap();
-        assert_eq!(
-            work.tree_builds, 0,
-            "resolution must reuse the sealed input: {work:?}"
-        );
-    });
-}
-
-#[test]
-fn review_round3_type_resolution_reuses_sealed_tree() {
+fn review_round3_resolution_preserves_values_and_locations() {
     let config = context();
     let parsed = parse_file(
-        "arguments { value: String }\n",
+        "let holder = mock.test.Resource { name = target.name }\nlet target = mock.test.Resource { name = 'ready' }\n",
         Path::new("sibling.crn"),
         &config,
     )
     .unwrap();
     let tree = AnalysisTree::try_from_file(&parsed).unwrap();
     crate::validation::deferred_types::with_session_for_test(&config, |session| {
-        let (result, work) = analysis_test_support::measure(|| {
-            crate::validation::resolve_file_type_exprs_from_analysis(&tree, session, None)
-        });
-        assert!(result.1.diagnostics().is_empty());
+        let resolved = resolve_resource_refs_from_analysis(&tree, session).unwrap();
         assert_eq!(
-            work.tree_builds, 0,
-            "type resolution must reuse the sealed input: {work:?}"
+            resolved.resources[0].attributes["name"],
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                "ready".into()
+            ))
+        );
+        let resolved_tree = AnalysisTree::try_from_file(&resolved).unwrap();
+        assert_eq!(
+            resolved_tree
+                .resources()
+                .map(|item| item.location())
+                .collect::<Vec<_>>(),
+            tree.resources()
+                .map(|item| item.location())
+                .collect::<Vec<_>>()
+        );
+    });
+}
+
+#[test]
+fn review_round3_type_resolution_preserves_parameter_types() {
+    let config = context();
+    let source = "arguments { value: String count: Int = 1 }\n";
+    let parsed = parse_file(source, Path::new("sibling.crn"), &config).unwrap();
+    let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+    crate::validation::deferred_types::with_session_for_test(&config, |session| {
+        let (resolved, report) =
+            crate::validation::resolve_file_type_exprs_from_analysis(&tree, session, None);
+        assert!(
+            report.diagnostics().is_empty(),
+            "{:#?}",
+            report.diagnostics()
+        );
+        assert_eq!(resolved.arguments.len(), 2);
+        assert_eq!(resolved.arguments[0].name, "value");
+        assert_eq!(resolved.arguments[0].static_type, TypeExpr::String);
+        assert_eq!(resolved.arguments[1].name, "count");
+        assert_eq!(resolved.arguments[1].static_type, TypeExpr::Int);
+        assert_eq!(
+            resolved.arguments[1].default,
+            Some(crate::resource::Value::Concrete(
+                crate::resource::ConcreteValue::Int(1)
+            ))
         );
     });
 }

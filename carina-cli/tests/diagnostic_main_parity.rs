@@ -1,4 +1,4 @@
-//! Review-round-2 regressions: validate must preserve main's findings (#4220).
+//! Review regressions: validate must preserve main's findings (#4220).
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -182,12 +182,46 @@ fn review_round2_upstream_shapes_skip_attribute_parameter_values() {
     let dir = upstream_fixture(
         "attributes { field: String = up.names.bad index: String = up.names['bad'] }\n",
     );
-    let (_, text) = validate(&dir.path().join("down"));
-    // Root attributes can have unrelated boundary diagnostics; these two
-    // shape checkers have never covered their parameter values on main.
+    let (output, text) = validate(&dir.path().join("down"));
+    assert!(output.status.success(), "{text}");
     assert!(
         !text.contains("reads it as a struct") && !text.contains("does not fit"),
         "{text}"
+    );
+}
+
+#[test]
+fn review_round4_identity_conflict_stops_before_upstream_shapes() {
+    let dir = upstream_fixture(
+        "mock.test.Thing { name = 'alpha' }\nmock.test.Thing { name = 'beta' }\nlet consumer = mock.test.resource { name = 'valid' }\n",
+    );
+    let down = dir.path().join("down");
+    let (identity_output, identity_text) = validate(&down);
+    assert!(!identity_output.status.success(), "{identity_text}");
+    assert!(
+        identity_text.contains("Anonymous resource identity is derived from mutable attributes"),
+        "{identity_text}"
+    );
+    assert_eq!(
+        identity_text.matches("Error: ").count(),
+        1,
+        "{identity_text}"
+    );
+
+    std::fs::write(
+        down.join("sibling.crn"),
+        "mock.test.Thing { name = 'alpha' }\nmock.test.Thing { name = 'beta' }\nlet consumer = mock.test.resource { name = up.names.bad }\n",
+    )
+    .unwrap();
+    let (output, text) = validate(&down);
+    assert_eq!(
+        output.status.code(),
+        identity_output.status.code(),
+        "{text}"
+    );
+    assert_eq!(
+        text, identity_text,
+        "main stops at the identity error before checking the sibling's upstream reference"
     );
 }
 

@@ -1000,64 +1000,6 @@ pub(crate) fn validate_and_resolve_errors_inner(
         }
     }
 
-    // Reject references to `upstream_state` fields that the upstream's
-    // `exports { }` block does not declare. Gated like the other
-    // validations above so `destroy` / `state` (which pass
-    // `skip_resource_validation = true`) can still run when an upstream
-    // has drifted — those commands are the recovery path for exactly
-    // that situation. No state I/O: we parse the upstream's `.crn`
-    // files directly.
-    if let Some(analysis) = &expanded_analysis {
-        let field_errors =
-            carina_core::upstream_exports::check_upstream_state_untyped_field_references(
-                analysis,
-                &upstream_exports,
-            );
-        // #1894 (option 2): cross-directory `for`-iterable shape check.
-        // Surfaces pending `list ↔ map` migrations in the upstream's
-        // `exports.crn` before they hit apply.
-        let shape_errors = carina_core::upstream_exports::check_upstream_state_for_iterable_shapes(
-            analysis,
-            &upstream_exports,
-        );
-        // #1894 follow-up: cross-directory attribute-access shape check.
-        // Catches `orgs.account.bad_field` / `orgs.list_field.foo` where
-        // the downstream's `.field` chain doesn't fit the upstream's
-        // declared `TypeExpr`.
-        let attribute_access_errors =
-            carina_core::upstream_exports::check_upstream_state_attribute_access_shape_fallbacks(
-                analysis,
-                &upstream_exports,
-            );
-        let subscript_errors = carina_core::upstream_exports::check_upstream_state_subscript_shapes(
-            analysis,
-            &upstream_exports,
-        );
-        // The four upstream-ref shape/existence checks return distinct concrete types
-        // but share `UpstreamRefDiagnostic`. Chain them through the
-        // trait (`Display` supertrait gives the canonical
-        // `"location: message"` form — the per-type `Display` impl is
-        // the single source of truth) so adding another check is one
-        // extra `chain(...)`.
-        errors.extend(
-            field_errors
-                .iter()
-                .map(|e| e as &dyn UpstreamRefDiagnostic)
-                .chain(shape_errors.iter().map(|e| e as &dyn UpstreamRefDiagnostic))
-                .chain(
-                    attribute_access_errors
-                        .iter()
-                        .map(|e| e as &dyn UpstreamRefDiagnostic),
-                )
-                .chain(
-                    subscript_errors
-                        .iter()
-                        .map(|e| e as &dyn UpstreamRefDiagnostic),
-                )
-                .map(|e| AppError::Validation(e.to_string())),
-        );
-    }
-
     let identity_conflict_policy = if skip_resource_validation {
         carina_core::identifier::AnonymousIdentityConflictPolicy::RepresentabilityOnly
     } else {
@@ -1084,6 +1026,73 @@ pub(crate) fn validate_and_resolve_errors_inner(
     // identity or move-target error must stop the pipeline here.
     if !errors.is_empty() {
         return Err(non_empty_validation_failure(errors));
+    }
+
+    // Reject references to `upstream_state` fields that the upstream's
+    // `exports { }` block does not declare. Gated like the other
+    // validations above so `destroy` / `state` (which pass
+    // `skip_resource_validation = true`) can still run when an upstream
+    // has drifted — those commands are the recovery path for exactly
+    // that situation. No state I/O: we parse the upstream's `.crn`
+    // files directly.
+    if !skip_resource_validation {
+        // Identity assignment mutates the parsed resources. Seal their final
+        // view only after the identity and move-target gate has succeeded.
+        let analysis = match carina_core::parser::AnalysisTree::try_from_file(parsed) {
+            Ok(tree) => tree,
+            Err(error) => {
+                errors.push(AppError::AnalysisInvariant(error));
+                return Err(non_empty_validation_failure(errors));
+            }
+        };
+        let field_errors =
+            carina_core::upstream_exports::check_upstream_state_untyped_field_references(
+                &analysis,
+                &upstream_exports,
+            );
+        // #1894 (option 2): cross-directory `for`-iterable shape check.
+        // Surfaces pending `list ↔ map` migrations in the upstream's
+        // `exports.crn` before they hit apply.
+        let shape_errors = carina_core::upstream_exports::check_upstream_state_for_iterable_shapes(
+            &analysis,
+            &upstream_exports,
+        );
+        // #1894 follow-up: cross-directory attribute-access shape check.
+        // Catches `orgs.account.bad_field` / `orgs.list_field.foo` where
+        // the downstream's `.field` chain doesn't fit the upstream's
+        // declared `TypeExpr`.
+        let attribute_access_errors =
+            carina_core::upstream_exports::check_upstream_state_attribute_access_shape_fallbacks(
+                &analysis,
+                &upstream_exports,
+            );
+        let subscript_errors = carina_core::upstream_exports::check_upstream_state_subscript_shapes(
+            &analysis,
+            &upstream_exports,
+        );
+        // The four upstream-ref shape/existence checks return distinct concrete types
+        // but share `UpstreamRefDiagnostic`. Chain them through the
+        // trait (`Display` supertrait gives the canonical
+        // `"location: message"` form — the per-type `Display` impl is
+        // the single source of truth) so adding another check is one
+        // extra `chain(...)`.
+        errors.extend(
+            field_errors
+                .iter()
+                .map(|e| e as &dyn UpstreamRefDiagnostic)
+                .chain(shape_errors.iter().map(|e| e as &dyn UpstreamRefDiagnostic))
+                .chain(
+                    attribute_access_errors
+                        .iter()
+                        .map(|e| e as &dyn UpstreamRefDiagnostic),
+                )
+                .chain(
+                    subscript_errors
+                        .iter()
+                        .map(|e| e as &dyn UpstreamRefDiagnostic),
+                )
+                .map(|e| AppError::Validation(e.to_string())),
+        );
     }
 
     match NonEmptyValidationErrors::try_from(errors) {

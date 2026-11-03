@@ -53,8 +53,8 @@ impl<B: BindingAddress> UnexpandedDependencyOperand<B> {
 ///
 /// Operand construction is parser-owned and always retains a location:
 ///
-/// ```compile_fail
-/// use carina_core::parser::{UnexpandedDependencies, UnexpandedDependencyOperand};
+/// ```compile_fail,E0599
+/// use carina_core::parser::UnexpandedDependencies;
 /// let _: UnexpandedDependencies = UnexpandedDependencies::new(vec![]);
 /// ```
 ///
@@ -63,18 +63,19 @@ impl<B: BindingAddress> UnexpandedDependencyOperand<B> {
 /// let _: UnexpandedDependencies = UnexpandedDependencies::from_located(vec![]);
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carina_core::parser::{UnexpandedDependencies, UnexpandedDependencyOperand};
 /// let mut dependencies: UnexpandedDependencies = Default::default();
-/// dependencies.push(UnexpandedDependencyOperand::BareBinding("arbitrary".into()));
+/// let operand: UnexpandedDependencyOperand = UnexpandedDependencyOperand::BareBinding("arbitrary".into());
+/// dependencies.push(operand);
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::parser::{RelativeBindingName, UnexpandedDependencies};
 /// let _: UnexpandedDependencies = vec![RelativeBindingName::new("arbitrary")].into();
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::parser::{RelativeBindingName, UnexpandedDependencies};
 /// let _: UnexpandedDependencies = [RelativeBindingName::new("arbitrary")].into_iter().collect();
 /// ```

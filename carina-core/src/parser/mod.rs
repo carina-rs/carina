@@ -3,9 +3,6 @@
 //! Convert DSL to AST using pest
 
 mod analysis;
-#[cfg(any(test, feature = "test-utils"))]
-#[doc(hidden)]
-pub mod analysis_test_support;
 pub use analysis::{
     AnalysisDependencyRef, AnalysisForRef, AnalysisItemKind, AnalysisReference,
     AnalysisResourceRef, AnalysisTree, AnalysisTreeDiagnostic, AnalysisTreeError,

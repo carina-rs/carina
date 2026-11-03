@@ -824,12 +824,19 @@ pub struct DirectoryParseResult {
 ///
 /// A consumer cannot attach arbitrary line numbers to a file:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0624
 /// use carina_core::{config_loader::DirectoryParseFailure, parser::ParseError};
-/// let _ = DirectoryParseFailure::Parse {
-///     location: "arbitrary.crn".into(), source_file: Some("arbitrary.crn".into()),
-///     error: Box::new(ParseError::InvalidExpression { line: 99, message: "error".into() }),
-/// }.diagnostic();
+/// let error = ParseError::InvalidExpression { line: 99, message: "error".into() };
+/// let _ = DirectoryParseFailure::from_parse_error(error);
+/// ```
+///
+/// The representation cannot be assembled by consumers either:
+///
+/// ```compile_fail,E0451
+/// use carina_core::config_loader::DirectoryParseFailure;
+/// fn fabricate() -> DirectoryParseFailure {
+///     DirectoryParseFailure { kind: todo!() }
+/// }
 /// ```
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]

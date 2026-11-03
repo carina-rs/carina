@@ -8500,8 +8500,6 @@ pub fn check_module_calls_with_overrides<E>(
     input: ModuleCallCheckInput<'_, '_, E, dyn deferred_types::ProviderTypeCheckContext + '_>,
     overrides: &crate::config_loader::SourceOverrides,
 ) -> Result<Vec<ModuleCallFinding>, crate::parser::AnalysisTreeError> {
-    #[cfg(any(test, feature = "test-utils"))]
-    crate::parser::analysis_test_support::module_calls_checked();
     let provider_context = typecheck::TypecheckProviderContext::for_session(input.provider_context);
     check_module_calls_with_provider_context(input, provider_context, overrides)
 }

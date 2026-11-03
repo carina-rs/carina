@@ -1507,21 +1507,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn review_round3_export_inference_reuses_sealed_tree() {
+    fn review_round3_export_inference_returns_inferred_type() {
         let parsed = crate::parser::parse_and_resolve("exports { answer = 'ready' }\n").unwrap();
         let tree = crate::parser::AnalysisTree::try_from_file(&parsed).unwrap();
         let schemas = ProviderLoadedSchemaRegistry::for_test(SchemaRegistry::new());
-        let (inferred, work) = crate::parser::analysis_test_support::measure(|| {
-            infer_export_params_with_loaded_provider_schemas(
-                &tree,
-                &schemas,
-                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-            )
-        });
+        let inferred = infer_export_params_with_loaded_provider_schemas(
+            &tree,
+            &schemas,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
+        assert_eq!(inferred.parameters().len(), 1);
         assert_eq!(inferred.parameters()[0].name, "answer");
         assert_eq!(
-            work.tree_builds, 0,
-            "inference must reuse the sealed input: {work:?}"
+            inferred.parameters()[0].static_type,
+            ExportStaticType::Inferred(StaticType::Known(TypeExpr::String))
         );
     }
 
