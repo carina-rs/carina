@@ -79,8 +79,9 @@ impl Document {
         let line_count = self.content.len_lines();
         let line_idx = (pos.line as usize).min(line_count.saturating_sub(1));
         let line_start = self.content.line_to_char(line_idx);
-        let line_len = self.content.line(line_idx).len_chars();
-        let col = (pos.character as usize).min(line_len);
+        let line = self.content.line(line_idx);
+        let col = crate::position::utf16_offset_to_char_offset(&line.to_string(), pos.character)
+            .unwrap_or_else(|| line.len_chars());
         line_start + col
     }
 
@@ -121,7 +122,7 @@ impl Document {
     /// Get the word at the given position
     pub fn word_at(&self, position: Position) -> Option<String> {
         let line = self.line_at(position.line)?;
-        let col = position.character as usize;
+        let col = crate::position::utf16_offset_to_char_offset(&line, position.character)?;
 
         let chars: Vec<char> = line.chars().collect();
 
@@ -155,6 +156,78 @@ fn is_word_char(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_4220_analysis_invariant_is_one_diagnostic_and_does_not_panic() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sibling.crn");
+        let source = "let item = mock.test.resource { name = 'live' }\n";
+        std::fs::write(&path, source).unwrap();
+        std::fs::write(directory.path().join("main.crn"), "invalid {{{").unwrap();
+        let mut document = Document::new_with_path(
+            source.to_string(),
+            path.clone(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        document.parsed.as_mut().unwrap().resources[0].declaration = Default::default();
+        let diagnostics = crate::diagnostics::DiagnosticEngine::without_loaded_provider_schemas(
+            carina_core::EnvironmentSnapshot::empty(),
+        )
+        .analyze(&document, Some(&path));
+        let failures: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("missing declaration provenance")
+            })
+            .collect();
+        assert_eq!(failures.len(), 1, "{diagnostics:#?}");
+        assert_eq!(failures[0].range, tower_lsp::lsp_types::Range::default());
+    }
+
+    #[test]
+    fn review_4220_named_analysis_invariant_belongs_only_to_its_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = directory.path().join("sibling.crn");
+        let other = directory.path().join("main.crn");
+        let source = "let item = mock.test.resource { name = 'live' }\n";
+        std::fs::write(&owner, source).unwrap();
+        std::fs::write(&other, "let unrelated = 'main'\n").unwrap();
+        std::fs::write(directory.path().join("broken.crn"), "invalid {{{").unwrap();
+        let context = Arc::new(ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        ));
+        let mut document =
+            Document::new_with_path(source.to_string(), owner.clone(), context.clone());
+        document.parsed.as_mut().unwrap().resources[0]
+            .attributes
+            .insert(
+                "missing_provenance".into(),
+                carina_core::resource::Value::Concrete(
+                    carina_core::resource::ConcreteValue::String("injected".into()),
+                ),
+            );
+        let mut other_document =
+            Document::new_with_path("let unrelated = 'main'\n".into(), other.clone(), context);
+        other_document.parsed = document.parsed.clone();
+        let engine = crate::diagnostics::DiagnosticEngine::without_loaded_provider_schemas(
+            carina_core::EnvironmentSnapshot::empty(),
+        );
+        for (document, path, expected) in [(&other_document, &other, 0), (&document, &owner, 1)] {
+            let diagnostics = engine.analyze(document, Some(path));
+            let findings: Vec<_> = diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.message.contains("missing")
+                        && diagnostic.message.contains("provenance")
+                })
+                .collect();
+            assert_eq!(findings.len(), expected, "{diagnostics:#?}");
+        }
+    }
 
     #[test]
     fn test_position_to_offset_beyond_last_line() {

@@ -556,7 +556,6 @@ pub struct SyntaxInventory<
     attribute_keys: Vec<AttributeKeyLocation>,
     providers: Vec<Located<ProviderDeclaration>>,
     upstream_sources: Vec<Located<B>>,
-    iterables: Vec<Located<String>>,
     configuration_blocks: Vec<Located<ConfigurationBlock>>,
     backend_keys: Vec<Located<String>>,
     anonymous_headers: Vec<DeclarationLocation>,
@@ -571,7 +570,6 @@ impl<B: crate::resource::BindingAddress> Default for SyntaxInventory<B> {
             attribute_keys: Vec::new(),
             providers: Vec::new(),
             upstream_sources: Vec::new(),
-            iterables: Vec::new(),
             configuration_blocks: Vec::new(),
             backend_keys: Vec::new(),
             anonymous_headers: Vec::new(),
@@ -611,16 +609,12 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
     pub fn upstream_sources(&self) -> &[Located<B>] {
         &self.upstream_sources
     }
-    pub fn for_iterables(&self) -> &[Located<String>] {
-        &self.iterables
-    }
     pub(crate) fn extend(&mut self, other: Self) {
         self.declarations.extend(other.declarations);
         self.type_annotations.extend(other.type_annotations);
         self.attribute_keys.extend(other.attribute_keys);
         self.providers.extend(other.providers);
         self.upstream_sources.extend(other.upstream_sources);
-        self.iterables.extend(other.iterables);
         self.configuration_blocks.extend(other.configuration_blocks);
         self.backend_keys.extend(other.backend_keys);
         self.anonymous_headers.extend(other.anonymous_headers);
@@ -636,7 +630,6 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
             type_annotations: self.type_annotations,
             attribute_keys: self.attribute_keys,
             providers: self.providers,
-            iterables: self.iterables,
             configuration_blocks: self.configuration_blocks,
             backend_keys: self.backend_keys,
             anonymous_headers: self.anonymous_headers,
@@ -820,12 +813,6 @@ impl SyntaxInventory {
             }
         }
         for pair in pairs.flatten() {
-            if pair.as_rule() == Rule::for_iterable {
-                out.iterables.push(Located::new(
-                    DeclarationLocation::from_pair(&pair, file, source),
-                    pair.as_str().trim().to_string(),
-                ));
-            }
             if pair.as_rule() == Rule::let_binding {
                 let mut inner = pair.into_inner();
                 let binding = inner.next().expect("let name").as_str().to_string();

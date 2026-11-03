@@ -1,33 +1,50 @@
-//! Utility functions for converting between byte offsets and character offsets.
-//!
-//! LSP protocol positions use UTF-16 code units by default. For characters in the Basic
-//! Multilingual Plane (including ASCII, Japanese, most common non-ASCII), UTF-16 code unit
-//! count equals Unicode codepoint count. These functions use codepoint counting
-//! (`chars().count()`), which is correct for all BMP characters and sufficient for Carina
-//! DSL content.
+//! Conversion from UTF-8 byte offsets to LSP's default UTF-16 code units.
 
-/// Convert a byte offset within a string to a character (codepoint) offset.
+/// Convert a byte offset within a string to a UTF-16 code-unit offset.
 ///
 /// # Panics
 /// Panics if `byte_offset` is not on a character boundary or exceeds the string length.
 pub fn byte_offset_to_char_offset(s: &str, byte_offset: usize) -> u32 {
-    s[..byte_offset].chars().count() as u32
+    s[..byte_offset].encode_utf16().count() as u32
 }
 
-/// Return the character count (not byte length) of a string.
+/// Return the UTF-16 code-unit count of a string.
 pub fn char_len(s: &str) -> u32 {
-    s.chars().count() as u32
+    s.encode_utf16().count() as u32
+}
+
+/// Convert an internal Unicode-scalar index to an LSP column.
+pub fn char_offset_to_utf16_offset(s: &str, offset: usize) -> u32 {
+    offset as u32
+        + s.chars()
+            .take(offset)
+            .map(|ch| ch.len_utf16() as u32 - 1)
+            .sum::<u32>()
+}
+
+/// Convert an LSP column to a Unicode-scalar index without splitting a surrogate pair.
+pub fn utf16_offset_to_char_offset(s: &str, offset: u32) -> Option<usize> {
+    let mut units = 0;
+    let mut count = 0;
+    for ch in s.chars() {
+        if units == offset {
+            return Some(count);
+        }
+        units += ch.len_utf16() as u32;
+        count += 1;
+        if units > offset {
+            return None;
+        }
+    }
+    (units == offset).then_some(count)
 }
 
 /// Calculate the character offset of leading whitespace in a line.
 ///
-/// Since leading whitespace consists only of ASCII spaces and tabs,
-/// the byte length equals the character count. This function uses
-/// byte arithmetic but is safe because whitespace is always ASCII.
+/// Measure the leading whitespace using the same UTF-16 units as other columns.
 pub fn leading_whitespace_chars(line: &str) -> u32 {
     let trimmed = line.trim_start();
-    // Leading whitespace is ASCII (spaces/tabs), so byte count == char count
-    (line.len() - trimmed.len()) as u32
+    byte_offset_to_char_offset(line, line.len() - trimmed.len())
 }
 
 #[cfg(test)]

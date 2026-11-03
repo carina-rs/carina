@@ -3150,21 +3150,26 @@ pub fn validate_user_function_ref_types_with_bindings<
     validate_user_function_ref_types_inner(parsed, bindings, UnknownReferencePolicy::Report)
 }
 
-fn validate_user_function_ref_types_inner<
-    E: crate::parser::ExportParamLike,
-    D: crate::parser::DeferredForPhaseTraversal,
->(
-    parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
-    bindings: &BindingIndex<'_>,
-    unknown_policy: UnknownReferencePolicy,
-) -> Result<(), String> {
-    fn check_refs(
+mod user_function_refs {
+    use super::*;
+    pub(super) enum FunctionRefFinding {
+        Reference(crate::resource::AccessPath<RelativeBindingName>, String),
+        Boundary(String),
+    }
+    impl FunctionRefFinding {
+        pub(super) fn into_message(self) -> String {
+            match self {
+                Self::Reference(_, message) | Self::Boundary(message) => message,
+            }
+        }
+    }
+    pub(super) fn check_refs(
         value: &Value,
         sink: Option<RefSink<'_>>,
         context: &str,
         bindings: &BindingIndex<'_>,
         unknown_policy: UnknownReferencePolicy,
-        errors: &mut Vec<String>,
+        errors: &mut Vec<FunctionRefFinding>,
     ) {
         visit_refs_with_sink(value, sink, &mut |path, sink, usage, _candidate| {
             let Some(sink) = sink else {
@@ -3198,7 +3203,14 @@ fn validate_user_function_ref_types_inner<
                     format!("{context}: {reason}")
                 }
             };
-            errors.push(message);
+            errors.push(match path {
+                ReferencePathRef::Access(path) => {
+                    FunctionRefFinding::Reference(path.clone(), message)
+                }
+                ReferencePathRef::Binding(_) | ReferencePathRef::BindingAccess { .. } => {
+                    FunctionRefFinding::Boundary(message)
+                }
+            });
         });
     }
 
@@ -3269,13 +3281,13 @@ fn validate_user_function_ref_types_inner<
         }
     }
 
-    fn check_function_calls(
+    pub(super) fn check_function_calls(
         value: &Value,
         result_sink: Option<&TypeExpr>,
         context: Option<&str>,
         bindings: &BindingIndex<'_>,
         unknown_policy: UnknownReferencePolicy,
-        errors: &mut Vec<String>,
+        errors: &mut Vec<FunctionRefFinding>,
     ) {
         fn check_call(
             name: &str,
@@ -3284,18 +3296,18 @@ fn validate_user_function_ref_types_inner<
             result_context: Option<(&TypeExpr, &str)>,
             bindings: &BindingIndex<'_>,
             unknown_policy: UnknownReferencePolicy,
-            errors: &mut Vec<String>,
+            errors: &mut Vec<FunctionRefFinding>,
         ) {
             if let (Some(source), Some((sink, context))) = (
                 function.and_then(|function| function.return_type.as_ref()),
                 result_context,
             ) {
                 match declared_result_mismatch(source, sink, bindings) {
-                    Ok(Some((expected, actual))) => errors.push(format!(
+                    Ok(Some((expected, actual))) => errors.push(FunctionRefFinding::Boundary(format!(
                         "{context}: expected {expected}, got {actual} (from function '{name}' return type)"
-                    )),
+                    ))),
                     Ok(None) => {},
-                    Err(error) => errors.push(format!("{context}: function '{name}' return type: {error}")),
+                    Err(error) => errors.push(FunctionRefFinding::Boundary(format!("{context}: function '{name}' return type: {error}"))),
                 }
             }
             for (index, argument) in args.iter().enumerate() {
@@ -3499,7 +3511,67 @@ fn validate_user_function_ref_types_inner<
             | crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(_)) => {}
         }
     }
+}
 
+/// Function boundary findings use the exact reference occurrence recorded by the parser.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{parser::ParsedFile, binding_index::BindingIndex, validation::user_function_reference_diagnostics};
+/// fn analyze(file: &ParsedFile, bindings: &BindingIndex<'_>) {
+///     user_function_reference_diagnostics(file, bindings);
+/// }
+/// ```
+pub fn user_function_reference_diagnostics(
+    tree: &crate::parser::AnalysisTree<'_>,
+    bindings: &BindingIndex<'_>,
+) -> Vec<crate::parser::Located<String>> {
+    use user_function_refs::{FunctionRefFinding, check_function_calls, check_refs};
+    let mut diagnostics = Vec::new();
+    tree.visit_function_values(&mut |input| {
+        let value = input.value;
+        let expected = input.expected;
+        let context = input.context.as_deref();
+        let mut findings = Vec::new();
+        if input.check_return {
+            check_refs(
+                value,
+                expected.map(RefSink::TypeExpr),
+                context.expect("function return context"),
+                bindings,
+                UnknownReferencePolicy::Report,
+                &mut findings,
+            );
+        }
+        check_function_calls(
+            value,
+            expected,
+            context,
+            bindings,
+            UnknownReferencePolicy::Report,
+            &mut findings,
+        );
+        for finding in findings {
+            let (location, message) = match finding {
+                FunctionRefFinding::Reference(path, message) => {
+                    (tree.reference_for_path(&path).location().clone(), message)
+                }
+                FunctionRefFinding::Boundary(message) => (input.location().clone(), message),
+            };
+            diagnostics.push(crate::parser::Located::new(location, message));
+        }
+    });
+    diagnostics
+}
+
+fn validate_user_function_ref_types_inner<
+    E: crate::parser::ExportParamLike,
+    D: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
+    bindings: &BindingIndex<'_>,
+    unknown_policy: UnknownReferencePolicy,
+) -> Result<(), String> {
+    use user_function_refs::{check_function_calls, check_refs};
     let mut errors = Vec::new();
 
     // Calls can appear in any value-bearing top-level construct. Ordinary
@@ -3630,7 +3702,11 @@ fn validate_user_function_ref_types_inner<
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(errors.join("\n"))
+        Err(errors
+            .into_iter()
+            .map(user_function_refs::FunctionRefFinding::into_message)
+            .collect::<Vec<_>>()
+            .join("\n"))
     }
 }
 
@@ -6998,7 +7074,6 @@ impl ModuleCallFinding {
         kind: ModuleCallFindingKind,
         owner: ModuleCallFindingOwner,
         call: &ModuleCallId,
-        _value_span: SourceSpan,
         message: ModuleCallFindingMessage,
         identity: Option<ModuleCallFindingIdentity>,
     ) -> Self {
@@ -7056,17 +7131,9 @@ impl ModuleCallFinding {
         call_label: &str,
         identity: ModuleCallReferenceIdentity,
         owner: ModuleCallFindingOwner,
-        value_span: SourceSpan,
     ) -> Self {
         let display_path = identity.path.clone();
-        Self::reference_type_with_display_path(
-            call_label,
-            identity,
-            display_path,
-            owner,
-            value_span,
-            false,
-        )
+        Self::reference_type_with_display_path(call_label, identity, display_path, owner, false)
     }
 
     fn reference_type_with_display_path(
@@ -7074,7 +7141,6 @@ impl ModuleCallFinding {
         identity: ModuleCallReferenceIdentity,
         display_path: ModuleCallDiagnosticPath,
         owner: ModuleCallFindingOwner,
-        value_span: SourceSpan,
         declared_constraint: bool,
     ) -> Self {
         let call = identity.call.clone();
@@ -7082,7 +7148,6 @@ impl ModuleCallFinding {
             ModuleCallFindingKind::ReferenceType,
             owner,
             &call,
-            value_span,
             ModuleCallFindingMessage::ReferenceType(Box::new(ModuleCallReferenceDiagnostic {
                 call_label: call_label.to_string(),
                 identity: identity.clone(),
@@ -7097,7 +7162,6 @@ impl ModuleCallFinding {
         call_label: &str,
         call: &ModuleCallId,
         argument: &str,
-        value_span: SourceSpan,
         finding: &BindingUseFinding,
         owner: ModuleCallFindingOwner,
     ) -> Self {
@@ -7130,7 +7194,6 @@ impl ModuleCallFinding {
                     },
                     error.path.clone(),
                     owner,
-                    value_span,
                     error.declared_constraint,
                 );
             }
@@ -7150,7 +7213,6 @@ impl ModuleCallFinding {
             kind,
             owner,
             call,
-            value_span,
             message,
             Some(ModuleCallFindingIdentity::BindingUse {
                 call: call.clone(),
@@ -7185,19 +7247,14 @@ impl ModuleCallFinding {
         &self.owners
     }
 
-    pub fn diagnostics_for_file(
-        &self,
-        file: &std::path::Path,
-    ) -> Vec<crate::parser::Located<&Self>> {
-        let mut locations = Vec::new();
-        if self.anchor.location().file().path() == file {
-            locations.push(self.anchor.location().clone());
-        } else {
-            for owner in &self.owners {
-                let location = owner.root.location();
-                if location.file().path() == file && !locations.contains(location) {
-                    locations.push(location.clone());
-                }
+    pub fn diagnostics(&self) -> Vec<crate::parser::Located<&Self>> {
+        let mut locations = vec![self.anchor.location().clone()];
+        for owner in &self.owners {
+            let location = owner.root.location();
+            // The primary anchor represents this file. Additional root-call
+            // owners retain diagnostics for callers in other files.
+            if location.file() != self.anchor.location().file() && !locations.contains(location) {
+                locations.push(location.clone());
             }
         }
         locations
@@ -7306,6 +7363,7 @@ pub enum ExpandedModuleCallCheckInput<'a, 'bindings, P: PlaceholderKind = Parser
 }
 
 struct ModuleCallChecker<'a> {
+    source_overrides: crate::config_loader::SourceOverrides,
     provider_context: typecheck::TypecheckProviderContext<'a>,
     schemas: &'a SchemaRegistry,
     findings: Vec<ModuleCallFinding>,
@@ -7473,7 +7531,7 @@ impl ModuleCallChecker<'_> {
             let crate::parser::BindingUseOwner::ModuleArgument {
                 call: finding_call,
                 argument,
-                value_span,
+                value_span: _,
             } = &finding.use_site.owner
             else {
                 continue;
@@ -7486,7 +7544,6 @@ impl ModuleCallChecker<'_> {
                 &module_call_label(call),
                 finding_call,
                 argument,
-                *value_span,
                 finding,
                 owner,
             );
@@ -7498,7 +7555,6 @@ impl ModuleCallChecker<'_> {
         call_label: &str,
         call: &ModuleCallId,
         argument: &str,
-        value_span: SourceSpan,
         finding: &BindingUseFinding,
         owner: &ModuleCallFindingOwner,
     ) {
@@ -7506,7 +7562,6 @@ impl ModuleCallChecker<'_> {
             call_label,
             call,
             argument,
-            value_span,
             finding,
             owner.clone(),
         ));
@@ -7626,7 +7681,6 @@ impl ModuleCallChecker<'_> {
                         ModuleCallFindingKind::HandleSink,
                         owner.clone(),
                         authored_call.id(),
-                        authored.value_span(),
                         ModuleCallFindingMessage::HandleSink {
                             call_label: call_label.clone(),
                             argument: argument.to_string(),
@@ -7689,7 +7743,6 @@ impl ModuleCallChecker<'_> {
                     ModuleCallFindingKind::HandleSink,
                     owner.clone(),
                     authored_call.id(),
-                    authored.value_span(),
                     ModuleCallFindingMessage::HandleSink {
                         call_label: call_label.clone(),
                         argument: argument.to_string(),
@@ -7721,7 +7774,6 @@ impl ModuleCallChecker<'_> {
                     ModuleCallFindingKind::ValueType,
                     owner.clone(),
                     authored_call.id(),
-                    authored.value_span(),
                     ModuleCallFindingMessage::ValueType {
                         call_label: call_label.clone(),
                         argument: argument.to_string(),
@@ -7812,16 +7864,10 @@ impl ModuleCallChecker<'_> {
             {
                 continue;
             }
-            let argument_span = authored_call
-                .arguments_with_source_spans()
-                .find(|argument| argument.name() == error.identity.argument)
-                .map(|argument| argument.value_span())
-                .unwrap_or(error.argument_span);
             self.push_finding(ModuleCallFinding::reference_type(
                 &module_call_label(authored_call),
                 error.identity,
                 owner.clone(),
-                argument_span,
             ));
         }
     }
@@ -7866,12 +7912,13 @@ impl ModuleCallChecker<'_> {
         // typed resolver below own the error. The strict expansion pass still
         // rejects the same declaration; its parser backstop is deduplicated
         // against this source-anchored finding.
-        if let Some(mut module) = crate::module_resolver::load_module_with_config(
+        if let Some(mut module) = crate::module_resolver::loader::load_module_with_overrides(
             &module_dir,
             self.provider_context.as_provider_context(),
+            &self.source_overrides,
         )
         .or_else(|| {
-            crate::module_resolver::load_module(
+            crate::module_resolver::loader::load_module_with_overrides(
                 &module_dir,
                 &ProviderContext::new(
                     self.provider_context
@@ -7879,6 +7926,7 @@ impl ModuleCallChecker<'_> {
                         .environment
                         .clone(),
                 ),
+                &self.source_overrides,
             )
         }) {
             let resolution_errors = resolve_file_type_exprs(
@@ -7887,10 +7935,11 @@ impl ModuleCallChecker<'_> {
                     .session()
                     .expect("module checks borrow their run session"),
             );
-            let signatures = crate::module_resolver::load_resolved_module_signatures(
+            let signatures = crate::module_resolver::load_resolved_module_signatures_with_overrides(
                 &module,
                 &module_dir,
                 self.provider_context.as_provider_context(),
+                &self.source_overrides,
             );
             let bindings = BindingIndex::from_parsed_with_module_signatures(
                 &module,
@@ -7958,7 +8007,7 @@ impl ModuleCallChecker<'_> {
             let root = call_path.root();
             let immediate = call_path.immediate();
             for (argument_name, argument) in &composition.signature.arguments {
-                let (declared_type, origin) = argument.validation_metadata();
+                let (declared_type, _) = argument.validation_metadata();
                 let Some(TypeExpr::Ref(expected)) = declared_type.known() else {
                     continue;
                 };
@@ -8019,13 +8068,6 @@ impl ModuleCallChecker<'_> {
                 let Some(error) = error else {
                     continue;
                 };
-                let value_span = match origin {
-                    crate::parser::ArgumentOrigin::Authored {
-                        key_span: _key_span,
-                        value_span,
-                    } => value_span,
-                    crate::parser::ArgumentOrigin::Defaulted => immediate.id.call_span(),
-                };
                 self.push_finding(ModuleCallFinding::argument_value(
                     ModuleCallFindingKind::HandleSink,
                     ModuleCallFindingOwner {
@@ -8033,7 +8075,6 @@ impl ModuleCallChecker<'_> {
                         immediate: ModuleCallFindingOwnerSource::ModuleCall(immediate.id.clone()),
                     },
                     &immediate.id,
-                    value_span,
                     ModuleCallFindingMessage::HandleSink {
                         call_label: immediate.display_label(),
                         argument: argument_name.clone(),
@@ -8049,13 +8090,6 @@ impl ModuleCallChecker<'_> {
                 CompositionRefError::ModuleCall(error) => {
                     let root = error.call_path.root();
                     let immediate = error.call_path.immediate();
-                    let span = match *error.origin {
-                        crate::parser::ArgumentOrigin::Authored {
-                            key_span: _key_span,
-                            value_span,
-                        } => value_span,
-                        crate::parser::ArgumentOrigin::Defaulted => immediate.id.call_span(),
-                    };
                     let display_path = ModuleCallDiagnosticPath::Expanded(error.path.clone());
                     self.push_finding(ModuleCallFinding::reference_type_with_display_path(
                         &immediate.display_label(),
@@ -8074,7 +8108,6 @@ impl ModuleCallChecker<'_> {
                                 immediate.id.clone(),
                             ),
                         },
-                        span,
                         false,
                     ));
                 }
@@ -8115,7 +8148,7 @@ impl ModuleCallChecker<'_> {
             let crate::parser::BindingUseOwner::ModuleArgument {
                 call,
                 argument,
-                value_span,
+                value_span: _,
             } = &finding.use_site.owner
             else {
                 continue;
@@ -8143,14 +8176,7 @@ impl ModuleCallChecker<'_> {
                 ));
             }
             for (owner, call_label) in owners {
-                self.push_binding_use_finding(
-                    &call_label,
-                    call,
-                    argument,
-                    *value_span,
-                    finding,
-                    &owner,
-                );
+                self.push_binding_use_finding(&call_label, call, argument, finding, &owner);
             }
         }
     }
@@ -8169,18 +8195,12 @@ impl ModuleCallChecker<'_> {
                 else {
                     continue;
                 };
-                let argument_value_span = match origin {
+                let authored_argument = matches!(
+                    origin,
                     crate::module_resolver::ResolvedModuleConstraintOrigin::Argument(
-                        crate::parser::ArgumentOrigin::Authored {
-                            key_span: _key_span,
-                            value_span,
-                        },
-                    ) => Some(*value_span),
-                    crate::module_resolver::ResolvedModuleConstraintOrigin::Argument(
-                        crate::parser::ArgumentOrigin::Defaulted,
+                        crate::parser::ArgumentOrigin::Authored { .. }
                     )
-                    | crate::module_resolver::ResolvedModuleConstraintOrigin::Call => None,
-                };
+                );
                 let mut owners = compositions
                     .iter()
                     .filter_map(|composition| {
@@ -8209,16 +8229,15 @@ impl ModuleCallChecker<'_> {
                 }
                 for owner in owners {
                     let message = ModuleCallFindingMessage::Constraint(diagnostic.clone());
-                    match argument_value_span {
-                        Some(value_span) => self.push_finding(ModuleCallFinding::argument_value(
+                    match authored_argument {
+                        true => self.push_finding(ModuleCallFinding::argument_value(
                             ModuleCallFindingKind::Constraint,
                             owner,
                             &report.source.id,
-                            value_span,
                             message,
                             None,
                         )),
-                        None => self.push(
+                        false => self.push(
                             ModuleCallFindingKind::Constraint,
                             owner,
                             ModuleCallFindingAnchor::new(
@@ -8338,8 +8357,15 @@ fn module_call_value_is_context_free(value: &Value) -> bool {
 pub fn check_module_calls<E>(
     input: ModuleCallCheckInput<'_, '_, E, dyn deferred_types::ProviderTypeCheckContext + '_>,
 ) -> Vec<ModuleCallFinding> {
+    check_module_calls_with_overrides(input, &Default::default())
+}
+
+pub fn check_module_calls_with_overrides<E>(
+    input: ModuleCallCheckInput<'_, '_, E, dyn deferred_types::ProviderTypeCheckContext + '_>,
+    overrides: &crate::config_loader::SourceOverrides,
+) -> Vec<ModuleCallFinding> {
     let provider_context = typecheck::TypecheckProviderContext::for_session(input.provider_context);
-    check_module_calls_with_provider_context(input, provider_context)
+    check_module_calls_with_provider_context(input, provider_context, overrides)
 }
 
 /// Providerless module-call diagnostics for bootstrap and orphan-editor
@@ -8349,12 +8375,13 @@ pub fn check_module_calls_providerless<E>(
     input: ModuleCallCheckInput<'_, '_, E, dyn deferred_types::ProviderTypeCheckContext + '_>,
 ) -> Vec<ModuleCallFinding> {
     let provider_context = typecheck::TypecheckProviderContext::for_session(input.provider_context);
-    check_module_calls_with_provider_context(input, provider_context)
+    check_module_calls_with_provider_context(input, provider_context, &Default::default())
 }
 
 fn check_module_calls_with_provider_context<'a, 'bindings, E, C: ?Sized>(
     input: ModuleCallCheckInput<'a, 'bindings, E, C>,
     provider_context: typecheck::TypecheckProviderContext<'a>,
+    overrides: &crate::config_loader::SourceOverrides,
 ) -> Vec<ModuleCallFinding> {
     let ModuleCallCheckInput {
         authored,
@@ -8368,6 +8395,7 @@ fn check_module_calls_with_provider_context<'a, 'bindings, E, C: ?Sized>(
         reference_checks,
     } = input;
     let mut checker = ModuleCallChecker {
+        source_overrides: overrides.clone(),
         provider_context,
         schemas,
         findings: Vec::new(),
@@ -8394,7 +8422,9 @@ pub fn check_expanded_module_calls<P: PlaceholderKind>(
     provider_context: &ProviderContext,
 ) -> Vec<ModuleCallFinding> {
     let schemas = SchemaRegistry::new();
+    let overrides = Default::default();
     let mut checker = ModuleCallChecker {
+        source_overrides: overrides,
         provider_context: typecheck::TypecheckProviderContext::providerless(provider_context),
         schemas: &schemas,
         findings: Vec::new(),

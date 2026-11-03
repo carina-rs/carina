@@ -539,13 +539,18 @@ pub(crate) fn validate_and_resolve_errors_inner(
                 .into_iter()
                 .map(|error| AppError::Config(error.to_string())),
         );
+    }
+    if !skip_resource_validation {
         match carina_core::parser::AnalysisTree::try_from_file(parsed.parsed()) {
             Ok(tree) => errors.extend(
                 carina_core::parser::check_provider_instance_routing(&tree)
                     .into_iter()
                     .map(|diagnostic| AppError::ProviderRouting(Box::new(diagnostic))),
             ),
-            Err(error) => errors.push(AppError::AnalysisInvariant(error)),
+            Err(error) => {
+                errors.push(AppError::AnalysisInvariant(error));
+                return Err(non_empty_validation_failure(errors));
+            }
         }
     }
 
@@ -698,10 +703,15 @@ pub(crate) fn validate_and_resolve_errors_inner(
         // failures. The per-argument report preserves every sound result even
         // when expansion cannot proceed to the final graph check.
         if !skip_resource_validation {
-            errors.extend(validate_depends_on_with_ctx(
-                parsed.parsed(),
-                &resolved_argument_types,
-            ));
+            // Resolution mutated the authored input. Seal this stage only on
+            // the early-error path; success uses the shared expanded tree.
+            match carina_core::parser::AnalysisTree::try_from_file(parsed.parsed()) {
+                Ok(tree) => errors.extend(validate_depends_on_with_ctx(
+                    &tree,
+                    &resolved_argument_types,
+                )),
+                Err(error) => errors.push(AppError::AnalysisInvariant(error)),
+            }
         }
         extend_module_call_errors(&mut errors, authored_module_call_findings);
         return Err(non_empty_validation_failure(errors));
@@ -848,7 +858,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
         return Err(non_empty_validation_failure(errors));
     }
 
-    let (upstream_exports, upstream_resolve_errors) = if !skip_resource_validation {
+    let expanded_analysis = if !skip_resource_validation {
         let analysis = match carina_core::parser::AnalysisTree::try_from_file(parsed) {
             Ok(tree) => tree,
             Err(error) => {
@@ -857,9 +867,14 @@ pub(crate) fn validate_and_resolve_errors_inner(
             }
         };
 
+        Some(analysis)
+    } else {
+        None
+    };
+    let (upstream_exports, upstream_resolve_errors) = if let Some(analysis) = &expanded_analysis {
         carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
             base_dir,
-            &analysis,
+            analysis,
             enriched_context,
             Some(ctx.schemas()),
         )
@@ -881,18 +896,18 @@ pub(crate) fn validate_and_resolve_errors_inner(
         errors.extend(ref_errors.into_iter().map(AppError::from));
     }
 
-    if !skip_resource_validation {
+    if let Some(analysis) = &expanded_analysis {
         errors.extend(validate_resources_with_ctx(
             ctx,
             parsed,
             enriched_context.catalog(),
         ));
         errors.extend(validate_depends_on_with_ctx(
-            parsed,
+            analysis,
             &resolved_argument_types,
         ));
-        errors.extend(validate_wait_bindings_with_ctx(ctx, parsed));
-        errors.extend(validate_deferred_populate_refs_with_ctx(ctx, parsed));
+        errors.extend(validate_wait_bindings_with_ctx(ctx, analysis));
+        errors.extend(validate_deferred_populate_refs_with_ctx(ctx, analysis));
         errors.extend(
             upstream_resolve_errors
                 .iter()
@@ -948,6 +963,64 @@ pub(crate) fn validate_and_resolve_errors_inner(
         }
     }
 
+    // Reject references to `upstream_state` fields that the upstream's
+    // `exports { }` block does not declare. Gated like the other
+    // validations above so `destroy` / `state` (which pass
+    // `skip_resource_validation = true`) can still run when an upstream
+    // has drifted — those commands are the recovery path for exactly
+    // that situation. No state I/O: we parse the upstream's `.crn`
+    // files directly.
+    if let Some(analysis) = &expanded_analysis {
+        let field_errors =
+            carina_core::upstream_exports::check_upstream_state_untyped_field_references(
+                analysis,
+                &upstream_exports,
+            );
+        // #1894 (option 2): cross-directory `for`-iterable shape check.
+        // Surfaces pending `list ↔ map` migrations in the upstream's
+        // `exports.crn` before they hit apply.
+        let shape_errors = carina_core::upstream_exports::check_upstream_state_for_iterable_shapes(
+            analysis,
+            &upstream_exports,
+        );
+        // #1894 follow-up: cross-directory attribute-access shape check.
+        // Catches `orgs.account.bad_field` / `orgs.list_field.foo` where
+        // the downstream's `.field` chain doesn't fit the upstream's
+        // declared `TypeExpr`.
+        let attribute_access_errors =
+            carina_core::upstream_exports::check_upstream_state_attribute_access_shape_fallbacks(
+                analysis,
+                &upstream_exports,
+            );
+        let subscript_errors = carina_core::upstream_exports::check_upstream_state_subscript_shapes(
+            analysis,
+            &upstream_exports,
+        );
+        // The four upstream-ref shape/existence checks return distinct concrete types
+        // but share `UpstreamRefDiagnostic`. Chain them through the
+        // trait (`Display` supertrait gives the canonical
+        // `"location: message"` form — the per-type `Display` impl is
+        // the single source of truth) so adding another check is one
+        // extra `chain(...)`.
+        errors.extend(
+            field_errors
+                .iter()
+                .map(|e| e as &dyn UpstreamRefDiagnostic)
+                .chain(shape_errors.iter().map(|e| e as &dyn UpstreamRefDiagnostic))
+                .chain(
+                    attribute_access_errors
+                        .iter()
+                        .map(|e| e as &dyn UpstreamRefDiagnostic),
+                )
+                .chain(
+                    subscript_errors
+                        .iter()
+                        .map(|e| e as &dyn UpstreamRefDiagnostic),
+                )
+                .map(|e| AppError::Validation(e.to_string())),
+        );
+    }
+
     let identity_conflict_policy = if skip_resource_validation {
         carina_core::identifier::AnonymousIdentityConflictPolicy::RepresentabilityOnly
     } else {
@@ -974,72 +1047,6 @@ pub(crate) fn validate_and_resolve_errors_inner(
     // identity or move-target error must stop the pipeline here.
     if !errors.is_empty() {
         return Err(non_empty_validation_failure(errors));
-    }
-
-    // Reject references to `upstream_state` fields that the upstream's
-    // `exports { }` block does not declare. Gated like the other
-    // validations above so `destroy` / `state` (which pass
-    // `skip_resource_validation = true`) can still run when an upstream
-    // has drifted — those commands are the recovery path for exactly
-    // that situation. No state I/O: we parse the upstream's `.crn`
-    // files directly.
-    if !skip_resource_validation {
-        let analysis = match carina_core::parser::AnalysisTree::try_from_file(parsed) {
-            Ok(tree) => tree,
-            Err(error) => {
-                errors.push(AppError::AnalysisInvariant(error));
-                return Err(non_empty_validation_failure(errors));
-            }
-        };
-
-        let field_errors =
-            carina_core::upstream_exports::check_upstream_state_untyped_field_references(
-                &analysis,
-                &upstream_exports,
-            );
-        // #1894 (option 2): cross-directory `for`-iterable shape check.
-        // Surfaces pending `list ↔ map` migrations in the upstream's
-        // `exports.crn` before they hit apply.
-        let shape_errors = carina_core::upstream_exports::check_upstream_state_for_iterable_shapes(
-            &analysis,
-            &upstream_exports,
-        );
-        // #1894 follow-up: cross-directory attribute-access shape check.
-        // Catches `orgs.account.bad_field` / `orgs.list_field.foo` where
-        // the downstream's `.field` chain doesn't fit the upstream's
-        // declared `TypeExpr`.
-        let attribute_access_errors =
-            carina_core::upstream_exports::check_upstream_state_attribute_access_shape_fallbacks(
-                &analysis,
-                &upstream_exports,
-            );
-        let subscript_errors = carina_core::upstream_exports::check_upstream_state_subscript_shapes(
-            &analysis,
-            &upstream_exports,
-        );
-        // The four upstream-ref shape/existence checks return distinct concrete types
-        // but share `UpstreamRefDiagnostic`. Chain them through the
-        // trait (`Display` supertrait gives the canonical
-        // `"location: message"` form — the per-type `Display` impl is
-        // the single source of truth) so adding another check is one
-        // extra `chain(...)`.
-        errors.extend(
-            field_errors
-                .iter()
-                .map(|e| e as &dyn UpstreamRefDiagnostic)
-                .chain(shape_errors.iter().map(|e| e as &dyn UpstreamRefDiagnostic))
-                .chain(
-                    attribute_access_errors
-                        .iter()
-                        .map(|e| e as &dyn UpstreamRefDiagnostic),
-                )
-                .chain(
-                    subscript_errors
-                        .iter()
-                        .map(|e| e as &dyn UpstreamRefDiagnostic),
-                )
-                .map(|e| AppError::Validation(e.to_string())),
-        );
     }
 
     match NonEmptyValidationErrors::try_from(errors) {

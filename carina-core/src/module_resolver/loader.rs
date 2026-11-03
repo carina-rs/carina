@@ -41,20 +41,6 @@ pub fn load_module(path: &ResolvedPath, config: &ProviderContext) -> Option<Pars
     load_module_with_diagnostics(path, config).map(|loaded| loaded.parsed)
 }
 
-/// Load a module signature using the caller's provider catalog.
-///
-/// A dotted argument type is intentionally ambiguous during bootstrap: it can
-/// name either a provider value type or a managed-resource handle. Signature
-/// consumers that already own an enriched provider context must therefore use
-/// that context while parsing, or a valid bare handle in `depends_on` can be
-/// rejected before the signature is available to diagnose its call site.
-pub(crate) fn load_module_with_config(
-    path: &ResolvedPath,
-    config: &ProviderContext,
-) -> Option<ParsedFile> {
-    load_module(path, config)
-}
-
 /// Diagnostic-preserving variant of [`load_module`].
 pub fn load_module_with_diagnostics(
     path: &ResolvedPath,
@@ -64,7 +50,7 @@ pub fn load_module_with_diagnostics(
     if !path.is_dir() {
         return None;
     }
-    load_directory_module_with_diagnostics_and_config(&path, config)
+    load_directory_module_with_diagnostics_and_config(&path, config, &Default::default())
 }
 
 /// Collect `.crn` file paths directly inside `dir_path`, sorted by path.
@@ -89,17 +75,56 @@ pub fn load_directory_module(
     dir_path: &ResolvedPath,
     config: &ProviderContext,
 ) -> Option<ParsedFile> {
-    load_directory_module_with_diagnostics_and_config(dir_path, config).map(|loaded| loaded.parsed)
+    load_directory_module_with_diagnostics_and_config(dir_path, config, &Default::default())
+        .map(|loaded| loaded.parsed)
+}
+
+/// Load a module signature using the caller's provider catalog.
+///
+/// A dotted argument type is intentionally ambiguous during bootstrap: it can
+/// name either a provider value type or a managed-resource handle. Signature
+/// consumers that already own an enriched provider context must therefore use
+/// that context while parsing, or a valid bare handle in `depends_on` can be
+/// rejected before the signature is available to diagnose its call site.
+pub(crate) fn load_module_with_overrides(
+    path: &ResolvedPath,
+    config: &ProviderContext,
+    overrides: &crate::config_loader::SourceOverrides,
+) -> Option<ParsedFile> {
+    if !path.is_dir() {
+        return None;
+    }
+    load_directory_module_with_diagnostics_and_config(path, config, overrides)
+        .map(|loaded| loaded.parsed)
+}
+
+pub(super) fn source_paths_with_overrides(
+    dir: &ResolvedPath,
+    overrides: &crate::config_loader::SourceOverrides,
+) -> std::io::Result<Vec<ResolvedPath>> {
+    let mut paths = sorted_crn_paths_in(dir)?;
+    for name in crate::config_loader::directory_source_overrides(dir, overrides).keys() {
+        let path = dir.join(name)?;
+        if !paths
+            .iter()
+            .any(|existing| existing.identity() == path.identity())
+        {
+            paths.push(path);
+        }
+    }
+    paths.sort_by_key(ResolvedPath::source_label);
+    Ok(paths)
 }
 
 fn load_directory_module_with_diagnostics_and_config(
     dir_path: &ResolvedPath,
     config: &ProviderContext,
+    overrides: &crate::config_loader::SourceOverrides,
 ) -> Option<LoadedModule> {
-    let paths = sorted_crn_paths_in(dir_path).ok()?;
+    let paths = source_paths_with_overrides(dir_path, overrides).ok()?;
     let mut files: Vec<(PathBuf, String)> = Vec::with_capacity(paths.len());
     for path in paths {
-        if let Ok(content) = path.read_to_string() {
+        if let Ok(content) = crate::config_loader::read_source_with_overrides(&path, overrides) {
             files.push((path.source_label(), content));
         }
     }

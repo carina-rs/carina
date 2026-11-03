@@ -585,6 +585,40 @@ pub fn find_duplicate_declarations_in_parsed_file(
     duplicate_groups(occurrences)
 }
 
+/// In-memory source snapshots keyed by the edited file path.
+pub type SourceOverrides = HashMap<PathBuf, String>;
+
+/// Read the editor snapshot even when a module/upstream reaches it by an alias.
+pub(crate) fn read_source_with_overrides(
+    path: &ResolvedPath,
+    overrides: &SourceOverrides,
+) -> std::io::Result<String> {
+    for (source, text) in overrides {
+        if *source == path.source_label()
+            || ResolvedPath::new(source).is_ok_and(|source| source.identity() == path.identity())
+        {
+            return Ok(text.clone());
+        }
+    }
+    path.read_to_string()
+}
+
+pub(crate) fn directory_source_overrides(
+    dir: &ResolvedPath,
+    overrides: &SourceOverrides,
+) -> HashMap<String, String> {
+    overrides
+        .iter()
+        .filter_map(|(path, text)| {
+            let parent = ResolvedPath::new(path.parent()?).ok()?;
+            if parent.identity() != dir.identity() {
+                return None;
+            }
+            Some((path.file_name()?.to_str()?.to_owned(), text.clone()))
+        })
+        .collect()
+}
+
 /// Recover declaration multiplicity from syntax when a semantic parse fails.
 /// Files with invalid grammar keep their own parse failure; inventories from
 /// other files remain usable, including the current unsaved buffer.
@@ -604,7 +638,10 @@ pub fn find_duplicate_declarations_with_overrides(
         seen.insert(name.to_string());
         let source = match overrides.get(name.as_ref()) {
             Some(source) => source.clone(),
-            None => file.read_to_string().map_err(|error| error.to_string())?,
+            None => match file.read_to_string() {
+                Ok(source) => source,
+                Err(_) => continue,
+            },
         };
         if let Ok(inventory) = parser::parse_syntax_inventory(&source, &path) {
             collect_inventory_declarations(Path::new(name.as_ref()), &inventory, &mut occurrences);

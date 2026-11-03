@@ -19,6 +19,7 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::path::Path;
 
+#[cfg(test)]
 use crate::config_loader::parse_directory;
 use crate::parser::{AnalysisReference, AnalysisTree, Located, TypeExpr, UpstreamState};
 #[cfg(test)]
@@ -227,6 +228,25 @@ pub fn resolve_upstream_exports_with_schemas<D, B: BindingAddress>(
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
+    resolve_upstream_exports_with_schemas_and_overrides(
+        base_dir,
+        tree,
+        config,
+        schemas,
+        &Default::default(),
+    )
+}
+
+pub fn resolve_upstream_exports_with_schemas_and_overrides<D, B: BindingAddress>(
+    base_dir: &ResolvedPath,
+    tree: &UpstreamAnalysis<'_, D, B>,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    schemas: Option<&crate::schema::SchemaRegistry>,
+    overrides: &crate::config_loader::SourceOverrides,
+) -> (UpstreamExports<B>, Vec<Located<UpstreamResolveError>>)
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
     let mut exports = HashMap::new();
     let mut findings = Vec::new();
     for state in tree.upstream_states() {
@@ -235,6 +255,7 @@ where
             std::slice::from_ref(*state.detail()),
             config,
             schemas,
+            overrides,
         );
         exports.extend(resolved);
         findings.extend(
@@ -283,7 +304,14 @@ pub fn discover_upstream_exports<B: BindingAddress>(
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
 ) -> UpstreamExports<B> {
-    resolve_upstream_exports_with_context(base_dir, upstream_states, config, schemas).0
+    resolve_upstream_exports_with_context(
+        base_dir,
+        upstream_states,
+        config,
+        schemas,
+        &Default::default(),
+    )
+    .0
 }
 
 fn resolve_upstream_exports_with_context<B: BindingAddress>(
@@ -291,6 +319,7 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
     upstream_states: &[UpstreamState<B>],
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
+    overrides: &crate::config_loader::SourceOverrides,
 ) -> (UpstreamExports<B>, Vec<UpstreamResolveError>) {
     let provider_context =
         crate::validation::typecheck::TypecheckProviderContext::for_session(config);
@@ -315,7 +344,11 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
             out.insert(us.binding.clone(), HashMap::new());
             continue;
         }
-        match parse_directory(&source_abs, config.catalog()) {
+        match crate::config_loader::parse_directory_with_overrides(
+            &source_abs,
+            config.catalog(),
+            &crate::config_loader::directory_source_overrides(&source_abs, overrides),
+        ) {
             Ok(parsed) => {
                 let mut parsed = parsed.into_parsed();
                 // Normalize every consumer-visible declaration before module
@@ -344,6 +377,7 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
                         &source_abs,
                         config,
                         expansion_schemas,
+                        overrides,
                     ),
                     None => {
                         crate::module_resolver::resolve_upstream_modules_with_providerless_config(
@@ -351,6 +385,7 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
                             &source_abs,
                             config,
                             expansion_schemas,
+                            overrides,
                         )
                     }
                 };
@@ -1536,6 +1571,7 @@ mod tests {
                         &[upstream("up", "upstream")],
                         session,
                         schemas,
+                        &Default::default(),
                     )
                 });
             assert!(

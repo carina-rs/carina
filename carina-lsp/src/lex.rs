@@ -43,8 +43,8 @@ pub(crate) struct LexedLine {
     ends_in_line_comment: bool,
 }
 
-/// Code text with every lexer-classified non-code character replaced by one
-/// space. The private field keeps semantic-token walkers from accepting raw
+/// Code text with non-code characters replaced by spaces of equal UTF-16 width.
+/// The private field keeps semantic-token walkers from accepting raw
 /// source text by accident.
 pub(crate) struct MaskedCode(String);
 
@@ -55,6 +55,9 @@ impl MaskedCode {
 }
 
 impl LexedLine {
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
     pub(crate) fn chars(&self) -> &[ClassifiedChar] {
         &self.chars
     }
@@ -63,11 +66,10 @@ impl LexedLine {
         self.heredoc_body
     }
 
-    /// Replace every non-code character with one space. An interpolation's
+    /// Replace every non-code UTF-16 code unit with one space. An interpolation's
     /// MACRO token owns its complete range, so its otherwise-code-visible
-    /// interior is masked here as well. This preserves source character
-    /// positions (the unit used by LSP ranges), though replacing a non-ASCII
-    /// character intentionally does not preserve UTF-8 byte offsets.
+    /// interior is masked here as well. This preserves LSP columns, including
+    /// the two code units of non-BMP characters.
     pub(crate) fn masked_code(&self) -> MaskedCode {
         let heredoc_opener =
             carina_core::heredoc::find_heredoc_opener_range(&self.text).map(|range| {
@@ -81,16 +83,16 @@ impl LexedLine {
                 .chars()
                 .zip(&self.chars)
                 .enumerate()
-                .map(|(index, (ch, classified))| {
+                .flat_map(|(index, (ch, classified))| {
                     let inside_heredoc_opener =
                         heredoc_opener.is_some_and(|(start, end)| index >= start && index < end);
                     if classified.is_code_visible()
                         && !classified.is_inside_interpolation()
                         && !inside_heredoc_opener
                     {
-                        ch
+                        std::iter::repeat_n(ch, 1)
                     } else {
-                        ' '
+                        std::iter::repeat_n(' ', ch.len_utf16())
                     }
                 })
                 .collect(),

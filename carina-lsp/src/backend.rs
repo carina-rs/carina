@@ -27,7 +27,7 @@ pub fn document_end_position(text: &str) -> (u32, u32) {
     let last_char = text
         .lines()
         .last()
-        .map(|l| l.chars().count() as u32)
+        .map(crate::position::char_len)
         .unwrap_or(0);
     let last_char = if text.ends_with('\n') { 0 } else { last_char };
     (last_line, last_char)

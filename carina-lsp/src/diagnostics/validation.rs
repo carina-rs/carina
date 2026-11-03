@@ -127,16 +127,7 @@ impl DiagnosticEngine {
         } else {
             spans.block_header.unwrap_or(spans.value)
         };
-        Some(Range::new(
-            tower_lsp::lsp_types::Position::new(
-                (span.start_line() - 1) as u32,
-                (span.start_column() - 1) as u32,
-            ),
-            tower_lsp::lsp_types::Position::new(
-                (span.end_line() - 1) as u32,
-                (span.end_column() - 1) as u32,
-            ),
-        ))
+        super::parser_span_range(source.doc, span)
     }
 
     /// Walk a [`FieldPath`] across the source `doc` and return the

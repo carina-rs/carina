@@ -41,15 +41,8 @@ pub struct WaitDiagnostic {
     pub message: String,
     pub binding_name: String,
     pub target: String,
-    pub kind: WaitDiagnosticKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WaitDiagnosticKind {
-    Target,
-    Attribute,
-    RightHandSide,
-}
 impl std::fmt::Display for WaitDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
@@ -58,6 +51,13 @@ impl std::fmt::Display for WaitDiagnostic {
 
 /// Run all wait diagnostics against a parsed file + schema registry.
 /// Returns the full list of errors; callers decide how to surface them.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{parser::ParsedFile, schema::SchemaRegistry, validation::wait::validate_wait_bindings};
+/// fn analyze(file: &ParsedFile) {
+///     validate_wait_bindings(file, &SchemaRegistry::new());
+/// }
+/// ```
 pub fn validate_wait_bindings<D, B>(
     parsed: &AnalysisTree<
         '_,
@@ -116,7 +116,6 @@ where
                     ),
                     binding_name: wb.binding().as_str().to_string(),
                     target: wb.target().as_str().to_string(),
-                    kind: WaitDiagnosticKind::Target,
                 },
             ));
             continue;
@@ -146,7 +145,6 @@ where
                         message,
                         binding_name: wb.binding().as_str().to_string(),
                         target: wb.target().as_str().to_string(),
-                        kind: WaitDiagnosticKind::Target,
                     },
                 ));
                 continue;
@@ -164,10 +162,10 @@ where
             &wb.until_predicate().rhs,
             Some(schema.schema()),
         ) {
-            let (kind, location) = if error.rhs_anchor().is_some() {
-                (WaitDiagnosticKind::RightHandSide, wb.rhs_location())
+            let location = if error.rhs_anchor().is_some() {
+                wb.rhs_location()
             } else {
-                (WaitDiagnosticKind::Attribute, wb.lhs_location())
+                wb.lhs_location()
             };
             out.push(Located::new(
                 location.clone(),
@@ -175,7 +173,6 @@ where
                     message: format!("wait `{}`: {error}", wb.binding()),
                     binding_name: wb.binding().as_str().to_string(),
                     target: wb.target().as_str().to_string(),
-                    kind,
                 },
             ));
         }
@@ -460,7 +457,6 @@ let found = wait lookup {
                 message: "wait `found`: target binding `lookup` is a data source; wait targets must be managed resources".to_string(),
                 binding_name: "found".to_string(),
                 target: "lookup".to_string(),
-                kind: WaitDiagnosticKind::Target,
             }]
         );
     }

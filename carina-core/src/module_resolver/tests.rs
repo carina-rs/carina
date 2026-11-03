@@ -189,6 +189,7 @@ impl ModuleResolutionFixture {
                 .unwrap(),
                 session,
                 &crate::schema::SchemaRegistry::new(),
+                &Default::default(),
             )
         })
     }

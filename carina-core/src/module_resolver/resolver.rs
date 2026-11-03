@@ -21,7 +21,6 @@ use crate::schema::SchemaRegistry;
 
 use super::error::{ModuleError, ModuleErrorCallSource};
 use super::expander::instance_prefix_for_call;
-use super::loader::sorted_crn_paths_in;
 use super::validation::{ConstraintOrigin, ModuleConstraintDiagnostic};
 
 type ModuleResolvedValue = crate::resource::Value<ParserPlaceholder, AbsoluteBindingAddress>;
@@ -871,6 +870,7 @@ pub(crate) struct ModuleResolver<'cfg, P = StrictTypeResolution> {
     /// not change while recursively resolving nested module imports and is
     /// therefore the stable base for user-facing source labels.
     configuration_root: PathBuf,
+    source_overrides: crate::config_loader::SourceOverrides,
     /// Cache of loaded modules: path -> ParsedFile
     pub(super) module_cache: HashMap<crate::paths::CanonicalPath, ParsedFile>,
     /// Currently resolving modules (for cycle detection)
@@ -984,6 +984,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             io_base_dir,
             module_locations: HashMap::new(),
             configuration_root: base_dir.clone(),
+            source_overrides: Default::default(),
             base_dir,
             module_cache: HashMap::new(),
             resolving: HashSet::new(),
@@ -1183,10 +1184,11 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     /// in `main.crn` would be invisible to `${env}` interpolations in
     /// sibling `role.crn` (#2815). #2817.
     fn load_directory_module(&self, dir_path: &ResolvedPath) -> Result<ParsedFile, ModuleError> {
-        let paths = sorted_crn_paths_in(dir_path)?;
+        let paths = super::loader::source_paths_with_overrides(dir_path, &self.source_overrides)?;
         let mut files: Vec<(std::path::PathBuf, String)> = Vec::with_capacity(paths.len());
         for path in paths {
-            let content = path.read_to_string()?;
+            let content =
+                crate::config_loader::read_source_with_overrides(&path, &self.source_overrides)?;
             files.push((path.source_label(), content));
         }
         let parsed_files = crate::config_loader::parse_directory_files_located_from_root(
@@ -1594,10 +1596,12 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
         base_dir: &ResolvedPath,
         config: &'cfg dyn crate::validation::deferred_types::ProviderTypeCheckContext,
         schemas: &'cfg SchemaRegistry,
+        overrides: &crate::config_loader::SourceOverrides,
     ) -> Result<Self, ModuleError> {
         let mut resolver = ModuleResolver::<DeferredUpstreamTypeResolution>::for_upstream(
             base_dir, config, schemas,
         );
+        resolver.source_overrides = overrides.clone();
         resolver.process_imports(&parsed.uses, &parsed.module_calls)?;
         let root_witness = resolver.validate_reference_types(parsed)?;
         Ok(Self {
@@ -1612,11 +1616,13 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
         base_dir: &ResolvedPath,
         config: &'cfg dyn crate::validation::deferred_types::ProviderTypeCheckContext,
         schemas: &'cfg SchemaRegistry,
+        overrides: &crate::config_loader::SourceOverrides,
     ) -> Result<Self, ModuleError> {
         let mut resolver =
             ModuleResolver::<DeferredUpstreamTypeResolution>::for_providerless_upstream(
                 base_dir, config, schemas,
             );
+        resolver.source_overrides = overrides.clone();
         resolver.process_imports(&parsed.uses, &parsed.module_calls)?;
         let root_witness = resolver.validate_reference_types(parsed)?;
         Ok(Self {
@@ -1826,10 +1832,16 @@ pub(crate) fn resolve_upstream_modules_with_providerless_config<
     base_dir: &ResolvedPath,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: &SchemaRegistry,
+    overrides: &crate::config_loader::SourceOverrides,
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
-    let expanded =
-        UpstreamRefCheckedModuleGraph::check_providerless(&mut parsed, base_dir, config, schemas)?
-            .expand()?;
+    let expanded = UpstreamRefCheckedModuleGraph::check_providerless(
+        &mut parsed,
+        base_dir,
+        config,
+        schemas,
+        overrides,
+    )?
+    .expand()?;
     finalize_deferred_for_bodies(expanded)
 }
 
@@ -1840,9 +1852,11 @@ pub(crate) fn resolve_upstream_modules_with_config<
     base_dir: &ResolvedPath,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: &SchemaRegistry,
+    overrides: &crate::config_loader::SourceOverrides,
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
     let expanded =
-        UpstreamRefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas)?.expand()?;
+        UpstreamRefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas, overrides)?
+            .expand()?;
     finalize_deferred_for_bodies(expanded)
 }
 
@@ -1859,7 +1873,28 @@ pub fn resolve_modules_with_diagnostics<E: ResolveExportBindingPhase<ParserPlace
     schemas: &SchemaRegistry,
     covered_findings: &[crate::validation::ModuleCallFinding],
 ) -> ModuleResolutionDiagnosticResult<E::Absolute> {
-    let resolver = ModuleResolver::with_constraint_reports(base_dir, config, schemas);
+    resolve_modules_with_diagnostics_and_overrides(
+        parsed,
+        base_dir,
+        config,
+        schemas,
+        covered_findings,
+        &Default::default(),
+    )
+}
+
+pub fn resolve_modules_with_diagnostics_and_overrides<
+    E: ResolveExportBindingPhase<ParserPlaceholder> + Clone,
+>(
+    parsed: &RootDirectoryParse<E>,
+    base_dir: &ResolvedPath,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    schemas: &SchemaRegistry,
+    covered_findings: &[crate::validation::ModuleCallFinding],
+    overrides: &crate::config_loader::SourceOverrides,
+) -> ModuleResolutionDiagnosticResult<E::Absolute> {
+    let mut resolver = ModuleResolver::with_constraint_reports(base_dir, config, schemas);
+    resolver.source_overrides = overrides.clone();
     resolve_modules_with_diagnostics_and_resolver(parsed.parsed(), resolver, covered_findings)
 }
 

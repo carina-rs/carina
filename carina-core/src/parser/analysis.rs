@@ -34,6 +34,11 @@ use crate::resource::{
 /// fn fabricate() { let _ = DeclarationLocation::block_header_from_pair; }
 /// ```
 ///
+/// ```compile_fail,E0624
+/// use carina_core::parser::DeclarationLocation;
+/// fn fabricate() { let _ = DeclarationLocation::reference_prefix_from_pair; }
+/// ```
+///
 /// There is no constructor from offsets, line numbers, or a file/span tuple:
 ///
 /// ```compile_fail,E0599
@@ -213,6 +218,15 @@ impl std::hash::Hash for DeclarationProvenance {
 /// }
 /// ```
 ///
+/// Locations remain mandatory when consumed:
+///
+/// ```compile_fail,E0308
+/// use carina_core::{parser::{DeclarationLocation, Located}, validation::TypeResolutionDiagnostic};
+/// fn location(finding: &Located<TypeResolutionDiagnostic>) {
+///     let _: Option<&DeclarationLocation> = finding.location();
+/// }
+/// ```
+///
 /// A location cannot be omitted or supplied later:
 ///
 /// ```compile_fail,E0061
@@ -373,6 +387,22 @@ pub enum AnalysisTreeError {
     },
 }
 
+pub enum AnalysisTreeDiagnostic<'a> {
+    File(FileScoped<&'a AnalysisTreeError>),
+    Directory(DirectoryScoped<&'a AnalysisTreeError>),
+}
+
+impl AnalysisTreeError {
+    pub fn diagnostic(&self) -> AnalysisTreeDiagnostic<'_> {
+        match self {
+            Self::MissingElementProvenance { declaration, .. } => {
+                AnalysisTreeDiagnostic::File(FileScoped::new(declaration.file().path(), self))
+            }
+            _ => AnalysisTreeDiagnostic::Directory(DirectoryScoped { detail: self }),
+        }
+    }
+}
+
 /// A sealed resource view: every item has a location, independent of its id.
 ///
 /// ```compile_fail,E0451
@@ -442,6 +472,13 @@ impl<B: BindingAddress> AnalysisValueReference<B> {
     pub fn typed_consumer(&self) -> bool {
         self.typed_consumer
     }
+}
+
+pub(crate) struct FunctionValidationValue<'a, P: ValueKind, B: BindingAddress> {
+    pub value: &'a Value<P, B>,
+    pub expected: Option<&'a super::TypeExpr>,
+    pub context: Option<String>,
+    pub check_return: bool,
 }
 
 /// A deferred iterable validated together with its parser-owned provenance.
@@ -846,6 +883,7 @@ pub struct AnalysisTree<
     provider_attribute_locations: Vec<std::collections::HashMap<String, DeclarationLocation>>,
     upstream_states: Vec<Located<&'a super::UpstreamState<B>>>,
     value_references: Vec<AnalysisValueReference<B>>,
+    validation_values: Vec<Located<FunctionValidationValue<'a, P, B>>>,
     iterables: Vec<AnalysisForRef<'a, P, B>>,
     arguments: &'a [super::ArgumentParameter<super::TypeExpr, P, B>],
     functions: &'a std::collections::HashMap<String, super::UserFunction<B>>,
@@ -1294,6 +1332,29 @@ where
         for function in file.user_functions.values() {
             type_annotations.extend(function.type_annotations.iter().cloned());
         }
+        for function in file.user_functions.values() {
+            require_syntax(
+                syntax.declarations().iter().any(|record| {
+                    record.kind() == crate::config_loader::DeclarationKind::UserFunction
+                        && record.name() == function.name
+                }),
+                format!("function {} declaration", function.name),
+            )?;
+            for value in function
+                .params
+                .iter()
+                .filter_map(|parameter| parameter.default.as_ref())
+                .chain(function.local_lets.iter().map(|(_, value, _)| value))
+                .chain(std::iter::once(&function.body.value))
+            {
+                collect_value_references(
+                    value,
+                    &format!("function {}", function.name),
+                    true,
+                    &mut value_references,
+                )?;
+            }
+        }
         let mut expected = file
             .arguments
             .iter()
@@ -1402,6 +1463,154 @@ where
                 })
             })
             .collect::<Result<_, AnalysisTreeError>>()?;
+        let mut validation_values = Vec::new();
+        let mut reference_sites: std::collections::HashSet<_> = value_references
+            .iter()
+            .map(|value| value.reference().location().clone())
+            .collect();
+        let mut add_value = |location: &DeclarationLocation,
+                             value: &'a Value<P, B>,
+                             expected,
+                             context|
+         -> Result<(), AnalysisTreeError> {
+            let mut references = Vec::new();
+            collect_value_references(value, "function boundary", true, &mut references)?;
+            value_references.extend(
+                references
+                    .into_iter()
+                    .filter(|value| reference_sites.insert(value.reference().location().clone())),
+            );
+            validation_values.push(Located::new(
+                location.clone(),
+                FunctionValidationValue {
+                    value,
+                    expected,
+                    context,
+                    check_return: false,
+                },
+            ));
+            Ok(())
+        };
+        let value_location =
+            |kind, name: &str| -> Result<&DeclarationLocation, AnalysisTreeError> {
+                syntax
+                    .declarations()
+                    .iter()
+                    .find(|record| record.kind() == kind && record.name() == name)
+                    .map(|record| record.value_location().unwrap_or(record.location()))
+                    .ok_or_else(|| AnalysisTreeError::MissingSyntaxProvenance {
+                        element: format!("{kind:?} {name} value"),
+                    })
+            };
+        use crate::config_loader::DeclarationKind;
+        for parameter in &file.arguments {
+            if let Some(value) = &parameter.default {
+                add_value(
+                    value_location(DeclarationKind::Argument, &parameter.name)?,
+                    value,
+                    Some(&parameter.static_type),
+                    Some(format!("argument '{}' default", parameter.name)),
+                )?;
+            }
+        }
+        for parameter in &file.attribute_params {
+            if let Some(super::BoundaryExpression::Value(value)) = &parameter.value {
+                let record = declaration(
+                    DeclarationKind::ModuleAttribute,
+                    &parameter.name,
+                    parameter.source_file(),
+                    parameter.source_span(),
+                )?;
+                add_value(
+                    record.value_location().expect("validated attribute value"),
+                    value,
+                    parameter.static_type.as_ref(),
+                    Some(format!("attribute '{}'", parameter.name)),
+                )?;
+            }
+        }
+        for parameter in &file.export_params {
+            if let Some(value) = parameter.value() {
+                let record = declaration(
+                    DeclarationKind::Export,
+                    parameter.name(),
+                    parameter.source_file(),
+                    parameter.source_span(),
+                )?;
+                add_value(
+                    record.value_location().expect("validated export value"),
+                    value,
+                    parameter.type_expr_opt(),
+                    Some(format!("export '{}'", parameter.name())),
+                )?;
+            }
+        }
+        for (name, value) in &file.variables {
+            add_value(
+                value_location(DeclarationKind::Binding, name)?,
+                value,
+                None,
+                None,
+            )?;
+        }
+        for call in &file.module_calls {
+            for (name, value) in call.arguments() {
+                add_value(
+                    call.id()
+                        .argument_value_location(name)
+                        .unwrap_or_else(|| call.id().declaration_location()),
+                    value.walker_value(),
+                    None,
+                    None,
+                )?;
+            }
+        }
+        for (index, provider) in file.providers.iter().enumerate() {
+            let header = syntax
+                .providers()
+                .iter()
+                .filter(|record| {
+                    record.detail().name == provider.name
+                        && record.detail().binding == provider.binding
+                })
+                .nth(
+                    file.providers[..index]
+                        .iter()
+                        .filter(|other| {
+                            other.name == provider.name && other.binding == provider.binding
+                        })
+                        .count(),
+                )
+                .expect("validated provider header");
+            for value in provider
+                .attributes
+                .values()
+                .chain(provider.default_tags.values())
+                .chain(provider.unresolved_attributes.values())
+            {
+                add_value(header.location(), value, None, None)?;
+            }
+        }
+        if let Some(backend) = &file.backend {
+            for value in backend.attributes.values() {
+                add_value(
+                    backend_location.expect("validated backend"),
+                    value,
+                    None,
+                    None,
+                )?;
+            }
+        }
+        for state in &file.state_blocks {
+            if let super::StateBlock::Import { id, .. } = state {
+                let location = syntax.state_targets().first().ok_or_else(|| {
+                    AnalysisTreeError::MissingSyntaxProvenance {
+                        element: "state import".into(),
+                    }
+                })?;
+                add_value(location, id, None, None)?;
+            }
+        }
         Ok(Self {
             resources,
             waits,
@@ -1417,6 +1626,7 @@ where
             provider_attribute_locations,
             upstream_states,
             value_references,
+            validation_values,
             iterables,
             arguments: &file.arguments,
             functions: &file.user_functions,
@@ -1496,6 +1706,26 @@ where
     pub fn value_references(&self) -> &[AnalysisValueReference<B>] {
         &self.value_references
     }
+    pub fn reference_for_path(
+        &self,
+        path: &crate::resource::AccessPath<B>,
+    ) -> &AnalysisReference<B> {
+        self.value_references
+            .iter()
+            .map(|value| value.reference())
+            .chain(
+                self.resources
+                    .iter()
+                    .flat_map(|resource| resource.references()),
+            )
+            .find(|reference| {
+                reference.path() == path
+                    && reference.path().reference_locations_shared()
+                        == path.reference_locations_shared()
+            })
+            .expect("reference validated at the analysis boundary")
+    }
+
     pub fn for_iterables(&self) -> &[AnalysisForRef<'a, P, B>] {
         &self.iterables
     }
@@ -1528,6 +1758,84 @@ impl<D, B: BindingAddress> AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder
 where
     D: DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
+    pub(crate) fn visit_function_values(
+        &self,
+        visit: &mut impl FnMut(Located<FunctionValidationValue<'_, ParserPlaceholder, B>>),
+    ) {
+        for resource in self.resources() {
+            for value in resource.attributes().values() {
+                visit(Located::new(
+                    resource.location().clone(),
+                    FunctionValidationValue {
+                        value,
+                        expected: None,
+                        context: None,
+                        check_return: false,
+                    },
+                ));
+            }
+        }
+        for input in &self.validation_values {
+            visit(Located::new(
+                input.location().clone(),
+                FunctionValidationValue {
+                    value: input.value,
+                    expected: input.expected,
+                    context: input.context.clone(),
+                    check_return: false,
+                },
+            ));
+        }
+        for function in self.functions.values() {
+            let location = self
+                .syntax
+                .declarations()
+                .iter()
+                .find(|record| {
+                    record.kind() == crate::config_loader::DeclarationKind::UserFunction
+                        && record.name() == function.name
+                })
+                .expect("validated function declaration")
+                .location();
+            for parameter in &function.params {
+                if let Some(value) = &parameter.default {
+                    visit(Located::new(
+                        location.clone(),
+                        FunctionValidationValue {
+                            value,
+                            expected: parameter.param_type.as_ref(),
+                            context: Some(format!(
+                                "function '{}': parameter '{}' default",
+                                function.name, parameter.name
+                            )),
+                            check_return: false,
+                        },
+                    ));
+                }
+            }
+            for (_, value, _) in &function.local_lets {
+                visit(Located::new(
+                    location.clone(),
+                    FunctionValidationValue {
+                        value,
+                        expected: None,
+                        context: None,
+                        check_return: false,
+                    },
+                ));
+            }
+            visit(Located::new(
+                location.clone(),
+                FunctionValidationValue {
+                    value: &function.body.value,
+                    expected: function.return_type.as_ref(),
+                    context: Some(format!("function '{}': return value", function.name)),
+                    check_return: true,
+                },
+            ));
+        }
+    }
+
     pub fn inference_bindings(
         &self,
     ) -> crate::validation::inference::InferenceBindings<ParserPlaceholder, B> {

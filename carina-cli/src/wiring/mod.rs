@@ -3029,22 +3029,17 @@ pub fn validate_resources_with_ctx<
 /// `AppError::Validation`. Warnings are emitted to stderr (no
 /// AppError::Warning variant exists today) so they don't fail the
 /// command but remain visible.
-pub fn validate_depends_on_with_ctx<E, B, D>(
-    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+pub fn validate_depends_on_with_ctx<B, D>(
+    tree: &carina_core::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
     argument_types: &validation::ResolvedArgumentTypes,
 ) -> Vec<AppError>
 where
-    E: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
     use carina_core::validation::depends_on::{Severity, validate_depends_on};
-    let tree = match carina_core::parser::AnalysisTree::try_from_file(parsed) {
-        Ok(tree) => tree,
-        Err(error) => return vec![AppError::AnalysisInvariant(error)],
-    };
     let mut errors = Vec::new();
-    for diag in validate_depends_on(&tree, argument_types) {
+    for diag in validate_depends_on(tree, argument_types) {
         match diag.severity {
             Severity::Error => errors.push(AppError::DependsOn(Box::new(diag))),
             Severity::Warning => eprintln!("warning: {diag}"),
@@ -3056,20 +3051,15 @@ where
 /// Surface `wait <target> { ... }` diagnostics as `AppError::Validation`.
 /// Shared with the LSP via the underlying
 /// `carina_core::validation::wait::validate_wait_bindings` pass.
-pub fn validate_wait_bindings_with_ctx<E, D, B>(
+pub fn validate_wait_bindings_with_ctx<D, B>(
     ctx: &WiringContext,
-    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    tree: &carina_core::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
 ) -> Vec<AppError>
 where
-    E: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    let tree = match carina_core::parser::AnalysisTree::try_from_file(parsed) {
-        Ok(tree) => tree,
-        Err(error) => return vec![AppError::AnalysisInvariant(error)],
-    };
-    carina_core::validation::wait::validate_wait_bindings(&tree, ctx.schemas())
+    carina_core::validation::wait::validate_wait_bindings(tree, ctx.schemas())
         .into_iter()
         .map(|diagnostic| AppError::Wait(Box::new(diagnostic)))
         .collect()
@@ -3081,24 +3071,16 @@ where
 /// `carina_core::validation::deferred_populate::validate_deferred_populate_refs`
 /// pass. carina#3034.
 pub fn validate_deferred_populate_refs_with_ctx<
-    E: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     ctx: &WiringContext,
-    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    tree: &carina_core::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
 ) -> Vec<AppError> {
-    let tree = match carina_core::parser::AnalysisTree::try_from_file(parsed) {
-        Ok(tree) => tree,
-        Err(error) => return vec![AppError::AnalysisInvariant(error)],
-    };
-    carina_core::validation::deferred_populate::validate_deferred_populate_refs(
-        &tree,
-        ctx.schemas(),
-    )
-    .into_iter()
-    .map(|diagnostic| AppError::DeferredPopulate(Box::new(diagnostic)))
-    .collect()
+    carina_core::validation::deferred_populate::validate_deferred_populate_refs(tree, ctx.schemas())
+        .into_iter()
+        .map(|diagnostic| AppError::DeferredPopulate(Box::new(diagnostic)))
+        .collect()
 }
 
 pub fn validate_resource_ref_types_with_ctx<

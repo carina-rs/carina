@@ -7779,7 +7779,7 @@ let first = unrelated { }
         },
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     );
-    let diagnostics = render_module_call_findings(&doc, doc.source_file(), &findings);
+    let diagnostics = render_module_call_findings(&doc, &findings);
 
     assert!(
         diagnostics.is_empty(),
@@ -15077,7 +15077,7 @@ mock.test.resource {
     assert_eq!(unknown[0].severity, Some(DiagnosticSeverity::WARNING));
     assert_eq!(
         unknown[0].range,
-        Range::new(Position::new(5, 19), Position::new(5, 26)),
+        Range::new(Position::new(5, 11), Position::new(5, 26)),
     );
 
     let mismatch = diagnostics
@@ -15265,10 +15265,10 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() 
     let diagnostics = engine.with_run_for_test(|run| {
         run.module_resolver_error_diagnostics(
             &module_doc,
-            merged.directory.parsed.parsed(),
+            &carina_core::parser::AnalysisTree::try_from_file(merged.directory.parsed.parsed())
+                .unwrap(),
             error,
             &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
-            Some(&module_path),
         )
     });
     let diagnostic = diagnostics

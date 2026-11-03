@@ -497,8 +497,7 @@ fn element_provenance_survives_module_expansion_and_deferred_phase_changes() {
         "names"
     );
     assert!(
-        tree.syntax()
-            .for_iterables()
+        tree.for_iterables()
             .iter()
             .any(|iterable| iterable.location().file().path() == child_path)
     );

@@ -50,6 +50,13 @@ impl std::fmt::Display for DeferredPopulateDiagnostic {
     }
 }
 
+///
+/// ```compile_fail,E0308
+/// use carina_core::{parser::ParsedFile, schema::SchemaRegistry, validation::deferred_populate::validate_deferred_populate_refs};
+/// fn analyze(file: &ParsedFile) {
+///     validate_deferred_populate_refs(file, &SchemaRegistry::new());
+/// }
+/// ```
 pub fn validate_deferred_populate_refs<B: BindingAddress, D>(
     tree: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
     schemas: &SchemaRegistry,

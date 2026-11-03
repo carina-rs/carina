@@ -27,6 +27,11 @@ pub enum ProviderRoutingDiagnostic {
     },
 }
 
+///
+/// ```compile_fail,E0308
+/// use carina_core::parser::{ParsedFile, check_provider_instance_routing};
+/// fn analyze(file: &ParsedFile) { check_provider_instance_routing(file); }
+/// ```
 pub fn check_provider_instance_routing<B: BindingAddress, D>(
     tree: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
 ) -> Vec<Located<ProviderRoutingDiagnostic>>

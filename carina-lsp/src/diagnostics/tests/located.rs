@@ -83,6 +83,239 @@ impl Directory {
 const MAIN: &str = "provider aws {}\nlet cert = aws.acm.Certificate { domain_name = 'main' }\n";
 
 #[test]
+fn review_4220_routing_waits_for_the_directory_parse() {
+    let directory = Directory::new(&[
+        ("main.crn", "let regional = provider aws {}\n"),
+        (
+            "sibling.crn",
+            "aws.acm.Certificate { domain_name = 'sibling' directives { provider = regional } }\n",
+        ),
+        ("broken.crn", "invalid {{{"),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine_with_wait_target(),
+        "not a known provider instance",
+        &[],
+    );
+}
+
+#[test]
+fn review_4220_unmappable_span_drops_only_that_finding() {
+    let directory = Directory::new(&[("main.crn", MAIN), ("sibling.crn", "let live = 'live'\n")]);
+    let path = directory.root.path().join("sibling.crn");
+    let document = create_document_at("let live = 'live'\n", path.clone());
+    let stale_source = format!("{}let stale = 'disk'\n", "\n".repeat(80));
+    let stale = create_document_at(&stale_source, path);
+    let live_tree =
+        carina_core::parser::AnalysisTree::try_from_file(document.parsed().unwrap()).unwrap();
+    let stale_tree =
+        carina_core::parser::AnalysisTree::try_from_file(stale.parsed().unwrap()).unwrap();
+    let findings = [
+        &stale_tree.syntax().declarations()[0],
+        &live_tree.syntax().declarations()[0],
+    ];
+    let diagnostics: Vec<_> = findings
+        .into_iter()
+        .filter_map(|finding| {
+            render_merged(
+                &document,
+                finding,
+                DiagnosticSeverity::ERROR,
+                "test finding".to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(
+        diagnostics[0].range,
+        Range::new(Position::new(0, 4), Position::new(0, 8))
+    );
+}
+
+#[test]
+fn review_4220_module_reload_uses_the_unsaved_buffer() {
+    let directory = Directory::new(&[
+        ("main.crn", "invalid {{{"),
+        (
+            "sibling.crn",
+            "arguments { label: String = 'default' }\nattributes { name = label }\n",
+        ),
+    ]);
+    let path = directory.root.path().join("main.crn");
+    // Loading this directory as a module must see the live self-import and
+    // report its cycle, rather than parsing the obsolete on-disk syntax.
+    let document = create_document_at(
+        "let local = use { source = '.' }\nlet call = local {}\n",
+        path.clone(),
+    );
+    let merged = test_engine()
+        .with_run_for_test(|run| {
+            run.parse_merged_with_buffer(
+                &document,
+                Some("main.crn"),
+                &carina_core::paths::ResolvedPath::new(directory.root.path()).unwrap(),
+            )
+        })
+        .unwrap();
+    let errors = match &merged.module_resolution {
+        checks::MergedModuleResolution::Unowned { errors }
+        | checks::MergedModuleResolution::ConstraintFailed { errors, .. } => errors,
+        checks::MergedModuleResolution::Expanded { .. } => panic!("self-import must fail"),
+    };
+    let messages: Vec<_> = errors
+        .iter()
+        .map(|error| error.display_relative_to(directory.root.path()))
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("ircular import")),
+        "{messages:#?}"
+    );
+    assert!(
+        !messages.iter().any(|message| message.contains("invalid")),
+        "{messages:#?}"
+    );
+}
+
+#[test]
+fn review_4220_upstream_reload_uses_the_unsaved_buffer() {
+    let directory = Directory::new(&[
+        ("main.crn", "invalid {{{"),
+        ("sibling.crn", "let label = 'sibling'\n"),
+    ]);
+    directory.assert_buffer_ranges(
+        &test_engine(),
+        "main.crn",
+        "let prior = upstream_state { source = '.' }\nexports { value: String = 'live' }\n",
+        "failed to parse",
+        &[],
+    );
+}
+
+#[test]
+fn review_4220_unreadable_sibling_keeps_buffer_duplicates() {
+    let source = "exports { repeated: String = 'one' repeated: String = 'two' }\n";
+    let directory = Directory::new(&[
+        ("main.crn", "let unrelated = 'main'\n"),
+        ("sibling.crn", "let on_disk = 'old'\n"),
+    ]);
+    std::fs::write(directory.root.path().join("broken.crn"), [0xff]).unwrap();
+    directory.assert_ranges(&test_engine(), "main.crn", "duplicate export", &[]);
+    directory.assert_buffer_ranges(
+        &test_engine(),
+        "sibling.crn",
+        source,
+        "duplicate export",
+        &[("repeated", 0), ("repeated", 1)],
+    );
+}
+
+#[test]
+fn review_4220_function_refs_use_each_authored_occurrence() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        (
+            "sibling.crn",
+            "let decoy = 'cert.domain_name'\n# cert.domain_name\nfn returns_int(): Int { cert.domain_name }\nfn another_int(): Int { cert.domain_name }\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine_with_wait_target(),
+        "expected Int, got String",
+        &[("cert.domain_name", 2), ("cert.domain_name", 3)],
+    );
+}
+
+#[test]
+fn review_4220_resource_refs_ignore_decoys_and_keep_each_occurrence() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        (
+            "sibling.crn",
+            "# cert.statu\naws.acm.Certificate { domain_name = cert.statu }\naws.acm.Certificate { domain_name = cert.statu }\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine_with_wait_target(),
+        "Unknown attribute 'statu'",
+        &[("cert.statu", 1), ("cert.statu", 2)],
+    );
+}
+
+#[test]
+fn review_4220_non_bmp_positions_agree_across_renderers() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        (
+            "sibling.crn",
+            "let note = '😀' let values = map('.name', [{ name = 'one' }])\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine_with_wait_target(),
+        "Consider using pipe form",
+        &[("map", 0)],
+    );
+    assert_eq!(position::byte_offset_to_char_offset("😀x", 4), 2);
+    assert_eq!(position::char_len("😀x"), 3);
+    let source = std::fs::read_to_string(directory.root.path().join("sibling.crn")).unwrap();
+    let tokens = crate::semantic_tokens::SemanticTokensProvider::new(&[]).tokenize(&source);
+    let mut column = 0;
+    let operators: Vec<_> = tokens
+        .iter()
+        .filter_map(|token| {
+            column = if token.delta_line == 0 {
+                column + token.delta_start
+            } else {
+                token.delta_start
+            };
+            (token.token_type == 6).then_some(column)
+        })
+        .collect();
+    let expected: Vec<_> = source
+        .match_indices('=')
+        .map(|(byte, _)| position::byte_offset_to_char_offset(&source, byte))
+        .collect();
+    assert_eq!(
+        operators, expected,
+        "semantic tokens must agree with diagnostic UTF-16 columns"
+    );
+
+    let path = directory.root.path().join("sibling.crn");
+    let mut document = create_document_at(&source, path);
+    let start = source.find("values").unwrap();
+    document.apply_change(tower_lsp::lsp_types::TextDocumentContentChangeEvent {
+        range: Some(Range::new(
+            Position::new(0, position::byte_offset_to_char_offset(&source, start)),
+            Position::new(
+                0,
+                position::byte_offset_to_char_offset(&source, start + "values".len()),
+            ),
+        )),
+        range_length: None,
+        text: "updated".into(),
+    });
+    assert_eq!(document.text(), source.replace("values", "updated"));
+}
+
+#[test]
+fn review_4220_parser_ranges_use_utf16() {
+    let directory = Directory::new(&[
+        ("main.crn", MAIN),
+        (
+            "sibling.crn",
+            "let note = '😀' aws.acm.Certificate { domain_name = 'first' domain_name = 'second' }\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine_with_wait_target(),
+        "Duplicate attribute 'domain_name'",
+        &[("domain_name", 1)],
+    );
+}
+
+#[test]
 fn depends_on_belongs_to_sibling_unnamed_resource() {
     let directory = Directory::new(&[
         ("main.crn", MAIN),

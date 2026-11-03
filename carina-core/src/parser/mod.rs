@@ -5,8 +5,9 @@
 mod analysis;
 pub use analysis::{
     AnalysisDependencyRef, AnalysisForRef, AnalysisItemKind, AnalysisReference,
-    AnalysisResourceRef, AnalysisTree, AnalysisTreeError, AnalysisValueReference, AnalysisWaitRef,
-    DeclarationLocation, DeclarationProvenance, DirectoryScoped, FileScoped, Located,
+    AnalysisResourceRef, AnalysisTree, AnalysisTreeDiagnostic, AnalysisTreeError,
+    AnalysisValueReference, AnalysisWaitRef, DeclarationLocation, DeclarationProvenance,
+    DirectoryScoped, FileScoped, Located,
 };
 mod ast;
 pub(crate) use ast::ParserSeedMetadata;
