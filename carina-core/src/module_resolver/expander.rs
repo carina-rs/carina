@@ -794,7 +794,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         let mut expanded_parser_metadata: crate::parser::ParserBindingMetadata<
             AbsoluteBindingAddress,
         > = crate::parser::ParserBindingMetadata::default();
-        expanded_parser_metadata.syntax = module
+        *expanded_parser_metadata.syntax = module
             .parser_binding_metadata
             .syntax()
             .clone()

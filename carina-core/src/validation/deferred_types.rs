@@ -1,6 +1,5 @@
 //! Provider-dependent evidence recorded by producers and consumed at a terminal boundary.
 
-use indexmap::IndexMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -41,7 +40,7 @@ pub struct ProviderTypeCheckSite {
     context: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum ProviderTypeCheckOwner {
     Declaration(DeclarationLocation),
     Directory,
@@ -90,13 +89,13 @@ fn deferred_type_diagnostics_preserve_symlink_parent_source_spelling() {
 /// The evidence belongs exclusively to one run, never to a cloneable catalog.
 #[derive(Debug)]
 struct DeferredProviderTypeChecks<'s> {
-    pending: IndexMap<ProviderTypeCheckKey, (ProviderTypeCheckSite, TypeExpr)>,
+    pending: BTreeMap<ProviderTypeCheckKey, (ProviderTypeCheckSite, TypeExpr)>,
     declarations: BTreeMap<String, Vec<ProviderTypeCheckSite>>,
     blocked: Vec<ProviderTypeCheckFinding>,
     brand: PhantomData<fn(&'s ()) -> &'s ()>,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
 struct ProviderTypeCheckKey {
     owner: ProviderTypeCheckOwner,
     type_label: String,
@@ -306,7 +305,7 @@ impl<'s> TypeCheckSession<'s> {
             brand: PhantomData,
             failed_function_declarations: Mutex::new(BTreeSet::new()),
             evidence: Mutex::new(DeferredProviderTypeChecks {
-                pending: IndexMap::new(),
+                pending: BTreeMap::new(),
                 declarations: BTreeMap::new(),
                 blocked: Vec::new(),
                 brand: PhantomData,
@@ -368,7 +367,7 @@ impl<'s> TypeCheckSession<'s> {
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         for key in unlocated {
-            if let Some((_old_site, expected)) = evidence.pending.shift_remove(&key) {
+            if let Some((_old_site, expected)) = evidence.pending.remove(&key) {
                 evidence.record(site.clone(), &expected);
             }
         }

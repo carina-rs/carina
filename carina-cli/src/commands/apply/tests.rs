@@ -1778,11 +1778,13 @@ fn authored_module_composition<P: PlaceholderKind + PartialEq>(
     argument: Value<P, carina_core::resource::RelativeBindingName>,
     rejected: &str,
 ) -> LiveComposition<P, carina_core::resource::RelativeBindingName> {
-    module_composition(
+    let mut composition = module_composition(
         argument,
         rejected,
         carina_core::resource::RelativeBindingName::new("checked"),
-    )
+    );
+    composition.declaration = crate::test_support::composition_declaration_fixture();
+    composition
 }
 
 #[test]
@@ -4428,12 +4430,15 @@ let lookup = read mock.iam.Roles {{
         ),
     );
     parsed.compositions.push(composition);
+    let mut authored_reference = crate::test_support::parsed_fixture(
+        "let checked = mock.test.resource {}\nlet lookup = read mock.iam.Roles { name_regex = checked.value }\n",
+    );
     parsed.data_sources[0].set_attr(
         "name_regex",
-        Value::<
-            carina_core::resource::ParserPlaceholder,
-            carina_core::resource::RelativeBindingName,
-        >::resource_ref("checked", "value", Vec::new()),
+        authored_reference.data_sources[0]
+            .attributes
+            .shift_remove("name_regex")
+            .unwrap(),
     );
     let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
         fixture.runtime(),

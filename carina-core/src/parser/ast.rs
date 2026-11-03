@@ -371,8 +371,16 @@ impl<S, P: ValueKind, B: BindingAddress, D> DeferredForTemplateResource<S, P, B,
 
     pub(crate) fn id_and_attributes_mut(
         &mut self,
-    ) -> (&ResourceId, &mut IndexMap<String, Value<P, B>>) {
-        (&self.resource.id, &mut self.resource.attributes)
+    ) -> (
+        &ResourceId,
+        &mut IndexMap<String, Value<P, B>>,
+        &mut super::DeclarationProvenance,
+    ) {
+        (
+            &self.resource.id,
+            &mut self.resource.attributes,
+            &mut self.resource.declaration,
+        )
     }
 
     pub(crate) fn resolve_ignore_changes(
@@ -813,7 +821,7 @@ pub(crate) enum DeferredForResourceExpressionError {
     UndefinedIterable(ParseError),
     Unsupported {
         file: Option<String>,
-        error: Box<DeferredForBodyUnsupportedError>,
+        error: Box<super::Located<ParseError>>,
     },
 }
 
@@ -920,7 +928,9 @@ impl<P: ValueKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
     pub(in crate::parser) fn record_iterable_location(
         &mut self,
         location: super::DeclarationLocation,
+        declaration: super::DeclarationProvenance,
     ) {
+        self.location.iterable = declaration;
         self.location.iterable.set_iterable(location);
     }
 
@@ -1075,15 +1085,24 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
                     file: location
                         .source_file()
                         .map(|file| file.display().to_string()),
-                    error: Box::new(DeferredForBodyUnsupportedError {
-                        line: location.line(),
-                        header,
-                        body: DeferredForBodyKind::Read {
-                            resource_type: data_source.id.display_type(),
-                        },
-                        span,
-                        iterable_resolution,
-                    }),
+                    error: Box::new(super::Located::new(
+                        location
+                            .iterable
+                            .location()
+                            .expect("deferred for expression must retain parser provenance")
+                            .clone(),
+                        ParseError::DeferredForBodyUnsupported(Box::new(
+                            DeferredForBodyUnsupportedError {
+                                line: location.line(),
+                                header,
+                                body: DeferredForBodyKind::Read {
+                                    resource_type: data_source.id.display_type(),
+                                },
+                                span,
+                                iterable_resolution,
+                            },
+                        )),
+                    )),
                 });
             }
             DeferredForBody::ModuleCall(call) => {
@@ -1091,15 +1110,24 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
                     file: location
                         .source_file()
                         .map(|file| file.display().to_string()),
-                    error: Box::new(DeferredForBodyUnsupportedError {
-                        line: location.line(),
-                        header,
-                        body: DeferredForBodyKind::ModuleCall {
-                            name: call.module_name,
-                        },
-                        span,
-                        iterable_resolution,
-                    }),
+                    error: Box::new(super::Located::new(
+                        location
+                            .iterable
+                            .location()
+                            .expect("deferred for expression must retain parser provenance")
+                            .clone(),
+                        ParseError::DeferredForBodyUnsupported(Box::new(
+                            DeferredForBodyUnsupportedError {
+                                line: location.line(),
+                                header,
+                                body: DeferredForBodyKind::ModuleCall {
+                                    name: call.module_name,
+                                },
+                                span,
+                                iterable_resolution,
+                            },
+                        )),
+                    )),
                 });
             }
         };
@@ -1856,6 +1884,7 @@ pub enum ResourceMut<
     Deferred {
         id: &'a ResourceId,
         attributes: &'a mut IndexMap<String, Value<T, B>>,
+        declaration: &'a mut super::DeclarationProvenance,
     },
 }
 
@@ -3732,7 +3761,7 @@ impl<P: ValueKind> ModuleArgument<P, AbsoluteBindingAddress> {
 /// The inner path is intentionally opaque: callers may inspect it for
 /// diagnostics and saved-plan normalization, but only the parser can mint an
 /// identity-bearing module call.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourceFileId(Arc<Path>);
 
 impl SourceFileId {
@@ -4688,7 +4717,7 @@ impl DeclarationSource {
 /// Calls expanded from one `for` body intentionally share the authored span
 /// and are distinguished by the [`CallExpansion`] carried by
 /// [`ModuleCall::id`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourceSpan {
     start_byte: usize,
     end_byte: usize,
@@ -5025,7 +5054,7 @@ impl UnexpandedCompositionAttribute<AbsoluteBindingAddress> {
 /// runtime [`Value`] model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParserBindingMetadata<B: BindingAddress = RelativeBindingName> {
-    pub(crate) syntax: super::SyntaxInventory<B>,
+    pub(crate) syntax: Box<super::SyntaxInventory<B>>,
     pub(crate) unexpanded_composition_attributes: Vec<UnexpandedCompositionAttribute<B>>,
     structural_handles: IndexMap<B, UnexpandedStructuralHandle<B>>,
     structural_aliases: IndexMap<B, UnexpandedStructuralHandle<B>>,
@@ -5251,7 +5280,7 @@ impl<B: BindingAddress> ParserBindingMetadata<B> {
     }
 
     pub(crate) fn extend(&mut self, other: Self) {
-        self.syntax.extend(other.syntax);
+        self.syntax.extend(*other.syntax);
         self.unexpanded_composition_attributes
             .extend(other.unexpanded_composition_attributes);
         self.structural_handles.extend(other.structural_handles);
@@ -5311,7 +5340,7 @@ impl ParserBindingMetadata<RelativeBindingName> {
             pending_function_type_checks,
         } = self;
         ParserBindingMetadata {
-            syntax: syntax.map_bindings(resolve),
+            syntax: Box::new((*syntax).map_bindings(resolve)),
             unexpanded_composition_attributes: unexpanded_composition_attributes
                 .into_iter()
                 .map(|attribute| attribute.map_bindings(resolve))
@@ -6168,8 +6197,12 @@ impl<P: ValueKind, B: BindingAddress> DeferredForPhaseTraversal<P, P, B>
                 .iter_mut()
                 .filter_map(|deferred| match &mut deferred.body {
                     DeferredForBody::Resource(resource) => {
-                        let (id, attributes) = resource.id_and_attributes_mut();
-                        Some(ResourceMut::Deferred { id, attributes })
+                        let (id, attributes, declaration) = resource.id_and_attributes_mut();
+                        Some(ResourceMut::Deferred {
+                            id,
+                            attributes,
+                            declaration,
+                        })
                     }
                     DeferredForBody::Read(_) | DeferredForBody::ModuleCall(_) => None,
                 }),
@@ -6259,8 +6292,12 @@ impl<P: ValueKind, T: ValueKind, B: BindingAddress> DeferredForPhaseTraversal<P,
 
     fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, P, T, B>> + '_> {
         Box::new(self.expressions.iter_mut().map(|deferred| {
-            let (id, attributes) = deferred.template_resource.id_and_attributes_mut();
-            ResourceMut::Deferred { id, attributes }
+            let (id, attributes, declaration) = deferred.template_resource.id_and_attributes_mut();
+            ResourceMut::Deferred {
+                id,
+                attributes,
+                declaration,
+            }
         }))
     }
 

@@ -2949,8 +2949,12 @@ let orgs = upstream_state {
                 path.ends_with("main.crn"),
                 "unexpected error owner: {path:?}"
             );
+            let finding = error
+                .element_diagnostic()
+                .expect("deferred expression location");
+            assert_eq!(finding.location().file().path(), path);
             assert!(matches!(
-                error.as_ref(),
+                finding.detail(),
                 crate::parser::ParseError::DeferredForBodyUnsupported(details)
                     if details.line == 3
                         && details.header == "for x in src.list"
@@ -3003,9 +3007,13 @@ let orgs = upstream_state {
             path.ends_with("parent/main.crn"),
             "unexpected error owner: {path:?}"
         );
+        let finding = error
+            .element_diagnostic()
+            .expect("deferred expression location");
+        assert_eq!(finding.location().file().path(), path);
         assert!(
             matches!(
-                error.as_ref(),
+                finding.detail(),
                 crate::parser::ParseError::DeferredForBodyUnsupported(details)
                     if details.line == 3
                         && details.header == "for name in names"
@@ -3059,7 +3067,12 @@ let orgs = upstream_state {
             panic!("expected a file-owned typed parse error, got {error:?}");
         };
         assert!(path.ends_with("b/main.crn"), "unexpected owner: {path:?}");
-        let crate::parser::ParseError::DeferredForBodyUnsupported(details) = error.as_ref() else {
+        let finding = error
+            .element_diagnostic()
+            .expect("deferred expression location");
+        assert_eq!(finding.location().file().path(), path);
+        let crate::parser::ParseError::DeferredForBodyUnsupported(details) = finding.detail()
+        else {
             panic!("expected a deferred-body error, got {error:?}");
         };
         assert_eq!(details.header, "for i in items");

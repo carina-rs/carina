@@ -7,6 +7,60 @@ use carina_core::{EnvironmentSnapshot, TestUserDirs};
 use carina_provider_mock::{ConfiguredBuiltinMock, MockBehavior, MockScope};
 use std::sync::{Arc, OnceLock};
 
+/// Fixtures that cross analysis boundaries must originate in real syntax.
+#[cfg(test)]
+pub(crate) fn parsed_fixture(source: &str) -> carina_core::parser::ParsedFile {
+    carina_core::parser::parse_file(
+        source,
+        std::path::Path::new("test.crn"),
+        &carina_core::parser::ProviderContext::new(EnvironmentSnapshot::empty()),
+    )
+    .expect("parse authored fixture")
+}
+
+#[cfg(test)]
+pub(crate) fn inferred_fixture(source: &str) -> carina_core::parser::InferredFile {
+    carina_core::validation::inference::apply_inference(
+        parsed_fixture(source),
+        &carina_core::schema::SchemaRegistry::new(),
+        &carina_core::parser::ProviderContext::new(EnvironmentSnapshot::empty()),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn composition_declaration_fixture() -> carina_core::parser::DeclarationProvenance {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("child")).unwrap();
+    std::fs::write(
+        directory.path().join("child/main.crn"),
+        "attributes { value: String = 'initial' }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("main.crn"),
+        "let child = use { source = './child' }\nlet checked = child {}\n",
+    )
+    .unwrap();
+    let context = carina_core::parser::ProviderContext::new(EnvironmentSnapshot::empty());
+    let schemas = carina_core::schema::SchemaRegistry::new();
+    let project = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
+    let loaded =
+        carina_core::config_loader::load_configuration_with_config(&project, &context, &schemas)
+            .unwrap();
+    carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+        carina_core::module_resolver::resolve_modules_with_providerless_config(
+            loaded.parsed,
+            &project,
+            session,
+            &schemas,
+        )
+        .unwrap()
+        .compositions
+        .remove(0)
+        .declaration
+    })
+}
+
 /// Builds one immutable invocation from the fixture's mock configuration.
 /// Reconfiguration starts a new invocation; existing runtime clones stay valid.
 /// Installed hooks belong to the fixture and survive invocation rebuilds.

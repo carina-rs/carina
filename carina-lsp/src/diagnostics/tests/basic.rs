@@ -152,12 +152,25 @@ fn deferred_for_unsupported_bodies_surface_parser_diagnostics() {
              let src = mock.test.resource {{ name = 'src' }}\n\
              let items = for x in src.list {{ {body} }}\n"
         );
-        let main_path = fixture.path().join("main.crn");
-        std::fs::write(&main_path, &source).expect("main fixture");
+        let sibling_path = fixture.path().join("sibling.crn");
+        let other_path = fixture.path().join("main.crn");
+        let other = "let unrelated = 'ok'\n";
+        std::fs::write(&other_path, other).unwrap();
+        std::fs::write(&sibling_path, &source).expect("sibling fixture");
+        let unrelated_diagnostics = test_engine().analyze(
+            &create_document_at(other, other_path.clone()),
+            Some(&other_path),
+        );
+        assert!(
+            !unrelated_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("for x in src.list")),
+            "sibling diagnostic leaked: {unrelated_diagnostics:#?}"
+        );
 
         let diagnostics = test_engine().analyze(
-            &create_document_at(&source, main_path.clone()),
-            Some(&main_path),
+            &create_document_at(&source, sibling_path.clone()),
+            Some(&sibling_path),
         );
         let diagnostic = diagnostics
             .iter()

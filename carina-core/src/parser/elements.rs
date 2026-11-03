@@ -102,6 +102,48 @@ fn value_location(
 }
 
 impl ElementLocations {
+    pub(crate) fn rename_attribute_path(
+        &mut self,
+        from: &[super::AttributePathSegment],
+        name: &str,
+    ) {
+        use super::AttributePathSegment as Segment;
+        let rename = |path: &mut [Segment]| {
+            // Map literals and block syntax use different segment variants
+            // for the same schema field. The schema walker resolves both.
+            if !from.is_empty()
+                && path.len() >= from.len()
+                && path
+                    .iter()
+                    .zip(from)
+                    .all(|(actual, expected)| match (actual, expected) {
+                        (
+                            Segment::StructField(a) | Segment::Key(a),
+                            Segment::StructField(b) | Segment::Key(b),
+                        ) => a == b,
+                        _ => actual == expected,
+                    })
+            {
+                match &mut path[from.len() - 1] {
+                    Segment::Attribute(value)
+                    | Segment::StructField(value)
+                    | Segment::Key(value) => {
+                        name.clone_into(value);
+                    }
+                    Segment::ListIndex(_) => {
+                        unreachable!("an attribute rename cannot rename an index")
+                    }
+                }
+            }
+        };
+        for key in &mut self.keys {
+            rename(&mut key.path);
+        }
+        for value in &mut self.attribute_values {
+            rename(&mut value.path);
+        }
+    }
+
     pub(in crate::parser) fn from_module_attributes(
         declarations: &[Located<DeclarationRecord>],
     ) -> Self {

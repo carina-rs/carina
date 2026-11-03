@@ -10870,7 +10870,15 @@ fn user_fn_return_type_mismatch_value() {
     let msg = format!("{err}");
     assert_eq!(
         msg,
-        "User-defined function error: function 'bad': return value: expected String, got int (42)"
+        "test.crn:3:13: User-defined function error: function 'bad': return value: expected String, got int (42)"
+    );
+    let finding = err
+        .element_diagnostic()
+        .expect("parser-owned return expression");
+    assert_eq!(finding.location().span().start_line(), 3);
+    assert_eq!(
+        &input[finding.location().span().start_byte()..finding.location().span().end_byte()],
+        "42"
     );
 }
 

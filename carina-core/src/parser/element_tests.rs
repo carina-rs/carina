@@ -9,6 +9,103 @@ fn slice<'a>(source: &'a str, location: &DeclarationLocation) -> &'a str {
 }
 
 #[test]
+fn generated_prefix_names_retain_authored_provenance() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+    let source = "let bucket = mock.test.Resource { name_prefix = 'service-' }\n";
+    let mut parsed = parse_file(source, Path::new("sibling.crn"), &context()).unwrap();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Resource")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    crate::identifier::resolve_attr_prefixes(&mut parsed.resources, &schemas).unwrap();
+    let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+    let resource = tree.resources().next().unwrap();
+    assert_eq!(
+        slice(source, resource.attribute_key_location("name")),
+        "name_prefix"
+    );
+}
+
+#[test]
+fn canonical_block_names_retain_nested_and_deferred_provenance() {
+    use crate::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
+    };
+    let source = "let src = mock.test.Resource {}\nlet direct = mock.test.Resource { rule { child { value = 'bad' } } }\nlet items = for x in src.items { mock.test.Resource { rule { child { value = x } } } }\nlet assigned = mock.test.Resource { rules = [{ child = [{ value = 'bad' }] }] }\n";
+    let mut parsed = parse_file(source, Path::new("sibling.crn"), &context()).unwrap();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Resource")
+            .attribute(
+                AttributeSchema::optional(
+                    "rules",
+                    AttributeType::list(AttributeType::struct_(
+                        "Rule",
+                        vec![
+                            StructField::optional(
+                                "children",
+                                AttributeType::list(AttributeType::struct_(
+                                    "Child",
+                                    vec![
+                                        StructField::optional("value", AttributeType::string())
+                                            .build(),
+                                    ],
+                                )),
+                            )
+                            .with_block_name("child")
+                            .build(),
+                        ],
+                    )),
+                )
+                .with_block_name("rule")
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    crate::schema::resolve_file_block_names_with_schemas(&mut parsed, &schemas).unwrap();
+    let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+    for resource in tree
+        .resources()
+        .filter(|item| item.binding() != Some("src"))
+    {
+        assert_eq!(
+            slice(source, resource.attribute_key_location("rules")),
+            if resource.binding() == Some("assigned") {
+                "rules"
+            } else {
+                "rule"
+            }
+        );
+        let key = resource.attribute_keys().iter().find(|key|
+            matches!(key.path(), [AttributePathSegment::Attribute(root), AttributePathSegment::ListIndex(0), AttributePathSegment::StructField(child) | AttributePathSegment::Key(child)] if root == "rules" && child == "children")
+        ).expect("canonical nested key");
+        assert_eq!(slice(source, key.location()), "child");
+        let value_path = crate::schema::FieldPath::new()
+            .push_index(0)
+            .push_field("children")
+            .push_index(0)
+            .push_field("value");
+        assert_eq!(
+            slice(
+                source,
+                resource.attribute_value_location("rules", &value_path)
+            ),
+            if matches!(resource.binding(), Some("direct" | "assigned")) {
+                "'bad'"
+            } else {
+                "x"
+            }
+        );
+    }
+}
+
+#[test]
 fn resolution_preserves_values_and_locations() {
     let config = context();
     let parsed = parse_file(

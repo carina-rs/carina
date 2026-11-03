@@ -220,6 +220,10 @@ impl DiagnosticEngine {
     }
 }
 
+pub(super) fn parse_error_message(error: &ParseError) -> String {
+    parse_error_to_diagnostic(error).message
+}
+
 fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
     match error {
         ParseError::Located { error, .. } => parse_error_to_diagnostic(error),

@@ -1092,13 +1092,7 @@ let observed_names = roles.names
     /// concern raised reviewing carina#3128.
     #[test]
     fn pending_named_direct_resource_does_not_render_trailing_dot() {
-        use carina_core::parser::ParsedFile;
-        use carina_core::resource::Resource;
-
-        let mut parsed = ParsedFile::default();
-        let mut res = Resource::pending("s3.Bucket");
-        res.id.provider = "aws".to_string();
-        parsed.resources.push(res); // allow: direct — fixture test inspection
+        let parsed = crate::test_support::parsed_fixture("aws.s3.Bucket {}\n");
         let parsed = resolve_file_for_test(parsed);
 
         let entries = validated_entries(&parsed);
@@ -1140,7 +1134,7 @@ let observed_names = roles.names
                     instance: instance.to_string(),
                     call_path: crate::test_authored_composition_call_path(),
                     quoted_string_attrs: Default::default(),
-                    declaration: Default::default(),
+                    declaration: crate::test_support::composition_declaration_fixture(),
                 }
             };
         let mut parsed = ParsedFile::default();

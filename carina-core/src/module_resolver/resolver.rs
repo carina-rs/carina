@@ -2257,7 +2257,7 @@ fn deferred_for_resource_expression_error(
             parse_error_to_module_error(error)
         }
         crate::parser::DeferredForResourceExpressionError::Unsupported { file, error } => {
-            let error = ParseError::DeferredForBodyUnsupported(error);
+            let error = ParseError::AtElement(error);
             match file {
                 Some(path) => ModuleError::ParseInFile {
                     path: std::path::PathBuf::from(path),

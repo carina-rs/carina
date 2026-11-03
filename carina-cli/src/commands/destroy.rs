@@ -2762,7 +2762,7 @@ mod tests {
     #[tokio::test]
     async fn destroy_provider_resolution_ignores_unrelated_missing_upstream_state() {
         let color_mode = crate::output_style::ColorMode::Plain;
-        let (_temp, downstream, mut parsed) = provider_upstream_fixture();
+        let (_temp, downstream, _) = provider_upstream_fixture();
         let unrelated = downstream.parent().unwrap().join("unrelated");
         std::fs::create_dir_all(&unrelated).unwrap();
         std::fs::write(
@@ -2770,12 +2770,19 @@ mod tests {
             "backend local { path = \"carina.state.json\" }\n",
         )
         .unwrap();
-        parsed
-            .upstream_states
-            .push(carina_core::parser::UpstreamState {
-                binding: carina_core::resource::RelativeBindingName::new("unrelated"),
-                source: std::path::PathBuf::from("../unrelated"),
-            });
+        std::fs::write(
+            downstream.join("unrelated.crn"),
+            "let unrelated = upstream_state { source = '../unrelated' }\n",
+        )
+        .unwrap();
+        let parsed = load_configuration_with_config(
+            &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .unwrap()
+        .parsed
+        .into_parsed();
 
         let backend =
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));

@@ -1504,6 +1504,10 @@ pub fn resolve_attr_prefixes<P: PlaceholderKind, B: BindingAddress>(
             // `swap_remove`) preserves the source-order of the rest of
             // the attributes, which is the whole point of #2222.
             resource.attributes.shift_remove(&prefix_key);
+            resource.declaration.rename_attribute_path(
+                &[crate::parser::AttributePathSegment::Attribute(prefix_key)],
+                &base_attr,
+            );
 
             // Store prefix
             resource.prefixes.insert(

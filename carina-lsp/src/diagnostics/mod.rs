@@ -599,14 +599,14 @@ impl DiagnosticRun<'_> {
                         doc,
                         finding,
                         DiagnosticSeverity::ERROR,
-                        parse_error.to_string(),
+                        buffer::parse_error_message(parse_error),
                     ));
                 } else if let Some(finding) = error.diagnostic() {
                     diagnostics.extend(render_parse(
                         doc,
                         &finding,
                         DiagnosticSeverity::ERROR,
-                        parse_error.to_string(),
+                        buffer::parse_error_message(parse_error),
                     ));
                 }
             }

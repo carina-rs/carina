@@ -69,7 +69,7 @@ use crate::resource::{
 /// use carina_core::parser::DeclarationLocation;
 /// let _: DeclarationLocation = serde_json::from_str("{}").unwrap();
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeclarationLocation {
     file: SourceFileId,
     span: SourceSpan,
@@ -191,6 +191,17 @@ impl DeclarationProvenance {
 
     pub(crate) fn elements(&self) -> &super::elements::ElementLocations {
         &self.elements
+    }
+
+    /// Follow a semantic attribute rename while retaining every authored span.
+    /// This changes lookup paths only; it cannot create diagnostic provenance.
+    pub(crate) fn rename_attribute_path(
+        &mut self,
+        from: &[super::AttributePathSegment],
+        name: &str,
+    ) {
+        let elements = Arc::make_mut(&mut self.elements);
+        elements.rename_attribute_path(from, name);
     }
 
     pub(in crate::parser) fn set_iterable(&mut self, location: DeclarationLocation) {

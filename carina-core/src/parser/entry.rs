@@ -1447,7 +1447,7 @@ fn parse_with_seeded_bindings_inner(
         .into_iter()
         .map(crate::resource::RelativeBindingName::new)
         .collect();
-    parser_binding_metadata.syntax = syntax;
+    parser_binding_metadata.syntax = Box::new(syntax);
     parsed.parser_binding_metadata = parser_binding_metadata;
     parsed.warnings = warnings;
     *parsed.parsed_deferred_for_expressions_mut() = ctx.parsed_deferred_for_expressions;

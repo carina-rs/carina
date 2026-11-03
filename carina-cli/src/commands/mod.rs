@@ -1364,8 +1364,11 @@ mod tests {
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .unwrap();
-        let mut parsed = empty_parsed_file();
-        parsed.backend = raw.backend;
+        let parsed = carina_core::validation::inference::apply_inference(
+            raw,
+            &carina_core::schema::SchemaRegistry::new(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        );
         let base = tempfile::tempdir().unwrap();
         let providers = ProviderLoad::load(
             &runtime,
@@ -1900,16 +1903,9 @@ child { values = [source] }
     }
 
     fn resource_create_only_enum_file(raw_region: &str) -> carina_core::parser::InferredFile {
-        let mut resource =
-            carina_core::resource::Resource::pending_with_provider("awscc", "ec2.Subnet", None);
-        resource.set_attr(
-            "placement_region".to_string(),
-            Value::Concrete(ConcreteValue::enum_identifier(raw_region)),
-        );
-
-        let mut parsed = carina_core::parser::InferredFile::default();
-        parsed.resources = vec![resource];
-        parsed
+        crate::test_support::inferred_fixture(&format!(
+            "awscc.ec2.Subnet {{ placement_region = {raw_region} }}\n"
+        ))
     }
 
     #[test]
