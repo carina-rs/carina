@@ -29,7 +29,8 @@ use carina_core::provider::{
 };
 use carina_core::resource::{ConcreteValue, Current, DeferredValue, ResourceId, State, Value};
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, ValidatedResourceSchema,
+    AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
+    ValidatedResourceSchema,
 };
 use carina_state::{ResourceState, StateFile};
 use tempfile::TempDir;
@@ -105,7 +106,23 @@ impl ProviderFactory for TypedRefMockFactory {
                 .attribute(AttributeSchema::provider_populated("typed_out", named).build()),
             ResourceSchema::new(CONSUMER)
                 .attribute(AttributeSchema::optional("x", refined.clone()).build())
-                .attribute(AttributeSchema::optional("xs", AttributeType::list(refined)).build()),
+                .attribute(
+                    AttributeSchema::optional("xs", AttributeType::list(refined.clone())).build(),
+                )
+                .attribute(
+                    AttributeSchema::optional(
+                        "dimensions",
+                        AttributeType::list(AttributeType::struct_(
+                            "Dimension",
+                            vec![
+                                StructField::required("name", AttributeType::string()).build(),
+                                StructField::required("value", refined).build(),
+                            ],
+                        )),
+                    )
+                    .with_block_name("dimensions")
+                    .build(),
+                ),
         ]
         .into_iter()
         .map(|schema| schema.validate().expect("typed reference mock schema"))
@@ -186,6 +203,47 @@ fn typed_ref_validate_accepts_anonymous_refined_scalar_sink() {
 fn typed_ref_validate_accepts_anonymous_refined_list_sink() {
     let errors = Scenario::new("  xs = [producer.typed_out]").validate();
     assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
+
+#[test]
+fn typed_ref_list_struct_sink_validates_and_plan_rejects_known_invalid_output() {
+    let scenario = Scenario::new(
+        r#"
+  dimensions {
+    name = "VpcId"
+    value = producer.typed_out
+  }
+"#,
+    );
+    let errors = scenario.validate();
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+
+    for (value, reason) in [("bad-id", "pattern"), ("good-overlongvalue", "length")] {
+        scenario.seed_output(value);
+        let fixture = scenario.plan();
+        let errors = fixture.plan.errors();
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        let error = &errors[0];
+        assert_eq!(error.resource_id.resource_type, CONSUMER);
+        assert_eq!(error.resource_id.identity_str(), Some("consumer"));
+        let PlanErrorKind::ResolvedValueConstraint {
+            attributes,
+            origins,
+            message,
+        } = &error.kind
+        else {
+            panic!("expected ResolvedValueConstraint, got {error:#?}");
+        };
+        assert_eq!(attributes, &["dimensions"]);
+        assert_eq!(origins, &["producer.typed_out"]);
+        assert!(
+            message
+                .as_str()
+                .contains("List item at index 0: Struct field 'value':"),
+            "{error:#?}"
+        );
+        assert!(message.as_str().contains(reason), "{error:#?}");
+    }
 }
 
 #[test]
