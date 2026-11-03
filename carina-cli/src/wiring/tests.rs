@@ -1674,7 +1674,20 @@ fn settlement_includes_checks_from_binding_readiness() {
         |_parsed, catalog| {
             catalog.record(
                 &expected,
-                ProviderTypeCheckSite::at_line(Path::new("main.crn"), 1, 1, "binding readiness"),
+                ProviderTypeCheckSite::new(
+                    carina_core::parser::parse_file(
+                        "attributes { value: Missing = 'id' }",
+                        Path::new("main.crn"),
+                        &carina_core::parser::ProviderContext::new(
+                            carina_core::EnvironmentSnapshot::empty(),
+                        ),
+                    )
+                    .unwrap()
+                    .attribute_params[0]
+                        .type_check_location()
+                        .clone(),
+                    "binding readiness",
+                ),
             );
             Ok(())
         },
@@ -15105,7 +15118,20 @@ fn settlement_loaded_validation_report_cannot_hide_pending_evidence() {
         .unwrap();
         checks.record(
             &expected,
-            ProviderTypeCheckSite::at_line(Path::new("/project/main.crn"), 2, 3, "attribute 'x'"),
+            ProviderTypeCheckSite::new(
+                carina_core::parser::parse_file(
+                    "\n  attributes { value: Missing = 'id' }",
+                    Path::new("/project/main.crn"),
+                    &carina_core::parser::ProviderContext::new(
+                        carina_core::EnvironmentSnapshot::empty(),
+                    ),
+                )
+                .unwrap()
+                .attribute_params[0]
+                    .type_check_location()
+                    .clone(),
+                "attribute 'x'",
+            ),
         );
         Ok(Default::default())
     });

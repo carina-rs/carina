@@ -174,10 +174,11 @@ impl carina_core::validation::deferred_types::ProviderTypeCheckSink for LintType
         &mut self,
         diagnostic: carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic,
     ) {
-        let (mut warning, is_error) = match diagnostic {
+        let (finding, is_error) = match diagnostic {
             carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning) => (warning, false),
             carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => (error, true),
         };
+        let mut warning = finding.into_warning();
         if warning.file.is_none() {
             warning.file = Some(self.path.to_string());
         }
@@ -583,7 +584,20 @@ mod tests {
         let checks = TypeCheckSession::run(&catalog, |session| {
             session.record(
                 &carina_core::parser::TypeExpr::String,
-                ProviderTypeCheckSite::at_line(Path::new("main.crn"), 3, 4, "lint check"),
+                ProviderTypeCheckSite::new(
+                    carina_core::parser::parse_file(
+                        "\n\n   attributes { value: Missing = 'id' }",
+                        Path::new("main.crn"),
+                        &carina_core::parser::ProviderContext::new(
+                            carina_core::EnvironmentSnapshot::empty(),
+                        ),
+                    )
+                    .unwrap()
+                    .attribute_params[0]
+                        .type_check_location()
+                        .clone(),
+                    "lint check",
+                ),
             );
             Err(AppError::Validation("producer failed".into()))
         });
@@ -601,7 +615,20 @@ mod tests {
         let checks = TypeCheckSession::run(&catalog, |session| {
             session.record(
                 &carina_core::parser::TypeExpr::String,
-                ProviderTypeCheckSite::at_line(Path::new("main.crn"), 3, 4, "lint check"),
+                ProviderTypeCheckSite::new(
+                    carina_core::parser::parse_file(
+                        "\n\n   attributes { value: Missing = 'id' }",
+                        Path::new("main.crn"),
+                        &carina_core::parser::ProviderContext::new(
+                            carina_core::EnvironmentSnapshot::empty(),
+                        ),
+                    )
+                    .unwrap()
+                    .attribute_params[0]
+                        .type_check_location()
+                        .clone(),
+                    "lint check",
+                ),
             );
             Ok(Vec::new())
         });

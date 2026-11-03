@@ -1,51 +1,66 @@
 //! Provider-dependent evidence recorded by producers and consumed at a terminal boundary.
 
+use indexmap::IndexMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::parser::{
-    ParseWarning, ParseWarningSpan, ProviderContext, SourceSpan, TypeExpr, UserFunction,
-    WarningKind,
+    DeclarationLocation, DirectoryScoped, Located, ParseWarning, ParseWarningSpan, ProviderContext,
+    TypeExpr, UserFunction, WarningKind,
 };
 
 /// Authored ownership of a check, retained independently of evaluated values.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// The parser's location is mandatory for declaration-owned checks.
+///
+/// ```compile_fail,E0599
+/// use carina_core::validation::deferred_types::ProviderTypeCheckSite;
+/// let site = ProviderTypeCheckSite::at_line(std::path::Path::new("sibling.crn"), 3, 7, "check");
+/// ```
+///
+/// ```compile_fail,E0308
+/// use carina_core::{parser::SourceSpan, validation::deferred_types::ProviderTypeCheckSite};
+/// fn fabricate(span: SourceSpan) { let site = ProviderTypeCheckSite::new(span, "check"); }
+/// ```
+///
+/// ```compile_fail,E0061
+/// use carina_core::{parser::SourceSpan, validation::deferred_types::ProviderTypeCheckSite};
+/// fn fabricate(path: &std::path::Path, span: SourceSpan) {
+///     let site = ProviderTypeCheckSite::new(path, span, "check");
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use carina_core::validation::deferred_types::ProviderTypeCheckSite;
+/// let site = ProviderTypeCheckSite::unlocated("check");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderTypeCheckSite {
-    source: PathBuf,
-    line: usize,
-    column: usize,
-    end_line: usize,
-    end_column: usize,
+    owner: ProviderTypeCheckOwner,
     context: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ProviderTypeCheckOwner {
+    Declaration(DeclarationLocation),
+    Directory,
+}
+
 impl ProviderTypeCheckSite {
-    pub fn new(source: &Path, span: SourceSpan, context: impl Into<String>) -> Self {
+    pub fn new(location: DeclarationLocation, context: impl Into<String>) -> Self {
         Self {
-            source: crate::utils::normalize_source_path(source),
-            line: span.start_line(),
-            column: span.start_column(),
-            end_line: span.end_line(),
-            end_column: span.end_column(),
+            owner: ProviderTypeCheckOwner::Declaration(location),
             context: context.into(),
         }
     }
 
-    pub fn at_line(source: &Path, line: usize, column: usize, context: impl Into<String>) -> Self {
+    /// A query without an authored declaration is explicitly directory scoped.
+    pub fn directory_scoped(context: impl Into<String>) -> Self {
         Self {
-            source: crate::utils::normalize_source_path(source),
-            line: line.max(1),
-            column: column.max(1),
-            end_line: line.max(1),
-            end_column: column.max(1) + 1,
+            owner: ProviderTypeCheckOwner::Directory,
             context: context.into(),
         }
-    }
-
-    fn unlocated(context: impl Into<String>) -> Self {
-        Self::at_line(Path::new("<config>"), 1, 1, context)
     }
 }
 
@@ -57,45 +72,40 @@ fn deferred_type_diagnostics_preserve_symlink_parent_source_spelling() {
     std::fs::create_dir(temp.path().join("private/bad")).unwrap();
     std::os::unix::fs::symlink("private/nested", temp.path().join("jump")).unwrap();
     let source = temp.path().join("jump/../bad/main.crn");
-    std::fs::write(&source, "arguments { value: MissingType }\n").unwrap();
-    let span = SourceSpan::dummy();
-    assert_eq!(
-        ProviderTypeCheckSite::new(&source, span, "annotation").source,
-        source
+    let parsed = crate::parser::parse_file(
+        "attributes { value: Missing = 'id' }",
+        &source,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let site = ProviderTypeCheckSite::new(
+        parsed.attribute_params[0].type_check_location().clone(),
+        "annotation",
     );
-    assert_eq!(
-        ProviderTypeCheckSite::at_line(&source, 1, 1, "annotation").source,
-        source
+    assert!(
+        matches!(site.owner, ProviderTypeCheckOwner::Declaration(location) if location.file().path() == source)
     );
 }
 
 /// The evidence belongs exclusively to one run, never to a cloneable catalog.
 #[derive(Debug)]
 struct DeferredProviderTypeChecks<'s> {
-    pending: BTreeMap<ProviderTypeCheckKey, (ProviderTypeCheckSite, TypeExpr)>,
+    pending: IndexMap<ProviderTypeCheckKey, (ProviderTypeCheckSite, TypeExpr)>,
     declarations: BTreeMap<String, Vec<ProviderTypeCheckSite>>,
-    blocked: Vec<ParseWarning>,
+    blocked: Vec<ProviderTypeCheckFinding>,
     brand: PhantomData<fn(&'s ()) -> &'s ()>,
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 struct ProviderTypeCheckKey {
-    source: PathBuf,
-    line: usize,
-    column: usize,
-    end_line: usize,
-    end_column: usize,
+    owner: ProviderTypeCheckOwner,
     type_label: String,
 }
 
 impl DeferredProviderTypeChecks<'_> {
     fn record(&mut self, site: ProviderTypeCheckSite, expected: &TypeExpr) {
         let key = ProviderTypeCheckKey {
-            source: site.source.clone(),
-            line: site.line,
-            column: site.column,
-            end_line: site.end_line,
-            end_column: site.end_column,
+            owner: site.owner.clone(),
             type_label: expected.to_string(),
         };
         self.pending
@@ -296,7 +306,7 @@ impl<'s> TypeCheckSession<'s> {
             brand: PhantomData,
             failed_function_declarations: Mutex::new(BTreeSet::new()),
             evidence: Mutex::new(DeferredProviderTypeChecks {
-                pending: BTreeMap::new(),
+                pending: IndexMap::new(),
                 declarations: BTreeMap::new(),
                 blocked: Vec::new(),
                 brand: PhantomData,
@@ -352,11 +362,13 @@ impl<'s> TypeCheckSession<'s> {
         let unlocated = evidence
             .pending
             .iter()
-            .filter(|(key, _)| key.source == Path::new("<config>") && key.type_label == label)
+            .filter(|(key, _)| {
+                key.owner == ProviderTypeCheckOwner::Directory && key.type_label == label
+            })
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         for key in unlocated {
-            if let Some((_old_site, expected)) = evidence.pending.remove(&key) {
+            if let Some((_old_site, expected)) = evidence.pending.shift_remove(&key) {
                 evidence.record(site.clone(), &expected);
             }
         }
@@ -375,7 +387,7 @@ impl<'s> TypeCheckSession<'s> {
             .declarations
             .get(&expected.to_string())
             .cloned()
-            .unwrap_or_else(|| vec![ProviderTypeCheckSite::unlocated(context)]);
+            .unwrap_or_else(|| vec![ProviderTypeCheckSite::directory_scoped(context)]);
         for site in sites {
             evidence.record(site, expected);
         }
@@ -628,8 +640,33 @@ pub struct ProviderTypeCheckResult<T> {
 
 #[derive(Debug)]
 pub enum ProviderTypeCheckDiagnostic {
-    Deferred(ParseWarning),
-    UnsettledLoadedCheck(ParseWarning),
+    Deferred(ProviderTypeCheckFinding),
+    UnsettledLoadedCheck(ProviderTypeCheckFinding),
+}
+
+/// A declaration finding has parser-owned provenance; a source-free query is
+/// explicitly directory scoped. Legacy CLI warnings are produced only at output.
+#[derive(Debug, Clone)]
+pub enum ProviderTypeCheckFinding {
+    Declaration(Located<ParseWarning>),
+    Directory(DirectoryScoped<ParseWarning>),
+}
+impl ProviderTypeCheckFinding {
+    pub fn into_warning(self) -> ParseWarning {
+        match self {
+            Self::Declaration(finding) => finding.into_parts().1,
+            Self::Directory(finding) => finding.into_detail(),
+        }
+    }
+}
+impl std::ops::Deref for ProviderTypeCheckFinding {
+    type Target = ParseWarning;
+    fn deref(&self) -> &ParseWarning {
+        match self {
+            Self::Declaration(finding) => finding.detail(),
+            Self::Directory(finding) => finding.detail(),
+        }
+    }
 }
 
 impl<T> ProviderTypeCheckResult<T> {
@@ -664,11 +701,27 @@ impl<T> ProviderTypeCheckResult<T> {
             } else {
                 format!("{}: type check for {expected} was deferred because provider schemas were not loaded", site.context)
             };
-            let warning = ParseWarning {
-                kind: WarningKind::ProviderSchemasNotLoaded,
-                file: Some(site.source.display().to_string()), line: site.line,
-                span: Some(ParseWarningSpan { start_line: site.line, start_column: site.column,
-                    end_line: site.end_line, end_column: site.end_column }), message,
+            let warning = match site.owner {
+                ProviderTypeCheckOwner::Declaration(location) => {
+                    let span = location.span();
+                    let warning = ParseWarning {
+                        kind: WarningKind::ProviderSchemasNotLoaded,
+                        file: Some(location.file().path().display().to_string()),
+                        line: span.start_line(),
+                        span: Some(ParseWarningSpan {
+                            start_line: span.start_line(), start_column: span.start_column(),
+                            end_line: span.end_line(), end_column: span.end_column(),
+                        }),
+                        message,
+                    };
+                    ProviderTypeCheckFinding::Declaration(Located::new(location, warning))
+                }
+                ProviderTypeCheckOwner::Directory => ProviderTypeCheckFinding::Directory(
+                    DirectoryScoped::provider_type_check(ParseWarning {
+                        kind: WarningKind::ProviderSchemasNotLoaded,
+                        file: None, line: 0, span: None, message,
+                    })
+                ),
             };
             if loaded { ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(warning) }
             else { ProviderTypeCheckDiagnostic::Deferred(warning) }
@@ -702,10 +755,18 @@ mod tests {
             |session| {
                 session.record(
                     &TypeExpr::String,
-                    ProviderTypeCheckSite::at_line(
-                        Path::new("/project/main.crn"),
-                        4,
-                        2,
+                    ProviderTypeCheckSite::new(
+                        crate::parser::parse_file(
+                            "\n\n\n attributes { value: Missing = 'id' }",
+                            Path::new("/project/main.crn"),
+                            &crate::parser::ProviderContext::new(
+                                crate::EnvironmentSnapshot::empty(),
+                            ),
+                        )
+                        .unwrap()
+                        .attribute_params[0]
+                            .type_check_location()
+                            .clone(),
                         "early check",
                     ),
                 );
@@ -763,10 +824,18 @@ mod tests {
                 )
                 .record_at(
                     context,
-                    ProviderTypeCheckSite::at_line(
-                        Path::new("/project/main.crn"),
-                        1,
-                        1,
+                    ProviderTypeCheckSite::new(
+                        crate::parser::parse_file(
+                            "attributes { value: Missing = 'id' }",
+                            Path::new("/project/main.crn"),
+                            &crate::parser::ProviderContext::new(
+                                crate::EnvironmentSnapshot::empty(),
+                            ),
+                        )
+                        .unwrap()
+                        .attribute_params[0]
+                            .type_check_location()
+                            .clone(),
                         "argument 'ids'",
                     ),
                 )
@@ -787,10 +856,16 @@ mod tests {
                     &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
                 .unwrap(),
-                ProviderTypeCheckSite::at_line(
-                    Path::new("/project/main.crn"),
-                    3,
-                    7,
+                ProviderTypeCheckSite::new(
+                    crate::parser::parse_file(
+                        "\n\n      attributes { value: Missing = 'id' }",
+                        Path::new("/project/main.crn"),
+                        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                    )
+                    .unwrap()
+                    .attribute_params[0]
+                        .type_check_location()
+                        .clone(),
                     "attribute 'x'",
                 ),
             );
@@ -805,10 +880,16 @@ mod tests {
         let result = TypeCheckSession::run(
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |sink| {
-                let site = ProviderTypeCheckSite::at_line(
-                    Path::new("/project/main.crn"),
-                    3,
-                    7,
+                let site = ProviderTypeCheckSite::new(
+                    crate::parser::parse_file(
+                        "\n\n      attributes { value: Missing = 'id' }",
+                        Path::new("/project/main.crn"),
+                        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                    )
+                    .unwrap()
+                    .attribute_params[0]
+                        .type_check_location()
+                        .clone(),
                     "attribute 'x'",
                 );
                 let expected = crate::parser::parse_type_expr_str(
@@ -1076,7 +1157,7 @@ mod producer_tests {
             diagnostics
                 .into_iter()
                 .map(|diagnostic| match diagnostic {
-                    ProviderTypeCheckDiagnostic::Deferred(warning) => warning,
+                    ProviderTypeCheckDiagnostic::Deferred(warning) => warning.into_warning(),
                     other => panic!("unexpected settlement: {other:?}"),
                 })
                 .collect(),
@@ -1317,7 +1398,7 @@ mod producer_tests {
 }
 
 #[cfg(test)]
-mod round6_session_tests {
+mod session_isolation_tests {
     use super::*;
     use crate::parser::{OwnedTypeIdentity, ProviderCustomTypes};
     use crate::schema::{RefinedScalarKind, TypeIdentity};
@@ -1377,7 +1458,20 @@ mod round6_session_tests {
                 let expected = crate::parser::parse_type_expr_str("Missing", &catalog).unwrap();
                 first.record(
                     &expected,
-                    ProviderTypeCheckSite::at_line(Path::new("/project/a.crn"), 3, 5, "first run"),
+                    ProviderTypeCheckSite::new(
+                        crate::parser::parse_file(
+                            "\n\n    attributes { value: Missing = 'id' }",
+                            Path::new("/project/a.crn"),
+                            &crate::parser::ProviderContext::new(
+                                crate::EnvironmentSnapshot::empty(),
+                            ),
+                        )
+                        .unwrap()
+                        .attribute_params[0]
+                            .type_check_location()
+                            .clone(),
+                        "first run",
+                    ),
                 );
             })
             .diagnostics()
@@ -1400,15 +1494,48 @@ mod round6_session_tests {
             session.record_type(&expected, "initial query");
             session.declaration(
                 &expected,
-                ProviderTypeCheckSite::at_line(Path::new("/project/main.crn"), 2, 4, "annotation"),
+                ProviderTypeCheckSite::new(
+                    crate::parser::parse_file(
+                        "\n   attributes { value: Missing = 'id' }",
+                        Path::new("/project/main.crn"),
+                        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                    )
+                    .unwrap()
+                    .attribute_params[0]
+                        .type_check_location()
+                        .clone(),
+                    "annotation",
+                ),
             );
             session.record(
                 &expected,
-                ProviderTypeCheckSite::at_line(Path::new("/project/main.crn"), 3, 7, "query one"),
+                ProviderTypeCheckSite::new(
+                    crate::parser::parse_file(
+                        "\n\n      attributes { value: Missing = 'id' }",
+                        Path::new("/project/main.crn"),
+                        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                    )
+                    .unwrap()
+                    .attribute_params[0]
+                        .type_check_location()
+                        .clone(),
+                    "query one",
+                ),
             );
             session.record(
                 &expected,
-                ProviderTypeCheckSite::at_line(Path::new("/project/main.crn"), 3, 12, "query two"),
+                ProviderTypeCheckSite::new(
+                    crate::parser::parse_file(
+                        "\n\n           attributes { value: Missing = 'id' }",
+                        Path::new("/project/main.crn"),
+                        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                    )
+                    .unwrap()
+                    .attribute_params[0]
+                        .type_check_location()
+                        .clone(),
+                    "query two",
+                ),
             );
         });
         assert_eq!(terminal.diagnostics().len(), 3);

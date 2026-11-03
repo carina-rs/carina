@@ -852,67 +852,6 @@ let vpc = awscc.ec2.Vpc {
 }
 
 #[test]
-fn carina_diagnostic_helper_produces_correct_fields() {
-    use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Range};
-
-    let diag = carina_diagnostic(
-        5,
-        10,
-        20,
-        DiagnosticSeverity::ERROR,
-        "test error message".to_string(),
-    );
-
-    assert_eq!(
-        diag.range,
-        Range {
-            start: Position {
-                line: 5,
-                character: 10,
-            },
-            end: Position {
-                line: 5,
-                character: 20,
-            },
-        }
-    );
-    assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
-    assert_eq!(diag.source, Some("carina".to_string()));
-    assert_eq!(diag.message, "test error message");
-    // Verify default fields are not set
-    assert!(diag.code.is_none());
-    assert!(diag.code_description.is_none());
-    assert!(diag.tags.is_none());
-    assert!(diag.related_information.is_none());
-    assert!(diag.data.is_none());
-}
-
-#[test]
-fn carina_diagnostic_helper_with_multiline_range() {
-    use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Range};
-
-    let diag = carina_diagnostic_range(
-        Range {
-            start: Position {
-                line: 3,
-                character: 0,
-            },
-            end: Position {
-                line: 4,
-                character: 0,
-            },
-        },
-        DiagnosticSeverity::ERROR,
-        "resource-level error".to_string(),
-    );
-
-    assert_eq!(diag.range.start.line, 3);
-    assert_eq!(diag.range.end.line, 4);
-    assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
-    assert_eq!(diag.source, Some("carina".to_string()));
-}
-
-#[test]
 fn unused_for_binding_emits_lsp_diagnostic() {
     // A for-loop binding never referenced in the body should surface as an
     // LSP diagnostic — not only a CLI warning — so editor users see it too.

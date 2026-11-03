@@ -9,7 +9,7 @@ fn slice<'a>(source: &'a str, location: &DeclarationLocation) -> &'a str {
 }
 
 #[test]
-fn review_round3_resolution_preserves_values_and_locations() {
+fn resolution_preserves_values_and_locations() {
     let config = context();
     let parsed = parse_file(
         "let holder = mock.test.Resource { name = target.name }\nlet target = mock.test.Resource { name = 'ready' }\n",
@@ -40,7 +40,7 @@ fn review_round3_resolution_preserves_values_and_locations() {
 }
 
 #[test]
-fn review_round3_type_resolution_preserves_parameter_types() {
+fn type_resolution_preserves_parameter_types() {
     let config = context();
     let source = "arguments { value: String count: Int = 1 }\n";
     let parsed = parse_file(source, Path::new("sibling.crn"), &config).unwrap();
@@ -368,7 +368,7 @@ fn analysis_boundary_rejects_missing_merged_renderer_inventory() {
 }
 
 #[test]
-fn review_round1_loop_inventory_requires_exact_file_identity() {
+fn loop_inventory_requires_exact_file_identity() {
     let source = "for x in ['a'] { mock.test.Resource { name = x } }\n";
     let files = crate::config_loader::parse_directory_files(
         &[
@@ -393,8 +393,8 @@ fn review_round1_loop_inventory_requires_exact_file_identity() {
 }
 
 #[test]
-fn review_round1_provider_analysis_returns_missing_provenance() {
-    let mut parsed = review_round1_provider_directory();
+fn provider_analysis_returns_missing_provenance() {
+    let mut parsed = provider_directory();
     parsed.parser_binding_metadata = Default::default();
     assert!(matches!(
         resolve_provider_unresolved_attributes_for_analysis(&mut parsed, &context()),
@@ -403,8 +403,8 @@ fn review_round1_provider_analysis_returns_missing_provenance() {
 }
 
 #[test]
-fn review_round1_expanded_provider_analysis_returns_missing_provenance() {
-    let mut parsed = review_round1_provider_directory().resolve_root_for_test();
+fn expanded_provider_analysis_returns_missing_provenance() {
+    let mut parsed = provider_directory().resolve_root_for_test();
     parsed.parser_binding_metadata = Default::default();
     assert!(matches!(
         resolve_expanded_provider_unresolved_attributes_for_analysis(&mut parsed, &context()),
@@ -413,8 +413,8 @@ fn review_round1_expanded_provider_analysis_returns_missing_provenance() {
 }
 
 #[test]
-fn review_round1_provider_finalization_returns_missing_provenance() {
-    let mut parsed = review_round1_provider_directory();
+fn provider_finalization_returns_missing_provenance() {
+    let mut parsed = provider_directory();
     parsed.parser_binding_metadata = Default::default();
     assert!(matches!(
         finalize_provider_configs_for_analysis(&mut parsed),
@@ -422,7 +422,7 @@ fn review_round1_provider_finalization_returns_missing_provenance() {
     ));
 }
 
-fn review_round1_provider_directory() -> ParsedFile {
+fn provider_directory() -> ParsedFile {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("main.crn"), "let unrelated = 'main'\n").unwrap();
     std::fs::write(
@@ -439,7 +439,7 @@ fn review_round1_provider_directory() -> ParsedFile {
 }
 
 #[test]
-fn review_round1_filtered_dependencies_keep_later_operand_locations() {
+fn filtered_dependencies_keep_later_operand_locations() {
     let source = "mock.test.Resource { directives { depends_on = [first, first, second] } }\n";
     let files = crate::config_loader::parse_directory_files(
         &[

@@ -1040,13 +1040,8 @@ pub(crate) fn validate_pending_function_type_check(
             &ctx,
             check.source_line,
             Some(
-                crate::validation::deferred_types::ProviderTypeCheckSite::at_line(
-                    check
-                        .source_file
-                        .as_deref()
-                        .unwrap_or_else(|| std::path::Path::new("<config>")),
-                    check.source_line,
-                    check.source_column.unwrap_or(1),
+                crate::validation::deferred_types::ProviderTypeCheckSite::new(
+                    check.location.clone(),
                     format!(
                         "function '{}' parameter '{}'",
                         function.name, parameter.name

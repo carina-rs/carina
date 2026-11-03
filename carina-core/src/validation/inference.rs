@@ -1507,7 +1507,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn review_round3_export_inference_returns_inferred_type() {
+    fn export_inference_returns_inferred_type() {
         let parsed = crate::parser::parse_and_resolve("exports { answer = 'ready' }\n").unwrap();
         let tree = crate::parser::AnalysisTree::try_from_file(&parsed).unwrap();
         let schemas = ProviderLoadedSchemaRegistry::for_test(SchemaRegistry::new());
@@ -1525,7 +1525,7 @@ mod tests {
     }
 
     #[test]
-    fn review_round2_loaded_export_inference_rejects_missing_provenance_without_panicking() {
+    fn loaded_export_inference_rejects_missing_provenance_without_panicking() {
         let mut parsed =
             crate::parser::parse_and_resolve("let source = mock.test.Resource {}\n").unwrap();
         parsed.resources[0].declaration = Default::default();
@@ -1540,7 +1540,7 @@ mod tests {
     }
 
     #[test]
-    fn review_round2_export_inference_retry_rejects_missing_provenance_without_panicking() {
+    fn export_inference_retry_rejects_missing_provenance_without_panicking() {
         let mut parsed =
             crate::parser::parse_and_resolve("let source = mock.test.Resource {}\n").unwrap();
         parsed.resources[0].declaration = Default::default();
@@ -1671,11 +1671,18 @@ mod tests {
     fn integer_arithmetic_requires_proven_operands_but_accepts_typed_deferred_ints() {
         use crate::integer_arithmetic::{IntegerOp, IntegerOperatorSpan, evaluate_integer_values};
 
-        let source = format!("\n{}+", " ".repeat(19));
-        let preprocessed = crate::parser::preprocess_file(&source).expect("test source");
-        let operator_span = IntegerOperatorSpan::from_original_position(
-            preprocessed.original_position(source.len() - 1),
-        );
+        let parsed = crate::parser::parse_file(
+            "arguments { source: Int }\nlet value = source + 1",
+            std::path::Path::new("sibling.crn"),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let Value::Deferred(DeferredValue::IntegerArithmetic(expression)) =
+            &parsed.variables["value"]
+        else {
+            panic!("deferred integer expression")
+        };
+        let operator_span = expression.operator_span();
 
         let bare = evaluate_integer_values(
             Value::Deferred(DeferredValue::BindingRef {

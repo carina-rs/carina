@@ -773,7 +773,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
     }
 
     #[test]
-    fn review_round2_overlapping_cycles_report_only_main_first_ring() {
+    fn overlapping_cycles_report_only_main_first_ring() {
         let parsed = parse_and_resolve("let a = mock.test.Resource { value = c.output directives { depends_on = [b] } }\nlet b = mock.test.Resource { directives { depends_on = [a] } }\nlet c = mock.test.Resource { directives { depends_on = [b] } }\n").unwrap();
         let diagnostics = check(&parsed).unwrap();
         let cycles: Vec<_> = diagnostics
@@ -801,7 +801,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
     }
 
     #[test]
-    fn review_round2_cycles_ignore_deferred_if_branches() {
+    fn cycles_ignore_deferred_if_branches() {
         let parsed = parse_and_resolve("arguments { enabled: Bool }\nlet a = if enabled { mock.test.Resource { value = 'a' directives { depends_on = [b] } } }\nlet b = mock.test.Resource { value = a.output }\n").unwrap();
         let diagnostics = check(&parsed).unwrap();
         assert!(
@@ -814,7 +814,7 @@ let other = wait cert { until = cert.status == "ISSUED" }
     }
 
     #[test]
-    fn review_round2_read_template_depends_on_does_not_enable_cycle_checks() {
+    fn read_template_depends_on_does_not_enable_cycle_checks() {
         let parsed = parse_and_resolve("let a = mock.test.Resource { value = b.output }\nlet b = mock.test.Resource { value = a.output }\nlet up = upstream_state { source = './up' }\nlet copies = for item in up.items { read mock.test.Resource { name = item directives { depends_on = [a] } } }\n").unwrap();
         let diagnostics = check(&parsed).unwrap();
         assert!(

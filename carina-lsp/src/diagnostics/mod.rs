@@ -1,3 +1,4 @@
+mod buffer;
 mod checks;
 mod validation;
 
@@ -12,9 +13,7 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::Document;
 use crate::position;
-use carina_core::parser::{
-    ParseError, ParsedFile, SourceSpan, WarningKind, contains_function_call,
-};
+use carina_core::parser::{ParseError, SourceSpan, WarningKind, contains_function_call};
 use carina_core::provider::{
     HostErrorCause, LoadedProviderSnapshot, ProviderError, ProviderFactory, SuspendedValidationId,
 };
@@ -119,32 +118,6 @@ fn render_analysis_resolution_error(
     }
 }
 
-fn parser_position(doc: &Document, line: u32, column: u32) -> Position {
-    Position::new(
-        line,
-        doc.line_at(line).map_or(column, |source| {
-            position::char_offset_to_utf16_offset(&source, column as usize)
-        }),
-    )
-}
-
-fn parse_error_in_document(doc: &Document, error: &ParseError) -> Diagnostic {
-    let mut diagnostic = parse_error_to_diagnostic(error);
-    diagnostic.range = Range::new(
-        parser_position(
-            doc,
-            diagnostic.range.start.line,
-            diagnostic.range.start.character,
-        ),
-        parser_position(
-            doc,
-            diagnostic.range.end.line,
-            diagnostic.range.end.character,
-        ),
-    );
-    diagnostic
-}
-
 fn parser_span_range(doc: &Document, span: SourceSpan) -> Option<Range> {
     let text = doc.text();
     Some(Range {
@@ -222,9 +195,17 @@ fn render_merged<F: MergedFinding>(
         }
         MergedScope::Directory => Range::default(),
     };
-    Some(carina_diagnostic_range(range, severity, message))
+    Some(Diagnostic {
+        range,
+        severity: Some(severity),
+        source: Some("carina".to_string()),
+        message,
+        ..Default::default()
+    })
 }
 
+/// Syntax errors can use coordinates only from this buffer's own parser.
+/// A directory parse failure without a local syntax error remains file scoped.
 fn render_parse(
     doc: &Document,
     finding: &carina_core::parser::FileScoped<&ParseError>,
@@ -234,22 +215,13 @@ fn render_parse(
     if finding.file().path() != doc.source_file() {
         return None;
     }
-    let mut diagnostic = parse_error_in_document(doc, finding.detail());
-    diagnostic.severity = Some(severity);
-    diagnostic.message = message;
-    Some(diagnostic)
-}
-
-fn integer_operator_range(
-    doc: &Document,
-    span: carina_core::integer_arithmetic::IntegerOperatorSpan,
-) -> Option<Range> {
-    let line = span.line()?.checked_sub(1)? as u32;
-    let column = span.column()?.checked_sub(1)? as u32;
-    Some(Range::new(
-        parser_position(doc, line, column),
-        parser_position(doc, line, column + 1),
-    ))
+    if let Some(mut diagnostic) = buffer::render_document_parse_error(doc) {
+        diagnostic.severity = Some(severity);
+        diagnostic.message = message;
+        Some(diagnostic)
+    } else {
+        render_merged(doc, finding, severity, message)
+    }
 }
 
 fn render_module_call_findings(
@@ -266,12 +238,8 @@ fn render_module_call_findings(
                 DiagnosticSeverity::ERROR,
                 finding.detail().message().to_string(),
             )?;
-            if let Some(type_error) = finding.detail().message().type_error()
-                && let Some(schema) =
-                    build_schema_diagnostic_from_error(type_error, Some(diagnostic.range))
-            {
-                diagnostic.data = schema.data;
-                diagnostic.code = schema.code;
+            if let Some(type_error) = finding.detail().message().type_error() {
+                decorate_schema_diagnostic(&mut diagnostic, type_error);
             }
             Some(diagnostic)
         })
@@ -307,66 +275,6 @@ impl ProviderValidationDeduplicator {
                 input_id,
             ))
     }
-}
-
-/// Create a `Diagnostic` on a single line with the standard "carina" source.
-pub(crate) fn carina_diagnostic(
-    line: u32,
-    start_col: u32,
-    end_col: u32,
-    severity: DiagnosticSeverity,
-    message: String,
-) -> Diagnostic {
-    Diagnostic {
-        range: Range {
-            start: Position {
-                line,
-                character: start_col,
-            },
-            end: Position {
-                line,
-                character: end_col,
-            },
-        },
-        severity: Some(severity),
-        source: Some("carina".to_string()),
-        message,
-        ..Default::default()
-    }
-}
-
-/// Create a `Diagnostic` with an arbitrary `Range` and the standard "carina" source.
-pub(crate) fn carina_diagnostic_range(
-    range: Range,
-    severity: DiagnosticSeverity,
-    message: String,
-) -> Diagnostic {
-    Diagnostic {
-        range,
-        severity: Some(severity),
-        source: Some("carina".to_string()),
-        message,
-        ..Default::default()
-    }
-}
-
-fn push_integer_arithmetic_diagnostic(
-    diagnostics: &mut Vec<Diagnostic>,
-    range: Range,
-    message: String,
-) {
-    if diagnostics.iter().any(|diagnostic| {
-        diagnostic.range == range
-            && diagnostic.severity == Some(DiagnosticSeverity::ERROR)
-            && diagnostic.message == message
-    }) {
-        return;
-    }
-    diagnostics.push(carina_diagnostic_range(
-        range,
-        DiagnosticSeverity::ERROR,
-        message,
-    ));
 }
 
 enum DiagnosticProviderContext {
@@ -453,6 +361,26 @@ impl std::ops::Deref for DiagnosticProviderContext {
     }
 }
 
+/// Analysis findings are rendered from parser-owned locations. Raw coordinate
+/// constructors are private to buffer syntax and style lint rendering.
+///
+/// ```compile_fail,E0432
+/// use carina_lsp::diagnostics::carina_diagnostic;
+/// use tower_lsp::lsp_types::DiagnosticSeverity;
+/// let finding = carina_diagnostic(3, 7, 8, DiagnosticSeverity::ERROR, "finding".into());
+/// ```
+///
+/// ```compile_fail,E0603
+/// use carina_lsp::diagnostics::buffer::carina_diagnostic_range;
+/// use tower_lsp::lsp_types::{DiagnosticSeverity, Range};
+/// let finding = carina_diagnostic_range(Range::default(), DiagnosticSeverity::ERROR, "finding".into());
+/// ```
+///
+/// Arithmetic findings cannot be rendered from file-free line/column spans.
+///
+/// ```compile_fail,E0432
+/// use carina_lsp::diagnostics::integer_operator_range;
+/// ```
 pub struct DiagnosticEngine {
     schemas: Arc<SchemaRegistry>,
     loaded_providers: Option<Arc<LoadedProviderSnapshot>>,
@@ -478,31 +406,17 @@ impl carina_core::validation::deferred_types::ProviderTypeCheckSink for LspTypeC
                 carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning) => (warning, DiagnosticSeverity::WARNING, "providers_not_loaded"),
                 carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => (error, DiagnosticSeverity::ERROR, "unsettled_provider_type_check"),
             };
-        let other_source = warning
-            .file
-            .as_deref()
-            .filter(|file| *file != "<config>")
-            .is_some_and(|file| Path::new(file) != self.doc.source_file());
-        if other_source {
+        let diagnostic = match &warning {
+            carina_core::validation::deferred_types::ProviderTypeCheckFinding::Declaration(
+                finding,
+            ) => render_merged(self.doc, finding, severity, warning.message.clone()),
+            carina_core::validation::deferred_types::ProviderTypeCheckFinding::Directory(
+                finding,
+            ) => render_merged(self.doc, finding, severity, warning.message.clone()),
+        };
+        let Some(mut diagnostic) = diagnostic else {
             return;
-        }
-        let span = warning.span.expect("provider check source span");
-        let mut diagnostic = carina_diagnostic_range(
-            Range::new(
-                parser_position(
-                    self.doc,
-                    (span.start_line - 1) as u32,
-                    (span.start_column - 1) as u32,
-                ),
-                parser_position(
-                    self.doc,
-                    (span.end_line - 1) as u32,
-                    (span.end_column - 1) as u32,
-                ),
-            ),
-            severity,
-            warning.message,
-        );
+        };
         diagnostic.code = Some(tower_lsp::lsp_types::NumberOrString::String(code.into()));
         self.diagnostics.push(diagnostic);
     }
@@ -731,7 +645,7 @@ impl DiagnosticRun<'_> {
                 .iter()
                 .any(|duplicate| duplicate.covers_parse_error(error))
         {
-            diagnostics.push(parse_error_in_document(doc, error));
+            diagnostics.extend(buffer::render_document_parse_error(doc));
         }
         diagnostics.extend(self.duplicate_declaration_diagnostics(doc, &duplicates));
         let merged = directory
@@ -971,7 +885,7 @@ impl DiagnosticRun<'_> {
             }
         }
 
-        // `known_bindings` for the text-scan undefined-reference check.
+        // Directory binding authority for parser-owned reference occurrences.
         // When the merged parse succeeds, `BindingNameSet::from_parsed`
         // yields every binding declared anywhere in the directory. When
         // it fails (`merged = None` because a parse error somewhere in
@@ -1002,11 +916,14 @@ impl DiagnosticRun<'_> {
                 },
             ),
         };
-        diagnostics.extend(self.check_undefined_references(
-            &text,
-            &known_bindings,
-            &declared_providers,
-        ));
+        if let Some(tree) = preferred_analysis {
+            diagnostics.extend(self.check_undefined_references(
+                doc,
+                tree,
+                &known_bindings,
+                &declared_providers,
+            ));
+        }
 
         // Semantic analysis on parsed file
         if let (Some(parsed), Some(tree), Some(preferred_tree)) = (
@@ -1024,12 +941,12 @@ impl DiagnosticRun<'_> {
             // Check provider region
             diagnostics.extend(self.check_provider_region(
                 doc,
-                parsed,
+                preferred_tree,
                 &provider_validation_deduplicator,
             ));
 
             // Check for unloaded providers
-            diagnostics.extend(self.check_unloaded_providers(doc, parsed));
+            diagnostics.extend(self.check_unloaded_providers(doc, preferred_tree));
 
             if let Some(base) = base_path {
                 diagnostics.extend(self.check_upstream_state_sources(doc, preferred_tree, base));
@@ -1143,17 +1060,19 @@ impl DiagnosticRun<'_> {
             // schema authority remains directory-wide, while source anchoring
             // comes from each authored operator.
             for finding in carina_core::validation::check_file_integer_arithmetic_values(
-                parsed,
+                tree,
                 &inference_bindings,
                 &self.schemas,
                 &binding_index,
             ) {
-                if let Some(range) = integer_operator_range(doc, finding.operator_span()) {
-                    push_integer_arithmetic_diagnostic(
-                        &mut diagnostics,
-                        range,
-                        finding.to_string(),
-                    );
+                if let Some(diagnostic) = render_merged(
+                    doc,
+                    &finding,
+                    DiagnosticSeverity::ERROR,
+                    finding.detail().to_string(),
+                ) && !diagnostics.contains(&diagnostic)
+                {
+                    diagnostics.push(diagnostic);
                 }
             }
             // A direct bare binding occupies the complete attribute value, so
@@ -1202,12 +1121,8 @@ impl DiagnosticRun<'_> {
                 ) else {
                     continue;
                 };
-                if let Some(type_error) = finding.error.type_error()
-                    && let Some(schema) =
-                        build_schema_diagnostic_from_error(type_error, Some(diagnostic.range))
-                {
-                    diagnostic.data = schema.data;
-                    diagnostic.code = schema.code;
+                if let Some(type_error) = finding.error.type_error() {
+                    decorate_schema_diagnostic(&mut diagnostic, type_error);
                 }
                 diagnostics.push(diagnostic);
             }
@@ -2097,8 +2012,8 @@ impl DiagnosticRun<'_> {
             // the parser) as LSP diagnostics. Other ParseWarnings (e.g. the
             // upstream_state "validate does not inspect" note) are informational
             // context meant for CLI output only and are not elevated here.
-            diagnostics.extend(self.check_unused_for_bindings(doc, parsed));
-            diagnostics.extend(self.check_single_quoted_interpolation_warnings(doc, parsed));
+            diagnostics.extend(self.check_unused_for_bindings(doc));
+            diagnostics.extend(self.check_single_quoted_interpolation_warnings(doc));
 
             // Check for unknown attributes on resource references (typo detection)
             diagnostics.extend(self.check_resource_ref_attributes(
@@ -2327,145 +2242,6 @@ impl DiagnosticEngine {
         catalog.custom_types = loaded_catalog.with_failed_providers(failed);
         Some(catalog)
     }
-
-    /// Check for duplicate attribute keys within the same block.
-    fn check_duplicate_attrs(&self, doc: &Document) -> Vec<Diagnostic> {
-        let text = doc.text();
-        let duplicates = carina_core::lint::find_duplicate_attrs(&text);
-
-        duplicates
-            .into_iter()
-            .map(|dup| {
-                // Convert 1-indexed line to 0-indexed
-                let line = (dup.line - 1) as u32;
-                // Convert the detector's 1-indexed character column to LSP's
-                // 0-indexed character offset.
-                let col = dup.column.saturating_sub(1) as u32;
-
-                carina_diagnostic_range(
-                    Range::new(parser_position(doc, line, col), parser_position(doc, line, dup.end_column.saturating_sub(1) as u32)),
-                    DiagnosticSeverity::WARNING,
-                    format!(
-                        "Duplicate attribute '{}' (first defined on line {}). The last value will be used.",
-                        dup.name, dup.first_line
-                    ),
-                )
-            })
-            .collect()
-    }
-
-    /// Check for direct calls to pipe-preferred functions (info-level).
-    fn check_pipe_preferred_direct_calls(&self, doc: &Document) -> Vec<Diagnostic> {
-        let text = doc.text();
-        let warnings = carina_core::lint::find_pipe_preferred_direct_calls(&text);
-
-        warnings
-            .into_iter()
-            .filter_map(|pw| {
-                let line = (pw.line - 1) as u32;
-                let line_text = text.lines().nth(pw.line - 1)?;
-                let pattern = format!("{}(", pw.name);
-                let byte_pos = line_text.find(&pattern)?;
-                let col = position::byte_offset_to_char_offset(line_text, byte_pos);
-
-                Some(carina_diagnostic(
-                    line,
-                    col,
-                    col + pw.name.len() as u32,
-                    DiagnosticSeverity::INFORMATION,
-                    format!(
-                        "Consider using pipe form for '{}': data |> {}(...)",
-                        pw.name, pw.name
-                    ),
-                ))
-            })
-            .collect()
-    }
-
-    /// Elevate "for-loop binding '<name>' is unused" parse warnings to LSP
-    /// diagnostics. Other ParseWarnings are intentionally not surfaced here:
-    /// informational notes (e.g. upstream_state "validate does not inspect")
-    /// belong on the CLI, not as editor squiggles.
-    fn check_unused_for_bindings(&self, doc: &Document, parsed: &ParsedFile) -> Vec<Diagnostic> {
-        let prefix = "for-loop binding '";
-        let text = doc.text();
-        parsed
-            .warnings
-            .iter()
-            .filter_map(|w| {
-                if w.kind != WarningKind::UnusedForBinding {
-                    return None;
-                }
-                let rest = w.message.strip_prefix(prefix)?;
-                let name = rest.split('\'').next()?;
-                let line_idx = w.line.checked_sub(1)?;
-                let line_text = text.lines().nth(line_idx)?;
-                let byte_pos = line_text.find(name)?;
-                let col = position::byte_offset_to_char_offset(line_text, byte_pos);
-                Some(carina_diagnostic(
-                    line_idx as u32,
-                    col,
-                    col + position::char_len(&name),
-                    DiagnosticSeverity::WARNING,
-                    w.message.clone(),
-                ))
-            })
-            .collect()
-    }
-
-    fn check_single_quoted_interpolation_warnings(
-        &self,
-        doc: &Document,
-        parsed: &ParsedFile,
-    ) -> Vec<Diagnostic> {
-        parsed
-            .warnings
-            .iter()
-            .filter(|w| w.kind == WarningKind::SingleQuotedInterpolation)
-            .filter_map(|w| {
-                let span = w.span.as_ref()?;
-                let line = span.start_line.checked_sub(1)? as u32;
-                let start_col = span.start_column.checked_sub(1)? as u32;
-                let end_col = span.end_column.checked_sub(1)? as u32;
-                Some(carina_diagnostic_range(
-                    Range::new(
-                        parser_position(doc, line, start_col),
-                        parser_position(doc, line, end_col),
-                    ),
-                    DiagnosticSeverity::WARNING,
-                    w.message.clone(),
-                ))
-            })
-            .collect()
-    }
-
-    /// Check for non-snake_case binding names (info-level).
-    fn check_non_snake_case_bindings(&self, doc: &Document) -> Vec<Diagnostic> {
-        let text = doc.text();
-        let warnings = carina_core::lint::find_non_snake_case_bindings(&text);
-
-        warnings
-            .into_iter()
-            .filter_map(|nw| {
-                let line = (nw.line - 1) as u32;
-                let line_text = text.lines().nth(nw.line - 1)?;
-                // Find the binding name position in the line
-                let byte_pos = line_text.find(&nw.name)?;
-                let col = position::byte_offset_to_char_offset(line_text, byte_pos);
-
-                Some(carina_diagnostic(
-                    line,
-                    col,
-                    col + nw.name.len() as u32,
-                    DiagnosticSeverity::INFORMATION,
-                    format!(
-                        "Binding '{}' is not snake_case. Use snake_case for binding names (e.g., 'my_resource').",
-                        nw.name
-                    ),
-                ))
-            })
-            .collect()
-    }
 }
 
 /// Build a `Diagnostic` for a failed direct `Enum` attribute validation,
@@ -2606,27 +2382,10 @@ fn render_schema_diagnostic(
     Some(diagnostic)
 }
 
-pub(super) fn build_schema_diagnostic_from_error(
-    error: &carina_core::schema::TypeError,
-    value_range: Option<tower_lsp::lsp_types::Range>,
-) -> Option<Diagnostic> {
-    let range = value_range?;
-    if is_duplicate_list_error(error) {
-        return Some(carina_diagnostic_range(
-            range,
-            DiagnosticSeverity::ERROR,
-            error.to_string(),
-        ));
+fn decorate_schema_diagnostic(diagnostic: &mut Diagnostic, error: &carina_core::schema::TypeError) {
+    if let Some(data) = crate::code_action::enum_diagnostic_data_for_error(error) {
+        diagnostic.data = Some(serde_json::to_value(data).expect("EnumDiagnosticData serialize"));
     }
-    let data = crate::code_action::enum_diagnostic_data_for_error(error)?;
-    Some(Diagnostic {
-        range,
-        severity: Some(DiagnosticSeverity::WARNING),
-        source: Some("carina".to_string()),
-        message: error.to_string(),
-        data: Some(serde_json::to_value(data).expect("EnumDiagnosticData serialize")),
-        ..Default::default()
-    })
 }
 
 /// Check whether a ResourceRef value is type-compatible with the expected attribute type.
@@ -2657,268 +2416,4 @@ fn check_resource_ref_type_mismatch(
         mismatch.actual_type_name(),
         mismatch.origin_description(path),
     ))
-}
-
-fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
-    match error {
-        ParseError::Located { error, .. } => parse_error_to_diagnostic(error),
-        ParseError::AtElement(finding) => parse_error_to_diagnostic(finding.detail()),
-        ParseError::Syntax(pest_error) => {
-            let (line, col) = match pest_error.line_col {
-                pest::error::LineColLocation::Pos((line, col)) => (line, col),
-                pest::error::LineColLocation::Span((line, col), _) => (line, col),
-            };
-
-            carina_diagnostic(
-                (line.saturating_sub(1)) as u32,
-                (col.saturating_sub(1)) as u32,
-                col as u32,
-                DiagnosticSeverity::ERROR,
-                format!("{}", pest_error),
-            )
-        }
-        ParseError::InvalidExpression { line, message } => carina_diagnostic(
-            (*line as u32).saturating_sub(1),
-            0,
-            100,
-            DiagnosticSeverity::ERROR,
-            message.clone(),
-        ),
-        ParseError::IntegerArithmetic {
-            line,
-            column,
-            end_column,
-            message,
-        } => carina_diagnostic(
-            line.saturating_sub(1) as u32,
-            column.saturating_sub(1) as u32,
-            end_column.saturating_sub(1) as u32,
-            DiagnosticSeverity::ERROR,
-            message.clone(),
-        ),
-        ParseError::UnresolvedDeclarationType {
-            token,
-            line: _line,
-            message,
-        } => {
-            let span = token.span();
-            carina_diagnostic_range(
-                Range::new(
-                    Position::new(
-                        span.start_line().saturating_sub(1) as u32,
-                        span.start_column().saturating_sub(1) as u32,
-                    ),
-                    Position::new(
-                        span.end_line().saturating_sub(1) as u32,
-                        span.end_column().saturating_sub(1) as u32,
-                    ),
-                ),
-                DiagnosticSeverity::ERROR,
-                message.clone(),
-            )
-        }
-        ParseError::UnknownFunction { name, line, column } => carina_diagnostic(
-            (*line as u32).saturating_sub(1),
-            (*column as u32).saturating_sub(1),
-            column.saturating_sub(1) as u32 + name.len() as u32,
-            DiagnosticSeverity::ERROR,
-            format!("Unknown function '{name}'"),
-        ),
-        ParseError::ReservedResourceAttribute {
-            attribute,
-            line,
-            column,
-            end_line,
-            end_column,
-        } => carina_diagnostic_range(
-            Range {
-                start: Position {
-                    line: line.saturating_sub(1) as u32,
-                    character: column.saturating_sub(1) as u32,
-                },
-                end: Position {
-                    line: end_line.saturating_sub(1) as u32,
-                    character: end_column.saturating_sub(1) as u32,
-                },
-            },
-            DiagnosticSeverity::ERROR,
-            format!(
-                "Reserved attribute name '{attribute}': names starting with '_' are reserved for Carina"
-            ),
-        ),
-        ParseError::SecretDerivedBackendAttribute {
-            line,
-            start_column,
-            end_column,
-            ..
-        } => carina_diagnostic(
-            line.saturating_sub(1) as u32,
-            start_column.saturating_sub(1) as u32,
-            end_column.saturating_sub(1) as u32,
-            DiagnosticSeverity::ERROR,
-            error.to_string(),
-        ),
-        ParseError::InterpolationNotAllowedInLiteralString { line } => carina_diagnostic(
-            (*line as u32).saturating_sub(1),
-            0,
-            100,
-            DiagnosticSeverity::ERROR,
-            "interpolation is not allowed in this string literal".to_string(),
-        ),
-        ParseError::UnboundLoopRead {
-            span: Some(span), ..
-        } => carina_diagnostic_range(
-            Range {
-                start: Position {
-                    line: span.start_line().saturating_sub(1) as u32,
-                    character: span.start_column().saturating_sub(1) as u32,
-                },
-                end: Position {
-                    line: span.end_line().saturating_sub(1) as u32,
-                    character: span.end_column().saturating_sub(1) as u32,
-                },
-            },
-            DiagnosticSeverity::ERROR,
-            error.to_string(),
-        ),
-        ParseError::UnboundLoopRead {
-            line, span: None, ..
-        } => carina_diagnostic(
-            line.saturating_sub(1) as u32,
-            0,
-            100,
-            DiagnosticSeverity::ERROR,
-            error.to_string(),
-        ),
-        ParseError::DeferredForBodyUnsupported(details) => carina_diagnostic_range(
-            Range {
-                start: Position {
-                    line: details.span.start_line().saturating_sub(1) as u32,
-                    character: details.span.start_column().saturating_sub(1) as u32,
-                },
-                end: Position {
-                    line: details.span.end_line().saturating_sub(1) as u32,
-                    character: details.span.end_column().saturating_sub(1) as u32,
-                },
-            },
-            DiagnosticSeverity::ERROR,
-            error.to_string(),
-        ),
-        ParseError::DeferredForBodyTemplate {
-            line: _,
-            header: _,
-            span,
-            error: _,
-        } => carina_diagnostic_range(
-            Range {
-                start: Position {
-                    line: span.start_line().saturating_sub(1) as u32,
-                    character: span.start_column().saturating_sub(1) as u32,
-                },
-                end: Position {
-                    line: span.end_line().saturating_sub(1) as u32,
-                    character: span.end_column().saturating_sub(1) as u32,
-                },
-            },
-            DiagnosticSeverity::ERROR,
-            error.to_string(),
-        ),
-        ParseError::InvalidResourceIdentity { line, error } => carina_diagnostic(
-            (*line as u32).saturating_sub(1),
-            0,
-            100,
-            DiagnosticSeverity::ERROR,
-            error.to_string(),
-        ),
-        ParseError::UndefinedVariable(name) => carina_diagnostic_range(
-            Range::default(),
-            DiagnosticSeverity::ERROR,
-            format!("Undefined variable: {}", name),
-        ),
-        ParseError::InvalidResourceType(name) => carina_diagnostic_range(
-            Range::default(),
-            DiagnosticSeverity::ERROR,
-            format!("Invalid resource type: {}", name),
-        ),
-        ParseError::DuplicateModule(name) => carina_diagnostic_range(
-            Range::default(),
-            DiagnosticSeverity::ERROR,
-            format!("Duplicate module definition: {}", name),
-        ),
-        ParseError::DuplicateBinding { name, line } => carina_diagnostic(
-            (line - 1) as u32,
-            0,
-            0,
-            DiagnosticSeverity::ERROR,
-            format!("Duplicate binding: {}", name),
-        ),
-        err @ ParseError::UndefinedDeferredIterable { span, .. } => carina_diagnostic_range(
-            Range {
-                start: Position {
-                    line: span.start_line().saturating_sub(1) as u32,
-                    character: span.start_column().saturating_sub(1) as u32,
-                },
-                end: Position {
-                    line: span.end_line().saturating_sub(1) as u32,
-                    character: span.end_column().saturating_sub(1) as u32,
-                },
-            },
-            DiagnosticSeverity::ERROR,
-            err.to_string(),
-        ),
-        err @ ParseError::UndefinedIdentifier {
-            span: Some(span), ..
-        } => carina_diagnostic_range(
-            Range {
-                start: Position {
-                    line: span.start_line().saturating_sub(1) as u32,
-                    character: span.start_column().saturating_sub(1) as u32,
-                },
-                end: Position {
-                    line: span.end_line().saturating_sub(1) as u32,
-                    character: span.end_column().saturating_sub(1) as u32,
-                },
-            },
-            DiagnosticSeverity::ERROR,
-            err.to_string(),
-        ),
-        err @ ParseError::UndefinedIdentifier {
-            line, span: None, ..
-        } => carina_diagnostic(
-            line.saturating_sub(1) as u32,
-            0,
-            0,
-            DiagnosticSeverity::ERROR,
-            err.to_string(),
-        ),
-        ParseError::ModuleNotFound(name) => carina_diagnostic_range(
-            Range::default(),
-            DiagnosticSeverity::ERROR,
-            format!("Module not found: {}", name),
-        ),
-        ParseError::InternalError { expected, context } => carina_diagnostic_range(
-            Range::default(),
-            DiagnosticSeverity::ERROR,
-            format!(
-                "Internal parser error: expected {} in {}",
-                expected, context
-            ),
-        ),
-        ParseError::RecursiveFunction(name) => carina_diagnostic_range(
-            Range::default(),
-            DiagnosticSeverity::ERROR,
-            format!("Recursive function call detected: {}", name),
-        ),
-        err @ ParseError::CyclicLetBinding { .. } => {
-            carina_diagnostic_range(Range::default(), DiagnosticSeverity::ERROR, err.to_string())
-        }
-        ParseError::UserFunctionError(msg) => {
-            carina_diagnostic_range(Range::default(), DiagnosticSeverity::ERROR, msg.to_string())
-        }
-        ParseError::UnavailableSecret(error) => carina_diagnostic_range(
-            Range::default(),
-            DiagnosticSeverity::ERROR,
-            error.to_string(),
-        ),
-    }
 }

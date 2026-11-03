@@ -43,7 +43,7 @@ fn assert_cycle(files: &[(&str, &str)], expected: &str, anchor: &str) {
 }
 
 #[test]
-fn review_round2_cycle_is_one_cli_error() {
+fn cycle_is_one_cli_error() {
     assert_cycle(
         &[
             (
@@ -61,7 +61,7 @@ fn review_round2_cycle_is_one_cli_error() {
 }
 
 #[test]
-fn review_round2_cycle_preserves_main_ring_order_and_first_cycle() {
+fn cycle_preserves_main_ring_order_and_first_cycle() {
     assert_cycle(
         &[
             (
@@ -79,7 +79,7 @@ fn review_round2_cycle_preserves_main_ring_order_and_first_cycle() {
 }
 
 #[test]
-fn review_round2_cycle_includes_bare_binding_dependencies() {
+fn cycle_includes_bare_binding_dependencies() {
     assert_cycle(
         &[
             (
@@ -97,7 +97,7 @@ fn review_round2_cycle_includes_bare_binding_dependencies() {
 }
 
 #[test]
-fn review_round2_cycle_includes_aliased_binding_dependencies() {
+fn cycle_includes_aliased_binding_dependencies() {
     assert_cycle(
         &[
             (
@@ -115,7 +115,7 @@ fn review_round2_cycle_includes_aliased_binding_dependencies() {
 }
 
 #[test]
-fn review_round2_cycle_includes_selected_binding_dependencies() {
+fn cycle_includes_selected_binding_dependencies() {
     assert_cycle(
         &[
             (
@@ -133,7 +133,7 @@ fn review_round2_cycle_includes_selected_binding_dependencies() {
 }
 
 #[test]
-fn review_round2_module_handle_dependency_origins_preserve_validation() {
+fn module_handle_dependency_origins_preserve_validation() {
     let dir = fixture(&[
         (
             "main.crn",
@@ -167,7 +167,7 @@ fn upstream_fixture(source: &str) -> tempfile::TempDir {
 }
 
 #[test]
-fn review_round2_upstream_shapes_skip_unused_let_values() {
+fn upstream_shapes_skip_unused_let_values() {
     let dir = upstream_fixture("let field = up.names.bad\nlet index = up.names['bad']\n");
     let (output, text) = validate(&dir.path().join("down"));
     assert!(output.status.success(), "{text}");
@@ -178,7 +178,7 @@ fn review_round2_upstream_shapes_skip_unused_let_values() {
 }
 
 #[test]
-fn review_round2_upstream_shapes_skip_attribute_parameter_values() {
+fn upstream_shapes_skip_attribute_parameter_values() {
     let dir = upstream_fixture(
         "attributes { field: String = up.names.bad index: String = up.names['bad'] }\n",
     );
@@ -191,7 +191,7 @@ fn review_round2_upstream_shapes_skip_attribute_parameter_values() {
 }
 
 #[test]
-fn review_round4_identity_conflict_stops_before_upstream_shapes() {
+fn identity_conflict_stops_before_upstream_shapes() {
     let dir = upstream_fixture(
         "mock.test.Thing { name = 'alpha' }\nmock.test.Thing { name = 'beta' }\nlet consumer = mock.test.resource { name = 'valid' }\n",
     );
@@ -226,7 +226,7 @@ fn review_round4_identity_conflict_stops_before_upstream_shapes() {
 }
 
 #[test]
-fn review_round2_upstream_expanded_copies_keep_each_context() {
+fn upstream_expanded_copies_keep_each_context() {
     for expression in ["up.names.bad", "up.names['bad']"] {
         let dir = upstream_fixture(&format!(
             "let copies = for n in [1, 2] {{\n  mock.test.resource {{ name = {expression} }}\n}}\n"
@@ -252,7 +252,7 @@ fn review_round2_upstream_expanded_copies_keep_each_context() {
 }
 
 #[test]
-fn review_round2_upstream_iterable_aliases_keep_each_occurrence() {
+fn upstream_iterable_aliases_keep_each_occurrence() {
     let dir = upstream_fixture(
         "let values = up.scalar\nlet copies = for n in (values ?? values) { mock.test.resource { name = n } }\n",
     );
@@ -274,7 +274,7 @@ fn review_round2_upstream_iterable_aliases_keep_each_occurrence() {
 }
 
 #[test]
-fn review_round2_upstream_iterable_keeps_repeated_occurrences() {
+fn upstream_iterable_keeps_repeated_occurrences() {
     let dir = upstream_fixture(
         "let copies = for n in (up.names.bad ?? up.names.bad) {\n  mock.test.resource { name = n }\n}\n",
     );

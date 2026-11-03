@@ -2690,7 +2690,7 @@ fn bind_constraint_expression(
                 line,
                 source_file,
             )?),
-            operator_span: *operator_span,
+            operator_span: operator_span.clone(),
         },
         ValidateExpr::And(lhs, rhs) => ValidateExpr::And(
             Box::new(bind_constraint_expression(
@@ -3926,7 +3926,7 @@ fn resolve_module_constraint_expression(
             lhs: Box::new(resolve_module_constraint_expression(lhs, resolver)?),
             op: *op,
             rhs: Box::new(resolve_module_constraint_expression(rhs, resolver)?),
-            operator_span: *operator_span,
+            operator_span: operator_span.clone(),
         },
         ValidateExpr::Compare { lhs, op, rhs } => ValidateExpr::Compare {
             lhs: Box::new(resolve_module_constraint_expression(lhs, resolver)?),

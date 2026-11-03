@@ -5,7 +5,7 @@ use carina_core::schema::{
 use tower_lsp::lsp_types::{InsertTextFormat, TextEdit};
 
 #[test]
-fn review_round3_completion_interpolation_after_non_bmp_uses_utf16() {
+fn completion_interpolation_after_non_bmp_uses_utf16() {
     let source = "let helper = test.foo.bar { attr = 'value' }\nlet role = test.foo.bar {\n  attr = \"😀 ${hel}\"\n}\n";
     let line = source.lines().nth(2).unwrap();
     let start = line.find("hel").unwrap();
@@ -27,7 +27,7 @@ fn review_round3_completion_interpolation_after_non_bmp_uses_utf16() {
 }
 
 #[test]
-fn review_round3_completion_inline_reference_edit_after_non_bmp_uses_utf16() {
+fn completion_inline_reference_edit_after_non_bmp_uses_utf16() {
     let source = "let helper = test.foo.bar { attr = 'value' }\nlet role = test.foo.bar { name = '😀' attr = helper.at}\n";
     let line = source.lines().nth(1).unwrap();
     let start = line.find("helper.at").unwrap();

@@ -2381,12 +2381,12 @@ impl<P: ValueKind, B: BindingAddress> ValidationBlock<P, B> {
         condition: ValidateExpr<P, B>,
         error_message: Option<String>,
         source_span: SourceSpan,
-        source_file: PathBuf,
+        source_location: super::DeclarationLocation,
     ) -> Self {
         Self {
             condition,
             error_message,
-            source: DeclarationSource::authored(source_span, source_file),
+            source: DeclarationSource::authored(source_span, source_location),
         }
     }
 
@@ -2396,7 +2396,7 @@ impl<P: ValueKind, B: BindingAddress> ValidationBlock<P, B> {
             condition,
             error_message,
             SourceSpan::dummy(),
-            PathBuf::from("test.crn"),
+            ModuleCallId::test_dummy_in("test.crn").location,
         )
     }
 
@@ -2727,12 +2727,12 @@ impl<P: ValueKind, B: BindingAddress> RequireBlock<P, B> {
         condition: ValidateExpr<P, B>,
         error_message: String,
         source_span: SourceSpan,
-        source_file: PathBuf,
+        source_location: super::DeclarationLocation,
     ) -> Self {
         Self {
             condition,
             error_message,
-            source: DeclarationSource::authored(source_span, source_file),
+            source: DeclarationSource::authored(source_span, source_location),
         }
     }
 
@@ -2742,7 +2742,7 @@ impl<P: ValueKind, B: BindingAddress> RequireBlock<P, B> {
             condition,
             error_message,
             SourceSpan::dummy(),
-            PathBuf::from("test.crn"),
+            ModuleCallId::test_dummy_in("test.crn").location,
         )
     }
 
@@ -2863,18 +2863,22 @@ pub struct AttributeParameter<
 }
 
 impl<P: ValueKind, B: BindingAddress> AttributeParameter<TypeExpr, P, B> {
+    pub fn type_check_location(&self) -> &super::DeclarationLocation {
+        &self.source.location
+    }
+
     pub(crate) fn new_in_source(
         name: String,
         type_expr: Option<TypeExpr>,
         value: Option<BoundaryExpression<P, B>>,
         source_span: SourceSpan,
-        source_file: PathBuf,
+        source_location: super::DeclarationLocation,
     ) -> Self {
         Self {
             name,
             static_type: type_expr,
             value,
-            source: DeclarationSource::authored(source_span, source_file),
+            source: DeclarationSource::authored(source_span, source_location),
         }
     }
 
@@ -2889,7 +2893,7 @@ impl<P: ValueKind, B: BindingAddress> AttributeParameter<TypeExpr, P, B> {
             type_expr,
             value.map(BoundaryExpression::Value),
             SourceSpan::dummy(),
-            PathBuf::from("test.crn"),
+            ModuleCallId::test_dummy_in("test.crn").location,
         )
     }
 
@@ -2963,18 +2967,22 @@ pub struct ParsedExportParam<
 }
 
 impl<P: ValueKind, B: BindingAddress> ParsedExportParam<P, B> {
+    pub fn type_check_location(&self) -> &super::DeclarationLocation {
+        &self.source.location
+    }
+
     pub(crate) fn new_in_source(
         name: String,
         type_expr: Option<TypeExpr>,
         value: Option<BoundaryExpression<P, B>>,
         source_span: SourceSpan,
-        source_file: PathBuf,
+        source_location: super::DeclarationLocation,
     ) -> Self {
         Self {
             name,
             static_type: type_expr,
             value,
-            source: DeclarationSource::authored(source_span, source_file),
+            source: DeclarationSource::authored(source_span, source_location),
         }
     }
 
@@ -2989,7 +2997,7 @@ impl<P: ValueKind, B: BindingAddress> ParsedExportParam<P, B> {
             type_expr,
             value.map(BoundaryExpression::Value),
             SourceSpan::dummy(),
-            PathBuf::from("test.crn"),
+            ModuleCallId::test_dummy_in("test.crn").location,
         )
     }
 
@@ -3042,6 +3050,7 @@ pub trait ExportParamLike<P: ValueKind = ParserPlaceholder, B: BindingAddress = 
     fn handle(&self) -> Option<&UnexpandedResourceHandle<B>>;
     fn source_file(&self) -> &Path;
     fn source_span(&self) -> SourceSpan;
+    fn type_check_location(&self) -> &super::DeclarationLocation;
     fn replace_value(&mut self, value: Value<P, B>);
     fn type_expr_opt(&self) -> Option<&TypeExpr>;
     fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr>;
@@ -3063,6 +3072,9 @@ impl<P: ValueKind + PartialEq, B: BindingAddress> ExportParamLike<P, B>
     }
     fn handle(&self) -> Option<&UnexpandedResourceHandle<B>> {
         self.value.as_ref().and_then(BoundaryExpression::handle)
+    }
+    fn type_check_location(&self) -> &super::DeclarationLocation {
+        &self.source.location
     }
     fn source_file(&self) -> &Path {
         &self.source.file
@@ -4246,7 +4258,7 @@ impl ModuleCallId {
         &self.expansion
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils", feature = "test-support"))]
     pub(crate) fn test_dummy_in(source_file: impl Into<PathBuf>) -> Self {
         let file = super::preprocess_file("fixture {}").expect("module-call fixture");
         let pair = file
@@ -4646,21 +4658,26 @@ struct ModuleCallSite {
 pub(crate) struct DeclarationSource {
     pub(crate) file: PathBuf,
     pub(crate) span: SourceSpan,
+    location: super::DeclarationLocation,
 }
 
 #[cfg(test)]
 impl Default for DeclarationSource {
     fn default() -> Self {
-        Self {
-            file: PathBuf::from("test.crn"),
-            span: SourceSpan::dummy(),
-        }
+        Self::authored(
+            SourceSpan::dummy(),
+            ModuleCallId::test_dummy_in("test.crn").location,
+        )
     }
 }
 
 impl DeclarationSource {
-    fn authored(span: SourceSpan, file: PathBuf) -> Self {
-        Self { file, span }
+    fn authored(span: SourceSpan, location: super::DeclarationLocation) -> Self {
+        Self {
+            file: location.file().path().to_path_buf(),
+            span,
+            location,
+        }
     }
 }
 
@@ -4821,13 +4838,13 @@ impl SourceSpan {
             .map(|inner| inner.as_span().end())
             .max()
             .unwrap_or_else(|| span.end());
-        // A block's closing brace is grammar punctuation rather than an
-        // inner pair. The declaration pair itself ends exactly at that brace;
-        // unlike declaration/value pairs, it cannot absorb trailing trivia
-        // outside the block.
+        // A compound token's closing delimiter is grammar punctuation rather
+        // than an inner pair. Its pair ends exactly at that delimiter, unlike
+        // declaration/value wrappers that can absorb trailing trivia.
         let end = if matches!(
             pair.as_rule(),
             crate::parser::Rule::module_call
+                | crate::parser::Rule::function_call
                 | crate::parser::Rule::for_expr
                 | crate::parser::Rule::if_expr
                 | crate::parser::Rule::resource_expr
@@ -5765,7 +5782,10 @@ impl<P: ValueKind, B: BindingAddress> InferredExportParam<P, B> {
             name: name.into(),
             static_type,
             value,
-            source: DeclarationSource::authored(SourceSpan::dummy(), PathBuf::from("test.crn")),
+            source: DeclarationSource::authored(
+                SourceSpan::dummy(),
+                ModuleCallId::test_dummy_in("test.crn").location,
+            ),
         }
     }
     pub fn source_span(&self) -> SourceSpan {
@@ -5790,6 +5810,9 @@ impl<P: ValueKind + PartialEq, B: BindingAddress> ExportParamLike<P, B>
     }
     fn handle(&self) -> Option<&UnexpandedResourceHandle<B>> {
         None
+    }
+    fn type_check_location(&self) -> &super::DeclarationLocation {
+        &self.source.location
     }
     fn source_file(&self) -> &Path {
         &self.source.file
@@ -10644,7 +10667,7 @@ impl<P: ValueKind, B: BindingAddress> ValidateExpr<P, B> {
                 lhs: Box::new(lhs.try_map_bound_arguments(map)?),
                 op: *op,
                 rhs: Box::new(rhs.try_map_bound_arguments(map)?),
-                operator_span: *operator_span,
+                operator_span: operator_span.clone(),
             },
             Self::Compare { lhs, op, rhs } => ValidateExpr::Compare {
                 lhs: Box::new(lhs.try_map_bound_arguments(map)?),

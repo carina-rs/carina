@@ -736,7 +736,7 @@ mod tests {
     use carina_core::schema::{AttributeSchema, AttributeType, StructField};
 
     #[test]
-    fn review_round3_hover_type_annotation_after_non_bmp_uses_utf16() {
+    fn hover_type_annotation_after_non_bmp_uses_utf16() {
         let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         let source = "exports { note: String = '😀' accounts: map(String) = {} }";
         let doc = Document::new(

@@ -239,7 +239,7 @@ fn round7_duplicate_binding_ignores_if_local_binding() {
 }
 
 #[test]
-fn round3_second_pass_range_owns_only_the_attribute_key() {
+fn second_pass_range_owns_only_the_attribute_key() {
     let (_source, diagnostics) =
         unique_list_declaration_scope_fixture("tag_list = \"\u{65e5}\u{672c}\u{8a9e}\"   ", true);
     let error = only_message_diagnostic(&diagnostics, "Unknown attribute");
@@ -578,7 +578,7 @@ fn round5_indexed_list_errors_keep_paths_without_element_spans() {
 }
 
 #[test]
-fn review_round3_computed_container_does_not_borrow_argument_element_spans() {
+fn computed_container_does_not_borrow_argument_element_spans() {
     let (source, diagnostics) =
         unique_list_declaration_scope_fixture("tags_list = concat([5], [6])", true);
     let errors: Vec<_> = diagnostics
@@ -16640,7 +16640,7 @@ fn loaded_catalog_settles_type_checks_and_keeps_typos_as_unknown_types() {
 }
 
 #[test]
-fn settlement_reviewer_fixtures_a_b_c_d_have_cli_parity() {
+fn provider_catalog_completeness_controls_annotation_warnings_and_errors() {
     let failed = "provider broken { source = 'file:///definitely-missing/broken.wasm' }\n";
     let attribute = "attributes {\n  x: AwsAccountId = '123'\n}\n";
     let functions = "fn f(x: Arnn) { x }\nfn g(): Bogus { 'x' }\n";
@@ -16705,10 +16705,10 @@ fn settlement_reviewer_fixtures_a_b_c_d_have_cli_parity() {
             .collect::<Vec<_>>();
         sites.sort_unstable();
         let expected_sites = match name {
-            "a" => vec![(2, 2)],
+            "a" => vec![(2, 5)],
             "b" => vec![(1, 8), (2, 8)],
-            "c" => vec![(1, 2)],
-            "d" => vec![(0, 8), (1, 8), (3, 2)],
+            "c" => vec![(1, 5)],
+            "d" => vec![(0, 8), (1, 8), (3, 5)],
             _ => unreachable!("fixture table"),
         };
         assert_eq!(sites, expected_sites, "fixture {name}: {diagnostics:#?}");
@@ -16949,7 +16949,20 @@ fn settlement_loaded_error_from_another_file_stays_out_of_the_current_document()
         .unwrap();
         session.record(
             &expected,
-            ProviderTypeCheckSite::at_line(Path::new("/project/other.crn"), 9, 3, "foreign check"),
+            ProviderTypeCheckSite::new(
+                carina_core::parser::parse_file(
+                    "\n\n\n\n\n\n\n\n  attributes { value: Missing = 'id' }",
+                    Path::new("/project/other.crn"),
+                    &carina_core::parser::ProviderContext::new(
+                        carina_core::EnvironmentSnapshot::empty(),
+                    ),
+                )
+                .unwrap()
+                .attribute_params[0]
+                    .type_check_location()
+                    .clone(),
+                "foreign check",
+            ),
         );
         Vec::new()
     });

@@ -67,7 +67,7 @@ fn rendered_typecheck_result(
 }
 
 #[test]
-fn review_round2_type_resolution_rejects_missing_provenance_without_panicking() {
+fn type_resolution_rejects_missing_provenance_without_panicking() {
     let mut parsed =
         crate::parser::parse_and_resolve("let source = mock.test.Resource {}\n").unwrap();
     parsed.resources[0].declaration = Default::default();
@@ -87,7 +87,7 @@ fn review_round2_type_resolution_rejects_missing_provenance_without_panicking() 
 }
 
 #[test]
-fn review_round2_ref_validation_rejects_missing_provenance_without_panicking() {
+fn ref_validation_rejects_missing_provenance_without_panicking() {
     let mut parsed = crate::parser::parse_and_resolve("let source = mock.test.Resource {}\nlet up = upstream_state { source = './up' }\nlet copies = for item in up.items { mock.test.Resource {} }\n").unwrap();
     parsed.resources[0].declaration = Default::default();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -455,7 +455,7 @@ let sink = mock.test.Consumer { count = invalid }
     let error = validate_resource_ref_types_for_test(&parsed, &schemas)
         .expect_err("an unused arithmetic let must still prove both operands are Int");
     assert_eq!(
-        error, "operator '+': left operand must be Int, got Float",
+        error, "test.crn:3:28: operator '+': left operand must be Int, got Float",
         "the declaration and its consuming resource attribute must not duplicate the finding",
     );
 }
@@ -632,7 +632,10 @@ fn deferred_string_resource_attribute_is_not_an_int_operand() {
 
     let error = validate_resource_ref_types_for_test(&parsed, &schemas)
         .expect_err("a deferred String attribute cannot be an arithmetic operand");
-    assert_eq!(error, "operator '+': left operand must be Int, got String");
+    assert_eq!(
+        error,
+        "test.crn:2:28: operator '+': left operand must be Int, got String"
+    );
 }
 
 #[test]
@@ -709,7 +712,10 @@ attributes { rounded: Int = ratio + 1 }
     .expect("invalid module fixture must parse before type validation");
     let error = validate_resource_ref_types_for_test(&invalid, &SchemaRegistry::new())
         .expect_err("a declared Float module argument cannot be used in integer arithmetic");
-    assert_eq!(error, "operator '+': left operand must be Int, got Float");
+    assert_eq!(
+        error,
+        "test.crn:3:35: operator '+': left operand must be Int, got Float"
+    );
 }
 
 #[test]
@@ -729,7 +735,10 @@ fn unused_function_integer_arithmetic_uses_declared_parameter_types() {
     .expect("invalid function fixture must parse before type validation");
     let error = validate_resource_ref_types_for_test(&invalid, &SchemaRegistry::new())
         .expect_err("an unused function must still reject a Float arithmetic operand");
-    assert_eq!(error, "operator '+': left operand must be Int, got Float");
+    assert_eq!(
+        error,
+        "test.crn:1:39: operator '+': left operand must be Int, got Float"
+    );
 
     let invalid_return = crate::parser::parse(
         "fn mislabeled(value: Int): String { value + 1 }\n",
@@ -2505,29 +2514,27 @@ fn resource_ref_validation_checks_composition_attribute_membership_only() {
         .expect("schema fixture must be valid"),
     );
 
-    let valid = Resource::with_provider("awscc", "test.Consumer", "valid", None).with_attribute(
-        "target_group_arn",
-        Value::resource_ref(
-            "instance".to_string(),
-            "target_group_arn".to_string(),
-            vec!["runtime_field".to_string()],
-        ),
-    );
-    let invalid = Resource::with_provider("awscc", "test.Consumer", "invalid", None)
-        .with_attribute(
-            "target_group_arn",
-            Value::resource_ref(
-                "instance".to_string(),
-                "target_group_ar".to_string(),
-                vec![],
-            ),
-        );
+    let mut parsed = crate::parser::parse(
+        "let valid = awscc.test.Consumer { target_group_arn = instance.target_group_arn.runtime_field }\nlet invalid = awscc.test.Consumer { target_group_arn = instance.target_group_ar }\n",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).expect("reference fixture must parse");
 
-    let mut parsed = empty_parsed();
-    parsed
-        .compositions
-        .push(make_composition("instance", &["target_group_arn"]));
-    parsed.resources.extend([valid, invalid]); // allow: direct — fixture test inspection
+    let mut composition = make_composition("instance", &["target_group_arn"]);
+    let module = crate::parser::parse(
+        "attributes { target_group_arn = 'value' }",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    composition.declaration = crate::parser::DeclarationProvenance::for_composition(
+        composition
+            .call_path
+            .immediate()
+            .id
+            .declaration_location()
+            .clone(),
+        module.parser_binding_metadata.syntax().declarations(),
+    );
+    parsed.compositions.push(composition);
 
     let err = validate_resource_ref_types_for_test(&parsed, &schemas).unwrap_err();
     assert_eq!(
@@ -2554,18 +2561,16 @@ fn unknown_binding_reference_reports_error() {
         .expect("schema fixture must be valid"),
     );
 
-    // Subnet references "vpc" binding which doesn't exist
-    let subnet = Resource::with_provider("awscc", "ec2.Subnet", "web-subnet", None).with_attribute(
-        "vpc_id",
-        Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-    );
+    let parsed = crate::parser::parse(
+        "let subnet = awscc.ec2.Subnet { vpc_id = vpc.vpc_id }\n",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("reference fixture must parse");
 
-    let mut parsed = empty_parsed();
-    parsed.resources.push(subnet); // allow: direct — fixture test inspection
     let result = validate_resource_ref_types_for_test(&parsed, &schemas);
     assert_eq!(
         result.unwrap_err(),
-        "awscc.ec2.Subnet.web-subnet: unknown binding 'vpc' in reference vpc.vpc_id"
+        "awscc.ec2.Subnet.subnet: unknown binding 'vpc' in reference vpc.vpc_id"
     );
 }
 
@@ -2591,27 +2596,15 @@ fn unknown_attribute_reference_reports_error() {
         .expect("schema fixture must be valid"),
     );
 
-    // VPC resource with binding
-    let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None)
-        .with_binding("vpc")
-        .with_attribute(
-            "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-        );
+    let parsed = crate::parser::parse(
+        "let vpc = awscc.ec2.Vpc { cidr_block = '10.0.0.0/16' }\nlet subnet = awscc.ec2.Subnet { vpc_id = vpc.nonexistent_attr }\n",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).expect("reference fixture must parse");
 
-    // Subnet references vpc.nonexistent_attr which doesn't exist on the VPC schema
-    let subnet = Resource::with_provider("awscc", "ec2.Subnet", "web-subnet", None).with_attribute(
-        "vpc_id",
-        Value::resource_ref("vpc".to_string(), "nonexistent_attr".to_string(), vec![]),
-    );
-
-    let mut parsed = empty_parsed();
-    parsed.resources.push(vpc); // allow: direct — fixture test inspection
-    parsed.resources.push(subnet); // allow: direct — fixture test inspection
     let result = validate_resource_ref_types_for_test(&parsed, &schemas);
     assert_eq!(
         result.unwrap_err(),
-        "awscc.ec2.Subnet.web-subnet: unknown attribute 'nonexistent_attr' on 'vpc' in reference vpc.nonexistent_attr"
+        "awscc.ec2.Subnet.subnet: unknown attribute 'nonexistent_attr' on 'vpc' in reference vpc.nonexistent_attr"
     );
 }
 
@@ -2651,17 +2644,15 @@ fn postfix_access_validation_fixture(
         .expect("schema fixture must be valid"),
     );
 
-    let queue = Resource::with_provider("mock", "test.Queue", "queue", None)
-        .with_binding("q")
-        .with_attribute(
-            "identifier",
-            Value::Concrete(ConcreteValue::String("a/b".into())),
-        )
-        .with_attribute("rules", Value::Concrete(ConcreteValue::List(Vec::new())));
-    let consumer = Resource::with_provider("mock", "test.Consumer", "consumer", None)
-        .with_attribute("value", value);
-    let mut parsed = empty_parsed();
-    parsed.resources.extend([queue, consumer]); // allow: direct — fixture test inspection
+    // Exercise the checker on authored syntax, including the provenance of
+    // references inside computed accesses.
+    let parsed = crate::parser::parse(
+        &format!(
+            "let q = mock.test.Queue {{ identifier = 'a/b' rules = [] }}\nlet consumer = mock.test.Consumer {{ value = {} }}\n",
+            crate::value::format_value(&value),
+        ),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).expect("postfix fixture must parse");
     (parsed, schemas)
 }
 
@@ -2925,22 +2916,11 @@ fn unknown_attribute_reference_suggests_similar_name() {
         .expect("schema fixture must be valid"),
     );
 
-    let igw =
-        Resource::with_provider("awscc", "ec2.internet_gateway", "igw", None).with_binding("igw");
+    let parsed = crate::parser::parse(
+        "let igw = awscc.ec2.internet_gateway {}\nawscc.ec2.route { name = 'main-route' gateway_id = igw.internet_gateway_idd }\n",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).expect("reference fixture must parse");
 
-    // Typo: internet_gateway_idd instead of internet_gateway_id
-    let route = Resource::with_provider("awscc", "ec2.route", "main-route", None).with_attribute(
-        "gateway_id",
-        Value::resource_ref(
-            "igw".to_string(),
-            "internet_gateway_idd".to_string(),
-            vec![],
-        ),
-    );
-
-    let mut parsed = empty_parsed();
-    parsed.resources.push(igw); // allow: direct — fixture test inspection
-    parsed.resources.push(route); // allow: direct — fixture test inspection
     let result = validate_resource_ref_types_for_test(&parsed, &schemas);
     let err = result.unwrap_err();
     assert!(
@@ -2975,42 +2955,10 @@ fn unknown_attribute_reference_through_wait_binding_reports_error() {
         .expect("schema fixture must be valid"),
     );
 
-    let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None)
-        .with_binding("cert")
-        .with_attribute(
-            "status",
-            Value::Concrete(ConcreteValue::String("pending".into())),
-        );
-    let listener =
-        Resource::with_provider("awscc", "elasticloadbalancingv2.Listener", "listener", None)
-            .with_attribute(
-                "certificate_arn",
-                Value::resource_ref(
-                    "cert_issued".to_string(),
-                    "certificate_arnn".to_string(),
-                    vec![],
-                ),
-            );
-
-    let mut parsed = empty_parsed();
-    parsed.resources.push(cert); // allow: direct — fixture test inspection
-    parsed.wait_bindings.push(WaitBinding {
-        binding: RelativeBindingName::from("cert_issued"),
-        target: RelativeBindingName::from("cert"),
-        until_raw: "cert.status == 'issued'".to_string(),
-        until_predicate: UntilPredicateAst {
-            root: "cert".into(),
-            attribute_segments: vec!["status".to_string()],
-            rhs: RelativeRuntimeValue::Concrete(crate::resource::ConcreteValue::String(
-                "issued".into(),
-            )),
-        },
-        timeout_secs: None,
-        depends_on: Default::default(),
-        line: 1,
-        declaration: Default::default(),
-    });
-    parsed.resources.push(listener); // allow: direct — fixture test inspection
+    let parsed = crate::parser::parse(
+        "let cert = aws.acm.Certificate { status = 'pending' }\nlet cert_issued = wait cert { until = cert.status == 'issued' }\nlet listener = awscc.elasticloadbalancingv2.Listener { certificate_arn = cert_issued.certificate_arnn }\n",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).expect("reference fixture must parse");
 
     let err = validate_resource_ref_types_for_test(&parsed, &schemas).unwrap_err();
     assert!(
@@ -3052,42 +3000,10 @@ fn known_attribute_reference_through_wait_binding_is_accepted() {
         .expect("schema fixture must be valid"),
     );
 
-    let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None)
-        .with_binding("cert")
-        .with_attribute(
-            "status",
-            Value::Concrete(ConcreteValue::String("pending".into())),
-        );
-    let listener =
-        Resource::with_provider("awscc", "elasticloadbalancingv2.Listener", "listener", None)
-            .with_attribute(
-                "certificate_arn",
-                Value::resource_ref(
-                    "cert_issued".to_string(),
-                    "certificate_arn".to_string(),
-                    vec![],
-                ),
-            );
-
-    let mut parsed = empty_parsed();
-    parsed.resources.push(cert); // allow: direct — fixture test inspection
-    parsed.wait_bindings.push(WaitBinding {
-        binding: RelativeBindingName::from("cert_issued"),
-        target: RelativeBindingName::from("cert"),
-        until_raw: "cert.status == 'issued'".to_string(),
-        until_predicate: UntilPredicateAst {
-            root: "cert".into(),
-            attribute_segments: vec!["status".to_string()],
-            rhs: RelativeRuntimeValue::Concrete(crate::resource::ConcreteValue::String(
-                "issued".into(),
-            )),
-        },
-        timeout_secs: None,
-        depends_on: Default::default(),
-        line: 1,
-        declaration: Default::default(),
-    });
-    parsed.resources.push(listener); // allow: direct — fixture test inspection
+    let parsed = crate::parser::parse(
+        "let cert = aws.acm.Certificate { status = 'pending' }\nlet cert_issued = wait cert { until = cert.status == 'issued' }\nlet listener = awscc.elasticloadbalancingv2.Listener { certificate_arn = cert_issued.certificate_arn }\n",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).expect("reference fixture must parse");
 
     assert!(validate_resource_ref_types_for_test(&parsed, &schemas).is_ok());
 }
@@ -3286,45 +3202,10 @@ fn unknown_attribute_reference_through_wait_binding_inside_nested_struct_reports
         .expect("schema fixture must be valid"),
     );
 
-    let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None)
-        .with_binding("cert")
-        .with_attribute(
-            "status",
-            Value::Concrete(ConcreteValue::String("pending".into())),
-        );
-    let mut certificate = IndexMap::new();
-    certificate.insert(
-        "certificate_arn".to_string(),
-        Value::resource_ref("cert_issued".to_string(), "arn".to_string(), vec![]),
-    );
-    let listener =
-        Resource::with_provider("awscc", "elasticloadbalancingv2.Listener", "listener", None)
-            .with_attribute(
-                "certificates",
-                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                    ConcreteValue::Map(certificate),
-                )])),
-            );
-
-    let mut parsed = empty_parsed();
-    parsed.resources.push(cert); // allow: direct — fixture test inspection
-    parsed.wait_bindings.push(WaitBinding {
-        binding: RelativeBindingName::from("cert_issued"),
-        target: RelativeBindingName::from("cert"),
-        until_raw: "cert.status == 'issued'".to_string(),
-        until_predicate: UntilPredicateAst {
-            root: "cert".into(),
-            attribute_segments: vec!["status".to_string()],
-            rhs: RelativeRuntimeValue::Concrete(crate::resource::ConcreteValue::String(
-                "issued".into(),
-            )),
-        },
-        timeout_secs: None,
-        depends_on: Default::default(),
-        line: 1,
-        declaration: Default::default(),
-    });
-    parsed.resources.push(listener); // allow: direct — fixture test inspection
+    let parsed = crate::parser::parse(
+        "let cert = aws.acm.Certificate { status = 'pending' }\nlet cert_issued = wait cert { until = cert.status == 'issued' }\nlet listener = awscc.elasticloadbalancingv2.Listener { certificates = [{ certificate_arn = cert_issued.arn }] }\n",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).expect("reference fixture must parse");
 
     let err = validate_resource_ref_types_for_test(&parsed, &schemas).unwrap_err();
     assert!(
@@ -3370,29 +3251,10 @@ fn unknown_attribute_reference_through_managed_binding_inside_nested_struct_repo
         .expect("schema fixture must be valid"),
     );
 
-    let cert = Resource::with_provider("aws", "acm.Certificate", "cert", None)
-        .with_binding("cert")
-        .with_attribute(
-            "status",
-            Value::Concrete(ConcreteValue::String("pending".into())),
-        );
-    let mut certificate = IndexMap::new();
-    certificate.insert(
-        "certificate_arn".to_string(),
-        Value::resource_ref("cert".to_string(), "arn".to_string(), vec![]),
-    );
-    let listener =
-        Resource::with_provider("awscc", "elasticloadbalancingv2.Listener", "listener", None)
-            .with_attribute(
-                "certificates",
-                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                    ConcreteValue::Map(certificate),
-                )])),
-            );
-
-    let mut parsed = empty_parsed();
-    parsed.resources.push(cert); // allow: direct — fixture test inspection
-    parsed.resources.push(listener); // allow: direct — fixture test inspection
+    let parsed = crate::parser::parse(
+        "let cert = aws.acm.Certificate { status = 'pending' }\nlet listener = awscc.elasticloadbalancingv2.Listener { certificates = [{ certificate_arn = cert.arn }] }\n",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).expect("reference fixture must parse");
 
     let err = validate_resource_ref_types_for_test(&parsed, &schemas).unwrap_err();
     assert!(
@@ -3414,20 +3276,10 @@ fn unknown_outer_attr_does_not_mask_nested_unknown_binding_ref() {
         .expect("schema fixture must be valid"),
     );
 
-    let mut nested = IndexMap::new();
-    nested.insert(
-        "certificate_arn".to_string(),
-        Value::resource_ref("unknown_binding".to_string(), "foo".to_string(), vec![]),
-    );
-    let listener =
-        Resource::with_provider("awscc", "elasticloadbalancingv2.Listener", "listener", None)
-            .with_attribute(
-                "certificates_typo",
-                Value::Concrete(ConcreteValue::Map(nested)),
-            );
-
-    let mut parsed = empty_parsed();
-    parsed.resources.push(listener); // allow: direct — fixture test inspection
+    let parsed = crate::parser::parse(
+        "let listener = awscc.elasticloadbalancingv2.Listener { certificates_typo = { certificate_arn = unknown_binding.foo } }\n",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).expect("reference fixture must parse");
 
     let err = validate_resource_ref_types_for_test(&parsed, &schemas).unwrap_err();
     assert!(
@@ -8705,8 +8557,6 @@ fn rendered_typecheck_result_skips_value_unknown() {
 /// entirely past `binding.attribute`.
 #[test]
 fn ref_with_chained_subscript_then_field_narrows_through_list() {
-    use crate::resource::{AccessPath, PathSegment, Subscript, Value};
-
     let mut schemas = SchemaRegistry::new();
     // `aws.acm.Certificate` exposes `domain_validation_options:
     // List<Struct{resource_record_name: String, ...}>`.
@@ -8747,30 +8597,11 @@ fn ref_with_chained_subscript_then_field_narrows_through_list() {
         .expect("schema fixture must be valid"),
     );
 
-    let cert = Resource::with_provider("aws", "acm.Certificate", "main", None).with_binding("cert");
+    let parsed = crate::parser::parse(
+        "let cert = aws.acm.Certificate {}\nlet validation = aws.route53.RecordSet { name = cert.domain_validation_options[0].resource_record_name }\n",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).expect("reference fixture must parse");
 
-    // `cert.domain_validation_options[0].resource_record_name`
-    let path = AccessPath::with_segments(
-        "cert",
-        "domain_validation_options",
-        vec![
-            PathSegment::Subscript {
-                index: Subscript::Int { index: 0 },
-            },
-            PathSegment::Field {
-                name: "resource_record_name".to_string(),
-            },
-        ],
-    );
-    let record = Resource::with_provider("aws", "route53.RecordSet", "validation", None)
-        .with_attribute(
-            "name",
-            Value::Deferred(crate::resource::DeferredValue::ResourceRef { path }),
-        );
-
-    let mut parsed = empty_parsed();
-    parsed.resources.push(cert); // allow: direct — fixture test inspection
-    parsed.resources.push(record); // allow: direct — fixture test inspection
     let result = validate_resource_ref_types_for_test(&parsed, &schemas);
     assert!(
         result.is_ok(),
@@ -8784,8 +8615,6 @@ fn ref_with_chained_subscript_then_field_narrows_through_list() {
 /// narrowing is "honest" about the path, not a silent acceptance.
 #[test]
 fn ref_with_chained_subscript_then_field_rejects_real_mismatch() {
-    use crate::resource::{AccessPath, PathSegment, Subscript, Value};
-
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
@@ -8816,29 +8645,11 @@ fn ref_with_chained_subscript_then_field_rejects_real_mismatch() {
         .expect("schema fixture must be valid"),
     );
 
-    let cert = Resource::with_provider("aws", "acm.Certificate", "main", None).with_binding("cert");
+    let parsed = crate::parser::parse(
+        "let cert = aws.acm.Certificate {}\nlet validation = aws.route53.RecordSet { name = cert.domain_validation_options[0].rotation_count }\n",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).expect("reference fixture must parse");
 
-    let path = AccessPath::with_segments(
-        "cert",
-        "domain_validation_options",
-        vec![
-            PathSegment::Subscript {
-                index: Subscript::Int { index: 0 },
-            },
-            PathSegment::Field {
-                name: "rotation_count".to_string(),
-            },
-        ],
-    );
-    let record = Resource::with_provider("aws", "route53.RecordSet", "validation", None)
-        .with_attribute(
-            "name",
-            Value::Deferred(crate::resource::DeferredValue::ResourceRef { path }),
-        );
-
-    let mut parsed = empty_parsed();
-    parsed.resources.push(cert); // allow: direct — fixture test inspection
-    parsed.resources.push(record); // allow: direct — fixture test inspection
     let err = validate_resource_ref_types_for_test(&parsed, &schemas).unwrap_err();
     assert!(
         err.contains("expected String"),
@@ -8858,8 +8669,6 @@ fn ref_with_chained_subscript_then_field_rejects_real_mismatch() {
 /// helped, because the attribute will never exist under that spelling.
 #[test]
 fn ref_with_chained_field_on_struct_flags_unknown_field() {
-    use crate::resource::{AccessPath, PathSegment, Subscript, Value};
-
     let mut schemas = SchemaRegistry::new();
     // Mirror the real `aws.acm.Certificate` shape after aws#295:
     // `domain_validation_options[*].resource_record: Struct{name, value}`.
@@ -8913,32 +8722,11 @@ fn ref_with_chained_field_on_struct_flags_unknown_field() {
         .expect("schema fixture must be valid"),
     );
 
-    let cert = Resource::with_provider("aws", "acm.Certificate", "main", None).with_binding("cert");
+    let parsed = crate::parser::parse(
+        "let cert = aws.acm.Certificate {}\nlet validation = aws.route53.RecordSet { name = cert.domain_validation_options[0].resource_record_name }\n",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).expect("reference fixture must parse");
 
-    // User wrote `cert.domain_validation_options[0].resource_record_name`
-    // — the old flat spelling that the nested-shape migration replaced
-    // with `[0].resource_record.name`.
-    let path = AccessPath::with_segments(
-        "cert",
-        "domain_validation_options",
-        vec![
-            PathSegment::Subscript {
-                index: Subscript::Int { index: 0 },
-            },
-            PathSegment::Field {
-                name: "resource_record_name".to_string(),
-            },
-        ],
-    );
-    let record = Resource::with_provider("aws", "route53.RecordSet", "validation", None)
-        .with_attribute(
-            "name",
-            Value::Deferred(crate::resource::DeferredValue::ResourceRef { path }),
-        );
-
-    let mut parsed = empty_parsed();
-    parsed.resources.push(cert); // allow: direct — fixture test inspection
-    parsed.resources.push(record); // allow: direct — fixture test inspection
     let err = validate_resource_ref_types_for_test(&parsed, &schemas).unwrap_err();
     assert!(
         err.contains("resource_record_name"),

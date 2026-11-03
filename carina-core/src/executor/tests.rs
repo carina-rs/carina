@@ -2210,10 +2210,7 @@ async fn unsettled_loaded_type_check_blocks_create_dispatch() {
         async |type_checks| {
             type_checks.record(
                 &crate::parser::TypeExpr::String,
-                crate::validation::deferred_types::ProviderTypeCheckSite::at_line(
-                    std::path::Path::new("main.crn"),
-                    1,
-                    1,
+                crate::validation::deferred_types::ProviderTypeCheckSite::directory_scoped(
                     "pending runtime check",
                 ),
             );

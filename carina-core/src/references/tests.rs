@@ -1886,7 +1886,7 @@ fn encryption_fixture(desired_key: Value, ignored: bool) -> Fixture {
 }
 
 #[tokio::test]
-async fn round3_ignored_nested_create_only_reference_with_sibling_change_is_an_update() {
+async fn ignored_nested_create_only_reference_with_sibling_change_is_an_update() {
     let fixture = encryption_fixture(string("alias/ignored"), true);
     let witness = fixture.prepare().await.unwrap();
     assert!(fixture.calls.lock().unwrap().is_empty());
@@ -1913,7 +1913,7 @@ async fn round3_ignored_nested_create_only_reference_with_sibling_change_is_an_u
 }
 
 #[tokio::test]
-async fn round3_unordered_list_index_ignore_precedes_projection_pairing_and_saved_merge() {
+async fn unordered_list_index_ignore_precedes_projection_pairing_and_saved_merge() {
     use crate::resource::{
         ParsedIgnorePath, ParsedIgnorePathSegment as Segment, ResolvedIgnoreChanges,
     };
@@ -2044,7 +2044,7 @@ async fn round3_unordered_list_index_ignore_precedes_projection_pairing_and_save
 }
 
 #[test]
-fn round3_comparator_reference_errors_render_the_nested_attribute_path() {
+fn comparator_reference_errors_render_the_nested_attribute_path() {
     for sensitive in [false, true] {
         let raw = if sensitive {
             Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
@@ -2079,7 +2079,7 @@ fn round3_comparator_reference_errors_render_the_nested_attribute_path() {
 }
 
 #[tokio::test]
-async fn round3_native_reference_batches_reject_short_and_long_results() {
+async fn native_reference_batches_reject_short_and_long_results() {
     for count in [0, 1, 3] {
         let mut fixture =
             Fixture::new(string("alias/live"), string("key/a"), HashMap::new(), false);
@@ -2110,7 +2110,7 @@ async fn round3_native_reference_batches_reject_short_and_long_results() {
 }
 
 #[tokio::test]
-async fn round3_apply_concrete_plan_reference_reresolves_without_widening_equivalent_patch() {
+async fn apply_concrete_plan_reference_reresolves_without_widening_equivalent_patch() {
     use crate::binding_index::{BindingValueSource, ResolvedBindings};
     use crate::executor::{LiveExecutionInput, ProviderCheckInputs, UnresolvedResource};
     use crate::schema::AttributeType;
@@ -2286,7 +2286,7 @@ async fn round3_apply_concrete_plan_reference_reresolves_without_widening_equiva
 }
 
 #[tokio::test]
-async fn round3_reference_list_writeback_preserves_authored_fields_across_alias_and_arn() {
+async fn reference_list_writeback_preserves_authored_fields_across_alias_and_arn() {
     use crate::explicit::ExplicitFields;
     use crate::schema::{AttributeType, StructField};
     let mut fixture = Fixture::new(

@@ -902,19 +902,22 @@ fn user_function_runtime_error(
 
 fn function_annotation_site<B: BindingAddress>(
     function: &crate::parser::UserFunction<B>,
-    span: Option<crate::parser::SourceSpan>,
+    kind: crate::validation::TypeResolutionDeclarationKind,
+    name: &str,
     context: String,
 ) -> crate::validation::deferred_types::ProviderTypeCheckSite {
     use crate::validation::deferred_types::ProviderTypeCheckSite;
-    let source = function
-        .annotation_source_file
-        .as_deref()
-        .or(function.body.source_file.as_deref())
-        .unwrap_or_else(|| std::path::Path::new("<config>"));
-    match span {
-        Some(span) => ProviderTypeCheckSite::new(source, span, context),
-        None => ProviderTypeCheckSite::at_line(source, function.body.source_line, 1, context),
-    }
+    let annotation = crate::validation::TypeResolutionContext::Declaration {
+        kind,
+        name: name.to_string(),
+    };
+    let location = function
+        .type_annotations
+        .iter()
+        .find(|finding| finding.detail() == &annotation)
+        .expect("function annotation parser provenance")
+        .location();
+    ProviderTypeCheckSite::new(location.clone(), context)
 }
 
 fn evaluate_runtime_user_function<B: BindingAddress>(
@@ -1000,7 +1003,8 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
                     crate::validation::typecheck::TypecheckInference::Unavailable,
                     function_annotation_site(
                         function,
-                        parameter.type_span,
+                        crate::validation::TypeResolutionDeclarationKind::FunctionParameter,
+                        &format!("{}' parameter '{}", function.name, parameter.name),
                         format!(
                             "function '{}' parameter '{}'",
                             function.name, parameter.name
@@ -1052,7 +1056,8 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
                 crate::validation::typecheck::TypecheckInference::Unavailable,
                 function_annotation_site(
                     function,
-                    function.return_type_span,
+                    crate::validation::TypeResolutionDeclarationKind::FunctionReturn,
+                    &function.name,
                     format!("function '{}' return value", function.name),
                 ),
             )

@@ -106,6 +106,9 @@ impl DeclarationLocation {
                 | Rule::upstream_state_expr
                 | Rule::primary
                 | Rule::type_expr
+                | Rule::attributes_param
+                | Rule::exports_param
+                | Rule::validate_expr
                 | Rule::for_expr
                 | Rule::if_expr
                 | Rule::resource_address
@@ -350,6 +353,11 @@ impl<D> FileScoped<D> {
 pub struct DirectoryScoped<D> {
     detail: D,
 }
+impl DirectoryScoped<super::ParseWarning> {
+    pub(crate) fn provider_type_check(detail: super::ParseWarning) -> Self {
+        Self { detail }
+    }
+}
 impl<D> DirectoryScoped<D> {
     pub fn detail(&self) -> &D {
         &self.detail
@@ -473,7 +481,6 @@ pub struct AnalysisResourceRef<
     attribute_locations: std::collections::HashMap<String, &'a DeclarationLocation>,
     attribute_keys: &'a [super::AttributeKeyLocation],
     attribute_values: &'a [super::elements::AttributeValueLocation],
-    integer_operators: &'a [DeclarationLocation],
     type_location: &'a DeclarationLocation,
     ignore_changes_location: Option<&'a DeclarationLocation>,
     references: Vec<AnalysisReference<B>>,
@@ -582,6 +589,7 @@ fn collect_value_references<P: ValueKind, B: BindingAddress>(
     scope: AnalysisValueScope,
     references: &mut Vec<AnalysisValueReference<B>>,
 ) -> Result<(), AnalysisTreeError> {
+    require_integer_operator_provenance(value, context)?;
     let mut result = Ok(());
     value.visit_resource_refs_with_usage(
         &mut |path, usage| match path.reference_locations_shared() {
@@ -604,6 +612,73 @@ fn collect_value_references<P: ValueKind, B: BindingAddress>(
         },
     );
     result
+}
+
+/// Validate operator ownership before any analysis producer can inspect values.
+fn require_integer_operator_provenance<P: ValueKind, B: BindingAddress>(
+    value: &Value<P, B>,
+    context: &str,
+) -> Result<(), AnalysisTreeError> {
+    use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart};
+    let check = |value: &Value<P, B>| require_integer_operator_provenance(value, context);
+    match value {
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            if expression.operator_span().location().is_none() {
+                return Err(AnalysisTreeError::new(
+                    AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                        element: format!("{context} integer operator"),
+                    },
+                ));
+            }
+            check(expression.lhs())?;
+            check(expression.rhs())?;
+        }
+        Value::Concrete(ConcreteValue::List(values)) => {
+            for value in values {
+                check(value)?;
+            }
+        }
+        Value::Concrete(ConcreteValue::Map(values)) => {
+            for value in values.values() {
+                check(value)?;
+            }
+        }
+        Value::Deferred(DeferredValue::Access(access)) => check(access.base())?,
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            for value in deferred.values() {
+                check(value)?;
+            }
+        }
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            for part in parts {
+                if let InterpolationPart::Expr(value) = part {
+                    check(value)?;
+                }
+            }
+        }
+        Value::Deferred(
+            DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::Unavailable { args, .. }
+            | DeferredValue::ResolvedFunctionCall { args, .. },
+        ) => {
+            for argument in args {
+                check(argument.walker_value())?;
+            }
+        }
+        Value::Deferred(DeferredValue::Secret(value)) => check(value)?,
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            check(value)?;
+            check(default)?;
+        }
+        Value::Concrete(_)
+        | Value::Deferred(
+            DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::Placeholder(_)
+            | DeferredValue::Unknown(_),
+        ) => {}
+    }
+    Ok(())
 }
 fn collect_iterable_result_references<P, B>(
     value: &Value<P, B>,
@@ -1519,7 +1594,6 @@ where
                     iterable,
                     attribute_keys: &provenance.elements().keys,
                     attribute_values: &provenance.elements().attribute_values,
-                    integer_operators: &provenance.elements().integer_operators,
                     type_location: if matches!(resource, ResourceRef::LiveComposition(_)) {
                         location
                     } else {
@@ -2160,6 +2234,35 @@ where
     pub fn providers(&self) -> &'a [super::ProviderConfig<P, B>] {
         self.providers
     }
+
+    pub fn provider_location(&self, index: usize) -> &DeclarationLocation {
+        self.provider_declaration(index).location()
+    }
+
+    pub fn provider_attribute_location(&self, index: usize, name: &str) -> &DeclarationLocation {
+        let declaration = self.provider_declaration(index);
+        declaration
+            .attributes
+            .iter()
+            .rev()
+            .find(|attribute| attribute.detail() == name)
+            .map_or(declaration.location(), |attribute| attribute.location())
+    }
+
+    fn provider_declaration(&self, index: usize) -> &Located<super::elements::ProviderDeclaration> {
+        let provider = &self.providers[index];
+        let occurrence = self.providers[..index]
+            .iter()
+            .filter(|other| other.name == provider.name && other.binding == provider.binding)
+            .count();
+        self.syntax
+            .providers()
+            .iter()
+            .filter(|record| record.name == provider.name && record.binding == provider.binding)
+            .nth(occurrence)
+            .expect("provider inventory validated at the analysis boundary")
+    }
+
     pub fn is_module_definition(&self) -> bool {
         self.module_definition
     }
@@ -2300,41 +2403,6 @@ impl<D, B: BindingAddress, E> AnalysisTree<'_, ParserPlaceholder, ParserPlacehol
 where
     D: DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    pub fn integer_arithmetic_findings(
-        &self,
-        resource: &AnalysisResourceRef<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
-        name: &str,
-        sink: crate::schema::EffectiveType<'_>,
-        bindings: &crate::validation::inference::InferenceBindings<ParserPlaceholder, B>,
-        schemas: &crate::schema::SchemaRegistry,
-        binding_index: &crate::binding_index::BindingIndex<'_, B>,
-    ) -> Vec<Located<crate::validation::IntegerArithmeticTypeFinding>> {
-        let attributes = resource.attributes();
-        crate::validation::check_integer_arithmetic_types(
-            &attributes[name],
-            sink,
-            bindings,
-            schemas,
-            binding_index,
-        )
-        .into_iter()
-        .map(|finding| {
-            let span = finding.operator_span();
-            let location = resource
-                .integer_operators
-                .iter()
-                .find(|location| {
-                    Some(location.span().start_line()) == span.line()
-                        && Some(location.span().start_column()) == span.column()
-                })
-                .unwrap_or_else(|| {
-                    resource.attribute_value_location(name, &crate::schema::FieldPath::new())
-                });
-            Located::new(location.clone(), finding)
-        })
-        .collect()
-    }
-
     pub(crate) fn visit_function_values(
         &self,
         visit: &mut impl FnMut(Located<FunctionValidationValue<'_, ParserPlaceholder, B>>),
@@ -2469,7 +2537,43 @@ mod location_tests {
     use super::*;
 
     #[test]
-    fn review_round3_missing_attribute_value_provenance_fails_at_seal() {
+    fn integer_operator_without_parser_provenance_fails_at_seal() {
+        use crate::integer_arithmetic::{IntegerOp, IntegerOperatorSpan, evaluate_integer_values};
+        use crate::resource::{ConcreteValue, DeferredValue};
+
+        for resource_value in [false, true] {
+            let mut parsed = super::super::parse_file(
+                "let count = 1\nmock.test.Resource { count = 1 }\n",
+                Path::new("sibling.crn"),
+                &super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .unwrap();
+            let arithmetic = evaluate_integer_values(
+                Value::Deferred(DeferredValue::BindingRef {
+                    binding: RelativeBindingName::new("count"),
+                }),
+                IntegerOp::Add,
+                Value::Concrete(ConcreteValue::Int(1)),
+                IntegerOperatorSpan::synthetic(),
+            )
+            .unwrap();
+            if resource_value {
+                parsed.resources[0]
+                    .attributes
+                    .insert("count".into(), arithmetic);
+            } else {
+                parsed.variables.insert("count".into(), arithmetic);
+            }
+            let error = match AnalysisTree::try_from_file(&parsed) {
+                Ok(_) => panic!("integer operator without provenance entered analysis"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("integer operator"), "{error}");
+        }
+    }
+
+    #[test]
+    fn missing_attribute_value_provenance_fails_at_seal() {
         let mut parsed = super::super::parse_file(
             "mock.test.Resource { enabled = true }\n",
             Path::new("sibling.crn"),

@@ -910,8 +910,8 @@ impl carina_core::validation::deferred_types::ProviderTypeCheckSink for CliTypeC
         diagnostic: carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic,
     ) {
         match diagnostic {
-            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning) => crate::commands::validate::print_provider_type_warning(&warning),
-            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => self.errors.push(error.message),
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning) => crate::commands::validate::print_provider_type_warning(&warning.into_warning()),
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => self.errors.push(error.into_warning().message),
         }
     }
 }
@@ -961,8 +961,8 @@ impl carina_core::validation::deferred_types::ProviderTypeCheckSink for Validati
         diagnostic: carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic,
     ) {
         match diagnostic {
-            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning) => self.warnings.push(warning),
-            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => self.errors.push(AppError::Validation(error.message)),
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::Deferred(warning) => self.warnings.push(warning.into_warning()),
+            carina_core::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(error) => self.errors.push(AppError::Validation(error.into_warning().message)),
         }
     }
 }

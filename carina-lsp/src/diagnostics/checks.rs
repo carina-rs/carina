@@ -6,7 +6,6 @@ use std::collections::{HashMap, HashSet};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
 use crate::document::Document;
-use crate::position;
 use carina_core::binding_index::{
     BindingIndex, RefTargetKind, RefType, RefTypeError, ResolvedBindings as GenericResolvedBindings,
 };
@@ -22,8 +21,8 @@ use carina_core::schema::suggest_similar_name;
 use carina_core::validation::typecheck::{self, TypecheckInference};
 
 use super::{
-    DiagnosticRun, ProviderValidationDeduplicator, carina_diagnostic, render_analysis_invariant,
-    render_merged, render_parse,
+    DiagnosticRun, ProviderValidationDeduplicator, render_analysis_invariant, render_merged,
+    render_parse,
 };
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
@@ -726,27 +725,18 @@ impl DiagnosticRun<'_> {
         }
     }
 
-    /// Check provider block attributes.
-    ///
-    /// Runs host-side type-level validation using
-    /// `ProviderFactory::provider_config_attribute_types`, then delegates to
-    /// `validate_config` for any provider-specific semantic checks. Mirrors
-    /// the CLI flow in `carina_core::validation::validate_provider_config`
-    /// so fixes to generic DSL format validation take effect in LSP without
-    /// rebuilding providers.
+    /// Validate provider configuration using its parser-owned header and keys.
     pub(super) fn check_provider_region(
         &self,
         doc: &Document,
-        parsed: &ParsedFile,
+        tree: &carina_core::parser::AnalysisTree<'_>,
         deduplicator: &ProviderValidationDeduplicator,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
-
-        for provider in &parsed.providers {
+        for (index, provider) in tree.providers().iter().enumerate() {
             let Some(factory) = self.factories.iter().find(|f| f.name() == provider.name) else {
                 continue;
             };
-
             let validation = carina_core::executor::provider_ready::validate_parser_provider_config(
                 factory.as_ref(),
                 &provider.name,
@@ -758,103 +748,42 @@ impl DiagnosticRun<'_> {
                 }) {
                     continue;
                 }
-                let position = error
-                    .attribute()
-                    .and_then(|attribute| {
-                        self.find_provider_attr_position(doc, &provider.name, attribute)
-                    })
-                    .or_else(|| self.find_provider_region_position(doc, &provider.name));
-                let Some((line, col)) = position else {
-                    continue;
-                };
-                let width = error.attribute().map_or(6, |attribute| {
-                    u32::try_from(attribute.chars().count()).unwrap_or(u32::MAX)
-                });
-                diagnostics.push(carina_diagnostic(
-                    line,
-                    col,
-                    col.saturating_add(width),
+                let location =
+                    tree.provider_attribute_location(index, error.attribute().unwrap_or("region"));
+                let finding = carina_core::parser::Located::new(location.clone(), error);
+                diagnostics.extend(render_merged(
+                    doc,
+                    &finding,
                     DiagnosticSeverity::WARNING,
-                    error.to_string(),
+                    finding.detail().to_string(),
                 ));
             }
         }
         diagnostics
     }
 
-    /// Check for providers that failed to load and show info-level diagnostics on the provider block.
     pub(super) fn check_unloaded_providers(
         &self,
         doc: &Document,
-        parsed: &ParsedFile,
+        tree: &carina_core::parser::AnalysisTree<'_>,
     ) -> Vec<Diagnostic> {
-        let mut diagnostics = Vec::new();
-        let text = doc.text();
-
-        for provider in &parsed.providers {
-            let Some(reason) = self.provider_errors.get(&provider.name) else {
-                continue;
-            };
-
-            // Find the provider block position
-            let provider_pattern = format!("provider {}", provider.name);
-            for (line_idx, line) in text.lines().enumerate() {
-                let trimmed = line.trim();
-                if trimmed.starts_with(&provider_pattern) {
-                    let col = position::leading_whitespace_chars(line);
-                    let end_col = col + trimmed.find('{').unwrap_or(trimmed.len()) as u32;
-                    diagnostics.push(carina_diagnostic(
-                        line_idx as u32,
-                        col,
-                        end_col,
-                        DiagnosticSeverity::INFORMATION,
-                        format!("Provider '{}' is not loaded: {}", provider.name, reason),
-                    ));
-                    break;
-                }
-            }
-        }
-
-        diagnostics
-    }
-
-    /// Find the position of the region attribute in a provider block
-    pub(super) fn find_provider_region_position(
-        &self,
-        doc: &Document,
-        provider_name: &str,
-    ) -> Option<(u32, u32)> {
-        self.find_provider_attr_position(doc, provider_name, "region")
-    }
-
-    /// Find the position of a named attribute in a provider block.
-    pub(super) fn find_provider_attr_position(
-        &self,
-        doc: &Document,
-        provider_name: &str,
-        attr_name: &str,
-    ) -> Option<(u32, u32)> {
-        let text = doc.text();
-        let mut in_provider = false;
-        let provider_pattern = format!("provider {}", provider_name);
-
-        for (line_idx, line) in text.lines().enumerate() {
-            let trimmed = line.trim();
-            if trimmed.starts_with(&provider_pattern) {
-                in_provider = true;
-            }
-
-            if in_provider {
-                if trimmed.starts_with(attr_name) {
-                    return Some((line_idx as u32, position::leading_whitespace_chars(line)));
-                }
-
-                if trimmed == "}" {
-                    in_provider = false;
-                }
-            }
-        }
-        None
+        tree.providers()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, provider)| {
+                let reason = self.provider_errors.get(&provider.name)?;
+                let finding = carina_core::parser::Located::new(
+                    tree.provider_location(index).clone(),
+                    format!("Provider '{}' is not loaded: {}", provider.name, reason),
+                );
+                render_merged(
+                    doc,
+                    &finding,
+                    DiagnosticSeverity::INFORMATION,
+                    finding.detail().clone(),
+                )
+            })
+            .collect()
     }
 
     /// Run a directory-scoped parse with the current editor buffer substituted
@@ -1512,8 +1441,7 @@ impl DiagnosticRun<'_> {
                         .record_at(
                             self.provider_context,
                             carina_core::validation::deferred_types::ProviderTypeCheckSite::new(
-                                attr_param.source_file(),
-                                attr_param.source_span(),
+                                attr_param.type_check_location().clone(),
                                 format!("attribute '{}'", attr_param.name),
                             ),
                         )
@@ -1794,100 +1722,53 @@ impl DiagnosticRun<'_> {
         )
     }
 
-    /// Check for undefined resource references in attribute values
+    /// Check authored references against directory-wide binding authority.
     pub(super) fn check_undefined_references(
         &self,
-        text: &str,
+        doc: &Document,
+        tree: &carina_core::parser::AnalysisTree<'_>,
         defined_bindings: &HashSet<String>,
         declared_providers: &HashSet<String>,
     ) -> Vec<Diagnostic> {
-        let mut diagnostics = Vec::new();
-        let mut provider_config_enum_namespaces = HashSet::new();
+        let mut enum_namespaces = HashSet::new();
         for factory in self
             .factories
             .iter()
             .filter(|factory| declared_providers.contains(factory.name()))
         {
-            let config_schema = factory.provider_config_attribute_types();
-            for attr_type in config_schema.parts().values() {
-                collect_enum_provider_namespaces(attr_type, &mut provider_config_enum_namespaces);
+            for attr_type in factory.provider_config_attribute_types().parts().values() {
+                collect_enum_provider_namespaces(attr_type, &mut enum_namespaces);
             }
         }
-
-        for (line_idx, line) in text.lines().enumerate() {
-            // Look for patterns like "binding_name.property" after "="
-            if let Some(eq_byte_pos) = line.find('=') {
-                let after_eq = &line[eq_byte_pos + 1..];
-                let after_eq_trimmed = after_eq.trim_start();
-                // Whitespace after '=' is ASCII spaces, so byte diff == char count
-                let whitespace_chars = after_eq.len() - after_eq_trimmed.len();
-
-                // Skip if it's a string literal
-                if after_eq_trimmed.starts_with('"') {
-                    continue;
+        let mut emitted = HashSet::new();
+        tree.value_references()
+            .iter()
+            .filter_map(|value| {
+                let reference = value.reference();
+                let identifier = reference.path().binding();
+                if defined_bindings.contains(identifier)
+                    || declared_providers.contains(identifier)
+                    || self.provider_names.iter().any(|name| name == identifier)
+                    || enum_namespaces.contains(identifier)
+                    || !emitted.insert(reference.location().clone())
+                {
+                    return None;
                 }
-
-                // Skip if it starts with a provider prefix. Include providers
-                // declared in the current document (issue #2019) so that an
-                // enum reference like `awscc.Region.ap_northeast_1` is not
-                // flagged as an undefined `let` binding when the provider is
-                // declared but not yet downloaded. A loaded provider config
-                // may also declare an enum owned by another namespace (for
-                // example awscc's config type is `aws.Region`), so recognize
-                // those schema-derived roots as enum namespaces too.
-                let is_provider_prefix = self
-                    .provider_names
-                    .iter()
-                    .any(|name| after_eq_trimmed.starts_with(&format!("{}.", name)))
-                    || declared_providers
-                        .iter()
-                        .any(|name| after_eq_trimmed.starts_with(&format!("{}.", name)))
-                    || provider_config_enum_namespaces
-                        .iter()
-                        .any(|name| after_eq_trimmed.starts_with(&format!("{}.", name)));
-                if is_provider_prefix {
-                    continue;
-                }
-
-                // Check if it looks like a resource reference: identifier.property
-                if let Some(dot_pos) = after_eq_trimmed.find('.') {
-                    let identifier = &after_eq_trimmed[..dot_pos];
-                    let after_dot = &after_eq_trimmed[dot_pos + 1..];
-
-                    // Extract property name
-                    let prop_end = after_dot
-                        .find(|c: char| !c.is_alphanumeric() && c != '_')
-                        .unwrap_or(after_dot.len());
-                    let property = &after_dot[..prop_end];
-
-                    // Check if this looks like a resource reference (e.g., main_vpc.id, bucket.arn)
-                    if !identifier.is_empty()
-                        && !property.is_empty()
-                        && identifier.chars().all(|c| c.is_alphanumeric() || c == '_')
-                        && identifier.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
-                    {
-                        // Check if the binding is defined
-                        if !defined_bindings.contains(identifier) {
-                            let col = position::byte_offset_to_char_offset(line, eq_byte_pos)
-                                + 1
-                                + whitespace_chars as u32;
-                            diagnostics.push(carina_diagnostic(
-                                line_idx as u32,
-                                col,
-                                col + identifier.len() as u32,
-                                DiagnosticSeverity::ERROR,
-                                format!(
-                                    "Undefined resource: '{}'. Define it with 'let {} = aws...'",
-                                    identifier, identifier
-                                ),
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        diagnostics
+                let finding = carina_core::parser::Located::new(
+                    reference.prefix_location().clone(),
+                    format!(
+                        "Undefined resource: '{}'. Define it with 'let {} = aws...'",
+                        identifier, identifier
+                    ),
+                );
+                render_merged(
+                    doc,
+                    &finding,
+                    DiagnosticSeverity::ERROR,
+                    finding.detail().clone(),
+                )
+            })
+            .collect()
     }
 
     /// Check for unknown attributes on resource references (typo detection).

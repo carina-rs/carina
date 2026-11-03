@@ -131,7 +131,7 @@ fn expand_directory(root: &Path) -> carina_core::parser::ExpandedParsedFile {
 }
 
 #[test]
-fn review_round1_module_private_bindings_do_not_enter_root_iterable_scope()
+fn module_private_bindings_do_not_enter_root_iterable_scope()
 -> Result<(), carina_core::parser::AnalysisTreeError> {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("module")).unwrap();
@@ -181,7 +181,7 @@ fn review_round1_module_private_bindings_do_not_enter_root_iterable_scope()
 }
 
 #[test]
-fn review_round1_root_and_module_loops_at_the_same_span_keep_distinct_files()
+fn root_and_module_loops_at_the_same_span_keep_distinct_files()
 -> Result<(), carina_core::parser::AnalysisTreeError> {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("module")).unwrap();

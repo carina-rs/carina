@@ -2,7 +2,6 @@
 //! resolution.
 
 use std::fmt;
-use std::num::NonZeroUsize;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -95,33 +94,46 @@ fn zero_divisor_error(op: IntegerOp) -> Option<IntegerArithmeticError> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Operator provenance survives evaluation and expansion. Synthetic runtime
+/// expressions have no authored position and cannot enter an `AnalysisTree`.
+/// Coordinates cannot be promoted into diagnostic provenance.
+///
+/// ```compile_fail,E0599
+/// use carina_core::integer_arithmetic::IntegerOperatorSpan;
+/// let span = IntegerOperatorSpan::from_line_column("sibling.crn", 3, 7);
+/// ```
+///
+/// ```compile_fail,E0451
+/// use carina_core::integer_arithmetic::IntegerOperatorSpan;
+/// let span = IntegerOperatorSpan { location: None };
+/// ```
+#[derive(Debug, Clone)]
 pub struct IntegerOperatorSpan {
-    line: Option<NonZeroUsize>,
-    column: Option<NonZeroUsize>,
+    location: Option<crate::parser::DeclarationLocation>,
 }
 
 impl IntegerOperatorSpan {
-    pub(crate) const fn from_original_position(position: crate::heredoc::OriginalPosition) -> Self {
+    pub fn authored(location: crate::parser::DeclarationLocation) -> Self {
         Self {
-            line: NonZeroUsize::new(position.line()),
-            column: NonZeroUsize::new(position.column()),
+            location: Some(location),
         }
     }
 
     pub const fn synthetic() -> Self {
-        Self {
-            line: None,
-            column: None,
-        }
+        Self { location: None }
     }
 
-    pub fn line(self) -> Option<usize> {
-        self.line.map(NonZeroUsize::get)
+    pub fn location(&self) -> Option<&crate::parser::DeclarationLocation> {
+        self.location.as_ref()
     }
 
-    pub fn column(self) -> Option<usize> {
-        self.column.map(NonZeroUsize::get)
+    pub fn line(&self) -> Option<usize> {
+        self.location().map(|location| location.span().start_line())
+    }
+
+    pub fn column(&self) -> Option<usize> {
+        self.location()
+            .map(|location| location.span().start_column())
     }
 }
 
@@ -268,12 +280,12 @@ impl<P: ValueKind, B: BindingAddress> ValidatedIntegerExpr<P, B> {
         &self.rhs
     }
 
-    pub const fn operator_span(&self) -> IntegerOperatorSpan {
-        self.operator_span
+    pub fn operator_span(&self) -> IntegerOperatorSpan {
+        self.operator_span.clone()
     }
 
     pub fn rebuild(&self, lhs: Value<P, B>, rhs: Value<P, B>) -> Result<Self, IntegerOperandError> {
-        Self::from_post_validation(lhs, self.op, rhs, self.operator_span)
+        Self::from_post_validation(lhs, self.op, rhs, self.operator_span.clone())
     }
 
     pub fn evaluate_with_operands(
@@ -284,9 +296,13 @@ impl<P: ValueKind, B: BindingAddress> ValidatedIntegerExpr<P, B> {
     where
         P: PlaceholderKind,
     {
-        evaluate_integer_values_inner(lhs, self.op, rhs, self.operator_span, |value, side| {
-            validate_post_validation_operand_shape(value, side)
-        })
+        evaluate_integer_values_inner(
+            lhs,
+            self.op,
+            rhs,
+            self.operator_span.clone(),
+            |value, side| validate_post_validation_operand_shape(value, side),
+        )
     }
 
     pub(crate) fn try_map_stage<Q: ValueKind, E>(

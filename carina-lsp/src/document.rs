@@ -158,7 +158,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn review_4220_analysis_invariant_is_one_diagnostic_and_does_not_panic() {
+    fn analysis_invariant_is_one_diagnostic_and_does_not_panic() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("sibling.crn");
         let source = "let item = mock.test.resource { name = 'live' }\n";
@@ -189,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn review_4220_named_analysis_invariant_belongs_only_to_its_file() {
+    fn named_analysis_invariant_belongs_only_to_its_file() {
         let directory = tempfile::tempdir().unwrap();
         let owner = directory.path().join("sibling.crn");
         let other = directory.path().join("main.crn");

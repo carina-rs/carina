@@ -82,7 +82,186 @@ impl Directory {
 
 const MAIN: &str = "provider aws {}\nlet cert = aws.acm.Certificate { domain_name = 'main' }\n";
 
-fn round3_schema_engine() -> DiagnosticEngine {
+#[test]
+fn deferred_provider_annotations_use_exact_parser_tokens_in_the_owner_file() {
+    let directory = Directory::new(&[
+        (
+            "main.crn",
+            "provider broken {}\nlet main_decoy = 'SharedId'\n",
+        ),
+        (
+            "sibling.crn",
+            "let decoy = '😀 SharedId'\nattributes { value: SharedId = 'id' }\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine()
+            .with_provider_errors(HashMap::from([("broken".into(), "unavailable".into())])),
+        "type check for SharedId was deferred",
+        &[("SharedId", 1)],
+    );
+}
+
+#[test]
+fn deferred_function_checks_preserve_annotation_and_complete_call_locations() {
+    let directory = Directory::new(&[
+        ("main.crn", "provider broken {}\nlet unrelated = 'main'\n"),
+        (
+            "sibling.crn",
+            "let decoy = '😀 Missing echo'\nfn echo(value: Missing) { value }\nlet actual = echo('id')\n",
+        ),
+    ]);
+    let engine = test_engine()
+        .with_provider_errors(HashMap::from([("broken".into(), "unavailable".into())]));
+    directory.assert_sibling_owner(
+        &engine,
+        "type check for Missing was deferred",
+        &[("Missing", 1), ("echo('id')", 0)],
+    );
+}
+
+#[test]
+fn unused_function_arithmetic_uses_the_operator_in_its_owner_file() {
+    let directory = Directory::new(&[
+        ("main.crn", "let decoy = '😀 +'\n"),
+        (
+            "sibling.crn",
+            "let decoy = '😀 +'\nfn bad(value: String): Int { value + 1 }\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(&test_engine(), "left operand must be Int", &[("+", 1)]);
+}
+
+#[test]
+fn resource_arithmetic_preserves_each_authored_operator() {
+    let directory = Directory::new(&[
+        ("main.crn", "provider mock {}\nlet main_decoy = '+'\n"),
+        (
+            "sibling.crn",
+            "arguments { text: String }\nlet decoy = '😀 +'\nmock.test.Thing { enabled = text + 1 }\nmock.test.Thing { enabled = text + 2 }\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &resource_location_schema_engine(),
+        "left operand must be Int",
+        &[("+", 1), ("+", 2)],
+    );
+}
+
+#[test]
+fn substituted_integer_operator_keeps_its_file_when_coordinates_coincide() {
+    use carina_core::parser::AnalysisTree;
+    let source = "arguments { ratio: Float }\nmock.test.Thing { enabled = ratio + 1 }\n";
+    let directory = Directory::new(&[("main.crn", source), ("sibling.crn", source)]);
+    let main = directory.root.path().join("main.crn");
+    let sibling = directory.root.path().join("sibling.crn");
+    let catalog = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let mut consumer = carina_core::parser::parse_file(source, &main, &catalog).unwrap();
+    let authored = carina_core::parser::parse_file(source, &sibling, &catalog).unwrap();
+    // Expansion substitutes a value, retaining its own parser provenance.
+    consumer.resources[0].attributes["enabled"] =
+        authored.resources[0].attributes["enabled"].clone();
+    let tree = AnalysisTree::try_from_file(&consumer).unwrap();
+    let resource = tree.resources().next().unwrap();
+    let engine = resource_location_schema_engine();
+    let schema = engine
+        .schemas
+        .get(
+            "mock",
+            "test.Thing",
+            carina_core::schema::SchemaKind::Resource,
+        )
+        .unwrap();
+    let bindings =
+        carina_core::binding_index::BindingIndex::from_parsed(&consumer, &engine.schemas, &catalog);
+    let findings = tree.integer_arithmetic_findings(
+        resource,
+        "enabled",
+        schema.effective_attribute("enabled").unwrap().value_type(),
+        &carina_core::validation::inference::bindings_from_parsed(&consumer),
+        &engine.schemas,
+        &bindings,
+    );
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    let finding = &findings[0];
+    assert_eq!(finding.location().file().path(), sibling);
+    let span = finding.location().span();
+    assert_eq!(&source[span.start_byte()..span.end_byte()], "+");
+    assert!(
+        render_merged(
+            &create_document_at(source, main),
+            finding,
+            DiagnosticSeverity::ERROR,
+            finding.detail().to_string()
+        )
+        .is_none()
+    );
+    let rendered = render_merged(
+        &create_document_at(source, sibling),
+        finding,
+        DiagnosticSeverity::ERROR,
+        finding.detail().to_string(),
+    )
+    .unwrap();
+    let column = source.lines().nth(1).unwrap().find('+').unwrap() as u32;
+    assert_eq!(
+        rendered.range,
+        Range::new(Position::new(1, column), Position::new(1, column + 1))
+    );
+}
+
+#[test]
+fn undefined_references_use_each_parser_occurrence_and_ignore_decoys() {
+    let directory = Directory::new(&[
+        (
+            "main.crn",
+            "provider mock {}\nlet main_decoy = 'missing.value'\n",
+        ),
+        (
+            "sibling.crn",
+            "let decoy = '😀 missing.value'\nmock.test.Thing { enabled = missing.value }\nmock.test.Thing { enabled = missing.value }\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &resource_location_schema_engine(),
+        "Undefined resource: 'missing'",
+        &[("missing.value", 1), ("missing.value", 2)],
+    );
+}
+
+#[test]
+fn authored_config_label_does_not_render_in_unrelated_buffers() {
+    use carina_core::validation::deferred_types::{ProviderTypeCheckSite, TypeCheckSession};
+    let catalog = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let source = "attributes { value: Missing = 'id' }";
+    let parsed = carina_core::parser::parse_file(source, Path::new("<config>"), &catalog).unwrap();
+    let terminal = TypeCheckSession::run(&catalog, |session| {
+        session.record(
+            &carina_core::parser::TypeExpr::String,
+            ProviderTypeCheckSite::new(
+                parsed.attribute_params[0].type_check_location().clone(),
+                "authored check",
+            ),
+        );
+        Vec::new()
+    });
+    let doc = create_document_at(source, "/project/sibling.crn".into());
+    assert!(DiagnosticEngine::publish_type_diagnostics(terminal, &doc).is_empty());
+}
+
+#[test]
+fn unloaded_provider_notice_ignores_comment_and_string_decoys() {
+    let source = "// provider aws {}\nlet decoy = 'provider aws {}'\nprovider aws {}\n";
+    let directory = Directory::new(&[
+        ("main.crn", "let main = 'provider aws {}'\n"),
+        ("sibling.crn", source),
+    ]);
+    let engine =
+        test_engine().with_provider_errors(HashMap::from([("aws".into(), "unavailable".into())]));
+    directory.assert_sibling_owner(&engine, "Provider 'aws' is not loaded", &[("aws", 2)]);
+}
+
+fn resource_location_schema_engine() -> DiagnosticEngine {
     use carina_core::schema::{
         AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
     };
@@ -117,7 +296,7 @@ fn round3_schema_engine() -> DiagnosticEngine {
     custom_engine(schemas)
 }
 
-fn assert_round3_resource_location(body: &str, message: &str, tokens: &[(&str, usize)]) {
+fn assert_resource_location(body: &str, message: &str, tokens: &[(&str, usize)]) {
     // Both the buffer parse and the sibling-function semantic fallback carry
     // the same authored spans. Test them with inline syntax and decoy text.
     for iterable in ["['one']", "names()"] {
@@ -138,13 +317,13 @@ fn assert_round3_resource_location(body: &str, message: &str, tokens: &[(&str, u
             "{iterable}: {:?}",
             doc.parse_error()
         );
-        directory.assert_sibling_owner(&round3_schema_engine(), message, tokens);
+        directory.assert_sibling_owner(&resource_location_schema_engine(), message, tokens);
     }
 }
 
 #[test]
-fn review_round3_resource_type_uses_parser_header() {
-    assert_round3_resource_location(
+fn resource_type_uses_parser_header() {
+    assert_resource_location(
         "mock.test.Missing {}",
         "No schema for mock.test.Missing",
         &[("mock.test.Missing", 1)],
@@ -152,8 +331,8 @@ fn review_round3_resource_type_uses_parser_header() {
 }
 
 #[test]
-fn review_round3_attribute_type_uses_parser_key() {
-    assert_round3_resource_location(
+fn attribute_type_uses_parser_key() {
+    assert_resource_location(
         "mock.test.Thing { enabled = 'bad' }",
         "expected Bool",
         &[("enabled", 1)],
@@ -161,8 +340,8 @@ fn review_round3_attribute_type_uses_parser_key() {
 }
 
 #[test]
-fn review_round3_enum_uses_parser_value() {
-    assert_round3_resource_location(
+fn enum_uses_parser_value() {
+    assert_resource_location(
         "mock.test.Thing { mode = 'bad' }",
         "string literal",
         &[("'bad'", 0)],
@@ -170,8 +349,8 @@ fn review_round3_enum_uses_parser_value() {
 }
 
 #[test]
-fn review_round3_unknown_attribute_uses_parser_key() {
-    assert_round3_resource_location(
+fn unknown_attribute_uses_parser_key() {
+    assert_resource_location(
         "mock.test.Thing { typo = true }",
         "Unknown attribute",
         &[("typo", 1)],
@@ -179,8 +358,8 @@ fn review_round3_unknown_attribute_uses_parser_key() {
 }
 
 #[test]
-fn review_round3_block_syntax_uses_each_parser_key() {
-    assert_round3_resource_location(
+fn block_syntax_uses_each_parser_key() {
+    assert_resource_location(
         "mock.test.Thing { config { enabled = true } }",
         "cannot use block syntax",
         &[("config", 1)],
@@ -188,8 +367,8 @@ fn review_round3_block_syntax_uses_each_parser_key() {
 }
 
 #[test]
-fn review_round3_nested_schema_uses_parser_field() {
-    assert_round3_resource_location(
+fn nested_schema_uses_parser_field() {
+    assert_resource_location(
         "mock.test.Thing { config = { typo = true } }",
         "Unknown field",
         &[("typo", 1)],
@@ -197,7 +376,7 @@ fn review_round3_nested_schema_uses_parser_field() {
 }
 
 #[test]
-fn review_round3_degraded_duplicates_keep_only_buffer_findings() {
+fn degraded_duplicates_keep_only_buffer_findings() {
     let directory = Directory::new(&[
         ("main.crn", "let same = 'first'\n"),
         (
@@ -216,7 +395,7 @@ fn review_round3_degraded_duplicates_keep_only_buffer_findings() {
 }
 
 #[test]
-fn review_round3_module_call_findings_are_reported_once() {
+fn module_call_findings_are_reported_once() {
     let directory = Directory::new(&[
         ("main.crn", "let service = use { source = './module' }\n"),
         ("sibling.crn", "service {}\n"),
@@ -238,7 +417,7 @@ fn review_round3_module_call_findings_are_reported_once() {
 }
 
 #[test]
-fn review_round3_cached_module_findings_keep_upstream_type_authority() {
+fn cached_module_findings_keep_upstream_type_authority() {
     let directory = Directory::new(&[
         (
             "main.crn",
@@ -252,7 +431,7 @@ fn review_round3_cached_module_findings_keep_upstream_type_authority() {
 }
 
 #[test]
-fn review_round3_cycle_reports_once_per_member_file_in_ring_order() {
+fn cycle_reports_once_per_member_file_in_ring_order() {
     let directory = Directory::new(&[
         ("main.crn", MAIN),
         (
@@ -271,7 +450,7 @@ fn review_round3_cycle_reports_once_per_member_file_in_ring_order() {
 }
 
 #[test]
-fn review_round2_wait_does_not_resolve_deferred_if_target() {
+fn wait_does_not_resolve_deferred_if_target() {
     let directory = Directory::new(&[
         (
             "main.crn",
@@ -290,7 +469,7 @@ fn review_round2_wait_does_not_resolve_deferred_if_target() {
 }
 
 #[test]
-fn review_round2_type_resolution_invariant_renders_in_each_directory_buffer() {
+fn type_resolution_invariant_renders_in_each_directory_buffer() {
     let directory = Directory::new(&[
         ("main.crn", MAIN),
         (
@@ -328,7 +507,7 @@ fn review_round2_type_resolution_invariant_renders_in_each_directory_buffer() {
 }
 
 #[test]
-fn review_round2_failed_function_annotation_keeps_main_finding_set() {
+fn failed_function_annotation_keeps_main_finding_set() {
     let directory = Directory::new(&[
         (
             "main.crn",
@@ -353,7 +532,7 @@ fn review_round2_failed_function_annotation_keeps_main_finding_set() {
 }
 
 #[test]
-fn review_round1_merged_function_error_uses_parser_owned_body_location() {
+fn merged_function_error_uses_parser_owned_body_location() {
     let directory = Directory::new(&[
         (
             "main.crn",
@@ -372,7 +551,7 @@ fn review_round1_merged_function_error_uses_parser_owned_body_location() {
 }
 
 #[test]
-fn review_round1_module_function_error_keeps_its_element_location() {
+fn module_function_error_keeps_its_element_location() {
     let directory = Directory::new(&[
         (
             "main.crn",
@@ -405,7 +584,7 @@ fn review_round1_module_function_error_keeps_its_element_location() {
 }
 
 #[test]
-fn review_round1_provider_error_uses_sibling_attribute_location() {
+fn provider_error_uses_sibling_attribute_location() {
     let directory = Directory::new(&[
         ("main.crn", "let regional = provider aws {}\n"),
         ("sibling.crn", "provider aws { default_tags = 'wrong' }\n"),
@@ -418,7 +597,7 @@ fn review_round1_provider_error_uses_sibling_attribute_location() {
 }
 
 #[test]
-fn review_round1_expanded_provider_invariant_is_rendered() {
+fn expanded_provider_invariant_is_rendered() {
     use carina_core::parser::{AnalysisResolutionError, ProviderContext};
     let directory = Directory::new(&[
         ("main.crn", "provider aws {}\n"),
@@ -450,7 +629,7 @@ fn review_round1_expanded_provider_invariant_is_rendered() {
 }
 
 #[test]
-fn review_4220_routing_waits_for_the_directory_parse() {
+fn routing_waits_for_the_directory_parse() {
     let directory = Directory::new(&[
         ("main.crn", "let regional = provider aws {}\n"),
         (
@@ -467,8 +646,7 @@ fn review_4220_routing_waits_for_the_directory_parse() {
 }
 
 #[test]
-fn review_4220_unmappable_span_drops_only_that_finding()
--> Result<(), carina_core::parser::AnalysisTreeError> {
+fn unmappable_span_drops_only_that_finding() -> Result<(), carina_core::parser::AnalysisTreeError> {
     let directory = Directory::new(&[("main.crn", MAIN), ("sibling.crn", "let live = 'live'\n")]);
     let path = directory.root.path().join("sibling.crn");
     let document = create_document_at("let live = 'live'\n", path.clone());
@@ -500,7 +678,7 @@ fn review_4220_unmappable_span_drops_only_that_finding()
 }
 
 #[test]
-fn review_4220_module_reload_uses_the_unsaved_buffer() {
+fn module_reload_uses_the_unsaved_buffer() {
     let directory = Directory::new(&[
         ("main.crn", "invalid {{{"),
         (
@@ -547,7 +725,7 @@ fn review_4220_module_reload_uses_the_unsaved_buffer() {
 }
 
 #[test]
-fn review_4220_upstream_reload_uses_the_unsaved_buffer() {
+fn upstream_reload_uses_the_unsaved_buffer() {
     let directory = Directory::new(&[
         ("main.crn", "invalid {{{"),
         ("sibling.crn", "let label = 'sibling'\n"),
@@ -562,7 +740,7 @@ fn review_4220_upstream_reload_uses_the_unsaved_buffer() {
 }
 
 #[test]
-fn review_4220_unreadable_sibling_keeps_buffer_duplicates() {
+fn unreadable_sibling_keeps_buffer_duplicates() {
     let source = "exports { repeated: String = 'one' repeated: String = 'two' }\n";
     let directory = Directory::new(&[
         ("main.crn", "let unrelated = 'main'\n"),
@@ -580,7 +758,7 @@ fn review_4220_unreadable_sibling_keeps_buffer_duplicates() {
 }
 
 #[test]
-fn review_4220_function_refs_use_each_authored_occurrence() {
+fn function_refs_use_each_authored_occurrence() {
     let directory = Directory::new(&[
         ("main.crn", MAIN),
         (
@@ -596,7 +774,7 @@ fn review_4220_function_refs_use_each_authored_occurrence() {
 }
 
 #[test]
-fn review_4220_resource_refs_ignore_decoys_and_keep_each_occurrence() {
+fn resource_refs_ignore_decoys_and_keep_each_occurrence() {
     let directory = Directory::new(&[
         ("main.crn", MAIN),
         (
@@ -612,7 +790,7 @@ fn review_4220_resource_refs_ignore_decoys_and_keep_each_occurrence() {
 }
 
 #[test]
-fn review_4220_non_bmp_positions_agree_across_renderers() {
+fn non_bmp_positions_agree_across_renderers() {
     let directory = Directory::new(&[
         ("main.crn", MAIN),
         (
@@ -668,7 +846,7 @@ fn review_4220_non_bmp_positions_agree_across_renderers() {
 }
 
 #[test]
-fn review_4220_parser_ranges_use_utf16() {
+fn parser_ranges_use_utf16() {
     let directory = Directory::new(&[
         ("main.crn", MAIN),
         (

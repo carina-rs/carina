@@ -2384,7 +2384,7 @@ mod tests {
     }
 
     #[test]
-    fn review_round2_upstream_expanded_field_and_subscript_findings_keep_context()
+    fn upstream_expanded_field_and_subscript_findings_keep_context()
     -> Result<(), crate::parser::AnalysisTreeError> {
         for (expression, field_error) in [("up.missing", true), ("up.names['bad']", false)] {
             let parsed = parse_project_with_provider(
@@ -2416,7 +2416,7 @@ mod tests {
     }
 
     #[test]
-    fn review_round2_upstream_iterable_aliases_preserve_each_occurrence()
+    fn upstream_iterable_aliases_preserve_each_occurrence()
     -> Result<(), crate::parser::AnalysisTreeError> {
         let parsed = parse_project_with_provider(
             "let up = upstream_state { source = './up' }\nlet values = up.scalar\nlet copies = for n in (values ?? values) { test.r.res { name = n } }\n",
@@ -2430,7 +2430,7 @@ mod tests {
     }
 
     #[test]
-    fn review_round2_upstream_shapes_keep_main_project_value_scope()
+    fn upstream_shapes_keep_main_project_value_scope()
     -> Result<(), crate::parser::AnalysisTreeError> {
         let parsed = parse_project_with_provider(
             "let up = upstream_state { source = './up' }\nlet copies = for n in up.names { read test.r.res { name = up.names.bad } }\n",

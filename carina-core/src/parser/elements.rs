@@ -40,7 +40,6 @@ pub(crate) enum ElementKind {
 pub(crate) struct ElementLocations {
     pub(crate) keys: Vec<AttributeKeyLocation>,
     pub(crate) attribute_values: Vec<AttributeValueLocation>,
-    pub(crate) integer_operators: Vec<DeclarationLocation>,
     pub(crate) values: Vec<(ElementKind, DeclarationLocation)>,
 }
 
@@ -146,7 +145,6 @@ impl ElementLocations {
         Self {
             keys,
             attribute_values,
-            integer_operators: Vec::new(),
             values: Vec::new(),
         }
     }
@@ -156,16 +154,7 @@ impl ElementLocations {
         file: &PreprocessedFile,
         path: &Path,
     ) -> Self {
-        let mut out = Self {
-            integer_operators: pair
-                .clone()
-                .into_inner()
-                .flatten()
-                .filter(|pair| matches!(pair.as_rule(), Rule::add_op | Rule::multiplicative_op))
-                .map(|pair| DeclarationLocation::from_pair(&pair, file, path))
-                .collect(),
-            ..Self::default()
-        };
+        let mut out = Self { ..Self::default() };
         if matches!(
             pair.as_rule(),
             Rule::resource_expr | Rule::anonymous_resource | Rule::read_resource_expr

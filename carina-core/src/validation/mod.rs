@@ -1085,8 +1085,7 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
                 value,
                 typecheck::TypecheckInference::Unavailable,
                 deferred_types::ProviderTypeCheckSite::new(
-                    use_site.source_file.path(),
-                    use_site.span,
+                    use_site.location().clone(),
                     format!("binding '{}'", use_site.name),
                 ),
             )
@@ -1902,35 +1901,37 @@ impl DeferredAccessTypeError {
     /// Return the authored operator span when this computed-expression error
     /// came from integer arithmetic. Frontends use this only for source
     /// anchoring; the diagnostic text and validity decision remain in core.
-    pub const fn integer_operator_span(
-        &self,
-    ) -> Option<crate::integer_arithmetic::IntegerOperatorSpan> {
+    fn integer_operator_span(&self) -> Option<crate::integer_arithmetic::IntegerOperatorSpan> {
         match self {
             Self::InvalidAccess {
                 error:
                     inference::InferenceError::InvalidIntegerArithmeticOperand { operator_span, .. },
-            } => Some(*operator_span),
+            } => Some(operator_span.clone()),
             Self::InvalidAccess { .. } | Self::TypeMismatch { .. } => None,
         }
     }
 }
 
 /// One arithmetic-specific failure found while walking a computed value.
-/// The error text and validity decision come from the shared core checker;
-/// frontends only use the span to anchor that finding in authored source.
+/// The shared checker returns this detail inside `Located`; coordinate-only
+/// arithmetic checks are not an external diagnostic API.
+///
+/// ```compile_fail,E0603
+/// use carina_core::validation::check_integer_arithmetic_types;
+/// ```
+///
+/// ```compile_fail,E0599
+/// use carina_core::validation::IntegerArithmeticTypeFinding;
+/// fn fabricate(finding: IntegerArithmeticTypeFinding) { let span = finding.operator_span(); }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntegerArithmeticTypeFinding {
     error: DeferredAccessTypeError,
-    operator_span: crate::integer_arithmetic::IntegerOperatorSpan,
 }
 
 impl IntegerArithmeticTypeFinding {
     pub fn error(&self) -> &DeferredAccessTypeError {
         &self.error
-    }
-
-    pub const fn operator_span(&self) -> crate::integer_arithmetic::IntegerOperatorSpan {
-        self.operator_span
     }
 }
 
@@ -2270,7 +2271,7 @@ fn check_integer_arithmetic_types_with_sink<'a, B: BindingAddress>(
     bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
     schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
-) -> Vec<IntegerArithmeticTypeFinding> {
+) -> Vec<crate::parser::Located<IntegerArithmeticTypeFinding>> {
     let mut findings = Vec::new();
     visit_computed_accesses_with_sink(value, sink, &mut |candidate, candidate_sink| {
         let GenericValue::Deferred(crate::resource::DeferredValue::IntegerArithmetic(expression)) =
@@ -2303,34 +2304,61 @@ fn check_integer_arithmetic_types_with_sink<'a, B: BindingAddress>(
         let operator_span = error
             .integer_operator_span()
             .unwrap_or_else(|| expression.operator_span());
-        let duplicate = findings
-            .iter()
-            .any(|finding: &IntegerArithmeticTypeFinding| {
-                finding.to_string() == error.to_string()
-                    && finding.operator_span.line() == operator_span.line()
-                    && finding.operator_span.column() == operator_span.column()
-            });
+        let duplicate = findings.iter().any(
+            |finding: &crate::parser::Located<IntegerArithmeticTypeFinding>| {
+                finding.detail().to_string() == error.to_string()
+                    && Some(finding.location()) == operator_span.location()
+            },
+        );
         if !duplicate {
-            findings.push(IntegerArithmeticTypeFinding {
-                error,
-                operator_span,
-            });
+            findings.push(crate::parser::Located::new(
+                operator_span
+                    .location()
+                    .expect("integer operator validated at the analysis boundary")
+                    .clone(),
+                IntegerArithmeticTypeFinding { error },
+            ));
         }
     });
     findings
+}
+
+impl<D, B: BindingAddress, E>
+    crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    pub fn integer_arithmetic_findings(
+        &self,
+        resource: &crate::parser::AnalysisResourceRef<
+            '_,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            B,
+        >,
+        name: &str,
+        sink: crate::schema::EffectiveType<'_>,
+        bindings: &crate::validation::inference::InferenceBindings<ParserPlaceholder, B>,
+        schemas: &crate::schema::SchemaRegistry,
+        binding_index: &crate::binding_index::BindingIndex<'_, B>,
+    ) -> Vec<crate::parser::Located<crate::validation::IntegerArithmeticTypeFinding>> {
+        let attributes = resource.attributes();
+        check_integer_arithmetic_types(&attributes[name], sink, bindings, schemas, binding_index)
+    }
 }
 
 /// Validate every integer-arithmetic node in a value tree against both its
 /// authored resource sink and its invariant Int operand sinks. This is the
 /// shared source for CLI and LSP arithmetic diagnostics; callers add only
 /// their surrounding resource context and source-range conversion.
-pub fn check_integer_arithmetic_types<B: BindingAddress>(
+fn check_integer_arithmetic_types<B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     sink: crate::schema::EffectiveType<'_>,
     bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
     schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
-) -> Vec<IntegerArithmeticTypeFinding> {
+) -> Vec<crate::parser::Located<IntegerArithmeticTypeFinding>> {
     check_integer_arithmetic_types_with_sink(
         value,
         Some(RefSink::from_effective_type(sink)),
@@ -2340,26 +2368,8 @@ pub fn check_integer_arithmetic_types<B: BindingAddress>(
     )
 }
 
-/// Validate arithmetic in a value that has no external declared sink, such as
-/// a top-level `let`. The expression's own result is Int, and every nested
-/// arithmetic node must independently prove both operands are Int.
-pub fn check_integer_arithmetic_value<B: BindingAddress>(
-    value: &GenericValue<ParserPlaceholder, B>,
-    bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
-    schemas: &SchemaRegistry,
-    binding_index: &BindingIndex<'_, B>,
-) -> Vec<IntegerArithmeticTypeFinding> {
-    check_integer_arithmetic_types_with_sink(
-        value,
-        Some(RefSink::TypeExpr(&INT_REF_SINK)),
-        bindings,
-        schemas,
-        binding_index,
-    )
-}
-
 fn append_unique_integer_arithmetic_findings<B: BindingAddress>(
-    findings: &mut Vec<IntegerArithmeticTypeFinding>,
+    findings: &mut Vec<crate::parser::Located<IntegerArithmeticTypeFinding>>,
     value: &GenericValue<ParserPlaceholder, B>,
     sink: Option<RefSink<'_>>,
     bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
@@ -2369,12 +2379,8 @@ fn append_unique_integer_arithmetic_findings<B: BindingAddress>(
     for finding in
         check_integer_arithmetic_types_with_sink(value, sink, bindings, schemas, binding_index)
     {
-        let span = finding.operator_span();
         let duplicate = findings.iter().any(|existing| {
-            let existing_span = existing.operator_span();
-            existing.to_string() == finding.to_string()
-                && existing_span.line() == span.line()
-                && existing_span.column() == span.column()
+            existing.to_string() == finding.to_string() && existing.location() == finding.location()
         });
         if !duplicate {
             findings.push(finding);
@@ -2384,19 +2390,28 @@ fn append_unique_integer_arithmetic_findings<B: BindingAddress>(
 
 /// Validate arithmetic in every non-resource value declaration in a parsed
 /// file. Resource attributes retain their external schema sink and are checked
-/// separately by [`check_integer_arithmetic_types`]; this pass covers values
+/// separately by [`crate::parser::AnalysisTree::integer_arithmetic_findings`]; this pass covers values
 /// that may otherwise be unused, including module attributes, provider/backend
 /// values, deferred iterables, and user-function bodies.
+/// A raw file cannot bypass the boundary that requires operator provenance.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{parser::ParsedFile, validation::{check_file_integer_arithmetic_values, inference::InferenceBindings}, schema::SchemaRegistry, binding_index::BindingIndex};
+/// fn analyze(file: &ParsedFile, bindings: &BindingIndex<'_>) {
+///     check_file_integer_arithmetic_values(file, &InferenceBindings::new(), &SchemaRegistry::new(), bindings);
+/// }
+/// ```
 pub fn check_file_integer_arithmetic_values<
     B: BindingAddress,
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
-    parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
     bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
     schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
-) -> Vec<IntegerArithmeticTypeFinding> {
+) -> Vec<crate::parser::Located<IntegerArithmeticTypeFinding>> {
+    let parsed = tree.file();
     let mut findings = Vec::new();
     let mut check =
         |value: &GenericValue<ParserPlaceholder, B>,
@@ -4258,12 +4273,14 @@ fn validate_resource_ref_types_inner<
     // operator keys so a let substituted into an attribute is not reported a
     // second time by the schema-sink pass below.
     let mut declaration_arithmetic_findings = HashSet::new();
-    for finding in
-        check_file_integer_arithmetic_values(parsed, &inference_bindings, registry, bindings)
-    {
-        let span = finding.operator_span();
+    for finding in check_file_integer_arithmetic_values(
+        &crate::parser::AnalysisTree::try_from_file(parsed)?,
+        &inference_bindings,
+        registry,
+        bindings,
+    ) {
         let message = finding.to_string();
-        declaration_arithmetic_findings.insert((span.line(), span.column(), message.clone()));
+        declaration_arithmetic_findings.insert((finding.location().clone(), message.clone()));
         all_errors.push(message);
     }
 
@@ -4428,12 +4445,9 @@ fn validate_resource_ref_types_inner<
                         registry,
                         bindings,
                     ) {
-                        let span = finding.operator_span();
-                        if declaration_arithmetic_findings.contains(&(
-                            span.line(),
-                            span.column(),
-                            finding.to_string(),
-                        )) {
+                        if declaration_arithmetic_findings
+                            .contains(&(finding.location().clone(), finding.to_string()))
+                        {
                             continue;
                         }
                         match finding.error() {
@@ -6121,7 +6135,7 @@ fn resolve_file_type_exprs_with_annotations<
     for argument in &mut parsed.arguments {
         let location = annotation(TypeResolutionDeclarationKind::Argument, &argument.name);
         let context = format!("argument '{}'", argument.name);
-        let site = ProviderTypeCheckSite::new(location.file().path(), location.span(), context);
+        let site = ProviderTypeCheckSite::new(location.clone(), context);
         let failures = resolve_declaration_type(&mut argument.static_type, config, &site);
         let resolution = if failures.is_empty() {
             DependencyArgumentResolution::Resolved(match &argument.static_type {
@@ -6142,14 +6156,12 @@ fn resolve_file_type_exprs_with_annotations<
         }
     }
     for attribute in &mut parsed.attribute_params {
-        // Provider-check deduplication uses the complete declaration; the
-        // emitted finding separately owns the precise annotation token.
-        let declaration_span = attribute.source_span();
+        // Declaration and runtime checks share the parser-owned annotation
+        // token, so deduplication never reconstructs a site from coordinates.
         if let Some(ty) = &mut attribute.static_type {
             let location = annotation(TypeResolutionDeclarationKind::Attribute, &attribute.name);
             let site = ProviderTypeCheckSite::new(
-                location.file().path(),
-                declaration_span,
+                location.clone(),
                 format!("attribute '{}'", attribute.name),
             );
             for error in resolve_declaration_type(ty, config, &site) {
@@ -6164,14 +6176,9 @@ fn resolve_file_type_exprs_with_annotations<
     }
     for export in &mut parsed.export_params {
         let name = export.name().to_string();
-        let declaration_span = export.source_span();
         if let Some(ty) = export.type_expr_opt_mut() {
             let location = annotation(TypeResolutionDeclarationKind::Export, &name);
-            let site = ProviderTypeCheckSite::new(
-                location.file().path(),
-                declaration_span,
-                format!("export '{name}'"),
-            );
+            let site = ProviderTypeCheckSite::new(location.clone(), format!("export '{name}'"));
             for error in resolve_declaration_type(ty, config, &site) {
                 errors.push(TypeResolutionDiagnostic::declaration(
                     TypeResolutionDeclarationKind::Export,
@@ -6189,8 +6196,7 @@ fn resolve_file_type_exprs_with_annotations<
                 let name = format!("{}' parameter '{}", function.name, parameter.name);
                 let location = annotation(TypeResolutionDeclarationKind::FunctionParameter, &name);
                 let site = ProviderTypeCheckSite::new(
-                    location.file().path(),
-                    location.span(),
+                    location.clone(),
                     format!(
                         "function '{}' parameter '{}'",
                         function.name, parameter.name
@@ -6212,8 +6218,7 @@ fn resolve_file_type_exprs_with_annotations<
                 &function.name,
             );
             let site = ProviderTypeCheckSite::new(
-                location.file().path(),
-                location.span(),
+                location.clone(),
                 format!("function '{}' return value", function.name),
             );
             for error in resolve_declaration_type(ty, config, &site) {
@@ -7850,8 +7855,11 @@ impl ModuleCallChecker<'_> {
                 value,
                 inference,
                 deferred_types::ProviderTypeCheckSite::new(
-                    authored_call.id().source_file(),
-                    authored.value_span(),
+                    authored_call
+                        .id()
+                        .argument_value_location(argument)
+                        .expect("parser-owned argument value")
+                        .clone(),
                     format!("{call_label} argument '{argument}'"),
                 ),
             ) {
@@ -8711,23 +8719,15 @@ where
                         (resolved_param.type_expr_opt(), resolved_param.value())
                     {
                         let provider = typecheck::TypecheckProviderContext::for_session(config);
-                        let check = match param.source_location() {
-                            Some((source, span)) => provider.check_at(
-                                type_expr,
-                                value,
-                                typecheck::TypecheckInference::Unavailable,
-                                deferred_types::ProviderTypeCheckSite::new(
-                                    source,
-                                    span,
-                                    format!("export '{}'", param.name()),
-                                ),
+                        let check = provider.check_at(
+                            type_expr,
+                            value,
+                            typecheck::TypecheckInference::Unavailable,
+                            deferred_types::ProviderTypeCheckSite::new(
+                                param.type_check_location().clone(),
+                                format!("export '{}'", param.name()),
                             ),
-                            None => provider.check(
-                                type_expr,
-                                value,
-                                typecheck::TypecheckInference::Unavailable,
-                            ),
-                        };
+                        );
                         if let Err(error) = check {
                             errors.push(format!("export '{}': {error}", param.name()));
                         }
@@ -8873,8 +8873,7 @@ fn validate_attribute_params_impl<P: PlaceholderKind, B: BindingAddress>(
                     value,
                     typecheck::TypecheckInference::Unavailable,
                     deferred_types::ProviderTypeCheckSite::new(
-                        param.source_file(),
-                        param.source_span(),
+                        param.type_check_location().clone(),
                         format!("attribute '{}'", param.name),
                     ),
                 ) {
