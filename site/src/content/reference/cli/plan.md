@@ -300,16 +300,17 @@ carina plan --detailed-exitcode
 
 ## Output Format
 
-The plan output shows each resource with its effect type:
+The plan output shows each resource with the action Carina will take:
 
 - **Create** (`+`) -- new resource to be created
 - **Update** (`~`) -- existing resource with attribute changes
 - **Delete** (`-`) -- resource to be removed
-- **Replace** (`+/-`) -- resource that must be destroyed and recreated
+- **Replace** (`+/-`) -- resource that must be destroyed and recreated; the plan
+  holds a Delete and a Create for it, shown together as one line
 - **Release** (`!`) -- an omitted key is no longer authored by the configuration,
   but the remote value is left unchanged because the API does not reset omitted keys
 
-A summary line shows the total count of each effect type. Releases have their own
+A summary line shows the total count of each action. Releases have their own
 `to release` count; a plan containing only releases is not reported as "No changes."
 
 ## Keyed partial-update list releases
