@@ -299,6 +299,10 @@ pub enum TypeExprValuePathSegment {
 /// A typed value mismatch against a declared [`TypeExpr`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeExprValueError {
+    InferredTypeMismatch {
+        path: Vec<TypeExprValuePathSegment>,
+        types: crate::schema::MismatchTypeNames,
+    },
     Mismatch {
         path: Vec<TypeExprValuePathSegment>,
         expected: Box<TypeExpr>,
@@ -330,7 +334,8 @@ pub enum TypeExprValueError {
 impl TypeExprValueError {
     fn prepend(mut self, segment: TypeExprValuePathSegment) -> Self {
         match &mut self {
-            Self::Mismatch { path, .. }
+            Self::InferredTypeMismatch { path, .. }
+            | Self::Mismatch { path, .. }
             | Self::MissingStructField { path, .. }
             | Self::UnknownStructField { path, .. }
             | Self::CustomTypeValidation { path, .. } => path.insert(0, segment),
@@ -361,6 +366,10 @@ fn write_path(f: &mut fmt::Formatter<'_>, path: &[TypeExprValuePathSegment]) -> 
 impl fmt::Display for TypeExprValueError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InferredTypeMismatch { path, types } => {
+                write_path(f, path)?;
+                types.fmt(f)
+            }
             Self::Mismatch {
                 path,
                 expected,
@@ -834,7 +843,10 @@ fn inferred_value_check<'s, P: PlaceholderKind, B: BindingAddress>(
     match inferred_type_assignment(expected, actual, &config.custom_types) {
         crate::schema::TypeAssignability::Assignable => TypeExprValueCheck::Assignable,
         crate::schema::TypeAssignability::Mismatch => {
-            TypeExprValueCheck::Mismatch(mismatch(expected, value))
+            TypeExprValueCheck::Mismatch(TypeExprValueError::InferredTypeMismatch {
+                path: Vec::new(),
+                types: crate::schema::MismatchTypeNames::for_type_exprs(expected, actual),
+            })
         }
         crate::schema::TypeAssignability::Unchecked(evidence) => {
             TypeExprValueCheck::Deferred(TypeExprValueDeferral {

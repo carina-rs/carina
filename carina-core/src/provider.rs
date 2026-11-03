@@ -6657,10 +6657,10 @@ impl CustomTypeCanonicalizationError {
                 identity,
                 expected: _expected,
                 actual,
-            } => crate::schema::TypeError::TypeMismatch {
-                expected: identity.to_string(),
-                got: actual.to_string(),
-            },
+            } => crate::schema::TypeError::value_type_mismatch(
+                identity.to_string(),
+                actual.to_string(),
+            ),
             error @ (Self::UnidentifiedDeclaration { .. }
             | Self::MissingScalarKind { .. }
             | Self::NonFiniteFloat { .. }

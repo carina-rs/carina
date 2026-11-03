@@ -251,12 +251,9 @@ impl<'a, R: PatternForm> EnumValueResolver<'a, R> {
             Some(defs) => self.attr_type.resolve_refs_with_defs(defs).as_attr(),
             None => self.attr_type,
         };
-        attr_type
-            .enum_parts()
-            .ok_or_else(|| TypeError::TypeMismatch {
-                expected: "Enum".to_string(),
-                got: attr_type.type_name(),
-            })
+        attr_type.enum_parts().ok_or_else(|| {
+            TypeError::value_type_mismatch("Enum".to_string(), attr_type.type_name())
+        })
     }
 }
 

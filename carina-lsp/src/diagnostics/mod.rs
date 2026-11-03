@@ -2371,10 +2371,7 @@ fn is_duplicate_list_error(error: &TypeError) -> bool {
         | TypeError::MapKeyError { inner, key: _ }
         | TypeError::MapValueError { inner, key: _ }
         | TypeError::StructFieldError { inner, field: _ } => is_duplicate_list_error(inner),
-        TypeError::TypeMismatch {
-            expected: _,
-            got: _,
-        }
+        TypeError::TypeMismatch { types: _ }
         | TypeError::BindingShadowsEnumMember(_)
         | TypeError::InvalidEnumVariant {
             value: _,
@@ -2485,9 +2482,8 @@ fn check_resource_ref_type_mismatch(
         }
     };
     Some(format!(
-        "Type mismatch: expected {}, got {} ({})",
-        expected.resolved_type_name(),
-        mismatch.actual_type_name(),
+        "Type mismatch: {} ({})",
+        mismatch.type_names(),
         mismatch.origin_description(path),
     ))
 }

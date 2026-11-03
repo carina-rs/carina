@@ -10047,6 +10047,22 @@ fn named_annotation_lsp_literals_keep_the_declared_length_bound() {
 }
 
 #[test]
+fn named_reference_mismatch_keeps_both_constraint_aware_names_in_lsp() {
+    let engine = named_annotation_engine(128);
+    let diagnostics = engine.analyze(
+        &create_document(
+            "provider aws {}\nlet source = aws.NameSource {}\nlet role = aws.iam.Role { role_name = source.name }\n",
+        ),
+        None,
+    );
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic.message
+            == "Type mismatch: expected aws.iam.Role.Name (length 1..=64), got aws.iam.Role.Name (length 1..=128) (from source.name)"),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
 fn registered_bare_provider_type_does_not_remain_a_fail_open_simple_in_lsp() {
     let directory = tempfile::tempdir().expect("bare type fixture");
     std::fs::write(directory.path().join("providers.crn"), "provider test {}\n")

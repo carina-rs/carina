@@ -143,10 +143,14 @@ pub enum NotInferableReason {
 pub enum InferenceError {
     #[error("{reason}", reason = crate::provider_text::ProviderText::new(reason))]
     UnknownType { reason: String },
-    #[error("{reason}", reason = crate::provider_text::ProviderText::new(reason))]
-    HeterogeneousCollection { reason: String },
-    #[error("coalesce default type `{default}` does not match left type `{left}`", default = crate::provider_text::ProviderText::new(default), left = crate::provider_text::ProviderText::new(left))]
-    IncompatibleCoalesceTypes { left: String, default: String },
+    #[error("collection element types disagree: `{}` vs `{}`", crate::provider_text::ProviderText::new(types.expected()), crate::provider_text::ProviderText::new(types.actual()))]
+    HeterogeneousCollection {
+        types: crate::schema::MismatchTypeNames,
+    },
+    #[error("coalesce default type `{}` does not match left type `{}`", crate::provider_text::ProviderText::new(types.actual()), crate::provider_text::ProviderText::new(types.expected()))]
+    IncompatibleCoalesceTypes {
+        types: crate::schema::MismatchTypeNames,
+    },
     #[error("operator '{op}': {side} operand must be Int, got {actual}", actual = crate::provider_text::ProviderText::new(actual))]
     InvalidIntegerArithmeticOperand {
         op: crate::integer_arithmetic::IntegerOp,

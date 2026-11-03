@@ -5017,10 +5017,7 @@ fn with_attribute_is_noop_for_variants_that_dont_carry_attribute() {
     // `with_attribute` is a no-op for TypeError variants that don't
     // carry an attribute slot — it must not panic or corrupt the
     // message.
-    let original = TypeError::TypeMismatch {
-        expected: "String".to_string(),
-        got: "Int".to_string(),
-    };
+    let original = TypeError::value_type_mismatch("String".to_string(), "Int".to_string());
     let expected_msg = original.to_string();
     let wrapped = original.with_attribute("foo").to_string();
     assert_eq!(wrapped, expected_msg);
@@ -7009,10 +7006,10 @@ fn secret_structured_string_enum_error_is_masked_without_literal_quotes() {
                     )],
                 })
             }
-            other => Err(TypeError::TypeMismatch {
-                expected: "String".to_string(),
-                got: other.type_name(),
-            }),
+            other => Err(TypeError::value_type_mismatch(
+                "String".to_string(),
+                other.type_name(),
+            )),
         }),
         None,
     );
@@ -13867,10 +13864,7 @@ fn schema_union_ref_member_missing_from_defs_keeps_generic_type_mismatch() {
         AttributeType::ref_("MissingYears"),
     ]));
     let value = union_map(vec![("days", Value::Concrete(ConcreteValue::Int(30)))]);
-    let expected = TypeError::TypeMismatch {
-        expected: schema.root.type_name(),
-        got: "Map".to_string(),
-    };
+    let expected = TypeError::value_type_mismatch(schema.root.type_name(), "Map".to_string());
 
     for (path, err) in union_ref_errors_from_schema_paths(&schema, &value) {
         assert_eq!(err, expected, "{path} changed the missing-Ref fallback");
@@ -13894,10 +13888,7 @@ fn standalone_union_ref_members_keep_generic_type_mismatch_without_internal_erro
         .expect_err("standalone Ref members cannot resolve without defs");
     assert_eq!(
         err,
-        TypeError::TypeMismatch {
-            expected: union.type_name(),
-            got: "Map".to_string(),
-        }
+        TypeError::value_type_mismatch(union.type_name(), "Map".to_string())
     );
     assert!(!err.to_string().contains("internal:"));
 }
@@ -13918,10 +13909,7 @@ fn schema_validate_self_cyclic_union_ref_failing_value_terminates() {
         .expect_err("the cyclic union has no member accepting Int");
     assert_eq!(
         err,
-        TypeError::TypeMismatch {
-            expected: "Ref(A) | String".to_string(),
-            got: "Int".to_string(),
-        }
+        TypeError::value_type_mismatch("Ref(A) | String".to_string(), "Int".to_string())
     );
 }
 
@@ -14019,10 +14007,7 @@ fn nested_union_preserves_inner_struct_alternative_diagnostic() {
 fn scalar_union_without_a_shape_match_keeps_generic_type_mismatch() {
     let union = AttributeType::union(vec![AttributeType::int(), AttributeType::bool()]);
     let value = Value::Concrete(ConcreteValue::String("neither".into()));
-    let expected = TypeError::TypeMismatch {
-        expected: union.type_name(),
-        got: "String".to_string(),
-    };
+    let expected = TypeError::value_type_mismatch(union.type_name(), "String".to_string());
 
     for (path, err) in union_errors_from_public_paths(&union, &value) {
         assert_eq!(err, expected, "{path} changed scalar-union fallback");
@@ -14361,8 +14346,8 @@ fn tied_list_union_reports_each_element_failure() {
             [
                 TypeError::ListItemError { index: 0, inner: first },
                 TypeError::ListItemError { index: 0, inner: second },
-            ] if matches!(first.as_ref(), TypeError::TypeMismatch { expected, got } if expected == "String" && got == "Bool")
-                && matches!(second.as_ref(), TypeError::TypeMismatch { expected, got } if expected == "Int" && got == "Bool")
+            ] if matches!(first.as_ref(), TypeError::TypeMismatch { types } if types.expected() == "String" && types.actual() == "Bool")
+                && matches!(second.as_ref(), TypeError::TypeMismatch { types } if types.expected() == "Int" && types.actual() == "Bool")
         ));
         assert_eq!(
             error.to_string(),
@@ -14885,10 +14870,10 @@ fn custom_validator_can_capture_external_state() {
                     .into(),
                 })
             }
-            other => Err(TypeError::TypeMismatch {
-                expected: "String".to_string(),
-                got: other.type_name(),
-            }),
+            other => Err(TypeError::value_type_mismatch(
+                "String".to_string(),
+                other.type_name(),
+            )),
         }),
         None,
     );
@@ -14933,10 +14918,10 @@ fn custom_validator_returns_structured_type_error_directly() {
                     ],
                 })
             }
-            other => Err(TypeError::TypeMismatch {
-                expected: "String".to_string(),
-                got: other.type_name(),
-            }),
+            other => Err(TypeError::value_type_mismatch(
+                "String".to_string(),
+                other.type_name(),
+            )),
         }),
         None,
     );

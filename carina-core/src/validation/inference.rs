@@ -272,10 +272,7 @@ struct InferenceSchemaContext<'a> {
 
 fn heterogeneous_collection_error(first: &TypeExpr, next: &TypeExpr) -> InferenceError {
     InferenceError::HeterogeneousCollection {
-        reason: format!(
-            "collection element types disagree: `{}` vs `{}`",
-            first, next
-        ),
+        types: crate::schema::MismatchTypeNames::for_type_exprs(first, next),
     }
 }
 
@@ -349,8 +346,7 @@ pub(crate) fn infer_type_from_value_without_bindings<P: PlaceholderKind, B: Bind
             match infer_type_from_value_without_bindings(default) {
                 Ok(right) if right == left => Ok(left),
                 Ok(right) => Err(InferenceError::IncompatibleCoalesceTypes {
-                    left: left.to_string(),
-                    default: right.to_string(),
+                    types: crate::schema::MismatchTypeNames::for_type_exprs(&left, &right),
                 }
                 .into()),
                 Err(InferenceIssue::Failed(InferenceError::UnknownType { .. }))
@@ -552,8 +548,7 @@ fn infer_type_from_value_with_visiting<P: PlaceholderKind, B: BindingAddress>(
             match infer_type_from_value_with_visiting(default, bindings, context, visiting) {
                 Ok(right) if right == left => Ok(left),
                 Ok(right) => Err(InferenceError::IncompatibleCoalesceTypes {
-                    left: left.to_string(),
-                    default: right.to_string(),
+                    types: crate::schema::MismatchTypeNames::for_type_exprs(&left, &right),
                 }
                 .into()),
                 Err(InferenceIssue::Failed(InferenceError::UnknownType { .. }))
@@ -697,7 +692,9 @@ fn require_integer_arithmetic_operands(
             return Err(InferenceError::InvalidIntegerArithmeticOperand {
                 op,
                 side,
-                actual: operand.to_string(),
+                actual: crate::schema::MismatchTypeNames::for_type_exprs(&TypeExpr::Int, &operand)
+                    .actual()
+                    .to_string(),
                 operator_span,
             }
             .into());
@@ -1985,10 +1982,17 @@ mod tests {
 
         assert_eq!(without_bindings, with_bindings);
         assert_eq!(
+            without_bindings.as_ref().unwrap_err().to_string(),
+            "collection element types disagree: `String` vs `Int`",
+        );
+        assert_eq!(
             without_bindings,
             Err(InferenceIssue::Failed(
                 InferenceError::HeterogeneousCollection {
-                    reason: "collection element types disagree: `String` vs `Int`".to_string(),
+                    types: crate::schema::MismatchTypeNames::for_type_exprs(
+                        &TypeExpr::String,
+                        &TypeExpr::Int
+                    ),
                 }
             ))
         );

@@ -9545,8 +9545,7 @@ fn attribute_reference_message_fixture(module_directory: &str) -> CompositionAtt
                 RootScope::new().resolve("source".into()),
             ),
             kind: ModuleCallRefErrorKind::TypeMismatch {
-                expected: "String".to_string(),
-                actual: "Int".to_string(),
+                types: MismatchTypeNames::for_type_exprs(&TypeExpr::String, &TypeExpr::Int),
                 declared: None,
             },
         },
@@ -9607,8 +9606,7 @@ fn module_reference_coverage_uses_typed_call_identity_not_display_text() {
     )
     .expect("second fixture parse");
     let kind = ModuleCallRefErrorKind::TypeMismatch {
-        expected: "String".to_string(),
-        actual: "Int".to_string(),
+        types: MismatchTypeNames::for_type_exprs(&TypeExpr::String, &TypeExpr::Int),
         declared: None,
     };
     let path = ReferencePath::Binding("source".into());

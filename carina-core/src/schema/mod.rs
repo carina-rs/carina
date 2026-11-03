@@ -2452,10 +2452,10 @@ impl Schema {
                 }) else {
                     out.push((
                         path.clone(),
-                        TypeError::TypeMismatch {
-                            expected: attr.type_name(),
-                            got: concrete.type_name().to_string(),
-                        },
+                        TypeError::value_type_mismatch(
+                            attr.type_name(),
+                            concrete.type_name().to_string(),
+                        ),
                     ));
                     return;
                 };
@@ -2538,10 +2538,10 @@ impl Schema {
                 }) else {
                     out.push((
                         path.clone(),
-                        TypeError::TypeMismatch {
-                            expected: attr.type_name(),
-                            got: concrete.type_name().to_string(),
-                        },
+                        TypeError::value_type_mismatch(
+                            attr.type_name(),
+                            concrete.type_name().to_string(),
+                        ),
                     ));
                     return;
                 };
@@ -2581,10 +2581,10 @@ impl Schema {
                 }) else {
                     out.push((
                         path.clone(),
-                        TypeError::TypeMismatch {
-                            expected: attr.type_name(),
-                            got: concrete.type_name().to_string(),
-                        },
+                        TypeError::value_type_mismatch(
+                            attr.type_name(),
+                            concrete.type_name().to_string(),
+                        ),
                     ));
                     return;
                 };
@@ -2708,10 +2708,10 @@ pub(crate) fn validate_attr_with_defs_and_ancestry<P: PlaceholderKind, B: Bindin
     let mut visited_refs = Vec::new();
     validation_error_with_defs_on_path(attr, value, defs, ancestry, &mut visited_refs).and_then(
         |()| {
-            Err(TypeError::TypeMismatch {
-                expected: attr.type_name(),
-                got: value.type_name(),
-            })
+            Err(TypeError::value_type_mismatch(
+                attr.type_name(),
+                value.type_name(),
+            ))
         },
     )
 }
@@ -2737,10 +2737,10 @@ fn validate_attr_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
     }
 
     validation_error_with_defs_on_path(attr, value, defs, ancestry, visited_refs).and_then(|()| {
-        Err(TypeError::TypeMismatch {
-            expected: attr.type_name(),
-            got: value.type_name(),
-        })
+        Err(TypeError::value_type_mismatch(
+            attr.type_name(),
+            value.type_name(),
+        ))
     })
 }
 
@@ -2801,10 +2801,10 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>
                 ),
                 None => return Ok(()),
                 Some(_) => {
-                    return Err(TypeError::TypeMismatch {
-                        expected: attr.type_name(),
-                        got: value.type_name(),
-                    });
+                    return Err(TypeError::value_type_mismatch(
+                        attr.type_name(),
+                        value.type_name(),
+                    ));
                 }
             };
             for result in constraints.check(
@@ -2872,10 +2872,10 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>
             } else if value.as_concrete().is_none() {
                 Ok(())
             } else {
-                Err(TypeError::TypeMismatch {
-                    expected: attr.type_name(),
-                    got: value.type_name(),
-                })
+                Err(TypeError::value_type_mismatch(
+                    attr.type_name(),
+                    value.type_name(),
+                ))
             }
         }
         AttrTypeKind::Struct {
@@ -2919,10 +2919,10 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>
             } else if value.as_concrete().is_none() {
                 Ok(())
             } else {
-                Err(TypeError::TypeMismatch {
-                    expected: attr.type_name(),
-                    got: value.type_name(),
-                })
+                Err(TypeError::value_type_mismatch(
+                    attr.type_name(),
+                    value.type_name(),
+                ))
             }
         }
         AttrTypeKind::Union(members) => {
@@ -4218,10 +4218,10 @@ impl PatternAttributeType<Compiled> {
             }
             (AttrTypeKind::Bool, ConcreteValueRef::Bool(_)) => Ok(()),
             (AttrTypeKind::Duration, ConcreteValueRef::Duration(_)) => Ok(()),
-            _ => Err(TypeError::TypeMismatch {
-                expected: self.type_name(),
-                got: value.type_name().to_string(),
-            }),
+            _ => Err(TypeError::value_type_mismatch(
+                self.type_name(),
+                value.type_name().to_string(),
+            )),
         }
     }
 
@@ -4250,10 +4250,10 @@ impl PatternAttributeType<Compiled> {
             if c.identity().same_type(identity) {
                 return Ok(());
             }
-            return Err(TypeError::TypeMismatch {
-                expected: name.to_string(),
-                got: c.identity().to_string(),
-            });
+            return Err(TypeError::value_type_mismatch(
+                name.to_string(),
+                c.identity().to_string(),
+            ));
         }
         if let ConcreteValueRef::EnumIdentifier(raw) = value {
             let enum_attr = CompiledAttributeType::enum_(
@@ -4388,10 +4388,10 @@ impl PatternAttributeType<Compiled> {
                 })
             }
         } else {
-            Err(TypeError::TypeMismatch {
-                expected: name.to_string(),
-                got: resolved_value.type_name(),
-            })
+            Err(TypeError::value_type_mismatch(
+                name.to_string(),
+                resolved_value.type_name(),
+            ))
         }
     }
 }
@@ -4475,6 +4475,79 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     }
 }
 
+/// Constraint-aware names for a type comparison, kept together until rendered.
+/// Construct from types so equal nominal names cannot hide different bounds.
+///
+/// ```compile_fail,E0451
+/// use carina_core::schema::MismatchTypeNames;
+/// let _ = MismatchTypeNames { expected: "Name".into(), actual: "Name".into() };
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MismatchTypeNames {
+    expected: String,
+    actual: String,
+}
+
+impl MismatchTypeNames {
+    pub fn for_resource_types(
+        expected: &crate::parser::ResourceTypePath,
+        actual: &crate::parser::ResourceTypePath,
+    ) -> Self {
+        Self::for_type_exprs(
+            &crate::parser::TypeExpr::Ref(expected.clone()),
+            &crate::parser::TypeExpr::Ref(actual.clone()),
+        )
+    }
+
+    pub fn for_types<R: PatternForm>(
+        expected: TypeInSchema<'_, R>,
+        actual: TypeInSchema<'_, R>,
+    ) -> Self {
+        let (expected, actual) = actual.mismatch_type_names(expected);
+        Self { expected, actual }
+    }
+
+    /// Lift resolved annotations before formatting to retain their constraints.
+    /// Unresolved declarations have only their authored spelling available.
+    pub fn for_type_exprs(
+        expected: &crate::parser::TypeExpr,
+        actual: &crate::parser::TypeExpr,
+    ) -> Self {
+        match (
+            crate::validation::lift_type_expr(expected),
+            crate::validation::lift_type_expr(actual),
+        ) {
+            (Some(expected), Some(actual)) => Self::for_types(
+                TypeInSchema::schemaless(&expected),
+                TypeInSchema::schemaless(&actual),
+            ),
+            _ => Self {
+                expected: expected.to_string(),
+                actual: actual.to_string(),
+            },
+        }
+    }
+
+    pub fn expected(&self) -> &str {
+        &self.expected
+    }
+
+    pub fn actual(&self) -> &str {
+        &self.actual
+    }
+}
+
+impl std::fmt::Display for MismatchTypeNames {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "expected {}, got {}",
+            ProviderText::new(self.expected()),
+            ProviderText::new(self.actual())
+        )
+    }
+}
+
 impl<'source, R: PatternForm> TypeInSchema<'source, R> {
     /// Pair a structurally Ref-free type with an empty definition context.
     ///
@@ -4533,8 +4606,15 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     .in_schema(self.defs)
                     .resolved_type_name_on_path(visited_refs, expand_constraints)
             ),
-            // `type_name` intentionally renders only a Map's value type; keep
-            // that public spelling while resolving the displayed node.
+            AttrTypeKind::Map { key, value } if expand_constraints => format!(
+                "Map<key: {}, value: {}>",
+                key.in_schema(self.defs)
+                    .resolved_type_name_on_path(visited_refs, true),
+                value
+                    .in_schema(self.defs)
+                    .resolved_type_name_on_path(visited_refs, true),
+            ),
+            // Keep the ordinary value-only spelling outside expanded diagnostics.
             AttrTypeKind::Map { value: inner, .. } => format!(
                 "Map<{}>",
                 inner
@@ -6443,10 +6523,7 @@ pub(crate) fn select_union_member_on_path<'a, P: PlaceholderKind, B: BindingAddr
 
     Err(best_failure
         .map(|best| best.into_error(value, resolved_members, ancestry))
-        .unwrap_or(TypeError::TypeMismatch {
-            expected,
-            got: value.type_name().to_string(),
-        }))
+        .unwrap_or_else(|| TypeError::value_type_mismatch(expected, value.type_name().to_string())))
 }
 
 /// Resolve one host value-map key to its canonical [`StructField`].
@@ -7524,12 +7601,8 @@ fn format_field_group_violation(path: &FieldPath, group: &FieldGroup) -> String 
 /// Type error
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum TypeError {
-    #[error(
-        "Type mismatch: expected {}, got {}",
-        ProviderText::new(expected),
-        ProviderText::new(got)
-    )]
-    TypeMismatch { expected: String, got: String },
+    #[error("Type mismatch: {types}")]
+    TypeMismatch { types: MismatchTypeNames },
 
     #[error(transparent)]
     BindingShadowsEnumMember(Box<BindingShadowsEnumMemberError>),
@@ -7720,6 +7793,18 @@ impl From<crate::parser::CustomTypeValidationError> for TypeError {
 }
 
 impl TypeError {
+    /// Report a concrete value's kind when no second static type is available.
+    /// Comparisons of two static types must construct `TypeMismatch` with
+    /// [`MismatchTypeNames::for_types`] or [`MismatchTypeNames::for_type_exprs`].
+    pub fn value_type_mismatch(expected: String, got: String) -> Self {
+        Self::TypeMismatch {
+            types: MismatchTypeNames {
+                expected,
+                actual: got,
+            },
+        }
+    }
+
     fn from_union_member_failures(
         first: UnionMemberFailure,
         rest: impl IntoIterator<Item = UnionMemberFailure>,

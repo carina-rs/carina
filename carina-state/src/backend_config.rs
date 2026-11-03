@@ -334,10 +334,10 @@ fn invalid_resolved_shape<P: PlaceholderKind, B: BindingAddress>(
     BackendAttributeError::InvalidAttribute {
         backend_type: backend_type.to_string(),
         attribute: attribute.to_string(),
-        error: Box::new(TypeError::TypeMismatch {
-            expected: expected.to_string(),
-            got: value.type_name(),
-        }),
+        error: Box::new(TypeError::value_type_mismatch(
+            expected.to_string(),
+            value.type_name(),
+        )),
     }
 }
 

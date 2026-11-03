@@ -263,8 +263,7 @@ impl DeclaredValueSource {
 /// The first source constraint that failed assignment to a sink.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefTypeMismatch {
-    expected: String,
-    actual: String,
+    types: crate::schema::MismatchTypeNames,
     declared: Option<String>,
 }
 
@@ -276,20 +275,23 @@ pub enum RefTypeAssignabilityError {
 }
 
 impl RefTypeMismatch {
-    pub(crate) fn direct(expected: String, actual: String) -> Self {
+    pub(crate) fn direct(types: crate::schema::MismatchTypeNames) -> Self {
         Self {
-            expected,
-            actual,
+            types,
             declared: None,
         }
     }
 
     pub fn actual_type_name(&self) -> &str {
-        &self.actual
+        self.types.actual()
     }
 
     pub fn expected_type_name(&self) -> &str {
-        &self.expected
+        self.types.expected()
+    }
+
+    pub fn type_names(&self) -> &crate::schema::MismatchTypeNames {
+        &self.types
     }
 
     /// Present only when forwarded/inferred evidence failed after the
@@ -307,6 +309,16 @@ impl RefTypeMismatch {
 }
 
 impl ResolvedRefType {
+    pub(crate) fn mismatch_type_names(
+        &self,
+        expected: TypeInSchema<'_, crate::schema::Compiled>,
+    ) -> crate::schema::MismatchTypeNames {
+        crate::schema::MismatchTypeNames::for_types(
+            expected,
+            self.authoritative.constraint().type_in_schema(),
+        )
+    }
+
     /// Retain the original source at a declared value boundary. Every later
     /// sink checks the declaration and re-admits original identities with its
     /// own authority, so an earlier provider's edge cannot be forwarded as proof.
@@ -479,10 +491,8 @@ impl ResolvedRefType {
         if !judge(authoritative)
             .map_err(|reason| RefTypeAssignabilityError::Unchecked(Box::new(reason)))?
         {
-            let (expected, actual) = authoritative.mismatch_type_names(expected);
             return Err(RefTypeAssignabilityError::Mismatch(RefTypeMismatch {
-                expected,
-                actual,
+                types: crate::schema::MismatchTypeNames::for_types(expected, authoritative),
                 declared: None,
             }));
         }
@@ -492,10 +502,8 @@ impl ResolvedRefType {
             if !judge(evidence)
                 .map_err(|reason| RefTypeAssignabilityError::Unchecked(Box::new(reason)))?
             {
-                let (expected, actual) = evidence.mismatch_type_names(expected);
                 return Err(RefTypeAssignabilityError::Mismatch(RefTypeMismatch {
-                    expected,
-                    actual,
+                    types: crate::schema::MismatchTypeNames::for_types(expected, evidence),
                     declared: self
                         .authoritative
                         .is_declared_composition_attribute()
@@ -3318,6 +3326,45 @@ mod tests {
         std::sync::LazyLock::new(|| crate::parser::SchemaTypeOwner::Provider("test".into()));
 
     use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
+    #[test]
+    fn inferred_evidence_mismatch_keeps_constraints_after_the_declaration_passes() {
+        let identity = TypeIdentity::from_dotted("aws.iam.Role.Name");
+        let wide = AttributeType::refined_string(
+            Some(identity.clone()),
+            None,
+            Some((Some(1), Some(128))),
+            None,
+        );
+        let narrow =
+            AttributeType::refined_string(Some(identity), None, Some((Some(8), Some(64))), None);
+        let source = ResolvedRefType::with_declared_type(
+            ResolvedTypeConstraint::new(narrow.clone(), BTreeMap::new()),
+            Some(ResolvedRefType::new(wide, BTreeMap::new())),
+        );
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::ParsedFile::default();
+        let schemas = SchemaRegistry::new();
+        let bindings = BindingIndex::from_parsed(&parsed, &schemas, &context);
+        let sink = TypeInSchema::schemaless(&narrow).with_authority(
+            &context.custom_types,
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+        );
+        let RefTypeAssignabilityError::Mismatch(mismatch) =
+            source.is_assignable_to_sink(sink, &bindings).unwrap_err()
+        else {
+            panic!("evidence must fail the sink after the declaration passes")
+        };
+        assert_eq!(
+            mismatch.expected_type_name(),
+            "aws.iam.Role.Name (length 8..=64)"
+        );
+        assert_eq!(
+            mismatch.actual_type_name(),
+            "aws.iam.Role.Name (length 1..=128)"
+        );
+        assert_eq!(mismatch.declared_type_name(), Some("aws.iam.Role.Name"));
+    }
+
     #[test]
     fn review_declared_source_mismatch_preserves_both_constraint_names() {
         let identity = TypeIdentity::from_dotted("aws.iam.Role.Name");

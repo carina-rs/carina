@@ -7,7 +7,10 @@ use crate::schema::{
     AttributeSchema, AttributeType as DraftType, RawShape, ResourceSchema, SchemaKind,
     TypeInSchema, ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
 };
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 struct Factory {
     owner: &'static str,
@@ -1029,4 +1032,524 @@ fn unbounded_annotation_constraints_admit_explicitly_unbounded_schema_declaratio
             ));
         }
     }
+}
+
+#[test]
+fn computed_access_mismatch_keeps_inferred_constraints_and_nested_path() {
+    let snapshot = snapshot(vec![("p", vec![string(1, 128, None), string(1, 64, None)])]);
+    let bindings = inference::InferenceBindings::from([(
+        "source".into(),
+        inference::InferenceBinding::Resource {
+            provider: "p".into(),
+            resource_type: "Values".into(),
+        },
+    )]);
+    let base = list(vec![Value::resource_ref("source", "value0", Vec::new())]);
+    let access = crate::resource::apply_value_path_segment(
+        Value::Deferred(crate::resource::DeferredValue::Coalesce {
+            value: Box::new(base.clone()),
+            default: Box::new(base),
+        }),
+        crate::resource::PathSegment::Subscript {
+            index: crate::resource::Subscript::Int { index: 0 },
+        },
+        1,
+        crate::resource::AccessMissPolicy::Error,
+    )
+    .unwrap()
+    .into_value()
+    .unwrap();
+    assert!(matches!(
+        access,
+        Value::Deferred(crate::resource::DeferredValue::Access(_))
+    ));
+    let expected = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 1), "p");
+    let error = typecheck::check_type_expr_value(
+        &TypeExpr::List(Box::new(expected)),
+        &list(vec![access]),
+        snapshot.provider_context(),
+        typecheck::TypecheckInference::Available {
+            bindings: &bindings,
+            schemas: snapshot.schema_registry(),
+        },
+    )
+    .require_provider_schemas()
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "at list element 0: expected aws.iam.Role.Name (length 1..=64), got aws.iam.Role.Name (length 1..=128)"
+    );
+}
+
+#[test]
+fn coalesce_and_collection_inference_mismatches_distinguish_named_constraints() {
+    let snapshot = snapshot(vec![("p", vec![string(1, 64, None), string(1, 128, None)])]);
+    let bindings = inference::InferenceBindings::from([(
+        "source".into(),
+        inference::InferenceBinding::Resource {
+            provider: "p".into(),
+            resource_type: "Values".into(),
+        },
+    )]);
+    let first = Value::resource_ref("source", "value0", Vec::new());
+    let second = Value::resource_ref("source", "value1", Vec::new());
+    for (value, expected) in [
+        (
+            Value::Deferred(crate::resource::DeferredValue::Coalesce {
+                value: Box::new(first.clone()),
+                default: Box::new(second.clone()),
+            }),
+            "coalesce default type `aws.iam.Role.Name (length 1..=128)` does not match left type `aws.iam.Role.Name (length 1..=64)`",
+        ),
+        (
+            list(vec![first.clone(), second.clone()]),
+            "collection element types disagree: `aws.iam.Role.Name (length 1..=64)` vs `aws.iam.Role.Name (length 1..=128)`",
+        ),
+        (
+            map(IndexMap::from([("a".into(), first), ("b".into(), second)])),
+            "collection element types disagree: `aws.iam.Role.Name (length 1..=64)` vs `aws.iam.Role.Name (length 1..=128)`",
+        ),
+    ] {
+        let error = inference::infer_type_from_value(
+            &value,
+            &bindings,
+            snapshot.schema_registry(),
+            snapshot.provider_context().as_provider_context(),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
+fn enum_binding_mismatch_uses_the_typed_error_constructor() {
+    let snapshot = snapshot(vec![(
+        "p",
+        vec![DraftType::enum_(
+            identity(),
+            Some(vec!["VALID".into()]),
+            vec![],
+            None,
+            None,
+        )],
+    )]);
+    let findings = call_findings(
+        "arguments { x: Bool }\nlet child = use { source = './child' }\nlet instance = child { x = x }\n",
+        &snapshot,
+        annotation(&snapshot),
+    );
+    assert!(
+        findings.iter().any(|finding| finding
+            .message()
+            .to_string()
+            .contains("expected aws.iam.Role.Name, got Bool")),
+        "{findings:#?}"
+    );
+}
+
+fn typed_function_result(type_expr: TypeExpr) -> Value {
+    let mut parsed = crate::parser::parse(
+        "fn result() { 'VALID' }\n",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let mut function = parsed.user_functions.remove("result").unwrap();
+    function.return_type = Some(type_expr);
+    Value::Deferred(crate::resource::DeferredValue::ResolvedFunctionCall {
+        function: Arc::new(function),
+        functions: Arc::new(HashMap::new()),
+        args: Vec::new(),
+        source_line: 1.into(),
+    })
+}
+
+#[test]
+fn enum_resource_binding_mismatch_keeps_the_exact_enum_name() {
+    let snapshot = snapshot(vec![(
+        "p",
+        vec![DraftType::enum_(
+            identity(),
+            Some(vec!["VALID".into()]),
+            vec![],
+            None,
+            None,
+        )],
+    )]);
+    let parsed = crate::parser::parse(
+        "arguments { x: Bool }\nlet target = p.Values { value0 = x }\n",
+        snapshot.provider_context().as_provider_context(),
+    )
+    .unwrap();
+    let signatures = HashMap::new();
+    let report = check_bare_binding_uses(
+        &parsed,
+        &ValidationTypeContext::new(
+            &parsed,
+            snapshot.schema_registry(),
+            snapshot.provider_context(),
+            &signatures,
+        ),
+    );
+    assert!(
+        report.findings().iter().any(|finding| finding
+            .error
+            .to_string()
+            .contains("expected aws.iam.Role.Name, got Bool")),
+        "{report:#?}"
+    );
+
+    let owner = crate::parser::SchemaTypeOwner::Provider("p".into());
+    let target = ExpectedEnumTarget {
+        attr_type: declaration(&snapshot, "p", 0),
+        defs: crate::schema::empty_defs_for_schema_walks(),
+        ancestry: FieldAncestry::WRITABLE,
+        owner: &owner,
+    };
+    let error = binding_value_assignable_to_enum(
+        &Value::Concrete(crate::resource::ConcreteValue::Bool(true)),
+        Some(&TypeExpr::Bool),
+        typecheck::TypecheckProviderContext::loaded(snapshot.provider_context()),
+        &target,
+        &EnumValueResolver::with_defs(target.attr_type, target.defs),
+        &identity(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Type mismatch: expected aws.iam.Role.Name, got Bool"
+    );
+}
+
+#[test]
+fn inference_without_bindings_retains_constraints_for_coalesce_collections_and_branches() {
+    let snapshot = snapshot(vec![("p", vec![string(1, 64, None), string(1, 128, None)])]);
+    let first = typed_function_result(inference::attribute_type_to_type_expr(
+        declaration(&snapshot, "p", 0),
+        "p",
+    ));
+    let second = typed_function_result(inference::attribute_type_to_type_expr(
+        declaration(&snapshot, "p", 1),
+        "p",
+    ));
+    let values = [
+        Value::Deferred(crate::resource::DeferredValue::Coalesce {
+            value: Box::new(first.clone()),
+            default: Box::new(second.clone()),
+        }),
+        list(vec![first.clone(), second.clone()]),
+        map(IndexMap::from([
+            ("a".into(), first.clone()),
+            ("b".into(), second.clone()),
+        ])),
+        Value::Deferred(crate::resource::DeferredValue::ModuleIf(Box::new(
+            crate::parser::DeferredValueIf::new(
+                crate::parser::DeferredIfCondition::new(
+                    Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                        ParserPlaceholder::ModuleArgument {
+                            name: "flag".into(),
+                            diagnostic: Default::default(),
+                        },
+                    )),
+                    "main.crn".into(),
+                    1,
+                ),
+                first,
+                second,
+            ),
+        ))),
+    ];
+    for value in values {
+        let error = inference::infer_type_from_value_without_bindings(&value).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("aws.iam.Role.Name (length 1..=64)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("aws.iam.Role.Name (length 1..=128)"),
+            "{message}"
+        );
+        assert_eq!(
+            error,
+            inference::infer_type_from_value(
+                &value,
+                &inference::InferenceBindings::new(),
+                snapshot.schema_registry(),
+                snapshot.provider_context().as_provider_context(),
+            )
+            .unwrap_err(),
+        );
+    }
+}
+
+#[test]
+fn reference_boundaries_retain_both_names_from_the_shared_formatter() {
+    let snapshot = snapshot(vec![("p", vec![string(1, 128, None), string(1, 64, None)])]);
+    let context = snapshot.provider_context().as_provider_context();
+    let mut parsed = crate::parser::parse(
+        "let source = p.Values {}\nlet target = p.Values { value1 = source.value0 }\nattributes { name: aws.iam.Role.Name = source.value0 }\nexports { name: aws.iam.Role.Name = source.value0 }\nfn result(): aws.iam.Role.Name { source.value0 }\n",
+        context,
+    ).unwrap();
+    deferred_types::with_session_for_test(snapshot.provider_context(), |session| {
+        resolve_file_type_exprs_report(&mut parsed, session, None)
+    })
+    .unwrap();
+    let parsed = inference::apply_inference(parsed, snapshot.schema_registry(), context);
+    let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
+    let messages = [
+        validate_resource_ref_types(
+            &parsed,
+            snapshot.schema_registry(),
+            &HashSet::new(),
+            &bindings,
+        )
+        .unwrap_err()
+        .to_string(),
+        validate_attribute_param_ref_types_with_bindings(&parsed.attribute_params, &bindings)
+            .unwrap_err(),
+        validate_export_param_ref_types_with_bindings(&parsed.export_params, &bindings)
+            .unwrap_err()
+            .into_iter()
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        validate_user_function_ref_types_with_bindings(&parsed, &bindings).unwrap_err(),
+    ];
+    for message in messages {
+        assert!(
+            message.contains(
+                "expected aws.iam.Role.Name (length 1..=64), got aws.iam.Role.Name (length 1..=128)"
+            ),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn declared_function_result_and_deferred_coalesce_keep_the_formatted_pair() {
+    let snapshot = snapshot(vec![("p", vec![string(1, 128, None), string(1, 64, None)])]);
+    let context = snapshot.provider_context().as_provider_context();
+    let mut parsed = crate::parser::parse(
+        "attributes { name: aws.iam.Role.Name = 'VALID' }\n",
+        context,
+    )
+    .unwrap();
+    deferred_types::with_session_for_test(snapshot.provider_context(), |session| {
+        resolve_file_type_exprs_report(&mut parsed, session, None)
+    })
+    .unwrap();
+    let wide = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 0), "p");
+    let narrow = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 1), "p");
+    parsed.attribute_params[0].value = Some(crate::parser::BoundaryExpression::Value(
+        typed_function_result(wide.clone()),
+    ));
+    let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
+    let error = validate_user_function_ref_types_with_bindings(&parsed, &bindings).unwrap_err();
+    assert!(error.contains("expected aws.iam.Role.Name (length 1..=64), got aws.iam.Role.Name (length 1..=128) (from function 'result' return type)"), "{error}");
+
+    let value = Value::Deferred(crate::resource::DeferredValue::Coalesce {
+        value: Box::new(typed_function_result(narrow)),
+        default: Box::new(typed_function_result(wide)),
+    });
+    let error = check_deferred_access_type(
+        &value,
+        declaration(&snapshot, "p", 1)
+            .in_schema(crate::schema::empty_defs_for_schema_walks())
+            .with_authority(
+                &context.custom_types,
+                crate::schema::SinkAuthority::Owner(&crate::parser::SchemaTypeOwner::Provider(
+                    "p".into(),
+                )),
+            ),
+        &inference::InferenceBindings::new(),
+        snapshot.schema_registry(),
+        &bindings,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Type mismatch: expected aws.iam.Role.Name (length 1..=64), got aws.iam.Role.Name (length 1..=128) (from coalesce default)"
+    );
+}
+
+#[test]
+fn mismatch_formatter_preserves_refs_nested_types_and_map_key_constraints() {
+    let snapshot = snapshot(vec![("p", vec![string(1, 64, None), string(1, 128, None)])]);
+    let reference = AttributeType::ref_("Name");
+    let expected_defs = BTreeMap::from([("Name".into(), declaration(&snapshot, "p", 0).clone())]);
+    let actual_defs = BTreeMap::from([("Name".into(), declaration(&snapshot, "p", 1).clone())]);
+    for root in [
+        reference.clone(),
+        AttributeType::list(reference.clone()),
+        AttributeType::map(reference.clone()),
+        AttributeType::map_with_key(reference.clone(), AttributeType::bool()),
+        AttributeType::struct_(
+            "Record",
+            vec![crate::schema::CompiledStructField::required("name", reference).build()],
+        ),
+    ] {
+        let error = TypeError::TypeMismatch {
+            types: MismatchTypeNames::for_types(
+                root.in_schema(&expected_defs),
+                root.in_schema(&actual_defs),
+            ),
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("aws.iam.Role.Name (length 1..=64)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("aws.iam.Role.Name (length 1..=128)"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn integer_result_mismatches_share_names_in_value_and_resource_checkers() {
+    let snapshot = snapshot(vec![(
+        "p",
+        vec![DraftType::refined_int(
+            Some(TypeIdentity::bare("Int")),
+            Some((Some(1), Some(64))),
+        )],
+    )]);
+    let context = snapshot.provider_context().as_provider_context();
+    let parsed = crate::parser::parse(
+        "arguments { x: Int }\nlet target = p.Values { value0 = x + 1 }\n",
+        context,
+    )
+    .unwrap();
+    let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
+    let expected = "expected Int (range 1..=64), got Int (range unbounded)";
+    let error = validate_resource_ref_types(
+        &parsed,
+        snapshot.schema_registry(),
+        &HashSet::new(),
+        &bindings,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains(expected), "{error}");
+
+    let error = typecheck::check_type_expr_value(
+        &inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 0), "p"),
+        &parsed.resources[0].attributes["value0"],
+        snapshot.provider_context(),
+        typecheck::TypecheckInference::Available {
+            bindings: &inference::bindings_from_parsed(&parsed),
+            schemas: snapshot.schema_registry(),
+        },
+    )
+    .require_provider_schemas()
+    .unwrap_err();
+    assert_eq!(error.to_string(), expected);
+}
+
+#[test]
+fn integer_operand_mismatches_do_not_hide_a_named_strings_constraints() {
+    let snapshot = snapshot(vec![(
+        "p",
+        vec![DraftType::refined_string(
+            Some(TypeIdentity::bare("Int")),
+            None,
+            Some((Some(1), Some(16))),
+            None,
+        )],
+    )]);
+    let context = snapshot.provider_context().as_provider_context();
+    let mut parsed = crate::parser::parse(
+        "let source = p.Values {}\nlet result = source.value0 + 1\n",
+        context,
+    )
+    .unwrap();
+    let error = inference::infer_type_from_value(
+        &parsed.variables["result"],
+        &inference::bindings_from_parsed(&parsed),
+        snapshot.schema_registry(),
+        context,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "operator '+': left operand must be Int, got Int (length 1..=16)"
+    );
+    let crate::resource::Value::Deferred(crate::resource::DeferredValue::IntegerArithmetic(
+        expression,
+    )) = &parsed.variables["result"]
+    else {
+        panic!("deferred arithmetic")
+    };
+    let computed = crate::integer_arithmetic::evaluate_integer_values(
+        typed_function_result(inference::attribute_type_to_type_expr(
+            declaration(&snapshot, "p", 0),
+            "p",
+        )),
+        crate::integer_arithmetic::IntegerOp::Add,
+        integer(1),
+        expression.operator_span(),
+    )
+    .unwrap();
+    parsed.variables.insert("result".into(), computed);
+    let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
+    let error = validate_resource_ref_types(
+        &parsed,
+        snapshot.schema_registry(),
+        &HashSet::new(),
+        &bindings,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("left operand must be Int, got Int (length 1..=16)"),
+        "{error}"
+    );
+}
+
+#[test]
+fn handle_mismatches_use_the_same_type_formatter_and_preserve_handle_wording() {
+    let snapshot = snapshot(vec![(
+        "p",
+        vec![DraftType::refined_string(
+            Some(TypeIdentity::new(Some("p"), Vec::<String>::new(), "Values")),
+            None,
+            Some((Some(1), Some(128))),
+            None,
+        )],
+    )]);
+    let context = snapshot.provider_context().as_provider_context();
+    let parsed = crate::parser::parse("let source = p.Values {}\n", context).unwrap();
+    let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
+    let path = crate::resource::AccessPath::new("source", "value0");
+    let error = check_ref_type_for_handle_sink(
+        bindings.ref_type(&path),
+        &ResourceTypePath::new("p", "Values"),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "expected resource handle p.Values; got p.Values (length 1..=128)"
+    );
+    let error = HandleSinkError::expanded_value_for_handle(
+        &ResourceTypePath::new("p", "Values"),
+        &Value::resource_ref("source", "value0", Vec::new()),
+        &bindings,
+    );
+    assert_eq!(
+        error.to_string(),
+        "expected resource handle p.Values; got p.Values (length 1..=128)"
+    );
+    let error = crate::resolved_graph::ExpandedGraphResolutionError::HandleTypeMismatch {
+        owner: "output".into(),
+        reference: "source".into(),
+        types: MismatchTypeNames::for_resource_types(
+            &ResourceTypePath::new("p", "Expected"),
+            &ResourceTypePath::new("p", "Values"),
+        ),
+    };
+    assert_eq!(
+        error.to_string(),
+        "output: expected resource handle p.Expected; got resource handle p.Values from 'source'"
+    );
 }

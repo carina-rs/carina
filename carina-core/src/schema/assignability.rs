@@ -511,9 +511,8 @@ impl TypeInSchema<'_, super::Compiled> {
                 ));
             }
             Ok(false) => {
-                let (expected, actual) = self.mismatch_type_names(*sink);
                 return DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Mismatch(
-                    RefTypeMismatch::direct(expected, actual),
+                    RefTypeMismatch::direct(super::MismatchTypeNames::for_types(*sink, self)),
                 ));
             }
             Ok(true) => {}
