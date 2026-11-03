@@ -6102,9 +6102,10 @@ impl From<&ResourceId> for ResolvedComparisonKey {
 
 #[derive(Debug, Clone)]
 struct ResolvedComparisonData {
-    owner: String,
+    owner: crate::parser::SchemaTypeOwner,
     schema: ValidatedResourceSchema,
     reference_forms: crate::schema::ReferenceForms,
+    assignability_edges: Vec<crate::schema::AssignabilityEdge>,
     scope: ReferenceScope,
 }
 
@@ -6131,6 +6132,7 @@ impl ResolvedComparisonTable {
             &data.owner,
             &data.schema,
             &data.reference_forms,
+            &data.assignability_edges,
         );
         Ok(ResolvedComparison {
             owner_schema,
@@ -6420,9 +6422,10 @@ impl ProviderRouter {
             entries.insert(
                 key,
                 ResolvedComparisonData {
-                    owner: owner_schema.owner().to_string(),
+                    owner: owner_schema.schema_type_owner().clone(),
                     schema: owner_schema.schema().clone(),
                     reference_forms: owner_schema.reference_forms().clone(),
+                    assignability_edges: owner_schema.assignability_edges().to_vec(),
                     scope: provider.reference_scope().clone(),
                 },
             );
@@ -7683,6 +7686,17 @@ fn capture_provider_factory_schema_snapshot(
         .collect()
 }
 
+fn register_provider_factory_schemas(
+    schemas: &mut SchemaRegistry,
+    snapshot: &[ProviderFactorySchemaSnapshot],
+) {
+    for factory in snapshot {
+        schemas
+            .insert_provider_witness(&factory.name, &factory.witness)
+            .expect("each schema owner must expose one consistent validated witness");
+    }
+}
+
 pub(crate) trait ProviderFactorySource: Send + Sync {
     fn as_factories(&self) -> &[Box<dyn ProviderFactory>];
 }
@@ -7705,6 +7719,8 @@ impl ProviderFactorySource for &[Box<dyn ProviderFactory>] {
 pub(crate) struct FactoryCustomTypeResolver<F> {
     factories: F,
     index: BTreeMap<String, OwnerCustomTypeIndex>,
+    assignability_closures:
+        BTreeMap<crate::parser::SchemaTypeOwner, crate::schema::AssignabilityClosure>,
 }
 
 impl<F> FactoryCustomTypeResolver<F>
@@ -7714,11 +7730,21 @@ where
     pub(crate) fn new(factories: F) -> Self {
         let snapshot = capture_provider_factory_schema_snapshot(factories.as_factories());
         let index = build_owner_custom_type_index(&snapshot);
-        Self { factories, index }
+        let mut schemas = SchemaRegistry::new();
+        register_provider_factory_schemas(&mut schemas, &snapshot);
+        Self::with_index(factories, index, &schemas)
     }
 
-    fn with_index(factories: F, index: BTreeMap<String, OwnerCustomTypeIndex>) -> Self {
-        Self { factories, index }
+    fn with_index(
+        factories: F,
+        index: BTreeMap<String, OwnerCustomTypeIndex>,
+        schemas: &SchemaRegistry,
+    ) -> Self {
+        Self {
+            factories,
+            index,
+            assignability_closures: schemas.assignability_closures().clone(),
+        }
     }
 
     fn known_custom_types(&self) -> BTreeSet<crate::parser::OwnedTypeIdentity> {
@@ -7824,6 +7850,12 @@ where
     fn known_custom_types(&self) -> BTreeSet<crate::parser::OwnedTypeIdentity> {
         FactoryCustomTypeResolver::known_custom_types(self)
     }
+
+    fn assignability_closures(
+        &self,
+    ) -> BTreeMap<crate::parser::SchemaTypeOwner, crate::schema::AssignabilityClosure> {
+        self.assignability_closures.clone()
+    }
 }
 
 fn build_owner_custom_type_index(
@@ -7869,15 +7901,12 @@ pub fn loaded_provider_snapshot_from_factories(
     environment: crate::EnvironmentSnapshot,
 ) -> LoadedProviderSnapshot {
     let snapshot = capture_provider_factory_schema_snapshot(&factories);
-    for factory in &snapshot {
-        schemas
-            .insert_provider_witness(&factory.name, &factory.witness)
-            .expect("each schema owner must expose one consistent validated witness");
-    }
+    register_provider_factory_schemas(&mut schemas, &snapshot);
     let custom_types =
         crate::parser::ProviderCustomTypes::from_source(FactoryCustomTypeResolver::with_index(
             std::sync::Arc::clone(&factories),
             build_owner_custom_type_index(&snapshot),
+            &schemas,
         ));
     let provider_context =
         crate::parser::LoadedProviderContext::new(crate::parser::ProviderContext {
@@ -8100,6 +8129,379 @@ impl Provider for Box<dyn Provider> {
 
 #[cfg(test)]
 mod tests {
+    mod assignability_edges_stage_a {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        use crate::parser::SchemaTypeOwner;
+        use crate::provider::{
+            BoxFuture, CanonicalProviderConfigAttributes, InitializeOutcomeMint, ProviderError,
+            ProviderFactory, ProviderInitialization, ProviderReadyConfig, ProviderResult,
+            loaded_provider_snapshot_from_factories,
+        };
+        use crate::schema::{
+            AssignabilityEdge, AttributeSchema, AttributeType, ReferenceForms, ResourceSchema,
+            SchemaRegistry, TypeIdentity, TypeInSchema, ValidatedConfigSchema,
+            ValidatedProviderSchemaWitness, ValidatedResourceSchema,
+        };
+
+        fn identity(kind: &str) -> TypeIdentity {
+            TypeIdentity::new(Some("semantic"), ["Bucket"], kind)
+        }
+
+        fn owner(name: &str) -> SchemaTypeOwner {
+            SchemaTypeOwner::Provider(name.to_string())
+        }
+
+        fn string(kind: &str) -> AttributeType {
+            AttributeType::refined_string(Some(identity(kind)), None, None, None)
+        }
+
+        struct EdgeFactory {
+            owner: &'static str,
+            witness: ValidatedProviderSchemaWitness,
+            captures: Arc<AtomicUsize>,
+        }
+
+        impl ProviderFactory for EdgeFactory {
+            fn name(&self) -> &str {
+                self.owner
+            }
+            fn display_name(&self) -> &str {
+                self.owner
+            }
+            fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
+                self.captures.fetch_add(1, Ordering::SeqCst);
+                self.witness.clone()
+            }
+            fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+                panic!("snapshot must use the aggregate witness")
+            }
+            fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+                panic!("snapshot must use the aggregate witness")
+            }
+            fn validate_config(&self, _: &CanonicalProviderConfigAttributes) -> ProviderResult<()> {
+                Ok(())
+            }
+            fn create_provider(
+                &self,
+                _: Option<&str>,
+                _: &ProviderReadyConfig,
+                _: InitializeOutcomeMint,
+            ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
+                Box::pin(async { Err(ProviderError::internal("schema-only test")) })
+            }
+        }
+
+        fn factory(
+            owner: &'static str,
+            edges: &[(&str, &str)],
+            captures: Arc<AtomicUsize>,
+        ) -> Box<dyn ProviderFactory> {
+            let resource = ["A", "B", "C", "Unrelated"]
+                .into_iter()
+                .fold(ResourceSchema::new("test.Bucket"), |schema, kind| {
+                    schema.attribute(AttributeSchema::optional(kind, string(kind)).build())
+                })
+                .validate()
+                .unwrap();
+            let witness = ValidatedProviderSchemaWitness::new(
+                vec![resource],
+                ValidatedConfigSchema::default(),
+                ReferenceForms::new(),
+                edges
+                    .iter()
+                    .map(|(source, sink)| {
+                        AssignabilityEdge::new(identity(source), identity(sink)).unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            Box::new(EdgeFactory {
+                owner,
+                witness,
+                captures,
+            })
+        }
+
+        fn snapshot(
+            factories: Vec<Box<dyn ProviderFactory>>,
+        ) -> crate::provider::LoadedProviderSnapshot {
+            loaded_provider_snapshot_from_factories(
+                Arc::new(factories),
+                SchemaRegistry::new(),
+                crate::EnvironmentSnapshot::empty(),
+            )
+        }
+
+        #[test]
+        fn registry_witness_edges_reach_loaded_catalog_without_a_factory() {
+            let mut registry = SchemaRegistry::new();
+            registry
+                .insert_provider_witness(
+                    "builtin",
+                    &factory("builtin", &[("A", "B")], Arc::default()).schema_witness(),
+                )
+                .unwrap();
+            // Registry merges must preserve the witness's edge authority too.
+            let mut merged = SchemaRegistry::new();
+            merged.extend(registry).unwrap();
+            let loaded = loaded_provider_snapshot_from_factories(
+                Arc::default(),
+                merged,
+                crate::EnvironmentSnapshot::empty(),
+            );
+            let catalog = &loaded.provider_context().custom_types;
+            assert!(catalog.is_loaded());
+            assert!(
+                loaded
+                    .schema_registry()
+                    .assignability_closures()
+                    .contains_key(&owner("builtin"))
+            );
+            assert!(catalog.reachable(&owner("builtin"), &identity("A"), &identity("B")));
+            let schema = loaded
+                .schema_registry()
+                .get(
+                    "builtin",
+                    "test.Bucket",
+                    crate::schema::SchemaKind::Resource,
+                )
+                .unwrap();
+            assert!(matches!(
+                TypeInSchema::schemaless(schema.as_schema().attributes()["A"].attr_type())
+                    .assignment_to(schema.assignment_sink(
+                        schema.as_schema().attributes()["B"].attr_type(),
+                        catalog
+                    )),
+                crate::schema::TypeAssignability::Assignable,
+            ));
+        }
+
+        #[test]
+        fn registry_witness_without_edges_proves_mismatch_without_a_factory() {
+            let mut registry = SchemaRegistry::new();
+            registry
+                .insert_provider_witness(
+                    "builtin",
+                    &factory("builtin", &[], Arc::default()).schema_witness(),
+                )
+                .unwrap();
+            let loaded = loaded_provider_snapshot_from_factories(
+                Arc::default(),
+                registry,
+                crate::EnvironmentSnapshot::empty(),
+            );
+            let catalog = &loaded.provider_context().custom_types;
+            assert!(catalog.is_loaded());
+            assert!(
+                loaded
+                    .schema_registry()
+                    .assignability_closures()
+                    .contains_key(&owner("builtin"))
+            );
+            assert!(catalog.assignability_edges_available(&owner("builtin")));
+            let schema = loaded
+                .schema_registry()
+                .get(
+                    "builtin",
+                    "test.Bucket",
+                    crate::schema::SchemaKind::Resource,
+                )
+                .unwrap();
+            assert!(matches!(
+                TypeInSchema::schemaless(schema.as_schema().attributes()["A"].attr_type())
+                    .assignment_to(schema.assignment_sink(
+                        schema.as_schema().attributes()["B"].attr_type(),
+                        catalog
+                    )),
+                crate::schema::TypeAssignability::Mismatch,
+            ));
+        }
+
+        #[test]
+        fn registry_rejects_conflicting_witness_edges_on_insert_and_merge() {
+            let with_edges = factory("builtin", &[("A", "B")], Arc::default()).schema_witness();
+            let without_edges = factory("builtin", &[], Arc::default()).schema_witness();
+            for merge in [false, true] {
+                let mut registry = SchemaRegistry::new();
+                registry
+                    .insert_provider_witness("builtin", &with_edges)
+                    .unwrap();
+                let result = if merge {
+                    let mut incoming = SchemaRegistry::new();
+                    incoming
+                        .insert_provider_witness("builtin", &without_edges)
+                        .unwrap();
+                    registry.extend(incoming)
+                } else {
+                    registry.insert_provider_witness("builtin", &without_edges)
+                };
+                assert_eq!(
+                    result.expect_err("one owner cannot have conflicting witness-backed edges"),
+                    crate::schema::SchemaRegistryError::ConflictingAssignabilityEdges {
+                        owner: "builtin".into()
+                    },
+                );
+                assert!(
+                    registry.assignability_closures()[&owner("builtin")]
+                        .reachable(&identity("A"), &identity("B"))
+                );
+            }
+        }
+
+        #[test]
+        fn native_factory_edges_reach_loaded_catalog_from_one_witness_capture() {
+            let captures = Arc::new(AtomicUsize::new(0));
+            let loaded = snapshot(vec![factory(
+                "actual-owner",
+                &[("A", "B")],
+                Arc::clone(&captures),
+            )]);
+            let catalog = &loaded.provider_context().custom_types;
+            assert!(catalog.reachable(&owner("actual-owner"), &identity("A"), &identity("B")));
+            assert!(
+                !catalog.reachable(&owner("semantic"), &identity("A"), &identity("B")),
+                "TypeIdentity::provider is not the declaration owner"
+            );
+            assert!(!catalog.reachable(&owner("actual-owner"), &identity("B"), &identity("A")));
+            assert_eq!(captures.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn reachability_is_transitive_and_directional_within_one_provider() {
+            let loaded = snapshot(vec![factory(
+                "owner",
+                &[("A", "B"), ("B", "C")],
+                Arc::default(),
+            )]);
+            let catalog = &loaded.provider_context().custom_types;
+            assert!(catalog.reachable(&owner("owner"), &identity("A"), &identity("B")));
+            assert!(catalog.reachable(&owner("owner"), &identity("B"), &identity("C")));
+            assert!(catalog.reachable(&owner("owner"), &identity("A"), &identity("C")));
+            assert!(!catalog.reachable(&owner("owner"), &identity("C"), &identity("A")));
+            assert!(!catalog.reachable(&owner("owner"), &identity("A"), &identity("Unrelated")));
+            assert!(!catalog.reachable(&owner("missing-owner"), &identity("A"), &identity("C")));
+        }
+
+        #[test]
+        fn reachability_never_composes_edges_from_two_providers() {
+            // Both owners declare all endpoints. Only the edges differ, so a
+            // global union of edge sets would incorrectly manufacture A -> C.
+            let loaded = snapshot(vec![
+                factory("first", &[("A", "B")], Arc::default()),
+                factory("second", &[("B", "C")], Arc::default()),
+            ]);
+            let catalog = &loaded.provider_context().custom_types;
+            assert!(catalog.reachable(&owner("first"), &identity("A"), &identity("B")));
+            assert!(catalog.reachable(&owner("second"), &identity("B"), &identity("C")));
+            for name in ["first", "second"] {
+                assert!(!catalog.reachable(&owner(name), &identity("A"), &identity("C")));
+            }
+            assert!(!catalog.reachable(&owner("first"), &identity("B"), &identity("C")));
+            assert!(!catalog.reachable(&owner("second"), &identity("A"), &identity("B")));
+        }
+
+        #[test]
+        fn reachability_for_all_rejects_an_edge_missing_from_one_co_owner() {
+            let loaded = snapshot(vec![
+                factory("first", &[("A", "B")], Arc::default()),
+                factory("second", &[], Arc::default()),
+            ]);
+            let catalog = &loaded.provider_context().custom_types;
+            let sink = catalog
+                .known()
+                .iter()
+                .find(|owned| owned.identity() == &identity("B"))
+                .unwrap();
+            assert_eq!(sink.owners().iter().len(), 2);
+            assert!(catalog.reachable(&owner("first"), &identity("A"), sink.identity()));
+            assert!(!catalog.reachable(&owner("second"), &identity("A"), sink.identity()));
+            assert!(!catalog.reachable_for_all(sink.owners(), &identity("A"), sink.identity()));
+        }
+
+        #[test]
+        fn reachability_for_all_accepts_an_edge_declared_by_both_co_owners() {
+            let loaded = snapshot(vec![
+                factory("first", &[("A", "B")], Arc::default()),
+                factory("second", &[("A", "B")], Arc::default()),
+            ]);
+            let catalog = &loaded.provider_context().custom_types;
+            let sink = catalog
+                .known()
+                .iter()
+                .find(|owned| owned.identity() == &identity("B"))
+                .unwrap();
+            assert_eq!(sink.owners().iter().len(), 2);
+            assert!(catalog.reachable_for_all(sink.owners(), &identity("A"), sink.identity()));
+            assert!(!catalog.reachable_for_all(sink.owners(), sink.identity(), &identity("A")));
+            assert!(
+                !catalog
+                    .with_failed_providers(std::collections::BTreeSet::from(["second".to_string()]))
+                    .reachable_for_all(sink.owners(), &identity("A"), sink.identity())
+            );
+            assert!(
+                !crate::parser::ProviderCustomTypes::default().reachable_for_all(
+                    sink.owners(),
+                    &identity("A"),
+                    sink.identity(),
+                )
+            );
+        }
+
+        #[test]
+        fn reachability_is_unavailable_for_failed_owners() {
+            let loaded = snapshot(vec![
+                factory("first", &[("A", "B")], Arc::default()),
+                factory("second", &[("B", "C")], Arc::default()),
+            ]);
+            let catalog = loaded
+                .provider_context()
+                .custom_types
+                .with_failed_providers(std::collections::BTreeSet::from(["first".to_string()]));
+            assert!(!catalog.reachable(&owner("first"), &identity("A"), &identity("B")));
+            assert!(catalog.reachable(&owner("second"), &identity("B"), &identity("C")));
+            assert!(!crate::parser::ProviderCustomTypes::default().reachable(
+                &owner("first"),
+                &identity("A"),
+                &identity("B"),
+            ));
+        }
+
+        #[test]
+        fn stage_b_judgement_consults_the_stored_edges() {
+            let sink_owner = owner("owner");
+            let loaded = snapshot(vec![factory("owner", &[("A", "B")], Arc::default())]);
+            assert!(loaded.provider_context().custom_types.reachable(
+                &owner("owner"),
+                &identity("A"),
+                &identity("B")
+            ));
+            let source = string("A");
+            let sink = string("B");
+            assert!(TypeInSchema::schemaless(&source).is_assignable_to(
+                (TypeInSchema::schemaless(&sink)).with_authority(
+                    &loaded.provider_context().custom_types,
+                    crate::schema::SinkAuthority::Owner(&sink_owner)
+                )
+            ));
+            assert!(!TypeInSchema::schemaless(&sink).is_assignable_to(
+                (TypeInSchema::schemaless(&source)).with_authority(
+                    &loaded.provider_context().custom_types,
+                    crate::schema::SinkAuthority::Owner(&sink_owner)
+                )
+            ));
+            assert!(TypeInSchema::schemaless(&source).is_assignable_to(
+                (TypeInSchema::schemaless(&source)).with_authority(
+                    &loaded.provider_context().custom_types,
+                    crate::schema::SinkAuthority::Owner(&sink_owner)
+                )
+            ));
+        }
+    }
+
     #[test]
     fn provider_text_persisted_attribute_error_labels_are_capped_with_safe_sources() {
         let raw = format!("\x1b[2J\u{9b}{}", "x".repeat(20 * 1024));
@@ -8479,6 +8881,7 @@ mod tests {
                 self.schemas(),
                 self.provider_config_attribute_types(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }
@@ -8540,6 +8943,7 @@ mod tests {
                 )]))
                 .unwrap(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap(),
         });
@@ -8547,6 +8951,7 @@ mod tests {
         let resolver = FactoryCustomTypeResolver::with_index(
             factories,
             build_owner_custom_type_index(&snapshots),
+            &SchemaRegistry::new(),
         );
         let known = resolver.known_custom_types();
         assert_eq!(known.len(), 2, "only owners with the same kind are grouped");
@@ -8647,6 +9052,7 @@ mod tests {
                 self.schemas(),
                 self.provider_config_attribute_types(),
                 Default::default(),
+                Vec::new(),
             )
             .expect("snapshot fixture must expose one valid aggregate witness")
         }
@@ -12247,6 +12653,7 @@ mod tests {
             vec![schema],
             ValidatedConfigSchema::default(),
             forms,
+            Vec::new(),
         )
         .expect("fixture provider schema must validate");
         let mut registry = crate::schema::SchemaRegistry::new();
@@ -12503,6 +12910,7 @@ mod tests {
                     self.schemas(),
                     self.provider_config_attribute_types(),
                     Default::default(),
+                    Vec::new(),
                 )
                 .unwrap()
             }
@@ -12596,6 +13004,7 @@ mod tests {
                     self.schemas(),
                     self.provider_config_attribute_types(),
                     Default::default(),
+                    Vec::new(),
                 )
                 .unwrap()
             }

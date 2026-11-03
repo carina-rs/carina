@@ -50,7 +50,7 @@ impl TestClient {
         client
     }
 
-    async fn with_factory_builder(factory_builder: Option<FactoryBuilder>) -> Self {
+    pub async fn with_factory_builder(factory_builder: Option<FactoryBuilder>) -> Self {
         let (client_writer, server_reader) = tokio::io::duplex(1024 * 1024);
         let (server_writer, client_reader) = tokio::io::duplex(1024 * 1024);
 
@@ -141,7 +141,7 @@ impl TestClient {
         self.initialize_with_root(None).await
     }
 
-    async fn initialize_with_root(&mut self, root_uri: Option<&str>) -> Value {
+    pub async fn initialize_with_root(&mut self, root_uri: Option<&str>) -> Value {
         let id = self.next_id();
         let init_request = json!({
             "jsonrpc": "2.0",
@@ -203,7 +203,7 @@ impl TestClient {
         .await
     }
 
-    async fn wait_for_server_notification(
+    pub async fn wait_for_server_notification(
         &mut self,
         method: &str,
         matches: impl Fn(&Value) -> bool,

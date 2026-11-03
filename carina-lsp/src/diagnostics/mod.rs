@@ -13,7 +13,10 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::Document;
 use crate::position;
-use carina_core::parser::{ParseError, SourceSpan, WarningKind, contains_function_call};
+use carina_core::parser::{
+    ParseError, ProviderConfig, SourceSpan, WarningKind, contains_function_call,
+};
+use carina_core::paths::PathIdentity;
 use carina_core::provider::{
     HostErrorCause, LoadedProviderSnapshot, ProviderError, ProviderFactory, SuspendedValidationId,
 };
@@ -21,7 +24,7 @@ use carina_core::resource::{
     AbsoluteBindingAddress, BindingAddress, ConcreteValue, DeferredValue, ParserPlaceholder,
     RelativeBindingName, Value as GenericValue,
 };
-use carina_core::schema::{SchemaRegistry, TypeError, TypeInSchema};
+use carina_core::schema::{SchemaRegistry, TypeError};
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
@@ -317,7 +320,7 @@ impl ExpandedDiagnosticValidationInputs<'_> {
         &self,
         resource_id: &carina_core::resource::ResourceId,
         attribute: &str,
-        expected: TypeInSchema<'_, carina_core::schema::Compiled>,
+        expected: carina_core::schema::AssignmentSink<'_, carina_core::schema::Compiled>,
         schemas: &SchemaRegistry,
     ) -> Option<Result<(), carina_core::validation::DeferredAccessTypeError>> {
         let resource = self
@@ -392,6 +395,10 @@ impl std::ops::Deref for DiagnosticProviderContext {
 pub struct DiagnosticEngine {
     schemas: Arc<SchemaRegistry>,
     loaded_providers: Option<Arc<LoadedProviderSnapshot>>,
+    /// Declarations and directory that produced this engine's loaded snapshot.
+    /// Ancestor, imported, and empty states cannot establish authority for a
+    /// different directory when its declarations fail to parse.
+    directory_providers: Option<DirectoryProviderDeclarations>,
     provider_names: Vec<String>,
     known_provider_names: HashSet<String>,
     factories: Arc<Vec<Box<dyn ProviderFactory>>>,
@@ -399,6 +406,11 @@ pub struct DiagnosticEngine {
     provider_errors: HashMap<String, String>,
     /// Cached provider context with custom type validators from schemas.
     provider_context: DiagnosticProviderContext,
+}
+
+struct DirectoryProviderDeclarations {
+    directory: PathIdentity,
+    providers: Vec<ProviderConfig>,
 }
 
 struct LspTypeCheckSink<'a> {
@@ -1439,7 +1451,7 @@ impl DiagnosticRun<'_> {
                             let arithmetic_findings = tree.integer_arithmetic_findings(
                                 rref,
                                 attr_name,
-                                effective_type.clone(),
+                                validated_schema,
                                 &inference_bindings,
                                 &self.schemas,
                                 &binding_index,
@@ -1591,7 +1603,10 @@ impl DiagnosticRun<'_> {
                                         .or_else(|| {
                                             carina_core::validation::check_deferred_access_type(
                                                 value,
-                                                schema.type_in_schema(attr_schema.attr_type()),
+                                                validated_schema.assignment_sink(
+                                                    attr_schema.attr_type(),
+                                                    &self.provider_context.catalog().custom_types,
+                                                ),
                                                 &inference_bindings,
                                                 &self.schemas,
                                                 &binding_index,
@@ -1612,14 +1627,20 @@ impl DiagnosticRun<'_> {
                                         inputs.check_resource_access(
                                             resource_id,
                                             attr_name,
-                                            schema.type_in_schema(attr_schema.attr_type()),
+                                            validated_schema.assignment_sink(
+                                                attr_schema.attr_type(),
+                                                &self.provider_context.catalog().custom_types,
+                                            ),
                                             &self.schemas,
                                         )
                                     })
                                     .unwrap_or_else(|| {
                                         carina_core::validation::check_deferred_access_type(
                                             value,
-                                            schema.type_in_schema(attr_schema.attr_type()),
+                                            validated_schema.assignment_sink(
+                                                attr_schema.attr_type(),
+                                                &self.provider_context.catalog().custom_types,
+                                            ),
                                             &inference_bindings,
                                             &self.schemas,
                                             &binding_index,
@@ -1630,7 +1651,10 @@ impl DiagnosticRun<'_> {
                                 (_, Value::Deferred(DeferredValue::BindingRef { binding })) => {
                                     check_resource_ref_type_mismatch(
                                         &binding_index,
-                                        schema.type_in_schema(attr_schema.attr_type()),
+                                        validated_schema.assignment_sink(
+                                            attr_schema.attr_type(),
+                                            &self.provider_context.catalog().custom_types,
+                                        ),
                                         binding.into(),
                                     )
                                 }
@@ -1646,7 +1670,10 @@ impl DiagnosticRun<'_> {
                                     .and_then(|path| {
                                         check_resource_ref_type_mismatch(
                                             &binding_index,
-                                            schema.type_in_schema(attr_schema.attr_type()),
+                                            validated_schema.assignment_sink(
+                                                attr_schema.attr_type(),
+                                                &self.provider_context.catalog().custom_types,
+                                            ),
                                             (&path).into(),
                                         )
                                     }),
@@ -2067,6 +2094,7 @@ impl DiagnosticEngine {
         Self {
             schemas: Arc::clone(&schemas),
             loaded_providers: None,
+            directory_providers: None,
             provider_names: Vec::new(),
             known_provider_names: HashSet::new(),
             factories: Arc::new(Vec::new()),
@@ -2089,6 +2117,7 @@ impl DiagnosticEngine {
         Self {
             schemas,
             loaded_providers: Some(loaded_providers),
+            directory_providers: None,
             provider_names,
             known_provider_names,
             factories,
@@ -2103,6 +2132,18 @@ impl DiagnosticEngine {
 
     pub fn with_provider_errors(mut self, errors: HashMap<String, String>) -> Self {
         self.provider_errors = errors;
+        self
+    }
+
+    pub(crate) fn with_directory_providers(
+        mut self,
+        directory: PathIdentity,
+        providers: Vec<ProviderConfig>,
+    ) -> Self {
+        self.directory_providers = Some(DirectoryProviderDeclarations {
+            directory,
+            providers,
+        });
         self
     }
 
@@ -2159,9 +2200,17 @@ impl DiagnosticEngine {
                 .ok()
                 .and_then(|directory| self.directory_catalog(doc, &directory))
                 .unwrap_or_else(|| {
-                    carina_core::parser::ProviderContext::new(
-                        doc.provider_context().environment.clone(),
-                    )
+                    if let Some(scope) = &self.directory_providers
+                        && scope.directory == PathIdentity::new(directory)
+                    {
+                        // A resource edit may break declaration parsing without
+                        // invalidating this directory's loaded provider snapshot.
+                        self.catalog_for_provider_declarations(&scope.providers)
+                    } else {
+                        carina_core::parser::ProviderContext::new(
+                            doc.provider_context().environment.clone(),
+                        )
+                    }
                 }),
             None => (*self.provider_context).clone(),
         };
@@ -2221,6 +2270,15 @@ impl DiagnosticEngine {
                 .ok()?,
             );
         }
+        Some(self.catalog_for_provider_declarations(&providers))
+    }
+
+    /// Apply the same default-provider failure policy to freshly parsed
+    /// declarations and the declarations retained with an exact-directory state.
+    fn catalog_for_provider_declarations<P: carina_core::resource::PlaceholderKind>(
+        &self,
+        providers: &[ProviderConfig<P>],
+    ) -> carina_core::parser::ProviderContext {
         let mut loaded = self
             .provider_names
             .iter()
@@ -2243,7 +2301,7 @@ impl DiagnosticEngine {
             loaded.insert(carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string());
         }
         let failed = carina_core::parser::unavailable_provider_kinds(
-            &providers,
+            providers,
             &loaded,
             &self.provider_errors,
         );
@@ -2256,7 +2314,7 @@ impl DiagnosticEngine {
                 carina_core::provider::provider_custom_types_from_factories(Arc::new(Vec::new()))
             });
         catalog.custom_types = loaded_catalog.with_failed_providers(failed);
-        Some(catalog)
+        catalog
     }
 }
 
@@ -2409,7 +2467,7 @@ fn decorate_schema_diagnostic(diagnostic: &mut Diagnostic, error: &carina_core::
 /// cannot be resolved (unknown bindings are not flagged here).
 fn check_resource_ref_type_mismatch(
     binding_index: &carina_core::binding_index::BindingIndex<'_, RelativeBindingName>,
-    expected: TypeInSchema<'_, carina_core::schema::Compiled>,
+    expected: carina_core::schema::AssignmentSink<'_, carina_core::schema::Compiled>,
     path: carina_core::resource::ReferencePathRef<'_, RelativeBindingName>,
 ) -> Option<String> {
     let carina_core::binding_index::RefType::Typed(source) = binding_index.ref_type(path) else {

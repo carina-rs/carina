@@ -120,7 +120,16 @@ impl ProviderState {
                     .or_insert_with(|| format!("Provider '{provider}' schemas are unavailable"));
             }
         }
-        let diagnostic_engine = diagnostic_engine.with_provider_errors(provider_errors);
+        let mut diagnostic_engine = diagnostic_engine.with_provider_errors(provider_errors);
+        if let Some((directory, _)) = configs.first() {
+            diagnostic_engine = diagnostic_engine.with_directory_providers(
+                PathIdentity::new(directory),
+                configs
+                    .iter()
+                    .map(|(_, config)| config.factory_config().clone())
+                    .collect(),
+            );
+        }
         Self {
             schemas: Arc::clone(&schemas),
             diagnostic_engine,
@@ -969,6 +978,7 @@ mod tests {
                 self.schemas(),
                 self.provider_config_attribute_types(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }

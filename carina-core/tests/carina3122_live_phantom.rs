@@ -129,6 +129,7 @@ fn carina3122_live_distribution_readback_defaults_are_projected_away() {
         ],
         ValidatedConfigSchema::default(),
         Default::default(),
+        Vec::new(),
     )
     .expect("comparison owner witness is valid");
     schemas

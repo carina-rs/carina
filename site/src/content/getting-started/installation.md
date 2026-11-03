@@ -63,7 +63,7 @@ carina init
 
 `carina init` resolves the version through the provider registry (`registry.carina-rs.dev`), verifies the artifact's signature, installs the plugin into `.carina/providers/`, and records the resolved version and checksum in `carina-providers.lock`. For an allow-listed `carina-rs` source, it also records the downloaded artifact's canonical source, SHA-256, and verified signer when available in the current user's trust directory, `~/.carina/trust/` (overridable with `CARINA_TRUST_RECORD_DIR`). If a matching project artifact or global cache entry for an allow-listed source exists without this user record, `carina init` downloads the artifact from its origin again before creating the record. The command fails if it cannot write a required trust record; third-party sources neither write nor require one.
 
-After upgrading Carina, the first `carina init` re-downloads each allow-listed `carina-rs` provider from its origin to create the current trust record, so it needs network access. For a GitHub `revision` source whose locked commit artifact has expired (GitHub normally retains artifacts for about 90 days), run `carina init --upgrade` to resolve a current artifact.
+When upgrading from a version without the required user trust record, the first `carina init` re-downloads the affected allow-listed `carina-rs` providers from their origins and needs network access. Existing valid records permit cache reuse. For a GitHub `revision` source whose locked commit artifact has expired (GitHub normally retains artifacts for about 90 days), run `carina init --upgrade` to resolve a current artifact.
 
 Commit the lock file; `carina init --upgrade` re-resolves versions from the constraints, and `carina init --locked` fails if the lock does not cover every provider (for CI). `validate`, `plan`, and `apply` do not download anything — they fail with `Run carina init` if a provider is missing. An allow-listed `carina-rs` AWS, AWSCC, or GitHub provider loads only when the exact bytes match this user's valid trust record. A `carina-providers.lock` file or `.carina/` directory shipped in a repository cannot create that verification. If the record is absent, unreadable, malformed, or names a signer outside `carina-rs`, Carina fails before running the provider and the error tells the user to run `carina init`.
 
@@ -91,7 +91,7 @@ provider awscc {
 
 With a GitHub source, `revision` can also be a commit SHA and installs the CI build artifact for that commit. [Your First Provider](/providers/writing/getting-started/#use-it-from-github) describes which builds qualify. Resolving it calls the GitHub API, so it needs a token (`GITHUB_TOKEN`, or a logged-in `gh`). A registry source needs no token.
 
-The two official providers are:
+The two official AWS providers are:
 
 | Provider | Source |
 |----------|--------|

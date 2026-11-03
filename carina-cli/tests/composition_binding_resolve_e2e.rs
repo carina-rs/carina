@@ -78,6 +78,7 @@ impl ProviderFactory for AwsccTestFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }

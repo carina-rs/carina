@@ -182,7 +182,7 @@ fn differ_treats_equal_cyclic_values_as_unchanged() {
     // `type_aware_equal` resolves `Ref` at function entry and so
     // semantically equal cyclic values do not surface a phantom diff.
     let schema = cyclic_webacl_like_schema();
-    let id = ResourceId::with_identity("wafv2.WebACL", "main");
+    let id = ResourceId::with_provider_identity("test", "wafv2.WebACL", "main", None);
 
     let rules_value = Value::Concrete(ConcreteValue::List(vec![rule_value("BlockBadIPs", 2)]));
     let desired = build_resource(&id, &[("rules", rules_value.clone())]);
@@ -202,21 +202,22 @@ fn differ_treats_equal_cyclic_values_as_unchanged() {
         ],
         ValidatedConfigSchema::default(),
         Default::default(),
+        Vec::new(),
     )
     .expect("comparison owner witness is valid");
     schemas
-        .insert_provider_witness("", &witness)
+        .insert_provider_witness("test", &witness)
         .expect("comparison owner witness is consistent");
     let mut providers = ProviderRouter::new();
     providers.add_provider(
-        String::new(),
+        "test".into(),
         InitializedProvider::unavailable(Box::new(ProviderRouter::new())),
     );
     let comparison = providers
         .comparison_context_for(
             &id,
             schemas
-                .get("", "wafv2.WebACL", SchemaKind::Resource)
+                .get("test", "wafv2.WebACL", SchemaKind::Resource)
                 .expect("comparison owner schema is registered"),
         )
         .expect("comparison provider route is initialized");
@@ -245,7 +246,7 @@ fn differ_surfaces_a_real_change_inside_a_cyclic_value() {
     // the `Ref` resolution didn't accidentally collapse the inner
     // walk into a no-op.
     let schema = cyclic_webacl_like_schema();
-    let id = ResourceId::with_identity("wafv2.WebACL", "main");
+    let id = ResourceId::with_provider_identity("test", "wafv2.WebACL", "main", None);
 
     let desired_rules = Value::Concrete(ConcreteValue::List(vec![rule_value("BlockBadIPs", 3)]));
     let desired = build_resource(&id, &[("rules", desired_rules)]);
@@ -268,21 +269,22 @@ fn differ_surfaces_a_real_change_inside_a_cyclic_value() {
         ],
         ValidatedConfigSchema::default(),
         Default::default(),
+        Vec::new(),
     )
     .expect("comparison owner witness is valid");
     schemas
-        .insert_provider_witness("", &witness)
+        .insert_provider_witness("test", &witness)
         .expect("comparison owner witness is consistent");
     let mut providers = ProviderRouter::new();
     providers.add_provider(
-        String::new(),
+        "test".into(),
         InitializedProvider::unavailable(Box::new(ProviderRouter::new())),
     );
     let comparison = providers
         .comparison_context_for(
             &id,
             schemas
-                .get("", "wafv2.WebACL", SchemaKind::Resource)
+                .get("test", "wafv2.WebACL", SchemaKind::Resource)
                 .expect("comparison owner schema is registered"),
         )
         .expect("comparison provider route is initialized");
@@ -347,6 +349,7 @@ fn resource_schema_validate_routes_ref_through_defs() {
         vec![schema],
         ValidatedConfigSchema::default(),
         Default::default(),
+        Vec::new(),
     )
     .expect("cyclic schema provider witness is valid");
     registry

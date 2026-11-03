@@ -24,7 +24,7 @@ Print the formatting diff to stdout without rewriting any files. Combine with `-
 
 ### `--recursive`, `-r`
 
-Recurse into subdirectories of PATH and include every `.crn` file found.
+Recurse into subdirectories of PATH and format `.crn` files, skipping hidden directories, `target`, and `node_modules`. Each canonical directory is visited once.
 
 ## Examples
 
@@ -40,7 +40,7 @@ Format the `.crn` files in another directory:
 carina fmt infra/network
 ```
 
-Format every `.crn` under the current tree:
+Format `.crn` files under the current tree, skipping hidden directories, `target`, and `node_modules`:
 
 ```bash
 carina fmt --recursive

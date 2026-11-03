@@ -2448,6 +2448,7 @@ impl ProviderFactory for FailBCreateFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -3251,6 +3252,7 @@ impl ProviderFactory for ApplyTimeReadFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -3458,6 +3460,7 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }

@@ -3,7 +3,7 @@ title: "Registries"
 description: "Where users install a provider from: a GitHub repository, the official registry at registry.carina-rs.dev, or a registry you host yourself."
 ---
 
-A configuration names where each provider comes from in the `source` of its `provider` block. There are three kinds of source:
+A configuration names where each provider comes from in the `source` of its `provider` block. Remote providers have the following three source forms. Local builds can also use `file://<path>`.
 
 ```hcl
 provider aws {
@@ -36,7 +36,7 @@ You can serve a registry yourself without any server software. Every file a clie
 
 The hostname is part of the provider's identity. `carina-providers.lock` records it, and the same `namespace/name` on another host is a different provider, so choose a hostname you will keep. The client never reads documentation pages, so a self-hosted registry may serve its own pages for your docs, or none.
 
-The client verifies a self-hosted registry the same way as the official one: it checks each binary's SHA-256 against the `shasum` the registry serves for that version, verifies a Sigstore signature when one is present, and pins what it saw in the lock file. Provider credentials are separate from this: environment credentials such as AWS keys are passed only to the official providers (see [The sandbox](/providers/writing/overview/#the-sandbox)), so a provider from your registry should take its settings as `provider` block attributes.
+The client verifies a self-hosted registry the same way as the official one: it checks each binary's SHA-256 against the `shasum` the registry serves for that version, verifies a Sigstore signature when one is present, and pins what it saw in the lock file. Provider credentials are separate from this: AWS-kind providers obtain host-resolved credentials through a typed import (see [The sandbox](/providers/writing/overview/#the-sandbox)). Other providers should accept settings as `provider` block attributes; local builds require an explicit trust grant to receive credentials.
 
 ## Trusting a self-hosted host
 

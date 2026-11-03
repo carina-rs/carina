@@ -33,7 +33,7 @@ their provider schema's destruction-protection default.
 
 ### `--parallelism <N>`
 
-Maximum number of provider operations run concurrently. Defaults to `8`.
+Maximum number of destroy effects executed concurrently. Defaults to `8`. The preparatory refresh phase has a separate concurrency limit of `5`.
 
 ## Progress and Errors
 

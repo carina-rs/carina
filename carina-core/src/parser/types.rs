@@ -114,6 +114,19 @@ impl From<UnloadedSchemaType> for TypeIdentity {
     }
 }
 
+impl TryFrom<TypeIdentity> for TypeExpr {
+    type Error = String;
+
+    fn try_from(identity: TypeIdentity) -> Result<Self, Self::Error> {
+        match UnloadedSchemaType::try_from(identity.clone()) {
+            Ok(unloaded) => Ok(Self::UnloadedSchemaType(unloaded)),
+            Err(error) => BuiltinTypeName::lookup(&pascal_to_snake(&identity.kind))
+                .map(Self::Simple)
+                .ok_or(error),
+        }
+    }
+}
+
 /// Resolve an identity using the catalog, retaining only nominal evidence
 /// when that catalog is not loaded. Deserialized annotations retain nominal
 /// identity only, with no loaded provider candidates.
@@ -520,6 +533,30 @@ fn parse_type_expr_atom(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_conversion_preserves_builtins_and_provider_nominals() {
+        for identity in crate::schema::builtin_type_registry().keys() {
+            assert!(
+                matches!(
+                    TypeExpr::try_from(identity.clone()),
+                    Ok(TypeExpr::Simple(_))
+                ),
+                "{identity}"
+            );
+        }
+        for identity in [
+            TypeIdentity::bare("CustomCount"),
+            TypeIdentity::new(Some("provider"), ["Bucket"], "PositiveInt"),
+        ] {
+            let TypeExpr::UnloadedSchemaType(unloaded) =
+                TypeExpr::try_from(identity.clone()).unwrap()
+            else {
+                panic!("provider identity must retain nominal evidence");
+            };
+            assert_eq!(unloaded.identity(), &identity);
+        }
+    }
 
     fn loaded_context(
         known: std::collections::HashSet<crate::parser::OwnedTypeIdentity>,

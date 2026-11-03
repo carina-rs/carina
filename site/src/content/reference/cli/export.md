@@ -21,7 +21,7 @@ warning to stderr and reads exports from the locked old backend. An explicit
 
 ### `--json`
 
-Output as JSON. With a NAME, prints `{"<name>": <value>}`. Without, prints the full export map.
+Output as JSON. With a NAME, prints that export's value directly (for example, `"vpc-audit"`). Without a NAME, prints the full export map.
 
 JSON export output is decoded for consumers: canonical enums are printed as
 their provider API strings, and user map keys beginning with `$` keep their
@@ -30,7 +30,7 @@ are not exposed by this command.
 
 ### `--raw`
 
-Output the raw value without the export name or surrounding quotes. Requires a NAME. Useful for piping a single export into another command.
+Output the raw value without the export name or surrounding quotes. Use a NAME with `--raw`. The CLI rejects an omitted name when exports exist; an empty export map prints `No exports defined.` and exits `0`. Useful for piping a single export into another command.
 
 ### `--state-url <URL>`
 

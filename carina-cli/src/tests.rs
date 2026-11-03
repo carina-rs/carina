@@ -211,6 +211,7 @@ impl ProviderFactory for EvidenceTestFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -2140,6 +2141,7 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
         vec![schema.validate().expect("valid schema")],
         ValidatedConfigSchema::default(),
         forms,
+        Vec::new(),
     )
     .expect("valid provider schema witness");
     let mut schemas = SchemaRegistry::new();

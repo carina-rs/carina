@@ -85,13 +85,13 @@ This guide walks you through creating an AWS VPC using Carina.
 
   <Step number={6} eyebrow="Step 6 · Destroy" title="Destroy">
 
-  Tear down all managed resources:
+  Tear down managed resources:
 
   ```bash
   carina destroy
   ```
 
-  After you confirm by typing `yes`, this deletes every resource recorded in the state file.
+  After you confirm by typing `yes`, Carina destroys eligible managed resources in state. Protected resources are retained, and `removed` entries are forgotten without cloud deletion.
 
   </Step>
 </Stepper>

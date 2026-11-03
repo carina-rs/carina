@@ -34,7 +34,7 @@ carina apply --lock=false
 
 ### `--parallelism <N>`
 
-Maximum number of provider operations run concurrently. Defaults to `8`.
+Maximum number of effects executed concurrently. Defaults to `8`. Preparatory refresh and data-source reads have a separate concurrency limit of `5`.
 
 ```bash
 carina apply --parallelism=2
@@ -59,7 +59,8 @@ A saved plan also records the providers it was computed with: for each provider,
 
 Saved plans are tied to the plan-file format of the Carina version that wrote them. A plan written by another version is rejected with `Unsupported plan file version`; create it again with `carina plan --out`.
 
-The current saved-plan format is 39, superseding 38. It retains resolved
+The current saved-plan format is `40`, superseding `39`. It adds the
+absolute source locator and canonical source identity. It retains resolved
 lifecycle directive values and per-element loop expressions, and carries
 complete resolved dependency addresses and the legacy dependency migration
 classification that apply checks against locked state before writing state
@@ -75,9 +76,11 @@ verifies the re-evaluated plaintext against the digest, including for resource
 attributes, provider configuration, and deferred templates. The provider then
 receives the rehydrated plaintext, while state stores the exact digest carried
 by the plan placeholder. If a secret changed or can no longer be found, apply stops
-before any planned provider mutation or state write and asks you to run
-`carina plan --out` again. A secret that came through a module call is matched
-to that call by its position in the source, not by its name. Apply therefore also
+before planned provider mutations and asks you to run
+`carina plan --out` again. A required state-format migration or legacy
+data-source cleanup may already have been persisted under the lock. A secret
+that came through a module call is matched to that call by its position in the
+source, not by its name. Apply therefore also
 stops if such a call has moved since the plan was made, for example when a line
 was added above it or its file was renamed. The error names the call's file and
 line. Saved-plan verification may perform additional
@@ -100,7 +103,7 @@ produce a fresh saved plan.
 
 When `--auto-approve` is not set, Carina follows this flow:
 
-1. Refreshes state from the cloud provider for all managed resources and reads all data sources
+1. Refreshes state from the cloud provider for all managed resources and reads data sources whose inputs are available; reads depending on new or unresolved resources are deferred to apply execution
 2. Computes and displays the execution plan
 3. If no changes are needed, prints "No changes needed." and exits
 4. Prompts: "Do you want to perform these actions?"
@@ -109,7 +112,7 @@ When `--auto-approve` is not set, Carina follows this flow:
 7. Saves the final state to the backend
 8. Prints a summary of results
 
-When `carina apply` creates a plan directly from a configuration directory, data sources are always read. Likewise, `carina plan --refresh=false` skips only managed-resource refresh before writing a saved plan; it still reads every data source.
+When `carina apply` creates a plan directly from a configuration directory, it reads data sources whose inputs are available and defers reads depending on new or unresolved resources to apply execution. Likewise, `carina plan --refresh=false` skips only managed-resource refresh before writing a saved plan; it preserves this data-source read and deferral behavior.
 
 ## Progress Output
 
@@ -120,7 +123,7 @@ When stderr is a terminal, Carina shows a spinner for each running effect. Other
 - If an effect fails, Carina refreshes the resource state from the provider to capture any partial changes
 - If a create fails after the provider reported the new resource's identifier, the identifier is still recorded in state. When Carina could read the resource back, the note says `resource created; recorded in state, the next apply completes it`. When it could not, the note says the provider reported the identifier but the resource could not be observed, with the reason; the next `carina plan` checks it again
 - State is written incrementally while effects run, so results of completed effects survive even if the process is killed before the final save
-- The state file is always saved after execution, even if some effects failed, to prevent state drift
+- Carina attempts to save final state even when effects fail, while it still owns the state lock. If lock ownership is lost, it stops without a final save; cancellation cleanup can also exhaust its flush budget. Previously persisted checkpoints remain available
 - Failed, partial, skipped and interrupted effects are reported in the summary (e.g., "3 succeeded, 1 failed, 1 skipped, 1 outcome unknown"). An effect that was still running when apply stopped is shown as `? <effect> - interrupted (outcome unknown)`; run `carina plan` to see what it left behind
 - Exit codes: `0` on success; `1` on an error or when any effect failed, was skipped or was interrupted; `2` when the only problem is creates that completed partially; `130` when cancelled with Ctrl+C
 

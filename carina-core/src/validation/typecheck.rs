@@ -578,7 +578,7 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
                 }
             };
             return match inferred {
-                Ok(actual) => inferred_value_check(expected, &actual, value),
+                Ok(actual) => inferred_value_check(expected, &actual, value, config),
                 Err(crate::static_type::InferenceIssue::Failed(
                     error @ (super::inference::InferenceError::InvalidAccess { .. }
                     | super::inference::InferenceError::UnknownAttribute { .. }
@@ -616,14 +616,14 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
                 }
             };
             return match inferred {
-                Ok(actual) => inferred_value_check(expected, &actual, value),
+                Ok(actual) => inferred_value_check(expected, &actual, value, config),
                 Err(crate::static_type::InferenceIssue::Failed(error)) => {
                     Mismatch(TypeExprValueError::InvalidAccess { error })
                 }
                 Err(crate::static_type::InferenceIssue::NotInferable(
                     crate::static_type::NotInferableReason::CustomTypeSchemaUnavailable { .. },
                 )) if !matches!(
-                    inferred_type_assignment(expected, &TypeExpr::Int),
+                    inferred_type_assignment(expected, &TypeExpr::Int, &config.custom_types),
                     crate::schema::TypeAssignability::Mismatch
                 ) =>
                 {
@@ -822,8 +822,9 @@ fn inferred_value_check<'s, P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
     actual: &TypeExpr,
     value: &Value<P, B>,
+    config: &ProviderContext,
 ) -> TypeExprValueCheck<'s> {
-    match inferred_type_assignment(expected, actual) {
+    match inferred_type_assignment(expected, actual, &config.custom_types) {
         crate::schema::TypeAssignability::Assignable => TypeExprValueCheck::Assignable,
         crate::schema::TypeAssignability::Mismatch => {
             TypeExprValueCheck::Mismatch(mismatch(expected, value))
@@ -945,6 +946,7 @@ fn is_qualified_enum_identifier(identifier: &str) -> bool {
 fn inferred_type_assignment<'s>(
     expected: &'s TypeExpr,
     actual: &'s TypeExpr,
+    catalog: &crate::parser::ProviderCustomTypes,
 ) -> crate::schema::TypeAssignability<'s> {
     match (
         super::lift_type_expr(actual),
@@ -952,7 +954,7 @@ fn inferred_type_assignment<'s>(
     ) {
         (Some(actual), Some(expected)) => {
             match crate::schema::TypeInSchema::schemaless(&actual)
-                .assignment_to(crate::schema::TypeInSchema::schemaless(&expected))
+                .assignment_to(expected.assignment_sink(catalog))
             {
                 crate::schema::TypeAssignability::Assignable => {
                     crate::schema::TypeAssignability::Assignable
@@ -979,9 +981,13 @@ fn inferred_type_assignment<'s>(
 
 #[cfg(test)]
 fn inferred_type_fits(expected: &TypeExpr, actual: &TypeExpr) -> bool {
-    inferred_type_assignment(expected, actual)
-        .require_loaded()
-        .unwrap_or(false)
+    inferred_type_assignment(
+        expected,
+        actual,
+        crate::schema::assignment_catalog_without_edges_for_test(),
+    )
+    .require_loaded()
+    .unwrap_or(false)
 }
 
 /// Directional compatibility for a declared source flowing into a declared sink.

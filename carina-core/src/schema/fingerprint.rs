@@ -10,7 +10,7 @@
 use sha2::{Digest, Sha256};
 
 use super::{
-    AttrTypeKind, CompiledAttributeSchema as AttributeSchema,
+    AssignabilityEdge, AttrTypeKind, CompiledAttributeSchema as AttributeSchema,
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
     CompiledStructField as StructField, DslTransform, FieldGroup, FieldGroupKind, IdentityMode,
     InputMode, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms, ResourceValidation,
@@ -18,7 +18,7 @@ use super::{
 };
 use crate::resource::Value;
 
-const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v8";
+const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v9";
 
 #[derive(Default)]
 struct CanonicalEncoder {
@@ -93,26 +93,44 @@ impl ResourceSchema {
         hex::encode(Sha256::digest(semantic_encoding(
             self,
             &ReferenceForms::new(),
+            &[],
         )))
     }
 }
 
 impl OwnerBoundResourceSchema<'_> {
-    /// SHA-256 of the resource semantics and its owner's complete forms table.
+    /// SHA-256 of resource semantics, owner reference forms, and declared edges.
     pub fn semantic_fingerprint(self) -> String {
         hex::encode(Sha256::digest(semantic_encoding(
             self.schema().as_schema(),
             self.reference_forms(),
+            self.assignability_edges(),
         )))
     }
 }
 
-fn semantic_encoding(schema: &ResourceSchema, reference_forms: &ReferenceForms) -> Vec<u8> {
+fn semantic_encoding(
+    schema: &ResourceSchema,
+    reference_forms: &ReferenceForms,
+    assignability_edges: &[AssignabilityEdge],
+) -> Vec<u8> {
     let mut encoder = CanonicalEncoder::default();
     encoder.string(ENCODING_VERSION);
     encode_resource_schema(&mut encoder, schema);
     encode_reference_forms(&mut encoder, reference_forms);
+    encode_assignability_edges(&mut encoder, assignability_edges);
     encoder.finish()
+}
+
+fn encode_assignability_edges(encoder: &mut CanonicalEncoder, edges: &[AssignabilityEdge]) {
+    let mut edges = edges.iter().collect::<Vec<_>>();
+    edges.sort_unstable();
+    encoder.usize(edges.len());
+    for edge in edges {
+        let (source, sink) = edge.parts();
+        encode_type_identity(encoder, source);
+        encode_type_identity(encoder, sink);
+    }
 }
 
 fn encode_reference_forms(encoder: &mut CanonicalEncoder, forms: &ReferenceForms) {
@@ -708,10 +726,13 @@ mod tests {
             },
         )]);
 
-        let without = OwnerBoundResourceSchema::new("aws", &schema, &empty).semantic_fingerprint();
-        let with = OwnerBoundResourceSchema::new("aws", &schema, &first).semantic_fingerprint();
+        let owner = crate::parser::SchemaTypeOwner::Provider("aws".into());
+        let without =
+            OwnerBoundResourceSchema::new(&owner, &schema, &empty, &[]).semantic_fingerprint();
+        let with =
+            OwnerBoundResourceSchema::new(&owner, &schema, &first, &[]).semantic_fingerprint();
         let changed =
-            OwnerBoundResourceSchema::new("aws", &schema, &changed).semantic_fingerprint();
+            OwnerBoundResourceSchema::new(&owner, &schema, &changed, &[]).semantic_fingerprint();
 
         assert_ne!(without, with, "adding a form must change the fingerprint");
         assert_ne!(with, changed, "changing a form must change the fingerprint");

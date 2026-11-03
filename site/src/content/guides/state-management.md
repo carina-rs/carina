@@ -11,7 +11,7 @@ When you run `carina apply`, Carina records each managed resource and its attrib
 
 By default, state is stored locally as `carina.state.json`. Use `backend local { path = '...' }` to store it at another local path, and configure the S3 backend for team usage.
 
-`apply` and `destroy` save state while effects run, not only at the end, so an interrupted run (Ctrl+C, a killed CI job) keeps the results of the operations that already finished. A create that the cloud accepted but that did not finish is recorded as in flight, and the next plan resumes it instead of creating the resource a second time.
+`apply` and `destroy` checkpoint cumulative state while effects run. After interruption, the last durable checkpoint retains completed work; later work may require recovery. A create with a persisted continuation can be resumed.
 
 ### State format upgrades
 
@@ -145,7 +145,7 @@ When the bucket is auto-created, Carina:
 
 `carina plan` shows the upcoming bucket creation as a bootstrap plan before the main resource plan.
 
-To disable auto-creation and require the bucket to exist beforehand, set `auto_create = false`. If the bucket is missing, `carina plan` and `carina apply` will fail with an error.
+Set `auto_create = false` to disable implicit bucket creation. A missing bucket is an error unless a matching `aws.s3.Bucket` is explicitly declared for bootstrap.
 
 To delete an auto-created state bucket, use:
 

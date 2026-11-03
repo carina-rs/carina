@@ -188,7 +188,7 @@ pub fn visit_normalized_resource<T>(
     visitor(&resource.resource)
 }
 
-/// Render one error chain for protocol-v20 metadata's string-only failure
+/// Render one error chain for protocol-v21 metadata's string-only failure
 /// channel. Each source is appended at most once even when a legacy outer
 /// display already includes its immediate source text.
 #[doc(hidden)]
@@ -216,9 +216,9 @@ pub fn wit_to_proto_applied_identifier(
     proto::AppliedIdentifier::new(identifier)
 }
 
-/// Return the honest directive default for protocol-20 WIT resource records.
+/// Return the honest directive default for current WIT resource records.
 ///
-/// Protocol 20 does not transport directives on create, poll-create,
+/// The current protocol does not transport directives on create, poll-create,
 /// resume-create, or read-data-source requests. Providers
 /// therefore receive all-false directives on those paths (see carina#4151).
 /// Desired normalization uses a separate record without directive fields.
@@ -803,7 +803,7 @@ macro_rules! export_provider {
                 operation: &str,
                 error: &(dyn ::std::error::Error + 'static),
             ) -> String {
-                // Protocol v20 metadata exports return a bare string rather
+                // Protocol v21 metadata exports return a bare string rather
                 // than `result`. A JSON string is deliberately the wrong
                 // top-level shape for both schema records and config maps, so
                 // the host reports its normal typed schema-decode failure

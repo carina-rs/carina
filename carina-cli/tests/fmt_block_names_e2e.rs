@@ -69,6 +69,7 @@ impl ProviderFactory for FormattingFactory {
             self.schemas(),
             self.provider_config_attribute_types(),
             Default::default(),
+            Vec::new(),
         )
         .unwrap()
     }

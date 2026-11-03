@@ -56,7 +56,7 @@ pub trait Api {
 // The SDK's trait returns `ProviderError` by value; match its allowance.
 #![allow(clippy::result_large_err)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use carina_plugin_sdk::core::schema::ReferenceForms;
 use carina_plugin_sdk::types::*;
@@ -83,6 +83,10 @@ impl<A: Api> CarinaProvider for WidgetProvider<A> {
 
     fn reference_forms(&self) -> ReferenceForms {
         ReferenceForms::new()
+    }
+
+    fn assignability_edges(&self) -> Vec<carina_plugin_sdk::core::schema::AssignabilityEdge> {
+        Vec::new()
     }
 
     fn initialize(
@@ -141,8 +145,8 @@ fn api_error(operation: &str, err: ApiError) -> ProviderError {
 
 // --- attributes -----------------------------------------------------------
 
-fn attributes(widget: &Widget) -> HashMap<String, Value> {
-    HashMap::from([
+fn attributes(widget: &Widget) -> BTreeMap<String, Value> {
+    BTreeMap::from([
         ("name".to_string(), Value::String(widget.name.clone())),
         ("size".to_string(), Value::Int(widget.size)),
     ])
@@ -577,7 +581,7 @@ A schema with `kind: SchemaKind::DataSource` declares a data source. The host ca
 
 ## Other trait methods
 
-`reference_forms` is required; return `ReferenceForms::new()` when the provider declares no short-to-long reference forms. `required_permissions` feeds the IAM preflight check that `carina plan --check-iam` runs, which warns about missing AWS IAM actions before an apply. Return an empty list unless your provider manages AWS resources. `normalize_desired`, `normalize_state` and `hydrate_read_state` are optional hooks for providers whose API changes values on the way in or out. Their default implementations return the values unchanged, so implement them only when you need them.
+`reference_forms` is required; return `ReferenceForms::new()` when the provider declares no short-to-long reference forms. `assignability_edges` is also required; return `Vec::new()` when the provider declares no directional identity relations. `required_permissions` feeds the IAM preflight check that `carina plan --check-iam` runs, which warns about missing AWS IAM actions before an apply. Return an empty list unless your provider manages AWS resources. `normalize_desired`, `normalize_state` and `hydrate_read_state` are optional hooks for providers whose API changes values on the way in or out. Their default implementations return the values unchanged, so implement them only when you need them.
 
 Desired normalization uses the same `DesiredView` on both routes. Each route stages its edits in an owner and applies them only after a successful `finish()`. A failed finish leaves the original resource unchanged.
 

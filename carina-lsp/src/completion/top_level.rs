@@ -468,10 +468,11 @@ impl CompletionProvider {
                 .unwrap_or_else(|_| arg_type.clone());
         if let parser::TypeExpr::SchemaType { owned } = &resolved_type
             && let Ok(Some(declaration)) = provider_ctx.catalog().enum_declaration(owned)
+            && let Some(lifted) = carina_core::validation::lift_type_expr(&resolved_type)
         {
-            return self.value_completions_for_attribute_type(
+            return self.value_completions_with_declaration(
+                lifted.assignment_sink(&provider_ctx.catalog().custom_types),
                 &declaration,
-                &std::collections::BTreeMap::new(),
                 text,
                 base_path,
                 provider_ctx,
@@ -487,8 +488,7 @@ impl CompletionProvider {
             // which never lowers to `AttributeType::Ref`; an empty map is
             // sufficient for compatibility checks that still accept defs.
             return self.value_completions_for_attribute_type(
-                &attr_type,
-                &std::collections::BTreeMap::new(),
+                attr_type.assignment_sink(&provider_ctx.catalog().custom_types),
                 text,
                 base_path,
                 provider_ctx,

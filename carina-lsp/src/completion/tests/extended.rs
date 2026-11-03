@@ -980,14 +980,13 @@ fn type_based_completion_resolves_ref_typed_source_attribute() {
     );
     let provider =
         CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
-    let target = PatternAttributeType::string();
-    let target_defs = std::collections::BTreeMap::new();
+    let target =
+        carina_core::validation::lift_type_expr(&carina_core::parser::TypeExpr::String).unwrap();
     let completions = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             provider.value_completions_for_attribute_type(
-                &target,
-                &target_defs,
+                target.assignment_sink(&session.catalog().custom_types),
                 "let source = test.source.Item {}\n",
                 None,
                 session,
@@ -3195,7 +3194,63 @@ for _, account_id in orgs.accounts {
 "#,
     );
     let main_src = std::fs::read_to_string(base.join("main.crn")).unwrap();
-    let doc = create_document(&main_src);
+    // A definitive incompatibility needs the provider's complete, empty edge
+    // declaration. With an unloaded catalog this comparison is provisional.
+    struct SemanticFactory(Vec<carina_core::schema::ValidatedResourceSchema>);
+    impl ProviderFactory for SemanticFactory {
+        fn name(&self) -> &str {
+            "awscc"
+        }
+        fn display_name(&self) -> &str {
+            "semantic completion fixture"
+        }
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+            self.0.clone()
+        }
+        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+            Default::default()
+        }
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                Default::default(),
+                Default::default(),
+                Vec::new(),
+            )
+            .unwrap()
+        }
+        fn validate_config(
+            &self,
+            _: &carina_core::provider::CanonicalProviderConfigAttributes,
+        ) -> carina_core::provider::ProviderResult<()> {
+            Ok(())
+        }
+        fn create_provider(
+            &self,
+            _: Option<&str>,
+            _: &carina_core::provider::ProviderReadyConfig,
+            _: carina_core::provider::InitializeOutcomeMint,
+        ) -> carina_core::provider::BoxFuture<
+            '_,
+            carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
+        > {
+            Box::pin(async { unreachable!("completion does not initialize providers") })
+        }
+    }
+    let schemas = provider
+        .schemas
+        .iter()
+        .map(|(_owner, _resource, _kind, schema)| schema.clone())
+        .collect();
+    let loaded = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(vec![Box::new(SemanticFactory(schemas))]),
+        SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
+    );
+    let doc = Document::new(
+        main_src.clone(),
+        Arc::new(loaded.provider_context().as_provider_context().clone()),
+    );
     let position = Position {
         line: 3,
         character: "    principal_type = ".chars().count() as u32,
@@ -3676,6 +3731,7 @@ fn completion_uses_the_directory_partial_catalog_instead_of_the_document_catalog
                 self.schemas(),
                 Default::default(),
                 Default::default(),
+                Vec::new(),
             )
             .unwrap()
         }

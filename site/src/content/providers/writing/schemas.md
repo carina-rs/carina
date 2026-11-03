@@ -5,7 +5,7 @@ description: "How a Carina provider declares its resource types: the schema buil
 
 A provider describes every resource type it manages with a schema: the attributes, their types, which ones the configuration sets and which ones the provider fills in, and the rules a value must follow. The host uses the schema to check a configuration before anything reaches the provider, to compute plans, to drive the editor's completion and diagnostics, and to store state.
 
-This page shows how to write schemas with the builder API in `carina-plugin-sdk`. Every Rust example on it is compiled and run as a doctest of `carina-plugin-sdk`, so the examples always match the SDK on the carina `main` branch. [Your First Provider](/providers/writing/getting-started/) uses the same builders for its complete example.
+This page shows how to write schemas with the builder API in `carina-plugin-sdk`. The runnable Rust examples and compile-fail checks are covered by SDK doctests. Ignored signature fragments are illustrative. [Your First Provider](/providers/writing/getting-started/) uses the same builders for its complete example.
 
 The schema types live in `carina_core::schema`. The SDK re-exports `carina_core` as `carina_plugin_sdk::core`, so a provider depends only on `carina-plugin-sdk`.
 
@@ -109,9 +109,9 @@ reference forms are inert: the host does not expand short names through them.
 
 `{name}` describes the unqualified form: one bare segment containing no `:` or
 `/`. During semantic comparison the host expands only that bare form through
-the `long` template. Strings containing `:` or `/` are qualified or path forms
-and compare exactly as written; a qualified value therefore never compares
-equal to a bare name.
+the `long` template. A bare name compares equal to its matching long reference
+in the available scope; other qualified or path forms compare exactly as
+written.
 
 What the attributes declare:
 
@@ -374,7 +374,7 @@ assert!(schema.effective_attribute("api_key").unwrap().is_write_only());
 assert!(schema.as_schema().write_only_bearing("webhook"));
 ```
 
-Write-only describes what the read API returns, not whether a value is secret. The host compares a write-only value against the value it recorded in state when the provider accepted it, because the read result never contains it. An unchanged write-only value therefore never causes an update on its own, and a changed one does. When an update happens for any reason, the host also re-sends every write-only value of the resource as a `Reassert` patch operation, because many APIs drop values a request leaves out. See [Implementing Operations](/providers/writing/implementing-operations/) for how a provider handles `Reassert`.
+Write-only describes what the read API returns, not whether a value is secret. The host compares a write-only value against the value it recorded in state when the provider accepted it, because the read result never contains it. An unchanged write-only value therefore never causes an update on its own, and a changed one does. When another change causes an update, the host also re-sends unchanged desired, updatable write-only or write-only-bearing attributes as `Reassert` patch operations, unless already patched or wholly ignored, because many APIs drop values a request leaves out. See [Implementing Operations](/providers/writing/implementing-operations/) for how a provider handles `Reassert`.
 
 `validate()` rejects write-only on any path below a provider-populated value and inside a union, where the host could not track which member the value belongs to. For the same projection reason, it rejects create-only fields below union members.
 
@@ -428,6 +428,41 @@ assert!(color.validate(&red).is_ok());
 `validator` takes a closure that returns a `TypeError`. `legacy_validator` takes one that returns `Result<(), String>` and wraps the message for you.
 
 The closure runs inside the provider's WebAssembly component. When the host validates a value, it sends the type identity and the value to the provider, which runs every validator it registered for that identity. The identity is therefore the type's name across the whole provider, not just one attribute: if two schemas declare the same identity with different validators, a value of that type must pass both. Give each distinct type its own identity, reuse one only for types that mean the same thing, and use the same scalar kind for every declaration of it (`validate()` rejects an identity used as both a string and an int). Even without a validator, an identity names the type in diagnostics and in the editor.
+
+## Assignability edges
+
+Implement the required `CarinaProvider::assignability_edges` method to declare
+directional assignments between named types. Return `Vec::new()` when the
+provider declares no edges. For example, a provider that declares both of these
+String identities can admit a legacy name where a current name is expected:
+
+```rust
+use carina_plugin_sdk::core::schema::{AssignabilityEdge, TypeIdentity};
+
+let edges = vec![AssignabilityEdge::new(
+    TypeIdentity::new(Some("widget"), ["widget"], "LegacyName"),
+    TypeIdentity::new(Some("widget"), ["widget"], "Name"),
+)
+.expect("distinct identities")];
+```
+
+Both endpoints must be String, Int, or Float identities declared by the same
+provider's resource or config schemas, with the same scalar kind. Built-in,
+enum, and reference identities cannot be endpoints. Self edges, duplicate
+edges, and cycles are rejected. Transitive assignments use only that provider's
+edges; edges from different providers never combine into a path.
+
+The provider that owns the sink attribute decides which edges it accepts,
+regardless of the identity's namespace. A type annotation shared by several
+owners requires every owner to admit the assignment. Passing through an
+annotation or module argument does not make one owner's edge proof for a later
+sink. Identified sinks still require length or numeric range containment, and
+the sink's value constraints and validators still run on the resolved value.
+
+A native `ProviderFactory::schema_witness` must pass the same edges to
+`ValidatedProviderSchemaWitness::new` as `CarinaProvider::assignability_edges`
+returns. Have one implementation call the other so native and WebAssembly
+providers cannot disagree.
 
 ## Declared validation
 
@@ -488,11 +523,12 @@ let schema = ResourceSchema::new("organizations.Account")
     .expect("the schema is valid");
 ```
 
-Carina then rejects deletion and replacement unless the user sets
-`prevent_destroy` to a value that resolves to `false`, for example
-`directives { prevent_destroy = false }`. Resource schemas are
+Ordinary deletion and replacement require the user to set `prevent_destroy`
+explicitly to a value that resolves to `false`, for example
+`directives { prevent_destroy = false }`. `carina destroy --force` can override
+destruction protection. Resource schemas are
 unprotected by default, so use this builder only where deletion has unusually
-severe consequences. The required boolean is transported in protocol-v20
+severe consequences. The required boolean is transported in protocol-v21
 schema JSON; an older provider that omits it fails during schema loading.
 
 A module argument default that resolves to `false` cannot disable this schema
