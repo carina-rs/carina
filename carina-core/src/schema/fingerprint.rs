@@ -715,27 +715,22 @@ mod tests {
     #[test]
     fn map_length_changes_the_fingerprint() {
         let schema = |length| {
-            let wire = serde_json::from_value(serde_json::json!({
-                "type": "map", "inner": {"type": "String"},
-                "key": {"type": "String"}, "length": length,
-            }))
-            .unwrap();
-            let map = crate::protocol_convert::protocol_to_attribute_type(&wire).unwrap();
-            PatternResourceSchema::new("test.Subject")
-                .attribute(PatternAttributeSchema::optional("params", map).build())
-                .validate()
-                .unwrap()
+            ResourceSchema::new("test.Subject").attribute(
+                AttributeSchema::optional(
+                    "params",
+                    AttributeType::refined_map(
+                        AttributeType::string(),
+                        AttributeType::string(),
+                        length,
+                    ),
+                )
+                .build(),
+            )
         };
-        let unbounded = schema(None).as_schema().semantic_fingerprint();
-        let bounded = schema(Some((Some(0), Some(10))))
-            .as_schema()
-            .semantic_fingerprint();
-        let different_max = schema(Some((Some(0), Some(11))))
-            .as_schema()
-            .semantic_fingerprint();
-        let different_min = schema(Some((Some(1), Some(10))))
-            .as_schema()
-            .semantic_fingerprint();
+        let unbounded = schema(None).semantic_fingerprint();
+        let bounded = schema(Some((Some(0), Some(10)))).semantic_fingerprint();
+        let different_max = schema(Some((Some(0), Some(11)))).semantic_fingerprint();
+        let different_min = schema(Some((Some(1), Some(10)))).semantic_fingerprint();
         assert_ne!(unbounded, bounded);
         assert_ne!(bounded, different_max);
         assert_ne!(bounded, different_min);

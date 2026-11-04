@@ -17,9 +17,9 @@ The current protocol and minimum supported provider protocol are both **22**.
 ## Version 22
 
 Protocol v22 adds an optional `length` field to the `map` attribute type, with
-the same `[min, max]` shape and serde rules as the `list` type's `length`. Each
-endpoint may be omitted. A missing `length` means the map has no entry-count
-bound.
+the same `[min, max]` shape and serde rules as the `list` type's `length`. An
+unbounded endpoint is written as `null`, for example `[null, 10]` or `[2, null]`.
+A missing `length` means the map has no entry-count bound.
 
 Hosts enforce the bound during validation, planning, and LSP diagnostics, the
 same way they enforce a list's item-count bound. The bound counts entries. Type

@@ -32,20 +32,6 @@ use crate::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
 
-fn map_with_protocol_length(length: Option<(Option<u64>, Option<u64>)>) -> AttributeType {
-    let wire = serde_json::from_value(serde_json::json!({
-        "type": "map",
-        "inner": { "type": "String" },
-        "key": { "type": "String" },
-        "length": length,
-    }))
-    .unwrap();
-    crate::protocol_convert::protocol_to_config_schema(BTreeMap::from([("params".into(), wire)]))
-        .unwrap()
-        .parts()["params"]
-        .clone()
-}
-
 fn map_entries(count: usize) -> Value {
     Value::Concrete(ConcreteValue::Map(
         (0..count)
@@ -56,7 +42,11 @@ fn map_entries(count: usize) -> Value {
 
 #[test]
 fn map_length_max_accepts_ten_entries() {
-    let map = map_with_protocol_length(Some((None, Some(10))));
+    let map = AttributeType::refined_map(
+        AttributeType::string(),
+        AttributeType::string(),
+        Some((None, Some(10))),
+    );
     let value = map_entries(10);
     assert!(map.validate(&value).is_ok());
     assert!(Schema::flat(map).validate_collect(&value).is_empty());
@@ -64,7 +54,11 @@ fn map_length_max_accepts_ten_entries() {
 
 #[test]
 fn map_length_max_rejects_eleven_entries() {
-    let map = map_with_protocol_length(Some((None, Some(10))));
+    let map = AttributeType::refined_map(
+        AttributeType::string(),
+        AttributeType::string(),
+        Some((None, Some(10))),
+    );
     let value = map_entries(11);
     let error = map
         .validate(&value)
@@ -94,7 +88,11 @@ fn map_length_max_rejects_eleven_entries() {
 
 #[test]
 fn map_length_min_rejects_too_few_entries() {
-    let map = map_with_protocol_length(Some((Some(2), None)));
+    let map = AttributeType::refined_map(
+        AttributeType::string(),
+        AttributeType::string(),
+        Some((Some(2), None)),
+    );
     assert!(map.validate(&map_entries(2)).is_ok());
     let value = map_entries(1);
     assert!(matches!(
@@ -114,7 +112,7 @@ fn map_length_min_rejects_too_few_entries() {
 fn map_length_unbounded_preserves_validation() {
     for map in [
         AttributeType::map(AttributeType::string()),
-        map_with_protocol_length(None),
+        AttributeType::refined_map(AttributeType::string(), AttributeType::string(), None),
     ] {
         for count in [0, 11, 100] {
             let value = map_entries(count);
@@ -130,7 +128,11 @@ fn map_length_unbounded_preserves_validation() {
 
 #[test]
 fn map_length_is_checked_for_every_validation_purpose() {
-    let map = map_with_protocol_length(Some((Some(1), Some(10))));
+    let map = AttributeType::refined_map(
+        AttributeType::string(),
+        AttributeType::string(),
+        Some((Some(1), Some(10))),
+    );
     for purpose in [
         CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
         CanonicalizationPurpose::ProviderConfig {
@@ -159,7 +161,11 @@ fn map_length_is_checked_for_every_validation_purpose() {
 
 #[test]
 fn map_length_collector_keeps_entry_errors() {
-    let map = map_with_protocol_length(Some((None, Some(0))));
+    let map = AttributeType::refined_map(
+        AttributeType::string(),
+        AttributeType::string(),
+        Some((None, Some(0))),
+    );
     let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
         "key".into(),
         Value::Concrete(ConcreteValue::Int(7)),
@@ -186,13 +192,13 @@ fn map_length_schema_admission_matches_list_for_inverted_bounds() {
             ListElements::AllowDuplicates,
         ),
     )]));
-    let wire = serde_json::from_value(serde_json::json!({
-        "type": "map", "inner": {"type": "String"}, "key": {"type": "String"}, "length": length,
-    }))
-    .unwrap();
-    let map = crate::protocol_convert::protocol_to_config_schema(BTreeMap::from([(
+    let map = ValidatedConfigSchema::validate(BTreeMap::from([(
         "value".into(),
-        wire,
+        PatternAttributeType::refined_map(
+            PatternAttributeType::string(),
+            PatternAttributeType::string(),
+            length,
+        ),
     )]));
     assert!(list.is_ok(), "List currently admits inverted length bounds");
     assert!(map.is_ok(), "Map must follow List schema admission");
