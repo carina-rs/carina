@@ -310,6 +310,24 @@ impl EnumValueResolver<'_, Compiled> {
         self.resolve_text(text, EnumInputPhase::StateText, None)
     }
 
+    /// Map keys can use API spellings or qualified DSL identifiers. Select
+    /// their interpretation before validation so a failing callback is never
+    /// retried as a different spelling of the same leaf.
+    pub(crate) fn resolve_map_key(&self, text: &str) -> Result<CanonicalEnumValue, TypeError> {
+        let (_, values, _, _, _) = self.parts()?;
+        let valid: Vec<_> = values.into_iter().flatten().map(String::as_str).collect();
+        let phase = if values.is_none()
+            || matches!(
+                state_text_valid_value_match(text, &valid),
+                StateTextValidValueMatch::Unique(_)
+            ) {
+            EnumInputPhase::StateText
+        } else {
+            EnumInputPhase::RawDsl
+        };
+        self.resolve_text(text, phase, None)
+    }
+
     fn resolve_text(
         &self,
         text: &str,

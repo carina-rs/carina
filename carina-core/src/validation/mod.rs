@@ -756,7 +756,7 @@ pub struct BindingUseReport {
 
 impl std::fmt::Display for BindingUseReport {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (index, finding) in self.findings.iter().enumerate() {
+        for (index, finding) in self.authored_findings().enumerate() {
             if index > 0 {
                 formatter.write_str("\n")?;
             }
@@ -840,17 +840,13 @@ impl BindingUseReport {
         use crate::schema::resource_value_validation::{
             ResourceBindingValidation, ResourceBindingValueOutcome,
         };
-        let owns = |use_site: &crate::parser::BareBindingUse| {
-            matches!(use_site.owner, BindingUseOwner::Resource(_))
-                && resource.location().file() == use_site.location().file()
-                && resource.location().span().contains(use_site.span)
-        };
+        let owns = |use_site: &crate::parser::BareBindingUse| matches!(&use_site.owner, BindingUseOwner::Resource(address) if address.resource_id() == resource.id());
         let mut inputs = crate::schema::ResourceValueInputs::new(attributes);
         for slot in uses.pending_slots().filter(|slot| matches!(&slot.owner, BindingUseOwner::Resource(address) if address.resource_id() == resource.id())) {
             inputs.pending.insert(slot.path.root_name().into());
         }
-        // Findings are already unique by authored use, even when expansion
-        // recorded several value checks for that token. Precheck failures
+        // Select this parser-assigned instance before authored deduplication.
+        // Expanded copies share tokens but can have different outcomes. Precheck failures
         // stay authoritative; only schema walks with reusable leaf outcomes
         // are attributed again by the resource collector.
         for finding in self
@@ -861,7 +857,7 @@ impl BindingUseReport {
                 BindingResolutionError::Type(error) => {
                     if !matches!(error, TypeError::BindingShadowsEnumMember(_))
                         && self.value_checks.iter().any(|(use_site, checked)| {
-                            same_authored_use(&finding.use_site, use_site) && !checked.is_empty()
+                            same_instance_use(&finding.use_site, use_site) && !checked.is_empty()
                         })
                     {
                         continue;
@@ -914,8 +910,32 @@ impl BindingUseReport {
     }
 
     pub fn resource_findings(&self) -> impl Iterator<Item = BindingUseDiagnostic> {
-        self.resource_raw_findings()
+        self.authored_resource_findings()
             .filter_map(BindingUseDiagnostic::from_finding)
+    }
+
+    fn authored_resource_findings(&self) -> impl Iterator<Item = &BindingUseFinding> {
+        self.authored_findings().filter(|finding| {
+            matches!(
+                finding.use_site.owner,
+                crate::parser::BindingUseOwner::Resource(_)
+            )
+        })
+    }
+
+    fn authored_findings(&self) -> impl Iterator<Item = &BindingUseFinding> {
+        let mut reported: Vec<&BindingUseFinding> = Vec::new();
+        self.findings.iter().filter(move |finding| {
+            if reported
+                .iter()
+                .any(|existing| same_authored_finding(existing, finding))
+            {
+                false
+            } else {
+                reported.push(finding);
+                true
+            }
+        })
     }
 
     /// Direct uses and failed nested uses supersede editor binding checks.
@@ -925,14 +945,14 @@ impl BindingUseReport {
             && (use_site.path.segments().len() == 1
                 || self
                     .resource_raw_findings()
-                    .any(|finding| same_authored_use(&finding.use_site, use_site)))
+                    .any(|finding| same_instance_use(&finding.use_site, use_site)))
     }
 
     /// Resource schema errors cross only the typed value-report boundary.
     pub fn resource_value_findings(
         &self,
     ) -> impl Iterator<Item = crate::schema::ResourceValueFinding> + '_ {
-        self.resource_raw_findings().filter_map(|finding| {
+        self.authored_resource_findings().filter_map(|finding| {
             let BindingResolutionError::Type(error) = &finding.error else {
                 return None;
             };
@@ -943,7 +963,10 @@ impl BindingUseReport {
                         &finding.use_site.path,
                     )),
                     anchor: crate::schema::ValueFindingAnchor::BindingToken(
-                        finding.use_site.location().clone(),
+                        crate::schema::BindingTokenAnchor::for_authority_error(
+                            finding.use_site.location().clone(),
+                            error,
+                        ),
                     ),
                 },
                 error: error.clone(),
@@ -956,8 +979,7 @@ impl BindingUseReport {
     }
 
     pub fn into_findings(self) -> Vec<BindingUseDiagnostic> {
-        self.findings
-            .iter()
+        self.authored_findings()
             .filter_map(BindingUseDiagnostic::from_finding)
             .collect()
     }
@@ -1488,13 +1510,7 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
         let existing = match prechecked {
             Some(error) => Err(error),
             None if declared_type.is_none() && resource_validation.is_some() => {
-                validate_bound_schema_value(
-                    use_site,
-                    value,
-                    sink,
-                    context,
-                    resource_validation.unwrap(),
-                )
+                validate_bound_schema_value(use_site, value, sink, resource_validation.unwrap())
             }
             None => binding_value_assignable_to_enum(
                 value,
@@ -1528,9 +1544,7 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
             ancestry,
             owner: _,
         } => match resource_validation {
-            Some(validation) => {
-                validate_bound_schema_value(use_site, value, sink, context, validation)
-            }
+            Some(validation) => validate_bound_schema_value(use_site, value, sink, validation),
             None => crate::schema::validate_attr_with_defs_and_ancestry(
                 attr_type, value, defs, ancestry,
             )
@@ -1575,31 +1589,16 @@ fn validate_bound_schema_value<B: BindingAddress>(
     use_site: &crate::parser::BareBindingUse,
     value: &GenericValue<ParserPlaceholder, B>,
     sink: RefSink<'_>,
-    context: &ValidationTypeContext<'_, B>,
     validation: &mut crate::schema::resource_value_validation::BindingValueValidation,
 ) -> Result<(), BindingResolutionError> {
     let RefSink::EffectiveType {
         attr_type,
         defs,
         ancestry,
-        owner,
+        owner: _,
     } = sink
     else {
         unreachable!("resource sink")
-    };
-    let crate::parser::SchemaTypeOwner::Provider(owner) = owner;
-    let lookup = |attr: &AttributeType, value: &crate::resource::Value| {
-        let Some(declaration) = crate::parser::IdentifiedCustomTypeDeclaration::new(attr) else {
-            return Ok(());
-        };
-        context
-            .raw_provider_context()
-            .custom_type_resolver()
-            .validate(
-                crate::parser::CustomTypeValidationTarget::Declaration { owner, declaration },
-                value,
-            )
-            .map_err(TypeError::from)
     };
     crate::schema::resource_value_validation::check_binding_value(
         attr_type,
@@ -1607,7 +1606,6 @@ fn validate_bound_schema_value<B: BindingAddress>(
         defs,
         ancestry,
         &binding_field_path(&use_site.path),
-        &lookup,
         validation,
     )
     .map_err(BindingResolutionError::Type)
@@ -1852,6 +1850,13 @@ fn same_authored_use(
     left.source_file == right.source_file && left.span == right.span && left.name == right.name
 }
 
+fn same_instance_use(
+    left: &crate::parser::BareBindingUse,
+    right: &crate::parser::BareBindingUse,
+) -> bool {
+    left.owner == right.owner && left.path == right.path && same_authored_use(left, right)
+}
+
 /// Whether the typed binding-use authority owns validation of an authored
 /// module argument. A direct bare binding is the complete argument. For a
 /// nested use, ordinary container validation remains active unless the typed
@@ -2007,11 +2012,10 @@ where
         }
         if let Err(error) = result {
             let finding = BindingUseFinding::error(record.authored.clone(), error);
-            if !report
-                .findings
-                .iter()
-                .any(|existing| same_authored_finding(existing, &finding))
-            {
+            if !report.findings.iter().any(|existing| {
+                existing.use_site.owner == finding.use_site.owner
+                    && same_authored_finding(existing, &finding)
+            }) {
                 report.findings.push(finding);
             }
         }
@@ -2400,16 +2404,52 @@ impl std::fmt::Display for AccessTypeFinding {
     }
 }
 
+/// An expression whose type still needs editor inference. Sensitivity wrappers
+/// do not make concrete leaves eligible for this boundary.
+///
+/// ```compile_fail
+/// use carina_core::validation::{check_editor_access_type, inference};
+/// use carina_core::{binding_index::BindingIndex, resource::{Value, ParserPlaceholder, RelativeBindingName}};
+/// use carina_core::schema::{AssignmentSink, Compiled, SchemaRegistry};
+/// fn concrete(value: &Value<ParserPlaceholder, RelativeBindingName>, sink: AssignmentSink<'_, Compiled>, bindings: &inference::InferenceBindings<ParserPlaceholder, RelativeBindingName>, schemas: &SchemaRegistry, index: &BindingIndex<'_>) {
+///     let _ = check_editor_access_type(value, sink, bindings, schemas, index);
+/// }
+/// ```
+pub struct UnresolvedExpression<'a, B: BindingAddress> {
+    value: &'a GenericValue<ParserPlaceholder, B>,
+}
+
+impl<'a, B: BindingAddress> UnresolvedExpression<'a, B> {
+    pub fn new(value: &'a GenericValue<ParserPlaceholder, B>) -> Option<Self> {
+        use crate::resource::DeferredValue;
+        match value {
+            GenericValue::Deferred(DeferredValue::Secret(inner)) => Self::new(inner),
+            GenericValue::Deferred(DeferredValue::Coalesce {
+                value: left,
+                default,
+            }) => (Self::new(left).is_some() || Self::new(default).is_some())
+                .then_some(Self { value }),
+            GenericValue::Deferred(_) => Some(Self { value }),
+            _ => None,
+        }
+    }
+
+    pub fn value(&self) -> &'a GenericValue<ParserPlaceholder, B> {
+        self.value
+    }
+}
+
 /// Infer editor expressions through an opaque, authority-produced finding.
 /// Coalesce compatibility is checked only after each operand satisfies the
 /// sink; concrete sink failures stay with resource-value validation.
 pub fn check_editor_access_type<B: BindingAddress>(
-    value: &GenericValue<ParserPlaceholder, B>,
+    expression: UnresolvedExpression<'_, B>,
     expected: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
     bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
     schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
 ) -> Result<(), AccessTypeFinding> {
+    let value = expression.value();
     if let GenericValue::Deferred(crate::resource::DeferredValue::Coalesce { value, default }) =
         value
     {

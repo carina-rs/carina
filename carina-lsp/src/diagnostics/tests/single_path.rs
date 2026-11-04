@@ -1,6 +1,106 @@
 use super::*;
 use carina_core::schema::{AttributeSchema, AttributeType, ListElements, ResourceSchema};
 
+fn round2_source_diagnostics(field_type: AttributeType, source: &str) -> Vec<Diagnostic> {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Collection")
+            .attribute(AttributeSchema::optional("params", field_type).build())
+            .validate()
+            .unwrap(),
+    );
+    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    let path = directory.path().join("main.crn");
+    std::fs::write(&path, source).unwrap();
+    engine.analyze(&create_document_at(source, path.clone()), Some(&path))
+}
+
+#[test]
+fn round2_for_binding_outcomes_follow_parser_instance() {
+    for expression in ["x", "[x]"] {
+        let leaf = AttributeType::refined_string(None, None, Some((None, Some(1))), None);
+        let field_type = if expression == "x" {
+            leaf
+        } else {
+            AttributeType::list(leaf)
+        };
+        for items in [r#"["a", "abcd"]"#, r#"["abcd", "a"]"#] {
+            let source = format!(
+                "let copies = for x in {items} {{\n  mock.test.Collection {{ params = {expression} }}\n}}\n"
+            );
+            let diagnostics = round2_source_diagnostics(field_type.clone(), &source);
+            assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:#?}");
+            assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+            assert!(
+                diagnostics[0].message.contains("length 4"),
+                "{diagnostics:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn round2_secret_concrete_leaf_has_only_core_error() {
+    for expression in ["secret(42)", "secret(secret(42))"] {
+        let diagnostics = collection_diagnostics(AttributeType::string(), expression);
+        assert_eq!(diagnostics.len(), 1, "{expression}: {diagnostics:#?}");
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert!(diagnostics[0].message.contains("expected String, got Int"));
+    }
+}
+
+#[test]
+fn round2_container_binding_enum_has_no_scalar_quick_fix() {
+    use carina_core::schema::TypeIdentity;
+    let enum_type = AttributeType::enum_(
+        TypeIdentity::new(Some("mock"), ["test"], "Mode"),
+        Some(vec!["ok".into()]),
+        vec![],
+        None,
+        None,
+    );
+    let diagnostics = round2_source_diagnostics(
+        AttributeType::list(enum_type.clone()),
+        "let xs = [\"bad\"]\nmock.test.Collection { params = xs }\n",
+    );
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert!(diagnostics[0].data.is_none(), "{diagnostics:#?}");
+    let scalar = round2_source_diagnostics(
+        enum_type,
+        "let x = \"bad\"\nmock.test.Collection { params = x }\n",
+    );
+    assert_eq!(scalar.len(), 1, "{scalar:#?}");
+    assert!(scalar[0].data.is_some(), "{scalar:#?}");
+}
+
+#[test]
+fn round2_expansion_deduplicates_rule_with_substituted_values() {
+    let diagnostics = round2_source_diagnostics(
+        AttributeType::refined_string(None, None, Some((None, Some(1))), None),
+        "let copies = for x in [\"ab\", \"cd\"] {\n  mock.test.Collection { params = \"${x}\" }\n}\n",
+    );
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert!(diagnostics[0].message.contains("length 2"));
+}
+
+#[test]
+fn round2_expansion_retains_each_authored_coalesce_operand() {
+    let diagnostics = round2_source_diagnostics(
+        AttributeType::refined_string(None, None, Some((None, Some(1))), None),
+        "let producer = mock.test.Collection {}\nlet copies = for x in [\"ab\", \"cdef\"] {\n  mock.test.Collection { params = (producer.params ?? \"${x}\") ?? \"${x}\" }\n}\n",
+    );
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+    );
+}
+
 #[test]
 fn for_expansion_reports_one_list_count_error_per_authored_token() {
     let mut schemas = SchemaRegistry::new();

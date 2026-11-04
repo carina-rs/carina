@@ -6,6 +6,157 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
+fn round2_union_reuses_rejecting_leaf_across_arms_and_keeps_operands() {
+    for native in [true, false] {
+        for coalesce in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&calls);
+            let identity = TypeIdentity::new(Some("mock"), ["test"], "Counted");
+            let leaf = if native {
+                AttributeType::refined_string_with_validator(
+                    identity.clone(),
+                    None,
+                    None,
+                    validator(move |_| {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Err(TypeError::ValidationFailed {
+                            message: "rejected".into(),
+                        })
+                    }),
+                    None,
+                )
+            } else {
+                AttributeType::refined_string(Some(identity.clone()), None, None, None)
+            };
+            let mut registry = SchemaRegistry::new();
+            registry.insert(
+                "mock",
+                ResourceSchema::new("test.Sink")
+                    .attribute(
+                        AttributeSchema::optional(
+                            "params",
+                            AttributeType::union(vec![
+                                AttributeType::list(leaf.clone()),
+                                AttributeType::refined_list(
+                                    leaf,
+                                    true,
+                                    Some((Some(2), None)),
+                                    ListElements::AllowDuplicates,
+                                ),
+                            ]),
+                        )
+                        .build(),
+                    )
+                    .validate()
+                    .unwrap(),
+            );
+            let operand: Value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("bad".into()),
+            )]));
+            let value = if coalesce {
+                Value::Deferred(crate::resource::DeferredValue::Coalesce {
+                    value: Box::new(operand.clone()),
+                    default: Box::new(operand),
+                })
+            } else {
+                operand
+            };
+            let values = HashMap::from([("params".into(), value)]);
+            let resolver = |_: CustomTypeValidationTarget<'_>, _: &Value| {
+                assert!(!native);
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(CustomTypeValidationError::Rejected {
+                    owner: "mock".into(),
+                    identity: identity.clone(),
+                    message: "rejected".into(),
+                })
+            };
+            let schema = registry
+                .get("mock", "test.Sink", SchemaKind::Resource)
+                .unwrap();
+            assert!(
+                !schema
+                    .collect_validation_with_resolver(&values, &|_| false, &resolver)
+                    .is_empty()
+            );
+            assert_eq!(
+                calls.swap(0, Ordering::SeqCst),
+                if coalesce { 2 } else { 1 },
+                "native={native}, coalesce={coalesce}"
+            );
+            assert!(
+                schema
+                    .validate_with_resolver(&values, &|_| false, &resolver)
+                    .is_err()
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                if coalesce { 2 } else { 1 },
+                "aggregate: native={native}, coalesce={coalesce}"
+            );
+        }
+    }
+}
+
+#[test]
+fn round2_qualified_enum_map_keys_preserve_dsl_resolution_once() {
+    for rejecting in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let key = AttributeType::enum_(
+            TypeIdentity::new(Some("mock"), ["test"], "Key"),
+            Some(vec!["ok".into()]),
+            vec![],
+            Some(validator(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                if rejecting {
+                    Err(TypeError::ValidationFailed {
+                        message: "rejected key".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            })),
+            None,
+        );
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "mock",
+            ResourceSchema::new("test.Sink")
+                .attribute(
+                    AttributeSchema::optional(
+                        "params",
+                        AttributeType::map_with_key(key, AttributeType::string()),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let values: HashMap<String, Value> = HashMap::from([(
+            "params".into(),
+            Value::Concrete(ConcreteValue::Map(
+                indexmap::indexmap! { if rejecting { "mock.test.Key.bad" } else { "mock.test.Key.ok" }.into() => Value::Concrete(ConcreteValue::String("ok".into())) },
+            )),
+        )]);
+        let schema = registry
+            .get("mock", "test.Sink", SchemaKind::Resource)
+            .unwrap();
+        let resolver = |_: CustomTypeValidationTarget<'_>, _: &Value| Ok(());
+        let findings = schema.collect_validation_with_resolver(&values, &|_| false, &resolver);
+        assert_eq!(calls.swap(0, Ordering::SeqCst), 1, "{findings:#?}");
+        assert_eq!(findings.is_empty(), !rejecting, "{findings:#?}");
+        assert_eq!(
+            schema
+                .validate_with_resolver(&values, &|_| false, &resolver)
+                .is_err(),
+            rejecting
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
 fn resource_collection_calls_native_and_bridged_validators_once_per_leaf() {
     for native in [false, true] {
         for rejecting in [false, true] {

@@ -5,7 +5,9 @@ use super::super::Value;
 use carina_core::parser::{AnalysisResourceRef, Located};
 use carina_core::resource::DeferredValue;
 use carina_core::schema::ValidatedResourceSchema;
-use carina_core::validation::{AccessTypeFinding, IntegerArithmeticTypeFinding};
+use carina_core::validation::{
+    AccessTypeFinding, IntegerArithmeticTypeFinding, UnresolvedExpression,
+};
 use std::fmt;
 use tower_lsp::lsp_types::DiagnosticSeverity;
 
@@ -59,7 +61,10 @@ pub(in crate::diagnostics) fn attribute_findings(
     name: &str,
     value: &Value,
     arithmetic: Vec<Located<IntegerArithmeticTypeFinding>>,
-    mut access_check: impl FnMut(&Value, bool) -> Result<(), AccessTypeFinding>,
+    mut access_check: impl FnMut(
+        UnresolvedExpression<'_, carina_core::resource::RelativeBindingName>,
+        bool,
+    ) -> Result<(), AccessTypeFinding>,
 ) -> Vec<Located<EditorFinding>> {
     if !arithmetic.is_empty() {
         return arithmetic
@@ -89,32 +94,37 @@ fn deferred_findings(
     name: &str,
     value: &Value,
     top_level: bool,
-    check: &mut impl FnMut(&Value, bool) -> Result<(), AccessTypeFinding>,
+    check: &mut impl FnMut(
+        UnresolvedExpression<'_, carina_core::resource::RelativeBindingName>,
+        bool,
+    ) -> Result<(), AccessTypeFinding>,
     findings: &mut Vec<Located<EditorFinding>>,
 ) {
     match value {
         // Concrete operands belong to the core value walk. Only deferred
         // operands need editor inference, so a bad concrete default cannot
         // be re-emitted here as a second type mismatch.
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+        coalesce @ Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             let before = findings.len();
             deferred_findings(resource, name, value, false, check, findings);
             deferred_findings(resource, name, default, false, check, findings);
-            if findings.len() == before {
-                let coalesce = Value::Deferred(DeferredValue::Coalesce {
-                    value: value.clone(),
-                    default: default.clone(),
-                });
-                if let Err(error) = check(&coalesce, top_level) {
-                    findings.push(Located::new(
-                        resource.attribute_key_location(name).clone(),
-                        EditorFinding::DeferredAccess(error),
-                    ));
-                }
+            if findings.len() == before
+                && let Some(expression) = UnresolvedExpression::new(coalesce)
+                && let Err(error) = check(expression, top_level)
+            {
+                findings.push(Located::new(
+                    resource.attribute_key_location(name).clone(),
+                    EditorFinding::DeferredAccess(error),
+                ));
             }
         }
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            deferred_findings(resource, name, inner, top_level, check, findings);
+        }
         Value::Deferred(_) => {
-            if let Err(error) = check(value, top_level) {
+            if let Some(expression) = UnresolvedExpression::new(value)
+                && let Err(error) = check(expression, top_level)
+            {
                 findings.push(Located::new(
                     resource.attribute_key_location(name).clone(),
                     EditorFinding::DeferredAccess(error),

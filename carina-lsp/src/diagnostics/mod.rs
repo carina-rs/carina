@@ -330,8 +330,9 @@ impl ExpandedDiagnosticValidationInputs<'_> {
             .find(|candidate| candidate.id() == resource_id)?;
         let attributes = resource.attributes();
         let value = attributes.get(attribute)?;
+        let expression = carina_core::validation::UnresolvedExpression::new(value)?;
         Some(carina_core::validation::check_editor_access_type(
-            value,
+            expression,
             expected,
             &self.inference_bindings,
             schemas,
@@ -1100,7 +1101,7 @@ impl DiagnosticRun<'_> {
             // the LSP's legacy BindingIndex pass using a differently enriched
             // bootstrap identity. Nested uses keep the surrounding schema
             // walk so unrelated sibling leaves are still validated.
-            let binding_error_sinks = parsed
+            let binding_error_sinks = pre_expansion_input
                 .bare_binding_uses()
                 .uses()
                 .filter(|use_site| binding_use_report.owns_resource_use(use_site))
@@ -1112,7 +1113,7 @@ impl DiagnosticRun<'_> {
                     carina_core::parser::BindingUseOwner::ModuleArgument { .. } => None,
                 })
                 .collect::<HashSet<_>>();
-            let pending_resource_sinks = parsed
+            let pending_resource_sinks = pre_expansion_input
                 .bare_binding_uses()
                 .pending_slots()
                 .filter_map(|slot| match &slot.owner {
@@ -1229,7 +1230,7 @@ impl DiagnosticRun<'_> {
             // itself carries any diagnostic-sensitivity provenance.
             let resolved_buffer = {
                 match carina_core::parser::resolve_resource_refs_from_analysis(
-                    tree,
+                    preferred_tree,
                     self.provider_context,
                 ) {
                     Ok(resolved) => Some(resolved),
@@ -1246,10 +1247,16 @@ impl DiagnosticRun<'_> {
             let resolved_buffer_resources = resolved_buffer
                 .as_ref()
                 .map(|resolved| resolved.iter_all_resources().collect::<Vec<_>>());
-            // Every schema finding is anchored by the sealed parser view,
-            // including the semantic per-file fallback after a buffer parse fails.
+            // The resource walk and binding report must borrow the same parse:
+            // its parser-assigned identities distinguish expanded instances.
+            // The directory parse includes the unsaved buffer and its sealed
+            // source locations, so it also owns the authored targets.
             let mut resource_value_report = validation::ResourceValueReport::default();
-            for (resource_index, rref) in tree.project_resources().enumerate() {
+            for (resource_index, rref) in preferred_tree
+                .project_resources()
+                .enumerate()
+                .filter(|(_, resource)| resource.location().file().path() == doc.source_file())
+            {
                 let resource_id = rref.id();
                 let resource_attributes = rref.attributes();
                 let resolved_resource_attributes = resolved_buffer_resources
@@ -1350,7 +1357,7 @@ impl DiagnosticRun<'_> {
                 if let Some(validated_schema) = validated_schema {
                     let schema = validated_schema.as_schema();
                     let bn_map = schema.block_name_map();
-                    let mut values = rref.resolved_attributes();
+                    let mut values = HashMap::new();
                     for (attr_name, authored_value) in resource_attributes.iter() {
                         let attr_value = if contains_function_call(authored_value) {
                             resolved_resource_attributes
@@ -1417,7 +1424,7 @@ impl DiagnosticRun<'_> {
                         {
                             continue;
                         }
-                        let arithmetic = tree.integer_arithmetic_findings(
+                        let arithmetic = preferred_tree.integer_arithmetic_findings(
                             rref,
                             attr_name,
                             validated_schema,
@@ -1430,14 +1437,14 @@ impl DiagnosticRun<'_> {
                             attr_name,
                             &values[attr_name],
                             arithmetic,
-                            |value, top_level| {
+                            |expression, top_level| {
                                 let expected = validated_schema.assignment_sink(
                                     attribute.attr_type(),
                                     &self.provider_context.catalog().custom_types,
                                 );
                                 let expanded = (top_level
                                     && matches!(
-                                        value,
+                                        expression.value(),
                                         Value::Deferred(
                                             DeferredValue::ResourceRef { .. }
                                                 | DeferredValue::Access(_)
@@ -1456,7 +1463,7 @@ impl DiagnosticRun<'_> {
                                 .flatten();
                                 expanded.unwrap_or_else(|| {
                                     carina_core::validation::check_editor_access_type(
-                                        value,
+                                        expression,
                                         expected,
                                         &inference_bindings,
                                         &self.schemas,
@@ -1484,7 +1491,7 @@ impl DiagnosticRun<'_> {
                     // participates in rendering.
                     let findings = validated_schema.collect_validation_inputs_with_resolver(
                         binding_use_report.resource_value_inputs(
-                            parsed.bare_binding_uses(),
+                            pre_expansion_input.bare_binding_uses(),
                             rref,
                             &values,
                         ),

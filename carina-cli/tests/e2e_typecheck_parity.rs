@@ -139,6 +139,85 @@ fn engine_with_schemas(schemas: SchemaRegistry) -> DiagnosticEngine {
     }
 }
 
+#[test]
+fn round2_cli_aggregates_bridged_binding_and_missing_required_findings() {
+    let schemas = single_schema_map(
+        ResourceSchema::new("ec2.vpc")
+            .attribute(
+                AttributeSchema::required(
+                    "vpc_id",
+                    AttributeType::refined_string(
+                        Some(carina_core::schema::TypeIdentity::bare("VpcId")),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .attribute(AttributeSchema::required("required", AttributeType::string()).build()),
+    );
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider test {}\n"),
+        (
+            "main.crn",
+            "let bad = \"invalid\"\ntest.ec2.vpc { vpc_id = bad }\n",
+        ),
+    ]);
+    let diagnostics = cli_diagnostics(
+        vec![Box::new(WasmStyleProviderFactory {
+            name: "test".into(),
+            schemas: schemas
+                .iter()
+                .map(|(_, _, _, schema)| schema.clone())
+                .collect(),
+        })],
+        &fixture,
+    );
+    assert_eq!(
+        diagnostics,
+        [
+            "test.ec2.vpc.<pending>: Required attribute 'required' is missing",
+            "test.ec2.vpc.<pending>: test rejected `VpcId`: Invalid vpc_id 'invalid': must start with 'vpc-'",
+        ]
+    );
+}
+
+#[test]
+fn round2_cli_accepts_qualified_enum_map_keys() {
+    use carina_core::schema::TypeIdentity;
+    let key = AttributeType::enum_(
+        TypeIdentity::new(Some("mock"), ["test"], "Key"),
+        Some(vec!["ok".into()]),
+        vec![],
+        None,
+        None,
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "params",
+                    AttributeType::map_with_key(key, AttributeType::string()),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider mock {}\n"),
+        (
+            "main.crn",
+            "mock.test.Sink { params = { \"mock.test.Key.ok\" = \"ok\" } }\n",
+        ),
+    ]);
+    let diagnostics = cli_diagnostics(factories_for(&schemas), &fixture);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+}
+
 fn single_schema_map(schema: ResourceSchema) -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(

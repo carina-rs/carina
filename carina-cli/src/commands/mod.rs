@@ -449,7 +449,7 @@ fn extend_binding_use_errors(
             unreachable!("binding value target")
         };
         AppError::BindingValue {
-            location: location.clone(),
+            location: location.location().clone(),
             error: Box::new(finding.error),
         }
     }));

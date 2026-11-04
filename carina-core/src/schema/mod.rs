@@ -229,8 +229,8 @@ pub(crate) mod resource_value_validation;
 mod type_identity;
 
 pub use resource_value_validation::{
-    ResourceValueFinding, ResourceValueInputs, ResourceValueTarget, ValueFindingAnchor,
-    ValueFindingPath,
+    BindingTokenAnchor, ResourceValueFinding, ResourceValueInputs, ResourceValueTarget,
+    ValueFindingAnchor, ValueFindingPath,
 };
 
 pub use assignability::{AssignmentSink, SinkAuthority, TypeAssignability, TypeAssignmentDeferral};
@@ -3189,7 +3189,7 @@ pub(crate) fn lift_map_key<P: crate::resource::ValueKind, B: BindingAddress>(
         .is_ok_and(|resolution| matches!(&resolution.attr.kind, AttrTypeKind::Enum { .. }));
     if is_enum {
         EnumValueResolver::with_defs(key_type, defs)
-            .resolve_state_text(key)
+            .resolve_map_key(key)
             .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
     } else {
         Ok(Value::Concrete(ConcreteValue::String(

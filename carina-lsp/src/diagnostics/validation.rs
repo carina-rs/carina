@@ -25,7 +25,7 @@ pub(super) struct ResourceValueReport {
 
 struct AuthoredValueFinding {
     core: ResourceValueFinding,
-    scalar_value: Option<Value>,
+    guidance: Option<String>,
     replaceable: bool,
 }
 
@@ -47,10 +47,13 @@ impl ResourceValueReport {
             // coalesce operands can produce equal errors at one fallback
             // anchor, and both findings from that walk must survive.
             for finding in findings {
-                if let Some(index) = reported
-                    .iter()
-                    .zip(&matched)
-                    .position(|(existing, matched)| !matched && existing.core == finding.core)
+                if let Some(index) =
+                    reported
+                        .iter()
+                        .zip(&matched)
+                        .position(|(existing, matched)| {
+                            !matched && existing.core.same_authored_rule(&finding.core)
+                        })
                 {
                     matched[index] = true;
                 } else {
@@ -83,7 +86,7 @@ impl ResourceValueReport {
                 return;
             }
         }
-        let (location, scalar_value, replaceable) = match &finding.target {
+        let (location, guidance, replaceable) = match &finding.target {
             ResourceValueTarget::Resource => (resource.type_location(), None, false),
             ResourceValueTarget::Attribute {
                 authored_attribute: name,
@@ -93,7 +96,7 @@ impl ResourceValueReport {
                 let location = match anchor {
                     ValueFindingAnchor::Key => path.key_location(resource, name),
                     ValueFindingAnchor::Value => path.value_location(resource, name),
-                    ValueFindingAnchor::BindingToken(location) => location,
+                    ValueFindingAnchor::BindingToken(token) => token.location(),
                     ValueFindingAnchor::Assignment => {
                         let assignment = resource.attribute_assignment_location(name);
                         let span = assignment.span();
@@ -104,30 +107,31 @@ impl ResourceValueReport {
                         }
                     }
                 };
-                let scalar_value = if path.is_empty()
-                    && matches!(finding.error, TypeError::TypeMismatch { .. })
-                {
-                    values
-                        .get(name)
-                        .filter(|value| matches!(value, Value::Concrete(ConcreteValue::String(_))))
-                        .cloned()
+                let guidance = if path.is_empty() {
+                    scalar_guidance(&finding.error, values.get(name))
                 } else {
                     None
                 };
-                let replaceable = matches!(anchor, ValueFindingAnchor::BindingToken(_))
-                    || (path.is_empty()
-                        && resource.replaceable_attribute_value(name) == Some(location));
-                (location, scalar_value, replaceable)
+                let replaceable = match anchor {
+                    ValueFindingAnchor::BindingToken(token) => {
+                        token.replaceable_location() == Some(location)
+                    }
+                    _ => {
+                        path.is_empty()
+                            && resource.replaceable_attribute_value(name) == Some(location)
+                    }
+                };
+                (location, guidance, replaceable)
             }
         };
-        self.insert(location.clone(), finding, scalar_value, replaceable);
+        self.insert(location.clone(), finding, guidance, replaceable);
     }
 
     fn insert(
         &mut self,
         location: DeclarationLocation,
         core: ResourceValueFinding,
-        scalar_value: Option<Value>,
+        guidance: Option<String>,
         replaceable: bool,
     ) {
         self.findings
@@ -135,7 +139,7 @@ impl ResourceValueReport {
             .or_default()
             .push(AuthoredValueFinding {
                 core,
-                scalar_value,
+                guidance,
                 replaceable,
             });
     }
@@ -188,7 +192,7 @@ fn render_value_finding(
 ) -> Option<Diagnostic> {
     let AuthoredValueFinding {
         core: ResourceValueFinding { target, mut error },
-        scalar_value,
+        guidance,
         replaceable,
     } = finding;
     let message = match target {
@@ -220,7 +224,7 @@ fn render_value_finding(
             } else if indexed && error.attribute_name().is_none() {
                 format!("{error} for '{attribute}'")
             } else if path.is_empty() {
-                scalar_guidance(&error, scalar_value.as_ref()).unwrap_or_else(|| error.to_string())
+                guidance.unwrap_or_else(|| error.to_string())
             } else {
                 error.to_string()
             }
