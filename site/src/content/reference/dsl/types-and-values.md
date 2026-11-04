@@ -55,11 +55,23 @@ directly in the attribute or bound to a `let` first. A value that is only
 known to be a plain `String`, such as a `String` module argument, is not
 accepted by a named string type.
 
+A string that consists of nothing but one reference, `"${x}"`, is not a new
+string: when `x` has a string type, `"${x}"` has exactly the type of `x` and
+is checked as if you had written `x`. Wrapping a plain `String` in `"${...}"`
+therefore does not let it into a named string type. When `x` is a number or
+a boolean, `"${x}"` still converts it to a string, and a named string type
+checks the converted value.
+
 ```crn
 let suffix = source.value                     # String, known after apply
 awscc.iam.RolePolicy {
   role_name   = 'app'
   policy_name = "${suffix}-inline"            # accepted; checked once resolved
+}
+
+awscc.iam.RolePolicy {
+  role_name   = 'app'
+  policy_name = "${suffix}"                   # rejected, same as policy_name = suffix
 }
 ```
 
