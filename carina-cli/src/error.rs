@@ -1249,7 +1249,20 @@ pub enum AppError {
 
     /// One schema-aware bare-binding failure at its authored source token.
     #[error(transparent)]
-    BindingUse(Box<carina_core::validation::BindingUseFinding>),
+    BindingUse(Box<carina_core::validation::BindingUseDiagnostic>),
+
+    /// A binding-authority schema error retaining its authored location and cause.
+    /// The CLI's source-chain renderer appends the schema diagnostic once.
+    #[error(
+        "{} at line {}",
+        carina_core::utils::normalize_source_path(.location.file().path()).display(),
+        .location.span().start_line()
+    )] // error-chain: caller-renders-sources
+    BindingValue {
+        location: carina_core::parser::DeclarationLocation,
+        #[source]
+        error: Box<carina_core::schema::TypeError>,
+    },
 
     /// All schema-aware bare-binding failures from one resolved file.
     #[error(transparent)]

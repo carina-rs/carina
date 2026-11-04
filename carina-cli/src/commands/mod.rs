@@ -438,9 +438,21 @@ fn extend_binding_use_errors(
     errors.extend(
         report
             .resource_findings()
-            .cloned()
             .map(|finding| AppError::BindingUse(Box::new(finding))),
     );
+    errors.extend(report.resource_value_findings().map(|finding| {
+        let carina_core::schema::ResourceValueTarget::Attribute {
+            anchor: carina_core::schema::ValueFindingAnchor::BindingToken(location),
+            ..
+        } = &finding.target
+        else {
+            unreachable!("binding value target")
+        };
+        AppError::BindingValue {
+            location: location.clone(),
+            error: Box::new(finding.error),
+        }
+    }));
 }
 
 fn extend_module_call_errors(

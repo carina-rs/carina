@@ -9,7 +9,7 @@ use crate::document::Document;
 use carina_core::parser::{AnalysisResourceRef, DeclarationLocation, Located, ProviderContext};
 use carina_core::resource::{ConcreteValue, DeferredValue};
 use carina_core::schema::{
-    FieldPathStep, ResourceValueFinding, ResourceValueTarget, TypeError, ValidatedResourceSchema,
+    ResourceValueFinding, ResourceValueTarget, TypeError, ValidatedResourceSchema,
     ValueFindingAnchor,
 };
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
@@ -91,8 +91,8 @@ impl ResourceValueReport {
                 anchor,
             } => {
                 let location = match anchor {
-                    ValueFindingAnchor::Key => resource.attribute_path_location(name, path),
-                    ValueFindingAnchor::Value => resource.attribute_value_location(name, path),
+                    ValueFindingAnchor::Key => path.key_location(resource, name),
+                    ValueFindingAnchor::Value => path.value_location(resource, name),
                     ValueFindingAnchor::BindingToken(location) => location,
                     ValueFindingAnchor::Assignment => {
                         let assignment = resource.attribute_assignment_location(name);
@@ -199,10 +199,7 @@ fn render_value_finding(
             anchor,
         } => {
             let binding_token = matches!(anchor, ValueFindingAnchor::BindingToken(_));
-            let indexed = path
-                .steps()
-                .iter()
-                .any(|step| matches!(step, FieldPathStep::Index(_)));
+            let indexed = path.is_indexed();
             let duplicate = matches!(error, TypeError::DuplicateListElement { .. });
             let attribute =
                 if indexed && !duplicate && !matches!(error, TypeError::FieldGroupViolation { .. })
@@ -232,7 +229,7 @@ fn render_value_finding(
     let mut diagnostic = render_merged(
         doc,
         &Located::new(location, &error),
-        severity_for_validation_error(&error),
+        DiagnosticSeverity::ERROR,
         message,
     )?;
     if replaceable && let Some(data) = crate::code_action::enum_diagnostic_data_for_error(&error) {
@@ -280,80 +277,5 @@ impl DiagnosticEngine {
                 )
             })
             .collect()
-    }
-}
-
-fn severity_for_validation_error(_: &TypeError) -> DiagnosticSeverity {
-    DiagnosticSeverity::ERROR
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use carina_core::resource::{ConcreteValue, NoPlaceholder, Value};
-    use carina_core::schema::{
-        AttributeType, RootlessType, TypeIdentity, ValidatedConfigSchema, validator,
-    };
-    use std::collections::BTreeMap;
-
-    fn pathless_test_type(attr_type: AttributeType) -> RootlessType {
-        ValidatedConfigSchema::validate(BTreeMap::from([("value".to_string(), attr_type)]))
-            .expect("test config type must be valid")
-            .rootless_type("value")
-            .expect("test config type must exist")
-    }
-
-    fn tied_string_error(first: TypeError, second: TypeError) -> TypeError {
-        let rejecting = |error: TypeError| {
-            AttributeType::refined_string_with_validator(
-                TypeIdentity::bare("TestValidator"),
-                None,
-                None,
-                validator(move |_| Err(error.clone())),
-                None,
-            )
-        };
-        pathless_test_type(AttributeType::union(vec![
-            rejecting(first),
-            rejecting(second),
-        ]))
-        .validate(&Value::<NoPlaceholder>::Concrete(ConcreteValue::String(
-            "invalid".into(),
-        )))
-        .expect_err("both Union arms must reject the value")
-    }
-
-    #[test]
-    fn tied_union_is_error_when_only_one_arm_is_a_writability_error() {
-        let error = tied_string_error(
-            TypeError::ReadOnlyAttribute {
-                name: "provider_value".to_string(),
-            },
-            TypeError::ValidationFailed {
-                message: "not accepted".into(),
-            },
-        );
-
-        assert_eq!(
-            severity_for_validation_error(&error),
-            DiagnosticSeverity::ERROR
-        );
-    }
-
-    #[test]
-    fn tied_union_is_error_when_every_arm_is_an_error() {
-        let error = tied_string_error(
-            TypeError::ReadOnlyAttribute {
-                name: "first".to_string(),
-            },
-            TypeError::ReadOnlyAttribute {
-                name: "second".to_string(),
-            },
-        );
-
-        assert_eq!(
-            severity_for_validation_error(&error),
-            DiagnosticSeverity::ERROR
-        );
     }
 }

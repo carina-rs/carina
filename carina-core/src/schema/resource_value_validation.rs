@@ -15,12 +15,79 @@ pub enum ValueFindingAnchor {
     BindingToken(crate::parser::DeclarationLocation),
 }
 
+/// A source path whose private anchoring data may contain secret map keys.
+/// Display and Debug always use its sensitivity-aware projection.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ValueFindingPath {
+    source: FieldPath,
+    sensitive: bool,
+}
+
+impl ValueFindingPath {
+    pub(crate) fn new(source: FieldPath) -> Self {
+        Self {
+            source,
+            sensitive: false,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.source.is_empty()
+    }
+    pub fn is_indexed(&self) -> bool {
+        self.source
+            .steps()
+            .iter()
+            .any(|step| matches!(step, FieldPathStep::Index(_)))
+    }
+    pub fn key_location<'a, P, T, D, B>(
+        &self,
+        resource: &'a crate::parser::AnalysisResourceRef<'_, P, T, D, B>,
+        name: &str,
+    ) -> &'a crate::parser::DeclarationLocation
+    where
+        P: PlaceholderKind,
+        T: crate::resource::ValueKind,
+        B: BindingAddress,
+        D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
+    {
+        resource.attribute_path_location(name, &self.source)
+    }
+    pub fn value_location<'a, P, T, D, B>(
+        &self,
+        resource: &'a crate::parser::AnalysisResourceRef<'_, P, T, D, B>,
+        name: &str,
+    ) -> &'a crate::parser::DeclarationLocation
+    where
+        P: PlaceholderKind,
+        T: crate::resource::ValueKind,
+        B: BindingAddress,
+        D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
+    {
+        resource.attribute_value_location(name, &self.source)
+    }
+}
+
+impl fmt::Display for ValueFindingPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.sensitive {
+            self.source.clone().masked_for_secret().fmt(f)
+        } else {
+            self.source.fmt(f)
+        }
+    }
+}
+impl fmt::Debug for ValueFindingPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ValueFindingPath({self})")
+    }
+}
+
 /// An authored attribute path, or a failure of the resource as a whole.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceValueTarget {
     Attribute {
         authored_attribute: String,
-        path: FieldPath,
+        path: ValueFindingPath,
         anchor: ValueFindingAnchor,
     },
     Resource,
@@ -38,16 +105,16 @@ pub struct ResourceValueFinding {
 /// by the binding authority. Plain value callers start with `new`.
 pub struct ResourceValueInputs<'a, P: PlaceholderKind, B: BindingAddress> {
     pub(crate) attributes: &'a HashMap<String, Value<P, B>>,
-    pub(crate) checked: HashSet<String>,
-    pub(crate) binding_findings: Vec<ResourceValueFinding>,
+    pub(crate) pending: HashSet<String>,
+    pub(crate) bindings: Vec<ResourceBindingValidation>,
 }
 
 impl<'a, P: PlaceholderKind, B: BindingAddress> ResourceValueInputs<'a, P, B> {
     pub fn new(attributes: &'a HashMap<String, Value<P, B>>) -> Self {
         Self {
             attributes,
-            checked: HashSet::new(),
-            binding_findings: Vec::new(),
+            pending: HashSet::new(),
+            bindings: Vec::new(),
         }
     }
 }
@@ -77,7 +144,7 @@ impl ResourceValueReport {
 }
 
 struct PathFinding {
-    path: FieldPath,
+    path: ValueFindingPath,
     anchor: ValueFindingAnchor,
     error: TypeError,
 }
@@ -92,7 +159,7 @@ impl PathFinding {
             ValueFindingAnchor::Key
         };
         Self {
-            path: path.clone(),
+            path: ValueFindingPath::new(path.clone()),
             anchor,
             error,
         }
@@ -144,6 +211,7 @@ impl<'a> CheckedValue<'a> {
         self.primary = self.primary.map(TypeError::masked_for_secret);
         for finding in self.local.iter_mut().chain(&mut self.external) {
             finding.error = finding.error.clone().masked_for_secret();
+            finding.path.sensitive = true;
         }
         self
     }
@@ -161,7 +229,7 @@ impl PatternResourceSchema<Compiled> {
         for (name, schema) in &self.attributes {
             if schema.is_required()
                 && !attributes.contains_key(name)
-                && !inputs.checked.contains(name)
+                && !inputs.pending.contains(name)
                 && schema.default.is_none()
             {
                 report.resource_error(TypeError::MissingRequired { name: name.clone() });
@@ -173,11 +241,26 @@ impl PatternResourceSchema<Compiled> {
             lookup,
             ValueEntryValidation::FullInput,
             None,
-            &inputs.checked,
+            &inputs.bindings,
         );
         report.errors.extend(values.errors);
         report.findings.extend(values.findings);
-        report.findings.extend(inputs.binding_findings);
+        // Authority failures can reserve a pending slot with no runtime value.
+        // Emit them independently of the walk, preserving their authored token
+        // instead of folding them into a container's aggregate error.
+        for binding in &inputs.bindings {
+            if let ResourceBindingValueOutcome::Rejected(Some(error)) = &binding.outcome {
+                report.errors.push(error.clone());
+                report.findings.push(ResourceValueFinding {
+                    target: ResourceValueTarget::Attribute {
+                        authored_attribute: binding.attribute.clone(),
+                        path: ValueFindingPath::new(binding.path.clone()),
+                        anchor: ValueFindingAnchor::BindingToken(binding.location.clone()),
+                    },
+                    error: error.clone(),
+                });
+            }
+        }
         for group in &self.field_groups {
             let present = group
                 .fields()
@@ -204,7 +287,7 @@ impl PatternResourceSchema<Compiled> {
                     .map_or(ResourceValueTarget::Resource, |name| {
                         ResourceValueTarget::Attribute {
                             authored_attribute: name.to_string(),
-                            path: FieldPath::new(),
+                            path: ValueFindingPath::new(FieldPath::new()),
                             anchor: ValueFindingAnchor::Key,
                         }
                     });
@@ -222,7 +305,7 @@ impl PatternResourceSchema<Compiled> {
         lookup: CustomTypeLookup<'_>,
         mode: ValueEntryValidation,
         selected: Option<&HashSet<String>>,
-        checked: &HashSet<String>,
+        bindings: &[ResourceBindingValidation],
     ) -> ResourceValueReport {
         let mut report = ResourceValueReport::default();
         let aliases = self.block_name_map();
@@ -249,7 +332,7 @@ impl PatternResourceSchema<Compiled> {
                     report.findings.push(ResourceValueFinding {
                         target: ResourceValueTarget::Attribute {
                             authored_attribute: name.clone(),
-                            path: FieldPath::new(),
+                            path: ValueFindingPath::new(FieldPath::new()),
                             anchor: ValueFindingAnchor::Assignment,
                         },
                         error,
@@ -257,9 +340,18 @@ impl PatternResourceSchema<Compiled> {
                 }
                 continue;
             };
-            if checked.contains(name) {
-                continue;
-            }
+            let mut walk = ValueWalk::new(lookup);
+            walk.bindings = bindings
+                .iter()
+                .filter(|binding| binding.attribute == *name)
+                .cloned()
+                .collect();
+            walk.previous = walk
+                .bindings
+                .iter()
+                .filter_map(ResourceBindingValidation::checked)
+                .flat_map(|checked| checked.leaves.iter().cloned())
+                .collect();
             let mut checked = if attribute.is_read_only() && mode == ValueEntryValidation::FullInput
             {
                 CheckedValue::rejected(
@@ -273,7 +365,7 @@ impl PatternResourceSchema<Compiled> {
                     &self.defs,
                     FieldAncestry::from_input_mode(attribute.input_mode()),
                     &FieldPath::new(),
-                    lookup,
+                    &mut walk,
                     &mut Vec::new(),
                 )
             };
@@ -301,8 +393,21 @@ impl PatternResourceSchema<Compiled> {
                 report.findings.push(ResourceValueFinding {
                     target: ResourceValueTarget::Attribute {
                         authored_attribute: name.clone(),
-                        path: finding.path,
-                        anchor: finding.anchor,
+                        path: finding.path.clone(),
+                        anchor: walk
+                            .bindings
+                            .iter()
+                            .filter(|binding| {
+                                finding
+                                    .path
+                                    .source
+                                    .steps()
+                                    .starts_with(binding.path.steps())
+                            })
+                            .max_by_key(|binding| binding.path.steps().len())
+                            .map_or(finding.anchor, |binding| {
+                                ValueFindingAnchor::BindingToken(binding.location.clone())
+                            }),
                     },
                     error: if quoted_enum {
                         finding.error.into_string_literal_diagnostic()
@@ -316,28 +421,374 @@ impl PatternResourceSchema<Compiled> {
     }
 }
 
+/// Results belong to individual scalar leaves, including failed callbacks.
+/// Containers are always revisited so counts, groups and writability remain
+/// independent of a bound leaf's validation result.
+#[derive(Clone, Default, PartialEq)]
+pub(crate) struct BindingValueValidation {
+    source: Option<Value>,
+    leaves: Vec<CheckedBindingLeaf>,
+}
+
+impl fmt::Debug for BindingValueValidation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BindingValueValidation")
+            .field("leaves", &self.leaves)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq)]
+enum LeafInput {
+    Value(Value),
+    MapKey(String),
+}
+
+#[derive(Clone)]
+struct CheckedBindingLeaf {
+    path: FieldPath,
+    declaration: String,
+    native: Option<CustomValidator>,
+    input: LeafInput,
+    result: LeafResult,
+}
+
+impl fmt::Debug for CheckedBindingLeaf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CheckedBindingLeaf")
+    }
+}
+impl PartialEq for CheckedBindingLeaf {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.declaration == other.declaration
+            && same_callback(self.native.as_ref(), other.native.as_ref())
+            && self.input == other.input
+            && self.result == other.result
+    }
+}
+fn same_callback(left: Option<&CustomValidator>, right: Option<&CustomValidator>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+fn native_callback(attr: &CompiledAttributeType) -> Option<&CustomValidator> {
+    match &attr.kind {
+        AttrTypeKind::String { binding, .. }
+        | AttrTypeKind::Int { binding, .. }
+        | AttrTypeKind::Float { binding, .. } => binding.callback(),
+        AttrTypeKind::Enum { validate, .. } => validate.as_ref(),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LeafResult {
+    fit: Option<(FitExactness, LeafFit)>,
+    primary: Option<TypeError>,
+    external: Vec<TypeError>,
+}
+#[derive(Clone, Debug, PartialEq)]
+enum LeafFit {
+    Scalar,
+    Deferred,
+    Enum(CanonicalEnumValue),
+}
+
+impl BindingValueValidation {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.leaves.is_empty()
+    }
+}
+
+impl LeafResult {
+    fn capture(checked: &CheckedValue<'_>) -> Option<Self> {
+        let fit = match &checked.fit {
+            None => None,
+            Some(fit) => Some((
+                fit.exactness,
+                match &fit.kind {
+                    FitKind::PassThrough => LeafFit::Scalar,
+                    FitKind::Deferred => LeafFit::Deferred,
+                    FitKind::Enum { canonical, .. } => LeafFit::Enum(canonical.clone()),
+                    _ => return None,
+                },
+            )),
+        };
+        Some(Self {
+            fit,
+            primary: checked.primary.clone(),
+            external: checked
+                .external
+                .iter()
+                .map(|finding| finding.error.clone())
+                .collect(),
+        })
+    }
+    fn restore<'a>(&self, attr: &'a CompiledAttributeType, path: &FieldPath) -> CheckedValue<'a> {
+        CheckedValue {
+            fit: self.fit.as_ref().map(|(exactness, kind)| {
+                Fit::with_kind(
+                    *exactness,
+                    attr,
+                    match kind {
+                        LeafFit::Scalar => FitKind::PassThrough,
+                        LeafFit::Deferred => FitKind::Deferred,
+                        LeafFit::Enum(canonical) => FitKind::Enum {
+                            canonical: canonical.clone(),
+                            rewrite: true,
+                        },
+                    },
+                )
+            }),
+            primary: self.primary.clone(),
+            local: self
+                .primary
+                .iter()
+                .cloned()
+                .map(|error| PathFinding::new(path, error))
+                .collect(),
+            external: self
+                .external
+                .iter()
+                .cloned()
+                .map(|error| PathFinding::new(path, error))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ResourceBindingValidation {
+    pub attribute: String,
+    pub path: FieldPath,
+    pub location: crate::parser::DeclarationLocation,
+    pub outcome: ResourceBindingValueOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ResourceBindingValueOutcome {
+    Checked(BindingValueValidation),
+    // The authority owns this leaf's failure, including when parsing omitted
+    // its runtime value. Non-schema failures use the opaque binding report.
+    Rejected(Option<TypeError>),
+}
+
+impl ResourceBindingValidation {
+    fn checked(&self) -> Option<&BindingValueValidation> {
+        match &self.outcome {
+            ResourceBindingValueOutcome::Checked(checked) => Some(checked),
+            ResourceBindingValueOutcome::Rejected(_) => None,
+        }
+    }
+}
+
+struct ValueWalk<'a> {
+    lookup: CustomTypeLookup<'a>,
+    previous: Vec<CheckedBindingLeaf>,
+    recorded: Vec<CheckedBindingLeaf>,
+    bindings: Vec<ResourceBindingValidation>,
+}
+impl<'a> ValueWalk<'a> {
+    fn new(lookup: CustomTypeLookup<'a>) -> Self {
+        Self {
+            lookup,
+            previous: Vec::new(),
+            recorded: Vec::new(),
+            bindings: Vec::new(),
+        }
+    }
+}
+
+pub(crate) fn check_binding_value<P: PlaceholderKind, B: BindingAddress>(
+    attr: &CompiledAttributeType,
+    value: &Value<P, B>,
+    defs: &BTreeMap<String, CompiledAttributeType>,
+    ancestry: FieldAncestry,
+    path: &FieldPath,
+    lookup: CustomTypeLookup<'_>,
+    validation: &mut BindingValueValidation,
+) -> Result<(), TypeError> {
+    if ancestry.provider_populated {
+        return Ok(());
+    }
+    validation.source = value
+        .to_expanded()
+        .and_then(Value::try_into_address_free_absolute);
+    let mut walk = ValueWalk::new(lookup);
+    let checked = check_value(
+        attr,
+        value,
+        defs,
+        ancestry,
+        path,
+        &mut walk,
+        &mut Vec::new(),
+    );
+    validation.leaves = walk.recorded;
+    checked
+        .primary
+        .or_else(|| {
+            checked
+                .external
+                .into_iter()
+                .next()
+                .map(|finding| finding.error)
+        })
+        .map_or(Ok(()), Err)
+}
+
 fn check_value<'a, P: PlaceholderKind, B: BindingAddress>(
     attr: &'a CompiledAttributeType,
     value: &Value<P, B>,
     defs: &'a BTreeMap<String, CompiledAttributeType>,
     ancestry: FieldAncestry,
     path: &FieldPath,
-    lookup: CustomTypeLookup<'_>,
+    walk: &mut ValueWalk<'_>,
     visited_refs: &mut Vec<&'a str>,
 ) -> CheckedValue<'a> {
+    if walk.bindings.iter().any(|binding| {
+        binding.path == *path && matches!(binding.outcome, ResourceBindingValueOutcome::Rejected(_))
+    }) {
+        return CheckedValue::accepted(attr, FitExactness::EXACT, FitKind::Deferred);
+    }
+    // The editor can hand off an authored binding token rather than its
+    // substituted value. Keep the binding authority's source at this seam,
+    // including containers whose independent constraints must still be walked.
+    let source = walk
+        .bindings
+        .iter()
+        .find(|binding| binding.path == *path)
+        .and_then(ResourceBindingValidation::checked)
+        .and_then(|checked| checked.source.clone());
+    match source {
+        Some(source) => check_input(
+            attr,
+            CheckInput::Value(&source),
+            defs,
+            ancestry,
+            path,
+            walk,
+            visited_refs,
+        ),
+        None => check_input(
+            attr,
+            CheckInput::Value(value),
+            defs,
+            ancestry,
+            path,
+            walk,
+            visited_refs,
+        ),
+    }
+}
+
+enum CheckInput<'a, P: PlaceholderKind, B: BindingAddress> {
+    Value(&'a Value<P, B>),
+    MapKey(&'a str),
+}
+
+fn check_input<'a, P: PlaceholderKind, B: BindingAddress>(
+    attr: &'a CompiledAttributeType,
+    value: CheckInput<'_, P, B>,
+    defs: &'a BTreeMap<String, CompiledAttributeType>,
+    ancestry: FieldAncestry,
+    path: &FieldPath,
+    walk: &mut ValueWalk<'_>,
+    visited_refs: &mut Vec<&'a str>,
+) -> CheckedValue<'a> {
+    if let CheckInput::Value(Value::Deferred(DeferredValue::Secret(inner))) = value {
+        let mut checked = check_input(
+            attr,
+            CheckInput::Value(inner),
+            defs,
+            ancestry.inside_secret(),
+            path,
+            walk,
+            visited_refs,
+        )
+        .mask();
+        checked.fit = checked
+            .fit
+            .map(|fit| Fit::with_kind(fit.exactness, attr, FitKind::Secret(Box::new(fit))));
+        return checked;
+    }
     let resolution = match resolve_refs_on_path(attr, defs, visited_refs) {
         Ok(resolution) => resolution,
         Err(error) => return CheckedValue::rejected(path, error.into_validation_error()),
     };
-    let checked = check_resolved_value(
-        resolution.attr,
-        value,
-        defs,
-        ancestry,
-        path,
-        lookup,
-        visited_refs,
-    );
+    let input = match &value {
+        CheckInput::Value(value) => {
+            let scalar = !matches!(
+                resolution.attr.kind,
+                AttrTypeKind::List { .. }
+                    | AttrTypeKind::Map { .. }
+                    | AttrTypeKind::Struct { .. }
+                    | AttrTypeKind::Union(_)
+                    | AttrTypeKind::Ref(_)
+            ) && value.as_concrete().is_some();
+            scalar
+                .then(|| {
+                    value
+                        .to_expanded()
+                        .and_then(Value::try_into_address_free_absolute)
+                })
+                .flatten()
+                .map(LeafInput::Value)
+        }
+        // Key lifting may invoke a native enum validator. Cache the authored
+        // key before lifting so both accepted and rejected resolutions reuse it.
+        CheckInput::MapKey(key) => Some(LeafInput::MapKey((*key).into())),
+    };
+    let declaration = input
+        .as_ref()
+        .map(|_| resolution.attr.declaration_fingerprint());
+    if let Some(index) = walk.previous.iter().position(|leaf| {
+        leaf.path == *path
+            && Some(&leaf.declaration) == declaration.as_ref()
+            && Some(&leaf.input) == input.as_ref()
+            && same_callback(leaf.native.as_ref(), native_callback(resolution.attr))
+    }) {
+        let cached = walk.previous.remove(index);
+        visited_refs.truncate(resolution.restore_len);
+        return cached.result.restore(resolution.attr, path);
+    }
+    let checked = match value {
+        CheckInput::Value(value) => check_resolved_value(
+            resolution.attr,
+            value,
+            defs,
+            ancestry,
+            path,
+            walk,
+            visited_refs,
+        ),
+        CheckInput::MapKey(key) => match lift_map_key::<P, B>(resolution.attr, key, defs) {
+            Ok(lifted) => check_resolved_value(
+                resolution.attr,
+                &lifted,
+                defs,
+                ancestry,
+                path,
+                walk,
+                visited_refs,
+            ),
+            Err(error) => CheckedValue::rejected(path, error),
+        },
+    };
+    if let (Some(input), Some(declaration), Some(result)) =
+        (input, declaration, LeafResult::capture(&checked))
+    {
+        walk.recorded.push(CheckedBindingLeaf {
+            path: path.clone(),
+            declaration,
+            native: native_callback(resolution.attr).cloned(),
+            input,
+            result,
+        });
+    }
     visited_refs.truncate(resolution.restore_len);
     checked
 }
@@ -348,28 +799,12 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
     defs: &'a BTreeMap<String, CompiledAttributeType>,
     ancestry: FieldAncestry,
     path: &FieldPath,
-    lookup: CustomTypeLookup<'_>,
+    walk: &mut ValueWalk<'_>,
     visited_refs: &mut Vec<&'a str>,
 ) -> CheckedValue<'a> {
-    if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        let mut checked = check_resolved_value(
-            attr,
-            inner,
-            defs,
-            ancestry.inside_secret(),
-            path,
-            lookup,
-            visited_refs,
-        )
-        .mask();
-        checked.fit = checked
-            .fit
-            .map(|fit| Fit::with_kind(fit.exactness, attr, FitKind::Secret(Box::new(fit))));
-        return checked;
-    }
     if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
-        let mut left = check_value(attr, value, defs, ancestry, path, lookup, &mut Vec::new());
-        let right = check_value(attr, default, defs, ancestry, path, lookup, &mut Vec::new());
+        let mut left = check_value(attr, value, defs, ancestry, path, walk, &mut Vec::new());
+        let right = check_value(attr, default, defs, ancestry, path, walk, &mut Vec::new());
         left.fit = left.fit.zip(right.fit).map(|(value, default)| {
             let mut exactness = value.exactness;
             exactness.combine(default.exactness);
@@ -390,7 +825,7 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
     if let Value::Deferred(DeferredValue::ModuleIf(deferred)) = value {
         let mut checked = CheckedValue::accepted(attr, FitExactness::EXACT, FitKind::Deferred);
         for branch in &deferred.values()[1..] {
-            let branch = check_value(attr, branch, defs, ancestry, path, lookup, &mut Vec::new());
+            let branch = check_value(attr, branch, defs, ancestry, path, walk, &mut Vec::new());
             checked.primary = checked.primary.or(branch.primary);
             checked.local.extend(branch.local);
             checked.external.extend(branch.external);
@@ -422,7 +857,7 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
             defs,
             ancestry,
             path,
-            lookup,
+            walk,
         ),
         (
             AttrTypeKind::List {
@@ -445,7 +880,7 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                 defs,
                 ancestry,
                 path,
-                lookup,
+                walk,
             )
         }
         (
@@ -512,7 +947,7 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                     defs,
                     ancestry.descend(field),
                     &next_path,
-                    lookup,
+                    walk,
                     &mut Vec::new(),
                 );
                 if let Some(error) = child.primary {
@@ -555,14 +990,13 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
             let mut first_value_error = None;
             for (map_key, map_value) in map {
                 let next_path = path.push_field(map_key.clone());
-                let lifted: Value<P, B> = lift_map_key(key, map_key, defs);
-                let key_checked = check_value(
+                let key_checked = check_input::<P, B>(
                     key,
-                    &lifted,
+                    CheckInput::MapKey(map_key),
                     defs,
                     ancestry,
                     &next_path,
-                    lookup,
+                    walk,
                     &mut Vec::new(),
                 );
                 if let Some(error) = key_checked.primary {
@@ -580,7 +1014,7 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                     defs,
                     ancestry,
                     &next_path,
-                    lookup,
+                    walk,
                     &mut Vec::new(),
                 );
                 if let Some(error) = &child.primary {
@@ -634,8 +1068,7 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
             let mut best_failure: Option<BestUnionMemberFailures> = None;
             let mut best_external: Option<Vec<PathFinding>> = None;
             for member in members.as_raw_slice() {
-                let checked =
-                    check_value(member, value, defs, ancestry, path, lookup, visited_refs);
+                let checked = check_value(member, value, defs, ancestry, path, walk, visited_refs);
                 if best_external
                     .as_ref()
                     .is_none_or(|best| checked.external.len() < best.len())
@@ -746,7 +1179,7 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                     );
                     if validate.is_none() {
                         let value = Value::Concrete(ConcreteValue::CanonicalEnum(canonical));
-                        if let Err(error) = lookup(attr, &value) {
+                        if let Err(error) = (walk.lookup)(attr, &value) {
                             checked.external.push(PathFinding::new(path, error));
                         }
                     }
@@ -795,7 +1228,7 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                 && let Some(value) = value
                     .to_expanded()
                     .and_then(Value::try_into_address_free_absolute)
-                && let Err(error) = lookup(attr, &value)
+                && let Err(error) = (walk.lookup)(attr, &value)
             {
                 checked.external.push(PathFinding::new(path, error));
             }
@@ -814,7 +1247,7 @@ fn check_list<'a, P: PlaceholderKind, B: BindingAddress>(
     defs: &'a BTreeMap<String, CompiledAttributeType>,
     ancestry: FieldAncestry,
     path: &FieldPath,
-    lookup: CustomTypeLookup<'_>,
+    walk: &mut ValueWalk<'_>,
 ) -> CheckedValue<'a> {
     let mut children: Vec<_> = items
         .iter()
@@ -826,7 +1259,7 @@ fn check_list<'a, P: PlaceholderKind, B: BindingAddress>(
                 defs,
                 ancestry,
                 &path.push_index(index),
-                lookup,
+                walk,
                 &mut Vec::new(),
             )
         })

@@ -3,16 +3,16 @@
 
 use super::super::Value;
 use carina_core::parser::{AnalysisResourceRef, Located};
-use carina_core::resource::{DeferredValue, ParserPlaceholder};
+use carina_core::resource::DeferredValue;
 use carina_core::schema::ValidatedResourceSchema;
-use carina_core::validation::{DeferredAccessTypeError, IntegerArithmeticTypeFinding};
+use carina_core::validation::{AccessTypeFinding, IntegerArithmeticTypeFinding};
 use std::fmt;
 use tower_lsp::lsp_types::DiagnosticSeverity;
 
 pub(crate) enum EditorFinding {
     MixedAttributeSyntax { authored: String, canonical: String },
     PreferBlockSyntax { attribute: String },
-    DeferredAccess(DeferredAccessTypeError),
+    DeferredAccess(AccessTypeFinding),
     IntegerArithmetic(IntegerArithmeticTypeFinding),
 }
 
@@ -20,12 +20,16 @@ impl EditorFinding {
     pub(in crate::diagnostics) fn severity(&self) -> DiagnosticSeverity {
         match self {
             Self::PreferBlockSyntax { .. } => DiagnosticSeverity::HINT,
-            Self::DeferredAccess(DeferredAccessTypeError::TypeMismatch { .. }) => {
-                DiagnosticSeverity::WARNING
+            Self::DeferredAccess(error) => {
+                if error.is_type_mismatch() {
+                    DiagnosticSeverity::WARNING
+                } else {
+                    DiagnosticSeverity::ERROR
+                }
             }
-            Self::MixedAttributeSyntax { .. }
-            | Self::DeferredAccess(DeferredAccessTypeError::InvalidAccess { .. })
-            | Self::IntegerArithmetic(_) => DiagnosticSeverity::ERROR,
+            Self::MixedAttributeSyntax { .. } | Self::IntegerArithmetic(_) => {
+                DiagnosticSeverity::ERROR
+            }
         }
     }
 }
@@ -55,7 +59,7 @@ pub(in crate::diagnostics) fn attribute_findings(
     name: &str,
     value: &Value,
     arithmetic: Vec<Located<IntegerArithmeticTypeFinding>>,
-    mut access_check: impl FnMut(&Value, bool) -> Result<(), DeferredAccessTypeError>,
+    mut access_check: impl FnMut(&Value, bool) -> Result<(), AccessTypeFinding>,
 ) -> Vec<Located<EditorFinding>> {
     if !arithmetic.is_empty() {
         return arithmetic
@@ -85,7 +89,7 @@ fn deferred_findings(
     name: &str,
     value: &Value,
     top_level: bool,
-    check: &mut impl FnMut(&Value, bool) -> Result<(), DeferredAccessTypeError>,
+    check: &mut impl FnMut(&Value, bool) -> Result<(), AccessTypeFinding>,
     findings: &mut Vec<Located<EditorFinding>>,
 ) {
     match value {
@@ -93,15 +97,23 @@ fn deferred_findings(
         // operands need editor inference, so a bad concrete default cannot
         // be re-emitted here as a second type mismatch.
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            let before = findings.len();
             deferred_findings(resource, name, value, false, check, findings);
             deferred_findings(resource, name, default, false, check, findings);
+            if findings.len() == before {
+                let coalesce = Value::Deferred(DeferredValue::Coalesce {
+                    value: value.clone(),
+                    default: default.clone(),
+                });
+                if let Err(error) = check(&coalesce, top_level) {
+                    findings.push(Located::new(
+                        resource.attribute_key_location(name).clone(),
+                        EditorFinding::DeferredAccess(error),
+                    ));
+                }
+            }
         }
-        Value::Deferred(
-            DeferredValue::ResourceRef { .. }
-            | DeferredValue::Access(_)
-            | DeferredValue::BindingRef { .. }
-            | DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument { .. }),
-        ) => {
+        Value::Deferred(_) => {
             if let Err(error) = check(value, top_level) {
                 findings.push(Located::new(
                     resource.attribute_key_location(name).clone(),

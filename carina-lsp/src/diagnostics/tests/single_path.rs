@@ -351,3 +351,133 @@ fn value_report_uses_unsaved_buffer_with_sibling_binding_authority() {
         buffer.find("fallback").unwrap() as u32
     );
 }
+
+#[test]
+fn review_secret_bound_callback_runs_once() {
+    use carina_core::resource::{ConcreteValue, Value};
+    use carina_core::schema::{TypeIdentity, validator};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let leaf = AttributeType::refined_string_with_validator(
+        TypeIdentity::bare("Counted"),
+        None,
+        None,
+        validator(move |value| {
+            assert!(
+                matches!(value, Value::Concrete(ConcreteValue::String(text)) if text.expose_plaintext() == "ok")
+            );
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }),
+        None,
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .as_data_source()
+            .attribute(AttributeSchema::optional("values", AttributeType::list(leaf)).build())
+            .validate()
+            .unwrap(),
+    );
+    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    // Data-source inputs use the production value collector without the
+    // separate managed-resource identity canonicalization pass.
+    let source =
+        "let input = \"ok\"\nlet sink = read mock.test.Sink { values = [secret(input)] }\n";
+    let path = directory.path().join("main.crn");
+    std::fs::write(&path, source).unwrap();
+    let findings = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert!(findings.is_empty(), "{findings:#?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn review_concrete_arithmetic_sink_has_one_owner() {
+    let diagnostics = collection_diagnostics(AttributeType::string(), "length([\"a\"]) + 1");
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert!(diagnostics[0].message.contains("expected String, got Int"));
+}
+
+fn review_coalesce_diagnostics(sink: AttributeType, expression: &str) -> Vec<Diagnostic> {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Producer")
+            .attribute(AttributeSchema::provider_populated("text", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::provider_populated(
+                    "items",
+                    AttributeType::list(AttributeType::string()),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(AttributeSchema::optional("params", sink).build())
+            .validate()
+            .unwrap(),
+    );
+    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    let source = format!(
+        "let producer = mock.test.Producer {{}}\nmock.test.Sink {{\n  params = {expression}\n}}\n"
+    );
+    let path = directory.path().join("main.crn");
+    std::fs::write(&path, &source).unwrap();
+    engine.analyze(&create_document_at(&source, path.clone()), Some(&path))
+}
+
+#[test]
+fn review_deferred_function_coalesce_checks_both_operands() {
+    for expression in [
+        "producer.text ?? length(producer.items)",
+        "length(producer.items) ?? producer.text",
+    ] {
+        let diagnostics = review_coalesce_diagnostics(AttributeType::string(), expression);
+        assert_eq!(diagnostics.len(), 1, "{expression}: {diagnostics:#?}");
+        assert!(
+            diagnostics[0].message.contains("String") && diagnostics[0].message.contains("Int"),
+            "{diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn review_coalesce_checks_compatibility_even_when_union_accepts_operands() {
+    let diagnostics = review_coalesce_diagnostics(
+        AttributeType::union(vec![AttributeType::string(), AttributeType::int()]),
+        "producer.text ?? length(producer.items)",
+    );
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert!(diagnostics[0].message.contains("String") && diagnostics[0].message.contains("Int"));
+}
+
+#[test]
+fn review_secret_indexed_map_path_masks_key_and_retains_anchor() {
+    let source = "[secret({ private_key = \"ok\" })]";
+    let diagnostics = collection_diagnostics(
+        AttributeType::list(AttributeType::map_with_key(
+            AttributeType::refined_string(None, None, Some((None, Some(1))), None),
+            AttributeType::string(),
+        )),
+        source,
+    );
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert!(
+        !diagnostics[0].message.contains("private_key"),
+        "{diagnostics:#?}"
+    );
+    assert!(diagnostics[0].message.contains("(secret)"));
+}

@@ -225,11 +225,12 @@ mod assignability_edges;
 mod fingerprint;
 mod resolved_attr_type;
 mod resolved_union_members;
-mod resource_value_validation;
+pub(crate) mod resource_value_validation;
 mod type_identity;
 
 pub use resource_value_validation::{
     ResourceValueFinding, ResourceValueInputs, ResourceValueTarget, ValueFindingAnchor,
+    ValueFindingPath,
 };
 
 pub use assignability::{AssignmentSink, SinkAuthority, TypeAssignability, TypeAssignmentDeferral};
@@ -2598,9 +2599,10 @@ impl Schema {
                 let mut first_value_error = None;
                 for (map_key, map_value) in map {
                     let next_path = path.push_field(map_key.clone());
-                    let lifted_key: Value<P, B> = lift_map_key(key, map_key, defs);
                     if let Err(inner) =
-                        validate_attr_with_defs_and_ancestry(key, &lifted_key, defs, ancestry)
+                        lift_map_key::<P, B>(key, map_key, defs).and_then(|lifted_key| {
+                            validate_attr_with_defs_and_ancestry(key, &lifted_key, defs, ancestry)
+                        })
                     {
                         out.push((
                             next_path.clone(),
@@ -2860,10 +2862,9 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>
         AttrTypeKind::Map { key, value: val_ty } => {
             if let Some(ConcreteValueRef::Map(map)) = value.as_concrete() {
                 for (k, v) in map.iter() {
-                    let key_val: Value<P, B> = lift_map_key(key, k, defs);
-                    if let Err(inner_err) =
+                    if let Err(inner_err) = lift_map_key::<P, B>(key, k, defs).and_then(|key_val| {
                         validate_attr_with_defs_and_ancestry(key, &key_val, defs, ancestry)
-                    {
+                    }) {
                         return Err(TypeError::MapKeyError {
                             key: k.clone(),
                             inner: Box::new(inner_err),
@@ -3182,7 +3183,7 @@ pub(crate) fn lift_map_key<P: crate::resource::ValueKind, B: BindingAddress>(
     key_type: &PatternAttributeType<Compiled>,
     key: &str,
     defs: &BTreeMap<String, PatternAttributeType<Compiled>>,
-) -> Value<P, B> {
+) -> Result<Value<P, B>, TypeError> {
     let mut visited_refs = Vec::new();
     let is_enum = resolve_refs_on_path(key_type, defs, &mut visited_refs)
         .is_ok_and(|resolution| matches!(&resolution.attr.kind, AttrTypeKind::Enum { .. }));
@@ -3190,9 +3191,10 @@ pub(crate) fn lift_map_key<P: crate::resource::ValueKind, B: BindingAddress>(
         EnumValueResolver::with_defs(key_type, defs)
             .resolve_state_text(key)
             .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
-            .unwrap_or_else(|_| Value::Concrete(ConcreteValue::enum_identifier(key.to_string())))
     } else {
-        Value::Concrete(ConcreteValue::String(key.to_string().into()))
+        Ok(Value::Concrete(ConcreteValue::String(
+            key.to_string().into(),
+        )))
     }
 }
 
@@ -5285,7 +5287,7 @@ pub fn enum_identity(name: &str, namespace: Option<&str>) -> TypeIdentity {
     }
 }
 
-fn validation_error_message(err: TypeError) -> String {
+pub(crate) fn validation_error_message(err: TypeError) -> String {
     match err {
         TypeError::ValidationFailed { message } => message.to_string(),
         other => other.to_string(),
@@ -5928,7 +5930,7 @@ fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: Binding
             let mut exactness = FitExactness::GENERIC_MAP;
             let mut entry_fits = Vec::with_capacity(map.len());
             for (map_key, map_value) in map {
-                let lifted_key: Value<P, B> = lift_map_key(key, map_key, defs);
+                let lifted_key: Value<P, B> = lift_map_key(key, map_key, defs).ok()?;
                 let key_fit = inspect_structure_with_defs_on_path(
                     key,
                     &lifted_key,
@@ -6806,7 +6808,7 @@ pub(crate) fn enum_value_matches(input: &str, expected: &str) -> bool {
         || input.replace('_', "-").eq_ignore_ascii_case(expected)
 }
 
-fn enum_expected_variants(
+pub(crate) fn enum_expected_variants(
     namespace: Option<&str>,
     type_name: &str,
     values: &[String],
@@ -14689,15 +14691,11 @@ impl<'a> OwnerBoundResourceSchema<'a> {
         is_string_literal: &dyn Fn(&str) -> bool,
         resolver: &dyn crate::parser::CustomTypeResolver,
     ) -> Vec<ResourceValueFinding> {
-        let lookup = crate::parser::custom_type_lookup_for_schema(resolver, self);
-        self.schema
-            .as_schema()
-            .collect_resource_values(
-                ResourceValueInputs::new(attributes),
-                is_string_literal,
-                &lookup,
-            )
-            .findings
+        self.collect_validation_inputs_with_resolver(
+            ResourceValueInputs::new(attributes),
+            is_string_literal,
+            resolver,
+        )
     }
 
     /// Collect resource findings including the binding authority's typed
@@ -15562,15 +15560,8 @@ impl PatternResourceSchema<Compiled> {
         mode: ValueEntryValidation,
         selected: Option<&HashSet<String>>,
     ) -> Vec<TypeError> {
-        self.collect_value_entries(
-            attributes,
-            is_string_literal,
-            lookup,
-            mode,
-            selected,
-            &HashSet::new(),
-        )
-        .errors
+        self.collect_value_entries(attributes, is_string_literal, lookup, mode, selected, &[])
+            .errors
     }
 }
 

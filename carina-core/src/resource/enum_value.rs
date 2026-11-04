@@ -264,21 +264,15 @@ impl EnumValueResolver<'_, Compiled> {
         &self,
         text: &super::ValueString,
     ) -> Result<CanonicalEnumValue, TypeError> {
-        let attr = self.defs.map_or(self.attr_type, |defs| {
-            self.attr_type.resolve_refs_with_defs(defs).as_attr()
-        });
-        attr.validate_identified_scalar_value(&super::Value::<super::NoPlaceholder>::Concrete(
-            super::ConcreteValue::String(text.clone()),
-        ))?;
-        let (identity, _, _, _, dsl_map) = self.parts()?;
-        Ok(CanonicalEnumValue::new_resolved(
-            identity.clone(),
-            dsl_map.api_for(text.expose_plaintext()),
-        ))
+        self.resolve_text(
+            text.expose_plaintext(),
+            EnumInputPhase::StateText,
+            Some(text),
+        )
     }
 
     pub fn resolve_raw(&self, raw: &RawEnumIdentifier) -> Result<CanonicalEnumValue, TypeError> {
-        self.resolve_text(raw.as_str(), EnumInputPhase::RawDsl)
+        self.resolve_text(raw.as_str(), EnumInputPhase::RawDsl, None)
     }
 
     /// Resolve one authored DSL member and return both its canonical API value
@@ -313,15 +307,30 @@ impl EnumValueResolver<'_, Compiled> {
     }
 
     pub fn resolve_state_text(&self, text: &str) -> Result<CanonicalEnumValue, TypeError> {
-        self.resolve_text(text, EnumInputPhase::StateText)
+        self.resolve_text(text, EnumInputPhase::StateText, None)
     }
 
     fn resolve_text(
         &self,
         text: &str,
         phase: EnumInputPhase,
+        quoted: Option<&super::ValueString>,
     ) -> Result<CanonicalEnumValue, TypeError> {
         let (identity, values, dsl_aliases, validate, dsl_map) = self.parts()?;
+        if let (Some(text), Some(values)) = (quoted, values) {
+            return Err(TypeError::StringLiteralExpectedEnum {
+                user_typed: text.into(),
+                attribute: None,
+                type_name: identity.kind.clone(),
+                expected: crate::schema::enum_expected_variants(
+                    identity.dotted_prefix().as_deref(),
+                    &identity.kind,
+                    values,
+                    dsl_aliases,
+                ),
+                extra_message: None,
+            });
+        }
         let valid: Vec<&str> = values.into_iter().flatten().map(String::as_str).collect();
         let prefix_escaped_value = if phase == EnumInputPhase::RawDsl {
             raw_dsl_prefix_escaped_value(text, identity, values)
@@ -409,6 +418,17 @@ impl EnumValueResolver<'_, Compiled> {
                 identity.clone(),
                 api_value,
             ))
+        } else if let Some(quoted) = quoted {
+            Err(TypeError::StringLiteralExpectedEnum {
+                user_typed: quoted.into(),
+                attribute: None,
+                type_name: identity.kind.clone(),
+                expected: Vec::new(),
+                extra_message: validation_result
+                    .and_then(Result::err)
+                    .map(crate::schema::validation_error_message)
+                    .map(crate::provider_text::ProviderText::new),
+            })
         } else {
             Err(invalid_enum_variant(
                 text,

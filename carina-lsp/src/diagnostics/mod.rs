@@ -25,7 +25,7 @@ use carina_core::resource::{
     RelativeBindingName, Value as GenericValue,
 };
 use carina_core::schema::{SchemaRegistry, TypeError};
-use carina_core::validation::DeferredAccessTypeError;
+use carina_core::validation::AccessTypeFinding;
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
@@ -323,14 +323,14 @@ impl ExpandedDiagnosticValidationInputs<'_> {
         attribute: &str,
         expected: carina_core::schema::AssignmentSink<'_, carina_core::schema::Compiled>,
         schemas: &SchemaRegistry,
-    ) -> Option<Result<(), carina_core::validation::DeferredAccessTypeError>> {
+    ) -> Option<Result<(), AccessTypeFinding>> {
         let resource = self
             .graph
             .iter_all_resources()
             .find(|candidate| candidate.id() == resource_id)?;
         let attributes = resource.attributes();
         let value = attributes.get(attribute)?;
-        Some(carina_core::validation::check_deferred_access_type(
+        Some(carina_core::validation::check_editor_access_type(
             value,
             expected,
             &self.inference_bindings,
@@ -1103,14 +1103,7 @@ impl DiagnosticRun<'_> {
             let binding_error_sinks = parsed
                 .bare_binding_uses()
                 .uses()
-                .filter(|use_site| {
-                    use_site.path.segments().len() == 1
-                        || binding_use_report.resource_findings().any(|finding| {
-                            finding.use_site.source_file == use_site.source_file
-                                && finding.use_site.span == use_site.span
-                                && finding.use_site.name == use_site.name
-                        })
-                })
+                .filter(|use_site| binding_use_report.owns_resource_use(use_site))
                 .filter_map(|use_site| match &use_site.owner {
                     carina_core::parser::BindingUseOwner::Resource(address) => Some((
                         address.resource_id().clone(),
@@ -1131,17 +1124,13 @@ impl DiagnosticRun<'_> {
                 })
                 .collect::<HashSet<_>>();
             for finding in binding_use_report.resource_findings() {
-                match finding.resource_value_outcome() {
-                    carina_core::validation::ResourceBindingOutcome::Value(_) => {}
-                    carina_core::validation::ResourceBindingOutcome::Binding(error) => {
-                        diagnostics.extend(render_merged(
-                            doc,
-                            &finding.diagnostic(),
-                            DiagnosticSeverity::ERROR,
-                            error.to_string(),
-                        ));
-                    }
-                }
+                let finding = finding.diagnostic();
+                diagnostics.extend(render_merged(
+                    doc,
+                    &finding,
+                    DiagnosticSeverity::ERROR,
+                    finding.detail().to_string(),
+                ));
             }
             let semantic_file = current_file_path.and_then(|path| {
                 merged_result
@@ -1439,50 +1428,41 @@ impl DiagnosticRun<'_> {
                         let findings = validation::attribute_findings(
                             rref,
                             attr_name,
-                            typecheck_value,
+                            &values[attr_name],
                             arithmetic,
                             |value, top_level| {
                                 let expected = validated_schema.assignment_sink(
                                     attribute.attr_type(),
                                     &self.provider_context.catalog().custom_types,
                                 );
-                                let result: Result<(), DeferredAccessTypeError> = if top_level
+                                let expanded = (top_level
                                     && matches!(
                                         value,
                                         Value::Deferred(
                                             DeferredValue::ResourceRef { .. }
                                                 | DeferredValue::Access(_)
                                         )
-                                    ) {
-                                    expanded_validation_inputs
-                                        .as_ref()
-                                        .and_then(|inputs| {
-                                            inputs.check_resource_access(
-                                                resource_id,
-                                                attr_name,
-                                                expected,
-                                                &self.schemas,
-                                            )
-                                        })
-                                        .unwrap_or_else(|| {
-                                            carina_core::validation::check_deferred_access_type(
-                                                value,
-                                                expected,
-                                                &inference_bindings,
-                                                &self.schemas,
-                                                &binding_index,
-                                            )
-                                        })
-                                } else {
-                                    carina_core::validation::check_deferred_access_type(
+                                    ))
+                                .then(|| {
+                                    expanded_validation_inputs.as_ref().and_then(|inputs| {
+                                        inputs.check_resource_access(
+                                            resource_id,
+                                            attr_name,
+                                            expected,
+                                            &self.schemas,
+                                        )
+                                    })
+                                })
+                                .flatten();
+                                expanded.unwrap_or_else(|| {
+                                    carina_core::validation::check_editor_access_type(
                                         value,
                                         expected,
                                         &inference_bindings,
                                         &self.schemas,
                                         &binding_index,
                                     )
-                                };
-                                result
+                                })
                             },
                         );
                         for finding in findings {

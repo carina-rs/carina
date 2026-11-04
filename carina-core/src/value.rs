@@ -6237,8 +6237,16 @@ fn canonicalize_without_fit<
             let canonicalized = map
                 .into_iter()
                 .map(|(key, value)| {
-                    let lifted_key: Value<H, B> = crate::schema::lift_map_key(key_type, &key, defs)
-                        .into_placeholder_type::<H>();
+                    let lifted_key: Value<H, B> =
+                        match crate::schema::lift_map_key(key_type, &key, defs) {
+                            Ok(value) => value,
+                            Err(source) => error_policy
+                                .canonicalization_failed(
+                                    Value::Concrete(ConcreteValue::String(key.clone().into())),
+                                    source,
+                                )
+                                .map_err(|error| error_policy.at_map_key(key.clone(), error))?,
+                        };
                     let canonical_key_value = canonicalize_with_type_for_purpose(
                         lifted_key,
                         key_type,

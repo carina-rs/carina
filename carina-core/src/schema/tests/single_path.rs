@@ -205,3 +205,410 @@ fn resource_collection_checks_both_coalesce_operands_once() {
     assert_eq!(findings.len(), 2);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
+
+fn review_binding_collection(
+    attribute: AttributeSchema,
+    source: &str,
+    context: &crate::parser::ProviderContext,
+) -> Vec<ResourceValueFinding> {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(attribute)
+            .validate()
+            .unwrap(),
+    );
+    let parsed = crate::parser::parse(source, context).unwrap();
+    let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+    let bindings = crate::validation::check_bare_binding_uses(
+        &parsed,
+        &crate::validation::ValidationTypeContext::new_providerless(
+            &parsed,
+            &registry,
+            context,
+            &signatures,
+        ),
+    );
+    let tree = crate::parser::AnalysisTree::try_from_file(&parsed).unwrap();
+    let resource = tree.resources().next().unwrap();
+    let values = resource.resolved_attributes();
+    registry
+        .get("mock", "test.Sink", SchemaKind::Resource)
+        .unwrap()
+        .collect_validation_inputs_with_resolver(
+            bindings.resource_value_inputs(parsed.bare_binding_uses(), resource, &values),
+            &|_| false,
+            context.custom_type_resolver(),
+        )
+}
+
+#[test]
+fn binding_precheck_findings_keep_authored_targets_with_and_without_runtime_values() {
+    let event = AttributeType::enum_(
+        TypeIdentity::new(Some("mock"), ["test", "Sink"], "Event"),
+        Some(vec!["viewer_request".into()]),
+        vec![],
+        None,
+        None,
+    );
+    for (binding, attr_type, value, count) in [
+        (
+            "5",
+            AttributeType::map(event.clone()),
+            "{ default = viewer_request, other = 7 }",
+            2,
+        ),
+        ("mock.test.Source {}", event.clone(), "viewer_request", 1),
+        (
+            "mock.test.Source {}",
+            AttributeType::list(event.clone()),
+            "[viewer_request, viewer_request]",
+            2,
+        ),
+        (
+            "mock.test.Source {}",
+            AttributeType::map(event),
+            "{ default = viewer_request }",
+            1,
+        ),
+    ] {
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("test.Source").validate().unwrap(),
+        );
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("test.Sink")
+                .attribute(AttributeSchema::required("value", attr_type).build())
+                .validate()
+                .unwrap(),
+        );
+        let source =
+            format!("let viewer_request = {binding}\nmock.test.Sink {{ value = {value} }}\n");
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse(&source, &context).unwrap();
+        let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+        let bindings = crate::validation::check_bare_binding_uses(
+            &parsed,
+            &crate::validation::ValidationTypeContext::new_providerless(
+                &parsed,
+                &schemas,
+                &context,
+                &signatures,
+            ),
+        );
+        let authority: Vec<_> = bindings.resource_value_findings().collect();
+        assert!(!authority.is_empty(), "{source}");
+        let tree = crate::parser::AnalysisTree::try_from_file(&parsed).unwrap();
+        let resource = tree.resources().last().unwrap();
+        let values = resource.resolved_attributes();
+        let findings = schemas
+            .get("mock", "test.Sink", SchemaKind::Resource)
+            .unwrap()
+            .collect_validation_inputs_with_resolver(
+                bindings.resource_value_inputs(parsed.bare_binding_uses(), resource, &values),
+                &|_| false,
+                context.custom_type_resolver(),
+            );
+        assert_eq!(findings.len(), count, "{source}: {findings:#?}");
+        for finding in authority {
+            assert!(matches!(
+                finding.error,
+                TypeError::BindingShadowsEnumMember(_)
+            ));
+            assert_eq!(
+                findings.iter().filter(|actual| **actual == finding).count(),
+                1,
+                "binding authority's typed error and parser target must survive: {source}: {findings:#?}",
+            );
+        }
+    }
+}
+
+#[test]
+fn review_direct_binding_preserves_writability() {
+    let findings = review_binding_collection(
+        AttributeSchema::provider_populated("value", AttributeType::string()).build(),
+        "let input = \"ok\"\nmock.test.Sink { value = input }\n",
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert!(matches!(
+        findings[0].error,
+        TypeError::ReadOnlyAttribute { .. }
+    ));
+}
+
+#[test]
+fn review_direct_binding_runs_bridged_validator() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let identity = TypeIdentity::bare("Bridged");
+    let context = crate::parser::ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            std::collections::HashSet::new(),
+            Box::new(move |target: CustomTypeValidationTarget<'_>, _: &Value| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err(CustomTypeValidationError::Rejected {
+                    owner: "mock".into(),
+                    identity: target.identity().clone(),
+                    message: "bridge rejected".into(),
+                })
+            }),
+        ),
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
+    };
+    let findings = review_binding_collection(
+        AttributeSchema::optional(
+            "value",
+            AttributeType::refined_string(Some(identity), None, None, None),
+        )
+        .build(),
+        "let input = \"ok\"\nmock.test.Sink { value = input }\n",
+        &context,
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "{findings:#?}");
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert!(findings[0].error.to_string().contains("bridge rejected"));
+}
+
+#[test]
+fn review_failed_nested_binding_retains_count_and_sibling_errors() {
+    let findings = review_binding_collection(
+        AttributeSchema::optional(
+            "values",
+            AttributeType::refined_list(
+                AttributeType::string(),
+                true,
+                Some((None, Some(1))),
+                ListElements::AllowDuplicates,
+            ),
+        )
+        .build(),
+        "let bad = 3\nmock.test.Sink { values = [bad, 4] }\n",
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
+    assert_eq!(findings.len(), 3, "{findings:#?}");
+    assert_eq!(
+        findings
+            .iter()
+            .filter(|f| matches!(f.error, TypeError::LengthOutOfRange { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        findings
+            .iter()
+            .filter(|f| matches!(f.error, TypeError::TypeMismatch { .. }))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn review_successful_nested_binding_callback_runs_once() {
+    for rejecting in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let leaf = AttributeType::refined_string_with_validator(
+            TypeIdentity::bare("Counted"),
+            None,
+            None,
+            validator(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                if rejecting {
+                    Err(TypeError::ValidationFailed {
+                        message: "rejected".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            }),
+            None,
+        );
+        let findings = review_binding_collection(
+            AttributeSchema::optional("values", AttributeType::list(leaf)).build(),
+            "let input = \"ok\"\nmock.test.Sink { values = [input] }\n",
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "rejecting={rejecting}: {findings:#?}"
+        );
+        assert_eq!(findings.len(), usize::from(rejecting), "{findings:#?}");
+    }
+}
+
+#[test]
+fn review_quoted_open_enum_callback_receives_canonical_spelling_once() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let leaf = AttributeType::enum_(
+        TypeIdentity::new(Some("mock"), ["test"], "Zone"),
+        None,
+        vec![],
+        Some(validator(move |value| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            if matches!(value, Value::Concrete(ConcreteValue::String(text)) if text.expose_plaintext() == "ap-northeast-1")
+            {
+                Ok(())
+            } else {
+                Err(TypeError::ValidationFailed {
+                    message: "canonical API spelling required".into(),
+                })
+            }
+        })),
+        Some(DslTransform::HyphenToUnderscore),
+    );
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(AttributeSchema::optional("value", leaf).build())
+            .validate()
+            .unwrap(),
+    );
+    let values: HashMap<String, Value> = HashMap::from([(
+        "value".into(),
+        Value::Concrete(ConcreteValue::String("ap_northeast_1".into())),
+    )]);
+    let result = registry
+        .get("mock", "test.Sink", SchemaKind::Resource)
+        .unwrap()
+        .validate_with_resolver(
+            &values,
+            &|_| true,
+            &|_: CustomTypeValidationTarget<'_>, _: &Value| Ok(()),
+        );
+    assert!(result.is_ok(), "{result:#?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn review_invalid_enum_map_key_callback_runs_once() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let key = AttributeType::enum_(
+        TypeIdentity::new(Some("mock"), ["test"], "Key"),
+        None,
+        vec![],
+        Some(validator(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Err(TypeError::ValidationFailed {
+                message: "bad key".into(),
+            })
+        })),
+        None,
+    );
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "values",
+                    AttributeType::map_with_key(key, AttributeType::string()),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let values: HashMap<String, Value> = HashMap::from([(
+        "values".into(),
+        Value::Concrete(ConcreteValue::Map(
+            indexmap::indexmap! { "bad".into() => Value::Concrete(ConcreteValue::String("ok".into())) },
+        )),
+    )]);
+    let findings = registry
+        .get("mock", "test.Sink", SchemaKind::Resource)
+        .unwrap()
+        .collect_validation_with_resolver(
+            &values,
+            &|_| false,
+            &|_: CustomTypeValidationTarget<'_>, _: &Value| Ok(()),
+        );
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn review_secret_map_path_debug_is_redacted() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "values",
+                    AttributeType::map_with_key(
+                        AttributeType::refined_string(None, None, Some((None, Some(1))), None),
+                        AttributeType::string(),
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let values: HashMap<String, Value> = HashMap::from([(
+        "values".into(),
+        Value::Deferred(crate::resource::DeferredValue::Secret(Box::new(
+            Value::Concrete(ConcreteValue::Map(
+                indexmap::indexmap! { "private-key".into() => Value::Concrete(ConcreteValue::String("ok".into())) },
+            )),
+        ))),
+    )]);
+    let findings = registry
+        .get("mock", "test.Sink", SchemaKind::Resource)
+        .unwrap()
+        .collect_validation_with_resolver(
+            &values,
+            &|_| false,
+            &|_: CustomTypeValidationTarget<'_>, _: &Value| Ok(()),
+        );
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert!(!format!("{findings:#?}").contains("private-key"));
+    let ResourceValueTarget::Attribute { path, .. } = &findings[0].target else {
+        panic!("attribute")
+    };
+    assert!(!path.to_string().contains("private-key"));
+}
+
+#[test]
+fn review_bound_map_key_reuses_success_and_failure_results() {
+    for rejecting in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let key = AttributeType::enum_(
+            TypeIdentity::new(Some("mock"), ["test"], "Key"),
+            None,
+            vec![],
+            Some(validator(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                if rejecting {
+                    Err(TypeError::ValidationFailed {
+                        message: "bad key".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            })),
+            None,
+        );
+        let findings = review_binding_collection(
+            AttributeSchema::optional(
+                "values",
+                AttributeType::map_with_key(key, AttributeType::string()),
+            )
+            .build(),
+            "let input = { bad = \"ok\" }\nmock.test.Sink { values = input }\n",
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
+        assert_eq!(findings.len(), usize::from(rejecting), "{findings:#?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "rejecting={rejecting}");
+    }
+}

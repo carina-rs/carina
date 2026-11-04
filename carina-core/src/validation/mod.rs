@@ -638,51 +638,16 @@ impl<'a, B: BindingAddress> ValidationTypeContext<'a, B> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BindingUseFinding {
     pub use_site: crate::parser::BareBindingUse,
-    pub error: BindingResolutionError,
+    pub(crate) error: BindingResolutionError,
 }
 
 impl BindingUseFinding {
-    /// Separate core schema values from the other binding diagnostics before
-    /// either frontend renders them.
-    pub fn resource_value_outcome(&self) -> ResourceBindingOutcome<'_> {
-        match &self.error {
-            BindingResolutionError::Type(error) => ResourceBindingOutcome::Value(error),
-            BindingResolutionError::ValueType(error) => {
-                ResourceBindingOutcome::Binding(BindingDiagnostic::ValueType(error))
-            }
-            BindingResolutionError::ReferenceType(error) => {
-                ResourceBindingOutcome::Binding(BindingDiagnostic::ReferenceType(error))
-            }
-            BindingResolutionError::DeferredAccess(error) => {
-                ResourceBindingOutcome::Binding(BindingDiagnostic::DeferredAccess(error))
-            }
-            BindingResolutionError::CustomType(error) => {
-                ResourceBindingOutcome::Binding(BindingDiagnostic::CustomType(error))
-            }
-            BindingResolutionError::TypeResolution(error) => {
-                ResourceBindingOutcome::Binding(BindingDiagnostic::TypeResolution(error))
-            }
-            BindingResolutionError::Existing(message) => {
-                ResourceBindingOutcome::Binding(BindingDiagnostic::Existing(message))
-            }
-        }
-    }
-
-    pub fn diagnostic(&self) -> crate::parser::Located<&Self> {
-        crate::parser::Located::new(self.use_site.location().clone(), self)
-    }
-
     fn error(use_site: crate::parser::BareBindingUse, error: BindingResolutionError) -> Self {
         Self { use_site, error }
     }
 }
 
-pub enum ResourceBindingOutcome<'a> {
-    Value(&'a TypeError),
-    Binding(BindingDiagnostic<'a>),
-}
-
-pub enum BindingDiagnostic<'a> {
+enum BindingDiagnostic<'a> {
     ValueType(&'a typecheck::TypeExprValueError),
     ReferenceType(&'a BindingReferenceTypeError),
     DeferredAccess(&'a DeferredAccessTypeError),
@@ -701,6 +666,53 @@ impl std::fmt::Display for BindingDiagnostic<'_> {
             Self::TypeResolution(error) => error.fmt(f),
             Self::Existing(message) => f.write_str(message),
         }
+    }
+}
+
+/// A binding diagnostic that cannot contain a resource schema value error.
+/// The raw finding and its constructor remain private to the authority.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BindingUseDiagnostic {
+    pub use_site: crate::parser::BareBindingUse,
+    inner: BindingUseFinding,
+}
+impl BindingUseDiagnostic {
+    fn from_finding(finding: &BindingUseFinding) -> Option<Self> {
+        match finding.error {
+            BindingResolutionError::Type(_) => None,
+            _ => Some(Self {
+                use_site: finding.use_site.clone(),
+                inner: finding.clone(),
+            }),
+        }
+    }
+    pub fn diagnostic(&self) -> crate::parser::Located<impl std::fmt::Display + '_> {
+        let detail = match &self.inner.error {
+            BindingResolutionError::ValueType(error) => BindingDiagnostic::ValueType(error),
+            BindingResolutionError::ReferenceType(error) => BindingDiagnostic::ReferenceType(error),
+            BindingResolutionError::DeferredAccess(error) => {
+                BindingDiagnostic::DeferredAccess(error)
+            }
+            BindingResolutionError::CustomType(error) => BindingDiagnostic::CustomType(error),
+            BindingResolutionError::TypeResolution(error) => {
+                BindingDiagnostic::TypeResolution(error)
+            }
+            BindingResolutionError::Existing(message) => BindingDiagnostic::Existing(message),
+            BindingResolutionError::Type(_) => {
+                unreachable!("value errors cannot construct a binding diagnostic")
+            }
+        };
+        crate::parser::Located::new(self.use_site.location().clone(), detail)
+    }
+}
+impl std::fmt::Display for BindingUseDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+impl std::error::Error for BindingUseDiagnostic {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.inner.error)
     }
 }
 
@@ -723,9 +735,23 @@ impl std::error::Error for BindingUseFinding {
 }
 
 /// Complete result of consuming one parsed file's out-of-band provenance.
+/// Resource binding diagnostics cannot expose schema value errors.
+///
+/// ```compile_fail
+/// use carina_core::validation::{BindingUseReport, BindingResolutionError};
+/// fn bypass_value_report(report: &BindingUseReport) {
+///     for finding in report.resource_findings() {
+///         let _: &BindingResolutionError = &finding.error;
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct BindingUseReport {
     findings: Vec<BindingUseFinding>,
+    value_checks: Vec<(
+        crate::parser::BareBindingUse,
+        crate::schema::resource_value_validation::BindingValueValidation,
+    )>,
 }
 
 impl std::fmt::Display for BindingUseReport {
@@ -810,77 +836,130 @@ impl BindingUseReport {
         resource: &crate::parser::AnalysisResourceRef<'_, P, T, D, B>,
         attributes: &'a std::collections::HashMap<String, GenericValue<P, B>>,
     ) -> crate::schema::ResourceValueInputs<'a, P, B> {
-        use crate::parser::{AttributePathSegment, BindingUseOwner};
-        use crate::schema::{
-            FieldPath, ResourceValueFinding, ResourceValueInputs, ResourceValueTarget,
-            ValueFindingAnchor,
+        use crate::parser::BindingUseOwner;
+        use crate::schema::resource_value_validation::{
+            ResourceBindingValidation, ResourceBindingValueOutcome,
         };
         let owns = |use_site: &crate::parser::BareBindingUse| {
             matches!(use_site.owner, BindingUseOwner::Resource(_))
                 && resource.location().file() == use_site.location().file()
                 && resource.location().span().contains(use_site.span)
         };
-        let mut inputs = ResourceValueInputs::new(attributes);
-        for use_site in uses.uses().filter(|use_site| owns(use_site)) {
-            if use_site.path.segments().len() == 1 {
-                inputs.checked.insert(use_site.path.root_name().into());
-            }
-        }
+        let mut inputs = crate::schema::ResourceValueInputs::new(attributes);
         for slot in uses.pending_slots().filter(|slot| matches!(&slot.owner, BindingUseOwner::Resource(address) if address.resource_id() == resource.id())) {
-            inputs.checked.insert(slot.path.root_name().into());
+            inputs.pending.insert(slot.path.root_name().into());
         }
+        // Findings are already unique by authored use, even when expansion
+        // recorded several value checks for that token. Precheck failures
+        // stay authoritative; only schema walks with reusable leaf outcomes
+        // are attributed again by the resource collector.
         for finding in self
-            .resource_findings()
+            .resource_raw_findings()
             .filter(|finding| owns(&finding.use_site))
         {
-            let name = finding.use_site.path.root_name();
-            inputs.checked.insert(name.into());
-            if let ResourceBindingOutcome::Value(error) = finding.resource_value_outcome() {
-                let path = finding.use_site.path.segments()[1..].iter().fold(
-                    FieldPath::new(),
-                    |path, segment| match segment {
-                        AttributePathSegment::ListIndex(index) => path.push_index(*index),
-                        AttributePathSegment::Key(name)
-                        | AttributePathSegment::StructField(name)
-                        | AttributePathSegment::Attribute(name) => path.push_field(name.clone()),
-                    },
-                );
-                inputs.binding_findings.push(ResourceValueFinding {
-                    target: ResourceValueTarget::Attribute {
-                        authored_attribute: name.into(),
-                        path,
-                        anchor: ValueFindingAnchor::BindingToken(
-                            finding.use_site.location().clone(),
-                        ),
-                    },
-                    error: error.clone(),
-                });
+            let error = match &finding.error {
+                BindingResolutionError::Type(error) => {
+                    if !matches!(error, TypeError::BindingShadowsEnumMember(_))
+                        && self.value_checks.iter().any(|(use_site, checked)| {
+                            same_authored_use(&finding.use_site, use_site) && !checked.is_empty()
+                        })
+                    {
+                        continue;
+                    }
+                    Some(error.clone())
+                }
+                _ => None,
+            };
+            inputs.bindings.push(ResourceBindingValidation {
+                attribute: finding.use_site.path.root_name().into(),
+                path: binding_field_path(&finding.use_site.path),
+                location: finding.use_site.location().clone(),
+                outcome: ResourceBindingValueOutcome::Rejected(error),
+            });
+        }
+        for (use_site, checked) in self
+            .value_checks
+            .iter()
+            .filter(|(use_site, _)| owns(use_site))
+        {
+            if inputs.bindings.iter().any(|binding| {
+                binding.location == *use_site.location()
+                    && matches!(binding.outcome, ResourceBindingValueOutcome::Rejected(_))
+            }) {
+                continue;
             }
+            inputs.bindings.push(ResourceBindingValidation {
+                attribute: use_site.path.root_name().into(),
+                path: binding_field_path(&use_site.path),
+                location: use_site.location().clone(),
+                outcome: ResourceBindingValueOutcome::Checked(checked.clone()),
+            });
         }
         inputs
     }
 
-    pub fn findings(&self) -> &[BindingUseFinding] {
+    pub(crate) fn findings(&self) -> &[BindingUseFinding] {
         &self.findings
     }
 
     /// Findings whose sink remains owned by resource validation adapters.
     /// Module-argument findings are consumed by [`check_module_calls`].
-    pub fn resource_findings(&self) -> impl Iterator<Item = &BindingUseFinding> {
+    fn resource_raw_findings(&self) -> impl Iterator<Item = &BindingUseFinding> {
         self.findings.iter().filter(|finding| {
             matches!(
-                &finding.use_site.owner,
-                crate::parser::BindingUseOwner::Resource(_address)
+                finding.use_site.owner,
+                crate::parser::BindingUseOwner::Resource(_)
             )
         })
     }
 
-    pub fn has_resource_findings(&self) -> bool {
-        self.resource_findings().next().is_some()
+    pub fn resource_findings(&self) -> impl Iterator<Item = BindingUseDiagnostic> {
+        self.resource_raw_findings()
+            .filter_map(BindingUseDiagnostic::from_finding)
     }
 
-    pub fn into_findings(self) -> Vec<BindingUseFinding> {
+    /// Direct uses and failed nested uses supersede editor binding checks.
+    /// Ownership includes typed value failures as well as opaque diagnostics.
+    pub fn owns_resource_use(&self, use_site: &crate::parser::BareBindingUse) -> bool {
+        matches!(use_site.owner, crate::parser::BindingUseOwner::Resource(_))
+            && (use_site.path.segments().len() == 1
+                || self
+                    .resource_raw_findings()
+                    .any(|finding| same_authored_use(&finding.use_site, use_site)))
+    }
+
+    /// Resource schema errors cross only the typed value-report boundary.
+    pub fn resource_value_findings(
+        &self,
+    ) -> impl Iterator<Item = crate::schema::ResourceValueFinding> + '_ {
+        self.resource_raw_findings().filter_map(|finding| {
+            let BindingResolutionError::Type(error) = &finding.error else {
+                return None;
+            };
+            Some(crate::schema::ResourceValueFinding {
+                target: crate::schema::ResourceValueTarget::Attribute {
+                    authored_attribute: finding.use_site.path.root_name().into(),
+                    path: crate::schema::ValueFindingPath::new(binding_field_path(
+                        &finding.use_site.path,
+                    )),
+                    anchor: crate::schema::ValueFindingAnchor::BindingToken(
+                        finding.use_site.location().clone(),
+                    ),
+                },
+                error: error.clone(),
+            })
+        })
+    }
+
+    pub fn has_resource_findings(&self) -> bool {
+        self.resource_raw_findings().next().is_some()
+    }
+
+    pub fn into_findings(self) -> Vec<BindingUseDiagnostic> {
         self.findings
+            .iter()
+            .filter_map(BindingUseDiagnostic::from_finding)
+            .collect()
     }
 
     pub fn is_ready(&self) -> bool {
@@ -1381,6 +1460,9 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
     sink: RefSink<'_>,
     context: &ValidationTypeContext<'_, B>,
     diagnostic_path: &impl Fn(ReferencePathRef<'_, B>) -> ModuleCallDiagnosticPath,
+    resource_validation: Option<
+        &mut crate::schema::resource_value_validation::BindingValueValidation,
+    >,
 ) -> Result<(), BindingResolutionError> {
     let mut prechecked = precheck_value_source(
         use_site,
@@ -1405,6 +1487,15 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
             .expect("enum_target_from_sink proved the enum identity");
         let existing = match prechecked {
             Some(error) => Err(error),
+            None if declared_type.is_none() && resource_validation.is_some() => {
+                validate_bound_schema_value(
+                    use_site,
+                    value,
+                    sink,
+                    context,
+                    resource_validation.unwrap(),
+                )
+            }
             None => binding_value_assignable_to_enum(
                 value,
                 declared_type,
@@ -1436,8 +1527,15 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
             defs,
             ancestry,
             owner: _,
-        } => crate::schema::validate_attr_with_defs_and_ancestry(attr_type, value, defs, ancestry)
+        } => match resource_validation {
+            Some(validation) => {
+                validate_bound_schema_value(use_site, value, sink, context, validation)
+            }
+            None => crate::schema::validate_attr_with_defs_and_ancestry(
+                attr_type, value, defs, ancestry,
+            )
             .map_err(BindingResolutionError::Type),
+        },
         RefSink::String => crate::schema::validate_attr_with_defs_and_ancestry(
             &AttributeType::string(),
             value,
@@ -1458,6 +1556,61 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
             )
             .map_err(|error| BindingResolutionError::ValueType(Box::new(error))),
     }
+}
+
+fn binding_field_path(path: &crate::parser::AttributePath) -> crate::schema::FieldPath {
+    use crate::parser::AttributePathSegment;
+    path.segments()[1..].iter().fold(
+        crate::schema::FieldPath::new(),
+        |path, segment| match segment {
+            AttributePathSegment::ListIndex(index) => path.push_index(*index),
+            AttributePathSegment::Attribute(name)
+            | AttributePathSegment::StructField(name)
+            | AttributePathSegment::Key(name) => path.push_field(name.clone()),
+        },
+    )
+}
+
+fn validate_bound_schema_value<B: BindingAddress>(
+    use_site: &crate::parser::BareBindingUse,
+    value: &GenericValue<ParserPlaceholder, B>,
+    sink: RefSink<'_>,
+    context: &ValidationTypeContext<'_, B>,
+    validation: &mut crate::schema::resource_value_validation::BindingValueValidation,
+) -> Result<(), BindingResolutionError> {
+    let RefSink::EffectiveType {
+        attr_type,
+        defs,
+        ancestry,
+        owner,
+    } = sink
+    else {
+        unreachable!("resource sink")
+    };
+    let crate::parser::SchemaTypeOwner::Provider(owner) = owner;
+    let lookup = |attr: &AttributeType, value: &crate::resource::Value| {
+        let Some(declaration) = crate::parser::IdentifiedCustomTypeDeclaration::new(attr) else {
+            return Ok(());
+        };
+        context
+            .raw_provider_context()
+            .custom_type_resolver()
+            .validate(
+                crate::parser::CustomTypeValidationTarget::Declaration { owner, declaration },
+                value,
+            )
+            .map_err(TypeError::from)
+    };
+    crate::schema::resource_value_validation::check_binding_value(
+        attr_type,
+        value,
+        defs,
+        ancestry,
+        &binding_field_path(&use_site.path),
+        &lookup,
+        validation,
+    )
+    .map_err(BindingResolutionError::Type)
 }
 
 fn resource_sink<
@@ -1672,6 +1825,7 @@ fn resolve_record_against_module<B: BindingAddress>(
             RefSink::TypeExpr(&expected),
             context,
             diagnostic_path,
+            None,
         ),
         crate::parser::BareBindingSource::Structural(handle) => {
             check_handle_sink(handle, &resolved)
@@ -1758,9 +1912,12 @@ where
 {
     let mut report = BindingUseReport {
         findings: Vec::new(),
+        value_checks: Vec::new(),
     };
 
     for record in file.bare_binding_uses().records() {
+        let mut value_checks =
+            crate::schema::resource_value_validation::BindingValueValidation::default();
         let mut result = match &record.authored.owner {
             crate::parser::BindingUseOwner::Resource(address) => {
                 match resource_sink(file, address, &record.authored.path, context.schemas) {
@@ -1775,6 +1932,7 @@ where
                             sink,
                             context,
                             &diagnostic_path,
+                            Some(&mut value_checks),
                         ),
                         crate::parser::BareBindingSource::Structural(handle) => {
                             let existing = BindingResolutionError::Existing(
@@ -1839,6 +1997,14 @@ where
             ));
         }
 
+        if matches!(
+            record.authored.owner,
+            crate::parser::BindingUseOwner::Resource(_)
+        ) {
+            report
+                .value_checks
+                .push((record.authored.clone(), value_checks));
+        }
         if let Err(error) = result {
             let finding = BindingUseFinding::error(record.authored.clone(), error);
             if !report
@@ -2208,6 +2374,55 @@ fn visit_computed_accesses_with_sink<'a, B: BindingAddress>(
         | GenericValue::Deferred(crate::resource::DeferredValue::Unknown(_))
         | GenericValue::Deferred(crate::resource::DeferredValue::Placeholder(_)) => {}
     }
+}
+
+/// Editor access findings cannot be fabricated from arbitrary inference text.
+///
+/// ```compile_fail
+/// use carina_core::validation::AccessTypeFinding;
+/// use carina_core::validation::inference::InferenceError;
+/// let _ = AccessTypeFinding::InvalidAccess {
+///     error: InferenceError::UnknownType { reason: "stringified TypeError".into() },
+/// };
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessTypeFinding {
+    error: DeferredAccessTypeError,
+}
+impl AccessTypeFinding {
+    pub fn is_type_mismatch(&self) -> bool {
+        matches!(self.error, DeferredAccessTypeError::TypeMismatch { .. })
+    }
+}
+impl std::fmt::Display for AccessTypeFinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+/// Infer editor expressions through an opaque, authority-produced finding.
+/// Coalesce compatibility is checked only after each operand satisfies the
+/// sink; concrete sink failures stay with resource-value validation.
+pub fn check_editor_access_type<B: BindingAddress>(
+    value: &GenericValue<ParserPlaceholder, B>,
+    expected: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
+    bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
+    schemas: &SchemaRegistry,
+    binding_index: &BindingIndex<'_, B>,
+) -> Result<(), AccessTypeFinding> {
+    if let GenericValue::Deferred(crate::resource::DeferredValue::Coalesce { value, default }) =
+        value
+    {
+        for operand in [value, default] {
+            if check_deferred_access_type(operand, expected, bindings, schemas, binding_index)
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+    }
+    check_deferred_access_type(value, expected, bindings, schemas, binding_index)
+        .map_err(|error| AccessTypeFinding { error })
 }
 
 /// A statically-known postfix access error shared by CLI validation and LSP
@@ -2610,12 +2825,19 @@ fn check_integer_result_sink<B: BindingAddress>(
     }
 }
 
+#[derive(Clone, Copy)]
+enum ArithmeticResultOwner {
+    Expression,
+    CoreWhenConcrete,
+}
+
 fn check_integer_arithmetic_types_with_sink<'a, B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     sink: Option<RefSink<'a>>,
     bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
     schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
+    result_owner: ArithmeticResultOwner,
 ) -> Vec<crate::parser::Located<IntegerArithmeticTypeFinding>> {
     let mut findings = Vec::new();
     visit_computed_accesses_with_sink(value, sink, &mut |candidate, candidate_sink| {
@@ -2642,7 +2864,16 @@ fn check_integer_arithmetic_types_with_sink<'a, B: BindingAddress>(
                 binding_index,
             )
         })
-        .and_then(|()| check_integer_result_sink(candidate, candidate_sink, binding_index));
+        .and_then(|()| match result_owner {
+            ArithmeticResultOwner::CoreWhenConcrete
+                if crate::parser::is_static_value(candidate) =>
+            {
+                Ok(())
+            }
+            ArithmeticResultOwner::Expression | ArithmeticResultOwner::CoreWhenConcrete => {
+                check_integer_result_sink(candidate, candidate_sink, binding_index)
+            }
+        });
         let Err(error) = result else {
             return;
         };
@@ -2693,13 +2924,16 @@ where
             .effective_attribute_by_authored_name(name)
             .expect("a checked attribute has an effective sink")
             .value_type();
-        check_integer_arithmetic_types(
+        check_integer_arithmetic_types_with_sink(
             &attributes[name],
-            sink,
-            schema.schema_type_owner(),
+            Some(RefSink::from_effective_type(
+                sink,
+                schema.schema_type_owner(),
+            )),
             bindings,
             schemas,
             binding_index,
+            ArithmeticResultOwner::CoreWhenConcrete,
         )
     }
 }
@@ -2722,6 +2956,7 @@ fn check_integer_arithmetic_types<B: BindingAddress>(
         bindings,
         schemas,
         binding_index,
+        ArithmeticResultOwner::Expression,
     )
 }
 
@@ -2733,9 +2968,14 @@ fn append_unique_integer_arithmetic_findings<B: BindingAddress>(
     schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
 ) {
-    for finding in
-        check_integer_arithmetic_types_with_sink(value, sink, bindings, schemas, binding_index)
-    {
+    for finding in check_integer_arithmetic_types_with_sink(
+        value,
+        sink,
+        bindings,
+        schemas,
+        binding_index,
+        ArithmeticResultOwner::Expression,
+    ) {
         let duplicate = findings.iter().any(|existing| {
             existing.to_string() == finding.to_string() && existing.location() == finding.location()
         });
@@ -8406,7 +8646,7 @@ impl ModuleCallChecker<'_> {
                     &signatures,
                 ),
             );
-            for finding in binding_use_report.resource_findings() {
+            for finding in binding_use_report.resource_raw_findings() {
                 let anchor = ModuleCallFindingAnchor::new(finding.use_site.location().clone());
                 self.push(
                     ModuleCallFindingKind::BindingUse,
