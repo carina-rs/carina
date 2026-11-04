@@ -122,6 +122,9 @@ pub fn consumer_static_type_label(static_type: &ConsumerStaticType) -> &TypeExpr
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum NotInferableReason {
+    /// A valid expression whose type requires its resolved value.
+    #[error("{reason}", reason = crate::provider_text::ProviderText::new(reason))]
+    ValueDependent { reason: String },
     #[error("missing value")]
     MissingValue,
     #[error("binding `{binding}` is not inferable in this context", binding = crate::provider_text::ProviderText::new(binding))]

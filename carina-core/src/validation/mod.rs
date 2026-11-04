@@ -1242,22 +1242,26 @@ fn precheck_value_source<B: BindingAddress>(
             )));
         }
     };
-    {
-        let expected = match sink {
-            RefSink::EffectiveType {
-                attr_type,
-                owner: crate::parser::SchemaTypeOwner::Provider(provider),
-                ..
-            } => inference::attribute_type_to_type_expr(attr_type, provider),
-            RefSink::String => TypeExpr::String,
-            RefSink::TypeExpr(ty) => ty.clone(),
-        };
-        if matches!(
-            crate::parser::retained::admit_expression(expression, &expected),
-            Ok(crate::parser::retained::ExpressionAdmission::DeferredInterpolation)
-        ) {
-            return None;
-        }
+    let expected = match sink {
+        RefSink::EffectiveType {
+            attr_type,
+            owner: crate::parser::SchemaTypeOwner::Provider(provider),
+            ..
+        } => inference::attribute_type_to_type_expr(attr_type, provider),
+        RefSink::String => TypeExpr::String,
+        RefSink::TypeExpr(ty) => ty.clone(),
+    };
+    let admission =
+        crate::parser::retained::admit_expression(expression, &expected).map_err(|error| {
+            BindingResolutionError::DeferredAccess(Box::new(
+                DeferredAccessTypeError::InvalidAccess { error },
+            ))
+        });
+    if matches!(
+        admission,
+        Ok(crate::parser::retained::ExpressionAdmission::DeferredInterpolation)
+    ) {
+        return None;
     }
     let string_sink = lift_type_expr(&TypeExpr::String).expect("built-in String lifts");
     let lifted_sink;
@@ -1279,12 +1283,14 @@ fn precheck_value_source<B: BindingAddress>(
                 Ok(resolved) => resolved,
                 Err(error) => return Some(BindingResolutionError::TypeResolution(error)),
             };
-            let lifted = lift_type_expr(&resolved)?;
+            let Some(lifted) = lift_type_expr(&resolved) else {
+                return admission.err();
+            };
             lifted_sink = lifted;
             lifted_sink.assignment_sink(&context.raw_provider_context().custom_types)
         }
     };
-    deferred_value_mismatch(
+    let diagnostic = deferred_value_mismatch(
         ValueSource {
             value,
             declared_type,
@@ -1295,7 +1301,21 @@ fn precheck_value_source<B: BindingAddress>(
         &context.scope_bindings,
         &use_site.name,
         diagnostic_path,
-    )
+    );
+    match admission {
+        // A projection can refine a type mismatch's wording, but can never
+        // overturn rejected admission, including when it folded to a valid value.
+        Err(error) => Some(if expression.assignment_source_type().is_some() {
+            diagnostic
+                .or_else(|| {
+                    binding_value_constraints(use_site, value, declared_type, sink, context).err()
+                })
+                .unwrap_or(error)
+        } else {
+            error
+        }),
+        Ok(_) => diagnostic,
+    }
 }
 
 fn resolve_value_source_against_sink<B: BindingAddress>(
@@ -1322,27 +1342,39 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
             );
     }
 
+    let result = match prechecked {
+        Some(error) => Err(error),
+        None => binding_value_constraints(use_site, value, declared_type, sink, context),
+    };
+    match enum_target_from_sink(sink) {
+        Some(target) => {
+            let resolver = EnumValueResolver::with_defs(target.attr_type, target.defs);
+            result.map_err(|error| enum_shadow_or_existing(use_site, &resolver, error))
+        }
+        None => result,
+    }
+}
+
+fn binding_value_constraints<B: BindingAddress>(
+    use_site: &crate::parser::BareBindingUse,
+    value: &GenericValue<ParserPlaceholder, B>,
+    declared_type: Option<&TypeExpr>,
+    sink: RefSink<'_>,
+    context: &ValidationTypeContext<'_, B>,
+) -> Result<(), BindingResolutionError> {
     if let Some(target) = enum_target_from_sink(sink) {
         let resolver = EnumValueResolver::with_defs(target.attr_type, target.defs);
         let identity = resolver
             .enum_identity()
             .expect("enum_target_from_sink proved the enum identity");
-        let existing = match prechecked {
-            Some(error) => Err(error),
-            None => binding_value_assignable_to_enum(
-                value,
-                declared_type,
-                context.provider_context,
-                &target,
-                &resolver,
-                &identity,
-            ),
-        };
-        return existing.map_err(|error| enum_shadow_or_existing(use_site, &resolver, error));
-    }
-
-    if let Some(error) = prechecked {
-        return Err(error);
+        return binding_value_assignable_to_enum(
+            value,
+            declared_type,
+            context.provider_context,
+            &target,
+            &resolver,
+            &identity,
+        );
     }
     if let Some(declared_type) = declared_type {
         return declared_value_assignable_to_sink(
@@ -2347,6 +2379,7 @@ fn check_inferred_assignment<P: PlaceholderKind, B: BindingAddress>(
         ))
         | Err(crate::static_type::InferenceIssue::NotInferable(
             crate::static_type::NotInferableReason::MissingValue
+            | crate::static_type::NotInferableReason::ValueDependent { .. }
             | crate::static_type::NotInferableReason::PlaceholderTypeUnavailable { .. }
             | crate::static_type::NotInferableReason::NonInferableBinding { .. }
             | crate::static_type::NotInferableReason::SchemaUnavailable { .. }
@@ -5129,6 +5162,7 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
         ))
         | Err(crate::static_type::InferenceIssue::NotInferable(
             crate::static_type::NotInferableReason::MissingValue
+            | crate::static_type::NotInferableReason::ValueDependent { .. }
             | crate::static_type::NotInferableReason::PlaceholderTypeUnavailable { .. }
             | crate::static_type::NotInferableReason::NonInferableBinding { .. }
             | crate::static_type::NotInferableReason::SchemaUnavailable { .. }

@@ -88,6 +88,103 @@ fn expression_typing_schemas() -> SchemaRegistry {
 }
 
 #[test]
+fn value_dependent_bindings_keep_cli_lsp_directory_parity_at_every_sink() {
+    for (definition, accesses, ty) in [
+        (
+            "let cfg = lookup({ prod = { name = 'a' } }, 'prod', {})",
+            &[
+                "cfg.name",
+                "cfg['name']",
+                "(cfg).name",
+                "alias.name",
+                "cfg[key]",
+            ][..],
+            "String",
+        ),
+        (
+            "let cfg = map('.inner', { prod = { inner = { name = 'a' } } })",
+            &["cfg.prod.name", "cfg['prod']['name']", "cfg.prod[key]"][..],
+            "String",
+        ),
+        (
+            "let cfg = { name = 'a' enabled = true }",
+            &["cfg.name", "cfg['name']", "cfg[key]"][..],
+            "String",
+        ),
+        (
+            "fn make() { { name = 'a' } }\nlet cfg = make()",
+            &["cfg.name", "cfg['name']", "cfg[key]"][..],
+            "String",
+        ),
+        (
+            "let cfg = { name = min(1, 2) }",
+            &["cfg.name", "cfg['name']", "cfg[key]"][..],
+            "Int",
+        ),
+        (
+            "let cfg = { name = max(1, 2) }",
+            &["cfg.name", "cfg['name']", "cfg[key]"][..],
+            "Int",
+        ),
+    ] {
+        for access in accesses {
+            for sink in [
+                format!("let m = template {{ name = {access} }}"),
+                format!("attributes {{ result: {ty} = {access} }}"),
+                format!("exports {{ result: {ty} = {access} }}"),
+                format!("fn take(x: {ty}) {{ x }}\nlet y = take({access})"),
+            ] {
+                for origin in ["a-values.crn", "z-values.crn"] {
+                    let main = format!(
+                        "let key = 'name'\nlet template = use {{ source = './child' }}\n{sink}\n"
+                    );
+                    let fixture = write_fixture(&[
+                        ("main.crn", &main),
+                        (origin, &format!("{definition}\nlet alias = cfg\n")),
+                    ]);
+                    std::fs::create_dir(fixture.path().join("child")).unwrap();
+                    std::fs::write(
+                        fixture.path().join("child/main.crn"),
+                        format!("arguments {{ name: {ty} }}\nattributes {{ result = name }}\n"),
+                    )
+                    .unwrap();
+                    let schemas = SchemaRegistry::new();
+                    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+                    assert!(cli.is_empty(), "{definition}\n{sink}: {cli:#?}");
+                    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+                    assert!(lsp.is_empty(), "{definition}\n{sink}: {lsp:#?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn value_dependent_module_outputs_keep_cli_lsp_access_parity() {
+    for access in ["produced.cfg.name", "produced.cfg['name']"] {
+        let main = format!(
+            "let producer = use {{ source = './producer' }}\nlet produced = producer {{}}\nlet consumer = use {{ source = './consumer' }}\nlet c = consumer {{ name = {access} }}\nexports {{ name: String = {access} }}\n"
+        );
+        let fixture = write_fixture(&[("main.crn", &main)]);
+        for (module, source) in [
+            (
+                "producer",
+                "attributes { cfg = lookup({ prod = { name = 'a' } }, 'prod', {}) }\n",
+            ),
+            ("consumer", "arguments { name: String }\n"),
+        ] {
+            std::fs::create_dir(fixture.path().join(module)).unwrap();
+            std::fs::write(fixture.path().join(module).join("main.crn"), source).unwrap();
+        }
+        let schemas = SchemaRegistry::new();
+        let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+        assert!(cli.is_empty(), "{access}: {cli:#?}");
+        let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+        assert!(lsp.is_empty(), "{access}: {lsp:#?}");
+    }
+}
+
+#[test]
 fn authored_expression_coalesce_cli_lsp_directory_parity() {
     for reverse in [false, true] {
         for expression in [

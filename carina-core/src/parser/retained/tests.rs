@@ -56,7 +56,9 @@ fn dynamic_call_needs_an_export_annotation_without_poisoning_known_results() {
     let value = report.binding(&RelativeBindingName::new("value")).unwrap();
     assert!(matches!(
         value.static_type(),
-        Err(InferenceIssue::Failed(InferenceError::UnknownType { .. }))
+        Err(InferenceIssue::NotInferable(
+            crate::static_type::NotInferableReason::ValueDependent { .. }
+        ))
     ));
     assert_eq!(
         admit_expression(value, &TypeExpr::String),

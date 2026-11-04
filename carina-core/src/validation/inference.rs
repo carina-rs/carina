@@ -1211,6 +1211,16 @@ where
                             Ok(type_expr) => {
                                 ExportStaticType::Inferred(StaticType::Known(type_expr))
                             }
+                            // The expression itself is valid. An unannotated
+                            // export additionally requires a static type, so
+                            // this boundary owns the annotation failure.
+                            Err(InferenceIssue::NotInferable(
+                                NotInferableReason::ValueDependent { reason },
+                            )) => ExportStaticType::Inferred(StaticType::Unchecked(
+                                InferredUncheckedReason::InferenceFailed(
+                                    InferenceError::UnknownType { reason },
+                                ),
+                            )),
                             Err(issue) => {
                                 ExportStaticType::Inferred(StaticType::Unchecked(issue.into()))
                             }
@@ -1367,6 +1377,7 @@ where
             ExportStaticType::Inferred(StaticType::Unchecked(
                 InferredUncheckedReason::NotInferable(
                     NotInferableReason::MissingValue
+                    | NotInferableReason::ValueDependent { .. }
                     | NotInferableReason::PlaceholderTypeUnavailable { .. },
                 ),
             )) => false,

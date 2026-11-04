@@ -1371,7 +1371,10 @@ impl DiagnosticRun<'_> {
                 // Check for undefined binding references in parser-native shapes
                 // (`Value::Deferred(DeferredValue::ResourceRef)` for `name.attr`, `Value::Deferred(DeferredValue::BindingRef)`
                 // for bare `name`, since #2847).
-                let undefined_binding = match value {
+                let undefined_binding = match semantic_view
+                    .value_for_typecheck(attr_param)
+                    .unwrap_or(value)
+                {
                     Value::Deferred(DeferredValue::ResourceRef { path })
                         if !known_bindings.contains(path.binding()) =>
                     {

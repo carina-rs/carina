@@ -1482,8 +1482,8 @@ mod judgement {
             owner: FailureOwner,
         },
         ValueDependent {
-            reason: InferenceIssue,
-            shape: Option<CollectionKind>,
+            reason: NotInferableReason,
+            shape: Option<(CollectionKind, Knowledge)>,
             owner: FailureOwner,
         },
         AuthorityUnavailable(ProviderAuthorityUnavailable),
@@ -1496,13 +1496,13 @@ mod judgement {
                 ExprJudgement::Typed { kind, .. } => Some(*kind),
                 ExprJudgement::Rejected { source, .. } => source.kind(),
                 ExprJudgement::ValueDependent {
-                    shape: Some(CollectionKind::List),
+                    shape: Some((CollectionKind::List, knowledge)),
                     ..
-                } => Some(InferredKind::List(Knowledge::Deferred)),
+                } => Some(InferredKind::List(*knowledge)),
                 ExprJudgement::ValueDependent {
-                    shape: Some(CollectionKind::Map),
+                    shape: Some((CollectionKind::Map, knowledge)),
                     ..
-                } => Some(InferredKind::Map(Knowledge::Deferred)),
+                } => Some(InferredKind::Map(*knowledge)),
                 _ => None,
             }
         }
@@ -1511,7 +1511,9 @@ mod judgement {
                 ExprJudgement::Typed { ty, .. } => Ok(ty),
                 ExprJudgement::Failed { error, .. } => Err(error.clone().into()),
                 ExprJudgement::Rejected { source, .. } => source.static_type(),
-                ExprJudgement::ValueDependent { reason, .. } => Err(reason.clone()),
+                ExprJudgement::ValueDependent { reason, .. } => {
+                    Err(InferenceIssue::NotInferable(reason.clone()))
+                }
                 ExprJudgement::AuthorityUnavailable(authority) => {
                     Err(InferenceIssue::NotInferable(match &authority.0 {
                         UnavailableSchema::Resource { binding } => {
@@ -1619,6 +1621,13 @@ mod judgement {
         fn concrete(&self) -> bool {
             matches!(self.judgement, ExprJudgement::Typed { kind, .. }
                 if kind.knowledge() == Knowledge::Known)
+                || matches!(
+                    self.judgement,
+                    ExprJudgement::ValueDependent {
+                        shape: Some((_, Knowledge::Known)),
+                        ..
+                    }
+                )
         }
         fn failed(&self) -> bool {
             self.failure().is_some()
@@ -1704,6 +1713,16 @@ mod judgement {
                 self.kind(),
                 Some(InferredKind::Ordinary(_) | InferredKind::Reference(_))
             ) && self.alternatives.is_empty()
+        }
+        pub(crate) fn assignment_source_type(&self) -> Option<&TypeExpr> {
+            match &self.judgement {
+                ExprJudgement::Typed { ty, .. } => Some(ty),
+                ExprJudgement::Rejected { source, .. } => match source.as_ref() {
+                    ExprJudgement::Typed { ty, .. } => Some(ty),
+                    _ => None,
+                },
+                _ => None,
+            }
         }
         pub(crate) fn is_string_construction(&self) -> bool {
             matches!(self.kind(), Some(InferredKind::StringConstruction(_)))
@@ -2818,6 +2837,103 @@ mod judgement {
             Ok(current)
         }
 
+        // Every reference and postfix form selects from judgement evidence.
+        // Reconstructing from static_type() alone loses dynamic results and
+        // the authored children of heterogeneous records.
+        fn access(
+            &self,
+            base: &JudgedExpr,
+            step: Option<&PathSegment>,
+            binding: &str,
+        ) -> JudgedExpr {
+            if base.is_value_dependent()
+                || base.failed()
+                || matches!(base.judgement, ExprJudgement::AuthorityUnavailable(_))
+                || base.kind() == Some(InferredKind::EnumIdentifier)
+            {
+                return base.clone();
+            }
+            let Some(step) = step else {
+                if let Some(member) = &base.member {
+                    return (**member).clone();
+                }
+                let candidates: Vec<_> = base
+                    .elements
+                    .iter()
+                    .chain(base.fields.values())
+                    .cloned()
+                    .collect();
+                let Some(first) = candidates.first() else {
+                    return incomplete("dynamic access element");
+                };
+                let ty = first.static_type();
+                if ty.is_err()
+                    || candidates
+                        .iter()
+                        .any(|candidate| candidate.static_type() != ty)
+                {
+                    return value_dependent("dynamic access depends on the selected element");
+                }
+                return alternatives(ty.cloned(), &candidates);
+            };
+            let selected = match step {
+                PathSegment::Subscript {
+                    index: crate::resource::Subscript::Int { index },
+                } => usize::try_from(*index).ok().and_then(|index| {
+                    base.elements.get(index).or_else(|| {
+                        base.member
+                            .as_deref()
+                            .filter(|_| base.value_shape() == Some(ValueShape::List))
+                    })
+                }),
+                PathSegment::Subscript {
+                    index: crate::resource::Subscript::Str { key },
+                } => base.fields.get(key.expose_plaintext()).or_else(|| {
+                    base.member
+                        .as_deref()
+                        .filter(|_| base.value_shape() == Some(ValueShape::Map))
+                }),
+                PathSegment::Field { name } => base.fields.get(name).or_else(|| {
+                    base.member
+                        .as_deref()
+                        .filter(|_| base.value_shape() == Some(ValueShape::Map))
+                }),
+            };
+            if let Some(selected) = selected {
+                return selected.clone();
+            }
+            let ty = base
+                .static_type()
+                .cloned()
+                .and_then(|ty| self.narrow_declared(&ty, std::slice::from_ref(step), binding));
+            let mut result = declared(ty, base.concrete());
+            result.report_at(
+                if base.check_owner() == ExpressionCheckOwner::BindingIndex {
+                    FailureOwner::BindingIndex
+                } else {
+                    FailureOwner::Boundary
+                },
+            );
+            if matches!(
+                base.static_type(),
+                Ok(TypeExpr::Ref(_) | TypeExpr::DottedUnresolved(_))
+            ) {
+                result.set_kind(InferredKind::Reference);
+            }
+            result
+        }
+
+        fn access_path(
+            &self,
+            base: JudgedExpr,
+            steps: &[PathSegment],
+            binding: &str,
+        ) -> JudgedExpr {
+            steps
+                .iter()
+                .fold(base, |base, step| self.access(&base, Some(step), binding))
+        }
+
         fn infer(
             &mut self,
             expression: &ExprValue<ParserPlaceholder, B>,
@@ -2860,32 +2976,17 @@ mod judgement {
                     .chain(segments.iter().cloned())
                     .collect::<Vec<_>>();
                     if let Some(ty) = self.parameter_type(binding) {
-                        return ordinary(self.narrow_declared(ty, &steps, binding.as_str()), false)
-                            .owned_by_bindings();
+                        return self.access_path(
+                            ordinary(Ok(ty.clone()), false).owned_by_bindings(),
+                            &steps,
+                            binding.as_str(),
+                        );
                     }
                     if let Some(attribute) = self.module_attributes.and_then(|attributes| {
                         attributes.get(&(binding.clone(), attribute.clone()))
                     }) {
                         let attribute = self.refresh_module_output(attribute);
-                        return ordinary(
-                            attribute.static_type().cloned().and_then(|ty| {
-                                if segments.is_empty() {
-                                    Ok(ty)
-                                } else {
-                                    crate::validation::narrow_type_expr(
-                                        &ty,
-                                        segments,
-                                        Some(self.schemas),
-                                    )
-                                    .ok_or(
-                                        InferenceIssue::NotInferable(
-                                            NotInferableReason::MissingValue,
-                                        ),
-                                    )
-                                }
-                            }),
-                            attribute.concrete(),
-                        );
+                        return self.access_path(attribute, segments, binding.as_str());
                     }
                     if matches!(
                         self.bindings.get(binding.as_str()),
@@ -2895,11 +2996,9 @@ mod judgement {
                             "external value is checked at its declared or resolved boundary",
                         );
                         result.data_mut().judgement = ExprJudgement::ValueDependent {
-                            reason: InferenceIssue::NotInferable(
-                                NotInferableReason::NonInferableBinding {
-                                    binding: binding.to_string(),
-                                },
-                            ),
+                            reason: NotInferableReason::NonInferableBinding {
+                                binding: binding.to_string(),
+                            },
                             shape: None,
                             owner: FailureOwner::Expression,
                         };
@@ -2931,12 +3030,7 @@ mod judgement {
                         )
                     } else if let Some(definition) = self.expressions.definitions.get(binding) {
                         let base = self.judge(definition);
-                        ordinary(
-                            base.static_type()
-                                .cloned()
-                                .and_then(|ty| self.narrow_declared(&ty, &steps, binding.as_str())),
-                            base.concrete(),
-                        )
+                        self.access_path(base, &steps, binding.as_str())
                     } else {
                         ordinary(Ok(TypeExpr::String), true)
                             .with_kind(|_| InferredKind::EnumIdentifier)
@@ -3178,59 +3272,7 @@ mod judgement {
                         None => incomplete("function declaration or builtin signature"),
                     }
                 }
-                ExprKind::Access(step) => {
-                    let base = &children[0];
-                    if base.kind() == Some(InferredKind::EnumIdentifier) {
-                        return base.clone();
-                    }
-                    if base.is_value_dependent() {
-                        return base.clone();
-                    }
-                    let selected = match step {
-                        PathSegment::Subscript {
-                            index: crate::resource::Subscript::Int { index },
-                        } => usize::try_from(*index).ok().and_then(|index| {
-                            base.elements.get(index).or_else(|| {
-                                base.member
-                                    .as_deref()
-                                    .filter(|_| base.value_shape() == Some(ValueShape::List))
-                            })
-                        }),
-                        PathSegment::Subscript {
-                            index: crate::resource::Subscript::Str { key },
-                        } => base.fields.get(key.expose_plaintext()).or_else(|| {
-                            base.member
-                                .as_deref()
-                                .filter(|_| base.value_shape() == Some(ValueShape::Map))
-                        }),
-                        PathSegment::Field { name } => base.fields.get(name).or_else(|| {
-                            base.member
-                                .as_deref()
-                                .filter(|_| base.value_shape() == Some(ValueShape::Map))
-                        }),
-                    };
-                    if let Some(selected) = selected {
-                        return selected.clone();
-                    }
-                    let ty = child_type(0).and_then(|base| {
-                        self.narrow_declared(&base, std::slice::from_ref(step), "access base")
-                    });
-                    let mut result = ordinary(ty, base.concrete());
-                    result.report_at(
-                        if base.check_owner() == ExpressionCheckOwner::BindingIndex {
-                            FailureOwner::BindingIndex
-                        } else {
-                            FailureOwner::Boundary
-                        },
-                    );
-                    if matches!(
-                        base.static_type(),
-                        Ok(TypeExpr::Ref(_) | TypeExpr::DottedUnresolved(_))
-                    ) {
-                        result.set_kind(InferredKind::Reference);
-                    }
-                    result
-                }
+                ExprKind::Access(step) => self.access(&children[0], Some(step), "access base"),
                 ExprKind::Integer { op, location } => {
                     let operands = [children[0].clone(), children[1].clone()];
                     self.operands.insert(
@@ -3392,7 +3434,9 @@ mod judgement {
                     let mut result = alternatives(ty, branches);
                     if !branches.iter().any(JudgedExpr::failed) && result.failed() {
                         result.data_mut().judgement = ExprJudgement::ValueDependent {
-                            reason: result.static_type().unwrap_err(),
+                            reason: NotInferableReason::ValueDependent {
+                                reason: result.static_type().unwrap_err().to_string(),
+                            },
                             shape: None,
                             owner: FailureOwner::Boundary,
                         };
@@ -3441,27 +3485,7 @@ mod judgement {
                     result.data_mut().member = Some(Arc::new(body));
                     result
                 }
-                ExprKind::DynamicAccess => {
-                    let base = &children[0];
-                    if base.is_value_dependent() {
-                        return base.clone();
-                    }
-                    if let Some(member) = &base.member {
-                        return (**member).clone();
-                    }
-                    let candidates: Vec<_> = base
-                        .elements
-                        .iter()
-                        .chain(base.fields.values())
-                        .cloned()
-                        .collect();
-                    if candidates.is_empty() {
-                        return incomplete("dynamic access element");
-                    }
-                    let mut result = candidates[0].clone();
-                    result.data_mut().alternatives = Arc::new(candidates);
-                    result
-                }
+                ExprKind::DynamicAccess => self.access(&children[0], None, "dynamic access base"),
                 ExprKind::Boolean => {
                     let mut result = ordinary(
                         Ok(TypeExpr::Bool),
@@ -3631,8 +3655,13 @@ mod judgement {
             Err(reason) => {
                 let mut result = value_dependent("collection has no common element type");
                 result.data_mut().judgement = ExprJudgement::ValueDependent {
-                    reason,
-                    shape: Some(shape),
+                    reason: match reason {
+                        InferenceIssue::NotInferable(reason) => reason,
+                        InferenceIssue::Failed(error) => NotInferableReason::ValueDependent {
+                            reason: error.to_string(),
+                        },
+                    },
+                    shape: Some((shape, concrete.into())),
                     owner: FailureOwner::Boundary,
                 };
                 result
@@ -3668,12 +3697,11 @@ mod judgement {
             )) => ExprJudgement::AuthorityUnavailable(ProviderAuthorityUnavailable(
                 UnavailableSchema::Named { identity },
             )),
-            Err(
-                reason @ InferenceIssue::NotInferable(
-                    NotInferableReason::NonInferableBinding { .. }
-                    | NotInferableReason::PlaceholderTypeUnavailable { .. },
-                ),
-            ) => ExprJudgement::ValueDependent {
+            Err(InferenceIssue::NotInferable(
+                reason @ (NotInferableReason::ValueDependent { .. }
+                | NotInferableReason::NonInferableBinding { .. }
+                | NotInferableReason::PlaceholderTypeUnavailable { .. }),
+            )) => ExprJudgement::ValueDependent {
                 reason,
                 shape: None,
                 owner: FailureOwner::Boundary,
@@ -3708,9 +3736,9 @@ mod judgement {
     pub(super) fn constraint_fixture() -> JudgedExpr {
         let mut result = value_dependent("constraint-check fixture");
         result.data_mut().judgement = ExprJudgement::ValueDependent {
-            reason: InferenceIssue::NotInferable(NotInferableReason::NonInferableBinding {
+            reason: NotInferableReason::NonInferableBinding {
                 binding: "constraint-check fixture".into(),
-            }),
+            },
             shape: None,
             owner: FailureOwner::Expression,
         };
@@ -3734,10 +3762,9 @@ mod judgement {
     pub(super) fn value_dependent(reason: &str) -> JudgedExpr {
         let mut result = declared(Ok(TypeExpr::String), false);
         result.data_mut().judgement = ExprJudgement::ValueDependent {
-            reason: InferenceError::UnknownType {
+            reason: NotInferableReason::ValueDependent {
                 reason: reason.into(),
-            }
-            .into(),
+            },
             shape: None,
             owner: FailureOwner::Expression,
         };

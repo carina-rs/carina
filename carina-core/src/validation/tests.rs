@@ -10388,6 +10388,53 @@ fn bare_typeexpr_sink_requires_authored_evidence() {
     assert!(!report.is_ready(), "a TypeExpr sink used pending evidence");
 }
 
+#[test]
+fn bare_binding_precheck_preserves_rejection_after_constant_folding() {
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let schemas = SchemaRegistry::new();
+    for rhs in ["'present' ?? 42", "['present', ('present' ?? 42)][0]"] {
+        let parsed = crate::parser::parse_and_resolve(&format!(
+            "let bad = {rhs}\nlet template = use {{ source = './child' }}\nlet child = template {{ x = bad }}"
+        ))
+        .unwrap();
+        let loaded = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config);
+        let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+        let context =
+            ValidationTypeContext::new_providerless(loaded.judged(), &config, &signatures);
+        let record = parsed
+            .bare_binding_uses()
+            .records()
+            .iter()
+            .find(|record| record.authored.name == "bad")
+            .unwrap();
+        let crate::parser::BareBindingSource::Value {
+            value,
+            declared_type,
+        } = &record.source
+        else {
+            panic!("value binding expected");
+        };
+        assert!(value.is_fully_resolved(), "{rhs}: {value:?}");
+        let expected = TypeExpr::String;
+        let error = precheck_value_source(
+            &record.authored,
+            value,
+            declared_type.as_deref(),
+            RefSink::TypeExpr(&expected),
+            &context,
+            &|path| ModuleCallDiagnosticPath::Authored(path.to_owned()),
+        )
+        .expect("a folded value must not overturn rejected admission");
+        assert!(
+            matches!(error, BindingResolutionError::DeferredAccess(error)
+            if matches!(*error, DeferredAccessTypeError::InvalidAccess {
+                error: inference::InferenceError::IncompatibleCoalesceTypes { .. }
+            })),
+            "{rhs}"
+        );
+    }
+}
+
 fn expression_validation_config() -> ProviderContext {
     ProviderContext::new(crate::EnvironmentSnapshot::empty())
 }
