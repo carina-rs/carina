@@ -541,8 +541,63 @@ pub struct ValidationTypeContext<'a, B: BindingAddress = RelativeBindingName> {
     expression_report: &'a crate::parser::retained::ExpressionReport<B>,
 }
 
-pub(crate) fn expression_sink_type(attr_type: &AttributeType, owner: &str) -> TypeExpr {
-    inference::attribute_type_to_type_expr(attr_type, owner)
+pub(crate) fn expression_sink_type(
+    attr_type: &AttributeType,
+    owner: &str,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> TypeExpr {
+    project_expression_sink_type(attr_type, owner, defs, &mut Vec::new())
+}
+
+fn project_expression_sink_type<'a>(
+    attr_type: &'a AttributeType,
+    owner: &str,
+    defs: &'a std::collections::BTreeMap<String, AttributeType>,
+    visited_refs: &mut Vec<&'a str>,
+) -> TypeExpr {
+    use crate::schema::RawShape;
+
+    // Inference uses a String sentinel for union and Ref receivers. Admission
+    // preserves alternatives and follows the owning schema's definitions.
+    let restore_len = visited_refs.len();
+    let Some(resolved) = attr_type.resolve_refs_for_union_walk_on_path(defs, visited_refs) else {
+        // Retain inference's cycle cutoff rather than expanding recursive
+        // schema definitions indefinitely.
+        visited_refs.truncate(restore_len);
+        return inference::attribute_type_to_type_expr(attr_type, owner);
+    };
+    let attr_type = resolved.as_attr();
+    let projected = match attr_type.raw_shape() {
+        RawShape::Union(members) => TypeExpr::Union(
+            members
+                .iter()
+                .map(|member| project_expression_sink_type(member, owner, defs, visited_refs))
+                .collect(),
+        ),
+        RawShape::List { element_type, .. } => TypeExpr::List(Box::new(
+            project_expression_sink_type(element_type, owner, defs, visited_refs),
+        )),
+        RawShape::Map { value, .. } => TypeExpr::Map(Box::new(project_expression_sink_type(
+            value,
+            owner,
+            defs,
+            visited_refs,
+        ))),
+        RawShape::Struct { fields, .. } => TypeExpr::Struct {
+            fields: fields
+                .iter()
+                .map(|field| {
+                    (
+                        field.name.clone(),
+                        project_expression_sink_type(&field.field_type, owner, defs, visited_refs),
+                    )
+                })
+                .collect(),
+        },
+        _ => inference::attribute_type_to_type_expr(attr_type, owner),
+    };
+    visited_refs.truncate(restore_len);
+    projected
 }
 
 impl<'a, B: BindingAddress> ValidationTypeContext<'a, B> {
@@ -1245,9 +1300,10 @@ fn precheck_value_source<B: BindingAddress>(
     let expected = match sink {
         RefSink::EffectiveType {
             attr_type,
+            defs,
             owner: crate::parser::SchemaTypeOwner::Provider(provider),
             ..
-        } => inference::attribute_type_to_type_expr(attr_type, provider),
+        } => expression_sink_type(attr_type, provider, defs),
         RefSink::String => TypeExpr::String,
         RefSink::TypeExpr(ty) => ty.clone(),
     };

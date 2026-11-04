@@ -2609,6 +2609,15 @@ mod judgement {
     }
 
     impl<B: BindingAddress> Judge<'_, B> {
+        fn is_list_literal(mut expression: &ExprValue<ParserPlaceholder, B>) -> bool {
+            while matches!(expression.authored.kind, ExprKind::Alias)
+                && let [inner] = expression.authored.children.as_slice()
+            {
+                expression = inner;
+            }
+            matches!(expression.authored.kind, ExprKind::List)
+        }
+
         fn judge(&mut self, expression: &ExprValue<ParserPlaceholder, B>) -> JudgedExpr {
             let root = &expression.authored;
             let id = Arc::as_ptr(root) as usize;
@@ -2629,11 +2638,44 @@ mod judgement {
             self.visiting.push(id);
             // Always visit every child, even for length(), selected access,
             // interpolation, and a coalesce whose left payload is concrete.
-            let children = root
+            let mut children = root
                 .children
                 .iter()
                 .map(|child| self.judge(child))
                 .collect::<Vec<_>>();
+            if matches!(&root.kind, ExprKind::Call(name) if name == "join"
+                && !self.functions.contains_key(&(root.location.instance.clone(), name.clone())))
+                && root.children.get(1).is_some_and(Self::is_list_literal)
+                && let Some(list) = children.get_mut(1)
+                && list.failed()
+                && !list.elements.is_empty()
+                && list.elements.iter().all(|element| {
+                    !element.failed()
+                        && matches!(
+                            element.value_shape(),
+                            Some(
+                                ValueShape::String
+                                    | ValueShape::Int
+                                    | ValueShape::Float
+                                    | ValueShape::Bool
+                                    | ValueShape::Duration
+                            )
+                        )
+                })
+            {
+                // join converts each scalar independently; this argument does
+                // not require a common element type. Only its list-shape
+                // failure is discharged: every element retains its evidence,
+                // and other uses of this collection retain their rejection.
+                let knowledge = list.elements.iter().all(JudgedExpr::concrete).into();
+                list.data_mut().judgement = ExprJudgement::ValueDependent {
+                    reason: NotInferableReason::ValueDependent {
+                        reason: "join accepts independently rendered scalar elements".into(),
+                    },
+                    shape: Some((CollectionKind::List, knowledge)),
+                    owner: FailureOwner::Boundary,
+                };
+            }
             let mut result = self.infer(expression, &children);
             result.data_mut().origin = Some(root.location.clone());
             result.data_mut().authority = Some(self.authority.clone());
@@ -3502,6 +3544,7 @@ mod judgement {
                             let expected = crate::validation::expression_sink_type(
                                 attribute.field_type(),
                                 schema.owner(),
+                                schema.schema().as_schema().defs(),
                             );
                             let value = &child.authored.children[0];
                             let judged = self.judge(value);
@@ -3512,7 +3555,18 @@ mod judgement {
                                 self.config,
                             );
                             if let Err(error) = admission {
-                                let owner = judged.sink_owner(&expected);
+                                // Direct resource parameters retain the binding
+                                // check's resource, argument, and source context.
+                                // Folded branches and other boundaries still
+                                // need the judge to report their rejection.
+                                let owner = if judged.requires_declared_assignment()
+                                    && matches!(judged.kind(), Some(InferredKind::Ordinary(_)))
+                                    && judged.check_owner() == ExpressionCheckOwner::BindingIndex
+                                {
+                                    FailureOwner::BindingIndex
+                                } else {
+                                    judged.sink_owner(&expected)
+                                };
                                 if owner == FailureOwner::Expression {
                                     self.push_finding(value.location().clone(), error.clone());
                                 }

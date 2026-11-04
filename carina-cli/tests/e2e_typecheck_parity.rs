@@ -45,6 +45,315 @@ fn write_fixture(files: &[(&str, &str)]) -> TempDir {
     dir
 }
 
+// Mirrors carina-aws-types' IAM document: optional struct fields, principal
+// Struct | String, String | List<String> leaves, and nested condition maps.
+fn iam_document_schemas() -> SchemaRegistry {
+    let strings = || {
+        AttributeType::union(vec![
+            AttributeType::string(),
+            AttributeType::unordered_list(AttributeType::string()),
+        ])
+    };
+    let principal = AttributeType::union(vec![
+        AttributeType::struct_(
+            "Principal",
+            ["service", "aws", "federated", "canonical_user"]
+                .into_iter()
+                .map(|name| StructField::optional(name, strings()).build())
+                .collect(),
+        ),
+        AttributeType::string(),
+    ]);
+    let statement = AttributeType::struct_(
+        "Statement",
+        vec![
+            StructField::optional("sid", AttributeType::string()).build(),
+            StructField::optional("effect", AttributeType::string()).build(),
+            StructField::optional("action", strings()).build(),
+            StructField::optional("resource", strings()).build(),
+            StructField::optional("principal", principal).build(),
+            StructField::optional(
+                "condition",
+                AttributeType::map(AttributeType::map(strings())),
+            )
+            .build(),
+        ],
+    );
+    let document = AttributeType::struct_(
+        "PolicyDocument",
+        vec![
+            StructField::optional("version", AttributeType::string()).build(),
+            StructField::optional("id", AttributeType::string()).build(),
+            StructField::optional("statement", AttributeType::list(statement))
+                .with_block_name("statement")
+                .build(),
+        ],
+    );
+    let named = |name| {
+        AttributeType::refined_string(
+            Some(carina_core::schema::TypeIdentity::from_schema_type(
+                "test", "iam.Role", name,
+            )),
+            None,
+            None,
+            None,
+        )
+    };
+    let mut schemas = single_schema_map(
+        ResourceSchema::new("iam.Role")
+            .attribute(AttributeSchema::optional("role_name", named("Name")).build())
+            .attribute(AttributeSchema::provider_populated("arn", named("Arn")).build())
+            .attribute(
+                AttributeSchema::provider_populated("arns", AttributeType::list(named("Arn")))
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("assume_role_policy_document", document.clone()).build(),
+            ),
+    );
+    schemas.insert(
+        "test",
+        ResourceSchema::new("s3.BucketPolicy")
+            .attribute(AttributeSchema::required("policy", document).build())
+            .validate()
+            .unwrap(),
+    );
+    schemas
+}
+
+fn assert_iam_document_valid(source: &str) {
+    for sibling in ["a-source.crn", "z-source.crn"] {
+        let fixture = write_fixture(&[
+            ("providers.crn", "provider test {}\n"),
+            (sibling, "let source = test.iam.Role {}\n"),
+            ("main.crn", source),
+        ]);
+        let schemas = iam_document_schemas();
+        let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+        assert!(cli.is_empty(), "{sibling}: {cli:#?}");
+        let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+        assert!(lsp.is_empty(), "{sibling}: {lsp:#?}");
+    }
+}
+
+#[test]
+fn iam_bucket_policy_multifile_principal_struct_union() {
+    assert_iam_document_valid(
+        r#"test.s3.BucketPolicy {
+  policy = {
+    version = '2012-10-17'
+    statement {
+      effect = 'Allow'
+      principal = { aws = ["${source.arn}", 'arn:aws:iam::123456789012:root'] }
+      action = 's3:GetObject'
+      resource = "${source.arn}/*"
+    }
+  }
+}
+"#,
+    );
+}
+
+#[test]
+fn iam_role_policy_multifile_typed_principal_list_union() {
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider test {}\n"),
+        ("source.crn", "let source = test.iam.Role {}\n"),
+        (
+            "main.crn",
+            "let deploy = use { source = './deploy' }\nlet role = deploy { sso_admin_role_arns = source.arns }\n",
+        ),
+    ]);
+    std::fs::create_dir(fixture.path().join("deploy")).unwrap();
+    std::fs::write(
+        fixture.path().join("deploy/arguments.crn"),
+        "arguments { sso_admin_role_arns: list(test.iam.Role.Arn) }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.path().join("deploy/main.crn"),
+        r#"let role = test.iam.Role {
+  assume_role_policy_document = {
+    statement {
+      effect = 'Allow'
+      principal = { aws = sso_admin_role_arns }
+      action = 'sts:AssumeRole'
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    let schemas = iam_document_schemas();
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    assert!(cli.is_empty(), "{cli:#?}");
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "deploy/main.crn");
+    assert!(
+        lsp.iter().all(|diagnostic| diagnostic.severity
+            != Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)),
+        "{lsp:#?}"
+    );
+}
+
+#[test]
+fn iam_trust_document_multifile_struct_and_condition_map_unions() {
+    assert_iam_document_valid(
+        r#"let role = test.iam.Role {
+  assume_role_policy_document = {
+    statement {
+      effect = 'Allow'
+      principal = { aws = ["${source.arn}", "${source.arns[0]}"] }
+      action = ['sts:AssumeRole', 'sts:TagSession']
+      condition = { string_equals = { 'aws:PrincipalArn' = ["${source.arn}"] } }
+    }
+    statement {
+      effect = 'Allow'
+      principal = '*'
+      action = 'sts:AssumeRole'
+    }
+  }
+}
+"#,
+    );
+}
+
+#[test]
+fn iam_module_string_argument_keeps_main_diagnostic_text_and_owner() {
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider test {}\n"),
+        (
+            "main.crn",
+            "let role = use { source = './child' }\nlet instance = role { role_name = 'example' }\n",
+        ),
+    ]);
+    std::fs::create_dir(fixture.path().join("child")).unwrap();
+    std::fs::write(
+        fixture.path().join("child/arguments.crn"),
+        "arguments { role_name: String }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.path().join("child/main.crn"),
+        "let role = test.iam.Role {\n  role_name = role_name\n}\n",
+    )
+    .unwrap();
+    let cli: Vec<_> = cli_diagnostics(factories_for(&iam_document_schemas()), &fixture)
+        .into_iter()
+        .map(|message| message.replace(&format!("{}/", fixture.path().display()), ""))
+        .collect();
+    let mismatch = "Type mismatch: expected test.iam.Role.Name, got String (from role_name)";
+    assert_eq!(
+        cli,
+        vec![
+            "child: test.iam.Role.role: cannot assign String to 'role_name': expected test.iam.Role.Name, got String (from role_name)".to_string(),
+            format!("child/main.crn at line 2\n{mismatch}"),
+            format!("child/main.crn at line 2\nchild/main.crn: {mismatch} at line 2\nchild/main.crn at line 2\n{mismatch}"),
+        ],
+        "module binding checks must own the same diagnostics as main"
+    );
+}
+
+#[test]
+fn scheduler_join_multifile_accepts_mixed_scalars_and_keeps_operand_errors() {
+    for (item, accepted) in [("interval", true), ("('present' ?? interval)", false)] {
+        let fixture = write_fixture(&[
+            ("providers.crn", "provider test {}\n"),
+            ("interval.crn", "let interval = 5\n"),
+            (
+                "main.crn",
+                &format!("test.r.typed {{ name = join('', ['rate(', {item}, ' minutes)']) }}\n"),
+            ),
+        ]);
+        let schemas = expression_typing_schemas();
+        let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+        assert_eq!(cli.is_empty(), accepted, "{item}: {cli:#?}");
+        let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+        assert_eq!(
+            lsp_error_multiset(&lsp).is_empty(),
+            accepted,
+            "{item}: {lsp:#?}"
+        );
+    }
+}
+
+#[test]
+fn cloudfront_multifile_shared_struct_definitions_keep_field_types() {
+    let behavior = AttributeType::struct_(
+        "CacheBehavior",
+        vec![
+            StructField::optional("forwarded_values", AttributeType::ref_("ForwardedValues"))
+                .build(),
+        ],
+    );
+    let mut schemas = expression_typing_schemas();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("cloudfront.Distribution")
+            .attribute(
+                AttributeSchema::required(
+                    "distribution_config",
+                    AttributeType::struct_(
+                        "DistributionConfig",
+                        vec![
+                            StructField::optional("comment", AttributeType::string()).build(),
+                            StructField::optional("default_cache_behavior", behavior.clone())
+                                .build(),
+                            StructField::optional("cache_behaviors", AttributeType::list(behavior))
+                                .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .with_def(
+                "ForwardedValues",
+                AttributeType::struct_(
+                    "ForwardedValues",
+                    vec![
+                        StructField::required("query_string", AttributeType::bool()).build(),
+                        StructField::optional("cookies", AttributeType::ref_("Cookies")).build(),
+                    ],
+                ),
+            )
+            .with_def(
+                "Cookies",
+                AttributeType::struct_(
+                    "Cookies",
+                    vec![StructField::optional("forward", AttributeType::string()).build()],
+                ),
+            )
+            .validate()
+            .unwrap(),
+    );
+    for (query_string, accepted) in [("false", true), ("'wrong'", false)] {
+        let fixture = write_fixture(&[
+            ("providers.crn", "provider test {}\n"),
+            ("source.crn", "let source = test.r.typed {}\n"),
+            (
+                "main.crn",
+                &format!(
+                    r#"test.cloudfront.Distribution {{
+  distribution_config = {{
+    comment = "${{source.value}} distribution"
+    default_cache_behavior = {{
+      forwarded_values = {{ query_string = {query_string} cookies = {{ forward = 'none' }} }}
+    }}
+    cache_behaviors = [{{
+      forwarded_values = {{ query_string = false cookies = {{ forward = 'none' }} }}
+    }}]
+  }}
+}}
+"#
+                ),
+            ),
+        ]);
+        let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+        assert_eq!(cli.is_empty(), accepted, "{query_string}: {cli:#?}");
+        let lsp = lsp_diagnostics(&engine_with_schemas(schemas.clone()), &fixture, "main.crn");
+        assert_eq!(lsp.is_empty(), accepted, "{query_string}: {lsp:#?}");
+    }
+}
+
 fn expression_typing_schemas() -> SchemaRegistry {
     let mut schemas = single_schema_map(
         ResourceSchema::new("r.typed")
