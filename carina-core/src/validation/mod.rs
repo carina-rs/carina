@@ -160,15 +160,26 @@ fn lift_attribute_type(type_expr: &TypeExpr) -> Option<AttributeType> {
     }
 }
 
-static STRING_REF_SINK: TypeExpr = TypeExpr::String;
+// Interpolation renders scalar operands to text; collections and handles
+// cannot satisfy this boundary. Keep the operand contract separate from the
+// String type of the completed interpolation.
+static INTERPOLATION_REF_SINK: std::sync::LazyLock<TypeExpr> = std::sync::LazyLock::new(|| {
+    TypeExpr::Union(vec![
+        TypeExpr::String,
+        TypeExpr::Int,
+        TypeExpr::Float,
+        TypeExpr::Bool,
+        TypeExpr::Duration,
+    ])
+});
 static INT_REF_SINK: TypeExpr = TypeExpr::Int;
 
 /// The declared type at one position in a [`Value`] tree.
 ///
 /// Module boundaries use `TypeExpr`; provider resource attributes use
-/// `AttributeType` plus their definition map. `String` represents the inside
-/// of an interpolation, whose expression parts are rendered to text regardless
-/// of the outer container.
+/// `AttributeType` plus their definition map. `Interpolation` constrains
+/// expression parts to scalars that can be rendered to text regardless of the
+/// outer container.
 #[derive(Clone, Copy)]
 pub(crate) enum RefSink<'a> {
     TypeExpr(&'a TypeExpr),
@@ -178,7 +189,7 @@ pub(crate) enum RefSink<'a> {
         ancestry: crate::schema::FieldAncestry,
         owner: &'a crate::parser::SchemaTypeOwner,
     },
-    String,
+    Interpolation,
 }
 
 impl<'a> RefSink<'a> {
@@ -197,7 +208,7 @@ impl<'a> RefSink<'a> {
     fn as_type_expr(self) -> Option<&'a TypeExpr> {
         match self {
             Self::TypeExpr(type_expr) => Some(type_expr),
-            Self::String => Some(&STRING_REF_SINK),
+            Self::Interpolation => Some(&INTERPOLATION_REF_SINK),
             Self::EffectiveType {
                 attr_type: _,
                 defs: _,
@@ -305,7 +316,7 @@ impl<'a> RefSink<'a> {
                 | TypeExpr::Struct { fields: _ }
                 | TypeExpr::StringLiteral(_),
             )
-            | Self::String => None,
+            | Self::Interpolation => None,
         }
     }
 
@@ -411,7 +422,7 @@ impl<'a> RefSink<'a> {
                 | TypeExpr::SchemaType { owned: _ }
                 | TypeExpr::StringLiteral(_),
             )
-            | Self::String => None,
+            | Self::Interpolation => None,
         }
     }
 }
@@ -1020,7 +1031,7 @@ fn enum_target_from_sink<'a>(sink: RefSink<'a>) -> Option<ExpectedEnumTarget<'a>
             owner: _,
         }
         | RefSink::TypeExpr(_)
-        | RefSink::String => None,
+        | RefSink::Interpolation => None,
     }
 }
 
@@ -1040,7 +1051,8 @@ fn declared_value_assignable_to_sink(
         return Ok(());
     };
     let source = crate::schema::TypeInSchema::schemaless(&source);
-    let string_sink = lift_type_expr(&TypeExpr::String).expect("built-in String lifts");
+    let interpolation_sink =
+        lift_type_expr(&INTERPOLATION_REF_SINK).expect("built-in interpolation operand types lift");
     let lifted_sink;
     let target = match sink {
         RefSink::EffectiveType {
@@ -1052,7 +1064,7 @@ fn declared_value_assignable_to_sink(
             &config.custom_types,
             crate::schema::SinkAuthority::Owner(owner),
         ),
-        RefSink::String => string_sink.assignment_sink(&config.custom_types),
+        RefSink::Interpolation => interpolation_sink.assignment_sink(&config.custom_types),
         RefSink::TypeExpr(type_expr) => {
             let resolved = resolve_type_expr(type_expr, config)
                 .and_then(|resolved| {
@@ -1304,7 +1316,7 @@ fn precheck_value_source<B: BindingAddress>(
             owner: crate::parser::SchemaTypeOwner::Provider(provider),
             ..
         } => expression_sink_type(attr_type, provider, defs),
-        RefSink::String => TypeExpr::String,
+        RefSink::Interpolation => INTERPOLATION_REF_SINK.clone(),
         RefSink::TypeExpr(ty) => ty.clone(),
     };
     let admission =
@@ -1319,7 +1331,8 @@ fn precheck_value_source<B: BindingAddress>(
     ) {
         return None;
     }
-    let string_sink = lift_type_expr(&TypeExpr::String).expect("built-in String lifts");
+    let interpolation_sink =
+        lift_type_expr(&INTERPOLATION_REF_SINK).expect("built-in interpolation operand types lift");
     let lifted_sink;
     let target = match sink {
         RefSink::EffectiveType {
@@ -1331,8 +1344,8 @@ fn precheck_value_source<B: BindingAddress>(
             &context.raw_provider_context().custom_types,
             crate::schema::SinkAuthority::Owner(owner),
         ),
-        RefSink::String => {
-            string_sink.assignment_sink(&context.raw_provider_context().custom_types)
+        RefSink::Interpolation => {
+            interpolation_sink.assignment_sink(&context.raw_provider_context().custom_types)
         }
         RefSink::TypeExpr(type_expr) => {
             let resolved = match context.scope_bindings.resolve_declared_type(type_expr) {
@@ -1450,8 +1463,9 @@ fn binding_value_constraints<B: BindingAddress>(
             owner: _,
         } => crate::schema::validate_attr_with_defs_and_ancestry(attr_type, value, defs, ancestry)
             .map_err(BindingResolutionError::Type),
-        RefSink::String => crate::schema::validate_attr_with_defs_and_ancestry(
-            &AttributeType::string(),
+        RefSink::Interpolation => crate::schema::validate_attr_with_defs_and_ancestry(
+            &lift_type_expr(&INTERPOLATION_REF_SINK)
+                .expect("built-in interpolation operand types lift"),
             value,
             crate::schema::empty_defs_for_schema_walks(),
             FieldAncestry::WRITABLE,
@@ -2053,8 +2067,8 @@ fn unique_union_map_member<'a>(
 /// List or Map value shape. Function arguments likewise have no locally
 /// available signature and deliberately receive `None`: the function's result
 /// sink says nothing sound about its input positions. Secrets preserve their
-/// enclosing sink. Interpolation operands are rendered to text, so only
-/// reference existence is checked below an ordinary string construction.
+/// enclosing sink. Interpolation operands must be scalars that can be
+/// rendered to text, independently of the completed string's sink.
 pub(crate) fn visit_refs_with_sink<'a, P: PlaceholderKind, B: BindingAddress>(
     value: &GenericValue<P, B>,
     sink: Option<RefSink<'a>>,
@@ -2116,7 +2130,7 @@ fn visit_refs_with_sink_inner<'a, P: PlaceholderKind, B: BindingAddress>(
         GenericValue::Deferred(crate::resource::DeferredValue::Interpolation(parts)) => {
             for part in parts {
                 if let crate::resource::InterpolationPart::Expr(value) = part {
-                    visit_refs_with_sink_inner(value, None, usage, f);
+                    visit_refs_with_sink_inner(value, Some(RefSink::Interpolation), usage, f);
                 }
             }
         }
@@ -2229,14 +2243,7 @@ fn visit_computed_accesses_with_sink<'a, B: BindingAddress>(
         GenericValue::Deferred(crate::resource::DeferredValue::Interpolation(parts)) => {
             for part in parts {
                 if let crate::resource::InterpolationPart::Expr(value) = part {
-                    let sink = matches!(
-                        value,
-                        GenericValue::Deferred(crate::resource::DeferredValue::IntegerArithmetic(
-                            _
-                        ))
-                    )
-                    .then_some(RefSink::String);
-                    visit_computed_accesses_with_sink(value, sink, f);
+                    visit_computed_accesses_with_sink(value, Some(RefSink::Interpolation), f);
                 }
             }
         }
@@ -2262,7 +2269,7 @@ fn visit_computed_accesses_with_sink<'a, B: BindingAddress>(
             // Int result sink at that boundary while still honoring ordinary
             // resource/module sinks everywhere else.
             let result_sink = match sink {
-                Some(RefSink::String) => Some(RefSink::TypeExpr(&INT_REF_SINK)),
+                Some(RefSink::Interpolation) => Some(RefSink::TypeExpr(&INT_REF_SINK)),
                 other => other,
             };
             f(value, result_sink);
@@ -2687,7 +2694,7 @@ fn check_integer_result_sink<B: BindingAddress>(
         // Interpolation is the sole textual boundary. The arithmetic node
         // itself still has an Int result, and no external sink means its own
         // intrinsic Int contract is sufficient.
-        Some(RefSink::String) | None => return Ok(()),
+        Some(RefSink::Interpolation) | None => return Ok(()),
     };
     if binding_index
         .check_type_assignment(actual, expected)
@@ -3865,7 +3872,7 @@ mod user_function_refs {
                     if let crate::resource::InterpolationPart::Expr(value) = part {
                         check_function_calls(
                             value,
-                            Some(&STRING_REF_SINK),
+                            Some(&INTERPOLATION_REF_SINK),
                             context,
                             bindings,
                             unknown_policy,
@@ -4763,7 +4770,8 @@ fn validate_resource_ref_types_inner<
                 let sink = effective_sink.clone().map(|effective| {
                     RefSink::from_effective_type(effective, validated_schema.schema_type_owner())
                 });
-                let string_sink = lift_type_expr(&TypeExpr::String).expect("built-in String lifts");
+                let interpolation_sink = lift_type_expr(&INTERPOLATION_REF_SINK)
+                    .expect("built-in interpolation operand types lift");
                 visit_refs_with_sink(
                     assignment_value,
                     sink,
@@ -4808,8 +4816,8 @@ fn validate_resource_ref_types_inner<
                                 &bindings.provider_context().custom_types,
                                 crate::schema::SinkAuthority::Owner(owner),
                             )),
-                            Some(RefSink::String) => Some(
-                                string_sink
+                            Some(RefSink::Interpolation) => Some(
+                                interpolation_sink
                                     .assignment_sink(&bindings.provider_context().custom_types),
                             ),
                             Some(RefSink::TypeExpr(_)) | None => None,
@@ -4864,9 +4872,8 @@ fn validate_resource_ref_types_inner<
                             &bindings.provider_context().custom_types,
                             crate::schema::SinkAuthority::Owner(owner),
                         ),
-                        Some(RefSink::String) => {
-                            string_sink.assignment_sink(&bindings.provider_context().custom_types)
-                        }
+                        Some(RefSink::Interpolation) => interpolation_sink
+                            .assignment_sink(&bindings.provider_context().custom_types),
                         Some(RefSink::TypeExpr(_)) | None => return,
                     };
                     let checked = match declared_source.as_ref() {

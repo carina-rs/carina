@@ -6818,7 +6818,7 @@ fn unloaded_bare_attribute_interpolation_reports_only_providers_not_loaded() {
         r#"
 arguments { x: String }
 attributes {
-  value: SomeBareProviderType = "${x}"
+  value: SomeBareProviderType = "${x}-inline"
 }
 "#,
     );
@@ -17393,9 +17393,9 @@ fn reference_constraints_validate_offline_in_a_directory_configuration() {
 fn non_string_interpolation_sinks_across_files() {
     let engine = coalesce_resource_engine();
     for source in [
-        "exports { port: Int = \"${src.identifier}\" }",
-        "attributes { port: Bool = \"${src.identifier}\" }",
-        "let result = f(\"${src.identifier}\")",
+        "exports { port: Int = \"${src.identifier}-inline\" }",
+        "attributes { port: Bool = \"${src.identifier}-inline\" }",
+        "let result = f(\"${src.identifier}-inline\")",
     ] {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("providers.crn"), "provider mock {}\n").unwrap();
@@ -17482,7 +17482,7 @@ fn resource_child_failure_has_one_error_across_files() {
         "let src = mock.test.resource { name = 'source' }\n",
     )
     .unwrap();
-    let source = "let sink = mock.test.resource { name = \"${src.no_such_attr}\" }\n";
+    let source = "let sink = mock.test.resource { name = \"${src.no_such_attr}-inline\" }\n";
     std::fs::write(directory.path().join("main.crn"), source).unwrap();
     let diagnostics = analyze_with_buffer(
         &coalesce_resource_engine(),

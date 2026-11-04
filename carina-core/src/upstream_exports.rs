@@ -3228,6 +3228,55 @@ mod tests {
     }
 
     #[test]
+    fn type_check_interpolation_operands_accept_scalars_and_reject_collections() {
+        let schemas = schema_with_attr(
+            "tags",
+            PatternAttributeType::map(PatternAttributeType::string()),
+        );
+        for (ty, accepted) in [
+            (TypeExpr::String, true),
+            (TypeExpr::Int, true),
+            (TypeExpr::Float, true),
+            (TypeExpr::Bool, true),
+            (TypeExpr::Duration, true),
+            (TypeExpr::Map(Box::new(TypeExpr::String)), false),
+            (TypeExpr::List(Box::new(TypeExpr::String)), false),
+            (
+                TypeExpr::Struct {
+                    fields: vec![("name".into(), TypeExpr::String)],
+                },
+                false,
+            ),
+        ] {
+            let exports = mk_typed_exports(&[(
+                "orgs",
+                &[
+                    ("value", ty.clone()),
+                    ("values", TypeExpr::Map(Box::new(ty.clone()))),
+                ],
+            )]);
+            for reference in ["orgs.value", "orgs.values['k']"] {
+                for prefix in ["", "value: "] {
+                    let parsed = parse_project_with_provider(
+                        &format!(
+                            "let orgs = upstream_state {{ source = '../organizations' }}\n\
+                             test.r.res {{ tags = {{ Foo = \"{prefix}${{{reference}}}\" }} }}"
+                        ),
+                        "test",
+                    );
+                    let errors =
+                        check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
+                    assert_eq!(
+                        errors.len(),
+                        usize::from(!accepted),
+                        "{ty}: {prefix}${{{reference}}}: {errors:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn type_check_narrowed_map_inside_interpolation_flags() {
         // Acceptance criterion 3 from #2475: a `map(_)` ref embedded
         // inside a string interpolation cannot satisfy the String
