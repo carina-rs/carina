@@ -3191,12 +3191,7 @@ mod tests {
             let original = &schema.parts()["value"];
             let wire = attribute_type_to_protocol(original).unwrap();
             let json = serde_json::to_value(&wire).unwrap();
-            assert_eq!(
-                json.get("length")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-                serde_json::to_value(length).unwrap()
-            );
+            assert_eq!(json["length"], serde_json::to_value(length).unwrap());
             let decoded_wire = serde_json::from_value(json.clone()).unwrap();
             let decoded =
                 protocol_to_config_schema(BTreeMap::from([("value".into(), decoded_wire)]))
