@@ -225,7 +225,12 @@ mod assignability_edges;
 mod fingerprint;
 mod resolved_attr_type;
 mod resolved_union_members;
+mod resource_value_validation;
 mod type_identity;
+
+pub use resource_value_validation::{
+    ResourceValueFinding, ResourceValueInputs, ResourceValueTarget, ValueFindingAnchor,
+};
 
 pub use assignability::{AssignmentSink, SinkAuthority, TypeAssignability, TypeAssignmentDeferral};
 pub(crate) use assignability_edges::AssignabilityClosure;
@@ -14676,6 +14681,40 @@ impl<'a> OwnerBoundResourceSchema<'a> {
             .validate_with_origins_and_lookup(attributes, is_string_literal, &lookup)
     }
 
+    /// Collect every resource value finding in the same walk used by
+    /// `validate_with_resolver`, retaining authored names and nested targets.
+    pub fn collect_validation_with_resolver<P: PlaceholderKind, B: BindingAddress>(
+        self,
+        attributes: &HashMap<String, Value<P, B>>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        resolver: &dyn crate::parser::CustomTypeResolver,
+    ) -> Vec<ResourceValueFinding> {
+        let lookup = crate::parser::custom_type_lookup_for_schema(resolver, self);
+        self.schema
+            .as_schema()
+            .collect_resource_values(
+                ResourceValueInputs::new(attributes),
+                is_string_literal,
+                &lookup,
+            )
+            .findings
+    }
+
+    /// Collect resource findings including the binding authority's typed
+    /// outcomes, without revalidating the sinks that authority consumed.
+    pub fn collect_validation_inputs_with_resolver<P: PlaceholderKind, B: BindingAddress>(
+        self,
+        inputs: ResourceValueInputs<'_, P, B>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        resolver: &dyn crate::parser::CustomTypeResolver,
+    ) -> Vec<ResourceValueFinding> {
+        let lookup = crate::parser::custom_type_lookup_for_schema(resolver, self);
+        self.schema
+            .as_schema()
+            .collect_resource_values(inputs, is_string_literal, &lookup)
+            .findings
+    }
+
     /// Validate every concrete value known at the provider boundary, routing
     /// identified declarations through this schema's registered owner.
     pub fn validate_known_values_with_resolver(
@@ -15507,50 +15546,12 @@ impl PatternResourceSchema<Compiled> {
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
-        let mut errors = Vec::new();
-
-        // Check required attributes
-        for (name, schema) in &self.attributes {
-            if schema.is_required() && !attributes.contains_key(name) && schema.default.is_none() {
-                errors.push(TypeError::MissingRequired { name: name.clone() });
-            }
-        }
-
-        errors.extend(self.validate_value_entries(
-            attributes,
+        self.collect_resource_values(
+            ResourceValueInputs::new(attributes),
             is_string_literal,
             lookup,
-            ValueEntryValidation::FullInput,
-            None,
-        ));
-
-        for group in &self.field_groups {
-            let present = group
-                .fields()
-                .iter()
-                .filter(|name| attributes.contains_key(name.as_str()))
-                .count();
-            if !group.is_satisfied_by_count(present) {
-                errors.push(TypeError::FieldGroupViolation {
-                    path: FieldPath::new(),
-                    group: group.clone(),
-                });
-            }
-        }
-
-        // Run custom validator if present
-        if let Some(validator) = self.validator()
-            && let Some(attributes) = attributes_without_placeholders(attributes)
-            && let Err(mut validation_errors) = run_resource_validator(validator, &attributes)
-        {
-            errors.append(&mut validation_errors);
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
+        )
+        .into_result()
     }
 
     fn validate_value_entries<P: PlaceholderKind, B: BindingAddress>(
@@ -15561,80 +15562,15 @@ impl PatternResourceSchema<Compiled> {
         mode: ValueEntryValidation,
         selected: Option<&HashSet<String>>,
     ) -> Vec<TypeError> {
-        let mut errors = Vec::new();
-
-        // Build block_name -> canonical_name map for alias resolution
-        let bn_map = self.block_name_map();
-
-        // Build suggestion candidates (canonical names + block name aliases)
-        let mut known: Vec<&str> = self.attributes.keys().map(|s| s.as_str()).collect();
-        for bn in bn_map.keys() {
-            known.push(bn.as_str());
-        }
-
-        // Type check each attribute and reject unknown ones
-        for (name, value) in attributes {
-            if selected.is_some_and(|selected| !selected.contains(name)) {
-                continue;
-            }
-
-            // Resolve block_name alias to canonical name
-            let canonical = bn_map.get(name).map(|s| s.as_str()).unwrap_or(name);
-
-            if let Some(schema) = self.attributes.get(canonical) {
-                let effective_attribute = EffectiveAttribute {
-                    attribute: schema,
-                    defs: &self.defs,
-                    path: vec![schema.name.clone()],
-                };
-                // `read_only` attributes are provider-populated, so accepting a user
-                // value would silently drop it. Reject before type checking so the
-                // diagnostic reports writability instead of a confusing type error.
-                if schema.is_read_only() && mode == ValueEntryValidation::FullInput {
-                    errors.push(TypeError::ReadOnlyAttribute { name: name.clone() });
-                    continue;
-                }
-
-                if let Err(e) = effective_attribute.validate(value) {
-                    // Tag the error with the attribute name the user actually
-                    // wrote (which may be a block-name alias), so diagnostics
-                    // point back at a token that appears in their source.
-                    let tagged = e.with_attribute(name);
-                    // Other schema shapes may use custom validators that return
-                    // `InvalidEnumVariant`; quoted-form reshaping belongs only
-                    // to an Enum attribute.
-                    let reshaped = if is_string_literal(name.as_str())
-                        && matches!(effective_attribute.value_type().shape(), Shape::Enum { .. })
-                    {
-                        tagged.into_string_literal_diagnostic()
-                    } else {
-                        tagged
-                    };
-                    errors.push(reshaped);
-                }
-                walk_custom_lookup(
-                    &schema.attr_type,
-                    value,
-                    Some(name),
-                    lookup,
-                    &self.defs,
-                    &mut errors,
-                );
-            } else if mode == ValueEntryValidation::FullInput {
-                let id_attribute = format!("{name}_id");
-                let suggestion = if known.contains(&id_attribute.as_str()) {
-                    Some(id_attribute)
-                } else {
-                    suggest_similar_name(name, &known)
-                };
-                errors.push(TypeError::UnknownAttribute {
-                    name: name.clone(),
-                    suggestion,
-                });
-            }
-        }
-
-        errors
+        self.collect_value_entries(
+            attributes,
+            is_string_literal,
+            lookup,
+            mode,
+            selected,
+            &HashSet::new(),
+        )
+        .errors
     }
 }
 

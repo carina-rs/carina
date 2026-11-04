@@ -1,151 +1,290 @@
-//! Render schema findings from the sealed resource's parser-owned element locations.
+//! Render the sole resource-value report using parser-owned locations.
 
-use super::{DiagnosticEngine, render_merged, render_schema_diagnostic};
+mod editor;
+
+pub(super) use editor::attribute_findings;
+
+use super::{DiagnosticEngine, Value, render_merged};
 use crate::document::Document;
-use carina_core::parser::{AnalysisResourceRef, Located};
-use carina_core::resource::{ParserPlaceholder, RelativeBindingName, Value as GenericValue};
-use carina_core::schema::{EffectiveType, FieldPathStep, TypeError, ValidatedResourceSchema};
+use carina_core::parser::{AnalysisResourceRef, DeclarationLocation, Located, ProviderContext};
+use carina_core::resource::{ConcreteValue, DeferredValue};
+use carina_core::schema::{
+    FieldPathStep, ResourceValueFinding, ResourceValueTarget, TypeError, ValidatedResourceSchema,
+    ValueFindingAnchor,
+};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
-type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
+/// Expanded instances share their parser-authored locations. Keep the report
+/// keyed by those locations, rather than by an expanded resource's identity.
+/// A location can still carry distinct errors or paths (computed collections
+/// can anchor multiple invalid leaves to the same authored parent).
+#[derive(Default)]
+pub(super) struct ResourceValueReport {
+    findings: indexmap::IndexMap<DeclarationLocation, Vec<AuthoredValueFinding>>,
+}
 
-impl DiagnosticEngine {
-    /// Validate a container once and attach each path-tagged error to the
-    /// authored key, list element, or nearest authored computed parent.
-    pub(super) fn validate_container_value(
-        &self,
-        doc: &Document,
+struct AuthoredValueFinding {
+    core: ResourceValueFinding,
+    scalar_value: Option<Value>,
+    replaceable: bool,
+}
+
+impl ResourceValueReport {
+    pub(super) fn collect(
+        &mut self,
         resource: &AnalysisResourceRef<'_>,
-        attr_name: &str,
-        value: &Value,
-        effective_type: &EffectiveType<'_>,
-    ) -> (Vec<Diagnostic>, bool) {
-        let mut diagnostics = Vec::new();
-        let mut reported_duplicate = false;
-        for (path, error) in effective_type.validate_collect(value) {
-            let is_duplicate = super::is_duplicate_list_error(&error);
-            let is_item_error = path
+        findings: impl IntoIterator<Item = ResourceValueFinding>,
+        values: &std::collections::HashMap<String, Value>,
+    ) {
+        let mut authored = Self::default();
+        for finding in findings {
+            authored.collect_finding(resource, finding, values);
+        }
+        for (location, findings) in authored.findings {
+            let reported = self.findings.entry(location).or_default();
+            let mut matched = vec![false; reported.len()];
+            // Match each occurrence at most once across complete walks. Two
+            // coalesce operands can produce equal errors at one fallback
+            // anchor, and both findings from that walk must survive.
+            for finding in findings {
+                if let Some(index) = reported
+                    .iter()
+                    .zip(&matched)
+                    .position(|(existing, matched)| !matched && existing.core == finding.core)
+                {
+                    matched[index] = true;
+                } else {
+                    reported.push(finding);
+                    matched.push(true);
+                }
+            }
+        }
+    }
+
+    fn collect_finding(
+        &mut self,
+        resource: &AnalysisResourceRef<'_>,
+        finding: ResourceValueFinding,
+        values: &std::collections::HashMap<String, Value>,
+    ) {
+        if let ResourceValueTarget::Attribute {
+            authored_attribute,
+            path,
+            ..
+        } = &finding.target
+            && path.is_empty()
+            && matches!(finding.error, TypeError::BlockSyntaxNotAllowed { .. })
+        {
+            let blocks: Vec<_> = resource.attribute_block_keys(authored_attribute).collect();
+            if !blocks.is_empty() {
+                for location in blocks {
+                    self.insert(location.clone(), finding.clone(), None, false);
+                }
+                return;
+            }
+        }
+        let (location, scalar_value, replaceable) = match &finding.target {
+            ResourceValueTarget::Resource => (resource.type_location(), None, false),
+            ResourceValueTarget::Attribute {
+                authored_attribute: name,
+                path,
+                anchor,
+            } => {
+                let location = match anchor {
+                    ValueFindingAnchor::Key => resource.attribute_path_location(name, path),
+                    ValueFindingAnchor::Value => resource.attribute_value_location(name, path),
+                    ValueFindingAnchor::BindingToken(location) => location,
+                    ValueFindingAnchor::Assignment => {
+                        let assignment = resource.attribute_assignment_location(name);
+                        let span = assignment.span();
+                        if span.start_line() == span.end_line() {
+                            assignment
+                        } else {
+                            resource.attribute_key_location(name)
+                        }
+                    }
+                };
+                let scalar_value = if path.is_empty()
+                    && matches!(finding.error, TypeError::TypeMismatch { .. })
+                {
+                    values
+                        .get(name)
+                        .filter(|value| matches!(value, Value::Concrete(ConcreteValue::String(_))))
+                        .cloned()
+                } else {
+                    None
+                };
+                let replaceable = matches!(anchor, ValueFindingAnchor::BindingToken(_))
+                    || (path.is_empty()
+                        && resource.replaceable_attribute_value(name) == Some(location));
+                (location, scalar_value, replaceable)
+            }
+        };
+        self.insert(location.clone(), finding, scalar_value, replaceable);
+    }
+
+    fn insert(
+        &mut self,
+        location: DeclarationLocation,
+        core: ResourceValueFinding,
+        scalar_value: Option<Value>,
+        replaceable: bool,
+    ) {
+        self.findings
+            .entry(location)
+            .or_default()
+            .push(AuthoredValueFinding {
+                core,
+                scalar_value,
+                replaceable,
+            });
+    }
+
+    pub(super) fn render(self, doc: &Document) -> Vec<Diagnostic> {
+        self.findings
+            .into_iter()
+            .flat_map(|(location, findings)| {
+                findings
+                    .into_iter()
+                    .filter_map(move |finding| render_value_finding(doc, location.clone(), finding))
+            })
+            .collect()
+    }
+}
+
+/// Evaluate known expressions without selecting an authored coalesce branch.
+/// Each operand must still satisfy the sink, including an unused default.
+pub(super) fn evaluate_resource_value(value: &Value, context: &ProviderContext) -> Value {
+    match value {
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(evaluate_resource_value(value, context)),
+                default: Box::new(evaluate_resource_value(default, context)),
+            })
+        }
+        Value::Deferred(DeferredValue::Secret(value)) => Value::Deferred(DeferredValue::Secret(
+            Box::new(evaluate_resource_value(value, context)),
+        )),
+        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
+            items
+                .iter()
+                .map(|item| evaluate_resource_value(item, context))
+                .collect(),
+        )),
+        Value::Concrete(ConcreteValue::Map(map)) => Value::Concrete(ConcreteValue::Map(
+            map.iter()
+                .map(|(key, value)| (key.clone(), evaluate_resource_value(value, context)))
+                .collect(),
+        )),
+        _ => carina_core::parser::evaluate_static_value_for_validation(value, context)
+            .unwrap_or_else(|| value.clone()),
+    }
+}
+
+fn render_value_finding(
+    doc: &Document,
+    location: DeclarationLocation,
+    finding: AuthoredValueFinding,
+) -> Option<Diagnostic> {
+    let AuthoredValueFinding {
+        core: ResourceValueFinding { target, mut error },
+        scalar_value,
+        replaceable,
+    } = finding;
+    let message = match target {
+        ResourceValueTarget::Resource => error.to_string(),
+        ResourceValueTarget::Attribute {
+            authored_attribute: name,
+            path,
+            anchor,
+        } => {
+            let binding_token = matches!(anchor, ValueFindingAnchor::BindingToken(_));
+            let indexed = path
                 .steps()
                 .iter()
                 .any(|step| matches!(step, FieldPathStep::Index(_)));
-            let location = if is_duplicate {
-                resource.attribute_value_location(attr_name, &path)
-            } else {
-                resource.attribute_path_location(attr_name, &path)
-            };
-            let attribute = if is_item_error
-                && !is_duplicate
-                && !matches!(&error, TypeError::FieldGroupViolation { .. })
+            let duplicate = matches!(error, TypeError::DuplicateListElement { .. });
+            let attribute =
+                if indexed && !duplicate && !matches!(error, TypeError::FieldGroupViolation { .. })
+                {
+                    format!("{name}{path}")
+                } else {
+                    name.clone()
+                };
+            if !binding_token
+                && (indexed
+                    || path.is_empty()
+                    || matches!(error, TypeError::FieldGroupViolation { .. }))
             {
-                format!("{attr_name}{path}")
-            } else {
-                attr_name.to_string()
-            };
-            let error = if is_item_error
-                || path.is_empty()
-                || matches!(&error, TypeError::FieldGroupViolation { .. })
-            {
-                error.with_attribute(&attribute)
-            } else {
-                error
-            };
-            let message = if is_item_error && error.attribute_name().is_none() {
+                error = error.with_attribute(&attribute);
+            }
+            if binding_token {
+                error.to_string()
+            } else if indexed && error.attribute_name().is_none() {
                 format!("{error} for '{attribute}'")
+            } else if path.is_empty() {
+                scalar_guidance(&error, scalar_value.as_ref()).unwrap_or_else(|| error.to_string())
             } else {
                 error.to_string()
-            };
-            let finding = Located::new(location.clone(), error);
-            let diagnostic = if path.is_empty()
-                && (is_duplicate
-                    || crate::code_action::enum_diagnostic_data_for_error(finding.detail())
-                        .is_some())
-            {
-                let finding = Located::new(
-                    resource.attribute_value_location(attr_name, &path).clone(),
-                    finding.detail().clone(),
-                );
-                render_schema_diagnostic(
-                    doc,
-                    &finding,
-                    resource.replaceable_attribute_value(attr_name),
-                )
-            } else {
-                render_merged(
-                    doc,
-                    &finding,
-                    severity_for_validation_error(finding.detail()),
-                    message,
-                )
-            };
-            if let Some(diagnostic) = diagnostic {
-                diagnostics.push(diagnostic);
-                reported_duplicate |= is_duplicate;
             }
         }
-        (diagnostics, reported_duplicate)
+    };
+    let mut diagnostic = render_merged(
+        doc,
+        &Located::new(location, &error),
+        severity_for_validation_error(&error),
+        message,
+    )?;
+    if replaceable && let Some(data) = crate::code_action::enum_diagnostic_data_for_error(&error) {
+        diagnostic.data = Some(serde_json::to_value(data).expect("EnumDiagnosticData serialize"));
     }
+    Some(diagnostic)
+}
 
+fn scalar_guidance(error: &TypeError, value: Option<&Value>) -> Option<String> {
+    let TypeError::TypeMismatch { types } = error else {
+        return None;
+    };
+    let value @ Value::Concrete(ConcreteValue::String(_)) = value? else {
+        return None;
+    };
+    match types.expected() {
+        "Bool" => Some(format!(
+            "Type mismatch: expected Bool, got {}. Use true or false.",
+            carina_core::ValueDescription::of(value)
+        )),
+        "Int" | "Float" => Some(format!(
+            "Type mismatch: expected {}, got {}.",
+            types.expected(),
+            carina_core::ValueDescription::of(value)
+        )),
+        _ => None,
+    }
+}
+
+impl DiagnosticEngine {
     pub(super) fn check_list_struct_syntax(
         &self,
         doc: &Document,
         resource: &AnalysisResourceRef<'_>,
         schema: &ValidatedResourceSchema,
     ) -> Vec<Diagnostic> {
-        use carina_core::schema::Shape;
-        let mut diagnostics = Vec::new();
-        for attribute in schema.effective_attributes() {
-            let name = attribute.name();
-            if attribute.is_read_only() || !resource.is_list_literal(name) {
-                continue;
-            }
-            if !matches!(schema.as_schema().shape_of(attribute.field_type()), Shape::List { element_type, .. } if matches!(schema.as_schema().shape_of(element_type), Shape::Struct { .. }))
-            {
-                continue;
-            }
-            let finding = Located::new(
-                resource.attribute_key_location(name).clone(),
-                format!(
-                    "Prefer block syntax for '{}'. Use `{} {{ ... }}` instead of `{} = [{{ ... }}]`.",
-                    name, name, name,
-                ),
-            );
-            diagnostics.extend(render_merged(
-                doc,
-                &finding,
-                DiagnosticSeverity::HINT,
-                finding.detail().clone(),
-            ));
-        }
-        diagnostics
+        editor::syntax_findings(resource, schema)
+            .iter()
+            .filter_map(|finding| {
+                render_merged(
+                    doc,
+                    finding,
+                    finding.detail().severity(),
+                    finding.detail().to_string(),
+                )
+            })
+            .collect()
     }
 }
 
-fn severity_for_validation_error(error: &TypeError) -> DiagnosticSeverity {
-    match error {
-        TypeError::ReadOnlyAttribute { name: _ }
-        | TypeError::FieldGroupViolation { path: _, group: _ }
-        | TypeError::DuplicateListElement {
-            value: _,
-            index: _,
-            first_index: _,
-            attribute: _,
-        } => DiagnosticSeverity::ERROR,
-        TypeError::ListItemError { inner, .. }
-        | TypeError::MapKeyError { inner, .. }
-        | TypeError::MapValueError { inner, .. }
-        | TypeError::StructFieldError { inner, .. } => severity_for_validation_error(inner),
-        TypeError::UnionAlternativesMismatch { failures } => {
-            if failures
-                .iter()
-                .all(|failure| severity_for_validation_error(failure) == DiagnosticSeverity::ERROR)
-            {
-                DiagnosticSeverity::ERROR
-            } else {
-                DiagnosticSeverity::WARNING
-            }
-        }
-        _ => DiagnosticSeverity::WARNING,
-    }
+fn severity_for_validation_error(_: &TypeError) -> DiagnosticSeverity {
+    DiagnosticSeverity::ERROR
 }
 
 #[cfg(test)]
@@ -185,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn tied_union_is_warning_when_only_one_arm_is_an_error() {
+    fn tied_union_is_error_when_only_one_arm_is_a_writability_error() {
         let error = tied_string_error(
             TypeError::ReadOnlyAttribute {
                 name: "provider_value".to_string(),
@@ -197,7 +336,7 @@ mod tests {
 
         assert_eq!(
             severity_for_validation_error(&error),
-            DiagnosticSeverity::WARNING
+            DiagnosticSeverity::ERROR
         );
     }
 

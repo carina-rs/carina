@@ -45,6 +45,80 @@ fn write_fixture(files: &[(&str, &str)]) -> TempDir {
     dir
 }
 
+fn assert_collection_value_parity(field_type: AttributeType, value: &str, expected: Option<&str>) {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Collection")
+            .attribute(AttributeSchema::optional("params", field_type).build())
+            .validate()
+            .unwrap(),
+    );
+    let source = format!("mock.test.Collection {{\n  params = {value}\n}}\n");
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider mock {}\n"),
+        ("main.crn", &source),
+    ]);
+    let cli = carina_cli::commands::validate::validate_diagnostics_with_factories(
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        carina_cli::wiring::LoadedProviderFactory::for_test(factories_for(&schemas)),
+        HashMap::new(),
+    );
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    assert!(cli.warnings.is_empty(), "{:?}", cli.warnings);
+    assert_eq!(
+        cli.errors.len(),
+        usize::from(expected.is_some()),
+        "{:?}",
+        cli.errors
+    );
+    if let Some(message) = expected {
+        assert!(
+            cli.errors[0].to_string().contains(message),
+            "{:?}",
+            cli.errors
+        );
+        assert_eq!(lsp.len(), 1, "{lsp:#?}");
+        assert_eq!(
+            lsp[0].severity,
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+        );
+        assert!(lsp[0].message.contains(message), "{lsp:#?}");
+    } else {
+        assert!(lsp.is_empty(), "{lsp:#?}");
+    }
+}
+
+#[test]
+fn list_count_core_error_matches_cli_in_directory() {
+    for count in [10, 11] {
+        assert_collection_value_parity(
+            AttributeType::refined_list(
+                AttributeType::string(),
+                true,
+                Some((Some(0), Some(10))),
+                carina_core::schema::ListElements::AllowDuplicates,
+            ),
+            &format!("[{}]", vec!["\"ok\""; count].join(", ")),
+            (count == 11).then_some("length 11 is outside allowed range [0, 10]"),
+        );
+    }
+}
+
+#[test]
+fn refined_map_value_core_error_matches_cli_in_directory() {
+    assert_collection_value_parity(
+        AttributeType::map(AttributeType::refined_string(
+            None,
+            None,
+            Some((Some(0), Some(3))),
+            None,
+        )),
+        "{ key = \"abcd\" }",
+        Some("length 4 is outside allowed range [0, 3]"),
+    );
+}
+
 fn engine_with_schemas(schemas: SchemaRegistry) -> DiagnosticEngine {
     let provider_names: Vec<String> = schemas
         .iter()

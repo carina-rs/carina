@@ -4,11 +4,13 @@ use super::*;
 use crate::document::Document;
 use carina_core::parser::ProviderContext;
 use carina_core::provider::ProviderFactory;
+use carina_core::resource::ConcreteValue;
 use carina_core::schema::SchemaRegistry;
 
 mod basic;
 mod extended;
 mod located;
+mod single_path;
 
 pub(super) fn create_document(content: &str) -> Document {
     create_document_with_environment(content, carina_core::EnvironmentSnapshot::empty())

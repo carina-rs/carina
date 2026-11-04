@@ -24,6 +24,66 @@ fn draft_assignability_preserves_invalid_patterns_and_schema_definitions() {
 }
 
 use super::*;
+
+mod single_path;
+
+#[test]
+fn resource_validation_calls_rejecting_native_validator_once_per_leaf() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let leaf = AttributeType::refined_string_with_validator(
+        TypeIdentity::bare("Counted"),
+        None,
+        None,
+        validator(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Err(TypeError::ValidationFailed {
+                message: "rejected".into(),
+            })
+        }),
+        None,
+    );
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.Counted")
+            .attribute(AttributeSchema::optional("values", AttributeType::list(leaf)).build())
+            .validate()
+            .unwrap(),
+    );
+    let schema = registry
+        .get("mock", "test.Counted", SchemaKind::Resource)
+        .unwrap();
+    let values = HashMap::from([(
+        "values".into(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("bad".into()),
+        )])),
+    )]);
+    let resolver = |_: crate::parser::CustomTypeValidationTarget<'_>, _: &Value| Ok(());
+    assert!(
+        schema
+            .validate_with_resolver(&values, &|_| false, &resolver)
+            .is_err()
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "failure attribution must retain the first callback result"
+    );
+    calls.store(0, Ordering::SeqCst);
+    let findings = schema.collect_validation_with_resolver(&values, &|_| false, &resolver);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(findings.len(), 1);
+    assert!(
+        matches!(&findings[0].target, ResourceValueTarget::Attribute { authored_attribute, path, .. }
+        if authored_attribute == "values" && path.to_string() == "[0]")
+    );
+}
 use super::{
     CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
     CompiledResourceSchema as ResourceSchema, CompiledStructField as StructField,

@@ -258,6 +258,25 @@ impl<'a, R: PatternForm> EnumValueResolver<'a, R> {
 }
 
 impl EnumValueResolver<'_, Compiled> {
+    /// Resolve a quoted authored value, retaining the quoted-form diagnostic
+    /// and executing its native validator only once.
+    pub(crate) fn resolve_authored_string(
+        &self,
+        text: &super::ValueString,
+    ) -> Result<CanonicalEnumValue, TypeError> {
+        let attr = self.defs.map_or(self.attr_type, |defs| {
+            self.attr_type.resolve_refs_with_defs(defs).as_attr()
+        });
+        attr.validate_identified_scalar_value(&super::Value::<super::NoPlaceholder>::Concrete(
+            super::ConcreteValue::String(text.clone()),
+        ))?;
+        let (identity, _, _, _, dsl_map) = self.parts()?;
+        Ok(CanonicalEnumValue::new_resolved(
+            identity.clone(),
+            dsl_map.api_for(text.expose_plaintext()),
+        ))
+    }
+
     pub fn resolve_raw(&self, raw: &RawEnumIdentifier) -> Result<CanonicalEnumValue, TypeError> {
         self.resolve_text(raw.as_str(), EnumInputPhase::RawDsl)
     }

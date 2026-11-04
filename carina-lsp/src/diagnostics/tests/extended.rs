@@ -272,7 +272,7 @@ fn round6_let_scope_ignores_for_local_binding() {
         Range::new(Position::new(5, 21), Position::new(5, 22)),
         "{diagnostics:#?}"
     );
-    assert_eq!(error.severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
 }
 
 #[test]
@@ -293,7 +293,7 @@ fn round6_let_scope_ignores_if_local_binding() {
         Range::new(Position::new(5, 21), Position::new(5, 22)),
         "{diagnostics:#?}"
     );
-    assert_eq!(error.severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
 }
 
 #[test]
@@ -312,7 +312,7 @@ fn round6_let_scope_ignores_multiline_string_binding_text() {
             Range::new(Position::new(6, 21), Position::new(6, 22)),
             "{source}: {diagnostics:#?}"
         );
-        assert_eq!(error.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
     }
 }
 
@@ -464,7 +464,7 @@ fn round5_let_bound_plain_list_error_stays_in_second_resource() {
     let diagnostic = only_message_diagnostic(&diagnostics, "expected String");
     assert_eq!(diagnostic.range.start.line, 2, "{diagnostics:#?}");
     assert_eq!(diagnostic.range.end.line, 2, "{diagnostics:#?}");
-    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
 }
 
 #[test]
@@ -484,7 +484,7 @@ fn round5_let_bound_struct_list_error_stays_in_second_resource() {
     let diagnostic = only_message_diagnostic(&diagnostics, "expected String");
     assert_eq!(diagnostic.range.start.line, 3, "{diagnostics:#?}");
     assert_eq!(diagnostic.range.end.line, 3, "{diagnostics:#?}");
-    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
 }
 
 #[test]
@@ -549,7 +549,7 @@ fn round5_indexed_list_errors_use_element_spans() {
                 Range::new(Position::new(line, start), Position::new(line, start + 1)),
                 "{body}: {diagnostics:#?}"
             );
-            assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+            assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
         }
         assert_ne!(errors[0].range, errors[1].range);
     }
@@ -634,7 +634,7 @@ fn unique_list_item_errors_stay_in_the_second_resource() {
         let diagnostic = only_message_diagnostic(&diagnostics, message);
         assert_eq!(diagnostic.range.start.line, 8, "{diagnostics:?}");
         assert_eq!(diagnostic.range.end.line, 8, "{diagnostics:?}");
-        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
         let duplicate = only_message_diagnostic(&diagnostics, "Duplicate list element");
         assert_eq!(duplicate.range.start.line, 9, "{diagnostics:?}");
         assert_eq!(duplicate.range.end.line, 9, "{diagnostics:?}");
@@ -643,40 +643,50 @@ fn unique_list_item_errors_stay_in_the_second_resource() {
 
 #[test]
 fn unique_list_count_error_stays_in_the_second_resource() {
-    use carina_core::schema::{AttributeType, ListElements, ValidatedConfigSchema};
-    let schema = ValidatedConfigSchema::validate(std::collections::BTreeMap::from([(
-        "values".to_string(),
-        AttributeType::refined_list(
-            AttributeType::string(),
-            true,
-            Some((Some(1), None)),
-            ListElements::Unique,
-        ),
-    )]))
-    .unwrap();
-    let effective_type = schema.effective_type("values").unwrap();
-    let document = create_document(
-        "mock.test.UniqueLists {\n  values = [\"ok\"]\n}\nmock.test.UniqueLists {\n  values = []\n}\n",
+    use carina_core::schema::{AttributeSchema, AttributeType, ListElements, ResourceSchema};
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.UniqueLists")
+            .attribute(
+                AttributeSchema::optional(
+                    "values",
+                    AttributeType::refined_list(
+                        AttributeType::string(),
+                        true,
+                        Some((Some(1), None)),
+                        ListElements::Unique,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
     );
-    let resource = document
-        .parsed()
-        .unwrap()
-        .iter_all_resources()
-        .nth(1)
-        .unwrap();
-    let attributes = resource.attributes();
-    let tree =
-        carina_core::parser::AnalysisTree::try_from_file(document.parsed().unwrap()).unwrap();
-    let (diagnostics, reported_duplicate) = test_engine().validate_container_value(
-        &document,
-        tree.project_resources().nth(1).unwrap(),
-        "values",
-        attributes.get("values").unwrap(),
-        &effective_type,
+    let source = r#"let first = mock.test.UniqueLists {
+  values = ["ok"]
+}
+let second = mock.test.UniqueLists {
+  values = []
+}
+"#;
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    std::fs::write(directory.path().join("main.crn"), source).unwrap();
+    let diagnostics = analyze_with_buffer(
+        &custom_engine(schemas),
+        directory.path(),
+        "main.crn",
+        source,
     );
     let diagnostic = only_message_diagnostic(&diagnostics, "outside allowed range");
     assert_eq!(diagnostic.range.start.line, 4, "{diagnostics:?}");
-    assert!(!reported_duplicate);
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("Duplicate list element"))
+    );
 }
 
 #[test]
@@ -722,69 +732,21 @@ fn unique_list_item_error_does_not_suppress_a_resolved_duplicate() {
 
 #[test]
 fn unique_list_item_error_does_not_mark_a_duplicate_as_reported() {
-    use carina_core::schema::{AttributeSchema, AttributeType, ListElements, ResourceSchema};
-    let schema = ResourceSchema::new("test.UniqueLists")
-        .attribute(
-            AttributeSchema::optional(
-                "matrix",
-                AttributeType::refined_list(
-                    AttributeType::list(AttributeType::string()),
-                    true,
-                    None,
-                    ListElements::Unique,
-                ),
-            )
-            .build(),
-        )
-        .validate()
-        .unwrap();
-    let document = create_document(
-        "mock.test.UniqueLists {\n  matrix = [split(\",\", \"repo\"), [\"repo\"], [5]]\n}\n",
+    let (_, diagnostics) =
+        unique_list_scope_fixture(r#"matrix = [split(",", "repo"), ["repo"], [5]]"#);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("expected String"))
+            .count(),
+        1,
+        "{diagnostics:?}"
     );
-    let resource = document
-        .parsed()
-        .unwrap()
-        .iter_all_resources()
-        .next()
-        .unwrap();
-    let attributes = resource.attributes();
-    let value = attributes.get("matrix").unwrap();
-    let effective_attribute = schema.effective_attribute("matrix").unwrap();
-    let effective_type = effective_attribute.value_type();
-    let engine = test_engine();
-    let tree =
-        carina_core::parser::AnalysisTree::try_from_file(document.parsed().unwrap()).unwrap();
-    let (diagnostics, reported_duplicate) = engine.validate_container_value(
-        &document,
-        tree.project_resources().next().unwrap(),
-        "matrix",
-        value,
-        &effective_type,
-    );
-    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-    assert!(diagnostics[0].message.contains("expected String"));
-    assert!(
-        !reported_duplicate,
-        "an item error must not suppress a duplicate in a later pass"
-    );
-    let evaluated = carina_core::parser::evaluate_static_value_for_validation(
-        value,
-        document.provider_context(),
-    )
-    .unwrap();
-    let errors = effective_type.validate_collect(&evaluated);
-    assert!(
-        errors.iter().any(|(_, error)| matches!(
-            error,
-            TypeError::DuplicateListElement {
-                value: _,
-                index: _,
-                first_index: _,
-                attribute: _
-            }
-        )),
-        "{errors:?}"
-    );
+    let item = only_message_diagnostic(&diagnostics, "expected String");
+    assert_eq!(item.severity, Some(DiagnosticSeverity::ERROR));
+    let duplicate = only_message_diagnostic(&diagnostics, "Duplicate list element");
+    assert_eq!(duplicate.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(duplicate.range.start.line, 8, "{diagnostics:?}");
 }
 
 #[test]
@@ -2994,8 +2956,8 @@ outer {
     );
     assert_eq!(
         mismatch.unwrap().severity,
-        Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING),
-        "ordinary nested validation failures must retain warning severity"
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR),
+        "core nested validation failures must have error severity"
     );
 }
 
@@ -3833,12 +3795,12 @@ fn union_enum_and_struct_preserves_enum_quick_fix_diagnostic() {
         .iter()
         .filter(|diagnostic| {
             diagnostic.message.contains("invalid_mode")
-                && diagnostic.severity == Some(DiagnosticSeverity::WARNING)
+                && diagnostic.severity == Some(DiagnosticSeverity::ERROR)
         })
         .collect::<Vec<_>>();
     assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
     let diagnostic = matching[0];
-    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
     assert_eq!(
         diagnostic.range,
         Range::new(Position::new(3, 9), Position::new(3, 23))
