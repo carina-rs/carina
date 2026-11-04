@@ -2241,11 +2241,13 @@ pub enum TypeExpr {
     DottedUnresolved(ResourceTypePath),
     /// Provider-defined schema type (e.g., awscc.ec2.VpcId, awscc.ec2.SubnetId).
     ///
-    /// The scalar kind is fixed during resolution. Owners and semantic
+    /// The opaque witness retains resolved scalar constraints, including the
+    /// conjunction of every owner declaration for authored annotations. Exact
+    /// schema projections retain only their source declaration. Owners and semantic
     /// identity remain distinct: AWSCC can own a type in the shared `aws`
     /// identity namespace.
     SchemaType {
-        owned: super::OwnedTypeIdentity,
+        owned: super::ResolvedSchemaType,
     },
     /// Structural record type: `struct { name: type, ... }`.
     ///

@@ -6659,10 +6659,10 @@ impl CustomTypeCanonicalizationError {
                 identity,
                 expected: _expected,
                 actual,
-            } => crate::schema::TypeError::TypeMismatch {
-                expected: identity.to_string(),
-                got: actual.to_string(),
-            },
+            } => crate::schema::TypeError::value_type_mismatch(
+                identity.to_string(),
+                actual.to_string(),
+            ),
             error @ (Self::UnidentifiedDeclaration { .. }
             | Self::MissingScalarKind { .. }
             | Self::NonFiniteFloat { .. }
@@ -7618,7 +7618,7 @@ impl CustomTypeDispatchTable {
             .bindings
             .get(identity)
             .ok_or_else(|| format!("custom type `{identity}` is not declared by this provider"))?;
-        let value = bridge_text_to_typed_value(binding.scalar_kind, canonical_text)?;
+        let value = bridge_text_to_typed_value(binding.scalar_kind, canonical_text.into())?;
         for callback in &binding.callbacks {
             callback(&value).map_err(custom_validator_bridge_message)?;
         }
@@ -7626,21 +7626,21 @@ impl CustomTypeDispatchTable {
     }
 }
 
-fn bridge_text_to_typed_value(
+pub(crate) fn bridge_text_to_typed_value(
     scalar_kind: RefinedScalarKind,
-    canonical_text: &str,
+    canonical_text: ValueString,
 ) -> Result<Value, String> {
     match scalar_kind {
-        RefinedScalarKind::String => Ok(Value::Concrete(ConcreteValue::String(
-            canonical_text.to_string().into(),
-        ))),
+        RefinedScalarKind::String => Ok(Value::Concrete(ConcreteValue::String(canonical_text))),
         RefinedScalarKind::Int => Ok(Value::Concrete(ConcreteValue::Int(
             canonical_text
+                .expose_plaintext()
                 .parse::<i64>()
                 .map_err(|error| format!("invalid integer bridge value: {error}"))?,
         ))),
         RefinedScalarKind::Float => {
             let value = canonical_text
+                .expose_plaintext()
                 .parse::<f64>()
                 .map_err(|error| format!("invalid float bridge value: {error}"))?;
             if !value.is_finite() {
@@ -7772,7 +7772,7 @@ where
                     owner,
                     &declarations[0],
                 )
-                .expect("validated identified declarations have a scalar kind");
+                .expect("admitted identified declaration");
                 declarations_by_identity
                     .entry((identity.clone(), owned.scalar_kind()))
                     .and_modify(|existing| {
@@ -7790,6 +7790,67 @@ impl<F> crate::parser::CustomTypeResolver for FactoryCustomTypeResolver<F>
 where
     F: ProviderFactorySource,
 {
+    fn projection_declaration(
+        &self,
+        projection: &crate::parser::ResolvedSchemaType,
+    ) -> Result<AttributeType, crate::parser::CustomTypeValidationError> {
+        use crate::parser::CustomTypeValidationError;
+        let owner = projection.provider_names().next().expect("nonempty owners");
+        let missing = || CustomTypeValidationError::MissingDeclaration {
+            owner: owner.into(),
+            identity: projection.identity().clone(),
+        };
+        let mut candidates = self
+            .index
+            .get(owner)
+            .and_then(|index| index.declarations.get(projection.identity()))
+            .ok_or_else(missing)?
+            .iter()
+            .filter(|declaration| projection.matches_projection_declaration(declaration));
+        let selected = candidates.next().ok_or_else(missing)?;
+        if candidates.any(|declaration| !same_scalar_callbacks(selected, declaration)) {
+            return Err(CustomTypeValidationError::Rejected {
+                owner: owner.into(),
+                identity: projection.identity().clone(),
+                message: "exact schema projection has ambiguous callback provenance".into(),
+            });
+        }
+        Ok(selected.clone())
+    }
+
+    fn annotation_declaration(
+        &self,
+        owned: &crate::parser::OwnedTypeIdentity,
+    ) -> Result<crate::parser::ResolvedSchemaType, crate::parser::CustomTypeValidationError> {
+        use crate::parser::{CustomTypeValidationError, ResolvedSchemaType, SchemaTypeOwner};
+        let mut resolved: Option<ResolvedSchemaType> = None;
+        for owner in owned.owners().iter() {
+            let SchemaTypeOwner::Provider(owner) = owner;
+            let missing = || CustomTypeValidationError::MissingDeclaration {
+                owner: owner.clone(),
+                identity: owned.identity().clone(),
+            };
+            let declarations = self
+                .index
+                .get(owner)
+                .and_then(|index| index.declarations.get(owned.identity()))
+                .filter(|declarations| !declarations.is_empty())
+                .ok_or_else(missing)?;
+            for declaration in declarations {
+                let declaration = ResolvedSchemaType::from_schema_declaration(owner, declaration)
+                    .filter(|declaration| declaration.scalar_kind() == owned.scalar_kind())
+                    .ok_or_else(missing)?;
+                resolved = Some(match resolved {
+                    Some(existing) => existing.conjoin(&declaration),
+                    None => declaration,
+                });
+            }
+        }
+        Ok(resolved
+            .expect("nonempty owners and declarations")
+            .into_annotation())
+    }
+
     fn validate<'a>(
         &self,
         target: crate::parser::CustomTypeValidationTarget<'a>,
@@ -7855,6 +7916,24 @@ where
         }
         Ok(selected.map(|(_, _, declaration)| declaration))
     }
+}
+
+// Fingerprints retain callback presence, but executable callbacks have no
+// portable identity. Duplicate catalog occurrences are safe only when they
+// retain the same host callbacks, including an enum's base declaration.
+fn same_scalar_callbacks(left: &AttributeType, right: &AttributeType) -> bool {
+    let same_callback = match (local_custom_validator(left), local_custom_validator(right)) {
+        (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+        (None, None) => true,
+        _ => false,
+    };
+    same_callback
+        && match (left.raw_shape(), right.raw_shape()) {
+            (RawShape::Enum { base: left, .. }, RawShape::Enum { base: right, .. }) => {
+                same_scalar_callbacks(left, right)
+            }
+            _ => true,
+        }
 }
 
 impl<F> crate::parser::ProviderCustomTypeSource for FactoryCustomTypeResolver<F>

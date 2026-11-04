@@ -2713,12 +2713,26 @@ fn schema_type_serde_preserves_every_scalar_kind_without_registry() {
         RefinedScalarKind::Int,
         RefinedScalarKind::Float,
     ] {
-        let original = TypeExpr::SchemaType {
-            owned: crate::parser::OwnedTypeIdentity::provider(
-                "test",
-                TypeIdentity::from_dotted("test.counter.Count"),
-                kind,
+        let identity = TypeIdentity::from_dotted("test.counter.Count");
+        let declaration = match kind {
+            RefinedScalarKind::String => crate::schema::CompiledAttributeType::refined_string(
+                Some(identity),
+                Some(crate::schema::CompiledPattern::try_new("^[A-Z]+$").unwrap()),
+                Some((Some(1), Some(64))),
+                None,
             ),
+            RefinedScalarKind::Int => crate::schema::CompiledAttributeType::refined_int(
+                Some(identity),
+                Some((Some(2), Some(42))),
+            ),
+            RefinedScalarKind::Float => crate::schema::CompiledAttributeType::refined_float(
+                Some(identity),
+                Some((Some(0.5), Some(9.5))),
+            ),
+        };
+        let original = TypeExpr::SchemaType {
+            owned: crate::parser::ResolvedSchemaType::from_schema_declaration("test", &declaration)
+                .unwrap(),
         };
         let wire = serde_json::to_value(&original).unwrap();
         assert_eq!(
@@ -2731,6 +2745,138 @@ fn schema_type_serde_preserves_every_scalar_kind_without_registry() {
         assert_eq!(
             crate::provider::identified_custom_type_scalar_kind(&lifted).unwrap(),
             Some(kind)
+        );
+        match lifted.raw_shape() {
+            crate::schema::RawShape::String {
+                length, pattern, ..
+            } => {
+                assert_eq!(length, Some((Some(1), Some(64))));
+                assert_eq!(pattern, Some("^[A-Z]+$"));
+            }
+            crate::schema::RawShape::Int { range, .. } => {
+                assert_eq!(range, Some((Some(2), Some(42))));
+            }
+            crate::schema::RawShape::Float { range, .. } => {
+                assert_eq!(range, Some((Some(0.5), Some(9.5))));
+            }
+            _ => panic!("scalar witness must retain its declaration"),
+        }
+    }
+}
+
+#[test]
+fn schema_type_serde_requires_explicit_constraint_record_and_bounds() {
+    let declaration = crate::schema::CompiledAttributeType::refined_int(
+        Some(TypeIdentity::bare("Count")),
+        Some((None, Some(42))),
+    );
+    let original = TypeExpr::SchemaType {
+        owned: crate::parser::ResolvedSchemaType::from_schema_declaration("test", &declaration)
+            .unwrap(),
+    };
+    let mut wire = serde_json::to_value(&original).unwrap();
+    wire["SchemaType"]["owned"]
+        .as_object_mut()
+        .unwrap()
+        .remove("constraints");
+    assert!(
+        serde_json::from_value::<TypeExpr>(wire).is_err(),
+        "missing constraint evidence must never become an unbounded declaration"
+    );
+    let mut wire = serde_json::to_value(&original).unwrap();
+    wire["SchemaType"]["owned"]["constraints"]["scalar"]["Int"]["range"]
+        .as_object_mut()
+        .unwrap()
+        .remove("min");
+    assert!(
+        serde_json::from_value::<TypeExpr>(wire).is_err(),
+        "an omitted endpoint is not explicit unbounded evidence"
+    );
+}
+
+#[test]
+fn schema_type_serde_bounded_declaration_validates_constraint_evidence() {
+    let declaration = crate::schema::CompiledAttributeType::refined_string(
+        Some(TypeIdentity::bare("Name")),
+        Some(crate::schema::CompiledPattern::try_new("^[A-Z]+$").unwrap()),
+        Some((Some(1), Some(64))),
+        None,
+    );
+    let original = TypeExpr::SchemaType {
+        owned: crate::parser::ResolvedSchemaType::from_schema_declaration("test", &declaration)
+            .unwrap(),
+    };
+    let wire = serde_json::to_value(&original).unwrap();
+    let restored: TypeExpr = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(restored, original);
+    let lifted = crate::validation::lift_type_expr(&restored).unwrap();
+    assert!(
+        lifted
+            .validate(&Value::Concrete(ConcreteValue::String("VALID".into())))
+            .is_ok()
+    );
+    assert!(
+        lifted
+            .validate(&Value::Concrete(ConcreteValue::String("invalid".into())))
+            .is_err()
+    );
+    assert!(
+        lifted
+            .validate(&Value::Concrete(ConcreteValue::String(
+                "A".repeat(65).into()
+            )))
+            .is_err()
+    );
+
+    for pointer in [
+        "/SchemaType/owned/constraints",
+        "/SchemaType/owned/constraints/scalar",
+        "/SchemaType/owned/constraints/empty_intersection",
+        "/SchemaType/owned/constraints/scalar/String/length",
+        "/SchemaType/owned/constraints/scalar/String/length/min",
+        "/SchemaType/owned/constraints/scalar/String/length/max",
+        "/SchemaType/owned/constraints/scalar/String/patterns",
+    ] {
+        let mut invalid = wire.clone();
+        let (parent, field) = pointer.rsplit_once('/').unwrap();
+        invalid
+            .pointer_mut(parent)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        assert!(
+            serde_json::from_value::<TypeExpr>(invalid).is_err(),
+            "missing {pointer}"
+        );
+    }
+    for (pointer, value) in [
+        (
+            "/SchemaType/owned/constraints/scalar/String/length/min",
+            serde_json::json!({"Inclusive": 65}),
+        ),
+        (
+            "/SchemaType/owned/constraints/scalar/String/length/min",
+            serde_json::json!({"Inclusive": -1}),
+        ),
+        (
+            "/SchemaType/owned/constraints/scalar/String/patterns",
+            serde_json::json!(["["]),
+        ),
+        (
+            "/SchemaType/owned/constraints/empty_intersection",
+            serde_json::json!(true),
+        ),
+        (
+            "/SchemaType/owned/constraints/scalar",
+            serde_json::json!({"Int": {"range": {"min": "Unbounded", "max": "Unbounded"}}}),
+        ),
+    ] {
+        let mut invalid = wire.clone();
+        *invalid.pointer_mut(pointer).unwrap() = value;
+        assert!(
+            serde_json::from_value::<TypeExpr>(invalid).is_err(),
+            "invalid {pointer}"
         );
     }
 }
@@ -2759,7 +2905,8 @@ fn schema_type_serde_rejects_scalar_kind_that_conflicts_with_its_declaration() {
             "test",
             TypeIdentity::bare("Count"),
             crate::schema::RefinedScalarKind::Int,
-        ),
+        )
+        .unbounded_witness_for_test(),
     };
     let mut wire = serde_json::to_value(&original).unwrap();
     wire["SchemaType"]["owned"]["scalar_kind"] = serde_json::json!("String");
@@ -2776,7 +2923,8 @@ fn schema_type_serde_rejects_scalar_metadata_without_declaration_evidence() {
             "test",
             TypeIdentity::bare("Count"),
             crate::schema::RefinedScalarKind::Int,
-        ),
+        )
+        .unbounded_witness_for_test(),
     };
     let mut wire = serde_json::to_value(&original).unwrap();
     wire["SchemaType"]["owned"]
@@ -12680,7 +12828,8 @@ fn parse_schema_type_display() {
             "awscc",
             TypeIdentity::from_schema_type("awscc", "ec2", "VpcId"),
             crate::schema::RefinedScalarKind::String,
-        ),
+        )
+        .unbounded_witness_for_test(),
     };
     assert_eq!(t.to_string(), "awscc.ec2.VpcId");
 

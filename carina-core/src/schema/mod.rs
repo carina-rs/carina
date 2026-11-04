@@ -409,7 +409,7 @@ where
 #[derive(Clone)]
 pub(crate) enum RefinementBinding {
     MetadataOnly(Option<TypeIdentity>),
-    Annotation(crate::parser::OwnedTypeIdentity),
+    Annotation(crate::parser::ResolvedSchemaType),
     Validator {
         identity: TypeIdentity,
         callback: CustomValidator,
@@ -417,6 +417,13 @@ pub(crate) enum RefinementBinding {
 }
 
 impl RefinementBinding {
+    fn annotation(&self) -> Option<&crate::parser::ResolvedSchemaType> {
+        match self {
+            Self::Annotation(owned) => Some(owned),
+            Self::MetadataOnly(_) | Self::Validator { .. } => None,
+        }
+    }
+
     pub(crate) fn identity(&self) -> Option<&TypeIdentity> {
         match self {
             Self::MetadataOnly(identity) => identity.as_ref(),
@@ -2447,10 +2454,10 @@ impl Schema {
                 }) else {
                     out.push((
                         path.clone(),
-                        TypeError::TypeMismatch {
-                            expected: attr.type_name(),
-                            got: concrete.type_name().to_string(),
-                        },
+                        TypeError::value_type_mismatch(
+                            attr.type_name(),
+                            concrete.type_name().to_string(),
+                        ),
                     ));
                     return;
                 };
@@ -2533,10 +2540,10 @@ impl Schema {
                 }) else {
                     out.push((
                         path.clone(),
-                        TypeError::TypeMismatch {
-                            expected: attr.type_name(),
-                            got: concrete.type_name().to_string(),
-                        },
+                        TypeError::value_type_mismatch(
+                            attr.type_name(),
+                            concrete.type_name().to_string(),
+                        ),
                     ));
                     return;
                 };
@@ -2576,10 +2583,10 @@ impl Schema {
                 }) else {
                     out.push((
                         path.clone(),
-                        TypeError::TypeMismatch {
-                            expected: attr.type_name(),
-                            got: concrete.type_name().to_string(),
-                        },
+                        TypeError::value_type_mismatch(
+                            attr.type_name(),
+                            concrete.type_name().to_string(),
+                        ),
                     ));
                     return;
                 };
@@ -2703,10 +2710,10 @@ pub(crate) fn validate_attr_with_defs_and_ancestry<P: PlaceholderKind, B: Bindin
     let mut visited_refs = Vec::new();
     validation_error_with_defs_on_path(attr, value, defs, ancestry, &mut visited_refs).and_then(
         |()| {
-            Err(TypeError::TypeMismatch {
-                expected: attr.type_name(),
-                got: value.type_name(),
-            })
+            Err(TypeError::value_type_mismatch(
+                attr.type_name(),
+                value.type_name(),
+            ))
         },
     )
 }
@@ -2732,10 +2739,10 @@ fn validate_attr_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
     }
 
     validation_error_with_defs_on_path(attr, value, defs, ancestry, visited_refs).and_then(|()| {
-        Err(TypeError::TypeMismatch {
-            expected: attr.type_name(),
-            got: value.type_name(),
-        })
+        Err(TypeError::value_type_mismatch(
+            attr.type_name(),
+            value.type_name(),
+        ))
     })
 }
 
@@ -2796,10 +2803,10 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>
                 ),
                 None => return Ok(()),
                 Some(_) => {
-                    return Err(TypeError::TypeMismatch {
-                        expected: attr.type_name(),
-                        got: value.type_name(),
-                    });
+                    return Err(TypeError::value_type_mismatch(
+                        attr.type_name(),
+                        value.type_name(),
+                    ));
                 }
             };
             for result in constraints.check(
@@ -2867,10 +2874,10 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>
             } else if value.as_concrete().is_none() {
                 Ok(())
             } else {
-                Err(TypeError::TypeMismatch {
-                    expected: attr.type_name(),
-                    got: value.type_name(),
-                })
+                Err(TypeError::value_type_mismatch(
+                    attr.type_name(),
+                    value.type_name(),
+                ))
             }
         }
         AttrTypeKind::Struct {
@@ -2914,10 +2921,10 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>
             } else if value.as_concrete().is_none() {
                 Ok(())
             } else {
-                Err(TypeError::TypeMismatch {
-                    expected: attr.type_name(),
-                    got: value.type_name(),
-                })
+                Err(TypeError::value_type_mismatch(
+                    attr.type_name(),
+                    value.type_name(),
+                ))
             }
         }
         AttrTypeKind::Union(members) => {
@@ -4141,6 +4148,15 @@ impl PatternAttributeType<Compiled> {
         &self,
         value: ConcreteValueRef<'_, P, B>,
     ) -> Result<(), TypeError> {
+        if self.has_empty_scalar_intersection() {
+            return Err(TypeError::ValidationFailed {
+                message: format!(
+                    "{} has an empty intersection of scalar constraints",
+                    self.type_name()
+                )
+                .into(),
+            });
+        }
         match (&self.kind, value) {
             (AttrTypeKind::UnloadedSchemaType(_), _) => {
                 Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded.into())
@@ -4155,6 +4171,11 @@ impl PatternAttributeType<Compiled> {
                 ConcreteValueRef::String(s),
             ) => {
                 validate_string_refinement(binding.identity(), pattern.as_ref(), *length, s)?;
+                if let Some(owned) = binding.annotation() {
+                    for pattern in owned.patterns() {
+                        validate_string_refinement(binding.identity(), Some(pattern), None, s)?;
+                    }
+                }
                 binding
                     .callback()
                     .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
@@ -4199,10 +4220,10 @@ impl PatternAttributeType<Compiled> {
             }
             (AttrTypeKind::Bool, ConcreteValueRef::Bool(_)) => Ok(()),
             (AttrTypeKind::Duration, ConcreteValueRef::Duration(_)) => Ok(()),
-            _ => Err(TypeError::TypeMismatch {
-                expected: self.type_name(),
-                got: value.type_name().to_string(),
-            }),
+            _ => Err(TypeError::value_type_mismatch(
+                self.type_name(),
+                value.type_name().to_string(),
+            )),
         }
     }
 
@@ -4231,10 +4252,10 @@ impl PatternAttributeType<Compiled> {
             if c.identity().same_type(identity) {
                 return Ok(());
             }
-            return Err(TypeError::TypeMismatch {
-                expected: name.to_string(),
-                got: c.identity().to_string(),
-            });
+            return Err(TypeError::value_type_mismatch(
+                name.to_string(),
+                c.identity().to_string(),
+            ));
         }
         if let ConcreteValueRef::EnumIdentifier(raw) = value {
             let enum_attr = CompiledAttributeType::enum_(
@@ -4369,10 +4390,10 @@ impl PatternAttributeType<Compiled> {
                 })
             }
         } else {
-            Err(TypeError::TypeMismatch {
-                expected: name.to_string(),
-                got: resolved_value.type_name(),
-            })
+            Err(TypeError::value_type_mismatch(
+                name.to_string(),
+                resolved_value.type_name(),
+            ))
         }
     }
 }
@@ -4456,6 +4477,79 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     }
 }
 
+/// Constraint-aware names for a type comparison, kept together until rendered.
+/// Construct from types so equal nominal names cannot hide different bounds.
+///
+/// ```compile_fail,E0451
+/// use carina_core::schema::MismatchTypeNames;
+/// let _ = MismatchTypeNames { expected: "Name".into(), actual: "Name".into() };
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MismatchTypeNames {
+    expected: String,
+    actual: String,
+}
+
+impl MismatchTypeNames {
+    pub fn for_resource_types(
+        expected: &crate::parser::ResourceTypePath,
+        actual: &crate::parser::ResourceTypePath,
+    ) -> Self {
+        Self::for_type_exprs(
+            &crate::parser::TypeExpr::Ref(expected.clone()),
+            &crate::parser::TypeExpr::Ref(actual.clone()),
+        )
+    }
+
+    pub fn for_types<R: PatternForm>(
+        expected: TypeInSchema<'_, R>,
+        actual: TypeInSchema<'_, R>,
+    ) -> Self {
+        let (expected, actual) = actual.mismatch_type_names(expected);
+        Self { expected, actual }
+    }
+
+    /// Lift resolved annotations before formatting to retain their constraints.
+    /// Unresolved declarations have only their authored spelling available.
+    pub fn for_type_exprs(
+        expected: &crate::parser::TypeExpr,
+        actual: &crate::parser::TypeExpr,
+    ) -> Self {
+        match (
+            crate::validation::lift_type_expr(expected),
+            crate::validation::lift_type_expr(actual),
+        ) {
+            (Some(expected), Some(actual)) => Self::for_types(
+                TypeInSchema::schemaless(&expected),
+                TypeInSchema::schemaless(&actual),
+            ),
+            _ => Self {
+                expected: expected.to_string(),
+                actual: actual.to_string(),
+            },
+        }
+    }
+
+    pub fn expected(&self) -> &str {
+        &self.expected
+    }
+
+    pub fn actual(&self) -> &str {
+        &self.actual
+    }
+}
+
+impl std::fmt::Display for MismatchTypeNames {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "expected {}, got {}",
+            ProviderText::new(self.expected()),
+            ProviderText::new(self.actual())
+        )
+    }
+}
+
 impl<'source, R: PatternForm> TypeInSchema<'source, R> {
     /// Pair a structurally Ref-free type with an empty definition context.
     ///
@@ -4475,10 +4569,30 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
     /// never panic.
     pub fn resolved_type_name(&self) -> String {
         let mut visited_refs = Vec::new();
-        self.resolved_type_name_on_path(&mut visited_refs)
+        self.resolved_type_name_on_path(&mut visited_refs, false)
     }
 
-    fn resolved_type_name_on_path(&self, visited_refs: &mut Vec<&'source str>) -> String {
+    /// Expand scalar constraints only when ordinary names hide a difference.
+    /// The returned pair is (expected, actual), ready for mismatch diagnostics.
+    pub fn mismatch_type_names(&self, expected: TypeInSchema<'_, R>) -> (String, String) {
+        let actual_name = self.resolved_type_name();
+        let expected_name = expected.resolved_type_name();
+        let actual = self.resolved_type_name_on_path(&mut Vec::new(), true);
+        let expected = expected.resolved_type_name_on_path(&mut Vec::new(), true);
+        if (actual_name == expected_name && actual != expected)
+            || actual.contains("empty intersection")
+            || expected.contains("empty intersection")
+        {
+            return (expected, actual);
+        }
+        (expected_name, actual_name)
+    }
+
+    fn resolved_type_name_on_path(
+        &self,
+        visited_refs: &mut Vec<&'source str>,
+        expand_constraints: bool,
+    ) -> String {
         let Ok(resolution) = resolve_refs_on_path(self.attr, self.defs, visited_refs) else {
             return self.attr.type_name();
         };
@@ -4492,15 +4606,22 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 "List<{}>",
                 inner
                     .in_schema(self.defs)
-                    .resolved_type_name_on_path(visited_refs)
+                    .resolved_type_name_on_path(visited_refs, expand_constraints)
             ),
-            // `type_name` intentionally renders only a Map's value type; keep
-            // that public spelling while resolving the displayed node.
+            AttrTypeKind::Map { key, value } if expand_constraints => format!(
+                "Map<key: {}, value: {}>",
+                key.in_schema(self.defs)
+                    .resolved_type_name_on_path(visited_refs, true),
+                value
+                    .in_schema(self.defs)
+                    .resolved_type_name_on_path(visited_refs, true),
+            ),
+            // Keep the ordinary value-only spelling outside expanded diagnostics.
             AttrTypeKind::Map { value: inner, .. } => format!(
                 "Map<{}>",
                 inner
                     .in_schema(self.defs)
-                    .resolved_type_name_on_path(visited_refs)
+                    .resolved_type_name_on_path(visited_refs, expand_constraints)
             ),
             AttrTypeKind::Union(members) => members
                 .as_raw_slice()
@@ -4508,10 +4629,28 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 .map(|member| {
                     member
                         .in_schema(self.defs)
-                        .resolved_type_name_on_path(visited_refs)
+                        .resolved_type_name_on_path(visited_refs, expand_constraints)
                 })
                 .collect::<Vec<_>>()
                 .join(" | "),
+            AttrTypeKind::Struct { fields, .. } if expand_constraints => format!(
+                "struct {{ {} }}",
+                fields
+                    .iter()
+                    .map(|field| {
+                        format!(
+                            "{}: {}",
+                            field.name,
+                            field
+                                .field_type
+                                .in_schema(self.defs)
+                                .resolved_type_name_on_path(visited_refs, true)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            _ if expand_constraints => resolved.scalar_diagnostic_name(),
             _ => resolved.type_name(),
         };
         visited_refs.truncate(resolution.restore_len);
@@ -6403,10 +6542,7 @@ pub(crate) fn select_union_member_on_path<'a, P: PlaceholderKind, B: BindingAddr
 
     Err(best_failure
         .map(|best| best.into_error(value, resolved_members, ancestry))
-        .unwrap_or(TypeError::TypeMismatch {
-            expected,
-            got: value.type_name().to_string(),
-        }))
+        .unwrap_or_else(|| TypeError::value_type_mismatch(expected, value.type_name().to_string())))
 }
 
 /// Resolve one host value-map key to its canonical [`StructField`].
@@ -6533,8 +6669,9 @@ fn length_contains(
     source: Option<&(Option<u64>, Option<u64>)>,
     sink: Option<&(Option<u64>, Option<u64>)>,
 ) -> bool {
+    // Both representations describe the same unbounded interval.
     let Some((s_min, s_max)) = source else {
-        return sink.is_none();
+        return matches!(sink, None | Some((None, None)));
     };
     let Some((k_min, k_max)) = sink else {
         return true;
@@ -6559,7 +6696,7 @@ fn i64_range_contains(
     sink: Option<&(Option<i64>, Option<i64>)>,
 ) -> bool {
     let Some((s_min, s_max)) = source else {
-        return sink.is_none();
+        return matches!(sink, None | Some((None, None)));
     };
     let Some((k_min, k_max)) = sink else {
         return true;
@@ -6576,7 +6713,7 @@ fn f64_range_contains(
     sink: Option<&(Option<f64>, Option<f64>)>,
 ) -> bool {
     let Some((s_min, s_max)) = source else {
-        return sink.is_none();
+        return matches!(sink, None | Some((None, None)));
     };
     let Some((k_min, k_max)) = sink else {
         return true;
@@ -6593,7 +6730,7 @@ fn i64_range_assignable_to_f64(
     sink: Option<&(Option<f64>, Option<f64>)>,
 ) -> bool {
     let Some((source_min, source_max)) = source else {
-        return sink.is_none();
+        return matches!(sink, None | Some((None, None)));
     };
     let Some((sink_min, sink_max)) = sink else {
         return true;
@@ -7491,12 +7628,8 @@ fn format_field_group_violation(path: &FieldPath, group: &FieldGroup) -> String 
 /// Type error
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum TypeError {
-    #[error(
-        "Type mismatch: expected {}, got {}",
-        ProviderText::new(expected),
-        ProviderText::new(got)
-    )]
-    TypeMismatch { expected: String, got: String },
+    #[error("Type mismatch: {types}")]
+    TypeMismatch { types: MismatchTypeNames },
 
     #[error(transparent)]
     BindingShadowsEnumMember(Box<BindingShadowsEnumMemberError>),
@@ -7687,6 +7820,18 @@ impl From<crate::parser::CustomTypeValidationError> for TypeError {
 }
 
 impl TypeError {
+    /// Report a concrete value's kind when no second static type is available.
+    /// Comparisons of two static types must construct `TypeMismatch` with
+    /// [`MismatchTypeNames::for_types`] or [`MismatchTypeNames::for_type_exprs`].
+    pub fn value_type_mismatch(expected: String, got: String) -> Self {
+        Self::TypeMismatch {
+            types: MismatchTypeNames {
+                expected,
+                actual: got,
+            },
+        }
+    }
+
     fn from_union_member_failures(
         first: UnionMemberFailure,
         rest: impl IntoIterator<Item = UnionMemberFailure>,
@@ -13567,8 +13712,8 @@ impl fmt::Display for RefinedScalarKind {
 }
 
 impl RefinedScalarKind {
-    /// Lift an identity using its declared scalar shape, without guessing from
-    /// its name. Value constraints remain owned by the schema declaration.
+    /// Scalar identity comparison for canonical enum values. This does not
+    /// construct annotation evidence; annotations materialize their witness.
     pub(crate) fn identified_type<R: PatternForm>(
         self,
         identity: TypeIdentity,
@@ -13577,6 +13722,73 @@ impl RefinedScalarKind {
             Self::String => PatternAttributeType::refined_string(Some(identity), None, None, None),
             Self::Int => PatternAttributeType::refined_int(Some(identity), None),
             Self::Float => PatternAttributeType::refined_float(Some(identity), None),
+        }
+    }
+}
+
+impl<R: PatternForm> PatternAttributeType<R> {
+    fn scalar_diagnostic_name(&self) -> String {
+        fn bounds<T: fmt::Display>(bounds: Option<(Option<T>, Option<T>)>) -> String {
+            let (min, max) = bounds.unwrap_or((None, None));
+            match (min, max) {
+                (Some(min), Some(max)) => format!("{min}..={max}"),
+                (Some(min), None) => format!("{min}..unbounded"),
+                (None, Some(max)) => format!("unbounded..={max}"),
+                (None, None) => "unbounded".into(),
+            }
+        }
+        let mut constraints = Vec::new();
+        match &self.kind {
+            AttrTypeKind::String {
+                binding,
+                pattern,
+                length,
+                ..
+            } => {
+                constraints.push(format!("length {}", bounds(*length)));
+                if let Some(owned) = binding.annotation() {
+                    constraints.extend(
+                        owned
+                            .patterns()
+                            .map(|pattern| format!("pattern {:?}", pattern.as_str())),
+                    );
+                } else if let Some(pattern) = pattern {
+                    constraints.push(format!("pattern {:?}", &**pattern));
+                }
+            }
+            AttrTypeKind::Reference {
+                pattern, length, ..
+            } => {
+                constraints.push(format!("length {}", bounds(*length)));
+                if let Some(pattern) = pattern {
+                    constraints.push(format!("pattern {:?}", &**pattern));
+                }
+            }
+            AttrTypeKind::Int { range, .. } => {
+                constraints.push(format!("range {}", bounds(*range)))
+            }
+            AttrTypeKind::Float { range, .. } => {
+                constraints.push(format!("range {}", bounds(*range)))
+            }
+            AttrTypeKind::Enum { base, .. } => {
+                return format!("{} ({})", self.type_name(), base.scalar_diagnostic_name());
+            }
+            _ => return self.type_name(),
+        }
+        if self.has_empty_scalar_intersection() {
+            constraints.push("empty intersection".into());
+        }
+        format!("{} ({})", self.type_name(), constraints.join(", "))
+    }
+
+    pub(crate) fn has_empty_scalar_intersection(&self) -> bool {
+        match &self.kind {
+            AttrTypeKind::String { binding, .. }
+            | AttrTypeKind::Int { binding, .. }
+            | AttrTypeKind::Float { binding, .. } => binding
+                .annotation()
+                .is_some_and(crate::parser::ResolvedSchemaType::has_empty_intersection),
+            _ => false,
         }
     }
 }
@@ -14559,36 +14771,6 @@ impl fmt::Display for SchemaRegistryError {
 impl std::error::Error for SchemaRegistryError {}
 
 impl SchemaRegistry {
-    /// Owner-bearing scalar declarations observed in admitted resource
-    /// schemas. This is evidence for a particular identity, not a complete
-    /// provider catalog: config-only declarations may be absent here.
-    pub(crate) fn known_custom_type_declarations(
-        &self,
-        identity: &TypeIdentity,
-    ) -> Vec<crate::parser::OwnedTypeIdentity> {
-        let mut declarations = std::collections::BTreeSet::new();
-        for (owner, _, _, schema) in self.iter() {
-            let mut collect = |candidate: &TypeIdentity, declaration: &CompiledAttributeType| {
-                if candidate == identity {
-                    declarations.insert(
-                        crate::parser::OwnedTypeIdentity::from_schema_declaration(
-                            owner,
-                            declaration,
-                        )
-                        .expect("admitted identified declarations carry scalar kinds"),
-                    );
-                }
-            };
-            for attribute in schema.effective_attributes() {
-                visit_identified_declarations(attribute.field_type(), &mut collect);
-            }
-            for definition in schema.parts().defs.values() {
-                visit_identified_declarations(definition, &mut collect);
-            }
-        }
-        declarations.into_iter().collect()
-    }
-
     pub fn new() -> Self {
         Self::default()
     }

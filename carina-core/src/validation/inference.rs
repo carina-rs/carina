@@ -272,10 +272,7 @@ struct InferenceSchemaContext<'a> {
 
 fn heterogeneous_collection_error(first: &TypeExpr, next: &TypeExpr) -> InferenceError {
     InferenceError::HeterogeneousCollection {
-        reason: format!(
-            "collection element types disagree: `{}` vs `{}`",
-            first, next
-        ),
+        types: crate::schema::MismatchTypeNames::for_type_exprs(first, next),
     }
 }
 
@@ -349,8 +346,7 @@ pub(crate) fn infer_type_from_value_without_bindings<P: PlaceholderKind, B: Bind
             match infer_type_from_value_without_bindings(default) {
                 Ok(right) if right == left => Ok(left),
                 Ok(right) => Err(InferenceError::IncompatibleCoalesceTypes {
-                    left: left.to_string(),
-                    default: right.to_string(),
+                    types: crate::schema::MismatchTypeNames::for_type_exprs(&left, &right),
                 }
                 .into()),
                 Err(InferenceIssue::Failed(InferenceError::UnknownType { .. }))
@@ -552,8 +548,7 @@ fn infer_type_from_value_with_visiting<P: PlaceholderKind, B: BindingAddress>(
             match infer_type_from_value_with_visiting(default, bindings, context, visiting) {
                 Ok(right) if right == left => Ok(left),
                 Ok(right) => Err(InferenceError::IncompatibleCoalesceTypes {
-                    left: left.to_string(),
-                    default: right.to_string(),
+                    types: crate::schema::MismatchTypeNames::for_type_exprs(&left, &right),
                 }
                 .into()),
                 Err(InferenceIssue::Failed(InferenceError::UnknownType { .. }))
@@ -697,7 +692,9 @@ fn require_integer_arithmetic_operands(
             return Err(InferenceError::InvalidIntegerArithmeticOperand {
                 op,
                 side,
-                actual: operand.to_string(),
+                actual: crate::schema::MismatchTypeNames::for_type_exprs(&TypeExpr::Int, &operand)
+                    .actual()
+                    .to_string(),
                 operator_span,
             }
             .into());
@@ -997,6 +994,23 @@ pub(super) fn attribute_type_to_type_expr(
     attr_type: &AttributeType,
     schema_owner: &str,
 ) -> TypeExpr {
+    if let AttrTypeKind::String {
+        binding: crate::schema::RefinementBinding::Annotation(witness),
+        ..
+    }
+    | AttrTypeKind::Int {
+        binding: crate::schema::RefinementBinding::Annotation(witness),
+        ..
+    }
+    | AttrTypeKind::Float {
+        binding: crate::schema::RefinementBinding::Annotation(witness),
+        ..
+    } = attr_type.kind()
+    {
+        return TypeExpr::SchemaType {
+            owned: witness.clone(),
+        };
+    }
     let scalar_identity = match attr_type.kind() {
         AttrTypeKind::UnloadedSchemaType(unloaded) => {
             return TypeExpr::UnloadedSchemaType(unloaded.clone());
@@ -1018,7 +1032,7 @@ pub(super) fn attribute_type_to_type_expr(
     };
     if scalar_identity.is_some() {
         return TypeExpr::SchemaType {
-            owned: crate::parser::OwnedTypeIdentity::from_schema_declaration(
+            owned: crate::parser::ResolvedSchemaType::from_schema_declaration(
                 schema_owner,
                 attr_type,
             )
@@ -1059,7 +1073,7 @@ pub(super) fn attribute_type_to_type_expr(
             to_dsl,
             ..
         } if values.is_none() && (validate.is_some() || to_dsl.is_some()) => TypeExpr::SchemaType {
-            owned: crate::parser::OwnedTypeIdentity::from_declaration(
+            owned: crate::parser::ResolvedSchemaType::from_declaration(
                 schema_owner,
                 crate::parser::IdentifiedCustomTypeDeclaration::new(attr_type)
                     .expect("identified enum declaration"),
@@ -1778,7 +1792,8 @@ mod tests {
                 name.to_string(),
                 InferenceBinding::Argument {
                     type_expr: TypeExpr::SchemaType {
-                        owned: crate::parser::OwnedTypeIdentity::provider("test", identity, kind),
+                        owned: crate::parser::OwnedTypeIdentity::provider("test", identity, kind)
+                            .unbounded_witness_for_test(),
                     },
                 },
             )]);
@@ -1839,7 +1854,8 @@ mod tests {
                 "awscc",
                 TypeIdentity::bare("VpcId"),
                 crate::schema::RefinedScalarKind::String,
-            ),
+            )
+            .unbounded_witness_for_test(),
         }
     }
 
@@ -1966,10 +1982,17 @@ mod tests {
 
         assert_eq!(without_bindings, with_bindings);
         assert_eq!(
+            without_bindings.as_ref().unwrap_err().to_string(),
+            "collection element types disagree: `String` vs `Int`",
+        );
+        assert_eq!(
             without_bindings,
             Err(InferenceIssue::Failed(
                 InferenceError::HeterogeneousCollection {
-                    reason: "collection element types disagree: `String` vs `Int`".to_string(),
+                    types: crate::schema::MismatchTypeNames::for_type_exprs(
+                        &TypeExpr::String,
+                        &TypeExpr::Int
+                    ),
                 }
             ))
         );
@@ -2189,7 +2212,8 @@ mod tests {
                     "aws",
                     TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
                     crate::schema::RefinedScalarKind::String
-                ),
+                )
+                .unbounded_witness_for_test(),
             }
         );
     }

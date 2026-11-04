@@ -25,6 +25,7 @@ use carina_core::resource::{
     RelativeBindingName, Value as GenericValue,
 };
 use carina_core::schema::{SchemaRegistry, TypeError};
+use carina_core::validation::DeferredAccessTypeError;
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
@@ -1536,6 +1537,18 @@ impl DiagnosticRun<'_> {
                             // the type system).
                             let attr_shape = effective_type.shape();
                             let contains_struct = effective_type.contains_struct();
+                            let mut type_error_severity = DiagnosticSeverity::WARNING;
+                            let mut diagnose_access_error = |error: DeferredAccessTypeError| {
+                                type_error_severity = match &error {
+                                    DeferredAccessTypeError::InvalidAccess { .. } => {
+                                        DiagnosticSeverity::ERROR
+                                    }
+                                    DeferredAccessTypeError::TypeMismatch { .. } => {
+                                        DiagnosticSeverity::WARNING
+                                    }
+                                };
+                                error.to_string()
+                            };
                             let mut diagnose_schema_error = |error: TypeError| {
                                 let tagged = error.with_attribute(attr_name);
                                 if is_duplicate_list_error(&tagged)
@@ -1612,7 +1625,7 @@ impl DiagnosticRun<'_> {
                                                 &binding_index,
                                             )
                                             .err()
-                                            .map(|error| error.to_string())
+                                            .map(&mut diagnose_access_error)
                                         })
                                 }
                                 (
@@ -1647,7 +1660,7 @@ impl DiagnosticRun<'_> {
                                         )
                                     })
                                     .err()
-                                    .map(|error| error.to_string()),
+                                    .map(&mut diagnose_access_error),
                                 (_, Value::Deferred(DeferredValue::BindingRef { binding })) => {
                                     check_resource_ref_type_mismatch(
                                         &binding_index,
@@ -1778,7 +1791,7 @@ impl DiagnosticRun<'_> {
                                 diagnostics.extend(render_merged(
                                     doc,
                                     &finding,
-                                    DiagnosticSeverity::WARNING,
+                                    type_error_severity,
                                     finding.detail().clone(),
                                 ));
                             }
@@ -2371,10 +2384,7 @@ fn is_duplicate_list_error(error: &TypeError) -> bool {
         | TypeError::MapKeyError { inner, key: _ }
         | TypeError::MapValueError { inner, key: _ }
         | TypeError::StructFieldError { inner, field: _ } => is_duplicate_list_error(inner),
-        TypeError::TypeMismatch {
-            expected: _,
-            got: _,
-        }
+        TypeError::TypeMismatch { types: _ }
         | TypeError::BindingShadowsEnumMember(_)
         | TypeError::InvalidEnumVariant {
             value: _,
@@ -2485,9 +2495,8 @@ fn check_resource_ref_type_mismatch(
         }
     };
     Some(format!(
-        "Type mismatch: expected {}, got {} ({})",
-        expected.resolved_type_name(),
-        mismatch.actual_type_name(),
+        "Type mismatch: {} ({})",
+        mismatch.type_names(),
         mismatch.origin_description(path),
     ))
 }

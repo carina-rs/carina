@@ -69,12 +69,11 @@ impl<'de> serde::Deserialize<'de> for NonEmptySchemaTypeOwners {
     }
 }
 
-/// The routing key and scalar declaration for an identified refined type.
+/// A catalog routing key. This alone cannot be lifted as an annotation type.
 ///
 /// Production construction derives the scalar kind from an admitted schema
 /// declaration. Merging catalog owners retains that same declaration evidence.
-/// Decoding also requires the scalar declaration; independent identity/kind
-/// metadata cannot manufacture a resolved type.
+/// Resolved annotation evidence is carried separately by [`ResolvedSchemaType`].
 ///
 /// ```compile_fail
 /// use carina_core::parser::OwnedTypeIdentity;
@@ -157,13 +156,10 @@ impl<'de> serde::Deserialize<'de> for OwnedTypeIdentity {
                 "schema type identity and scalar kind must match their declaration",
             ));
         }
-        let declared_type = wire
-            .declaration
-            .scalar_kind()
-            .identified_type(wire.declaration.identity().clone());
-        let declaration = IdentifiedCustomTypeDeclaration::new(&declared_type)
-            .ok_or_else(|| serde::de::Error::custom("expected an identified scalar declaration"))?;
-        Ok(Self::from_declaration_with_owners(wire.owners, declaration))
+        Ok(Self {
+            owners: wire.owners,
+            declaration: wire.declaration,
+        })
     }
 }
 
@@ -245,6 +241,18 @@ impl OwnedTypeIdentity {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn unbounded_witness_for_test(self) -> ResolvedSchemaType {
+        let declared = self.scalar_kind().identified_type(self.identity().clone());
+        ResolvedSchemaType(std::sync::Arc::new(ResolvedScalarDeclaration {
+            constraints: super::scalar_constraints::ScalarConstraints::from_declaration(&declared)
+                .unwrap(),
+            owned: self,
+            projection: None,
+            projection_fingerprint: None,
+        }))
+    }
+
     pub fn owners(&self) -> &NonEmptySchemaTypeOwners {
         &self.owners
     }
@@ -283,6 +291,202 @@ impl OwnedTypeIdentity {
         self.identity().provider.as_deref() == Some(semantic_provider)
             && self.identity().segments == segments
             && self.identity().kind == kind
+    }
+}
+
+/// Opaque resolved scalar-declaration evidence for an annotation or an exact
+/// schema projection. Catalog annotations conjoin every declaration of every
+/// owner; exact projections retain only their own declaration. Shared storage
+/// keeps compiled patterns out of catalog keys and makes nested lifting cheap.
+///
+/// ```compile_fail
+/// use carina_core::parser::{OwnedTypeIdentity, ResolvedSchemaType};
+/// fn forge(key: OwnedTypeIdentity) -> ResolvedSchemaType { key.into() }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSchemaType(std::sync::Arc<ResolvedScalarDeclaration>);
+
+#[derive(Debug, Clone)]
+struct ResolvedScalarDeclaration {
+    owned: OwnedTypeIdentity,
+    constraints: super::scalar_constraints::ScalarConstraints,
+    projection: Option<AttributeType>,
+    // Portable declaration provenance. Decoding retains this key until the
+    // catalog can rebind the exact host declaration, including its callback.
+    projection_fingerprint: Option<String>,
+}
+
+// Type equality compares portable scalar evidence. The exact host declaration
+// retains callback dispatch provenance without making closures part of equality.
+impl PartialEq for ResolvedScalarDeclaration {
+    fn eq(&self, other: &Self) -> bool {
+        self.owned == other.owned && self.constraints == other.constraints
+    }
+}
+impl Eq for ResolvedScalarDeclaration {}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+enum ResolvedDeclarationOrigin {
+    Annotation,
+    Projection,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ResolvedSchemaTypeWire {
+    #[serde(flatten)]
+    owned: OwnedTypeIdentity,
+    constraints: super::scalar_constraints::ScalarConstraints,
+    origin: ResolvedDeclarationOrigin,
+    projection_fingerprint: Option<String>,
+}
+
+impl serde::Serialize for ResolvedSchemaType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ResolvedSchemaTypeWire {
+            owned: self.0.owned.clone(),
+            constraints: self.0.constraints.clone(),
+            origin: if self.0.projection_fingerprint.is_some() {
+                ResolvedDeclarationOrigin::Projection
+            } else {
+                ResolvedDeclarationOrigin::Annotation
+            },
+            projection_fingerprint: self.0.projection_fingerprint.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ResolvedSchemaType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut wire = ResolvedSchemaTypeWire::deserialize(deserializer)?;
+        if wire.owned.scalar_kind() != wire.constraints.kind() {
+            return Err(serde::de::Error::custom(
+                "schema type scalar kind must match its constraints",
+            ));
+        }
+        wire.constraints
+            .validate_record()
+            .map_err(serde::de::Error::custom)?;
+        match wire.origin {
+            ResolvedDeclarationOrigin::Annotation => {
+                if wire.projection_fingerprint.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "an annotation cannot carry exact projection provenance",
+                    ));
+                }
+            }
+            ResolvedDeclarationOrigin::Projection => {
+                if !wire.owned.owners().is_singleton() {
+                    return Err(serde::de::Error::custom(
+                        "an exact schema projection must have one owner",
+                    ));
+                }
+                if !wire
+                    .projection_fingerprint
+                    .as_ref()
+                    .is_some_and(|fingerprint| {
+                        fingerprint.len() == 64
+                            && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                {
+                    return Err(serde::de::Error::custom(
+                        "an exact schema projection requires its declaration fingerprint",
+                    ));
+                }
+            }
+        }
+        Ok(Self(std::sync::Arc::new(ResolvedScalarDeclaration {
+            owned: wire.owned,
+            constraints: wire.constraints,
+            projection: None,
+            projection_fingerprint: wire.projection_fingerprint,
+        })))
+    }
+}
+
+impl std::ops::Deref for ResolvedSchemaType {
+    type Target = OwnedTypeIdentity;
+    fn deref(&self) -> &Self::Target {
+        &self.0.owned
+    }
+}
+
+impl ResolvedSchemaType {
+    pub(crate) fn from_schema_declaration(
+        owner: impl Into<String>,
+        declaration: &AttributeType,
+    ) -> Option<Self> {
+        Some(Self(std::sync::Arc::new(ResolvedScalarDeclaration {
+            owned: OwnedTypeIdentity::from_schema_declaration(owner, declaration)?,
+            constraints: super::scalar_constraints::ScalarConstraints::from_declaration(
+                declaration,
+            )?,
+            projection: Some(declaration.clone()),
+            projection_fingerprint: Some(declaration.declaration_fingerprint()),
+        })))
+    }
+
+    pub(crate) fn from_declaration(
+        owner: impl Into<String>,
+        declaration: IdentifiedCustomTypeDeclaration<'_>,
+    ) -> Self {
+        Self::from_schema_declaration(owner, declaration.declared_type())
+            .expect("admitted scalar declaration")
+    }
+
+    pub(crate) fn conjoin(&self, other: &Self) -> Self {
+        assert_eq!(self.identity(), other.identity());
+        assert_eq!(self.scalar_kind(), other.scalar_kind());
+        let mut constraints = self.0.constraints.clone();
+        constraints.intersect(&other.0.constraints);
+        Self(std::sync::Arc::new(ResolvedScalarDeclaration {
+            owned: self
+                .0
+                .owned
+                .with_merged_owners(self.owners().union(other.owners())),
+            constraints,
+            projection: None,
+            projection_fingerprint: None,
+        }))
+    }
+
+    pub(crate) fn into_annotation(mut self) -> Self {
+        std::sync::Arc::make_mut(&mut self.0).projection = None;
+        std::sync::Arc::make_mut(&mut self.0).projection_fingerprint = None;
+        self
+    }
+
+    pub(crate) fn resolve_projection(
+        &self,
+        config: &ProviderContext,
+    ) -> Result<Option<AttributeType>, CustomTypeValidationError> {
+        match (&self.0.projection, &self.0.projection_fingerprint) {
+            (Some(declaration), _) => Ok(Some(declaration.clone())),
+            (None, Some(_)) => config.custom_types.projection_declaration(self).map(Some),
+            (None, None) => Ok(None),
+        }
+    }
+
+    pub(crate) fn matches_projection_declaration(&self, declaration: &AttributeType) -> bool {
+        self.0
+            .projection_fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| {
+                *fingerprint == declaration.declaration_fingerprint()
+                    && super::scalar_constraints::ScalarConstraints::from_declaration(declaration)
+                        .as_ref()
+                        == Some(&self.0.constraints)
+            })
+    }
+
+    pub(crate) fn materialize(&self) -> AttributeType {
+        self.0.constraints.materialize(self)
+    }
+    pub(crate) fn has_empty_intersection(&self) -> bool {
+        self.0.constraints.is_empty()
+    }
+    pub(crate) fn patterns(&self) -> impl Iterator<Item = &crate::schema::CompiledPattern> {
+        self.0.constraints.patterns()
     }
 }
 
@@ -705,6 +909,16 @@ type CustomTypeEnumLookupFn = Box<
         + Sync,
 >;
 
+type CustomTypeDeclarationLookupFn = Box<
+    dyn Fn(&OwnedTypeIdentity) -> Result<ResolvedSchemaType, CustomTypeValidationError>
+        + Send
+        + Sync,
+>;
+
+type CustomTypeProjectionLookupFn = Box<
+    dyn Fn(&ResolvedSchemaType) -> Result<AttributeType, CustomTypeValidationError> + Send + Sync,
+>;
+
 /// Owner-aware custom-type validation capability.
 ///
 /// Both the factory-backed resolver and [`ProviderCustomTypes`] implement this
@@ -716,6 +930,39 @@ pub trait CustomTypeResolver: Send + Sync {
         target: CustomTypeValidationTarget<'a>,
         value: &'a Value,
     ) -> Result<(), CustomTypeValidationError>;
+
+    /// Resolve every declaration of every requested owner from the same
+    /// authoritative catalog used for runtime validation. Implementations
+    /// must fail when any requested owner/declaration is unavailable.
+    fn annotation_declaration(
+        &self,
+        owned: &OwnedTypeIdentity,
+    ) -> Result<ResolvedSchemaType, CustomTypeValidationError> {
+        Err(CustomTypeValidationError::MissingDeclaration {
+            owner: owned
+                .provider_names()
+                .next()
+                .expect("nonempty owners")
+                .into(),
+            identity: owned.identity().clone(),
+        })
+    }
+
+    /// Rebind an exact wire projection to its original declaration. Missing or
+    /// ambiguous provenance must fail rather than fall back to scalar metadata.
+    fn projection_declaration(
+        &self,
+        projection: &ResolvedSchemaType,
+    ) -> Result<AttributeType, CustomTypeValidationError> {
+        Err(CustomTypeValidationError::MissingDeclaration {
+            owner: projection
+                .provider_names()
+                .next()
+                .expect("nonempty owners")
+                .into(),
+            identity: projection.identity().clone(),
+        })
+    }
 
     /// Return the exact enum declaration owned by `owned`, when the custom
     /// type is an enum. Implementations must resolve by structured identity
@@ -783,6 +1030,8 @@ enum ProviderCustomTypeState {
         known: BTreeSet<OwnedTypeIdentity>,
         resolver: CustomTypeValidatorFn,
         enum_lookup: CustomTypeEnumLookupFn,
+        annotation_lookup: CustomTypeDeclarationLookupFn,
+        projection_lookup: CustomTypeProjectionLookupFn,
         assignability_closures: BTreeMap<SchemaTypeOwner, crate::schema::AssignabilityClosure>,
     },
 }
@@ -804,11 +1053,38 @@ impl ProviderCustomTypes {
         known: HashSet<OwnedTypeIdentity>,
         resolver: CustomTypeValidatorFn,
     ) -> Self {
+        let declarations = known.clone();
         Self {
             state: std::sync::Arc::new(ProviderCustomTypeState::Loaded {
                 known: known.into_iter().collect(),
                 resolver,
                 enum_lookup: Box::new(|_| Ok(None)),
+                projection_lookup: Box::new(|projection| {
+                    Err(CustomTypeValidationError::MissingDeclaration {
+                        owner: projection
+                            .provider_names()
+                            .next()
+                            .expect("nonempty owners")
+                            .into(),
+                        identity: projection.identity().clone(),
+                    })
+                }),
+                annotation_lookup: Box::new(move |owned| {
+                    for owner in owned.owners().iter() {
+                        if !declarations.iter().any(|candidate| {
+                            candidate.identity() == owned.identity()
+                                && candidate.scalar_kind() == owned.scalar_kind()
+                                && candidate.owners().contains(owner)
+                        }) {
+                            let SchemaTypeOwner::Provider(owner) = owner;
+                            return Err(CustomTypeValidationError::MissingDeclaration {
+                                owner: owner.clone(),
+                                identity: owned.identity().clone(),
+                            });
+                        }
+                    }
+                    Ok(owned.clone().unbounded_witness_for_test())
+                }),
                 assignability_closures: BTreeMap::new(),
             }),
         }
@@ -819,11 +1095,19 @@ impl ProviderCustomTypes {
         let assignability_closures = source.assignability_closures();
         let source = std::sync::Arc::new(source);
         let validation_source = std::sync::Arc::clone(&source);
+        let declaration_source = std::sync::Arc::clone(&source);
+        let projection_source = std::sync::Arc::clone(&source);
         Self {
             state: std::sync::Arc::new(ProviderCustomTypeState::Loaded {
                 known,
                 resolver: Box::new(move |target, value| validation_source.validate(target, value)),
                 enum_lookup: Box::new(move |owned| source.enum_declaration(owned)),
+                annotation_lookup: Box::new(move |owned| {
+                    declaration_source.annotation_declaration(owned)
+                }),
+                projection_lookup: Box::new(move |projection| {
+                    projection_source.projection_declaration(projection)
+                }),
                 assignability_closures,
             }),
         }
@@ -854,6 +1138,8 @@ impl ProviderCustomTypes {
                 known: _,
                 resolver: _,
                 enum_lookup: _,
+                annotation_lookup: _,
+                projection_lookup: _,
                 assignability_closures: _,
             } => false,
             ProviderCustomTypeState::Partial {
@@ -871,6 +1157,8 @@ impl ProviderCustomTypes {
                 known: _known,
                 resolver: _resolver,
                 enum_lookup: _enum_lookup,
+                annotation_lookup: _annotation_lookup,
+                projection_lookup: _,
                 assignability_closures: _assignability_closures,
             }
         )
@@ -888,6 +1176,8 @@ impl ProviderCustomTypes {
                 known,
                 resolver: _resolver,
                 enum_lookup: _enum_lookup,
+                annotation_lookup: _annotation_lookup,
+                projection_lookup: _,
                 assignability_closures: _assignability_closures,
             } => known,
         }
@@ -910,6 +1200,8 @@ impl ProviderCustomTypes {
                 known: _,
                 resolver: _,
                 enum_lookup: _,
+                annotation_lookup: _,
+                projection_lookup: _,
                 assignability_closures: _,
             } => true,
         }
@@ -936,6 +1228,8 @@ impl ProviderCustomTypes {
                 known: _known,
                 resolver: _resolver,
                 enum_lookup: _enum_lookup,
+                annotation_lookup: _annotation_lookup,
+                projection_lookup: _,
                 assignability_closures,
             } => assignability_closures
                 .get(owner)
@@ -957,6 +1251,56 @@ impl ProviderCustomTypes {
 }
 
 impl CustomTypeResolver for ProviderCustomTypes {
+    fn projection_declaration(
+        &self,
+        projection: &ResolvedSchemaType,
+    ) -> Result<AttributeType, CustomTypeValidationError> {
+        match self.state.as_ref() {
+            ProviderCustomTypeState::Partial {
+                loaded,
+                failed_providers,
+            } => {
+                if projection
+                    .provider_names()
+                    .any(|owner| failed_providers.contains(owner))
+                {
+                    Err(CustomTypeValidationError::ProvidersNotLoaded)
+                } else {
+                    loaded.projection_declaration(projection)
+                }
+            }
+            ProviderCustomTypeState::Loaded {
+                projection_lookup, ..
+            } => projection_lookup(projection),
+            ProviderCustomTypeState::Unloaded => Err(CustomTypeValidationError::ProvidersNotLoaded),
+        }
+    }
+
+    fn annotation_declaration(
+        &self,
+        owned: &OwnedTypeIdentity,
+    ) -> Result<ResolvedSchemaType, CustomTypeValidationError> {
+        match self.state.as_ref() {
+            ProviderCustomTypeState::Partial {
+                loaded,
+                failed_providers,
+            } => {
+                if owned
+                    .provider_names()
+                    .any(|owner| failed_providers.contains(owner))
+                {
+                    Err(CustomTypeValidationError::ProvidersNotLoaded)
+                } else {
+                    loaded.annotation_declaration(owned)
+                }
+            }
+            ProviderCustomTypeState::Loaded {
+                annotation_lookup, ..
+            } => annotation_lookup(owned),
+            ProviderCustomTypeState::Unloaded => Err(CustomTypeValidationError::ProvidersNotLoaded),
+        }
+    }
+
     fn validate<'a>(
         &self,
         target: CustomTypeValidationTarget<'a>,
@@ -985,6 +1329,8 @@ impl CustomTypeResolver for ProviderCustomTypes {
                 known: _known,
                 resolver,
                 enum_lookup: _enum_lookup,
+                annotation_lookup: _annotation_lookup,
+                projection_lookup: _,
                 assignability_closures: _assignability_closures,
             } => resolver(target, value),
             ProviderCustomTypeState::Unloaded => Err(CustomTypeValidationError::ProvidersNotLoaded),
@@ -1013,6 +1359,8 @@ impl CustomTypeResolver for ProviderCustomTypes {
                 known: _known,
                 resolver: _resolver,
                 enum_lookup,
+                annotation_lookup: _,
+                projection_lookup: _,
                 assignability_closures: _assignability_closures,
             } => enum_lookup(owned),
             ProviderCustomTypeState::Unloaded => Err(CustomTypeValidationError::ProvidersNotLoaded),
@@ -1154,6 +1502,26 @@ impl LoadedProviderContext {
                     known: BTreeSet::new(),
                     resolver: Box::new(|_target, _value| Ok(())),
                     enum_lookup: Box::new(|_owned| Ok(None)),
+                    projection_lookup: Box::new(|projection| {
+                        Err(CustomTypeValidationError::MissingDeclaration {
+                            owner: projection
+                                .provider_names()
+                                .next()
+                                .expect("nonempty owners")
+                                .into(),
+                            identity: projection.identity().clone(),
+                        })
+                    }),
+                    annotation_lookup: Box::new(|owned| {
+                        Err(CustomTypeValidationError::MissingDeclaration {
+                            owner: owned
+                                .provider_names()
+                                .next()
+                                .expect("nonempty owners")
+                                .into(),
+                            identity: owned.identity().clone(),
+                        })
+                    }),
                     assignability_closures: BTreeMap::new(),
                 }),
             },
@@ -1213,6 +1581,8 @@ impl std::fmt::Debug for ProviderCustomTypes {
                 known,
                 resolver: _resolver,
                 enum_lookup: _enum_lookup,
+                annotation_lookup: _annotation_lookup,
+                projection_lookup: _,
                 assignability_closures: _assignability_closures,
             } => formatter
                 .debug_struct("Loaded")

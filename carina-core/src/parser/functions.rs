@@ -11,7 +11,7 @@ use super::{ProviderContext, Rule, is_static_eval, parse_expression};
 use crate::eval_value::{BareStructuralHandle, EvalValue, UnexpandedStructuralHandleKind};
 use crate::resource::{
     BindingAddress, ConcreteValue, DeferredValue, ParserPlaceholder, PlaceholderKind,
-    Value as GenericValue,
+    Value as GenericValue, ValueString,
 };
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
@@ -665,13 +665,22 @@ pub fn validate_schema_custom_type<P: PlaceholderKind, B: BindingAddress>(
     value: &GenericValue<P, B>,
     config: &crate::parser::LoadedProviderContext,
 ) -> Result<(), crate::parser::CustomTypeValidationError> {
-    validate_schema_custom_type_with_context(owned, value, config)
+    validate_schema_custom_type_key_with_context(owned, value, config, None)
 }
 
 pub(crate) fn validate_schema_custom_type_with_context<P: PlaceholderKind, B: BindingAddress>(
+    owned: &crate::parser::ResolvedSchemaType,
+    value: &GenericValue<P, B>,
+    config: &ProviderContext,
+) -> Result<(), crate::parser::CustomTypeValidationError> {
+    validate_schema_custom_type_key_with_context(owned, value, config, Some(owned))
+}
+
+fn validate_schema_custom_type_key_with_context<P: PlaceholderKind, B: BindingAddress>(
     owned: &crate::parser::OwnedTypeIdentity,
     value: &GenericValue<P, B>,
     config: &ProviderContext,
+    witness: Option<&crate::parser::ResolvedSchemaType>,
 ) -> Result<(), crate::parser::CustomTypeValidationError> {
     match value {
         GenericValue::Deferred(
@@ -718,10 +727,108 @@ pub(crate) fn validate_schema_custom_type_with_context<P: PlaceholderKind, B: Bi
             unreachable!("deferred values returned before provider validation")
         }
     };
-    config.custom_type_resolver().validate(
-        crate::parser::CustomTypeValidationTarget::Annotation(owned),
-        &value,
-    )
+    let projection = witness
+        .map(|witness| witness.resolve_projection(config))
+        .transpose()?
+        .flatten();
+    if let Some(projection) = projection.as_ref() {
+        if let Some(declaration) = super::IdentifiedCustomTypeDeclaration::new(projection) {
+            config.custom_type_resolver().validate(
+                super::CustomTypeValidationTarget::Declaration {
+                    owner: owned.provider_names().next().expect("nonempty owners"),
+                    declaration,
+                },
+                &value,
+            )?;
+        } else {
+            projection
+                .validate_identified_scalar_value(&value)
+                .map_err(
+                    |error| super::CustomTypeValidationError::InvalidDeclarationValue {
+                        owner: owned
+                            .provider_names()
+                            .next()
+                            .expect("nonempty owners")
+                            .into(),
+                        identity: owned.identity().clone(),
+                        error: Box::new(error),
+                    },
+                )?;
+        }
+    } else {
+        config
+            .custom_type_resolver()
+            .validate(super::CustomTypeValidationTarget::Annotation(owned), &value)?;
+    }
+    // The resolved witness can cross a catalog boundary (including serde).
+    // Retain its constraints even when the current catalog is less restrictive.
+    if let Some(witness) = witness {
+        let sensitive = value.contains_diagnostic_sensitive_string();
+        let invalid_value = |error: crate::schema::TypeError| {
+            super::CustomTypeValidationError::InvalidDeclarationValue {
+                owner: owned
+                    .provider_names()
+                    .next()
+                    .expect("nonempty owners")
+                    .into(),
+                identity: owned.identity().clone(),
+                error: Box::new(if sensitive {
+                    error.masked_for_secret()
+                } else {
+                    error
+                }),
+            }
+        };
+        let enumeration = match projection.as_ref() {
+            Some(declaration)
+                if matches!(
+                    declaration.raw_shape(),
+                    crate::schema::RawShape::Enum { .. }
+                ) =>
+            {
+                Some(declaration.clone())
+            }
+            Some(_) => None,
+            None => config.custom_type_resolver().enum_declaration(owned)?,
+        };
+        let canonical_text = if let Some(enumeration) = enumeration {
+            crate::provider::canonicalize_custom_type_value(&enumeration, &value)
+                .map_err(|error| invalid_value(error.into_type_error()))?
+                .map(|canonical| canonical.as_str().to_string())
+        } else {
+            match &value {
+                GenericValue::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
+                    Some(raw.as_str().to_string())
+                }
+                GenericValue::Concrete(ConcreteValue::CanonicalEnum(canonical)) => {
+                    Some(canonical.api_value().to_string())
+                }
+                _ => None,
+            }
+        };
+        let scalar = match canonical_text {
+            Some(text) => {
+                let source = match &value {
+                    GenericValue::Concrete(ConcreteValue::String(source)) => Some(source),
+                    _ => None,
+                };
+                let text = ValueString::derived_from(text, source);
+                crate::provider::bridge_text_to_typed_value(owned.scalar_kind(), text).map_err(
+                    |message| {
+                        invalid_value(crate::schema::TypeError::ValidationFailed {
+                            message: message.into(),
+                        })
+                    },
+                )?
+            }
+            None => value,
+        };
+        witness
+            .materialize()
+            .validate_identified_scalar_value(&scalar)
+            .map_err(invalid_value)?;
+    }
+    Ok(())
 }
 
 /// Check that a function argument matches the declared parameter type.
@@ -793,7 +900,8 @@ fn check_fn_arg_type<Source: Clone>(
             let name = match &error {
                     crate::static_type::StaticTypeResolutionError::UnknownCustomType { name }
                     | crate::static_type::StaticTypeResolutionError::UnknownCustomTypeWithSuggestion { name, .. }
-                    | crate::static_type::StaticTypeResolutionError::ConflictingScalarKinds { name, .. } => name,
+                    | crate::static_type::StaticTypeResolutionError::ConflictingScalarKinds { name, .. }
+            | crate::static_type::StaticTypeResolutionError::MissingDeclaration { name, .. } => name,
                 };
             let error = match parameter.type_span {
                 Some(span) => {

@@ -30,7 +30,7 @@ use crate::resource::{
 };
 use crate::schema::{
     BindingKind, BindingShadowsEnumMemberError, CompiledAttributeType as AttributeType,
-    FieldAncestry, SchemaRegistry, Shape, TypeError, TypeIdentity,
+    FieldAncestry, MismatchTypeNames, SchemaRegistry, Shape, TypeError, TypeIdentity,
 };
 use crate::static_type::{
     ConsumerExportStaticType, ConsumerInferredUncheckedReason, ConsumerResolvedType,
@@ -106,26 +106,7 @@ fn lift_attribute_type(type_expr: &TypeExpr) -> Option<AttributeType> {
         TypeExpr::UnloadedSchemaType(unloaded) => Some(AttributeType {
             kind: crate::schema::AttrTypeKind::UnloadedSchemaType(unloaded.clone()),
         }),
-        TypeExpr::SchemaType { owned } => {
-            let binding = crate::schema::RefinementBinding::Annotation(owned.clone());
-            let kind = match owned.scalar_kind() {
-                crate::schema::RefinedScalarKind::String => crate::schema::AttrTypeKind::String {
-                    binding,
-                    pattern: None,
-                    length: None,
-                    to_dsl: None,
-                },
-                crate::schema::RefinedScalarKind::Int => crate::schema::AttrTypeKind::Int {
-                    binding,
-                    range: None,
-                },
-                crate::schema::RefinedScalarKind::Float => crate::schema::AttrTypeKind::Float {
-                    binding,
-                    range: None,
-                },
-            };
-            Some(AttributeType { kind })
-        }
+        TypeExpr::SchemaType { owned } => Some(owned.materialize()),
         TypeExpr::List(inner) => lift_attribute_type(inner).map(AttributeType::list),
         TypeExpr::Map(inner) => lift_attribute_type(inner).map(AttributeType::map),
         TypeExpr::Struct { fields } => fields
@@ -454,8 +435,7 @@ pub enum BindingResolutionError {
 /// Typed incompatibility retained when a bare value binding crosses a sink.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindingReferenceTypeError {
-    expected: String,
-    actual: String,
+    types: MismatchTypeNames,
     declared: Option<String>,
     path: ModuleCallDiagnosticPath,
     declared_constraint: bool,
@@ -497,9 +477,8 @@ impl std::fmt::Display for BindingReferenceTypeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "Type mismatch: expected {}, got {} ({})",
-            self.expected,
-            self.actual,
+            "Type mismatch: {} ({})",
+            self.types,
             match &self.declared {
                 Some(declared) => {
                     format!("from {}, declared {declared}", self.path.to_dot_string())
@@ -543,17 +522,11 @@ impl std::fmt::Display for BindingResolutionError {
 // renderer. Structured consumers use `type_error()` or match the public enum.
 impl std::error::Error for BindingResolutionError {}
 
-#[derive(Clone, Copy)]
-enum EnumSinkAuthority<'a> {
-    Owner(&'a crate::parser::SchemaTypeOwner),
-    Annotation(&'a TypeExpr),
-}
-
 struct ExpectedEnumTarget<'a> {
     attr_type: &'a AttributeType,
     defs: &'a std::collections::BTreeMap<String, AttributeType>,
     ancestry: FieldAncestry,
-    authority: EnumSinkAuthority<'a>,
+    owner: &'a crate::parser::SchemaTypeOwner,
 }
 
 /// Typed inputs shared by CLI and LSP while consuming parser-authored bare
@@ -818,19 +791,12 @@ fn binding_value_assignable_to_enum<B: BindingAddress>(
     .scalar_kind();
     let identity_assignable = |source: &AttributeType| -> Result<bool, BindingResolutionError> {
         let target_type = scalar_kind.identified_type(identity.clone());
-        let lifted;
-        let sink = match target.authority {
-            EnumSinkAuthority::Owner(owner) => target_type
-                .in_schema(crate::schema::empty_defs_for_schema_walks())
-                .with_authority(
-                    &config.custom_types,
-                    crate::schema::SinkAuthority::Owner(owner),
-                ),
-            EnumSinkAuthority::Annotation(expected) => {
-                lifted = lift_type_expr(expected).expect("a resolved enum annotation lifts");
-                lifted.assignment_sink(&config.custom_types)
-            }
-        };
+        let sink = target_type
+            .in_schema(crate::schema::empty_defs_for_schema_walks())
+            .with_authority(
+                &config.custom_types,
+                crate::schema::SinkAuthority::Owner(target.owner),
+            );
         let assignment = crate::schema::TypeInSchema::schemaless(source).assignment_to(sink);
         if config.custom_types_loaded() {
             assignment
@@ -857,9 +823,19 @@ fn binding_value_assignable_to_enum<B: BindingAddress>(
                 return Ok(());
             }
         }
+        let crate::parser::SchemaTypeOwner::Provider(provider) = target.owner;
+        let expected = TypeExpr::SchemaType {
+            owned: crate::parser::ResolvedSchemaType::from_schema_declaration(
+                provider,
+                target
+                    .attr_type
+                    .resolve_refs_with_defs(target.defs)
+                    .as_attr(),
+            )
+            .expect("an enum target has an admitted scalar declaration"),
+        };
         return Err(BindingResolutionError::Type(TypeError::TypeMismatch {
-            expected: identity.to_string(),
-            got: resolved.to_string(),
+            types: MismatchTypeNames::for_type_exprs(&expected, &resolved),
         }));
     }
     match value {
@@ -867,8 +843,10 @@ fn binding_value_assignable_to_enum<B: BindingAddress>(
             let source = scalar_kind.identified_type(canonical.identity().clone());
             if !identity_assignable(&source)? {
                 return Err(BindingResolutionError::Type(TypeError::TypeMismatch {
-                    expected: identity.to_string(),
-                    got: canonical.identity().to_string(),
+                    types: MismatchTypeNames::for_types(
+                        target.attr_type.in_schema(target.defs),
+                        crate::schema::TypeInSchema::schemaless(&source),
+                    ),
                 }));
             }
             resolver
@@ -933,10 +911,9 @@ fn binding_value_assignable_to_enum<B: BindingAddress>(
 
 fn enum_shadow_or_existing(
     use_site: &crate::parser::BareBindingUse,
-    target: ExpectedEnumTarget<'_>,
+    resolver: &EnumValueResolver<'_, crate::schema::Compiled>,
     existing_error: BindingResolutionError,
 ) -> BindingResolutionError {
-    let resolver = EnumValueResolver::with_defs(target.attr_type, target.defs);
     let Some(identity) = resolver.enum_identity() else {
         return existing_error;
     };
@@ -973,7 +950,7 @@ fn enum_target_from_sink<'a>(sink: RefSink<'a>) -> Option<ExpectedEnumTarget<'a>
                 attr_type,
                 defs,
                 ancestry,
-                authority: EnumSinkAuthority::Owner(owner),
+                owner,
             })
         }
         RefSink::EffectiveType {
@@ -1051,8 +1028,7 @@ fn declared_value_assignable_to_sink(
     // lexical provenance, even after the caller's value has been substituted.
     Err(BindingResolutionError::ReferenceType(Box::new(
         BindingReferenceTypeError {
-            expected: target.resolved_type_name(),
-            actual: source.resolved_type_name(),
+            types: MismatchTypeNames::for_types(*target, source),
             declared: None,
             path: ModuleCallDiagnosticPath::Authored(ReferencePath::Binding(
                 RelativeBindingName::new(name),
@@ -1094,8 +1070,7 @@ fn reference_value_mismatch<B: BindingAddress>(
                     RefTypeAssignabilityError::Mismatch(mismatch),
                 ) => Some(BindingResolutionError::ReferenceType(Box::new(
                     BindingReferenceTypeError {
-                        expected: target.resolved_type_name(),
-                        actual: mismatch.actual_type_name().to_string(),
+                        types: mismatch.type_names().clone(),
                         declared: mismatch.declared_type_name().map(str::to_string),
                         path: diagnostic_path(reference),
                         declared_constraint: false,
@@ -1200,16 +1175,14 @@ fn deferred_value_mismatch<B: BindingAddress>(
             .err()
             .map(|error| match error {
                 DeferredAccessTypeError::TypeMismatch {
-                    expected,
-                    actual,
+                    types,
                     origin: _origin,
                 } => {
                     // Inference describes a parser-internal unresolved-module
                     // placeholder here. The authored binding path is the
                     // stable source used for the shared diagnostic and dedupe.
                     BindingResolutionError::ReferenceType(Box::new(BindingReferenceTypeError {
-                        expected,
-                        actual,
+                        types,
                         declared: None,
                         path: ModuleCallDiagnosticPath::Authored(ReferencePath::Binding(
                             RelativeBindingName::new(authored_binding.to_string()),
@@ -1325,7 +1298,7 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
                 &identity,
             ),
         };
-        return existing.map_err(|error| enum_shadow_or_existing(use_site, target, error));
+        return existing.map_err(|error| enum_shadow_or_existing(use_site, &resolver, error));
     }
 
     if let Some(error) = prechecked {
@@ -1572,61 +1545,30 @@ fn resolve_record_against_module<B: BindingAddress>(
     let expected = resolved.as_type_expr();
     let enum_declaration = module_enum_declaration(&expected, context.provider_context)?;
 
-    match &record.source {
+    let result = match &record.source {
         crate::parser::BareBindingSource::Value {
             value,
             declared_type,
-        } => {
-            if let Some(declaration) = enum_declaration.as_ref() {
-                let target = ExpectedEnumTarget {
-                    attr_type: declaration,
-                    defs: crate::schema::empty_defs_for_schema_walks(),
-                    ancestry: FieldAncestry::WRITABLE,
-                    authority: EnumSinkAuthority::Annotation(&expected),
-                };
-                let resolver = EnumValueResolver::with_defs(target.attr_type, target.defs);
-                let identity = resolver
-                    .enum_identity()
-                    .expect("module enum declaration must have an enum identity");
-                return binding_value_assignable_to_enum(
-                    value,
-                    declared_type.as_deref(),
-                    context.provider_context,
-                    &target,
-                    &resolver,
-                    &identity,
-                )
-                .map_err(|error| enum_shadow_or_existing(&record.authored, target, error));
-            }
-            resolve_value_source_against_sink(
-                &record.authored,
-                value,
-                declared_type.as_deref(),
-                RefSink::TypeExpr(&expected),
-                context,
-                diagnostic_path,
-            )
-        }
+        } => resolve_value_source_against_sink(
+            &record.authored,
+            value,
+            declared_type.as_deref(),
+            RefSink::TypeExpr(&expected),
+            context,
+            diagnostic_path,
+        ),
         crate::parser::BareBindingSource::Structural(handle) => {
-            let existing = match check_handle_sink(handle, &resolved) {
-                Ok(()) => return Ok(()),
-                Err(error) => BindingResolutionError::Existing(error.to_string()),
-            };
-            match enum_declaration.as_ref() {
-                Some(declaration) => Err(enum_shadow_or_existing(
-                    &record.authored,
-                    ExpectedEnumTarget {
-                        attr_type: declaration,
-                        defs: crate::schema::empty_defs_for_schema_walks(),
-                        ancestry: FieldAncestry::WRITABLE,
-                        authority: EnumSinkAuthority::Annotation(&expected),
-                    },
-                    existing,
-                )),
-                None => Err(existing),
-            }
+            check_handle_sink(handle, &resolved)
+                .map_err(|error| BindingResolutionError::Existing(error.to_string()))
         }
-    }
+    };
+    result.map_err(|error| match enum_declaration.as_ref() {
+        Some(declaration) => {
+            let resolver = EnumValueResolver::new(declaration);
+            enum_shadow_or_existing(&record.authored, &resolver, error)
+        }
+        None => error,
+    })
 }
 
 fn same_authored_finding(left: &BindingUseFinding, right: &BindingUseFinding) -> bool {
@@ -1724,7 +1666,13 @@ where
                             );
                             match enum_target_from_sink(sink) {
                                 Some(target) => {
-                                    Err(enum_shadow_or_existing(&record.authored, target, existing))
+                                    let resolver =
+                                        EnumValueResolver::with_defs(target.attr_type, target.defs);
+                                    Err(enum_shadow_or_existing(
+                                        &record.authored,
+                                        &resolver,
+                                        existing,
+                                    ))
                                 }
                                 None => Err(existing),
                             }
@@ -2155,8 +2103,7 @@ pub enum DeferredAccessTypeError {
         error: inference::InferenceError,
     },
     TypeMismatch {
-        expected: String,
-        actual: String,
+        types: MismatchTypeNames,
         origin: String,
     },
 }
@@ -2165,14 +2112,7 @@ impl std::fmt::Display for DeferredAccessTypeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidAccess { error } => error.fmt(f),
-            Self::TypeMismatch {
-                expected,
-                actual,
-                origin,
-            } => write!(
-                f,
-                "Type mismatch: expected {expected}, got {actual} ({origin})"
-            ),
+            Self::TypeMismatch { types, origin } => write!(f, "Type mismatch: {types} ({origin})"),
         }
     }
 }
@@ -2245,8 +2185,7 @@ pub fn check_deferred_access_type<B: BindingAddress>(
                 }
                 Err(RefTypeAssignabilityError::Mismatch(mismatch)) => {
                     Err(DeferredAccessTypeError::TypeMismatch {
-                        expected: expected.resolved_type_name(),
-                        actual: mismatch.actual_type_name().to_string(),
+                        types: mismatch.type_names().clone(),
                         origin: mismatch.origin_description(path.into()),
                     })
                 }
@@ -2288,24 +2227,23 @@ pub fn check_deferred_access_type<B: BindingAddress>(
             return Err(DeferredAccessTypeError::InvalidAccess { error });
         }
         Err(crate::static_type::InferenceIssue::Failed(
-            inference::InferenceError::IncompatibleCoalesceTypes { left, default },
+            inference::InferenceError::IncompatibleCoalesceTypes { types },
         )) => {
             return Err(DeferredAccessTypeError::TypeMismatch {
-                expected: left,
-                actual: default,
+                types,
                 origin: "from coalesce default".to_string(),
             });
         }
         Err(crate::static_type::InferenceIssue::Failed(
             error @ (inference::InferenceError::InvalidIntegerArithmeticOperand { .. }
+            | inference::InferenceError::HeterogeneousCollection { .. }
             | inference::InferenceError::UnknownType { .. }),
         )) => return Err(DeferredAccessTypeError::InvalidAccess { error }),
         // Dynamic result types and unavailable authorities cannot be checked
         // soundly at this phase. Spell every inference variant out so adding a
         // new failure reason forces an explicit checked/unchecked decision.
         Err(crate::static_type::InferenceIssue::Failed(
-            inference::InferenceError::HeterogeneousCollection { .. }
-            | inference::InferenceError::UnknownBinding { .. }
+            inference::InferenceError::UnknownBinding { .. }
             | inference::InferenceError::CyclicVirtualBinding { .. },
         ))
         | Err(crate::static_type::InferenceIssue::NotInferable(
@@ -2334,8 +2272,7 @@ pub fn check_deferred_access_type<B: BindingAddress>(
         return Ok(());
     }
     Err(DeferredAccessTypeError::TypeMismatch {
-        expected: expected.resolved_type_name(),
-        actual: actual.resolved_type_name(),
+        types: MismatchTypeNames::for_types(*expected, actual),
         origin: format!("from {}", crate::value::format_value(value)),
     })
 }
@@ -2473,7 +2410,9 @@ fn prove_integer_operand<B: BindingAddress>(
         Ok(actual) => Err(invalid_integer_operand(
             expression,
             side,
-            actual.to_string(),
+            MismatchTypeNames::for_type_exprs(&TypeExpr::Int, &actual)
+                .actual()
+                .to_string(),
         )),
         Err(crate::static_type::InferenceIssue::Failed(
             error @ inference::InferenceError::InvalidIntegerArithmeticOperand { .. },
@@ -2530,8 +2469,10 @@ fn check_integer_result_sink<B: BindingAddress>(
                 return Ok(());
             }
             return Err(DeferredAccessTypeError::TypeMismatch {
-                expected: crate::schema::TypeInSchema::schemaless(&expected).resolved_type_name(),
-                actual: "Int".to_string(),
+                types: MismatchTypeNames::for_types(
+                    crate::schema::TypeInSchema::schemaless(&expected),
+                    actual,
+                ),
                 origin: format!("from {}", crate::value::format_value(value)),
             });
         }
@@ -2547,8 +2488,7 @@ fn check_integer_result_sink<B: BindingAddress>(
         Ok(())
     } else {
         Err(DeferredAccessTypeError::TypeMismatch {
-            expected: expected.resolved_type_name(),
-            actual: "Int".to_string(),
+            types: MismatchTypeNames::for_types(*expected, actual),
             origin: format!("from {}", crate::value::format_value(value)),
         })
     }
@@ -2888,8 +2828,7 @@ fn resolve_resource_reference<B: BindingAddress>(
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ModuleCallRefErrorKind {
     TypeMismatch {
-        expected: String,
-        actual: String,
+        types: MismatchTypeNames,
         declared: Option<String>,
     },
     UnknownAttribute(RefTypeError),
@@ -3032,19 +2971,14 @@ fn format_module_call_ref_error_with_path(
     kind: &ModuleCallRefErrorKind,
 ) -> std::fmt::Result {
     match kind {
-        ModuleCallRefErrorKind::TypeMismatch {
-            expected,
-            actual,
-            declared,
-        } => write!(
+        ModuleCallRefErrorKind::TypeMismatch { types, declared } => write!(
             f,
-            "module call '{}': argument '{}': cannot assign {} to '{}': expected {}, got {} ({})",
+            "module call '{}': argument '{}': cannot assign {} to '{}': {} ({})",
             call_label,
             argument,
-            actual,
+            types.actual(),
             argument,
-            expected,
-            actual,
+            types,
             match declared {
                 Some(declared) => format!("from {path}, declared {declared}"),
                 None => format!("from {path}"),
@@ -3173,16 +3107,11 @@ pub struct AttributeParamRefError<B: BindingAddress = RelativeBindingName> {
 impl<B: BindingAddress> std::fmt::Display for AttributeParamRefError<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.kind {
-            ModuleCallRefErrorKind::TypeMismatch {
-                expected,
-                actual,
-                declared,
-            } => write!(
+            ModuleCallRefErrorKind::TypeMismatch { types, declared } => write!(
                 f,
-                "attribute '{}': type mismatch: expected {}, got {} ({})",
+                "attribute '{}': type mismatch: {} ({})",
                 self.attribute,
-                expected,
-                actual,
+                types,
                 match declared {
                     Some(declared) =>
                         format!("from {}, declared {}", self.path.to_dot_string(), declared),
@@ -3298,8 +3227,7 @@ enum CompositionRefErrorKindKey {
         reason: String,
     },
     TypeMismatch {
-        expected: String,
-        actual: String,
+        types: MismatchTypeNames,
         declared: Option<String>,
     },
     UnknownAttribute {
@@ -3333,13 +3261,8 @@ impl From<&ModuleCallRefErrorKind> for CompositionRefErrorKindKey {
                     reason: reason.clone(),
                 }
             }
-            ModuleCallRefErrorKind::TypeMismatch {
-                expected,
-                actual,
-                declared,
-            } => Self::TypeMismatch {
-                expected: expected.clone(),
-                actual: actual.clone(),
+            ModuleCallRefErrorKind::TypeMismatch { types, declared } => Self::TypeMismatch {
+                types: types.clone(),
                 declared: declared.clone(),
             },
             ModuleCallRefErrorKind::UnknownAttribute(RefTypeError::UnknownAttribute {
@@ -3426,8 +3349,7 @@ fn composition_ref_error_kind<B: BindingAddress>(
                 .map(|error| match error {
                     RefTypeAssignabilityError::Mismatch(mismatch) => {
                         ModuleCallRefErrorKind::TypeMismatch {
-                            expected: sink_type.resolved_type_name(),
-                            actual: mismatch.actual_type_name().to_string(),
+                            types: mismatch.type_names().clone(),
                             declared: mismatch.declared_type_name().map(str::to_string),
                         }
                     }
@@ -3497,12 +3419,8 @@ mod user_function_refs {
                 return;
             };
             let message = match kind {
-                ModuleCallRefErrorKind::TypeMismatch {
-                    expected,
-                    actual,
-                    declared,
-                } => format!(
-                    "{context}: reference {}: expected {expected}, got {actual} ({})",
+                ModuleCallRefErrorKind::TypeMismatch { types, declared } => format!(
+                    "{context}: reference {}: {types} ({})",
                     path.to_dot_string(),
                     declared.map_or_else(
                         || format!("from {}", path.to_dot_string()),
@@ -3534,7 +3452,7 @@ mod user_function_refs {
         source: &TypeExpr,
         sink: &TypeExpr,
         bindings: &BindingIndex<'_>,
-    ) -> Result<Option<(String, String)>, String> {
+    ) -> Result<Option<MismatchTypeNames>, String> {
         let source = bindings
             .resolve_declared_type(source)
             .map_err(|error| error.to_string())?;
@@ -3549,7 +3467,7 @@ mod user_function_refs {
         let assignable = bindings
             .check_type_assignment(source, sink)
             .map_err(|error| error.to_string())?;
-        Ok((!assignable).then(|| (sink.resolved_type_name(), source.resolved_type_name())))
+        Ok((!assignable).then(|| MismatchTypeNames::for_types(*sink, source)))
     }
 
     fn list_sink(type_expr: &TypeExpr) -> Option<&TypeExpr> {
@@ -3619,11 +3537,13 @@ mod user_function_refs {
                 result_context,
             ) {
                 match declared_result_mismatch(source, sink, bindings) {
-                    Ok(Some((expected, actual))) => errors.push(FunctionRefFinding::Boundary(format!(
-                        "{context}: expected {expected}, got {actual} (from function '{name}' return type)"
+                    Ok(Some(types)) => errors.push(FunctionRefFinding::Boundary(format!(
+                        "{context}: {types} (from function '{name}' return type)"
                     ))),
-                    Ok(None) => {},
-                    Err(error) => errors.push(FunctionRefFinding::Boundary(format!("{context}: function '{name}' return type: {error}"))),
+                    Ok(None) => {}
+                    Err(error) => errors.push(FunctionRefFinding::Boundary(format!(
+                        "{context}: function '{name}' return type: {error}"
+                    ))),
                 }
             }
             for (index, argument) in args.iter().enumerate() {
@@ -4684,12 +4604,11 @@ fn validate_resource_ref_types_inner<
                         let source_name = mismatch.actual_type_name();
                         let origin = mismatch.origin_description(reference);
                         all_errors.push(format!(
-                            "{}: cannot assign {} to '{}': expected {}, got {} ({})",
+                            "{}: cannot assign {} to '{}': {} ({})",
                             resource_location,
                             source_name,
                             attr_name,
-                            sink_type.resolved_type_name(),
-                            source_name,
+                            mismatch.type_names(),
                             origin,
                         ));
                     },
@@ -4723,7 +4642,7 @@ fn validate_resource_ref_types_inner<
                             crate::binding_index::DeclaredValueAssignment::Assignable
                             | crate::binding_index::DeclaredValueAssignment::IncomingBoundaryMismatch => Ok(()),
                             crate::binding_index::DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Mismatch(mismatch)) => Err(DeferredAccessTypeError::TypeMismatch {
-                                expected: sink_type.resolved_type_name(), actual: mismatch.actual_type_name().to_string(), origin: format!("from {name}"),
+                                types: mismatch.type_names().clone(), origin: format!("from {name}"),
                             }),
                             crate::binding_index::DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Unchecked(reason)) => Err(unchecked_assignment_error(reason)),
                         },
@@ -4734,14 +4653,15 @@ fn validate_resource_ref_types_inner<
                         Err(DeferredAccessTypeError::InvalidAccess { error }) => {
                             all_errors.push(format!("{}: {}", resource_location, error))
                         }
-                        Err(DeferredAccessTypeError::TypeMismatch {
-                            expected,
-                            actual,
-                            origin,
-                        }) => all_errors.push(format!(
-                            "{}: cannot assign {} to '{}': expected {}, got {} ({})",
-                            resource_location, actual, attr_name, expected, actual, origin,
-                        )),
+                        Err(DeferredAccessTypeError::TypeMismatch { types, origin }) => all_errors
+                            .push(format!(
+                                "{}: cannot assign {} to '{}': {} ({})",
+                                resource_location,
+                                types.actual(),
+                                attr_name,
+                                types,
+                                origin,
+                            )),
                     }
                 });
                 if let Some(effective_sink) = effective_sink {
@@ -4762,14 +4682,14 @@ fn validate_resource_ref_types_inner<
                             DeferredAccessTypeError::InvalidAccess { .. } => {
                                 all_errors.push(format!("{}: {}", resource_location, finding));
                             }
-                            DeferredAccessTypeError::TypeMismatch {
-                                expected,
-                                actual,
-                                origin,
-                            } => {
+                            DeferredAccessTypeError::TypeMismatch { types, origin } => {
                                 all_errors.push(format!(
-                                    "{}: cannot assign {} to '{}': expected {}, got {} ({})",
-                                    resource_location, actual, attr_name, expected, actual, origin,
+                                    "{}: cannot assign {} to '{}': {} ({})",
+                                    resource_location,
+                                    types.actual(),
+                                    attr_name,
+                                    types,
+                                    origin,
                                 ));
                             }
                         }
@@ -5113,18 +5033,10 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
     ) {
         Ok(inferred) => Some(inferred),
         Err(crate::static_type::InferenceIssue::Failed(
-            inference::InferenceError::IncompatibleCoalesceTypes { left, default },
+            error @ (inference::InferenceError::IncompatibleCoalesceTypes { .. }
+            | inference::InferenceError::HeterogeneousCollection { .. }),
         )) => {
-            diagnostics.push(deferred_iterable_diagnostic(
-                context,
-                format!("coalesce default type `{default}` does not match left type `{left}`"),
-            ));
-            None
-        }
-        Err(crate::static_type::InferenceIssue::Failed(
-            inference::InferenceError::HeterogeneousCollection { reason },
-        )) => {
-            diagnostics.push(deferred_iterable_diagnostic(context, reason));
+            diagnostics.push(deferred_iterable_diagnostic(context, error.to_string()));
             None
         }
         Err(crate::static_type::InferenceIssue::Failed(
@@ -5314,13 +5226,10 @@ fn check_attribute_param_ref<B: BindingAddress>(
                 }
             };
             if let TypeExpr::Ref(expected) = &resolved {
-                let actual = source.resource_handle_type().map_or_else(
-                    || source.display_type_name(),
-                    |actual| format!("resource handle {actual}"),
-                );
                 errors.push(format!(
-                    "attribute '{}': expected resource handle {}; got {}",
-                    param_name, expected, actual,
+                    "attribute '{}': {}",
+                    param_name,
+                    HandleSinkError::reference_for_handle(expected, &source),
                 ));
                 return;
             }
@@ -5337,10 +5246,9 @@ fn check_attribute_param_ref<B: BindingAddress>(
                 }
             };
             errors.push(format!(
-                "attribute '{}': type mismatch: expected {}, got {} ({})",
+                "attribute '{}': type mismatch: {} ({})",
                 param_name,
-                expected_type.expect("lifted expected type exists"),
-                mismatch.actual_type_name(),
+                mismatch.type_names(),
                 mismatch.origin_description(path),
             ));
         }
@@ -5607,11 +5515,10 @@ fn check_export_ref<B: BindingAddress>(
                 .declared_type_name()
                 .map(|_| format!(" ({})", mismatch.origin_description(path)));
             errors.push(format!(
-                "export '{}': type mismatch for '{}': expected {}, got {}{}",
+                "export '{}': type mismatch for '{}': {}{}",
                 param_name,
                 path.to_dot_string(),
-                type_expr,
-                mismatch.actual_type_name(),
+                mismatch.type_names(),
                 inferred_origin.as_deref().unwrap_or_default(),
             ));
         }
@@ -5878,8 +5785,9 @@ fn resolve_dotted_unresolved(
             registered.matches_authored_path(&path.provider, &authored_parts, &kind)
         })
         .collect::<Vec<_>>();
-    if let Some(resolved) = crate::parser::merge_custom_type_candidates(&matches)? {
-        return Ok(resolved);
+    if let Some(first) = matches.first() {
+        return crate::parser::resolve_custom_type_identity(first.identity(), config)?
+            .ok_or_else(|| unknown_type_resolution_error(&path.to_string(), config));
     }
 
     if config.custom_types.may_defer(Some(&path.provider)) {
@@ -6016,6 +5924,48 @@ impl HandleSinkError {
             bare_value_sink: false,
         }
     }
+
+    fn reference_for_handle(expected: &ResourceTypePath, actual: &ResolvedRefType) -> Self {
+        let expected = AttributeType::resource_handle(&expected.provider, &expected.resource_type);
+        Self::type_mismatch(
+            actual.mismatch_type_names(crate::schema::TypeInSchema::schemaless(&expected)),
+            actual.resource_handle_type().is_some(),
+        )
+    }
+
+    fn expanded_value_for_handle<P: PlaceholderKind, B: BindingAddress>(
+        expected: &ResourceTypePath,
+        value: &GenericValue<P, B>,
+        bindings: &BindingIndex<'_, B>,
+    ) -> Self {
+        if let GenericValue::Deferred(crate::resource::DeferredValue::ResourceRef { path }) = value
+            && let RefType::Typed(actual) = bindings.ref_type(path)
+        {
+            let expected =
+                AttributeType::resource_handle(&expected.provider, &expected.resource_type);
+            return Self::type_mismatch(
+                actual.mismatch_type_names(crate::schema::TypeInSchema::schemaless(&expected)),
+                false,
+            );
+        }
+        Self::value_for_handle(expected, typecheck::value_kind_name(value))
+    }
+
+    fn type_mismatch(types: MismatchTypeNames, actual_is_handle: bool) -> Self {
+        Self {
+            message: format!(
+                "expected resource handle {}; got {}{}",
+                types.expected(),
+                if actual_is_handle {
+                    "resource handle "
+                } else {
+                    ""
+                },
+                types.actual(),
+            ),
+            bare_value_sink: false,
+        }
+    }
 }
 
 impl std::fmt::Display for HandleSinkError {
@@ -6061,13 +6011,10 @@ pub(crate) fn check_handle_sink<B: crate::resource::BindingAddress>(
     if actual == expected {
         Ok(())
     } else {
-        Err(HandleSinkError {
-            message: format!(
-                "expected resource handle {expected}; got resource handle {}.{}",
-                actual.provider, actual.resource_type,
-            ),
-            bare_value_sink: false,
-        })
+        Err(HandleSinkError::type_mismatch(
+            MismatchTypeNames::for_resource_types(expected, actual),
+            true,
+        ))
     }
 }
 
@@ -6084,16 +6031,10 @@ pub(crate) fn check_ref_type_for_handle_sink(
                 if &actual_handle == expected {
                     Ok(true)
                 } else {
-                    Err(HandleSinkError::value_for_handle(
-                        expected,
-                        format_args!("resource handle {actual_handle}"),
-                    ))
+                    Err(HandleSinkError::reference_for_handle(expected, &actual))
                 }
             } else {
-                Err(HandleSinkError::value_for_handle(
-                    expected,
-                    actual.display_type_name(),
-                ))
+                Err(HandleSinkError::reference_for_handle(expected, &actual))
             }
         }
         RefType::Unchecked | RefType::UnknownBinding { .. } | RefType::UnknownAttribute(_) => {
@@ -6165,7 +6106,8 @@ impl TypeResolutionError {
         match &self.cause {
             StaticTypeResolutionError::UnknownCustomType { name }
             | StaticTypeResolutionError::UnknownCustomTypeWithSuggestion { name, .. }
-            | StaticTypeResolutionError::ConflictingScalarKinds { name, .. } => name,
+            | StaticTypeResolutionError::ConflictingScalarKinds { name, .. }
+            | StaticTypeResolutionError::MissingDeclaration { name, .. } => name,
         }
     }
 }
@@ -7025,13 +6967,11 @@ impl std::fmt::Display for ModuleCallReferenceDiagnostic {
         // sets and unions. This affects rendering only: the typed reference
         // identity still covers the resolver's assignment backstop.
         if self.declared_constraint
-            && let ModuleCallRefErrorKind::TypeMismatch {
-                expected, actual, ..
-            } = &self.identity.kind
+            && let ModuleCallRefErrorKind::TypeMismatch { types, .. } = &self.identity.kind
         {
             return write!(
                 formatter,
-                "module call '{}': argument '{}': Type mismatch: expected {expected}, got {actual} (from {})",
+                "module call '{}': argument '{}': Type mismatch: {types} (from {})",
                 self.call_label,
                 self.identity.argument,
                 self.display_path.to_dot_string(),
@@ -7577,8 +7517,7 @@ impl ModuleCallFinding {
                             span: finding.use_site.span,
                         }),
                         kind: ModuleCallRefErrorKind::TypeMismatch {
-                            expected: error.expected.clone(),
-                            actual: error.actual.clone(),
+                            types: error.types.clone(),
                             declared: error.declared.clone(),
                         },
                     },
@@ -8420,46 +8359,11 @@ impl ModuleCallChecker<'_> {
                     check_handle_sink(handle, &ResolvedParameterType::Handle(expected.clone()))
                         .err()
                 } else {
-                    let value = argument.value();
-                    let actual = match value {
-                        crate::resource::Value::Deferred(
-                            crate::resource::DeferredValue::ResourceRef { path },
-                        ) => match bindings.ref_type(path) {
-                            RefType::Typed(actual) => actual.display_type_name(),
-                            RefType::Unchecked
-                            | RefType::UnknownBinding { .. }
-                            | RefType::UnknownAttribute(_) => {
-                                typecheck::value_kind_name(value).to_string()
-                            }
-                        },
-                        crate::resource::Value::Concrete(
-                            crate::resource::ConcreteValue::String(_)
-                            | crate::resource::ConcreteValue::EnumIdentifier(_)
-                            | crate::resource::ConcreteValue::CanonicalEnum(_)
-                            | crate::resource::ConcreteValue::Int(_)
-                            | crate::resource::ConcreteValue::Float(_)
-                            | crate::resource::ConcreteValue::Bool(_)
-                            | crate::resource::ConcreteValue::Duration(_)
-                            | crate::resource::ConcreteValue::List(_)
-                            | crate::resource::ConcreteValue::StringList(_)
-                            | crate::resource::ConcreteValue::Map(_),
-                        )
-                        | crate::resource::Value::Deferred(
-                            crate::resource::DeferredValue::BindingRef { .. }
-                            | crate::resource::DeferredValue::Coalesce { .. }
-                            | crate::resource::DeferredValue::Interpolation(_)
-                            | crate::resource::DeferredValue::FunctionCall { .. }
-                            | crate::resource::DeferredValue::Unavailable { .. }
-                            | crate::resource::DeferredValue::ResolvedFunctionCall { .. }
-                            | crate::resource::DeferredValue::Access(_)
-                            | crate::resource::DeferredValue::ModuleIf(_)
-                            | crate::resource::DeferredValue::IntegerArithmetic(_)
-                            | crate::resource::DeferredValue::Secret(_)
-                            | crate::resource::DeferredValue::Unknown(_)
-                            | crate::resource::DeferredValue::Placeholder(_),
-                        ) => typecheck::value_kind_name(value).to_string(),
-                    };
-                    Some(HandleSinkError::value_for_handle(expected, actual))
+                    Some(HandleSinkError::expanded_value_for_handle(
+                        expected,
+                        argument.value(),
+                        bindings,
+                    ))
                 };
                 let Some(error) = error else {
                     continue;
@@ -9209,12 +9113,19 @@ fn validate_attribute_params_impl<P: PlaceholderKind, B: BindingAddress>(
                             ));
                         }
                     }
-                    ResolvedParameterType::Value(expected) => errors.push(format!(
-                        "attribute '{}': expected {expected}; got resource handle {} at line {}",
-                        param.name,
-                        handle.resource_type(),
-                        param.source_span().start_line(),
-                    )),
+                    ResolvedParameterType::Value(expected) => {
+                        let types = MismatchTypeNames::for_type_exprs(
+                            expected,
+                            &TypeExpr::Ref(handle.resource_type().clone()),
+                        );
+                        errors.push(format!(
+                            "attribute '{}': expected {}; got resource handle {} at line {}",
+                            param.name,
+                            types.expected(),
+                            types.actual(),
+                            param.source_span().start_line(),
+                        ));
+                    }
                 }
             }
         }
@@ -9582,5 +9493,7 @@ pub(crate) fn narrow_type_expr(
 
 pub mod inference;
 
+#[cfg(test)]
+mod named_annotation_tests;
 #[cfg(test)]
 mod tests;

@@ -6011,10 +6011,10 @@ fn canonical_map_key_text<H: ValueKind, B: BindingAddress>(
             | DeferredValue::Secret(_)
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
-        )) => Err(crate::schema::TypeError::TypeMismatch {
-            expected: "String or Enum map key".to_string(),
-            got: unexpected.type_name(),
-        }),
+        )) => Err(crate::schema::TypeError::value_type_mismatch(
+            "String or Enum map key".to_string(),
+            unexpected.type_name(),
+        )),
     }
 }
 
@@ -6076,10 +6076,8 @@ fn finish_no_fit<H: ValueKind, B: BindingAddress, P: CanonicalizationErrorPolicy
     if matches!(&expected.kind, AttrTypeKind::ResourceHandle { .. })
         || (purpose.rejects_unrecognized_enum_text() && type_contains_enum(expected, defs))
     {
-        let source = crate::schema::TypeError::TypeMismatch {
-            expected: expected.type_name(),
-            got: value.type_name(),
-        };
+        let source =
+            crate::schema::TypeError::value_type_mismatch(expected.type_name(), value.type_name());
         error_policy.canonicalization_failed(value, source)
     } else {
         Ok(value)
@@ -6377,10 +6375,10 @@ fn canonicalize_without_fit<
                     Ok(value)
                 }
                 Value::Concrete(ConcreteValue::CanonicalEnum(ref canonical)) => {
-                    let source = crate::schema::TypeError::TypeMismatch {
-                        expected: expected_identity.to_string(),
-                        got: canonical.identity().to_string(),
-                    };
+                    let source = crate::schema::TypeError::value_type_mismatch(
+                        expected_identity.to_string(),
+                        canonical.identity().to_string(),
+                    );
                     error_policy.canonicalization_failed(value, source)
                 }
                 other => finish_no_fit(other, unwrapped, defs, purpose, error_policy),

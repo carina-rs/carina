@@ -263,7 +263,7 @@ impl DeclaredValueSource {
 /// The first source constraint that failed assignment to a sink.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefTypeMismatch {
-    actual: String,
+    types: crate::schema::MismatchTypeNames,
     declared: Option<String>,
 }
 
@@ -275,15 +275,23 @@ pub enum RefTypeAssignabilityError {
 }
 
 impl RefTypeMismatch {
-    pub(crate) fn direct(actual: String) -> Self {
+    pub(crate) fn direct(types: crate::schema::MismatchTypeNames) -> Self {
         Self {
-            actual,
+            types,
             declared: None,
         }
     }
 
     pub fn actual_type_name(&self) -> &str {
-        &self.actual
+        self.types.actual()
+    }
+
+    pub fn expected_type_name(&self) -> &str {
+        self.types.expected()
+    }
+
+    pub fn type_names(&self) -> &crate::schema::MismatchTypeNames {
+        &self.types
     }
 
     /// Present only when forwarded/inferred evidence failed after the
@@ -301,6 +309,16 @@ impl RefTypeMismatch {
 }
 
 impl ResolvedRefType {
+    pub(crate) fn mismatch_type_names(
+        &self,
+        expected: TypeInSchema<'_, crate::schema::Compiled>,
+    ) -> crate::schema::MismatchTypeNames {
+        crate::schema::MismatchTypeNames::for_types(
+            expected,
+            self.authoritative.constraint().type_in_schema(),
+        )
+    }
+
     /// Retain the original source at a declared value boundary. Every later
     /// sink checks the declaration and re-admits original identities with its
     /// own authority, so an earlier provider's edge cannot be forwarded as proof.
@@ -444,7 +462,7 @@ impl ResolvedRefType {
         sink: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
         bindings: &BindingIndex<'_, B>,
     ) -> Result<(), RefTypeAssignabilityError> {
-        self.check_assignment(|source| bindings.check_type_assignment(source, sink))
+        self.check_assignment(*sink, |source| bindings.check_type_assignment(source, sink))
     }
 
     /// Inspect an incoming boundary without consuming or recording deferrals.
@@ -464,6 +482,7 @@ impl ResolvedRefType {
 
     pub(crate) fn check_assignment(
         &self,
+        expected: TypeInSchema<'_, crate::schema::Compiled>,
         mut judge: impl FnMut(
             TypeInSchema<'_, crate::schema::Compiled>,
         ) -> Result<bool, crate::parser::CustomTypeValidationError>,
@@ -473,7 +492,7 @@ impl ResolvedRefType {
             .map_err(|reason| RefTypeAssignabilityError::Unchecked(Box::new(reason)))?
         {
             return Err(RefTypeAssignabilityError::Mismatch(RefTypeMismatch {
-                actual: authoritative.resolved_type_name(),
+                types: crate::schema::MismatchTypeNames::for_types(expected, authoritative),
                 declared: None,
             }));
         }
@@ -484,7 +503,7 @@ impl ResolvedRefType {
                 .map_err(|reason| RefTypeAssignabilityError::Unchecked(Box::new(reason)))?
             {
                 return Err(RefTypeAssignabilityError::Mismatch(RefTypeMismatch {
-                    actual: evidence.resolved_type_name(),
+                    types: crate::schema::MismatchTypeNames::for_types(expected, evidence),
                     declared: self
                         .authoritative
                         .is_declared_composition_attribute()
@@ -1039,6 +1058,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
             // authoritative declaration resolution owns their diagnostic.
             Err(
                 crate::static_type::StaticTypeResolutionError::ConflictingScalarKinds { .. }
+                | crate::static_type::StaticTypeResolutionError::MissingDeclaration { .. }
                 | crate::static_type::StaticTypeResolutionError::UnknownCustomType { .. }
                 | crate::static_type::StaticTypeResolutionError::UnknownCustomTypeWithSuggestion {
                     ..
@@ -3307,6 +3327,86 @@ mod tests {
 
     use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
     #[test]
+    fn inferred_evidence_mismatch_keeps_constraints_after_the_declaration_passes() {
+        let identity = TypeIdentity::from_dotted("aws.iam.Role.Name");
+        let wide = AttributeType::refined_string(
+            Some(identity.clone()),
+            None,
+            Some((Some(1), Some(128))),
+            None,
+        );
+        let narrow =
+            AttributeType::refined_string(Some(identity), None, Some((Some(8), Some(64))), None);
+        let source = ResolvedRefType::with_declared_type(
+            ResolvedTypeConstraint::new(narrow.clone(), BTreeMap::new()),
+            Some(ResolvedRefType::new(wide, BTreeMap::new())),
+        );
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::ParsedFile::default();
+        let schemas = SchemaRegistry::new();
+        let bindings = BindingIndex::from_parsed(&parsed, &schemas, &context);
+        let sink = TypeInSchema::schemaless(&narrow).with_authority(
+            &context.custom_types,
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+        );
+        let RefTypeAssignabilityError::Mismatch(mismatch) =
+            source.is_assignable_to_sink(sink, &bindings).unwrap_err()
+        else {
+            panic!("evidence must fail the sink after the declaration passes")
+        };
+        assert_eq!(
+            mismatch.expected_type_name(),
+            "aws.iam.Role.Name (length 8..=64)"
+        );
+        assert_eq!(
+            mismatch.actual_type_name(),
+            "aws.iam.Role.Name (length 1..=128)"
+        );
+        assert_eq!(mismatch.declared_type_name(), Some("aws.iam.Role.Name"));
+    }
+
+    #[test]
+    fn review_declared_source_mismatch_preserves_both_constraint_names() {
+        let identity = TypeIdentity::from_dotted("aws.iam.Role.Name");
+        let wide = AttributeType::refined_string(
+            Some(identity.clone()),
+            None,
+            Some((Some(1), Some(128))),
+            None,
+        );
+        let narrow =
+            AttributeType::refined_string(Some(identity), None, Some((Some(8), Some(64))), None);
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::ParsedFile::default();
+        let schemas = SchemaRegistry::new();
+        let bindings = BindingIndex::from_parsed(&parsed, &schemas, &context);
+        let exact = TypeExpr::SchemaType {
+            owned: crate::parser::ResolvedSchemaType::from_schema_declaration("test", &wide)
+                .unwrap(),
+        };
+        let source = ResolvedRefType::new(wide, BTreeMap::new())
+            .with_value_declaration(&exact, &bindings)
+            .unwrap();
+        let sink = TypeInSchema::schemaless(&narrow).with_authority(
+            &context.custom_types,
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+        );
+        let DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Mismatch(mismatch)) =
+            source.assignment_to_sink(sink, &bindings)
+        else {
+            panic!("declaration must fail assignment")
+        };
+        assert_eq!(
+            mismatch.actual_type_name(),
+            "aws.iam.Role.Name (length 1..=128)"
+        );
+        assert_eq!(
+            mismatch.expected_type_name(),
+            "aws.iam.Role.Name (length 8..=64)"
+        );
+    }
+
+    #[test]
     fn declaration_mismatch_in_unloaded_session_reports_only_the_mismatch() {
         let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let terminal = crate::validation::deferred_types::TypeCheckSession::run(
@@ -4174,7 +4274,8 @@ let vpc = aws.ec2.Vpc {
                         "aws",
                         crate::schema::TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id"),
                         crate::schema::RefinedScalarKind::String,
-                    ),
+                    )
+                    .unbounded_witness_for_test(),
                 }),
             },
             ChainType {
@@ -4189,7 +4290,8 @@ let vpc = aws.ec2.Vpc {
                             "Id",
                         ),
                         crate::schema::RefinedScalarKind::String,
-                    ),
+                    )
+                    .unbounded_witness_for_test(),
                 }),
             },
             ChainType {
@@ -4532,7 +4634,8 @@ let vpc = aws.ec2.Vpc {
                                         "aws", "ec2.Vpc", "Id",
                                     ),
                                     crate::schema::RefinedScalarKind::String,
-                                ),
+                                )
+                                .unbounded_witness_for_test(),
                             },
                         )),
                     ),

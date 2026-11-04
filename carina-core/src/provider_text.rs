@@ -543,10 +543,7 @@ mod tests {
                 type_name: Some(raw.into()),
                 expected: vec![expected],
             },
-            TypeError::TypeMismatch {
-                expected: raw.into(),
-                got: "Int".into(),
-            },
+            TypeError::value_type_mismatch(raw.into(), "Int".into()),
             TypeError::MissingRequired { name: raw.into() },
             TypeError::UnknownAttribute {
                 name: "unknown".into(),

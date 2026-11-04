@@ -299,6 +299,10 @@ pub enum TypeExprValuePathSegment {
 /// A typed value mismatch against a declared [`TypeExpr`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeExprValueError {
+    InferredTypeMismatch {
+        path: Vec<TypeExprValuePathSegment>,
+        types: crate::schema::MismatchTypeNames,
+    },
     Mismatch {
         path: Vec<TypeExprValuePathSegment>,
         expected: Box<TypeExpr>,
@@ -330,7 +334,8 @@ pub enum TypeExprValueError {
 impl TypeExprValueError {
     fn prepend(mut self, segment: TypeExprValuePathSegment) -> Self {
         match &mut self {
-            Self::Mismatch { path, .. }
+            Self::InferredTypeMismatch { path, .. }
+            | Self::Mismatch { path, .. }
             | Self::MissingStructField { path, .. }
             | Self::UnknownStructField { path, .. }
             | Self::CustomTypeValidation { path, .. } => path.insert(0, segment),
@@ -361,6 +366,10 @@ fn write_path(f: &mut fmt::Formatter<'_>, path: &[TypeExprValuePathSegment]) -> 
 impl fmt::Display for TypeExprValueError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InferredTypeMismatch { path, types } => {
+                write_path(f, path)?;
+                types.fmt(f)
+            }
             Self::Mismatch {
                 path,
                 expected,
@@ -582,13 +591,13 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
                 Err(crate::static_type::InferenceIssue::Failed(
                     error @ (super::inference::InferenceError::InvalidAccess { .. }
                     | super::inference::InferenceError::UnknownAttribute { .. }
+                    | super::inference::InferenceError::HeterogeneousCollection { .. }
                     | super::inference::InferenceError::InvalidIntegerArithmeticOperand {
                         ..
                     }),
                 )) => Mismatch(TypeExprValueError::InvalidAccess { error }),
                 Err(crate::static_type::InferenceIssue::Failed(
                     super::inference::InferenceError::UnknownType { .. }
-                    | super::inference::InferenceError::HeterogeneousCollection { .. }
                     | super::inference::InferenceError::IncompatibleCoalesceTypes { .. }
                     | super::inference::InferenceError::UnknownBinding { .. }
                     | super::inference::InferenceError::CyclicVirtualBinding { .. },
@@ -724,6 +733,13 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
         TypeExpr::Ref(_) => Mismatch(mismatch(expected, value)),
         TypeExpr::SchemaType { owned } => {
             use crate::schema::RefinedScalarKind;
+            if owned.has_empty_intersection() {
+                return Mismatch(validation_mismatch(
+                    expected,
+                    value,
+                    "empty intersection of scalar constraints".into(),
+                ));
+            }
             let supported = matches!(
                 (owned.scalar_kind(), value),
                 (
@@ -827,7 +843,10 @@ fn inferred_value_check<'s, P: PlaceholderKind, B: BindingAddress>(
     match inferred_type_assignment(expected, actual, &config.custom_types) {
         crate::schema::TypeAssignability::Assignable => TypeExprValueCheck::Assignable,
         crate::schema::TypeAssignability::Mismatch => {
-            TypeExprValueCheck::Mismatch(mismatch(expected, value))
+            TypeExprValueCheck::Mismatch(TypeExprValueError::InferredTypeMismatch {
+                path: Vec::new(),
+                types: crate::schema::MismatchTypeNames::for_type_exprs(expected, actual),
+            })
         }
         crate::schema::TypeAssignability::Unchecked(evidence) => {
             TypeExprValueCheck::Deferred(TypeExprValueDeferral {
@@ -1068,14 +1087,16 @@ mod tests {
                 ])
                 .expect("two annotation owners are non-empty"),
                 crate::schema::RefinedScalarKind::String,
-            ),
+            )
+            .unbounded_witness_for_test(),
         };
         let actual = TypeExpr::SchemaType {
             owned: OwnedTypeIdentity::provider(
                 "aws",
                 identity,
                 crate::schema::RefinedScalarKind::String,
-            ),
+            )
+            .unbounded_witness_for_test(),
         };
 
         assert!(
@@ -1287,7 +1308,8 @@ mod tests {
                     "mock",
                     TypeIdentity::bare("Count"),
                     kind,
-                ),
+                )
+                .unbounded_witness_for_test(),
             };
             assert_eq!(
                 providerless_check(&expected, &value).is_ok(),
@@ -1308,7 +1330,8 @@ mod tests {
                         "awscc",
                         identity.clone(),
                         crate::schema::RefinedScalarKind::String,
-                    ),
+                    )
+                    .unbounded_witness_for_test(),
                 },
                 crate::parser::resolve_custom_type_identity(&identity, &config)
                     .unwrap()
@@ -1330,7 +1353,8 @@ mod tests {
                 "awscc",
                 TypeIdentity::from_dotted(name),
                 crate::schema::RefinedScalarKind::String,
-            ),
+            )
+            .unbounded_witness_for_test(),
         };
         let broad = schema_type("aws.Arn");
         let narrow = schema_type("aws.iam.Role.Arn");
@@ -1435,7 +1459,8 @@ mod tests {
                     "aws",
                     TypeIdentity::from_schema_type("aws", "ec2", "VpcId"),
                     crate::schema::RefinedScalarKind::String,
-                ),
+                )
+                .unbounded_witness_for_test(),
             },
             TypeExpr::Struct {
                 fields: vec![("name".to_string(), TypeExpr::String)],
@@ -1487,7 +1512,8 @@ mod tests {
                 "mock",
                 TypeIdentity::bare("AccountId"),
                 crate::schema::RefinedScalarKind::String,
-            ),
+            )
+            .unbounded_witness_for_test(),
         }
     }
 
@@ -1689,7 +1715,8 @@ mod tests {
                     "aws",
                     TypeIdentity::from_schema_type("aws", "ec2", "VpcId"),
                     crate::schema::RefinedScalarKind::String,
-                ),
+                )
+                .unbounded_witness_for_test(),
             },
             TypeExpr::Struct { fields: Vec::new() },
         ] {
@@ -1740,7 +1767,8 @@ mod tests {
                     "aws",
                     TypeIdentity::from_schema_type("aws", "ec2", "VpcId"),
                     crate::schema::RefinedScalarKind::String,
-                ),
+                )
+                .unbounded_witness_for_test(),
             },
             TypeExpr::Union(vec![
                 TypeExpr::StringLiteral("dev".to_string()),
@@ -1775,7 +1803,8 @@ mod tests {
                 "test",
                 identity.clone(),
                 crate::schema::RefinedScalarKind::String,
-            ),
+            )
+            .unbounded_witness_for_test(),
         };
         let checked_identity = identity.clone();
         let config = ProviderContext {
@@ -1915,7 +1944,8 @@ mod tests {
                 "test",
                 identity,
                 crate::schema::RefinedScalarKind::String,
-            ),
+            )
+            .unbounded_witness_for_test(),
         };
         let value = Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.dsl_value"));
 
@@ -1958,7 +1988,8 @@ mod tests {
                     "test",
                     TypeIdentity::from_schema_type("test", "widget", "PositiveInt"),
                     crate::schema::RefinedScalarKind::Int,
-                ),
+                )
+                .unbounded_witness_for_test(),
             },
         ] {
             check_with_config(&expected, &Value::Concrete(ConcreteValue::Int(1)), &config)
@@ -2031,7 +2062,8 @@ mod tests {
                 provider,
                 identity.clone(),
                 crate::schema::RefinedScalarKind::Int,
-            ),
+            )
+            .unbounded_witness_for_test(),
         };
 
         check_with_config(&ty("one"), &Value::Concrete(ConcreteValue::Int(5)), &config)
@@ -2126,14 +2158,16 @@ mod tests {
                     "bare-provider",
                     bare_identity,
                     crate::schema::RefinedScalarKind::String,
-                ),
+                )
+                .unbounded_witness_for_test(),
             },
             TypeExpr::SchemaType {
                 owned: crate::parser::OwnedTypeIdentity::provider(
                     "test",
                     schema_identity.clone(),
                     crate::schema::RefinedScalarKind::String,
-                ),
+                )
+                .unbounded_witness_for_test(),
             },
         ] {
             check_with_config(&expected, &value, &config)

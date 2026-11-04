@@ -224,11 +224,15 @@ fn type_expr_source_is_assignable_to(
     schemas: &SchemaRegistry,
     provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
 ) -> bool {
-    let Ok(source) = carina_core::parser::resolve_type_expr_from_schemas(
-        source,
-        schemas,
-        provider_ctx.catalog(),
-    ) else {
+    let Ok(source) = carina_core::validation::resolve_type_expr(source, provider_ctx.catalog())
+        .and_then(|source| {
+            carina_core::parser::resolve_type_expr_from_schemas(
+                &source,
+                schemas,
+                provider_ctx.catalog(),
+            )
+        })
+    else {
         return true;
     };
     let Some(source) = carina_core::validation::lift_type_expr(&source) else {
@@ -1877,6 +1881,24 @@ impl CompletionProvider {
             base_path,
             provider_ctx,
         ));
+        let mut src_buf = String::new();
+        let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
+        for (name, type_hint) in self.extract_argument_parameters(src) {
+            let Some(declared) =
+                carina_core::parser::parse_type_expr_str(&type_hint, provider_ctx.catalog())
+            else {
+                continue;
+            };
+            if type_expr_source_is_assignable_to(&declared, target, &self.schemas, provider_ctx) {
+                items.push(CompletionItem {
+                    label: name.clone(),
+                    kind: Some(CompletionItemKind::VARIABLE),
+                    detail: Some(format!("argument: {type_hint}")),
+                    insert_text: Some(name),
+                    ..Default::default()
+                });
+            }
+        }
         items
     }
 

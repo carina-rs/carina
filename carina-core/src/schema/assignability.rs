@@ -512,12 +512,12 @@ impl TypeInSchema<'_, super::Compiled> {
             }
             Ok(false) => {
                 return DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Mismatch(
-                    RefTypeMismatch::direct(self.resolved_type_name()),
+                    RefTypeMismatch::direct(super::MismatchTypeNames::for_types(*sink, self)),
                 ));
             }
             Ok(true) => {}
         }
-        match original.check_assignment(|source| {
+        match original.check_assignment(*sink, |source| {
             bindings.consume_type_assignment(source.identity_assignment_to(sink))
         }) {
             Ok(()) => DeclaredValueAssignment::Assignable,
@@ -601,6 +601,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
         use AttrTypeKind::*;
         use TypeAssignability::*;
         let result = match (&source.attr.kind, &target.attr.kind) {
+            (_, _)
+                if source.attr.has_empty_scalar_intersection()
+                    || target.attr.has_empty_scalar_intersection() =>
+            {
+                Mismatch
+            }
             (_, kind)
                 if check == AssignmentCheck::IdentifiedLeaves
                     && identity_leaf(kind).is_none()
