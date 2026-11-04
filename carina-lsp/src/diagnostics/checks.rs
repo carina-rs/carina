@@ -18,7 +18,7 @@ use carina_core::resource::{
     Value as GenericValue,
 };
 use carina_core::schema::suggest_similar_name;
-use carina_core::validation::typecheck::{self, TypecheckInference};
+use carina_core::validation::typecheck;
 
 use super::{
     DiagnosticRun, ProviderValidationDeduplicator, render_analysis_invariant, render_merged,
@@ -1454,7 +1454,7 @@ impl DiagnosticRun<'_> {
                             type_expr,
                             semantic_value,
                             provider_context,
-                            TypecheckInference::Judged(expression),
+                            expression,
                         )
                         .require_provider_schemas()
                         .err(),
@@ -1462,7 +1462,7 @@ impl DiagnosticRun<'_> {
                             type_expr,
                             semantic_value,
                             self.provider_context.catalog(),
-                            TypecheckInference::Judged(expression),
+                            expression,
                         )
                         .record_at(
                             self.provider_context,

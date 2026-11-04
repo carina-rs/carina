@@ -4,7 +4,7 @@ use crate::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, SchemaRegistry,
 };
 use crate::static_type::{InferenceError, InferenceIssue};
-use crate::validation::typecheck::{TypecheckInference, check_type_expr_value_providerless};
+use crate::validation::typecheck::check_type_expr_value_providerless;
 
 fn config() -> ProviderContext {
     ProviderContext::new(crate::EnvironmentSnapshot::empty())
@@ -38,7 +38,7 @@ fn heterogeneous_record_keeps_its_field_constraint_checks() {
         &expected,
         &parsed.variables["value"],
         &config,
-        TypecheckInference::Judged(expression),
+        expression,
     )
     .require_provider_schemas()
     .unwrap_err()
@@ -202,14 +202,9 @@ fn literal_access_retains_string_construction_kind() {
         admit_expression(result, &sink),
         Ok(ExpressionAdmission::DeferredInterpolation)
     );
-    check_type_expr_value_providerless(
-        &sink,
-        &parsed.variables["result"],
-        &config(),
-        TypecheckInference::Judged(result),
-    )
-    .require_provider_schemas()
-    .unwrap();
+    check_type_expr_value_providerless(&sink, &parsed.variables["result"], &config(), result)
+        .require_provider_schemas()
+        .unwrap();
 }
 
 #[test]
@@ -261,7 +256,7 @@ fn missing_child_evidence_is_a_hard_error() {
         &TypeExpr::List(Box::new(TypeExpr::String)),
         &projection,
         &config(),
-        TypecheckInference::Judged(result),
+        result,
     )
     .require_provider_schemas();
     assert!(check.is_err(), "missing evidence was admitted: {check:?}");
@@ -327,7 +322,7 @@ fn composite_collections_preserve_child_construction_kinds() {
             &sink,
             &parsed.variables["result"],
             &config(),
-            TypecheckInference::Judged(expression),
+            expression,
         )
         .require_provider_schemas();
         assert!(result.is_ok(), "{source}: {result:?}");

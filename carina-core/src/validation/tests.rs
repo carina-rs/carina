@@ -435,9 +435,7 @@ fn rendered_typecheck_result(
         type_expr,
         value,
         typecheck::TypecheckProviderContext::for_parser(config),
-        typecheck::TypecheckInference::Judged(
-            &crate::parser::retained::value_dependent_judgement_for_test(),
-        ),
+        &crate::parser::retained::value_dependent_judgement_for_test(),
     )
     .require_provider_schemas()
     .err()
@@ -1908,9 +1906,7 @@ fn unloaded_schema_nominals_defer_values_and_resolve_when_catalog_loads() {
         &ty,
         &value,
         typecheck::TypecheckProviderContext::for_parser(&context),
-        typecheck::TypecheckInference::Judged(
-            &crate::parser::retained::value_dependent_judgement_for_test(),
-        ),
+        &crate::parser::retained::value_dependent_judgement_for_test(),
     )
     .require_provider_schemas()
     .unwrap_err();
@@ -4391,9 +4387,7 @@ fn bare_builtin_custom_types_report_scalar_kind_mismatches() {
             typecheck::TypecheckProviderContext::for_parser(&ProviderContext::new(
                 crate::EnvironmentSnapshot::empty(),
             )),
-            typecheck::TypecheckInference::Judged(
-                &crate::parser::retained::value_dependent_judgement_for_test(),
-            ),
+            &crate::parser::retained::value_dependent_judgement_for_test(),
         )
         .require_provider_schemas()
         .expect_err("the declared scalar kind must be checked before its validator");

@@ -643,13 +643,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 return Err(ModuleError::ReferenceType(error));
             }
             self.typecheck_context()
-                .check(
-                    &resolved_type,
-                    value,
-                    crate::validation::typecheck::TypecheckInference::Judged(
-                        &argument_judgements[&arg.name],
-                    ),
-                )
+                .check(&resolved_type, value, &argument_judgements[&arg.name])
                 .map_err(|mismatch| ModuleError::InvalidArgumentType {
                     module: call.module_name.clone(),
                     argument: arg.name.clone(),
@@ -3996,7 +3990,7 @@ fn check_composition_argument_type<P: crate::resource::PlaceholderKind, B: Bindi
         .check(
             &resolved_parameter.as_type_expr(),
             argument.value(),
-            crate::validation::typecheck::TypecheckInference::Judged(expression),
+            expression,
         )
         .map_err(|mismatch| ArgumentSubstitutionError::Evaluation {
             source_file: None,

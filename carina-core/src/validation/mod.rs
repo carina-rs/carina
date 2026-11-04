@@ -1404,10 +1404,12 @@ fn binding_value_constraints<B: BindingAddress>(
         RefSink::TypeExpr(type_expr) => {
             let expression = context
                 .expression_report
-                .require_expression_in(&use_site.expression_instance, use_site.location())
+                .expression_in(&use_site.expression_instance, use_site.location())
                 .map_err(|error| {
                     BindingResolutionError::ValueType(Box::new(
-                        typecheck::TypeExprValueError::InvalidAccess { error },
+                        typecheck::TypeExprValueError::InvalidAccess {
+                            error: error.into(),
+                        },
                     ))
                 })?;
             context
@@ -1415,7 +1417,7 @@ fn binding_value_constraints<B: BindingAddress>(
                 .check_at(
                     type_expr,
                     value,
-                    typecheck::TypecheckInference::Judged(expression),
+                    expression,
                     deferred_types::ProviderTypeCheckSite::new(
                         use_site.location().clone(),
                         format!("binding '{}'", use_site.name),
@@ -4912,6 +4914,15 @@ enum DeferredIterableShape {
     NonIterable(TypeExpr),
 }
 
+impl From<crate::parser::retained::CollectionKind> for DeferredIterableShape {
+    fn from(kind: crate::parser::retained::CollectionKind) -> Self {
+        match kind {
+            crate::parser::retained::CollectionKind::List => Self::List,
+            crate::parser::retained::CollectionKind::Map => Self::Map,
+        }
+    }
+}
+
 #[cfg(test)]
 fn deferred_iterable_shape(
     value: &Value,
@@ -4938,16 +4949,13 @@ fn deferred_iterable_shape(
 fn deferred_iterable_shape_for_phase(
     expression: &crate::parser::retained::JudgedExpr,
 ) -> Result<DeferredIterableShape, crate::static_type::InferenceIssue> {
-    if let Some(kind) = expression.collection_kind() {
-        return Ok(match kind {
-            crate::parser::retained::CollectionKind::List => DeferredIterableShape::List,
-            crate::parser::retained::CollectionKind::Map => DeferredIterableShape::Map,
-        });
+    match expression.collection_kind() {
+        Some(kind) => Ok(kind.into()),
+        None => expression
+            .static_type()
+            .cloned()
+            .map(iterable_shape_from_type),
     }
-    expression
-        .static_type()
-        .cloned()
-        .map(iterable_shape_from_type)
 }
 
 fn iterable_shape_from_type(inferred: TypeExpr) -> DeferredIterableShape {
@@ -8197,13 +8205,15 @@ impl ModuleCallChecker<'_> {
             }
             let inference = authority_file
                 .expression_report()
-                .require_expression(
+                .expression(
                     authored_call
                         .id()
                         .argument_value_location(argument)
                         .expect("authored argument expression"),
                 )
-                .map_err(|error| typecheck::TypeExprValueError::InvalidAccess { error });
+                .map_err(|error| typecheck::TypeExprValueError::InvalidAccess {
+                    error: error.into(),
+                });
             let location = authored_call
                 .id()
                 .argument_value_location(argument)
@@ -8217,7 +8227,7 @@ impl ModuleCallChecker<'_> {
                 self.provider_context.check_at(
                     &resolved_parameter.as_type_expr(),
                     value,
-                    typecheck::TypecheckInference::Judged(expression),
+                    expression,
                     deferred_types::ProviderTypeCheckSite::new(
                         authored_call
                             .id()
@@ -9074,7 +9084,7 @@ where
                         let check = provider.check_at(
                             type_expr,
                             value,
-                            typecheck::TypecheckInference::Judged(expression),
+                            expression,
                             deferred_types::ProviderTypeCheckSite::new(
                                 param.type_check_location().clone(),
                                 format!("export '{}'", param.name()),

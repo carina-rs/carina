@@ -199,7 +199,7 @@ impl dyn ProviderTypeCheckContext + '_ {
 /// ```
 ///
 /// ```compile_fail
-/// use carina_core::{parser::{ProviderContext, TypeExpr}, resource::{AuthoredValue, AuthoredConcreteValue}, validation::{deferred_types::TypeCheckSession, typecheck::{check_type_expr_value_providerless, TypecheckInference}}};
+/// use carina_core::{parser::{ProviderContext, TypeExpr}, resource::{AuthoredValue, AuthoredConcreteValue}, validation::{deferred_types::TypeCheckSession, typecheck::check_type_expr_value_providerless}};
 /// let expected = TypeExpr::String;
 /// let value = AuthoredValue::Concrete(AuthoredConcreteValue::String("value".into()));
 /// let catalog = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
@@ -209,11 +209,11 @@ impl dyn ProviderTypeCheckContext + '_ {
 /// let report = loaded.judged();
 /// let expression = report.report().binding(&carina_core::resource::RelativeBindingName::new("value")).unwrap();
 /// let escaped = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
-///     check_type_expr_value_providerless(&expected, &value, session.catalog(), TypecheckInference::Judged(expression))
+///     check_type_expr_value_providerless(&expected, &value, session.catalog(), expression)
 /// });
 /// ```
 /// ```
-/// use carina_core::{parser::{ProviderContext, TypeExpr}, resource::{AuthoredValue, AuthoredConcreteValue}, validation::{deferred_types::TypeCheckSession, typecheck::{check_type_expr_value_providerless, TypecheckInference}}};
+/// use carina_core::{parser::{ProviderContext, TypeExpr}, resource::{AuthoredValue, AuthoredConcreteValue}, validation::{deferred_types::TypeCheckSession, typecheck::check_type_expr_value_providerless}};
 /// let expected = TypeExpr::String;
 /// let value = AuthoredValue::Concrete(AuthoredConcreteValue::String("value".into()));
 /// let catalog = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
@@ -223,7 +223,7 @@ impl dyn ProviderTypeCheckContext + '_ {
 /// let report = loaded.judged();
 /// let expression = report.report().binding(&carina_core::resource::RelativeBindingName::new("value")).unwrap();
 /// let result = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
-///     check_type_expr_value_providerless(&expected, &value, session.catalog(), TypecheckInference::Judged(expression))
+///     check_type_expr_value_providerless(&expected, &value, session.catalog(), expression)
 ///         .record_deferred(session).unwrap();
 /// });
 /// result.publish(&mut Vec::new());
@@ -831,9 +831,7 @@ mod tests {
                     &expected,
                     &value,
                     context.catalog(),
-                    super::super::typecheck::TypecheckInference::Judged(
-                        &crate::parser::retained::value_dependent_judgement_for_test(),
-                    ),
+                    &crate::parser::retained::value_dependent_judgement_for_test(),
                 )
                 .record_at(
                     context,

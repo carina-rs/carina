@@ -2294,19 +2294,6 @@ mod judgement {
                 .get(&ExpressionLocation::new(instance.clone(), location))
                 .ok_or_else(|| MissingEvidence::new(format!("{instance:?} at {location:?}")))
         }
-        pub(crate) fn require_expression_in(
-            &self,
-            instance: &ExpressionInstance,
-            location: &DeclarationLocation,
-        ) -> Result<&JudgedExpr, InferenceError> {
-            self.expression_in(instance, location).map_err(Into::into)
-        }
-        pub(crate) fn require_expression(
-            &self,
-            location: &DeclarationLocation,
-        ) -> Result<&JudgedExpr, InferenceError> {
-            self.require_expression_in(&self.instance, location)
-        }
         pub fn for_resource(
             &self,
             id: &crate::resource::ResourceId,
@@ -2463,23 +2450,21 @@ mod judgement {
             &self.findings
         }
         pub(crate) fn first_function_error(&self) -> Option<super::super::ParseError> {
-            self.function_errors.first().map(|finding| {
-                super::super::ParseError::InvalidExpression {
-                    line: finding.location().span().start_line(),
-                    message: finding.detail().to_string(),
-                }
-                .at(finding.location())
-            })
+            first_error(&self.function_errors)
         }
         pub fn first_error(&self) -> Option<super::super::ParseError> {
-            self.findings.first().map(|finding| {
-                super::super::ParseError::InvalidExpression {
-                    line: finding.location().span().start_line(),
-                    message: finding.detail().to_string(),
-                }
-                .at(finding.location())
-            })
+            first_error(&self.findings)
         }
+    }
+
+    fn first_error(findings: &[Located<InferenceError>]) -> Option<super::super::ParseError> {
+        findings.first().map(|finding| {
+            super::super::ParseError::InvalidExpression {
+                line: finding.location().span().start_line(),
+                message: finding.detail().to_string(),
+            }
+            .at(finding.location())
+        })
     }
 
     pub fn judge_expressions<E, D, B: BindingAddress>(
@@ -3172,10 +3157,7 @@ mod judgement {
                     result
                 }
                 ExprKind::Function { name, signature } => {
-                    let body = children
-                        .last()
-                        .cloned()
-                        .unwrap_or_else(|| incomplete("authored child"));
+                    let body = authored_child(children.last());
                     if let Some(sink) = &signature.return_type
                         && let Some(failure) = self.check_function_sink(
                             &body,
@@ -3189,10 +3171,7 @@ mod judgement {
                     }
                     declaration()
                 }
-                ExprKind::Sequence => children
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(|| incomplete("authored child")),
+                ExprKind::Sequence => authored_child(children.last()),
                 ExprKind::Call(name) => {
                     let mut argument_failure = None;
                     let signature = self
@@ -3324,10 +3303,9 @@ mod judgement {
                         .cloned()
                         .unwrap_or_else(|| incomplete("iterable operand"))
                 }
-                ExprKind::Alias | ExprKind::Wait => children
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| incomplete("authored child")),
+                ExprKind::Alias | ExprKind::Wait | ExprKind::Sink(_) => {
+                    authored_child(children.first())
+                }
                 ExprKind::Element => {
                     let collection = &children[0];
                     if collection.is_value_dependent() {
@@ -3369,10 +3347,6 @@ mod judgement {
                         Err(error) => ordinary(Err(error), false),
                     }
                 }
-                ExprKind::Sink(_) => children
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| incomplete("authored child")),
                 ExprKind::Resource {
                     provider,
                     resource_type,
@@ -3726,6 +3700,12 @@ mod judgement {
     pub(crate) fn unjudged() -> Result<JudgedExpr, MissingEvidence> {
         Err(MissingEvidence::new("declaration has not been judged"))
     }
+    fn authored_child(child: Option<&JudgedExpr>) -> JudgedExpr {
+        child
+            .cloned()
+            .unwrap_or_else(|| incomplete("authored child"))
+    }
+
     fn incomplete(request: &str) -> JudgedExpr {
         declared(
             Err(InferenceError::from(MissingEvidence::new(request)).into()),

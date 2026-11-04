@@ -13,6 +13,7 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::Document;
 use crate::position;
+use carina_core::parser::retained::JudgedExpr;
 use carina_core::parser::{
     ParseError, ProviderConfig, SourceSpan, WarningKind, contains_function_call,
 };
@@ -1086,10 +1087,10 @@ impl DiagnosticRun<'_> {
                     finding.detail().to_string(),
                 ) && !diagnostics.contains(&diagnostic)
                 {
-                    let owner = match expression_report.expression(finding.location()) {
-                        Ok(expression) => expression.boundary_owner(),
-                        Err(_) => None,
-                    };
+                    let owner = expression_report
+                        .expression(finding.location())
+                        .ok()
+                        .and_then(JudgedExpr::boundary_owner);
                     let owned_range = owner.and_then(|owner| {
                         render_merged(
                             doc,
@@ -1485,22 +1486,16 @@ impl DiagnosticRun<'_> {
                     let bn_map = schema.block_name_map();
                     let mut reported_attribute_diagnostics = HashSet::new();
                     for (attr_name, authored_attr_value) in resource_attributes.iter() {
-                        let judged_expression =
-                            expression_report.expression(rref.attribute_value_location(
-                                attr_name,
-                                &carina_core::schema::FieldPath::new(),
-                            ));
+                        let location = rref.attribute_value_location(
+                            attr_name,
+                            &carina_core::schema::FieldPath::new(),
+                        );
+                        let judged_expression = expression_report.expression(location);
                         let judged_expression = match judged_expression {
                             Ok(expression) => expression,
                             Err(error) => {
-                                let finding = carina_core::parser::Located::new(
-                                    rref.attribute_value_location(
-                                        attr_name,
-                                        &carina_core::schema::FieldPath::new(),
-                                    )
-                                    .clone(),
-                                    error,
-                                );
+                                let finding =
+                                    carina_core::parser::Located::new(location.clone(), error);
                                 diagnostics.extend(render_merged(
                                     doc,
                                     &finding,

@@ -1746,7 +1746,7 @@ fn render_value_type_error(
                         type_expr,
                         value,
                         provider_context,
-                        carina_core::validation::typecheck::TypecheckInference::Judged(expression),
+                        expression,
                     )
                     .require_provider_schemas()
                 }
@@ -1754,7 +1754,7 @@ fn render_value_type_error(
                     type_expr,
                     value,
                     &engine.provider_context,
-                    carina_core::validation::typecheck::TypecheckInference::Judged(expression),
+                    expression,
                 )
                 .record_deferred(session),
             };

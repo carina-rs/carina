@@ -379,9 +379,7 @@ fn exact_schema_projections_keep_their_declaration_instead_of_sibling_constraint
         &exact,
         &text("A".repeat(80)),
         snapshot.provider_context(),
-        typecheck::TypecheckInference::Judged(
-            &crate::parser::retained::value_dependent_judgement_for_test(),
-        ),
+        &crate::parser::retained::value_dependent_judgement_for_test(),
     )
     .require_provider_schemas()
     .expect("an exact source value must not inherit its narrower sibling's bound");
@@ -397,9 +395,7 @@ fn exact_schema_projections_keep_their_declaration_instead_of_sibling_constraint
         &restored,
         &text("A".repeat(80)),
         snapshot.provider_context(),
-        typecheck::TypecheckInference::Judged(
-            &crate::parser::retained::value_dependent_judgement_for_test(),
-        ),
+        &crate::parser::retained::value_dependent_judgement_for_test(),
     )
     .require_provider_schemas()
     .expect("serde must retain the exact projection's validation scope");
@@ -437,9 +433,7 @@ fn exact_projection_value_validation_keeps_its_callback_without_sibling_callback
         &exact,
         &value,
         snapshot.provider_context(),
-        typecheck::TypecheckInference::Judged(
-            &crate::parser::retained::value_dependent_judgement_for_test(),
-        ),
+        &crate::parser::retained::value_dependent_judgement_for_test(),
     )
     .require_provider_schemas()
     .expect("only the exact declaration's callback may validate this source");
@@ -448,9 +442,7 @@ fn exact_projection_value_validation_keeps_its_callback_without_sibling_callback
         &annotation(&snapshot),
         &value,
         snapshot.provider_context(),
-        typecheck::TypecheckInference::Judged(
-            &crate::parser::retained::value_dependent_judgement_for_test(),
-        ),
+        &crate::parser::retained::value_dependent_judgement_for_test(),
     )
     .require_provider_schemas()
     .unwrap_err();
@@ -549,9 +541,7 @@ fn review_projection_serde_rebinds_exact_callbacks_and_enum_semantics() {
                     ty,
                     &text("INVALID"),
                     snapshot.provider_context(),
-                    typecheck::TypecheckInference::Judged(
-                        &crate::parser::retained::value_dependent_judgement_for_test()
-                    ),
+                    &crate::parser::retained::value_dependent_judgement_for_test(),
                 )
                 .require_provider_schemas()
                 .is_err(),
@@ -564,9 +554,7 @@ fn review_projection_serde_rebinds_exact_callbacks_and_enum_semantics() {
                 &restored,
                 &text("VALID"),
                 missing.provider_context(),
-                typecheck::TypecheckInference::Judged(
-                    &crate::parser::retained::value_dependent_judgement_for_test()
-                ),
+                &crate::parser::retained::value_dependent_judgement_for_test(),
             )
             .require_provider_schemas()
             .is_err(),
@@ -628,9 +616,7 @@ fn review_projection_serde_keeps_reference_semantics_and_rejects_ambiguous_callb
         &restored,
         &text("VALID"),
         ambiguous.provider_context(),
-        typecheck::TypecheckInference::Judged(
-            &crate::parser::retained::value_dependent_judgement_for_test(),
-        ),
+        &crate::parser::retained::value_dependent_judgement_for_test(),
     )
     .require_provider_schemas()
     .unwrap_err();
@@ -665,9 +651,7 @@ fn review_enum_witness_constraints_apply_to_canonical_api_spelling() {
             &ty,
             &value,
             snapshot.provider_context(),
-            typecheck::TypecheckInference::Judged(
-                &crate::parser::retained::value_dependent_judgement_for_test(),
-            ),
+            &crate::parser::retained::value_dependent_judgement_for_test(),
         )
         .require_provider_schemas()
         .unwrap();
@@ -696,9 +680,7 @@ fn review_enum_values_validate_canonical_scalar_against_retained_witness() {
                     &ty,
                     &value,
                     lax.provider_context(),
-                    typecheck::TypecheckInference::Judged(
-                        &crate::parser::retained::value_dependent_judgement_for_test(),
-                    ),
+                    &crate::parser::retained::value_dependent_judgement_for_test(),
                 )
                 .require_provider_schemas();
                 assert_eq!(result.is_ok(), accepted, "{value:?}: {result:?}");
@@ -733,9 +715,7 @@ fn assert_enum_witness_masks_env_value(base: DraftType, expected: &str) {
             &ty,
             value,
             &context,
-            typecheck::TypecheckInference::Judged(
-                &crate::parser::retained::value_dependent_judgement_for_test(),
-            ),
+            &crate::parser::retained::value_dependent_judgement_for_test(),
         )
         .require_provider_schemas()
         .expect_err("the retained witness must reject the value");
@@ -1097,11 +1077,9 @@ fn computed_access_mismatch_keeps_inferred_constraints_and_nested_path() {
         &TypeExpr::List(Box::new(expected)),
         &list(vec![access]),
         snapshot.provider_context(),
-        typecheck::TypecheckInference::Judged(
-            report
-                .binding(&crate::resource::RelativeBindingName::new("result"))
-                .unwrap(),
-        ),
+        report
+            .binding(&crate::resource::RelativeBindingName::new("result"))
+            .unwrap(),
     )
     .require_provider_schemas()
     .unwrap_err();
@@ -1207,8 +1185,7 @@ fn computed_access_rejects_heterogeneous_collection_in_typecheck() {
         .into_value()
         .unwrap();
         {
-            let inference = typecheck::TypecheckInference::Judged(
-                report.binding(&crate::resource::RelativeBindingName::new("result")).unwrap());
+            let inference = report.binding(&crate::resource::RelativeBindingName::new("result")).unwrap();
             let result = typecheck::check_type_expr_value(
                 &expected,
                 &access,
@@ -1607,11 +1584,9 @@ fn integer_result_mismatches_share_names_in_value_and_resource_checkers() {
         &inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 0), "p"),
         &parsed.resources[0].attributes["value0"],
         snapshot.provider_context(),
-        typecheck::TypecheckInference::Judged(
-            report
-                .binding(&crate::resource::RelativeBindingName::new("result"))
-                .unwrap(),
-        ),
+        report
+            .binding(&crate::resource::RelativeBindingName::new("result"))
+            .unwrap(),
     )
     .require_provider_schemas()
     .unwrap_err();

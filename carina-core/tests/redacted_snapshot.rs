@@ -299,9 +299,7 @@ fn snapshot_preserves_real_loop_slots() {
 #[test]
 fn snapshot_state_typecheck_uses_checked_conversion() {
     use carina_core::parser::{ProviderContext, TypeExpr};
-    use carina_core::validation::typecheck::{
-        TypecheckInference, check_type_expr_value_providerless,
-    };
+    use carina_core::validation::typecheck::check_type_expr_value_providerless;
     let state = historical_siblings();
     let ordinary = resolve_historical_field("name").unwrap();
     let context = ProviderContext::new(carina_core::EnvironmentSnapshot::new([]));
@@ -318,23 +316,13 @@ fn snapshot_state_typecheck_uses_checked_conversion() {
         .report()
         .binding(&carina_core::resource::RelativeBindingName::new("ordinary"))
         .unwrap();
-    check_type_expr_value_providerless(
-        &TypeExpr::String,
-        &ordinary,
-        &context,
-        TypecheckInference::Judged(expression),
-    )
-    .require_provider_schemas()
-    .unwrap();
-    assert!(
-        check_type_expr_value_providerless(
-            &TypeExpr::Int,
-            &ordinary,
-            &context,
-            TypecheckInference::Judged(expression)
-        )
+    check_type_expr_value_providerless(&TypeExpr::String, &ordinary, &context, expression)
         .require_provider_schemas()
-        .is_err()
+        .unwrap();
+    assert!(
+        check_type_expr_value_providerless(&TypeExpr::Int, &ordinary, &context, expression)
+            .require_provider_schemas()
+            .is_err()
     );
     assert_eq!(
         state
