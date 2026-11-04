@@ -119,6 +119,69 @@ fn refined_map_value_core_error_matches_cli_in_directory() {
     );
 }
 
+fn round4_refined_union_factories() -> Vec<Box<dyn ProviderFactory>> {
+    let field = AttributeType::union(
+        [3, 4]
+            .into_iter()
+            .map(|max| {
+                AttributeType::refined_string(
+                    Some(carina_core::schema::TypeIdentity::bare("VpcId")),
+                    None,
+                    Some((None, Some(max))),
+                    None,
+                )
+            })
+            .collect(),
+    );
+    vec![Box::new(WasmStyleProviderFactory {
+        name: "mock".into(),
+        schemas: vec![
+            ResourceSchema::new("test.Collection")
+                .attribute(AttributeSchema::optional("params", field).build())
+                .validate()
+                .unwrap(),
+        ],
+    })]
+}
+
+#[test]
+fn round4_cli_union_requires_one_arm_to_pass_local_and_provider_validation() {
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider mock {}\n"),
+        ("main.crn", "mock.test.Collection { params = \"abcd\" }\n"),
+    ]);
+    let diagnostics = cli_diagnostics(round4_refined_union_factories(), &fixture);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert!(
+        diagnostics[0].contains("must start with 'vpc-'"),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn round4_lsp_union_requires_one_arm_to_pass_local_and_provider_validation() {
+    let loaded = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(round4_refined_union_factories()),
+        SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
+    );
+    let engine = DiagnosticEngine::new(Arc::new(loaded), vec!["mock".into()]);
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider mock {}\n"),
+        ("main.crn", "mock.test.Collection { params = \"abcd\" }\n"),
+    ]);
+    let diagnostics = lsp_diagnostics(&engine, &fixture, "main.crn");
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostics[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+    assert!(
+        diagnostics[0].message.contains("must start with 'vpc-'"),
+        "{diagnostics:#?}"
+    );
+}
+
 fn engine_with_schemas(schemas: SchemaRegistry) -> DiagnosticEngine {
     let provider_names: Vec<String> = schemas
         .iter()

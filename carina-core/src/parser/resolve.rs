@@ -712,6 +712,83 @@ pub fn resolve_resource_refs_from_analysis<E: ExportParamLike + Clone>(
     Ok(parsed)
 }
 
+/// Evaluate computed resource inputs without selecting authored value branches.
+/// References remain available to editor inference; calls resolve their inputs
+/// against the same directory bindings as ordinary resource resolution.
+pub struct ResourceValueEvaluator<'a> {
+    bindings: HashMap<String, HashMap<String, Value>>,
+    session: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+}
+
+impl<'a> ResourceValueEvaluator<'a> {
+    pub fn from_analysis<E: ExportParamLike>(
+        tree: &super::AnalysisTree<
+            '_,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            super::ParsedDeferredForPhase<ParserPlaceholder, RelativeBindingName>,
+            RelativeBindingName,
+            E,
+        >,
+        session: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Self {
+        Self {
+            bindings: tree
+                .file()
+                .iter_top_level_resources()
+                .filter_map(|resource| {
+                    resource
+                        .binding()
+                        .map(|binding| (binding.to_string(), resource.resolved_attributes()))
+                })
+                .collect(),
+            session,
+        }
+    }
+
+    pub fn evaluate(&self, value: &Value) -> Value {
+        match value {
+            Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                Value::Deferred(DeferredValue::Coalesce {
+                    value: Box::new(self.evaluate(value)),
+                    default: Box::new(self.evaluate(default)),
+                })
+            }
+            Value::Deferred(DeferredValue::ModuleIf(conditional)) => Value::Deferred(
+                DeferredValue::ModuleIf(Box::new(conditional.map(|branch| self.evaluate(branch)))),
+            ),
+            Value::Deferred(DeferredValue::Secret(inner)) => {
+                Value::Deferred(DeferredValue::Secret(Box::new(self.evaluate(inner))))
+            }
+            Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
+                items.iter().map(|item| self.evaluate(item)).collect(),
+            )),
+            Value::Concrete(ConcreteValue::Map(map)) => Value::Concrete(ConcreteValue::Map(
+                map.iter()
+                    .map(|(key, value)| (key.clone(), self.evaluate(value)))
+                    .collect(),
+            )),
+            _ => {
+                let resolved = if super::contains_function_call(value) {
+                    resolve_value_with_config(
+                        value,
+                        &self.bindings,
+                        self.session.catalog(),
+                        Some(self.session),
+                        false,
+                        false,
+                    )
+                    .unwrap_or_else(|_| value.clone())
+                } else {
+                    value.clone()
+                };
+                super::evaluate_static_value_for_validation(&resolved, self.session.catalog())
+                    .unwrap_or(resolved)
+            }
+        }
+    }
+}
+
 /// Parser/module-loader evaluation before the analysis boundary is sealed.
 pub(crate) fn resolve_resource_refs_in_session_unsealed<E: ExportParamLike>(
     parsed: &mut File<E>,

@@ -1,6 +1,130 @@
 use super::*;
 use carina_core::schema::{AttributeSchema, AttributeType, ListElements, ResourceSchema};
 
+#[test]
+fn round4_orphan_coalesce_enum_shadow_has_only_authority_error() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Collection")
+            .attribute(
+                AttributeSchema::optional(
+                    "params",
+                    AttributeType::enum_(
+                        carina_core::schema::TypeIdentity::new(Some("mock"), ["test"], "Event"),
+                        Some(vec!["viewer_request".into(), "ok".into()]),
+                        vec![],
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
+    let source = "provider mock {}\nlet viewer_request = 5\nmock.test.Collection { params = viewer_request ?? ok }\n";
+    let diagnostics = engine.analyze(&create_document(source), None);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert!(
+        diagnostics[0]
+            .message
+            .contains("was interpreted as the `let` binding"),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn round4_conditional_lists_evaluate_static_arithmetic_in_both_branches() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Collection")
+            .attribute(
+                AttributeSchema::optional("params", AttributeType::list(AttributeType::string()))
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("arguments.crn"),
+        "arguments { flag: Bool }\n",
+    )
+    .unwrap();
+    let source = "mock.test.Collection { params = if flag { [length(\"a\") + 2] } else { [length(\"abc\") + 4] } }\n";
+    let path = directory.path().join("main.crn");
+    std::fs::write(&path, source).unwrap();
+    let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    for diagnostic in diagnostics {
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+        assert!(
+            diagnostic.message.contains("expected String, got Int"),
+            "{diagnostic:#?}"
+        );
+    }
+}
+
+#[test]
+fn round4_preserved_collections_resolve_nested_calls() {
+    for (value, count) in [
+        ("[length(producer.params)]", 1),
+        ("[\"ok\" ?? length(producer.params)]", 1),
+        ("[length(producer.params) ?? length(producer.params)]", 2),
+    ] {
+        let diagnostics = round2_source_diagnostics(
+            AttributeType::list(AttributeType::string()),
+            &format!(
+                "let producer = mock.test.Collection {{ params = [\"known\"] }}\nmock.test.Collection {{ params = {value} }}\n"
+            ),
+        );
+        assert_eq!(diagnostics.len(), count, "{value}: {diagnostics:#?}");
+        for diagnostic in diagnostics {
+            assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+            assert!(
+                diagnostic.message.contains("expected String, got Int"),
+                "{diagnostic:#?}"
+            );
+            assert!(diagnostic.message.contains("params[0]"), "{diagnostic:#?}");
+        }
+    }
+}
+
+#[test]
+fn round4_expansion_keeps_complementary_coalesce_failures() {
+    let diagnostics = round2_source_diagnostics(
+        AttributeType::refined_string(None, None, Some((None, Some(3))), None),
+        "let copies = for x in [[\"abcd\", \"ok\"], [\"ok\", \"abcd\"]] {\n  mock.test.Collection { params = x[0] ?? x[1] }\n}\n",
+    );
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    for diagnostic in diagnostics {
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+        assert!(diagnostic.message.contains("length 4"), "{diagnostic:#?}");
+    }
+}
+
+#[test]
+fn round4_expansion_merges_computed_map_key_failures() {
+    let diagnostics = round2_source_diagnostics(
+        AttributeType::map_with_key(
+            AttributeType::refined_string(None, None, Some((None, Some(3))), None),
+            AttributeType::string(),
+        ),
+        "let copies = for x in [{ first = \"ok\" }, { second = \"ok\" }] {\n  mock.test.Collection { params = x }\n}\n",
+    );
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert!(
+        diagnostics[0].message.contains("outside allowed range"),
+        "{diagnostics:#?}"
+    );
+}
+
 fn round2_source_diagnostics(field_type: AttributeType, source: &str) -> Vec<Diagnostic> {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(

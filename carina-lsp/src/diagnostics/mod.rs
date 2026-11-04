@@ -1259,6 +1259,11 @@ impl DiagnosticRun<'_> {
                 )
             });
             let resource_tree = authored_tree.as_ref().unwrap_or(preferred_tree);
+            let resource_value_evaluator =
+                carina_core::parser::ResourceValueEvaluator::from_analysis(
+                    preferred_tree,
+                    self.provider_context,
+                );
             let mut resource_value_report = validation::ResourceValueReport::default();
             for (resource_index, rref) in resource_tree
                 .project_resources()
@@ -1408,13 +1413,7 @@ impl DiagnosticRun<'_> {
                         } else {
                             typecheck_value
                         };
-                        values.insert(
-                            attr_name.clone(),
-                            validation::evaluate_resource_value(
-                                value,
-                                self.provider_context.catalog(),
-                            ),
-                        );
+                        values.insert(attr_name.clone(), resource_value_evaluator.evaluate(value));
 
                         let canonical = bn_map
                             .get(attr_name)

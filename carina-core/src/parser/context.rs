@@ -751,6 +751,14 @@ impl<'a> ExpressionMode<'a> {
         mode
     }
 
+    pub(super) fn fold_value_branch(&self, ctx: &ParseContext, records: std::ops::Range<usize>) {
+        if let Some(sink) = &self.sink {
+            ctx.parsed_binding_uses
+                .borrow_mut()
+                .fold_value_branch(records, sink.branches.len() - 1);
+        }
+    }
+
     pub(super) fn has_resource_sink(&self) -> bool {
         self.sink
             .as_ref()

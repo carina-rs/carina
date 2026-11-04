@@ -6,6 +6,100 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
+fn round4_union_canonicalization_keeps_the_provider_accepted_arms_fit() {
+    let first = TypeIdentity::new(Some("mock"), ["test"], "First");
+    let second = TypeIdentity::new(Some("mock"), ["test"], "Second");
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "params",
+                    AttributeType::union(
+                        [first.clone(), second.clone()]
+                            .into_iter()
+                            .map(|identity| {
+                                AttributeType::enum_(
+                                    identity,
+                                    Some(vec!["ok".into()]),
+                                    vec![],
+                                    None,
+                                    None,
+                                )
+                            })
+                            .collect(),
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let context = crate::parser::ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            std::collections::HashSet::new(),
+            Box::new(move |target: CustomTypeValidationTarget<'_>, _: &Value| {
+                if target.identity() == &first {
+                    Err(CustomTypeValidationError::Rejected {
+                        owner: "mock".into(),
+                        identity: first.clone(),
+                        message: "first arm rejects".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            }),
+        ),
+        ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
+    };
+    let mut parsed = crate::parser::parse_file(
+        "mock.test.Sink { params = ok }\n",
+        std::path::Path::new("main.crn"),
+        &context,
+    )
+    .unwrap();
+    let checked = crate::validation::validate_resources_for_canonicalization(
+        &parsed,
+        &registry,
+        &std::collections::HashSet::from(["mock".into()]),
+        &context,
+    )
+    .unwrap();
+    checked.canonicalize(&mut parsed.resources).unwrap();
+    let Value::Concrete(ConcreteValue::CanonicalEnum(canonical)) =
+        &parsed.resources[0].attributes["params"]
+    else {
+        panic!("canonical enum")
+    };
+    assert_eq!(canonical.identity(), &second);
+}
+
+#[test]
+fn round4_folded_coalesce_enum_shadow_has_only_authority_error() {
+    let findings = review_binding_collection(
+        AttributeSchema::optional(
+            "value",
+            AttributeType::enum_(
+                TypeIdentity::new(Some("mock"), ["test", "Sink"], "Event"),
+                Some(vec!["viewer_request".into(), "ok".into()]),
+                vec![],
+                None,
+                None,
+            ),
+        )
+        .build(),
+        "let viewer_request = 5\nmock.test.Sink { value = viewer_request ?? ok }\n",
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
+    assert_eq!(findings.len(), 1, "{findings:#?}");
+    assert!(matches!(
+        findings[0].error,
+        TypeError::BindingShadowsEnumMember(_)
+    ));
+}
+
+#[test]
 fn round3_checked_canonicalization_consumes_the_validation_fit() {
     for change_input in [false, true] {
         let calls = Arc::new(AtomicUsize::new(0));

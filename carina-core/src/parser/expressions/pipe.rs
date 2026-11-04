@@ -155,17 +155,20 @@ pub(crate) fn parse_coalesce_expr_with_mode(
             if index + 1 < count {
                 operand = operand.at_branch(crate::parser::ValueBranch::CoalesceValue);
             }
-            parse_pipe_expr_with_mode(pair, ctx, &operand)
+            let start = ctx.parsed_binding_uses.borrow().records().len();
+            let value = parse_pipe_expr_with_mode(pair, ctx, &operand)?;
+            let end = ctx.parsed_binding_uses.borrow().records().len();
+            Ok::<_, ParseError>((value, operand, start..end))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut result = values
+    let (mut result, _, _) = values
         .pop()
         .expect("coalesce_expr grammar requires at least one pipe_expr");
 
     // `??` is right-associative: `a ?? b ?? c` is `a ?? (b ?? c)`.
     // Parse every operand before folding so syntax and diagnostics in later
     // defaults are retained even when an earlier concrete value wins.
-    while let Some(value) = values.pop() {
+    while let Some((value, operand, records)) = values.pop() {
         // Resource diagnostics own every authored operand, even if evaluation
         // will choose a known left value. Runtime reference resolution still
         // folds this expression normally after the authored snapshot is kept.
@@ -187,6 +190,11 @@ pub(crate) fn parse_coalesce_expr_with_mode(
                 ),
             }))
         } else {
+            // The selected concrete operand no longer has a coalesce node.
+            // Its binding uses must follow that same fold in the value walk.
+            if matches!(&value, EvalValue::User(Value::Concrete(_))) {
+                operand.fold_value_branch(ctx, records);
+            }
             combine_coalesce_operands(value, result, line)?
         };
     }

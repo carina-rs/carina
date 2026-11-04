@@ -926,7 +926,8 @@ impl BindingUseReport {
                     authored_attribute: finding.use_site.path.root_name().into(),
                     path: crate::schema::ValueFindingPath::new(binding_field_path(
                         &finding.use_site.path,
-                    )),
+                    ))
+                    .with_branches(&finding.use_site.branches),
                     anchor: crate::schema::ValueFindingAnchor::BindingToken(
                         crate::schema::BindingTokenAnchor::for_authority_error(
                             finding.use_site.location().clone(),

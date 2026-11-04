@@ -49,6 +49,8 @@ impl BindingTokenAnchor {
 pub struct ValueFindingPath {
     source: FieldPath,
     sensitive: bool,
+    branches: Vec<ValueBranch>,
+    map_keys: Vec<usize>,
 }
 
 impl ValueFindingPath {
@@ -56,7 +58,26 @@ impl ValueFindingPath {
         Self {
             source,
             sensitive: false,
+            branches: Vec::new(),
+            map_keys: Vec::new(),
         }
+    }
+    pub(crate) fn with_branches(mut self, branches: &[ValueBranch]) -> Self {
+        self.branches = branches.to_vec();
+        self
+    }
+
+    fn same_authored_path(&self, other: &Self) -> bool {
+        self.branches == other.branches
+            && self.map_keys == other.map_keys
+            && self.source.steps().len() == other.source.steps().len()
+            && self
+                .source
+                .steps()
+                .iter()
+                .zip(other.source.steps())
+                .enumerate()
+                .all(|(index, (left, right))| self.map_keys.contains(&index) || left == right)
     }
     pub fn is_empty(&self) -> bool {
         self.source.is_empty()
@@ -134,7 +155,23 @@ impl ResourceValueFinding {
     /// values describe an occurrence, while constraints identify its rule.
     /// Callers still retain every occurrence within an individual walk.
     pub fn same_authored_rule(&self, other: &Self) -> bool {
-        self.target == other.target && same_validation_rule(&self.error, &other.error)
+        let same_target = match (&self.target, &other.target) {
+            (
+                ResourceValueTarget::Attribute {
+                    authored_attribute,
+                    path,
+                    anchor,
+                },
+                ResourceValueTarget::Attribute {
+                    authored_attribute: rattr,
+                    path: rpath,
+                    anchor: ranchor,
+                },
+            ) => authored_attribute == rattr && anchor == ranchor && path.same_authored_path(rpath),
+            (ResourceValueTarget::Resource, ResourceValueTarget::Resource) => true,
+            _ => false,
+        };
+        same_target && same_validation_rule(&self.error, &other.error)
     }
 }
 
@@ -191,8 +228,8 @@ fn same_validation_rule(left: &TypeError, right: &TypeError) -> bool {
                 if attribute == rattr && same_custom_validation_rule(error, rerror)),
         ListItemError { index, inner } => matches!(right,
             ListItemError { index: rindex, inner: rinner } if index == rindex && same_validation_rule(inner, rinner)),
-        MapKeyError { key, inner } => matches!(right,
-            MapKeyError { key: rkey, inner: rinner } if key == rkey && same_validation_rule(inner, rinner)),
+        MapKeyError { inner, .. } => matches!(right,
+            MapKeyError { inner: rinner, .. } if same_validation_rule(inner, rinner)),
         MapValueError { inner, .. } => matches!(right,
             MapValueError { inner: rinner, .. } if same_validation_rule(inner, rinner)),
         StructFieldError { field, inner } => matches!(right,
@@ -414,7 +451,8 @@ impl PatternResourceSchema<Compiled> {
                 report.findings.push(ResourceValueFinding {
                     target: ResourceValueTarget::Attribute {
                         authored_attribute: binding.attribute.clone(),
-                        path: ValueFindingPath::new(binding.path.clone()),
+                        path: ValueFindingPath::new(binding.path.clone())
+                            .with_branches(&binding.branches),
                         anchor: ValueFindingAnchor::BindingToken(binding.anchor_for(&binding.path)),
                     },
                     error: error.clone(),
@@ -1049,7 +1087,12 @@ fn check_input<'a, P: PlaceholderKind, B: BindingAddress>(
     if matches!(&value, CheckInput::MapKey(_)) {
         walk.input_kind = CallbackInputKind::MapKey;
     }
-    let checked = check_input_inner(attr, value, defs, ancestry, path, walk, visited_refs);
+    let mut checked = check_input_inner(attr, value, defs, ancestry, path, walk, visited_refs);
+    for finding in checked.local.iter_mut().chain(&mut checked.external) {
+        if finding.path.branches.is_empty() {
+            finding.path.branches = walk.branches.clone();
+        }
+    }
     walk.input_kind = previous_kind;
     checked
 }
@@ -1461,7 +1504,7 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
             let mut first_value_error = None;
             for (map_key, map_value) in map {
                 let next_path = path.push_field(map_key.clone());
-                let key_checked = check_input::<P, B>(
+                let mut key_checked = check_input::<P, B>(
                     key,
                     CheckInput::MapKey(map_key),
                     defs,
@@ -1476,10 +1519,15 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                         inner: Box::new(error),
                     };
                     checked.primary.get_or_insert_with(|| error.clone());
-                    checked.local.push(PathFinding::new(&next_path, error));
+                    let mut finding = PathFinding::new(&next_path, error);
+                    finding.path.map_keys.push(path.steps().len());
+                    checked.local.push(finding);
+                }
+                for finding in &mut key_checked.external {
+                    finding.path.map_keys.insert(0, path.steps().len());
                 }
                 checked.external.extend(key_checked.external);
-                let child = check_value(
+                let mut child = check_value(
                     value_type,
                     map_value,
                     defs,
@@ -1488,6 +1536,9 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                     walk,
                     &mut Vec::new(),
                 );
+                for finding in child.local.iter_mut().chain(&mut child.external) {
+                    finding.path.map_keys.insert(0, path.steps().len());
+                }
                 if let Some(error) = &child.primary {
                     checked
                         .primary
@@ -1535,20 +1586,18 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                 defs,
                 visited_refs.clone(),
             );
-            let mut best_fit: Option<Fit<'a>> = None;
+            let mut best_fit: Option<CheckedValue<'a>> = None;
             let mut best_failure: Option<BestUnionMemberFailures> = None;
-            let mut best_external: Option<Vec<PathFinding>> = None;
             for member in members.as_raw_slice() {
-                let checked = check_value(member, value, defs, ancestry, path, walk, visited_refs);
-                if best_external
-                    .as_ref()
-                    .is_none_or(|best| checked.external.len() < best.len())
-                {
-                    best_external = Some(checked.external);
-                }
-                if let Some(fit) = checked.fit {
-                    if best_fit.as_ref().is_none_or(|best| fit > *best) {
-                        best_fit = Some(Fit::with_kind(
+                let mut checked =
+                    check_value(member, value, defs, ancestry, path, walk, visited_refs);
+                if let Some(fit) = checked.fit.take() {
+                    if best_fit.as_ref().is_none_or(|best| {
+                        checked.external.len() < best.external.len()
+                            || (checked.external.len() == best.external.len()
+                                && Some(&fit) > best.fit.as_ref())
+                    }) {
+                        checked.fit = Some(Fit::with_kind(
                             fit.exactness,
                             attr,
                             FitKind::Union {
@@ -1556,12 +1605,15 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                                 fit: Box::new(fit),
                             },
                         ));
+                        best_fit = Some(checked);
                     }
-                    if best_fit
-                        .as_ref()
-                        .is_some_and(|fit| fit.exactness.is_maximal())
-                        && best_external.as_ref().is_some_and(Vec::is_empty)
-                    {
+                    if best_fit.as_ref().is_some_and(|best| {
+                        best.external.is_empty()
+                            && best
+                                .fit
+                                .as_ref()
+                                .is_some_and(|fit| fit.exactness.is_maximal())
+                    }) {
                         break;
                     }
                 } else if let Some(error) = checked.primary {
@@ -1596,13 +1648,8 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                     }
                 }
             }
-            let mut checked = if let Some(fit) = best_fit {
-                CheckedValue {
-                    fit: Some(fit),
-                    primary: None,
-                    local: Vec::new(),
-                    external: Vec::new(),
-                }
+            if let Some(checked) = best_fit {
+                checked
             } else {
                 let error = best_failure
                     .map(|failure| failure.into_error(concrete, resolved_members, ancestry))
@@ -1610,9 +1657,7 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                         TypeError::value_type_mismatch(attr.type_name(), value.type_name())
                     });
                 CheckedValue::rejected(path, error)
-            };
-            checked.external = best_external.unwrap_or_default();
-            checked
+            }
         }
         (AttrTypeKind::Enum { identity, .. }, _) => {
             let resolver = EnumValueResolver::with_defs(attr, defs);

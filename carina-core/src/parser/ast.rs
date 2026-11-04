@@ -4013,6 +4013,12 @@ impl<B: BindingAddress> ParsedBindingUses<B> {
         &self.records
     }
 
+    pub(crate) fn fold_value_branch(&mut self, records: std::ops::Range<usize>, depth: usize) {
+        for record in &mut self.records[records] {
+            record.authored.branches.remove(depth);
+        }
+    }
+
     pub(crate) fn try_visit_values<E>(
         &self,
         visit: &mut impl FnMut(&Value<ParserPlaceholder, B>) -> Result<(), E>,

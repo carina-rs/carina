@@ -37,7 +37,7 @@ mod resolve;
 mod scalar_constraints;
 pub(crate) use resolve::resolve_resource_refs_in_session_unsealed;
 pub use resolve::{
-    AnalysisResolutionError, finalize_provider_configs_for_analysis,
+    AnalysisResolutionError, ResourceValueEvaluator, finalize_provider_configs_for_analysis,
     resolve_expanded_provider_unresolved_attributes_for_analysis,
     resolve_provider_unresolved_attributes_for_analysis, resolve_resource_refs_from_analysis,
 };

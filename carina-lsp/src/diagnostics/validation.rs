@@ -6,8 +6,8 @@ pub(super) use editor::attribute_findings;
 
 use super::{DiagnosticEngine, Value, render_merged};
 use crate::document::Document;
-use carina_core::parser::{AnalysisResourceRef, DeclarationLocation, Located, ProviderContext};
-use carina_core::resource::{ConcreteValue, DeferredValue};
+use carina_core::parser::{AnalysisResourceRef, DeclarationLocation, Located};
+use carina_core::resource::ConcreteValue;
 use carina_core::schema::{
     ResourceValueFinding, ResourceValueTarget, TypeError, ValidatedResourceSchema,
     ValueFindingAnchor,
@@ -170,35 +170,6 @@ impl ResourceValueReport {
                     .filter_map(move |finding| render_value_finding(doc, location.clone(), finding))
             })
             .collect()
-    }
-}
-
-/// Evaluate known expressions without selecting an authored coalesce branch.
-/// Each operand must still satisfy the sink, including an unused default.
-pub(super) fn evaluate_resource_value(value: &Value, context: &ProviderContext) -> Value {
-    match value {
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            Value::Deferred(DeferredValue::Coalesce {
-                value: Box::new(evaluate_resource_value(value, context)),
-                default: Box::new(evaluate_resource_value(default, context)),
-            })
-        }
-        Value::Deferred(DeferredValue::Secret(value)) => Value::Deferred(DeferredValue::Secret(
-            Box::new(evaluate_resource_value(value, context)),
-        )),
-        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
-            items
-                .iter()
-                .map(|item| evaluate_resource_value(item, context))
-                .collect(),
-        )),
-        Value::Concrete(ConcreteValue::Map(map)) => Value::Concrete(ConcreteValue::Map(
-            map.iter()
-                .map(|(key, value)| (key.clone(), evaluate_resource_value(value, context)))
-                .collect(),
-        )),
-        _ => carina_core::parser::evaluate_static_value_for_validation(value, context)
-            .unwrap_or_else(|| value.clone()),
     }
 }
 
