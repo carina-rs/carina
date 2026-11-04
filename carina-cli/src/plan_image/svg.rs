@@ -1032,7 +1032,10 @@ fn render_legend(out: &mut String, model: &GraphModel, layout: &Layout, render_s
         return;
     }
 
-    let divider_y = layout.height as f32 - 82.0;
+    // Canvas dimensions are used only as approximate SVG coordinates.
+    #[allow(clippy::cast_precision_loss)]
+    let (width, height) = (layout.width as f32, layout.height as f32);
+    let divider_y = height - 82.0;
     writeln!(
         out,
         r#"    <line{} x1="28" y1="{divider_y:.1}" x2="{}" y2="{divider_y:.1}" stroke="{}"/>"#,
@@ -1046,7 +1049,7 @@ fn render_legend(out: &mut String, model: &GraphModel, layout: &Layout, render_s
     for kind in visible_kinds {
         let style = kind_style(kind, palette);
         let item_width = text_width(style.symbol, 11.0) + text_width(style.label, 10.0) + 28.0;
-        if x + item_width > layout.width as f32 - 28.0 {
+        if x + item_width > width - 28.0 {
             x = 28.0;
             y += 20.0;
         }
@@ -1069,7 +1072,7 @@ fn render_legend(out: &mut String, model: &GraphModel, layout: &Layout, render_s
         .unwrap();
         x += item_width;
     }
-    let semantics_y = layout.height as f32 - 10.0;
+    let semantics_y = height - 10.0;
     let mut semantics_x = 28.0;
     if has_ordering_edges {
         writeln!(
@@ -1122,6 +1125,8 @@ fn render_legend(out: &mut String, model: &GraphModel, layout: &Layout, render_s
     }
 }
 
+// Character counts are used only to estimate SVG text widths.
+#[allow(clippy::cast_precision_loss)]
 fn text_width(text: &str, font_size: f32) -> f32 {
     text.chars().count() as f32 * font_size * MONOSPACE_ADVANCE_EM
 }

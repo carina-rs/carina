@@ -40,6 +40,7 @@ pub mod module;
 pub mod module_resolver;
 pub mod name_override;
 pub(crate) mod non_empty;
+pub(crate) mod numeric;
 pub mod parser;
 pub mod paths;
 pub mod plan;

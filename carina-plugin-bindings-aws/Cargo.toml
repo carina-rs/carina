@@ -5,6 +5,9 @@ publish.workspace = true
 edition = "2024"
 license = "MIT"
 
+[lints]
+workspace = true
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 carina-plugin-bindings-aws-credentials = { path = "../carina-plugin-bindings-aws-credentials" }
 wasi = "0.14"

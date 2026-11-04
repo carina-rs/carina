@@ -5,6 +5,9 @@ edition = "2024"
 publish.workspace = true
 license = "MIT"
 
+[lints]
+workspace = true
+
 [dependencies]
 psl = "2.1.245"
 serde = { version = "1", features = ["derive"] }

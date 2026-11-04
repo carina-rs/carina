@@ -200,6 +200,7 @@ pub use compiled_pattern::{
 
 use crate::provider_text::{ProviderString, ProviderText};
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, OnceLock};
@@ -207,6 +208,7 @@ use std::sync::{Arc, OnceLock};
 use indexmap::{IndexMap, IndexSet};
 
 use crate::config_loader::UnresolvedConfigSnapshot;
+use crate::numeric::compare_int_float;
 use crate::parser::{SchemaTypeOwner, display_string_literal};
 use crate::resource::{
     AbsoluteBindingAddress, BindingAddress, CanonicalEnumValue, ConcreteValue, ConcreteValueRef,
@@ -4190,7 +4192,7 @@ impl PatternAttributeType<Compiled> {
                 })
             }
             (AttrTypeKind::Float { binding, range }, ConcreteValueRef::Int(i)) => {
-                validate_float_range(*range, i as f64)?;
+                validate_int_in_float_range(*range, i)?;
                 binding
                     .callback()
                     .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
@@ -5201,11 +5203,28 @@ fn validate_float_range(
     if let Some((min, max)) = range
         && (min.is_some_and(|min| value < min) || max.is_some_and(|max| value > max))
     {
-        return Err(TypeError::ValidationFailed {
-            message: format!("value {value} is outside allowed range {min:?}..={max:?}").into(),
-        });
+        return Err(float_range_error(value, min, max));
     }
     Ok(())
+}
+
+fn validate_int_in_float_range(
+    range: Option<(Option<f64>, Option<f64>)>,
+    value: i64,
+) -> Result<(), TypeError> {
+    if let Some((min, max)) = range
+        && (min.is_some_and(|min| compare_int_float(value, min) == Some(Ordering::Less))
+            || max.is_some_and(|max| compare_int_float(value, max) == Some(Ordering::Greater)))
+    {
+        return Err(float_range_error(value, min, max));
+    }
+    Ok(())
+}
+
+fn float_range_error(value: impl fmt::Display, min: Option<f64>, max: Option<f64>) -> TypeError {
+    TypeError::ValidationFailed {
+        message: format!("value {value} is outside allowed range {min:?}..={max:?}").into(),
+    }
 }
 
 /// Ordered exactness accumulated across an entire value tree.
@@ -6579,11 +6598,19 @@ fn i64_range_assignable_to_f64(
     let Some((sink_min, sink_max)) = sink else {
         return true;
     };
-    let source_min = source_min.map_or(f64::NEG_INFINITY, |value| value as f64);
-    let source_max = source_max.map_or(f64::INFINITY, |value| value as f64);
+    let source_min = source_min.unwrap_or(i64::MIN);
+    let source_max = source_max.unwrap_or(i64::MAX);
     let sink_min = sink_min.unwrap_or(f64::NEG_INFINITY);
     let sink_max = sink_max.unwrap_or(f64::INFINITY);
-    sink_min <= source_min && source_max <= sink_max
+    let min_contained = matches!(
+        compare_int_float(source_min, sink_min),
+        Some(Ordering::Greater | Ordering::Equal)
+    );
+    let max_contained = matches!(
+        compare_int_float(source_max, sink_max),
+        Some(Ordering::Less | Ordering::Equal)
+    );
+    min_contained && max_contained
 }
 
 impl<R: PatternForm> fmt::Display for PatternAttributeType<R> {

@@ -1,11 +1,13 @@
 //! Type-aware comparison logic for diffing resource attributes.
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 
 use indexmap::IndexMap;
 
 use crate::explicit::{ExplicitFields, ExplicitProjection};
+use crate::numeric::compare_int_float;
 use crate::provider::{InitializedProvider, NestedWriteOnlyRecord, ReferenceScope};
 use crate::references::{ReferenceOperand, ReferenceSide};
 use crate::resource::{
@@ -919,12 +921,12 @@ fn type_aware_equal_on_path<'a, R: ReferenceEquality>(
                 Value::Concrete(ConcreteValue::Int(i)),
                 Value::Concrete(ConcreteValue::Float(f)),
                 crate::schema::Shape::Float { .. } | crate::schema::Shape::Int { .. },
-            ) => (*i as f64) == *f && (*i as f64) as i64 == *i,
-            (
+            )
+            | (
                 Value::Concrete(ConcreteValue::Float(f)),
                 Value::Concrete(ConcreteValue::Int(i)),
                 crate::schema::Shape::Float { .. } | crate::schema::Shape::Int { .. },
-            ) => *f == (*i as f64) && (*i as f64) as i64 == *i,
+            ) => compare_int_float(*i, *f) == Some(Ordering::Equal),
 
             // Preserve provider/API-to-DSL transform equality first, then
             // consult the identity's reference form under this initialized
@@ -1033,7 +1035,7 @@ fn type_aware_equal_on_path<'a, R: ReferenceEquality>(
                         )
                     }) =>
                     {
-                        (*i as f64) == *f && (*i as f64) as i64 == *i
+                        compare_int_float(*i, *f) == Some(Ordering::Equal)
                     }
                     _ => types.any_on_path(&mut current_path, |member, member_path| {
                         type_aware_equal_on_path(

@@ -5,6 +5,9 @@ edition = "2024"
 publish.workspace = true
 license = "MIT"
 
+[lints]
+workspace = true
+
 [features]
 test-utils = [
     "dep:aws-smithy-runtime-api",

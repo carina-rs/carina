@@ -1,5 +1,8 @@
 //! `min(a, b)` and `max(a, b)` built-in functions
 
+use std::cmp::Ordering;
+
+use crate::numeric::{NumericPair, int_to_exact_f64};
 use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value};
 
 use super::value_type_name;
@@ -8,7 +11,8 @@ use super::value_type_name;
 ///
 /// - Two arguments: both must be Int or Float
 /// - If both are Int, returns Int
-/// - If either is Float, converts to Float for comparison and returns Float
+/// - Compares all numeric values exactly, without rounding Int operands
+/// - If either is Float, returns Float; errors if the selected Int cannot be represented exactly
 ///
 /// Examples:
 /// ```text
@@ -22,14 +26,15 @@ pub(crate) fn builtin_min<B: BindingAddress>(
     if args.len() != 2 {
         return Err(format!("min() expects 2 arguments, got {}", args.len()));
     }
-    compare_values(&args[0], &args[1], "min", |a, b| a < b)
+    compare_values(&args[0], &args[1], "min", Ordering::Less)
 }
 
 /// `max(a, b)` - Return the larger of two numeric values.
 ///
 /// - Two arguments: both must be Int or Float
 /// - If both are Int, returns Int
-/// - If either is Float, converts to Float for comparison and returns Float
+/// - Compares all numeric values exactly, without rounding Int operands
+/// - If either is Float, returns Float; errors if the selected Int cannot be represented exactly
 ///
 /// Examples:
 /// ```text
@@ -43,62 +48,316 @@ pub(crate) fn builtin_max<B: BindingAddress>(
     if args.len() != 2 {
         return Err(format!("max() expects 2 arguments, got {}", args.len()));
     }
-    compare_values(&args[0], &args[1], "max", |a, b| a > b)
+    compare_values(&args[0], &args[1], "max", Ordering::Greater)
 }
 
-/// Compare two numeric values using the given predicate.
-/// Returns the first value if `prefer_first(a, b)` is true, otherwise the second.
+/// Select the first value if the exact comparison yields `prefer_first`.
+/// On equal comparisons, treat Float(-0.0) as smaller than +0 (including Int(0)),
+/// selecting the second for remaining ties. Reject NaN operands.
 fn compare_values<B: BindingAddress>(
     a: &Value<NoPlaceholder, B>,
     b: &Value<NoPlaceholder, B>,
     func_name: &str,
-    prefer_first: fn(f64, f64) -> bool,
+    prefer_first: Ordering,
 ) -> Result<Value<NoPlaceholder, B>, String> {
-    match (a, b) {
-        (Value::Concrete(ConcreteValue::Int(x)), Value::Concrete(ConcreteValue::Int(y))) => {
-            let (fx, fy) = (*x as f64, *y as f64);
-            if prefer_first(fx, fy) {
-                Ok(Value::Concrete(ConcreteValue::Int(*x)))
-            } else {
-                Ok(Value::Concrete(ConcreteValue::Int(*y)))
-            }
-        }
-        (Value::Concrete(ConcreteValue::Float(x)), Value::Concrete(ConcreteValue::Float(y))) => {
-            if prefer_first(*x, *y) {
-                Ok(Value::Concrete(ConcreteValue::Float(*x)))
-            } else {
-                Ok(Value::Concrete(ConcreteValue::Float(*y)))
-            }
-        }
-        (Value::Concrete(ConcreteValue::Int(x)), Value::Concrete(ConcreteValue::Float(y))) => {
-            let fx = *x as f64;
-            if prefer_first(fx, *y) {
-                Ok(Value::Concrete(ConcreteValue::Float(fx)))
-            } else {
-                Ok(Value::Concrete(ConcreteValue::Float(*y)))
-            }
-        }
-        (Value::Concrete(ConcreteValue::Float(x)), Value::Concrete(ConcreteValue::Int(y))) => {
-            let fy = *y as f64;
-            if prefer_first(*x, fy) {
-                Ok(Value::Concrete(ConcreteValue::Float(*x)))
-            } else {
-                Ok(Value::Concrete(ConcreteValue::Float(fy)))
-            }
-        }
-        _ => Err(format!(
+    let pair = match (a, b) {
+        (Value::Concrete(a), Value::Concrete(b)) => NumericPair::new(a, b),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        format!(
             "{}() arguments must be Int or Float, got {} and {}",
             func_name,
             value_type_name(a),
             value_type_name(b)
-        )),
-    }
+        )
+    })?;
+    // NaN can reach here only from provider values today; once carina#4257 makes
+    // ConcreteValue::Float finite-only, this branch goes away.
+    let ordering = pair
+        .partial_cmp()
+        .ok_or_else(|| format!("{func_name}() argument is NaN"))?;
+    let choose_first = if ordering == Ordering::Equal {
+        let is_negative_zero = |value: &Value<NoPlaceholder, B>| matches!(value, Value::Concrete(ConcreteValue::Float(f)) if *f == 0.0 && f.is_sign_negative());
+        match (is_negative_zero(a), is_negative_zero(b)) {
+            (true, false) => prefer_first == Ordering::Less,
+            (false, true) => prefer_first == Ordering::Greater,
+            _ => false,
+        }
+    } else {
+        ordering == prefer_first
+    };
+    let exact_float = |integer| {
+        int_to_exact_f64(integer).ok_or_else(|| {
+            format!("{func_name}() integer {integer} cannot be represented exactly as Float")
+        })
+    };
+    let result = match pair {
+        NumericPair::Ints(x, y) => ConcreteValue::Int(if choose_first { x } else { y }),
+        NumericPair::Floats(x, y) => ConcreteValue::Float(if choose_first { x } else { y }),
+        NumericPair::IntFloat(i, f) => {
+            ConcreteValue::Float(if choose_first { exact_float(i)? } else { f })
+        }
+        NumericPair::FloatInt(f, i) => {
+            ConcreteValue::Float(if choose_first { f } else { exact_float(i)? })
+        }
+    };
+    Ok(Value::Concrete(result))
 }
 
 #[cfg(test)]
 mod tests {
     use crate::builtins::evaluate_builtin_to_value_for_tests as evaluate_builtin;
     use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
+
+    fn assert_signed_zero_result(name: &str, a: ConcreteValue, b: ConcreteValue, expected: f64) {
+        let result = evaluate_builtin(name, &[Value::Concrete(a), Value::Concrete(b)]).unwrap();
+        let Value::Concrete(ConcreteValue::Float(actual)) = result else {
+            panic!("expected Float, got {result:?}");
+        };
+        assert_eq!(actual.to_bits(), expected.to_bits());
+    }
+
+    #[test]
+    fn min_positive_zero_then_negative_zero() {
+        assert_signed_zero_result(
+            "min",
+            ConcreteValue::Float(0.0),
+            ConcreteValue::Float(-0.0),
+            -0.0,
+        );
+    }
+
+    #[test]
+    fn min_negative_zero_then_positive_zero() {
+        assert_signed_zero_result(
+            "min",
+            ConcreteValue::Float(-0.0),
+            ConcreteValue::Float(0.0),
+            -0.0,
+        );
+    }
+
+    #[test]
+    fn max_positive_zero_then_negative_zero() {
+        assert_signed_zero_result(
+            "max",
+            ConcreteValue::Float(0.0),
+            ConcreteValue::Float(-0.0),
+            0.0,
+        );
+    }
+
+    #[test]
+    fn max_negative_zero_then_positive_zero() {
+        assert_signed_zero_result(
+            "max",
+            ConcreteValue::Float(-0.0),
+            ConcreteValue::Float(0.0),
+            0.0,
+        );
+    }
+
+    #[test]
+    fn min_int_zero_then_negative_zero() {
+        assert_signed_zero_result(
+            "min",
+            ConcreteValue::Int(0),
+            ConcreteValue::Float(-0.0),
+            -0.0,
+        );
+    }
+
+    #[test]
+    fn min_negative_zero_then_int_zero() {
+        assert_signed_zero_result(
+            "min",
+            ConcreteValue::Float(-0.0),
+            ConcreteValue::Int(0),
+            -0.0,
+        );
+    }
+
+    #[test]
+    fn max_int_zero_then_negative_zero() {
+        assert_signed_zero_result(
+            "max",
+            ConcreteValue::Int(0),
+            ConcreteValue::Float(-0.0),
+            0.0,
+        );
+    }
+
+    #[test]
+    fn max_negative_zero_then_int_zero() {
+        assert_signed_zero_result(
+            "max",
+            ConcreteValue::Float(-0.0),
+            ConcreteValue::Int(0),
+            0.0,
+        );
+    }
+
+    #[test]
+    fn min_nan_then_float() {
+        let error = evaluate_builtin(
+            "min",
+            &[
+                Value::Concrete(ConcreteValue::Float(f64::NAN)),
+                Value::Concrete(ConcreteValue::Float(1.0)),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(error, "min() argument is NaN");
+    }
+
+    #[test]
+    fn min_float_then_nan() {
+        let error = evaluate_builtin(
+            "min",
+            &[
+                Value::Concrete(ConcreteValue::Float(1.0)),
+                Value::Concrete(ConcreteValue::Float(f64::NAN)),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(error, "min() argument is NaN");
+    }
+
+    #[test]
+    fn max_nan_then_int() {
+        let error = evaluate_builtin(
+            "max",
+            &[
+                Value::Concrete(ConcreteValue::Float(f64::NAN)),
+                Value::Concrete(ConcreteValue::Int(9_007_199_254_740_993)),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(error, "max() argument is NaN");
+    }
+
+    #[test]
+    fn max_int_then_nan() {
+        let error = evaluate_builtin(
+            "max",
+            &[
+                Value::Concrete(ConcreteValue::Int(9_007_199_254_740_993)),
+                Value::Concrete(ConcreteValue::Float(f64::NAN)),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(error, "max() argument is NaN");
+    }
+
+    #[test]
+    fn min_two_nans() {
+        let error = evaluate_builtin(
+            "min",
+            &[
+                Value::Concrete(ConcreteValue::Float(f64::NAN)),
+                Value::Concrete(ConcreteValue::Float(f64::NAN)),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(error, "min() argument is NaN");
+    }
+
+    #[test]
+    fn min_exact_numeric_ints() {
+        for (smaller, larger) in [
+            (9_007_199_254_740_992, 9_007_199_254_740_993),
+            (i64::MAX - 1, i64::MAX),
+        ] {
+            for (a, b) in [(smaller, larger), (larger, smaller)] {
+                assert_eq!(
+                    evaluate_builtin(
+                        "min",
+                        &[
+                            Value::Concrete(ConcreteValue::Int(a)),
+                            Value::Concrete(ConcreteValue::Int(b)),
+                        ],
+                    )
+                    .unwrap(),
+                    Value::Concrete(ConcreteValue::Int(smaller)),
+                    "min({a}, {b})",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn max_exact_numeric_ints() {
+        for (smaller, larger) in [
+            (9_007_199_254_740_992, 9_007_199_254_740_993),
+            (i64::MAX - 1, i64::MAX),
+        ] {
+            for (a, b) in [(larger, smaller), (smaller, larger)] {
+                assert_eq!(
+                    evaluate_builtin(
+                        "max",
+                        &[
+                            Value::Concrete(ConcreteValue::Int(a)),
+                            Value::Concrete(ConcreteValue::Int(b)),
+                        ],
+                    )
+                    .unwrap(),
+                    Value::Concrete(ConcreteValue::Int(larger)),
+                    "max({a}, {b})",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn min_exact_numeric_mixed() {
+        let args = [
+            Value::Concrete(ConcreteValue::Int(9_007_199_254_740_993)),
+            Value::Concrete(ConcreteValue::Float(9_007_199_254_740_992.0)),
+        ];
+        for args in [args.clone(), [args[1].clone(), args[0].clone()]] {
+            assert_eq!(
+                evaluate_builtin("min", &args).unwrap(),
+                Value::Concrete(ConcreteValue::Float(9_007_199_254_740_992.0)),
+            );
+        }
+    }
+
+    #[test]
+    fn min_max_exact_numeric_unrepresentable_winner() {
+        for (name, integer, float) in [
+            ("max", 9_007_199_254_740_993, 9_007_199_254_740_992.0),
+            ("min", -9_007_199_254_740_993, -9_007_199_254_740_992.0),
+            ("min", i64::MAX, 9_223_372_036_854_775_808.0),
+        ] {
+            let args = [
+                Value::Concrete(ConcreteValue::Int(integer)),
+                Value::Concrete(ConcreteValue::Float(float)),
+            ];
+            for args in [args.clone(), [args[1].clone(), args[0].clone()]] {
+                let error = evaluate_builtin(name, &args).unwrap_err();
+                assert!(error.contains(&integer.to_string()), "{error}");
+                assert!(
+                    error.contains("cannot be represented exactly as Float"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn max_exact_numeric_representable_winner() {
+        let args = [
+            Value::Concrete(ConcreteValue::Int(9_007_199_254_740_992)),
+            Value::Concrete(ConcreteValue::Float(1.5)),
+        ];
+        for args in [args.clone(), [args[1].clone(), args[0].clone()]] {
+            assert_eq!(
+                evaluate_builtin("max", &args).unwrap(),
+                Value::Concrete(ConcreteValue::Float(9_007_199_254_740_992.0)),
+            );
+        }
+    }
 
     // ── min() tests ──
 
