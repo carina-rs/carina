@@ -46,6 +46,23 @@ let tag  = "vpc-${upper(env)}"
 let name = "vpc-${join('-', ['prod', 'web'])}"   # => 'vpc-prod-web'
 ```
 
+An interpolated string builds a string in place, the same way a literal
+does. It can therefore go into an attribute of a named string type, such as
+an IAM role name, even when part of it is only known after apply. Carina
+checks the resolved string against that type's constraints at plan and
+apply time. The rule is the same whether the interpolation is written
+directly in the attribute or bound to a `let` first. A value that is only
+known to be a plain `String`, such as a `String` module argument, is not
+accepted by a named string type.
+
+```crn
+let suffix = source.value                     # String, known after apply
+awscc.iam.RolePolicy {
+  role_name   = 'app'
+  policy_name = "${suffix}-inline"            # accepted; checked once resolved
+}
+```
+
 #### Recommended Style
 
 - **Use single quotes** for literal strings that do not need interpolation
