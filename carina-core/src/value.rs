@@ -6036,9 +6036,11 @@ fn type_contains_enum(
             AttrTypeKind::UnloadedSchemaType(_) => false,
             AttrTypeKind::Enum { .. } => true,
             AttrTypeKind::List { element_type, .. } => walk(element_type, defs, visited),
-            AttrTypeKind::Map { key, value } => {
-                walk(key, defs, visited) || walk(value, defs, visited)
-            }
+            AttrTypeKind::Map {
+                key,
+                value,
+                constraints: _,
+            } => walk(key, defs, visited) || walk(value, defs, visited),
             AttrTypeKind::Struct { fields, .. } => fields
                 .iter()
                 .any(|field| walk(&field.field_type, defs, visited)),
@@ -6232,6 +6234,7 @@ fn canonicalize_without_fit<
             crate::schema::Shape::Map {
                 key: key_type,
                 value: value_type,
+                constraints: _,
             },
         ) => {
             let canonicalized = map

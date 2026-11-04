@@ -17384,3 +17384,57 @@ fn reference_constraints_validate_offline_in_a_directory_configuration() {
         );
     }
 }
+
+#[test]
+fn map_length_diagnostics_in_directory_configuration() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    let params = AttributeType::refined_map(
+        AttributeType::string(),
+        AttributeType::string(),
+        Some((Some(0), Some(10))),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Request")
+            .attribute(AttributeSchema::required("params", params).build())
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    for count in [10, 11] {
+        let entries = (0..count)
+            .map(|i| format!("    key_{i} = 'value'\n"))
+            .collect::<String>();
+        let source = format!("mock.Request {{\n  params = {{\n{entries}  }}\n}}\n");
+        std::fs::write(directory.path().join("main.crn"), &source).unwrap();
+        let diagnostics = analyze_with_buffer(&engine, directory.path(), "main.crn", &source);
+        if count == 10 {
+            assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        } else {
+            let errors = diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+            assert!(errors[0].message.contains("params"), "{diagnostics:#?}");
+            assert!(
+                errors[0]
+                    .message
+                    .contains("length 11 is outside allowed range [0, 10]"),
+                "{diagnostics:#?}"
+            );
+            // The duplicate Warning for the same error is carina-rs/carina#4265.
+            assert!(
+                diagnostics.iter().all(|diagnostic| diagnostic
+                    .message
+                    .contains("length 11 is outside allowed range [0, 10]")),
+                "{diagnostics:#?}"
+            );
+        }
+    }
+}

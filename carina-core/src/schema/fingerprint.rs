@@ -18,7 +18,7 @@ use super::{
 };
 use crate::resource::Value;
 
-const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v9";
+const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v10";
 
 #[derive(Default)]
 struct CanonicalEncoder {
@@ -399,10 +399,15 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
             });
             encode_callback_presence(encoder, false);
         }
-        AttrTypeKind::Map { key, value } => {
+        AttrTypeKind::Map {
+            key,
+            value,
+            constraints,
+        } => {
             encoder.tag(9);
             encode_attribute_type(encoder, key);
             encode_attribute_type(encoder, value);
+            encode_optional_u64_range(encoder, constraints.length());
         }
         AttrTypeKind::Struct {
             name,
@@ -705,6 +710,35 @@ mod tests {
             schema(super::super::ListElements::AllowDuplicates).semantic_fingerprint(),
             schema(super::super::ListElements::Unique).semantic_fingerprint()
         );
+    }
+
+    #[test]
+    fn map_length_changes_the_fingerprint() {
+        let schema = |length| {
+            let wire = serde_json::from_value(serde_json::json!({
+                "type": "map", "inner": {"type": "String"},
+                "key": {"type": "String"}, "length": length,
+            }))
+            .unwrap();
+            let map = crate::protocol_convert::protocol_to_attribute_type(&wire).unwrap();
+            PatternResourceSchema::new("test.Subject")
+                .attribute(PatternAttributeSchema::optional("params", map).build())
+                .validate()
+                .unwrap()
+        };
+        let unbounded = schema(None).as_schema().semantic_fingerprint();
+        let bounded = schema(Some((Some(0), Some(10))))
+            .as_schema()
+            .semantic_fingerprint();
+        let different_max = schema(Some((Some(0), Some(11))))
+            .as_schema()
+            .semantic_fingerprint();
+        let different_min = schema(Some((Some(1), Some(10))))
+            .as_schema()
+            .semantic_fingerprint();
+        assert_ne!(unbounded, bounded);
+        assert_ne!(bounded, different_max);
+        assert_ne!(bounded, different_min);
     }
 
     #[test]

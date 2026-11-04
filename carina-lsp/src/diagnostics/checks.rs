@@ -448,7 +448,11 @@ fn collect_enum_provider_namespaces(
         RawShape::List { element_type, .. } => {
             collect_enum_provider_namespaces(element_type, namespaces);
         }
-        RawShape::Map { key, value } => {
+        RawShape::Map {
+            key,
+            value,
+            constraints: _,
+        } => {
             collect_enum_provider_namespaces(key, namespaces);
             collect_enum_provider_namespaces(value, namespaces);
         }

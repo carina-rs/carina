@@ -119,12 +119,17 @@ impl PatternAttributeType<Draft> {
                 ordered,
                 constraints,
             },
-            AttrTypeKind::Map { key, value } => {
+            AttrTypeKind::Map {
+                key,
+                value,
+                constraints,
+            } => {
                 let key = key.compile_patterns(location.with_suffix(".<key>"), issues);
                 let value = value.compile_patterns(location.with_suffix(".<value>"), issues);
                 AttrTypeKind::Map {
                     key: Box::new(key?),
                     value: Box::new(value?),
+                    constraints,
                 }
             }
             AttrTypeKind::Struct {
