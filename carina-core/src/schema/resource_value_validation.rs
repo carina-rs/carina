@@ -23,6 +23,13 @@ pub enum ValueFindingAnchor {
 pub struct BindingTokenAnchor {
     location: crate::parser::DeclarationLocation,
     scalar: bool,
+    source: BindingFindingSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindingFindingSource {
+    Authority,
+    Value,
 }
 
 impl BindingTokenAnchor {
@@ -32,6 +39,11 @@ impl BindingTokenAnchor {
     pub fn replaceable_location(&self) -> Option<&crate::parser::DeclarationLocation> {
         self.scalar.then_some(&self.location)
     }
+    /// Value-walk leaves retain their indexed context. Authority findings
+    /// already carry their complete binding explanation.
+    pub fn has_value_path(&self) -> bool {
+        self.source == BindingFindingSource::Value
+    }
     pub(crate) fn for_authority_error(
         location: crate::parser::DeclarationLocation,
         error: &TypeError,
@@ -39,6 +51,18 @@ impl BindingTokenAnchor {
         Self {
             location,
             scalar: matches!(error, TypeError::BindingShadowsEnumMember(_)),
+            source: BindingFindingSource::Authority,
+        }
+    }
+}
+
+impl ValueFindingAnchor {
+    fn same_authored_location(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::BindingToken(left), Self::BindingToken(right)) => {
+                left.location == right.location
+            }
+            _ => self == other,
         }
     }
 }
@@ -51,6 +75,7 @@ pub struct ValueFindingPath {
     sensitive: bool,
     branches: Vec<ValueBranch>,
     map_keys: Vec<usize>,
+    authored_depth: Option<usize>,
 }
 
 impl ValueFindingPath {
@@ -60,6 +85,7 @@ impl ValueFindingPath {
             sensitive: false,
             branches: Vec::new(),
             map_keys: Vec::new(),
+            authored_depth: None,
         }
     }
     pub(crate) fn with_branches(mut self, branches: &[ValueBranch]) -> Self {
@@ -68,14 +94,19 @@ impl ValueFindingPath {
     }
 
     fn same_authored_path(&self, other: &Self) -> bool {
+        let left = &self.source.steps()[..self.authored_depth.unwrap_or(self.source.steps().len())];
+        let right =
+            &other.source.steps()[..other.authored_depth.unwrap_or(other.source.steps().len())];
         self.branches == other.branches
-            && self.map_keys == other.map_keys
-            && self.source.steps().len() == other.source.steps().len()
             && self
-                .source
-                .steps()
+                .map_keys
                 .iter()
-                .zip(other.source.steps())
+                .filter(|&&index| index < left.len())
+                .eq(other.map_keys.iter().filter(|&&index| index < right.len()))
+            && left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
                 .enumerate()
                 .all(|(index, (left, right))| self.map_keys.contains(&index) || left == right)
     }
@@ -167,7 +198,11 @@ impl ResourceValueFinding {
                     path: rpath,
                     anchor: ranchor,
                 },
-            ) => authored_attribute == rattr && anchor == ranchor && path.same_authored_path(rpath),
+            ) => {
+                authored_attribute == rattr
+                    && anchor.same_authored_location(ranchor)
+                    && path.same_authored_path(rpath)
+            }
             (ResourceValueTarget::Resource, ResourceValueTarget::Resource) => true,
             _ => false,
         };
@@ -496,28 +531,8 @@ impl PatternResourceSchema<Compiled> {
         report
     }
 
-    pub(super) fn collect_value_entries<P: PlaceholderKind, B: BindingAddress>(
-        &self,
-        attributes: &HashMap<String, Value<P, B>>,
-        is_string_literal: &dyn Fn(&str) -> bool,
-        lookup: CustomTypeLookup<'_>,
-        mode: ValueEntryValidation,
-        selected: Option<&HashSet<String>>,
-        bindings: &[ResourceBindingValidation],
-    ) -> ResourceValueReport {
-        self.collect_value_entries_projected(
-            attributes,
-            is_string_literal,
-            lookup,
-            mode,
-            selected,
-            bindings,
-            &mut |_, _, _| {},
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
-    fn collect_value_entries_projected<
+    pub(super) fn collect_value_entries_projected<
         P: PlaceholderKind,
         B: BindingAddress,
         Project: FnMut(&str, &Value<P, B>, &Fit<'_>),
@@ -693,7 +708,7 @@ struct CheckedBindingLeaf {
     result: LeafResult,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct CheckedCallback {
     kind: CallbackInputKind,
     path: FieldPath,
@@ -726,17 +741,6 @@ impl PartialEq for CallbackIdentity {
 enum CallbackInputKind {
     Value,
     MapKey,
-}
-
-impl PartialEq for CheckedCallback {
-    fn eq(&self, other: &Self) -> bool {
-        self.path == other.path
-            && self.branches == other.branches
-            && self.kind == other.kind
-            && self.callback == other.callback
-            && self.input == other.input
-            && self.result == other.result
-    }
 }
 
 impl fmt::Debug for CheckedBindingLeaf {
@@ -898,6 +902,10 @@ impl ResourceBindingValidation {
         BindingTokenAnchor {
             location: self.location.clone(),
             scalar,
+            source: match &self.outcome {
+                ResourceBindingValueOutcome::Checked(_) => BindingFindingSource::Value,
+                ResourceBindingValueOutcome::Rejected(_) => BindingFindingSource::Authority,
+            },
         }
     }
 }
@@ -1064,6 +1072,10 @@ fn check_value<'a, P: PlaceholderKind, B: BindingAddress>(
         for finding in checked.local.iter_mut().chain(&mut checked.external) {
             finding.anchor =
                 ValueFindingAnchor::BindingToken(binding.anchor_for(&finding.path.source));
+            // Descendants of a substituted container have no authored leaf
+            // tokens. Keep their full paths for rendering, but identify the
+            // authored rule at the binding's path across expanded instances.
+            finding.path.authored_depth = Some(binding.path.steps().len());
         }
     }
     checked

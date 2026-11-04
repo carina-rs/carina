@@ -2,6 +2,115 @@ use super::*;
 use carina_core::schema::{AttributeSchema, AttributeType, ListElements, ResourceSchema};
 
 #[test]
+fn round5_generated_list_indexes_share_the_authored_binding_path() {
+    for (items, expected) in [
+        ("[[1, \"ok\"], [\"ok\", 1]]", 1),
+        ("[[1, 2], [3, \"ok\"]]", 2),
+    ] {
+        let source = format!(
+            "let copies = for x in {items} {{\n  mock.test.Collection {{ params = x }}\n}}\n"
+        );
+        let diagnostics =
+            round2_source_diagnostics(AttributeType::list(AttributeType::string()), &source);
+        assert_eq!(diagnostics.len(), expected, "{source}: {diagnostics:#?}");
+        for diagnostic in diagnostics {
+            assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+            assert!(
+                diagnostic.message.contains("expected String"),
+                "{diagnostic:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn round5_binding_scalar_extent_does_not_change_authored_rule_identity() {
+    let diagnostics = round2_source_diagnostics(
+        AttributeType::string(),
+        "let copies = for x in [1, []] {\n  mock.test.Collection { params = x }\n}\n",
+    );
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert!(diagnostics[0].data.is_none());
+}
+
+#[test]
+fn round5_binding_token_messages_keep_each_list_leaf_path() {
+    let source = "let xs = [5, 6]\nmock.test.Collection { params = xs }\n";
+    let diagnostics =
+        round2_source_diagnostics(AttributeType::list(AttributeType::string()), source);
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    for (index, diagnostic) in diagnostics.iter().enumerate() {
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+        assert!(
+            diagnostic.message.contains(&format!("params[{index}]")),
+            "{diagnostic:#?}"
+        );
+        let column = source.lines().nth(1).unwrap().find("xs").unwrap() as u32;
+        assert_eq!(
+            diagnostic.range,
+            Range::new(Position::new(1, column), Position::new(1, column + 2))
+        );
+    }
+    assert_ne!(diagnostics[0].message, diagnostics[1].message);
+}
+
+#[test]
+fn round5_coalesce_keeps_empty_list_inference_failure() {
+    let diagnostics = review_coalesce_diagnostics(
+        AttributeType::union(vec![
+            AttributeType::string(),
+            AttributeType::list(AttributeType::string()),
+        ]),
+        "producer.text ?? []",
+    );
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert!(
+        diagnostics[0].message.contains("empty collection"),
+        "{diagnostics:#?}"
+    );
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn round5_child_module_expansions_merge_authored_value_rules() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Collection")
+            .attribute(AttributeSchema::optional("params", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
+    let directory = tempfile::tempdir().unwrap();
+    let child = directory.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    std::fs::write(
+        child.join("arguments.crn"),
+        "arguments { label: String = \"ok\" }\n",
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    std::fs::write(
+        child.join("main.crn"),
+        "let copies = for x in [1, false] {\n  mock.test.Collection { params = x }\n}\n",
+    )
+    .unwrap();
+    let source = "let child = use { source = \"./child\" }\nchild {}\n";
+    let path = directory.path().join("main.crn");
+    std::fs::write(&path, source).unwrap();
+    let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert!(
+        diagnostics[0].message.contains("expected String"),
+        "{diagnostics:#?}"
+    );
+    assert_eq!(diagnostics[0].range.start.line, 1, "{diagnostics:#?}");
+}
+
+#[test]
 fn round4_orphan_coalesce_enum_shadow_has_only_authority_error() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(

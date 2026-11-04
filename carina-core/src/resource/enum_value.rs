@@ -328,14 +328,10 @@ impl EnumValueResolver<'_, Compiled> {
         text: &str,
         run: &mut crate::schema::NativeValidatorRunner<'_>,
     ) -> Result<CanonicalEnumValue, TypeError> {
-        let (_, values, _, _, _) = self.parts()?;
+        let (identity, values, _, _, _) = self.parts()?;
         let valid: Vec<_> = values.into_iter().flatten().map(String::as_str).collect();
-        let qualified_dsl = matches!(
-            RawEnumIdentifier::parse(text).parsed(),
-            RawEnumIdentifierParts::TypeQualified { .. }
-                | RawEnumIdentifierParts::ProviderQualified { .. }
-                | RawEnumIdentifierParts::FullyQualified { .. }
-        );
+        let qualified_dsl =
+            NamespacedId::parse(text).is_some_and(|qualified| qualified.matches_identity(identity));
         let api_member = matches!(
             state_text_valid_value_match(text, &valid),
             StateTextValidValueMatch::Unique(_)

@@ -45,6 +45,148 @@ fn write_fixture(files: &[(&str, &str)]) -> TempDir {
     dir
 }
 
+fn round5_arithmetic_fixture(expression: &str) -> (SchemaRegistry, TempDir) {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Producer")
+            .attribute(
+                AttributeSchema::optional("items", AttributeType::list(AttributeType::string()))
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let producer = if expression.contains("producer.items") {
+        "let producer = mock.test.Producer { items = [\"a\"] }\n"
+    } else {
+        ""
+    };
+    let source = format!("{producer}mock.test.Sink {{ name = {expression} }}\n");
+    (
+        schemas,
+        write_fixture(&[
+            ("providers.crn", "provider mock {}\n"),
+            ("main.crn", &source),
+        ]),
+    )
+}
+
+#[test]
+fn round5_lsp_arithmetic_result_has_one_owner_for_literals_and_references() {
+    for expression in ["length(producer.items) + 1", "length([\"a\"]) + 1"] {
+        let (schemas, fixture) = round5_arithmetic_fixture(expression);
+        let diagnostics = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+        assert_eq!(diagnostics.len(), 1, "{expression}: {diagnostics:#?}");
+        assert_eq!(
+            diagnostics[0].severity,
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+        );
+        assert!(
+            diagnostics[0].message.contains("expected String, got Int"),
+            "{diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn round5_secret_arithmetic_result_has_one_owner() {
+    for expression in [
+        "secret(length([\"a\"])) + 1",
+        "secret(length(producer.items)) + 1",
+    ] {
+        let (schemas, fixture) = round5_arithmetic_fixture(expression);
+        let diagnostics = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+        assert_eq!(diagnostics.len(), 1, "{expression}: {diagnostics:#?}");
+        assert_eq!(
+            diagnostics[0].severity,
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+        );
+        assert!(
+            diagnostics[0].message.contains("expected String, got Int"),
+            "{diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn round5_cli_arithmetic_result_matches_origin_main() {
+    for expression in ["length(producer.items) + 1", "length([\"a\"]) + 1"] {
+        let (schemas, fixture) = round5_arithmetic_fixture(expression);
+        let diagnostics = carina_cli::commands::validate::validate_diagnostics_with_factories(
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            carina_cli::wiring::LoadedProviderFactory::for_test(factories_for(&schemas)),
+            HashMap::new(),
+        );
+        assert!(
+            diagnostics.warnings.is_empty(),
+            "{:?}",
+            diagnostics.warnings
+        );
+        let errors: Vec<_> = diagnostics
+            .errors
+            .iter()
+            .map(|error| carina_cli::error::format_error_with_source_chain(error))
+            .collect();
+        // Captured from origin/main at 7ab4f659 for these same directory fixtures.
+        assert_eq!(
+            errors,
+            ["mock.test.Sink.<pending>: Type mismatch: expected String, got Int"],
+            "{expression}"
+        );
+    }
+}
+
+#[test]
+fn round5_cli_open_enum_map_keys_keep_literal_api_spellings() {
+    let key = AttributeType::enum_(
+        carina_core::schema::TypeIdentity::new(Some("mock"), ["test"], "Key"),
+        None,
+        vec![],
+        Some(carina_core::schema::validator(|value| {
+            if matches!(value, Value::Concrete(ConcreteValue::String(text)) if ["ok", "A.json", "other.thing"].contains(&text.expose_plaintext()))
+            {
+                Ok(())
+            } else {
+                Err(carina_core::schema::TypeError::ValidationFailed {
+                    message: "literal API key or member spelling required".into(),
+                })
+            }
+        })),
+        None,
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "params",
+                    AttributeType::map_with_key(key, AttributeType::string()),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    for key in ["mock.test.Key.ok", "A.json", "other.thing"] {
+        let source = format!("mock.test.Sink {{ params = {{ \"{key}\" = \"value\" }} }}\n");
+        let fixture = write_fixture(&[
+            ("providers.crn", "provider mock {}\n"),
+            ("main.crn", &source),
+        ]);
+        let diagnostics = cli_diagnostics(factories_for(&schemas), &fixture);
+        assert!(diagnostics.is_empty(), "{key}: {diagnostics:#?}");
+    }
+}
+
 fn assert_collection_value_parity(field_type: AttributeType, value: &str, expected: Option<&str>) {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(

@@ -15613,8 +15613,16 @@ impl PatternResourceSchema<Compiled> {
         mode: ValueEntryValidation,
         selected: Option<&HashSet<String>>,
     ) -> Vec<TypeError> {
-        self.collect_value_entries(attributes, is_string_literal, lookup, mode, selected, &[])
-            .errors
+        self.collect_value_entries_projected(
+            attributes,
+            is_string_literal,
+            lookup,
+            mode,
+            selected,
+            &[],
+            &mut |_, _, _| {},
+        )
+        .errors
     }
 }
 

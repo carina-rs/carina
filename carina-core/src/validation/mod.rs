@@ -2426,23 +2426,19 @@ impl<'a, B: BindingAddress> UnresolvedExpression<'a, B> {
     /// the sensitivity of any enclosing secret even after wrappers are peeled.
     pub fn operands(&self) -> impl Iterator<Item = Self> {
         use crate::resource::DeferredValue;
-        let values: &[_] = match self.value {
-            GenericValue::Deferred(DeferredValue::ModuleIf(deferred)) => &deferred.values()[1..],
-            _ => &[],
-        };
-        let coalesce = match self.value {
+        let operands = match self.value {
+            GenericValue::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                Some([deferred.then_value(), deferred.else_value()])
+            }
             GenericValue::Deferred(DeferredValue::Coalesce { value, default }) => {
                 Some([value.as_ref(), default.as_ref()])
             }
             _ => None,
         };
-        values
-            .iter()
-            .copied()
-            .chain(coalesce.iter().flatten().copied())
-            .filter_map(|value| Self::with_sensitivity(value, self.sensitive))
-            .collect::<Vec<_>>()
+        operands
             .into_iter()
+            .flatten()
+            .filter_map(|value| Self::with_sensitivity(value, self.sensitive))
     }
 
     pub fn value(&self) -> &'a GenericValue<ParserPlaceholder, B> {
@@ -2460,50 +2456,91 @@ pub fn check_editor_access_type<B: BindingAddress>(
     schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
 ) -> Result<(), AccessTypeFinding> {
-    let value = expression.value();
-    if matches!(
-        value,
-        GenericValue::Deferred(crate::resource::DeferredValue::ModuleIf(_))
-    ) {
-        for operand in expression.operands() {
-            check_editor_access_type(operand, expected, bindings, schemas, binding_index)?;
-        }
-        return Ok(());
-    }
-    if let GenericValue::Deferred(crate::resource::DeferredValue::Coalesce { value, default }) =
-        value
-    {
-        for operand in [value, default] {
-            if check_deferred_access_type(operand, expected, bindings, schemas, binding_index)
-                .is_err()
-            {
-                return Ok(());
-            }
-        }
-    }
-    check_deferred_access_type(value, expected, bindings, schemas, binding_index).map_err(|error| {
-        AccessTypeFinding {
-            error: if expression.sensitive {
-                match error {
-                    DeferredAccessTypeError::TypeMismatch { types, .. } => {
-                        DeferredAccessTypeError::TypeMismatch {
-                            types,
-                            origin: "from secret value".into(),
-                        }
-                    }
-                    DeferredAccessTypeError::InvalidAccess { .. } => {
-                        DeferredAccessTypeError::InvalidAccess {
-                            error: inference::InferenceError::UnknownType {
-                                reason: "invalid access in secret value".into(),
-                            },
-                        }
+    let finding = |error| AccessTypeFinding {
+        error: if expression.sensitive {
+            match error {
+                DeferredAccessTypeError::TypeMismatch { types, .. } => {
+                    DeferredAccessTypeError::TypeMismatch {
+                        types,
+                        origin: "from secret value".into(),
                     }
                 }
-            } else {
-                error
-            },
+                DeferredAccessTypeError::InvalidAccess { .. } => {
+                    DeferredAccessTypeError::InvalidAccess {
+                        error: inference::InferenceError::UnknownType {
+                            reason: "invalid access in secret value".into(),
+                        },
+                    }
+                }
+            }
+        } else {
+            error
+        },
+    };
+    check_editor_expression(
+        expression.value(),
+        expected,
+        bindings,
+        schemas,
+        binding_index,
+    )
+    .map(|_| ())
+    .map_err(finding)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditorExpressionFit {
+    FitsSink,
+    ValueReportFailure,
+}
+
+fn check_editor_expression<B: BindingAddress>(
+    value: &GenericValue<ParserPlaceholder, B>,
+    expected: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
+    bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
+    schemas: &SchemaRegistry,
+    binding_index: &BindingIndex<'_, B>,
+) -> Result<EditorExpressionFit, DeferredAccessTypeError> {
+    use crate::resource::DeferredValue;
+    let operands = match value {
+        GenericValue::Deferred(DeferredValue::Coalesce { value, default }) => {
+            Some([value.as_ref(), default.as_ref()])
         }
-    })
+        GenericValue::Deferred(DeferredValue::ModuleIf(conditional)) => {
+            Some([conditional.then_value(), conditional.else_value()])
+        }
+        GenericValue::Deferred(DeferredValue::Secret(inner)) => {
+            return check_editor_expression(inner, expected, bindings, schemas, binding_index);
+        }
+        _ => None,
+    };
+    if let Some(operands) = operands {
+        let mut fit = EditorExpressionFit::FitsSink;
+        for operand in operands {
+            if check_editor_expression(operand, expected, bindings, schemas, binding_index)?
+                == EditorExpressionFit::ValueReportFailure
+            {
+                fit = EditorExpressionFit::ValueReportFailure;
+            }
+        }
+        // A concrete failure anywhere inside an operand belongs to the value
+        // report. Retain that outcome through enclosing coalesces, while
+        // preserving every inference error encountered above.
+        if fit == EditorExpressionFit::ValueReportFailure
+            || matches!(value, GenericValue::Deferred(DeferredValue::ModuleIf(_)))
+        {
+            return Ok(fit);
+        }
+    }
+    match check_deferred_access_type(value, expected, bindings, schemas, binding_index) {
+        Ok(()) => Ok(EditorExpressionFit::FitsSink),
+        Err(DeferredAccessTypeError::TypeMismatch { .. })
+            if UnresolvedExpression::new(value).is_none() =>
+        {
+            Ok(EditorExpressionFit::ValueReportFailure)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// A statically-known postfix access error shared by CLI validation and LSP
@@ -2906,10 +2943,12 @@ fn check_integer_result_sink<B: BindingAddress>(
     }
 }
 
-#[derive(Clone, Copy)]
-enum ArithmeticResultOwner {
+type ArithmeticValueEvaluator<'a, B> =
+    dyn Fn(&GenericValue<ParserPlaceholder, B>) -> GenericValue<ParserPlaceholder, B> + 'a;
+
+enum ArithmeticResultOwner<'a, B: BindingAddress> {
     Expression,
-    CoreWhenConcrete,
+    ValueReport(&'a ArithmeticValueEvaluator<'a, B>),
 }
 
 fn check_integer_arithmetic_types_with_sink<'a, B: BindingAddress>(
@@ -2918,7 +2957,7 @@ fn check_integer_arithmetic_types_with_sink<'a, B: BindingAddress>(
     bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
     schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
-    result_owner: ArithmeticResultOwner,
+    result_owner: ArithmeticResultOwner<'_, B>,
 ) -> Vec<crate::parser::Located<IntegerArithmeticTypeFinding>> {
     let mut findings = Vec::new();
     visit_computed_accesses_with_sink(value, sink, &mut |candidate, candidate_sink| {
@@ -2945,15 +2984,21 @@ fn check_integer_arithmetic_types_with_sink<'a, B: BindingAddress>(
                 binding_index,
             )
         })
-        .and_then(|()| match result_owner {
-            ArithmeticResultOwner::CoreWhenConcrete
-                if crate::parser::is_static_value(candidate) =>
+        .and_then(|()| {
+            if let ArithmeticResultOwner::ValueReport(evaluate) = &result_owner
+                && matches!(
+                    crate::resource::peel_secrets(evaluate(candidate))
+                        .0
+                        .as_concrete(),
+                    Some(crate::resource::ConcreteValueRef::Int(_))
+                )
             {
-                Ok(())
+                // The value report sees this evaluated Int and owns its sink
+                // mismatch. Literal and reference-backed operands use the
+                // same typed evidence; operand validity is still proved above.
+                return Ok(());
             }
-            ArithmeticResultOwner::Expression | ArithmeticResultOwner::CoreWhenConcrete => {
-                check_integer_result_sink(candidate, candidate_sink, binding_index)
-            }
+            check_integer_result_sink(candidate, candidate_sink, binding_index)
         });
         let Err(error) = result else {
             return;
@@ -2980,11 +3025,19 @@ fn check_integer_arithmetic_types_with_sink<'a, B: BindingAddress>(
     findings
 }
 
-impl<D, B: BindingAddress, E>
-    crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>
+impl<D, E>
+    crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, RelativeBindingName, E>
 where
-    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    D: crate::parser::DeferredForPhaseTraversal<
+            ParserPlaceholder,
+            ParserPlaceholder,
+            RelativeBindingName,
+        >,
 {
+    /// Operand checks retain authored operators; evaluated Int results hand
+    /// their sink errors to the same resource-value evaluator used by the
+    /// value report.
+    #[allow(clippy::too_many_arguments)]
     pub fn integer_arithmetic_findings(
         &self,
         resource: &crate::parser::AnalysisResourceRef<
@@ -2992,13 +3045,17 @@ where
             ParserPlaceholder,
             ParserPlaceholder,
             D,
-            B,
+            RelativeBindingName,
         >,
         name: &str,
         schema: crate::schema::OwnerBoundResourceSchema<'_>,
-        bindings: &crate::validation::inference::InferenceBindings<ParserPlaceholder, B>,
+        bindings: &crate::validation::inference::InferenceBindings<
+            ParserPlaceholder,
+            RelativeBindingName,
+        >,
         schemas: &crate::schema::SchemaRegistry,
-        binding_index: &crate::binding_index::BindingIndex<'_, B>,
+        binding_index: &crate::binding_index::BindingIndex<'_, RelativeBindingName>,
+        evaluator: &crate::parser::ResourceValueEvaluator<'_>,
     ) -> Vec<crate::parser::Located<crate::validation::IntegerArithmeticTypeFinding>> {
         let attributes = resource.attributes();
         let sink = schema
@@ -3014,7 +3071,7 @@ where
             bindings,
             schemas,
             binding_index,
-            ArithmeticResultOwner::CoreWhenConcrete,
+            ArithmeticResultOwner::ValueReport(&|value| evaluator.evaluate(value)),
         )
     }
 }

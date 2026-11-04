@@ -34,17 +34,19 @@ impl ResourceValueReport {
         &mut self,
         findings: impl IntoIterator<Item = Located<ResourceValueFinding>>,
     ) {
+        let mut authored = Self::default();
         for finding in findings {
             let replaceable = matches!(&finding.detail().target,
                 ResourceValueTarget::Attribute { anchor: ValueFindingAnchor::BindingToken(token), .. }
                 if token.replaceable_location() == Some(finding.location()));
-            self.insert(
+            authored.insert(
                 finding.location().clone(),
                 finding.detail().clone(),
                 None,
                 replaceable,
             );
         }
+        self.merge(authored);
     }
 
     pub(super) fn collect(
@@ -57,6 +59,10 @@ impl ResourceValueReport {
         for finding in findings {
             authored.collect_finding(resource, finding, values);
         }
+        self.merge(authored);
+    }
+
+    fn merge(&mut self, authored: Self) {
         for (location, findings) in authored.findings {
             let reported = self.findings.entry(location).or_default();
             let mut matched = vec![false; reported.len()];
@@ -73,6 +79,7 @@ impl ResourceValueReport {
                         })
                 {
                     matched[index] = true;
+                    reported[index].replaceable &= finding.replaceable;
                 } else {
                     reported.push(finding);
                     matched.push(true);
@@ -191,6 +198,10 @@ fn render_value_finding(
             anchor,
         } => {
             let binding_token = matches!(anchor, ValueFindingAnchor::BindingToken(_));
+            let has_value_path = match &anchor {
+                ValueFindingAnchor::BindingToken(token) => token.has_value_path(),
+                _ => true,
+            };
             let indexed = path.is_indexed();
             let duplicate = matches!(error, TypeError::DuplicateListElement { .. });
             let attribute =
@@ -207,10 +218,10 @@ fn render_value_finding(
             {
                 error = error.with_attribute(&attribute);
             }
-            if binding_token {
-                error.to_string()
-            } else if indexed && error.attribute_name().is_none() {
+            if has_value_path && indexed && error.attribute_name().is_none() {
                 format!("{error} for '{attribute}'")
+            } else if binding_token {
+                error.to_string()
             } else if path.is_empty() {
                 guidance.unwrap_or_else(|| error.to_string())
             } else {

@@ -1438,6 +1438,7 @@ impl DiagnosticRun<'_> {
                             &inference_bindings,
                             &self.schemas,
                             &binding_index,
+                            &resource_value_evaluator,
                         );
                         let findings = validation::attribute_findings(
                             rref,

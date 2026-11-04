@@ -6,6 +6,76 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
+fn round5_open_enum_map_keys_recognize_only_the_declarations_namespace() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls = Arc::clone(&seen);
+    let key = AttributeType::enum_(
+        TypeIdentity::new(Some("mock"), ["test"], "Key"),
+        None,
+        vec![],
+        Some(validator(move |value| {
+            let Value::Concrete(ConcreteValue::String(text)) = value else {
+                panic!("{value:?}")
+            };
+            let text = text.expose_plaintext().to_string();
+            calls.lock().unwrap().push(text.clone());
+            if ["ok", "A.json", "other.thing"].contains(&text.as_str()) {
+                Ok(())
+            } else {
+                Err(TypeError::ValidationFailed {
+                    message: "literal API key or member spelling required".into(),
+                })
+            }
+        })),
+        None,
+    );
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "params",
+                    AttributeType::map_with_key(key, AttributeType::string()),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let schema = registry
+        .get("mock", "test.Sink", SchemaKind::Resource)
+        .unwrap();
+    for (authored, expected) in [
+        ("mock.test.Key.ok", "ok"),
+        ("A.json", "A.json"),
+        ("other.thing", "other.thing"),
+    ] {
+        let values: HashMap<String, Value> = HashMap::from([(
+            "params".into(),
+            Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
+                authored.into() => Value::Concrete(ConcreteValue::String("value".into()))
+            })),
+        )]);
+        let resolver = |_: CustomTypeValidationTarget<'_>, _: &Value| Ok(());
+        let findings = schema.collect_validation_with_resolver(&values, &|_| false, &resolver);
+        assert!(findings.is_empty(), "{authored}: {findings:#?}");
+        assert_eq!(
+            std::mem::take(&mut *seen.lock().unwrap()),
+            [expected],
+            "{authored}"
+        );
+        let result = schema.validate_with_resolver(&values, &|_| false, &resolver);
+        assert!(result.is_ok(), "{authored}: {result:#?}");
+        assert_eq!(
+            std::mem::take(&mut *seen.lock().unwrap()),
+            [expected],
+            "{authored}"
+        );
+    }
+}
+
+#[test]
 fn round4_union_canonicalization_keeps_the_provider_accepted_arms_fit() {
     let first = TypeIdentity::new(Some("mock"), ["test"], "First");
     let second = TypeIdentity::new(Some("mock"), ["test"], "Second");
