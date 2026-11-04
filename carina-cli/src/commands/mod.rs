@@ -51,7 +51,7 @@ use crate::wiring::{
     validate_no_backend_in_modules, validate_no_exports_in_modules,
     validate_no_provider_in_modules, validate_no_state_blocks_in_modules,
     validate_no_upstream_states_in_modules, validate_provider_region_with_ctx,
-    validate_resources_with_ctx, validate_wait_bindings_with_ctx,
+    validate_wait_bindings_with_ctx,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -404,14 +404,24 @@ impl ResolvedConfig {
         &mut self,
         ctx: &WiringContext,
         conflict_policy: carina_core::identifier::AnonymousIdentityConflictPolicy,
+        checked_values: Option<
+            carina_core::value::CheckedResourceCanonicalization<
+                '_,
+                carina_core::resource::ParserPlaceholder,
+                carina_core::resource::AbsoluteBindingAddress,
+            >,
+        >,
     ) -> Result<Vec<AppError>, AppError> {
         let providers = self.parsed().providers.clone();
         match self {
             Self::Evaluated { parsed, .. } => {
-                let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
-                    &mut parsed.resources,
-                    ctx.schemas(),
-                )?;
+                let canonical_resources = match checked_values {
+                    Some(checked) => checked.canonicalize(&mut parsed.resources)?,
+                    None => carina_core::value::canonicalize_resources_with_schemas(
+                        &mut parsed.resources,
+                        ctx.schemas(),
+                    )?,
+                };
                 Ok(compute_anonymous_identifiers_with_policy_with_ctx(
                     ctx,
                     canonical_resources,
@@ -459,11 +469,20 @@ fn extend_module_call_errors(
     errors: &mut Vec<AppError>,
     findings: Vec<carina_core::validation::ModuleCallFinding>,
 ) {
-    errors.extend(
-        findings
-            .into_iter()
-            .map(|finding| AppError::ModuleCall(Box::new(finding))),
-    );
+    for finding in findings {
+        match finding.report() {
+            carina_core::validation::ModuleCallFindingReport::Diagnostic(_) => {
+                errors.push(AppError::ModuleCall(Box::new(finding)));
+            }
+            carina_core::validation::ModuleCallFindingReport::ResourceValues(findings) => {
+                let finding = findings.into_primary();
+                errors.push(AppError::BindingValue {
+                    location: finding.location().clone(),
+                    error: Box::new(finding.detail().error.clone()),
+                });
+            }
+        }
+    }
 }
 
 fn extend_module_resolution_errors(
@@ -667,20 +686,6 @@ pub(crate) fn validate_and_resolve_errors_inner(
         &enriched_context.type_context(parsed.parsed(), ctx.schemas(), &imported_module_signatures),
     );
     extend_binding_use_errors(&mut errors, &binding_use_report);
-    for module in module_walk.iter() {
-        let module_parsed = &module.loaded().parsed;
-        let module_signatures = module_resolver::load_resolved_module_signatures(
-            module_parsed,
-            module.module_path(),
-            enriched_context.catalog(),
-        );
-        let report = carina_core::validation::check_bare_binding_uses(
-            module_parsed,
-            &enriched_context.type_context(module_parsed, ctx.schemas(), &module_signatures),
-        );
-        extend_binding_use_errors(&mut errors, &report);
-    }
-
     let authored_module_call_findings = {
         let module_call_bindings =
             carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
@@ -938,12 +943,16 @@ pub(crate) fn validate_and_resolve_errors_inner(
         errors.extend(ref_errors.into_iter().map(AppError::from));
     }
 
+    let mut checked_resource_values = None;
     if let Some(analysis) = &expanded_analysis {
-        errors.extend(validate_resources_with_ctx(
+        match crate::wiring::validate_resources_for_canonicalization_with_ctx(
             ctx,
             parsed,
             enriched_context.catalog(),
-        ));
+        ) {
+            Ok(checked) => checked_resource_values = Some(checked),
+            Err(findings) => errors.extend(findings),
+        }
         errors.extend(validate_depends_on_with_ctx(
             analysis,
             &resolved_argument_types,
@@ -1017,7 +1026,11 @@ pub(crate) fn validate_and_resolve_errors_inner(
     } else {
         carina_core::identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived
     };
-    match resolved_config.compute_anonymous_identifiers(ctx, identity_conflict_policy) {
+    match resolved_config.compute_anonymous_identifiers(
+        ctx,
+        identity_conflict_policy,
+        checked_resource_values,
+    ) {
         Ok(identifier_errors) => errors.extend(identifier_errors),
         Err(error) => errors.push(error),
     }

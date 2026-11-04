@@ -401,6 +401,9 @@ type ResourceValidator = fn(&HashMap<String, Value>) -> Result<(), Vec<TypeError
 /// pointer cannot do. See #2217.
 pub type CustomValidator = Arc<dyn Fn(&Value) -> Result<(), TypeError> + Send + Sync>;
 
+pub(crate) type NativeValidatorRunner<'a> =
+    dyn FnMut(&CustomValidator, &Value) -> Result<(), TypeError> + 'a;
+
 /// Build a [`CustomValidator`] from any closure that returns a structured
 /// [`TypeError`]. This is the preferred constructor: validators that emit
 /// `TypeError::InvalidEnumVariant` (or other structured variants) flow
@@ -3184,12 +3187,21 @@ pub(crate) fn lift_map_key<P: crate::resource::ValueKind, B: BindingAddress>(
     key: &str,
     defs: &BTreeMap<String, PatternAttributeType<Compiled>>,
 ) -> Result<Value<P, B>, TypeError> {
+    lift_map_key_with(key_type, key, defs, &mut |callback, value| callback(value))
+}
+
+pub(crate) fn lift_map_key_with<P: crate::resource::ValueKind, B: BindingAddress>(
+    key_type: &PatternAttributeType<Compiled>,
+    key: &str,
+    defs: &BTreeMap<String, PatternAttributeType<Compiled>>,
+    run: &mut NativeValidatorRunner<'_>,
+) -> Result<Value<P, B>, TypeError> {
     let mut visited_refs = Vec::new();
     let is_enum = resolve_refs_on_path(key_type, defs, &mut visited_refs)
         .is_ok_and(|resolution| matches!(&resolution.attr.kind, AttrTypeKind::Enum { .. }));
     if is_enum {
         EnumValueResolver::with_defs(key_type, defs)
-            .resolve_map_key(key)
+            .resolve_map_key(key, run)
             .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
     } else {
         Ok(Value::Concrete(ConcreteValue::String(
@@ -4155,6 +4167,14 @@ impl PatternAttributeType<Compiled> {
         &self,
         value: ConcreteValueRef<'_, P, B>,
     ) -> Result<(), TypeError> {
+        self.inspect_primitive_with(value, |callback, value| callback(value))
+    }
+
+    fn inspect_primitive_with<P: crate::resource::ValueKind, B: BindingAddress>(
+        &self,
+        value: ConcreteValueRef<'_, P, B>,
+        mut run: impl FnMut(&CustomValidator, &Value) -> Result<(), TypeError>,
+    ) -> Result<(), TypeError> {
         if self.has_empty_scalar_intersection() {
             return Err(TypeError::ValidationFailed {
                 message: format!(
@@ -4185,7 +4205,7 @@ impl PatternAttributeType<Compiled> {
                 }
                 binding
                     .callback()
-                    .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
+                    .map_or(Ok(()), |callback| run(callback, &value.to_owned_value()))
             }
             (
                 AttrTypeKind::Reference {
@@ -4204,7 +4224,7 @@ impl PatternAttributeType<Compiled> {
                 validate_int_range(*range, i)?;
                 binding
                     .callback()
-                    .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
+                    .map_or(Ok(()), |callback| run(callback, &value.to_owned_value()))
             }
             (AttrTypeKind::Float { binding, range }, ConcreteValueRef::Float(f))
                 if f.is_finite() =>
@@ -4212,7 +4232,7 @@ impl PatternAttributeType<Compiled> {
                 validate_float_range(*range, f)?;
                 binding
                     .callback()
-                    .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
+                    .map_or(Ok(()), |callback| run(callback, &value.to_owned_value()))
             }
             (AttrTypeKind::Float { .. }, ConcreteValueRef::Float(f)) => {
                 Err(TypeError::ValidationFailed {
@@ -4223,7 +4243,7 @@ impl PatternAttributeType<Compiled> {
                 validate_int_in_float_range(*range, i)?;
                 binding
                     .callback()
-                    .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
+                    .map_or(Ok(()), |callback| run(callback, &value.to_owned_value()))
             }
             (AttrTypeKind::Bool, ConcreteValueRef::Bool(_)) => Ok(()),
             (AttrTypeKind::Duration, ConcreteValueRef::Duration(_)) => Ok(()),
@@ -5445,6 +5465,10 @@ pub(crate) enum FitKind<'a> {
         value: Box<Fit<'a>>,
         default: Box<Fit<'a>>,
     },
+    Conditional {
+        then_value: Box<Fit<'a>>,
+        else_value: Box<Fit<'a>>,
+    },
     Enum {
         canonical: CanonicalEnumValue,
         rewrite: bool,
@@ -5472,6 +5496,7 @@ fn canonical_enum_key_from_fit(fit: &Fit<'_>) -> Option<String> {
         | FitKind::Deferred
         | FitKind::Secret(_)
         | FitKind::Coalesce { .. }
+        | FitKind::Conditional { .. }
         | FitKind::List(_)
         | FitKind::StringList(_)
         | FitKind::Map(_)
@@ -14681,6 +14706,34 @@ impl<'a> OwnerBoundResourceSchema<'a> {
         let lookup = crate::parser::custom_type_lookup_for_schema(resolver, self);
         self.schema
             .validate_with_origins_and_lookup(attributes, is_string_literal, &lookup)
+    }
+
+    pub(crate) fn project_validated_values_with_resolver<P: PlaceholderKind, B: BindingAddress>(
+        self,
+        attributes: &HashMap<String, Value<P, B>>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        resolver: &dyn crate::parser::CustomTypeResolver,
+    ) -> Result<resource_value_validation::ResourceValueProjection<P, B>, Vec<TypeError>> {
+        let lookup = crate::parser::custom_type_lookup_for_schema(resolver, self);
+        let mut canonical = Ok(attributes.clone());
+        let defs = self.schema.as_schema().defs();
+        let report = self.schema.as_schema().collect_resource_values_projected(
+            ResourceValueInputs::new(attributes),
+            is_string_literal,
+            &lookup,
+            &mut |name, value, fit| {
+                if let Ok(values) = &mut canonical {
+                    match crate::value::canonicalize_validated_value(value.clone(), fit, defs) {
+                        Ok(value) => {
+                            values.insert(name.into(), value);
+                        }
+                        Err(error) => canonical = Err((name.into(), error)),
+                    }
+                }
+            },
+        );
+        report.into_result()?;
+        Ok(resource_value_validation::ResourceValueProjection { canonical })
     }
 
     /// Collect every resource value finding in the same walk used by

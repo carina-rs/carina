@@ -30,6 +30,23 @@ struct AuthoredValueFinding {
 }
 
 impl ResourceValueReport {
+    pub(super) fn collect_located(
+        &mut self,
+        findings: impl IntoIterator<Item = Located<ResourceValueFinding>>,
+    ) {
+        for finding in findings {
+            let replaceable = matches!(&finding.detail().target,
+                ResourceValueTarget::Attribute { anchor: ValueFindingAnchor::BindingToken(token), .. }
+                if token.replaceable_location() == Some(finding.location()));
+            self.insert(
+                finding.location().clone(),
+                finding.detail().clone(),
+                None,
+                replaceable,
+            );
+        }
+    }
+
     pub(super) fn collect(
         &mut self,
         resource: &AnalysisResourceRef<'_>,

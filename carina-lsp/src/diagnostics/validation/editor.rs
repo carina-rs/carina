@@ -78,21 +78,23 @@ pub(in crate::diagnostics) fn attribute_findings(
             .collect();
     }
     let mut findings = Vec::new();
-    deferred_findings(
-        resource,
-        name,
-        value,
-        true,
-        &mut access_check,
-        &mut findings,
-    );
+    if let Some(expression) = UnresolvedExpression::new(value) {
+        deferred_findings(
+            resource,
+            name,
+            expression,
+            true,
+            &mut access_check,
+            &mut findings,
+        );
+    }
     findings
 }
 
 fn deferred_findings(
     resource: &AnalysisResourceRef<'_>,
     name: &str,
-    value: &Value,
+    expression: UnresolvedExpression<'_, carina_core::resource::RelativeBindingName>,
     top_level: bool,
     check: &mut impl FnMut(
         UnresolvedExpression<'_, carina_core::resource::RelativeBindingName>,
@@ -100,16 +102,16 @@ fn deferred_findings(
     ) -> Result<(), AccessTypeFinding>,
     findings: &mut Vec<Located<EditorFinding>>,
 ) {
-    match value {
+    match expression.value() {
         // Concrete operands belong to the core value walk. Only deferred
         // operands need editor inference, so a bad concrete default cannot
         // be re-emitted here as a second type mismatch.
-        coalesce @ Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+        Value::Deferred(DeferredValue::Coalesce { .. }) => {
             let before = findings.len();
-            deferred_findings(resource, name, value, false, check, findings);
-            deferred_findings(resource, name, default, false, check, findings);
+            for operand in expression.operands() {
+                deferred_findings(resource, name, operand, false, check, findings);
+            }
             if findings.len() == before
-                && let Some(expression) = UnresolvedExpression::new(coalesce)
                 && let Err(error) = check(expression, top_level)
             {
                 findings.push(Located::new(
@@ -118,13 +120,13 @@ fn deferred_findings(
                 ));
             }
         }
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            deferred_findings(resource, name, inner, top_level, check, findings);
+        Value::Deferred(DeferredValue::ModuleIf(_)) => {
+            for operand in expression.operands() {
+                deferred_findings(resource, name, operand, false, check, findings);
+            }
         }
         Value::Deferred(_) => {
-            if let Some(expression) = UnresolvedExpression::new(value)
-                && let Err(error) = check(expression, top_level)
-            {
+            if let Err(error) = check(expression, top_level) {
                 findings.push(Located::new(
                     resource.attribute_key_location(name).clone(),
                     EditorFinding::DeferredAccess(error),

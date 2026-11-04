@@ -53,6 +53,133 @@ fn module_arguments(
         .collect()
 }
 
+#[test]
+fn round3_editor_secret_inference_redacts_display_debug_and_origin() {
+    let parsed = crate::parser::parse_file(
+        "let producer = mock.test.Secret {}\nmock.test.Secret { params = secret(\"private-${producer.text}\") }\n",
+        std::path::Path::new("secrets.crn"),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).unwrap();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Secret")
+            .attribute(
+                PatternAttributeSchema::optional("text", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("params", PatternAttributeType::int()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let provider = LoadedProviderContext::empty_for_test();
+    let index = BindingIndex::from_parsed(&parsed, &schemas, &provider);
+    let bindings = inference::bindings_from_parsed(&parsed);
+    let expected = crate::schema::CompiledAttributeType::int();
+    let value = &parsed.resources[1].attributes["params"];
+    let finding = check_editor_access_type(
+        UnresolvedExpression::new(value).expect("deferred interpolation"),
+        crate::schema::TypeInSchema::schemaless(&expected).with_authority(
+            crate::schema::assignment_catalog_without_edges_for_test(),
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+        ),
+        &bindings,
+        &schemas,
+        &index,
+    )
+    .expect_err("String cannot satisfy Int");
+    for rendered in [finding.to_string(), format!("{finding:?}")] {
+        assert!(!rendered.contains("private-"), "{rendered}");
+    }
+    let DeferredAccessTypeError::TypeMismatch { origin, .. } = &finding.error else {
+        panic!("{finding:?}")
+    };
+    assert!(!origin.contains("private-"), "{origin}");
+}
+
+#[test]
+fn round3_nested_resource_schema_errors_use_value_report() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::create_dir(fixture.path().join("child")).unwrap();
+    std::fs::write(
+        fixture.path().join("child/main.crn"),
+        "arguments { enabled: Bool = true }\nlet bad = 42\nmock.test.Secret { params = bad }\n",
+    )
+    .unwrap();
+    let provider = LoadedProviderContext::empty_for_test();
+    let parsed = crate::parser::parse_file(
+        "let child = use { source = \"./child\" }\nchild {}\n",
+        &fixture.path().join("main.crn"),
+        &provider,
+    )
+    .unwrap();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Secret")
+            .attribute(
+                PatternAttributeSchema::optional("params", PatternAttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let base = crate::paths::ResolvedPath::new(fixture.path()).unwrap();
+    let signatures =
+        crate::module_resolver::load_resolved_module_signatures(&parsed, &base, &provider);
+    let report = check_bare_binding_uses(
+        &parsed,
+        &ValidationTypeContext::new(&parsed, &schemas, &provider, &signatures),
+    );
+    let bindings =
+        BindingIndex::from_parsed_with_module_signatures(&parsed, &schemas, &signatures, &provider);
+    for reference_checks in [
+        ModuleCallReferenceChecks::Enabled,
+        ModuleCallReferenceChecks::Skipped,
+    ] {
+        let findings = deferred_types::with_session_for_test(&provider, |session| {
+            check_module_calls(ModuleCallCheckInput {
+                authored: &parsed,
+                semantic: Some(&parsed),
+                base_dir: Some(&base),
+                imported_signatures: &signatures,
+                provider_context: session,
+                schemas: &schemas,
+                binding_use_report: &report,
+                bindings: &bindings,
+                reference_checks,
+            })
+            .unwrap()
+        });
+        assert!(!findings.is_empty(), "retain the nested resource failure");
+        let values = findings
+            .iter()
+            .flat_map(|finding| match finding.report() {
+                ModuleCallFindingReport::ResourceValues(findings) => findings.diagnostics(),
+                ModuleCallFindingReport::Diagnostic(_) => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values.len(),
+            2,
+            "nested token and root call retain the same typed error: {values:?}"
+        );
+        assert!(
+            values
+                .iter()
+                .all(|finding| matches!(finding.detail().error, TypeError::TypeMismatch { .. }))
+        );
+        for finding in &findings {
+            for diagnostic in finding.diagnostics() {
+                assert!(
+                    diagnostic.detail().message().type_error().is_none(),
+                    "resource schema error escaped the value-report boundary: {diagnostic:?}"
+                );
+            }
+        }
+    }
+}
+
 fn rendered_typecheck_result(
     type_expr: &TypeExpr,
     value: &Value,
@@ -2078,7 +2205,9 @@ fn binding_diagnostics_preserve_symlink_parent_source_spelling() {
         report.to_string(),
         format!("{}: {} at line 2", path.display(), finding.error)
     );
-    let nested = ModuleCallFindingMessage::NestedResourceBindingUse(Box::new(finding.clone()));
+    let nested = ModuleCallFindingMessage::NestedResourceBindingUse(Box::new(
+        BindingUseDiagnostic::from_finding(finding).unwrap(),
+    ));
     assert_eq!(nested.to_string(), report.to_string());
 }
 

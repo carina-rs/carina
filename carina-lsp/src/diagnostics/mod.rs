@@ -240,9 +240,18 @@ fn render_module_call_findings(
     doc: &Document,
     findings: &[carina_core::validation::ModuleCallFinding],
 ) -> Vec<Diagnostic> {
-    findings
+    let mut values = validation::ResourceValueReport::default();
+    let mut diagnostics = findings
         .iter()
-        .flat_map(|finding| finding.diagnostics())
+        .flat_map(|finding| match finding.report() {
+            carina_core::validation::ModuleCallFindingReport::Diagnostic(finding) => {
+                finding.diagnostics()
+            }
+            carina_core::validation::ModuleCallFindingReport::ResourceValues(findings) => {
+                values.collect_located(findings.diagnostics());
+                Vec::new()
+            }
+        })
         .filter_map(|finding| {
             let mut diagnostic = render_merged(
                 doc,
@@ -255,7 +264,9 @@ fn render_module_call_findings(
             }
             Some(diagnostic)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    diagnostics.extend(values.render(doc));
+    diagnostics
 }
 
 #[derive(Default)]
@@ -1113,17 +1124,6 @@ impl DiagnosticRun<'_> {
                     carina_core::parser::BindingUseOwner::ModuleArgument { .. } => None,
                 })
                 .collect::<HashSet<_>>();
-            let pending_resource_sinks = pre_expansion_input
-                .bare_binding_uses()
-                .pending_slots()
-                .filter_map(|slot| match &slot.owner {
-                    carina_core::parser::BindingUseOwner::Resource(address) => Some((
-                        address.resource_id().clone(),
-                        slot.path.root_name().to_string(),
-                    )),
-                    carina_core::parser::BindingUseOwner::ModuleArgument { .. } => None,
-                })
-                .collect::<HashSet<_>>();
             for finding in binding_use_report.resource_findings() {
                 let finding = finding.diagnostic();
                 diagnostics.extend(render_merged(
@@ -1251,8 +1251,16 @@ impl DiagnosticRun<'_> {
             // its parser-assigned identities distinguish expanded instances.
             // The directory parse includes the unsaved buffer and its sealed
             // source locations, so it also owns the authored targets.
+            let authored_tree = directory.as_ref().and_then(|directory| {
+                analysis_result(
+                    doc,
+                    directory.authored_bindings.analysis(),
+                    &mut diagnostics,
+                )
+            });
+            let resource_tree = authored_tree.as_ref().unwrap_or(preferred_tree);
             let mut resource_value_report = validation::ResourceValueReport::default();
-            for (resource_index, rref) in preferred_tree
+            for (resource_index, rref) in resource_tree
                 .project_resources()
                 .enumerate()
                 .filter(|(_, resource)| resource.location().file().path() == doc.source_file())
@@ -1390,13 +1398,13 @@ impl DiagnosticRun<'_> {
                         // validating their substituted values a second time.
                         let value = if binding_error_sinks
                             .contains(&(resource_id.clone(), attr_name.clone()))
-                        {
+                            || matches!(
+                                authored_value,
+                                Value::Deferred(
+                                    DeferredValue::Coalesce { .. } | DeferredValue::ModuleIf(_)
+                                ) | Value::Concrete(ConcreteValue::List(_) | ConcreteValue::Map(_))
+                            ) {
                             authored_value
-                        } else if matches!(
-                            attr_value,
-                            Value::Concrete(ConcreteValue::List(_) | ConcreteValue::Map(_))
-                        ) {
-                            attr_value
                         } else {
                             typecheck_value
                         };
@@ -1499,20 +1507,6 @@ impl DiagnosticRun<'_> {
                         self.provider_context.catalog().custom_type_resolver(),
                     );
                     let findings = findings.into_iter().filter(|finding| {
-                        if let TypeError::MissingRequired { name } = &finding.error
-                            && pending_resource_sinks.iter().any(
-                                |(pending_resource, authored_name)| {
-                                    pending_resource == resource_id
-                                        && bn_map
-                                            .get(authored_name)
-                                            .map(String::as_str)
-                                            .unwrap_or(authored_name)
-                                            == name
-                                },
-                            )
-                        {
-                            return false;
-                        }
                         provider_validation_deduplicator.should_emit_type_error(&finding.error)
                     });
                     resource_value_report.collect(rref, findings, &values);

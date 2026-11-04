@@ -647,28 +647,6 @@ impl BindingUseFinding {
     }
 }
 
-enum BindingDiagnostic<'a> {
-    ValueType(&'a typecheck::TypeExprValueError),
-    ReferenceType(&'a BindingReferenceTypeError),
-    DeferredAccess(&'a DeferredAccessTypeError),
-    CustomType(&'a crate::parser::CustomTypeValidationError),
-    TypeResolution(&'a StaticTypeResolutionError),
-    Existing(&'a str),
-}
-
-impl std::fmt::Display for BindingDiagnostic<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ValueType(error) => error.fmt(f),
-            Self::ReferenceType(error) => error.fmt(f),
-            Self::DeferredAccess(error) => error.fmt(f),
-            Self::CustomType(error) => error.fmt(f),
-            Self::TypeResolution(error) => error.fmt(f),
-            Self::Existing(message) => f.write_str(message),
-        }
-    }
-}
-
 /// A binding diagnostic that cannot contain a resource schema value error.
 /// The raw finding and its constructor remain private to the authority.
 #[derive(Debug, Clone, PartialEq)]
@@ -687,22 +665,7 @@ impl BindingUseDiagnostic {
         }
     }
     pub fn diagnostic(&self) -> crate::parser::Located<impl std::fmt::Display + '_> {
-        let detail = match &self.inner.error {
-            BindingResolutionError::ValueType(error) => BindingDiagnostic::ValueType(error),
-            BindingResolutionError::ReferenceType(error) => BindingDiagnostic::ReferenceType(error),
-            BindingResolutionError::DeferredAccess(error) => {
-                BindingDiagnostic::DeferredAccess(error)
-            }
-            BindingResolutionError::CustomType(error) => BindingDiagnostic::CustomType(error),
-            BindingResolutionError::TypeResolution(error) => {
-                BindingDiagnostic::TypeResolution(error)
-            }
-            BindingResolutionError::Existing(message) => BindingDiagnostic::Existing(message),
-            BindingResolutionError::Type(_) => {
-                unreachable!("value errors cannot construct a binding diagnostic")
-            }
-        };
-        crate::parser::Located::new(self.use_site.location().clone(), detail)
+        crate::parser::Located::new(self.use_site.location().clone(), &self.inner.error)
     }
 }
 impl std::fmt::Display for BindingUseDiagnostic {
@@ -870,6 +833,7 @@ impl BindingUseReport {
                 attribute: finding.use_site.path.root_name().into(),
                 path: binding_field_path(&finding.use_site.path),
                 location: finding.use_site.location().clone(),
+                branches: finding.use_site.branches.clone(),
                 outcome: ResourceBindingValueOutcome::Rejected(error),
             });
         }
@@ -888,6 +852,7 @@ impl BindingUseReport {
                 attribute: use_site.path.root_name().into(),
                 path: binding_field_path(&use_site.path),
                 location: use_site.location().clone(),
+                branches: use_site.branches.clone(),
                 outcome: ResourceBindingValueOutcome::Checked(checked.clone()),
             });
         }
@@ -2417,21 +2382,66 @@ impl std::fmt::Display for AccessTypeFinding {
 /// ```
 pub struct UnresolvedExpression<'a, B: BindingAddress> {
     value: &'a GenericValue<ParserPlaceholder, B>,
+    sensitive: bool,
 }
 
 impl<'a, B: BindingAddress> UnresolvedExpression<'a, B> {
     pub fn new(value: &'a GenericValue<ParserPlaceholder, B>) -> Option<Self> {
+        Self::with_sensitivity(value, false)
+    }
+
+    fn with_sensitivity(
+        value: &'a GenericValue<ParserPlaceholder, B>,
+        sensitive: bool,
+    ) -> Option<Self> {
         use crate::resource::DeferredValue;
         match value {
-            GenericValue::Deferred(DeferredValue::Secret(inner)) => Self::new(inner),
+            GenericValue::Deferred(DeferredValue::Secret(inner)) => {
+                Self::with_sensitivity(inner, true)
+            }
+            GenericValue::Deferred(DeferredValue::FunctionCall {
+                name: crate::builtins::BuiltinFunction::secret,
+                args,
+                ..
+            }) => args
+                .first()
+                .and_then(|arg| arg.value())
+                .and_then(|inner| Self::with_sensitivity(inner, true)),
             GenericValue::Deferred(DeferredValue::Coalesce {
                 value: left,
                 default,
             }) => (Self::new(left).is_some() || Self::new(default).is_some())
-                .then_some(Self { value }),
-            GenericValue::Deferred(_) => Some(Self { value }),
+                .then_some(Self { value, sensitive }),
+            GenericValue::Deferred(DeferredValue::ModuleIf(deferred)) => deferred.values()[1..]
+                .iter()
+                .any(|branch| Self::new(branch).is_some())
+                .then_some(Self { value, sensitive }),
+            GenericValue::Deferred(_) => Some(Self { value, sensitive }),
             _ => None,
         }
+    }
+
+    /// Only unresolved operands cross the editor boundary. Each child keeps
+    /// the sensitivity of any enclosing secret even after wrappers are peeled.
+    pub fn operands(&self) -> impl Iterator<Item = Self> {
+        use crate::resource::DeferredValue;
+        let values: &[_] = match self.value {
+            GenericValue::Deferred(DeferredValue::ModuleIf(deferred)) => &deferred.values()[1..],
+            _ => &[],
+        };
+        let coalesce = match self.value {
+            GenericValue::Deferred(DeferredValue::Coalesce { value, default }) => {
+                Some([value.as_ref(), default.as_ref()])
+            }
+            _ => None,
+        };
+        values
+            .iter()
+            .copied()
+            .chain(coalesce.iter().flatten().copied())
+            .filter_map(|value| Self::with_sensitivity(value, self.sensitive))
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     pub fn value(&self) -> &'a GenericValue<ParserPlaceholder, B> {
@@ -2450,6 +2460,15 @@ pub fn check_editor_access_type<B: BindingAddress>(
     binding_index: &BindingIndex<'_, B>,
 ) -> Result<(), AccessTypeFinding> {
     let value = expression.value();
+    if matches!(
+        value,
+        GenericValue::Deferred(crate::resource::DeferredValue::ModuleIf(_))
+    ) {
+        for operand in expression.operands() {
+            check_editor_access_type(operand, expected, bindings, schemas, binding_index)?;
+        }
+        return Ok(());
+    }
     if let GenericValue::Deferred(crate::resource::DeferredValue::Coalesce { value, default }) =
         value
     {
@@ -2461,8 +2480,29 @@ pub fn check_editor_access_type<B: BindingAddress>(
             }
         }
     }
-    check_deferred_access_type(value, expected, bindings, schemas, binding_index)
-        .map_err(|error| AccessTypeFinding { error })
+    check_deferred_access_type(value, expected, bindings, schemas, binding_index).map_err(|error| {
+        AccessTypeFinding {
+            error: if expression.sensitive {
+                match error {
+                    DeferredAccessTypeError::TypeMismatch { types, .. } => {
+                        DeferredAccessTypeError::TypeMismatch {
+                            types,
+                            origin: "from secret value".into(),
+                        }
+                    }
+                    DeferredAccessTypeError::InvalidAccess { .. } => {
+                        DeferredAccessTypeError::InvalidAccess {
+                            error: inference::InferenceError::UnknownType {
+                                reason: "invalid access in secret value".into(),
+                            },
+                        }
+                    }
+                }
+            } else {
+                error
+            },
+        }
+    })
 }
 
 /// A statically-known postfix access error shared by CLI validation and LSP
@@ -4614,6 +4654,7 @@ struct ResourceValidationContext<'a> {
     all_errors: &'a mut Vec<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
     id: &crate::resource::ResourceId,
     quoted_string_attrs: &HashSet<String>,
@@ -4621,15 +4662,31 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
     schema: Option<crate::schema::OwnerBoundResourceSchema<'_>>,
     kind: ValidatableKind,
     context: &mut ResourceValidationContext<'_>,
+    projection: Option<
+        &mut Option<crate::schema::resource_value_validation::ResourceValueProjection<P, B>>,
+    >,
 ) {
     match schema {
         Some(schema) => {
             let is_string_literal = |attr: &str| quoted_string_attrs.contains(attr);
-            if let Err(errors) = schema.validate_with_resolver(
-                &crate::resource::attrs_to_hashmap(attributes),
-                &is_string_literal,
-                context.provider_context.custom_type_resolver(),
-            ) {
+            let values = crate::resource::attrs_to_hashmap(attributes);
+            let result = match projection {
+                Some(projection) => schema
+                    .project_validated_values_with_resolver(
+                        &values,
+                        &is_string_literal,
+                        context.provider_context.custom_type_resolver(),
+                    )
+                    .map(|checked| {
+                        *projection = Some(checked);
+                    }),
+                None => schema.validate_with_resolver(
+                    &values,
+                    &is_string_literal,
+                    context.provider_context.custom_type_resolver(),
+                ),
+            };
+            if let Err(errors) = result {
                 context
                     .all_errors
                     .extend(errors.into_iter().map(|error| format!("{id}: {error}")));
@@ -4695,6 +4752,46 @@ pub fn validate_resources<
     known_providers: &HashSet<String>,
     provider_context: &ProviderContext,
 ) -> Result<(), String> {
+    validate_resources_inner(parsed, registry, known_providers, provider_context, None)
+}
+
+pub fn validate_resources_for_canonicalization<
+    'schemas,
+    E,
+    P: crate::resource::PlaceholderKind,
+    T: crate::resource::PlaceholderKind,
+    D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
+    B: BindingAddress,
+>(
+    parsed: &crate::parser::File<E, P, T, D, B>,
+    registry: &'schemas SchemaRegistry,
+    known_providers: &HashSet<String>,
+    provider_context: &ProviderContext,
+) -> Result<crate::value::CheckedResourceCanonicalization<'schemas, P, B>, String> {
+    let mut roots = Vec::new();
+    validate_resources_inner(
+        parsed,
+        registry,
+        known_providers,
+        provider_context,
+        Some(&mut roots),
+    )?;
+    Ok(crate::value::CheckedResourceCanonicalization { registry, roots })
+}
+
+fn validate_resources_inner<
+    E,
+    P: crate::resource::PlaceholderKind,
+    T: crate::resource::PlaceholderKind,
+    D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
+    B: BindingAddress,
+>(
+    parsed: &crate::parser::File<E, P, T, D, B>,
+    registry: &SchemaRegistry,
+    known_providers: &HashSet<String>,
+    provider_context: &ProviderContext,
+    mut canonical: Option<&mut Vec<crate::value::CheckedResourceProjection<P, B>>>,
+) -> Result<(), String> {
     let mut all_errors = Vec::new();
     // A standalone module receives its providers from the caller, so schema
     // availability cannot be decided until its resources are expanded into a
@@ -4734,7 +4831,7 @@ pub fn validate_resources<
             provider_context,
             all_errors: &mut all_errors,
         };
-        for rref in parsed.iter_all_resources() {
+        for (resource_index, rref) in parsed.iter_all_resources().enumerate() {
             // A deferred for-expression template body is always managed —
             // `for` bodies never carry `read` / composition.
             match rref {
@@ -4746,9 +4843,15 @@ pub fn validate_resources<
                     registry.get_for_data_source(resource),
                     ValidatableKind::DataSource,
                     &mut context,
+                    None,
                 ),
                 ResourceRef::Resource(resource) => {
                     let schema = registry.get_for(resource);
+                    let mut projection = None;
+                    // Only the leading File.resources slice is consumed by
+                    // CanonicalizedResources. Conditional templates are still
+                    // validated, but are not members of that root slice.
+                    let project_root = resource_index < parsed.resources.len(); // allow: direct — module expansion, handled separately
                     validate_resource_values(
                         &resource.id,
                         &resource.quoted_string_attrs,
@@ -4756,7 +4859,18 @@ pub fn validate_resources<
                         schema,
                         ValidatableKind::Resource,
                         &mut context,
+                        canonical
+                            .as_ref()
+                            .filter(|_| project_root)
+                            .map(|_| &mut projection),
                     );
+                    if project_root && let Some(roots) = &mut canonical {
+                        roots.push(crate::value::CheckedResourceProjection {
+                            id: resource.id.clone(),
+                            original: resource.attributes.clone(),
+                            projection,
+                        });
+                    }
                     if let Some(schema) = schema
                         && let Err(errors) =
                             crate::resource::resolve_ignore_changes(resource, &schema)
@@ -4777,6 +4891,7 @@ pub fn validate_resources<
                         schema,
                         ValidatableKind::Resource,
                         &mut context,
+                        None,
                     );
                     if let Some(schema) = schema
                         && let Err(errors) =
@@ -7385,6 +7500,14 @@ impl std::fmt::Display for ModuleCallReferenceDiagnostic {
 impl std::error::Error for ModuleCallReferenceDiagnostic {}
 
 /// The sole message-rendering authority for module-call findings.
+/// Nested resource schema errors cannot enter this diagnostic variant.
+///
+/// ```compile_fail
+/// use carina_core::validation::{BindingUseFinding, ModuleCallFindingMessage};
+/// fn bypass(finding: BindingUseFinding) {
+///     let _ = ModuleCallFindingMessage::NestedResourceBindingUse(Box::new(finding));
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModuleCallFindingMessage {
     UnknownArgument {
@@ -7410,7 +7533,8 @@ pub enum ModuleCallFindingMessage {
         argument: String,
         error: Box<BindingResolutionError>,
     },
-    NestedResourceBindingUse(Box<BindingUseFinding>),
+    NestedResourceBindingUse(Box<BindingUseDiagnostic>),
+    ResourceValues(Box<ModuleResourceValueFinding>),
     ReferenceType(Box<ModuleCallReferenceDiagnostic>),
     TypeResolution(Box<crate::parser::Located<TypeResolutionDiagnostic>>),
     AttributeReference(Box<CompositionAttributeRefError>),
@@ -7450,7 +7574,8 @@ impl ModuleCallFindingMessage {
                 argument: _argument,
                 error,
             } => error.type_error(),
-            Self::NestedResourceBindingUse(finding) => finding.error.type_error(),
+            Self::NestedResourceBindingUse(_) => None,
+            Self::ResourceValues(_) => None,
             Self::UnknownArgument {
                 module: _module,
                 argument: _argument,
@@ -7503,6 +7628,7 @@ impl ModuleCallFindingMessage {
                 error: _,
             }
             | Self::NestedResourceBindingUse(_)
+            | Self::ResourceValues(_)
             | Self::ReferenceType(_)
             | Self::TypeResolution(_)
             | Self::AttributeReference(_)
@@ -7540,6 +7666,7 @@ impl ModuleCallFindingMessage {
                 error: _,
             }
             | Self::NestedResourceBindingUse(_)
+            | Self::ResourceValues(_)
             | Self::ReferenceType(_)
             | Self::TypeResolution(_)
             | Self::AttributeReference(_)
@@ -7573,6 +7700,7 @@ impl ModuleCallFindingMessage {
                 error: _,
             }
             | Self::NestedResourceBindingUse(_)
+            | Self::ResourceValues(_)
             | Self::ReferenceType(_)
             | Self::TypeResolution(_)
             | Self::AttributeReference(_)
@@ -7606,6 +7734,7 @@ impl ModuleCallFindingMessage {
                 error: _,
             }
             | Self::NestedResourceBindingUse(_)
+            | Self::ResourceValues(_)
             | Self::ReferenceType(_)
             | Self::TypeResolution(_)
             | Self::AttributeReference(_)
@@ -7640,6 +7769,7 @@ impl ModuleCallFindingMessage {
                 error: _,
             }
             | Self::NestedResourceBindingUse(_)
+            | Self::ResourceValues(_)
             | Self::TypeResolution(_)
             | Self::AttributeReference(_)
             | Self::Constraint(_) => false,
@@ -7675,6 +7805,7 @@ impl ModuleCallFindingMessage {
                 error: _,
             }
             | Self::NestedResourceBindingUse(_)
+            | Self::ResourceValues(_)
             | Self::ReferenceType(_)
             | Self::AttributeReference(_)
             | Self::Constraint(_) => None,
@@ -7727,9 +7858,10 @@ impl std::fmt::Display for ModuleCallFindingMessage {
                 formatter,
                 "{}: {} at line {}",
                 crate::utils::normalize_source_path(finding.use_site.source_file.path()).display(),
-                finding.error,
+                finding.inner.error,
                 finding.use_site.span.start_line(),
             ),
+            Self::ResourceValues(_) => formatter.write_str("Resource value validation failed"),
             Self::ReferenceType(error) => error.fmt(formatter),
             Self::TypeResolution(error) => error.detail().fmt(formatter),
             Self::AttributeReference(error) => error.fmt(formatter),
@@ -7767,6 +7899,7 @@ impl std::error::Error for ModuleCallFindingMessage {
                 error: _error,
             } => None,
             Self::NestedResourceBindingUse(finding) => Some(finding.as_ref()),
+            Self::ResourceValues(_) => None,
             Self::ReferenceType(_error) => None,
             Self::Constraint(_diagnostic) => None,
         }
@@ -7793,6 +7926,40 @@ pub struct ModuleCallFinding {
     anchor: ModuleCallFindingAnchor,
     message: ModuleCallFindingMessage,
     identity: Option<ModuleCallFindingIdentity>,
+}
+
+/// Core-issued nested resource data, available to frontends only through
+/// `ModuleCallFinding::report` and its resource-value branch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleResourceValueFinding {
+    value: crate::schema::ResourceValueFinding,
+}
+
+/// Frontends must consume nested resource failures through the value-report
+/// renderer, while module argument and reference checks keep their own owner.
+pub enum ModuleCallFindingReport<'a> {
+    Diagnostic(&'a ModuleCallFinding),
+    ResourceValues(ModuleResourceValueReport<'a>),
+}
+
+/// A nested resource error has one CLI source and editor projections at its
+/// callers. Caller projections never become additional CLI failures.
+pub struct ModuleResourceValueReport<'a> {
+    finding: &'a ModuleCallFinding,
+    value: &'a crate::schema::ResourceValueFinding,
+}
+
+impl ModuleResourceValueReport<'_> {
+    pub fn into_primary(self) -> crate::parser::Located<crate::schema::ResourceValueFinding> {
+        crate::parser::Located::new(self.finding.anchor.location().clone(), self.value.clone())
+    }
+    pub fn diagnostics(&self) -> Vec<crate::parser::Located<crate::schema::ResourceValueFinding>> {
+        self.finding
+            .locations()
+            .into_iter()
+            .map(|location| crate::parser::Located::new(location, self.value.clone()))
+            .collect()
+    }
 }
 
 impl ModuleCallFinding {
@@ -7972,7 +8139,30 @@ impl ModuleCallFinding {
         &self.owners
     }
 
+    pub fn report(&self) -> ModuleCallFindingReport<'_> {
+        match &self.message {
+            ModuleCallFindingMessage::ResourceValues(finding) => {
+                ModuleCallFindingReport::ResourceValues(ModuleResourceValueReport {
+                    finding: self,
+                    value: &finding.value,
+                })
+            }
+            _ => ModuleCallFindingReport::Diagnostic(self),
+        }
+    }
+
     pub fn diagnostics(&self) -> Vec<crate::parser::Located<&Self>> {
+        match self.report() {
+            ModuleCallFindingReport::ResourceValues(_) => Vec::new(),
+            ModuleCallFindingReport::Diagnostic(_) => self
+                .locations()
+                .into_iter()
+                .map(|location| crate::parser::Located::new(location, self))
+                .collect(),
+        }
+    }
+
+    fn locations(&self) -> Vec<crate::parser::DeclarationLocation> {
         let mut locations = vec![self.anchor.location().clone()];
         for owner in &self.owners {
             let location = owner.root.location();
@@ -7983,9 +8173,6 @@ impl ModuleCallFinding {
             }
         }
         locations
-            .into_iter()
-            .map(|location| crate::parser::Located::new(location, self))
-            .collect()
     }
 
     pub fn anchor(&self) -> &ModuleCallFindingAnchor {
@@ -8038,6 +8225,7 @@ impl std::error::Error for ModuleCallFinding {
                 error: _error,
             } => Some(&self.message),
             ModuleCallFindingMessage::NestedResourceBindingUse(_finding) => Some(&self.message),
+            ModuleCallFindingMessage::ResourceValues(_) => None,
             ModuleCallFindingMessage::ReferenceType(_error) => Some(&self.message),
             ModuleCallFindingMessage::Constraint(_diagnostic) => Some(&self.message),
         }
@@ -8224,13 +8412,19 @@ impl ModuleCallChecker<'_> {
                             owner: owner.clone(),
                         },
                     );
-                    self.check_nested_module(authority_file, checked_call, base_dir, &owner.root)?;
                 }
                 ModuleCallReferenceChecks::Skipped => {}
             }
+            self.check_nested_module(
+                authority_file,
+                checked_call,
+                base_dir,
+                &owner.root,
+                reference_checks,
+            )?;
         }
 
-        if matches!(reference_checks, ModuleCallReferenceChecks::Enabled) {
+        {
             for import in &authored.uses {
                 let called = authored
                     .module_calls
@@ -8240,7 +8434,7 @@ impl ModuleCallChecker<'_> {
                     let root = root_owner.cloned().unwrap_or_else(|| {
                         ModuleCallFindingOwnerSource::Authored(module_use_anchor(import))
                     });
-                    self.check_nested_import(import, base_dir, &root)?;
+                    self.check_nested_import(import, base_dir, &root, reference_checks)?;
                 }
             }
         }
@@ -8607,6 +8801,7 @@ impl ModuleCallChecker<'_> {
         call: &ModuleCall,
         base_dir: Option<&crate::paths::ResolvedPath>,
         root_owner: &ModuleCallFindingOwnerSource,
+        reference_checks: ModuleCallReferenceChecks,
     ) -> Result<(), crate::parser::AnalysisTreeError> {
         let Some(import) = file
             .uses
@@ -8615,7 +8810,7 @@ impl ModuleCallChecker<'_> {
         else {
             return Ok(());
         };
-        self.check_nested_import(import, base_dir, root_owner)?;
+        self.check_nested_import(import, base_dir, root_owner, reference_checks)?;
         Ok(())
     }
 
@@ -8624,6 +8819,7 @@ impl ModuleCallChecker<'_> {
         import: &crate::parser::UseStatement,
         base_dir: Option<&crate::paths::ResolvedPath>,
         root_owner: &ModuleCallFindingOwnerSource,
+        reference_checks: ModuleCallReferenceChecks,
     ) -> Result<(), crate::parser::AnalysisTreeError> {
         let Some(base_dir) = base_dir else {
             return Ok(());
@@ -8659,12 +8855,15 @@ impl ModuleCallChecker<'_> {
                 &self.source_overrides,
             )
         }) {
-            let resolution_errors = resolve_file_type_exprs(
-                &mut module,
-                self.provider_context
-                    .session()
-                    .expect("module checks borrow their run session"),
-            )?;
+            let resolution_errors = match reference_checks {
+                ModuleCallReferenceChecks::Enabled => resolve_file_type_exprs(
+                    &mut module,
+                    self.provider_context
+                        .session()
+                        .expect("module checks borrow their run session"),
+                )?,
+                ModuleCallReferenceChecks::Skipped => Vec::new(),
+            };
             let signatures = crate::module_resolver::load_resolved_module_signatures_with_overrides(
                 &module,
                 &module_dir,
@@ -8686,7 +8885,7 @@ impl ModuleCallChecker<'_> {
                     &signatures,
                 ),
             );
-            for finding in binding_use_report.resource_raw_findings() {
+            for finding in binding_use_report.resource_findings() {
                 let anchor = ModuleCallFindingAnchor::new(finding.use_site.location().clone());
                 self.push(
                     ModuleCallFindingKind::BindingUse,
@@ -8697,6 +8896,28 @@ impl ModuleCallChecker<'_> {
                     anchor,
                     ModuleCallFindingMessage::NestedResourceBindingUse(Box::new(finding.clone())),
                 );
+            }
+            for finding in binding_use_report.resource_value_findings() {
+                let crate::schema::ResourceValueTarget::Attribute {
+                    anchor: crate::schema::ValueFindingAnchor::BindingToken(token),
+                    ..
+                } = &finding.target
+                else {
+                    unreachable!("binding value report has a token anchor")
+                };
+                let anchor = ModuleCallFindingAnchor::new(token.location().clone());
+                self.push_finding(ModuleCallFinding {
+                    kind: ModuleCallFindingKind::BindingUse,
+                    owners: vec![ModuleCallFindingOwner {
+                        root: root_owner.clone(),
+                        immediate: ModuleCallFindingOwnerSource::Authored(anchor.clone()),
+                    }],
+                    anchor,
+                    message: ModuleCallFindingMessage::ResourceValues(Box::new(
+                        ModuleResourceValueFinding { value: finding },
+                    )),
+                    identity: None,
+                });
             }
             for error in resolution_errors {
                 let anchor = ModuleCallFindingAnchor::new(error.location().clone());
@@ -8710,18 +8931,33 @@ impl ModuleCallChecker<'_> {
                     ModuleCallFindingMessage::TypeResolution(Box::new(error)),
                 );
             }
-            self.check_file(
-                &module,
-                ModuleFileCheckContext {
-                    semantic: Some(&module),
-                    base_dir: Some(&module_dir),
-                    signatures: &signatures,
-                    binding_use_report: &binding_use_report,
-                    bindings: &bindings,
-                    root_owner: Some(root_owner),
-                    reference_checks: ModuleCallReferenceChecks::Enabled,
-                },
-            )?;
+            match reference_checks {
+                ModuleCallReferenceChecks::Enabled => self.check_file(
+                    &module,
+                    ModuleFileCheckContext {
+                        semantic: Some(&module),
+                        base_dir: Some(&module_dir),
+                        signatures: &signatures,
+                        binding_use_report: &binding_use_report,
+                        bindings: &bindings,
+                        root_owner: Some(root_owner),
+                        reference_checks,
+                    },
+                )?,
+                ModuleCallReferenceChecks::Skipped => {
+                    // Recovery still checks resource binding readiness in
+                    // every imported module. Nested argument/reference checks
+                    // retain their existing later validation boundary.
+                    for import in &module.uses {
+                        self.check_nested_import(
+                            import,
+                            Some(&module_dir),
+                            root_owner,
+                            reference_checks,
+                        )?;
+                    }
+                }
+            }
         }
 
         self.active_modules.remove(&guard);

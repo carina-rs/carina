@@ -263,12 +263,22 @@ impl EnumValueResolver<'_, Compiled> {
     pub(crate) fn resolve_authored_string(
         &self,
         text: &super::ValueString,
+        run: &mut crate::schema::NativeValidatorRunner<'_>,
     ) -> Result<CanonicalEnumValue, TypeError> {
-        self.resolve_text(
+        self.resolve_text_with(
             text.expose_plaintext(),
             EnumInputPhase::StateText,
             Some(text),
+            run,
         )
+    }
+
+    pub(crate) fn resolve_raw_with(
+        &self,
+        raw: &RawEnumIdentifier,
+        run: &mut crate::schema::NativeValidatorRunner<'_>,
+    ) -> Result<CanonicalEnumValue, TypeError> {
+        self.resolve_text_with(raw.as_str(), EnumInputPhase::RawDsl, None, run)
     }
 
     pub fn resolve_raw(&self, raw: &RawEnumIdentifier) -> Result<CanonicalEnumValue, TypeError> {
@@ -313,19 +323,29 @@ impl EnumValueResolver<'_, Compiled> {
     /// Map keys can use API spellings or qualified DSL identifiers. Select
     /// their interpretation before validation so a failing callback is never
     /// retried as a different spelling of the same leaf.
-    pub(crate) fn resolve_map_key(&self, text: &str) -> Result<CanonicalEnumValue, TypeError> {
+    pub(crate) fn resolve_map_key(
+        &self,
+        text: &str,
+        run: &mut crate::schema::NativeValidatorRunner<'_>,
+    ) -> Result<CanonicalEnumValue, TypeError> {
         let (_, values, _, _, _) = self.parts()?;
         let valid: Vec<_> = values.into_iter().flatten().map(String::as_str).collect();
-        let phase = if values.is_none()
-            || matches!(
-                state_text_valid_value_match(text, &valid),
-                StateTextValidValueMatch::Unique(_)
-            ) {
+        let qualified_dsl = matches!(
+            RawEnumIdentifier::parse(text).parsed(),
+            RawEnumIdentifierParts::TypeQualified { .. }
+                | RawEnumIdentifierParts::ProviderQualified { .. }
+                | RawEnumIdentifierParts::FullyQualified { .. }
+        );
+        let api_member = matches!(
+            state_text_valid_value_match(text, &valid),
+            StateTextValidValueMatch::Unique(_)
+        );
+        let phase = if api_member || (values.is_none() && !qualified_dsl) {
             EnumInputPhase::StateText
         } else {
             EnumInputPhase::RawDsl
         };
-        self.resolve_text(text, phase, None)
+        self.resolve_text_with(text, phase, None, run)
     }
 
     fn resolve_text(
@@ -333,6 +353,16 @@ impl EnumValueResolver<'_, Compiled> {
         text: &str,
         phase: EnumInputPhase,
         quoted: Option<&super::ValueString>,
+    ) -> Result<CanonicalEnumValue, TypeError> {
+        self.resolve_text_with(text, phase, quoted, &mut |callback, value| callback(value))
+    }
+
+    fn resolve_text_with(
+        &self,
+        text: &str,
+        phase: EnumInputPhase,
+        quoted: Option<&super::ValueString>,
+        run: &mut crate::schema::NativeValidatorRunner<'_>,
     ) -> Result<CanonicalEnumValue, TypeError> {
         let (identity, values, dsl_aliases, validate, dsl_map) = self.parts()?;
         if let (Some(text), Some(values)) = (quoted, values) {
@@ -425,9 +455,12 @@ impl EnumValueResolver<'_, Compiled> {
         // spelling; source-facing namespace checks have already run for
         // RawDsl input above.
         let validation_result = validate.map(|validate| {
-            validate(&crate::resource::Value::Concrete(
-                crate::resource::ConcreteValue::String(api_value.clone().into()),
-            ))
+            run(
+                validate,
+                &crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                    api_value.clone().into(),
+                )),
+            )
         });
         let validation_ok = !enumerated && validation_result.as_ref().is_none_or(Result::is_ok);
 

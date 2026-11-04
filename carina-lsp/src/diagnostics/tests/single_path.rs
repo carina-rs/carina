@@ -19,6 +19,132 @@ fn round2_source_diagnostics(field_type: AttributeType, source: &str) -> Vec<Dia
 }
 
 #[test]
+fn round3_coalesce_binding_sources_keep_each_operand() {
+    for value in ["good ?? bad", "bad ?? good", "[good ?? bad]"] {
+        let leaf = AttributeType::refined_string(None, None, Some((None, Some(1))), None);
+        let field = if value.starts_with('[') {
+            AttributeType::list(leaf)
+        } else {
+            leaf
+        };
+        let source = format!(
+            "let good = \"a\"\nlet bad = \"abcd\"\nmock.test.Collection {{ params = {value} }}\n"
+        );
+        let diagnostics = round2_source_diagnostics(field, &source);
+        assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:#?}");
+        assert!(
+            diagnostics[0].message.contains("length 4"),
+            "{diagnostics:#?}"
+        );
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+        let bad_column = source.lines().last().unwrap().find("bad").unwrap() as u32;
+        assert_eq!(
+            diagnostics[0].range.start.character, bad_column,
+            "{diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn round3_known_reference_keeps_invalid_coalesce_default() {
+    let diagnostics = round2_source_diagnostics(
+        AttributeType::string(),
+        "let producer = mock.test.Collection { params = \"known\" }\nmock.test.Collection { params = producer.params ?? 42 }\n",
+    );
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert!(
+        diagnostics[0].message.contains("expected String, got Int"),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn round3_conditional_concrete_branches_stay_in_core() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Collection")
+            .attribute(AttributeSchema::optional("params", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("arguments.crn"),
+        "arguments { flag: Bool }\n",
+    )
+    .unwrap();
+    let source = "mock.test.Collection { params = if flag { 1 } else { 2 } }\n";
+    let path = directory.path().join("main.crn");
+    std::fs::write(&path, source).unwrap();
+    let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn round3_expansion_merges_substituted_actual_types() {
+    let diagnostics = round2_source_diagnostics(
+        AttributeType::string(),
+        "let copies = for x in [1, false] {\n  mock.test.Collection { params = x }\n}\n",
+    );
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn round3_expansion_merges_substituted_map_keys_and_preserves_operands() {
+    let diagnostics = round2_source_diagnostics(
+        AttributeType::map(AttributeType::string()),
+        "let copies = for x in [{ first = 1 }, { second = false }] {\n  mock.test.Collection { params = x }\n}\n",
+    );
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    let diagnostics = round2_source_diagnostics(
+        AttributeType::map(AttributeType::string()),
+        "let x = { first = 1 }\nlet y = { second = false }\nmock.test.Collection { params = x ?? y }\n",
+    );
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+}
+
+#[test]
+fn round3_secret_interpolation_redacts_every_diagnostic() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Secret")
+            .attribute(AttributeSchema::optional("text", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("params", AttributeType::int()).build())
+            .validate()
+            .unwrap(),
+    );
+    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    let source = "let producer = mock.test.Secret {}\nmock.test.Secret { params = secret(\"private-${producer.text}\") }\n";
+    let path = directory.path().join("main.crn");
+    std::fs::write(&path, source).unwrap();
+    let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert!(!diagnostics.is_empty());
+    for diagnostic in &diagnostics {
+        for rendered in [
+            diagnostic.message.clone(),
+            format!("{diagnostic:?}"),
+            serde_json::to_string(diagnostic).unwrap(),
+        ] {
+            assert!(!rendered.contains("private-"), "{rendered}");
+        }
+    }
+}
+
+#[test]
 fn round2_for_binding_outcomes_follow_parser_instance() {
     for expression in ["x", "[x]"] {
         let leaf = AttributeType::refined_string(None, None, Some((None, Some(1))), None);
@@ -151,27 +277,13 @@ fn for_expansion_reports_one_list_count_error_per_authored_token() {
 }
 
 fn collection_diagnostics(field_type: AttributeType, value: &str) -> Vec<Diagnostic> {
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "mock",
-        ResourceSchema::new("test.Collection")
-            .attribute(AttributeSchema::optional("params", field_type).build())
-            .validate()
-            .unwrap(),
-    );
-    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
-    let directory = tempfile::tempdir().unwrap();
-    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
     let prefix = if value.contains("producer") {
         "let producer = mock.test.Collection {}\n"
     } else {
         ""
     };
     let source = format!("{prefix}mock.test.Collection {{\n  params = {value}\n}}\n");
-    let path = directory.path().join("main.crn");
-    std::fs::write(&path, &source).unwrap();
-    let document = create_document_at(&source, path.clone());
-    engine.analyze(&document, Some(&path))
+    round2_source_diagnostics(field_type, &source)
 }
 
 #[test]

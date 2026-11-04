@@ -6,6 +6,290 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
+fn round3_checked_canonicalization_consumes_the_validation_fit() {
+    for change_input in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let key = AttributeType::enum_(
+            TypeIdentity::new(Some("mock"), ["test"], "Key"),
+            None,
+            vec![],
+            Some(validator(move |value| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(value, &Value::Concrete(ConcreteValue::String("ok".into())));
+                Ok(())
+            })),
+            None,
+        );
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "mock",
+            ResourceSchema::new("test.Sink")
+                .attribute(
+                    AttributeSchema::optional(
+                        "params",
+                        AttributeType::map_with_key(key, AttributeType::string()),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let mut parsed = crate::parser::parse_file(
+            "mock.test.Sink { params = { \"mock.test.Key.ok\" = \"value\" } }\n",
+            std::path::Path::new("main.crn"),
+            &context,
+        )
+        .unwrap();
+        let checked = crate::validation::validate_resources_for_canonicalization(
+            &parsed,
+            &registry,
+            &std::collections::HashSet::from(["mock".into()]),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        if change_input {
+            parsed.resources[0]
+                .attributes
+                .insert("params".into(), Value::Concrete(ConcreteValue::Int(1)));
+        }
+        assert_eq!(
+            checked.canonicalize(&mut parsed.resources).is_err(),
+            change_input
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        if !change_input {
+            let Value::Concrete(ConcreteValue::Map(values)) =
+                &parsed.resources[0].attributes["params"]
+            else {
+                panic!("map")
+            };
+            assert!(values.contains_key("ok"), "{values:?}");
+        }
+    }
+}
+
+#[test]
+fn round3_checked_canonicalization_keeps_conditional_fits() {
+    let mut registry = SchemaRegistry::new();
+    let key = AttributeType::enum_(
+        TypeIdentity::new(Some("mock"), ["test"], "Key"),
+        Some(vec!["ok".into()]),
+        vec![],
+        Some(validator(|_| Ok(()))),
+        None,
+    );
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "params",
+                    AttributeType::map_with_key(key, AttributeType::string()),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let mut parsed = crate::parser::parse_file("arguments { flag: Bool }\nmock.test.Sink { params = if flag { { \"mock.test.Key.ok\" = \"a\" } } else { { \"mock.test.Key.ok\" = \"b\" } } }\n", std::path::Path::new("main.crn"), &context).unwrap();
+    let checked = crate::validation::validate_resources_for_canonicalization(
+        &parsed,
+        &registry,
+        &std::collections::HashSet::from(["mock".into()]),
+        &context,
+    )
+    .unwrap();
+    assert!(checked.canonicalize(&mut parsed.resources).is_ok());
+    let Value::Deferred(crate::resource::DeferredValue::ModuleIf(conditional)) =
+        &parsed.resources[0].attributes["params"]
+    else {
+        panic!("conditional")
+    };
+    for branch in [conditional.then_value(), conditional.else_value()] {
+        let Value::Concrete(ConcreteValue::Map(values)) = branch else {
+            panic!("map")
+        };
+        assert!(values.contains_key("ok"), "{values:?}");
+    }
+}
+
+#[test]
+fn round3_enum_union_reuses_the_native_callback_outcome() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let callback = validator(move |_| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Err(TypeError::ValidationFailed {
+            message: "reject".into(),
+        })
+    });
+    let member = |name| {
+        AttributeType::enum_(
+            TypeIdentity::new(Some("mock"), ["test"], name),
+            None,
+            vec![],
+            Some(callback.clone()),
+            None,
+        )
+    };
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "params",
+                    AttributeType::union(vec![member("First"), member("Second")]),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let schema = registry
+        .get("mock", "test.Sink", SchemaKind::Resource)
+        .unwrap();
+    let values: HashMap<String, Value> = HashMap::from([(
+        "params".into(),
+        Value::Concrete(ConcreteValue::enum_identifier("bad")),
+    )]);
+    let resolver = |_: CustomTypeValidationTarget<'_>, _: &Value| panic!("native");
+    assert!(
+        !schema
+            .collect_validation_with_resolver(&values, &|_| false, &resolver)
+            .is_empty()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    calls.store(0, Ordering::SeqCst);
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "params",
+                    AttributeType::map_with_key(
+                        AttributeType::union(vec![member("First"), member("Second")]),
+                        member("First"),
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let schema = registry
+        .get("mock", "test.Sink", SchemaKind::Resource)
+        .unwrap();
+    let values: HashMap<String, Value> = HashMap::from([(
+        "params".into(),
+        Value::Concrete(ConcreteValue::Map(
+            indexmap::indexmap! { "bad".into() => Value::Concrete(ConcreteValue::String("bad".into())) },
+        )),
+    )]);
+    assert!(
+        !schema
+            .collect_validation_with_resolver(&values, &|_| false, &resolver)
+            .is_empty()
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "key and value are distinct authored leaves"
+    );
+}
+
+#[test]
+fn round3_union_caches_callbacks_independently_of_portable_refinements() {
+    for native in [true, false] {
+        for rejecting in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&calls);
+            let callback = validator(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                if rejecting {
+                    Err(TypeError::ValidationFailed {
+                        message: "rejected".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            });
+            let identity = TypeIdentity::new(Some("mock"), ["test"], "Counted");
+            let leaf = |max| {
+                if native {
+                    AttributeType::refined_string_with_validator(
+                        identity.clone(),
+                        None,
+                        Some((None, Some(max))),
+                        callback.clone(),
+                        None,
+                    )
+                } else {
+                    AttributeType::refined_string(
+                        Some(identity.clone()),
+                        None,
+                        Some((None, Some(max))),
+                        None,
+                    )
+                }
+            };
+            let mut registry = SchemaRegistry::new();
+            registry.insert(
+                "mock",
+                ResourceSchema::new("test.Sink")
+                    .attribute(
+                        AttributeSchema::optional(
+                            "params",
+                            AttributeType::union(vec![leaf(3), leaf(4)]),
+                        )
+                        .build(),
+                    )
+                    .validate()
+                    .unwrap(),
+            );
+            let schema = registry
+                .get("mock", "test.Sink", SchemaKind::Resource)
+                .unwrap();
+            let values: HashMap<String, Value> = HashMap::from([(
+                "params".into(),
+                Value::Concrete(ConcreteValue::String("ok".into())),
+            )]);
+            let resolver = |_: CustomTypeValidationTarget<'_>, _: &Value| {
+                assert!(!native, "native validator must not bridge");
+                calls.fetch_add(1, Ordering::SeqCst);
+                if rejecting {
+                    Err(CustomTypeValidationError::Rejected {
+                        owner: "mock".into(),
+                        identity: identity.clone(),
+                        message: "rejected".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            };
+            let findings = schema.collect_validation_with_resolver(&values, &|_| false, &resolver);
+            assert_eq!(findings.is_empty(), !rejecting, "{findings:#?}");
+            assert_eq!(
+                calls.swap(0, Ordering::SeqCst),
+                1,
+                "rejecting={rejecting}: {findings:#?}"
+            );
+            assert_eq!(
+                schema
+                    .validate_with_resolver(&values, &|_| false, &resolver)
+                    .is_err(),
+                rejecting
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+#[test]
 fn round2_union_reuses_rejecting_leaf_across_arms_and_keeps_operands() {
     for native in [true, false] {
         for coalesce in [false, true] {

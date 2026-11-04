@@ -133,6 +133,7 @@ pub(crate) struct ParseContext<'cfg, Source = AuthoredDiagnosticSource> {
     /// control-flow expressions defer only that provisional case; the final
     /// parse runs with this disabled and reports the classified error.
     pub(super) defer_provisional_static_conditions: bool,
+    pub(super) preserve_resource_value_branches: bool,
     /// Shared parser-side provenance recorder. Real lexical child contexts
     /// share it; expression parsing never clones the context merely to change
     /// sink behavior.
@@ -306,6 +307,7 @@ impl<'cfg, Source: Clone> ParseContext<'cfg, Source> {
             seeded_bindings: HashSet::new(),
             pending_function_type_checks: Rc::new(RefCell::new(Vec::new())),
             defer_provisional_static_conditions: false,
+            preserve_resource_value_branches: false,
             parsed_binding_uses: Rc::new(RefCell::new(ParsedBindingUses::default())),
             binding_scope: BindingScopeId::root(&source_file),
             binding_scope_source_file: source_file,
@@ -607,6 +609,7 @@ struct ExpressionSink<'a> {
     source_file: &'a std::path::Path,
     preprocessed_file: &'a super::PreprocessedFile,
     structural: StructuralSinkMode,
+    branches: Vec<super::ValueBranch>,
 }
 
 impl ExpressionMode<'_> {
@@ -633,6 +636,7 @@ impl<'a> ExpressionMode<'a> {
                 source_file,
                 preprocessed_file,
                 structural: StructuralSinkMode::Pending,
+                branches: Vec::new(),
             }),
             source: Some(IntegerOperandContext {
                 source_file,
@@ -663,6 +667,7 @@ impl<'a> ExpressionMode<'a> {
                 source_file,
                 preprocessed_file,
                 structural,
+                branches: Vec::new(),
             }),
             source: Some(IntegerOperandContext {
                 source_file,
@@ -717,6 +722,7 @@ impl<'a> ExpressionMode<'a> {
             sink: Some(ExpressionSink {
                 root_path: path.clone(),
                 path,
+                branches: Vec::new(),
                 ..sink.clone()
             }),
             source: self.source,
@@ -735,6 +741,20 @@ impl<'a> ExpressionMode<'a> {
 
     pub(super) fn at_list_index(&self, index: usize) -> Self {
         self.with_segment(AttributePathSegment::ListIndex(index))
+    }
+
+    pub(super) fn at_branch(&self, branch: super::ValueBranch) -> Self {
+        let mut mode = self.clone();
+        if let Some(sink) = &mut mode.sink {
+            sink.branches.push(branch);
+        }
+        mode
+    }
+
+    pub(super) fn has_resource_sink(&self) -> bool {
+        self.sink
+            .as_ref()
+            .is_some_and(|sink| matches!(sink.owner, BindingUseOwner::Resource(_)))
     }
 
     pub(super) fn at_key(&self, key: impl Into<String>) -> Self {
@@ -835,6 +855,7 @@ impl<'a> ExpressionMode<'a> {
             name: name.to_string(),
             span: SourceSpan::from_pest(token, sink.preprocessed_file),
             binding,
+            branches: sink.branches.clone(),
         };
         let pending_slot = (matches!(&source, BareBindingSource::Structural(_))
             && sink.structural == StructuralSinkMode::Pending)

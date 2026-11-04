@@ -218,6 +218,128 @@ fn round2_cli_accepts_qualified_enum_map_keys() {
     assert!(diagnostics.is_empty(), "{diagnostics:#?}");
 }
 
+#[test]
+fn round3_cli_open_enum_qualified_key_validates_only_member_once() {
+    use carina_core::schema::{TypeError, TypeIdentity, validator};
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&calls);
+    let key = AttributeType::enum_(
+        TypeIdentity::new(Some("mock"), ["test"], "Key"),
+        None,
+        vec![],
+        Some(validator(move |value| {
+            let Value::Concrete(ConcreteValue::String(text)) = value else {
+                panic!("{value:?}")
+            };
+            observed
+                .lock()
+                .unwrap()
+                .push(text.expose_plaintext().to_string());
+            if text.expose_plaintext() == "ok" {
+                Ok(())
+            } else {
+                Err(TypeError::ValidationFailed {
+                    message: "only member spelling ok is accepted".into(),
+                })
+            }
+        })),
+        None,
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "params",
+                    AttributeType::map_with_key(key, AttributeType::string()),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider mock {}\n"),
+        (
+            "main.crn",
+            "mock.test.Sink { params = { \"mock.test.Key.ok\" = \"ok\" } }\n",
+        ),
+    ]);
+    let diagnostics = cli_diagnostics(factories_for(&schemas), &fixture);
+    assert!(
+        diagnostics.is_empty(),
+        "{diagnostics:#?}; calls={:?}",
+        calls.lock().unwrap()
+    );
+    assert_eq!(*calls.lock().unwrap(), ["ok"]);
+    calls.lock().unwrap().clear();
+    let diagnostics = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+}
+
+#[test]
+fn round3_factory_does_not_repeat_rejected_portable_leaf() {
+    let field = AttributeType::refined_string(
+        Some(carina_core::schema::TypeIdentity::bare("VpcId")),
+        None,
+        Some((None, Some(3))),
+        None,
+    );
+    let schemas = single_schema_map(
+        ResourceSchema::new("ec2.vpc")
+            .attribute(AttributeSchema::optional("params", field).build()),
+    );
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider test {}\n"),
+        ("main.crn", "test.ec2.vpc { params = \"abcd\" }\n"),
+    ]);
+    let engine = engine_with_schemas(schemas.clone());
+    let diagnostics = lsp_diagnostics(&engine, &fixture, "main.crn");
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert!(diagnostics[0].message.contains("length 4"));
+    let diagnostics = cli_diagnostics(factories_for(&schemas), &fixture);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+}
+
+#[test]
+fn round3_nested_resource_value_error_matches_cli_once() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(AttributeSchema::optional("params", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider mock {}\n"),
+        (
+            "main.crn",
+            "let child = use { source = \"./child\" }\nchild {}\n",
+        ),
+    ]);
+    std::fs::create_dir(fixture.path().join("child")).unwrap();
+    std::fs::write(
+        fixture.path().join("child/main.crn"),
+        "arguments { enabled: Bool = true }\nlet bad = 42\nmock.test.Sink { params = bad }\n",
+    )
+    .unwrap();
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    assert_eq!(cli.len(), 1, "{cli:#?}");
+    assert!(cli[0].contains("expected String, got Int"), "{cli:#?}");
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    assert_eq!(lsp.len(), 1, "{lsp:#?}");
+    assert_eq!(
+        lsp[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+    assert!(
+        lsp[0].message.contains("expected String, got Int"),
+        "{lsp:#?}"
+    );
+}
+
 fn single_schema_map(schema: ResourceSchema) -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(

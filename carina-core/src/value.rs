@@ -5795,6 +5795,20 @@ pub(crate) fn canonical_json_with_fit<H: ValueKind, B: BindingAddress>(
     value_to_json_inner(&canonical, None, false, JsonEncoding::Ordinary).ok()
 }
 
+pub(crate) fn canonicalize_validated_value<H: ValueKind, B: BindingAddress>(
+    value: Value<H, B>,
+    fit: &crate::schema::Fit<'_>,
+    defs: &BTreeMap<String, AttributeType>,
+) -> Result<Value<H, B>, crate::schema::TypeError> {
+    canonicalize_with_fit(
+        value,
+        fit,
+        defs,
+        CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+        RejectEnumResolutionErrors,
+    )
+}
+
 /// Consume a successful fit witness without re-validating any selected Union
 /// member or re-resolving any enum. The value and witness have identical tree
 /// shapes by construction.
@@ -5830,6 +5844,29 @@ fn canonicalize_with_fit<H: ValueKind, B: BindingAddress, P: CanonicalizationErr
                 value: Box::new(value),
                 default: Box::new(default),
             }))
+        }
+        (
+            Value::Deferred(DeferredValue::ModuleIf(mut conditional)),
+            crate::schema::FitKind::Conditional {
+                then_value,
+                else_value,
+            },
+        ) => {
+            conditional.then_value = canonicalize_with_fit(
+                conditional.then_value,
+                then_value,
+                defs,
+                purpose,
+                error_policy,
+            )?;
+            conditional.else_value = canonicalize_with_fit(
+                conditional.else_value,
+                else_value,
+                defs,
+                purpose,
+                error_policy,
+            )?;
+            Ok(Value::Deferred(DeferredValue::ModuleIf(conditional)))
         }
         (value, crate::schema::FitKind::Union { member, fit }) => {
             // The witness retains the declaration member as well as its
@@ -6550,6 +6587,81 @@ pub struct CanonicalizedResources<
 impl<'a, S, H: PlaceholderKind, B: BindingAddress, D> CanonicalizedResources<'a, S, H, B, D> {
     pub(crate) fn into_mut_slice(self) -> &'a mut [crate::resource::Resource<S, H, B, D>] {
         self.resources
+    }
+}
+
+/// Successful validation retains canonical values from that same fit walk.
+/// The original parser instance and complete inputs bind each projection to
+/// its source; changing inputs invalidates this proof instead of replaying
+/// callbacks during canonicalization.
+///
+/// ```compile_fail
+/// use carina_core::{schema::SchemaRegistry, value::CheckedResourceCanonicalization};
+/// fn bypass(registry: &SchemaRegistry) {
+///     let _: CheckedResourceCanonicalization<'_, carina_core::resource::NoPlaceholder,
+///         carina_core::resource::AbsoluteBindingAddress> =
+///         CheckedResourceCanonicalization { registry, roots: Vec::new() };
+/// }
+/// ```
+pub struct CheckedResourceCanonicalization<'a, H: PlaceholderKind, B: BindingAddress> {
+    pub(crate) registry: &'a crate::schema::SchemaRegistry,
+    pub(crate) roots: Vec<CheckedResourceProjection<H, B>>,
+}
+
+pub(crate) struct CheckedResourceProjection<H: PlaceholderKind, B: BindingAddress> {
+    pub id: crate::resource::ResourceId,
+    pub original: IndexMap<String, Value<H, B>>,
+    pub projection: Option<crate::schema::resource_value_validation::ResourceValueProjection<H, B>>,
+}
+
+impl<H: PlaceholderKind, B: BindingAddress> CheckedResourceCanonicalization<'_, H, B> {
+    pub fn canonicalize<'a, S, D>(
+        self,
+        resources: &'a mut [crate::resource::Resource<S, H, B, D>],
+    ) -> Result<CanonicalizedResources<'a, S, H, B, D>, EnumCanonicalizationError> {
+        let mismatch = |id| {
+            EnumCanonicalizationError::new(
+                id,
+                "<resource>",
+                crate::schema::TypeError::ValidationFailed {
+                    message: "resource inputs changed after value validation".into(),
+                },
+            )
+        };
+        if resources.len() != self.roots.len() {
+            return Err(mismatch(
+                resources
+                    .first()
+                    .map(|resource| resource.id.clone())
+                    .or_else(|| self.roots.first().map(|root| root.id.clone()))
+                    .expect("different resource counts cannot both be empty"),
+            ));
+        }
+        if let Some((resource, _)) =
+            resources
+                .iter()
+                .zip(&self.roots)
+                .find(|(resource, checked)| {
+                    resource.id != checked.id || resource.attributes != checked.original
+                })
+        {
+            return Err(mismatch(resource.id.clone()));
+        }
+        for (resource, checked) in resources.iter_mut().zip(self.roots) {
+            if let Some(projection) = checked.projection {
+                let canonical = projection.canonical.map_err(|(name, error)| {
+                    EnumCanonicalizationError::new(resource.id.clone(), name, error)
+                })?;
+                // Retain authored attribute order, including aliases and unknown
+                // fields. Only values change at this consuming transition.
+                for (name, value) in &mut resource.attributes {
+                    *value = canonical[name].clone();
+                }
+            } else {
+                canonicalize_resources_with_schemas(std::slice::from_mut(resource), self.registry)?;
+            }
+        }
+        Ok(CanonicalizedResources { resources })
     }
 }
 

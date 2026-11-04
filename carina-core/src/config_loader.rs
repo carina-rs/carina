@@ -313,6 +313,12 @@ impl AuthoredBindingView {
     pub(crate) fn parsed(&self) -> &ParsedFile {
         &self.parsed
     }
+
+    /// Source-oriented resource expressions with directory binding
+    /// classification, before reference resolution can select a coalesce arm.
+    pub fn analysis(&self) -> Result<parser::AnalysisTree<'_>, parser::AnalysisTreeError> {
+        parser::AnalysisTree::try_from_file(&self.parsed)
+    }
 }
 
 /// The pre-resource-resolution configuration snapshot used for schema-aware

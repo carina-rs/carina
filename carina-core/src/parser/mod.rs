@@ -11,6 +11,7 @@ pub use analysis::{
 };
 mod ast;
 pub(crate) use ast::ParserSeedMetadata;
+pub(crate) use ast::ValueBranch;
 mod blocks;
 mod config;
 mod context;

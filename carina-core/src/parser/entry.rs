@@ -259,7 +259,8 @@ pub fn parse_file(
     config: &ProviderContext,
 ) -> Result<ParsedFile, ParseError> {
     let user_functions = resolve_top_level_user_functions(&[(path, input)], config)?;
-    let parsed = parse_with_seeded_bindings_inner(input, config, &[], &user_functions, true, path)?;
+    let parsed =
+        parse_with_seeded_bindings_inner(input, config, &[], &user_functions, true, path, false)?;
     super::resolve::reject_cyclic_let_bindings(&parsed)?;
     Ok(parsed)
 }
@@ -728,6 +729,7 @@ pub(crate) fn parse_with_seeded_bindings(
         &user_functions,
         true,
         std::path::Path::new("test.crn"),
+        false,
     )
 }
 
@@ -938,6 +940,7 @@ pub(crate) fn parse_with_directory_context(
         user_functions,
         bindings_fully_classified,
         source_file,
+        true,
     )
 }
 
@@ -948,6 +951,7 @@ fn parse_with_seeded_bindings_inner(
     seeded_user_functions: &HashMap<String, UserFunction>,
     bindings_fully_classified: bool,
     source_file: &std::path::Path,
+    preserve_resource_value_branches: bool,
 ) -> Result<ParsedFile, ParseError> {
     let preprocessed_file = Arc::new(super::preprocess_file(input)?);
     let pairs = preprocessed_file.parse()?;
@@ -963,6 +967,7 @@ fn parse_with_seeded_bindings_inner(
 
     let mut ctx = ParseContext::new(config, source_file, Arc::clone(&preprocessed_file));
     ctx.defer_provisional_static_conditions = !bindings_fully_classified;
+    ctx.preserve_resource_value_branches = preserve_resource_value_branches;
     ctx.extend_warnings(single_quote_warnings);
     seed_bindings(&mut ctx, seeds);
     ctx.extend_user_functions(seeded_user_functions.clone());

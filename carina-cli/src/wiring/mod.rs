@@ -3026,6 +3026,27 @@ pub fn validate_resources_with_ctx<
     ))
 }
 
+pub fn validate_resources_for_canonicalization_with_ctx<
+    'ctx,
+    E,
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+    B: BindingAddress,
+    D: carina_core::parser::DeferredForPhaseTraversal<P, T, B>,
+>(
+    ctx: &'ctx WiringContext,
+    parsed: &carina_core::parser::File<E, P, T, D, B>,
+    provider_context: &carina_core::parser::ProviderContext,
+) -> Result<carina_core::value::CheckedResourceCanonicalization<'ctx, P, B>, Vec<AppError>> {
+    validation::validate_resources_for_canonicalization(
+        parsed,
+        ctx.schemas(),
+        ctx.known_providers(),
+        provider_context,
+    )
+    .map_err(|error| split_validation_message(&error))
+}
+
 /// Surface `directives.depends_on` analysis-pass error diagnostics as
 /// `AppError::Validation`. Warnings are emitted to stderr (no
 /// AppError::Warning variant exists today) so they don't fail the

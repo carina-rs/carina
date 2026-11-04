@@ -3897,6 +3897,15 @@ pub enum BareBindingKind {
     },
 }
 
+/// An operand's authored identity within one resource value expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ValueBranch {
+    CoalesceValue,
+    CoalesceDefault,
+    Then,
+    Else,
+}
+
 /// Authored provenance for one bare identifier resolved by normal lexical
 /// lookup. This data is parser-only and never enters [`Value`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3909,6 +3918,7 @@ pub struct BareBindingUse {
     pub name: String,
     pub span: SourceSpan,
     pub binding: BareBindingKind,
+    pub(crate) branches: Vec<ValueBranch>,
 }
 
 impl BareBindingUse {

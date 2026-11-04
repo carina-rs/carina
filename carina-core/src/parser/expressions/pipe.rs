@@ -142,9 +142,21 @@ pub(crate) fn parse_coalesce_expr_with_mode(
     mode: &ExpressionMode<'_>,
 ) -> Result<EvalValue, ParseError> {
     let line = pair.line_col().0;
-    let mut values = pair
-        .into_inner()
-        .map(|pair| parse_pipe_expr_with_mode(pair, ctx, mode))
+    let operands = pair.into_inner().collect::<Vec<_>>();
+    let count = operands.len();
+    let mut values = operands
+        .into_iter()
+        .enumerate()
+        .map(|(index, pair)| {
+            let mut operand = mode.clone();
+            for _ in 0..index {
+                operand = operand.at_branch(crate::parser::ValueBranch::CoalesceDefault);
+            }
+            if index + 1 < count {
+                operand = operand.at_branch(crate::parser::ValueBranch::CoalesceValue);
+            }
+            parse_pipe_expr_with_mode(pair, ctx, &operand)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let mut result = values
         .pop()
@@ -154,7 +166,29 @@ pub(crate) fn parse_coalesce_expr_with_mode(
     // Parse every operand before folding so syntax and diagnostics in later
     // defaults are retained even when an earlier concrete value wins.
     while let Some(value) = values.pop() {
-        result = combine_coalesce_operands(value, result, line)?;
+        // Resource diagnostics own every authored operand, even if evaluation
+        // will choose a known left value. Runtime reference resolution still
+        // folds this expression normally after the authored snapshot is kept.
+        result = if ctx.preserve_resource_value_branches
+            && mode.has_resource_sink()
+            && !matches!(value, EvalValue::PendingValue(_))
+            && !matches!(result, EvalValue::PendingValue(_))
+        {
+            EvalValue::from_value(Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(
+                    value
+                        .into_value()
+                        .map_err(|error| ParseError::from_eval_value(error, line))?,
+                ),
+                default: Box::new(
+                    result
+                        .into_value()
+                        .map_err(|error| ParseError::from_eval_value(error, line))?,
+                ),
+            }))
+        } else {
+            combine_coalesce_operands(value, result, line)?
+        };
     }
     Ok(result)
 }
