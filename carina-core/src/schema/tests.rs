@@ -10563,6 +10563,89 @@ fn assignable_plain_float_accepts_identityless_range_sink() {
 }
 
 #[test]
+fn float_range_exact_numeric_int_bounds() {
+    for (integer, range) in [
+        (9_007_199_254_740_993, (None, Some(9_007_199_254_740_992.0))),
+        (
+            -9_007_199_254_740_993,
+            (Some(-9_007_199_254_740_992.0), None),
+        ),
+    ] {
+        let attr_type = AttributeType::refined_float(None, Some(range));
+        let error = attr_type
+            .validate(&Value::Concrete(ConcreteValue::Int(integer)))
+            .unwrap_err();
+        let TypeError::ValidationFailed { message } = error else {
+            panic!("expected range validation error, got {error:?}");
+        };
+        assert_eq!(
+            message.to_string(),
+            format!(
+                "value {integer} is outside allowed range {:?}..={:?}",
+                range.0, range.1
+            )
+        );
+    }
+}
+
+#[test]
+fn assignable_exact_numeric_int_float_bounds() {
+    for (source, sink, expected) in [
+        (
+            (None, Some(9_007_199_254_740_993)),
+            (None, Some(9_007_199_254_740_992.0)),
+            false,
+        ),
+        (
+            (Some(-9_007_199_254_740_993), None),
+            (Some(-9_007_199_254_740_992.0), None),
+            false,
+        ),
+        (
+            (None, Some(i64::MAX)),
+            (None, Some(9_223_372_036_854_775_808.0)),
+            true,
+        ),
+        (
+            (Some(i64::MIN), None),
+            (Some(-9_223_372_036_854_775_808.0), None),
+            true,
+        ),
+        ((Some(3), Some(4)), (Some(3.5), None), false),
+        ((Some(3), Some(4)), (None, Some(3.5)), false),
+    ] {
+        assert_eq!(
+            assignable(
+                &AttributeType::refined_int(None, Some(source)),
+                &AttributeType::refined_float(None, Some(sink)),
+            ),
+            expected,
+            "{source:?} into {sink:?}"
+        );
+    }
+}
+
+#[test]
+fn assignable_int_float_missing_bounds_use_i64_limits() {
+    for (source, sink, expected) in [
+        ((Some(0), None), (Some(-1.0), Some(1e300)), true),
+        ((None, None), (None, Some(1e300)), true),
+        ((None, None), (None, Some(9.0e18)), false),
+        ((None, None), (Some(-1e300), None), true),
+        ((None, None), (Some(-9.0e18), None), false),
+    ] {
+        assert_eq!(
+            assignable(
+                &AttributeType::refined_int(None, Some(source)),
+                &AttributeType::refined_float(None, Some(sink)),
+            ),
+            expected,
+            "{source:?} into {sink:?}"
+        );
+    }
+}
+
+#[test]
 fn assignable_int_source_widens_to_float_sink() {
     assert!(assignable(&AttributeType::int(), &AttributeType::float()));
     assert!(!assignable(&AttributeType::float(), &AttributeType::int()));

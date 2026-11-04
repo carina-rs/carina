@@ -326,6 +326,8 @@ pub(crate) fn layout_graph(model: &GraphModel) -> Layout {
             column_width(model, column)
         })
         .collect();
+    // Column counts are used only to estimate display spacing.
+    #[allow(clippy::cast_precision_loss)]
     let graph_width =
         column_widths.iter().sum::<f32>() + COLUMN_GAP * column_count.saturating_sub(1) as f32;
     let width = MIN_CANVAS_WIDTH.max(graph_width + CANVAS_SIDE_MARGIN * 2.0);
@@ -514,7 +516,9 @@ pub(crate) fn layout_graph(model: &GraphModel) -> Layout {
         })
         .collect();
     Layout {
+        // Internal layout width (never a DSL value) is rounded up to whole canvas pixels before casting.
         width: width.ceil() as u32,
+        // Internal layout height (never a DSL value) is rounded up to whole canvas pixels before casting.
         height: (graph_bottom + LEGEND_HEIGHT).ceil() as u32,
         nodes: positioned_nodes,
         modules: module_rects,
@@ -611,7 +615,10 @@ pub(crate) fn graph_node_height(node: &GraphNode) -> f32 {
     {
         let shown = node.attribute_names.len().min(MAX_ATTRIBUTE_NAMES);
         let more = usize::from(node.attribute_names.len() > MAX_ATTRIBUTE_NAMES);
-        height += (shown + more + 1) as f32 * 16.0 + 3.0;
+        // MAX_ATTRIBUTE_NAMES bounds this display row count, so the conversion is exact.
+        #[allow(clippy::cast_precision_loss)]
+        let row_count = (shown + more + 1) as f32;
+        height += row_count * 16.0 + 3.0;
     }
     if !node.affected_by.is_empty() {
         height += 20.0;
@@ -619,6 +626,8 @@ pub(crate) fn graph_node_height(node: &GraphNode) -> f32 {
     height
 }
 
+// Character counts are used only to estimate display text widths.
+#[allow(clippy::cast_precision_loss)]
 fn measured_width(text: &str, font_size: f32) -> f32 {
     work::text(text);
 
@@ -1328,7 +1337,13 @@ fn barycenter(
     if positions.is_empty() {
         f32::INFINITY
     } else {
-        positions.iter().sum::<usize>() as f32 / positions.len() as f32
+        // Approximate neighbor averages only guide graph placement.
+        #[allow(clippy::cast_precision_loss)]
+        let (position_sum, position_count) = (
+            positions.iter().sum::<usize>() as f32,
+            positions.len() as f32,
+        );
+        position_sum / position_count
     }
 }
 
@@ -2000,6 +2015,8 @@ fn spread_card_ports(routes: &mut [EdgeRoute], node_rects: &HashMap<GraphNodeId,
         let count = endpoints.len();
         for (index, endpoint) in endpoints.iter().enumerate() {
             work::visit();
+            // Endpoint indices are used only to interpolate display coordinates.
+            #[allow(clippy::cast_precision_loss)]
             let coordinate = if count == 1 {
                 (minimum + maximum) / 2.0
             } else {
@@ -2212,8 +2229,8 @@ fn edge_route_intersects_rect(route: &EdgeRoute, rect: &NodeRect) -> bool {
         let from = segment[0];
         let to = segment[1];
         let (control_one, control_two) = edge_segment_controls(from, to);
-        (0..=64).any(|step| {
-            let t = step as f32 / 64.0;
+        (0_u8..=64).any(|step| {
+            let t = f32::from(step) / 64.0;
             let one_minus_t = 1.0 - t;
             let point = Point {
                 x: one_minus_t.powi(3) * from.x

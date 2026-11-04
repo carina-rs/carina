@@ -5,6 +5,9 @@ publish.workspace = true
 edition = "2024"
 license = "MIT"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "carina-provider-mock-http"
 path = "src/main.rs"

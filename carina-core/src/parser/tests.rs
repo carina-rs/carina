@@ -170,6 +170,25 @@ fn parsed_int_binding(source: &str, name: &str) -> i64 {
 }
 
 #[test]
+fn min_exact_numeric_dsl() {
+    assert_eq!(
+        parsed_int_binding("let x = min(9007199254740992, 9007199254740993)", "x"),
+        9_007_199_254_740_992,
+    );
+    assert_eq!(
+        parsed_int_binding("let x = min(9223372036854775806, 9223372036854775807)", "x"),
+        i64::MAX - 1,
+    );
+    let parsed = parse_and_resolve("let x = min(9007199254740993, 9007199254740992.0)").unwrap();
+    assert_eq!(
+        parsed.variables.get("x"),
+        Some(&Value::Concrete(ConcreteValue::Float(
+            9_007_199_254_740_992.0
+        )))
+    );
+}
+
+#[test]
 fn integer_arithmetic_obeys_precedence_parentheses_and_left_associativity() {
     assert_eq!(parsed_int_binding("let value = 1 + 2 * 3", "value"), 7);
     assert_eq!(parsed_int_binding("let value = (1 + 2) * 3", "value"), 9);

@@ -5,6 +5,9 @@ publish.workspace = true
 edition = "2024"
 license = "MIT"
 
+[lints]
+workspace = true
+
 [dependencies]
 aws-config = "1"
 aws-credential-types = "1"

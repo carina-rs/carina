@@ -30,6 +30,9 @@ publish = false
 [workspace.dependencies]
 wit-bindgen = { version = "0.54", default-features = false, features = ["macros"] }
 
+[workspace.lints.clippy]
+cast_precision_loss = "deny"
+
 # Keep these proc-macro crate hashes worktree-independent by avoiding a baked-in
 # absolute OUT_DIR. scripts/check-vendored-patches-used.sh fails CI if a patch
 # stops applying, for example after a Wasmtime or wit-bindgen version bump.

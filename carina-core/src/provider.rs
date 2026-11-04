@@ -6628,6 +6628,8 @@ pub enum CustomTypeCanonicalizationError {
     },
     #[error("custom type `{identity}` requires a finite float")]
     NonFiniteFloat { identity: TypeIdentity },
+    #[error("integer {value} cannot be represented exactly as Float for custom type `{identity}`")]
+    InexactFloatWidening { identity: TypeIdentity, value: i64 },
     #[error("could not canonicalize enum `{identity}`: {error}")]
     EnumResolution {
         identity: TypeIdentity,
@@ -6664,6 +6666,7 @@ impl CustomTypeCanonicalizationError {
             error @ (Self::UnidentifiedDeclaration { .. }
             | Self::MissingScalarKind { .. }
             | Self::NonFiniteFloat { .. }
+            | Self::InexactFloatWidening { .. }
             | Self::EnumIdentityMismatch { .. }) => crate::schema::TypeError::ValidationFailed {
                 message: error.to_string().into(),
             },
@@ -6825,7 +6828,18 @@ pub fn canonicalize_custom_type_value(
                 validate: _,
             },
             Value::Concrete(ConcreteValue::Int(value)),
-        ) => Ok(Some(CanonicalCustomTypeValue(value.to_string()))),
+        ) => {
+            let float = crate::numeric::int_to_exact_f64(*value).ok_or_else(|| {
+                CustomTypeCanonicalizationError::InexactFloatWidening {
+                    identity: identity.clone(),
+                    value: *value,
+                }
+            })?;
+            canonicalize_custom_type_value(
+                declared_type,
+                &Value::Concrete(ConcreteValue::Float(float)),
+            )
+        }
         (
             RawShape::Float {
                 identity: _,
@@ -8596,6 +8610,125 @@ mod tests {
             .expect_err("the table must parse using the identity's declared scalar kind");
         assert!(error.contains("invalid integer bridge value"), "{error}");
         assert!(!error.contains("not-an-integer"), "{error}");
+    }
+
+    fn recording_float_dispatch_table(
+        received: std::sync::Arc<std::sync::Mutex<Vec<f64>>>,
+    ) -> (TypeIdentity, CustomTypeDispatchTable) {
+        let identity = TypeIdentity::new(Some("test"), ["number"], "GuardedFloat");
+        let schema = PatternResourceSchema::new("test.Guarded")
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "value",
+                    PatternAttributeType::refined_float_with_validator(
+                        identity.clone(),
+                        None,
+                        crate::schema::legacy_validator(move |value| match value {
+                            crate::resource::Value::Concrete(
+                                crate::resource::ConcreteValue::Float(value),
+                            ) => {
+                                received.lock().unwrap().push(*value);
+                                Ok(())
+                            }
+                            _ => Err("Expected float".to_string()),
+                        }),
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("dispatch fixture schema must validate");
+        let table = CustomTypeDispatchTable::build(&[schema], &ValidatedConfigSchema::default())
+            .expect("one scalar kind must build a dispatch table");
+        (identity, table)
+    }
+
+    fn assert_schema_derived_guest_float_round_trip(value: f64) {
+        use std::sync::{Arc, Mutex};
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let (identity, table) = recording_float_dispatch_table(Arc::clone(&received));
+        let declaration = AttributeType::refined_float(Some(identity.clone()), None);
+        let canonical = canonicalize_custom_type_value(
+            &declaration,
+            &Value::Concrete(ConcreteValue::Float(value)),
+        )
+        .expect("Float values must canonicalize")
+        .expect("Float values must produce bridge text");
+        table
+            .dispatch(&identity, canonical.as_str())
+            .expect("Float values must reach the validator");
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].to_bits(), value.to_bits());
+    }
+
+    #[test]
+    fn schema_derived_guest_float_dispatch_preserves_large_float() {
+        assert_schema_derived_guest_float_round_trip(9_223_372_036_854_774_784.0);
+    }
+
+    #[test]
+    fn schema_derived_guest_float_dispatch_preserves_negative_zero() {
+        assert_schema_derived_guest_float_round_trip(-0.0);
+    }
+
+    #[test]
+    fn schema_derived_guest_float_dispatch_requires_exact_integer_widening() {
+        use std::sync::{Arc, Mutex};
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let (identity, table) = recording_float_dispatch_table(Arc::clone(&received));
+        let declaration = AttributeType::refined_float(Some(identity.clone()), None);
+
+        for (value, expected_text, expected_float) in [
+            (Value::Concrete(ConcreteValue::Int(3)), "3", 3.0),
+            (Value::Concrete(ConcreteValue::Float(1.5)), "1.5", 1.5),
+            (
+                Value::Concrete(ConcreteValue::Int(9_223_372_036_854_774_784)),
+                "9223372036854775000",
+                9_223_372_036_854_774_784.0,
+            ),
+        ] {
+            let canonical = canonicalize_custom_type_value(&declaration, &value)
+                .expect("numeric values must canonicalize without rounding")
+                .expect("numeric values must produce bridge text");
+            assert_eq!(canonical.as_str(), expected_text);
+            let result = table.dispatch(&identity, canonical.as_str());
+            let received = std::mem::take(&mut *received.lock().unwrap());
+            result.expect("exact values must reach the Float validator");
+            assert_eq!(received, vec![expected_float]);
+        }
+
+        let result = canonicalize_custom_type_value(
+            &declaration,
+            &Value::Concrete(ConcreteValue::Int(9_007_199_254_740_993)),
+        )
+        .map(|canonical| {
+            let canonical = canonical.expect("numeric values must produce bridge text");
+            table
+                .dispatch(&identity, canonical.as_str())
+                .expect("canonical values must reach the Float validator");
+        });
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "inexact integer must not reach the callback"
+        );
+        let error = result.expect_err("inexact integer must fail during canonicalization");
+        assert_eq!(
+            error,
+            CustomTypeCanonicalizationError::InexactFloatWidening {
+                identity,
+                value: 9_007_199_254_740_993,
+            }
+        );
+        let expected_message = "integer 9007199254740993 cannot be represented exactly as Float for custom type `test.number.GuardedFloat`";
+        assert_eq!(error.to_string(), expected_message);
+        assert!(matches!(
+            error.into_type_error(),
+            crate::schema::TypeError::ValidationFailed { message }
+                if message == expected_message
+        ));
     }
 
     #[test]
