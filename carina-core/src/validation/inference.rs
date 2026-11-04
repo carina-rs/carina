@@ -1163,6 +1163,7 @@ impl<B: BindingAddress> SchemaCheckedExportParams<B> {
 /// Infer export types from a schema-judged configuration without cloning its file.
 pub fn infer_export_params<D, B: BindingAddress>(
     judged: &crate::parser::retained::JudgedFile<
+        '_,
         crate::parser::ParsedExportParam<crate::resource::ParserPlaceholder, B>,
         D,
         B,

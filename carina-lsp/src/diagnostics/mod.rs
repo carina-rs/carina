@@ -307,7 +307,8 @@ struct DiagnosticValidationInputs<'a> {
 
 /// Expanded values and their binding authority stay in the absolute phase.
 /// Authored values are used separately for source positions and lexical checks.
-type ExpandedConfiguration = carina_core::parser::retained::JudgedFile<
+type ExpandedConfiguration<'a> = carina_core::parser::retained::JudgedFile<
+    'a,
     carina_core::parser::ParsedExportParam<ParserPlaceholder, AbsoluteBindingAddress>,
     carina_core::parser::ResolvedDeferredForPhase<
         ParserPlaceholder,
@@ -329,7 +330,7 @@ type ExpandedTree<'a> = carina_core::parser::AnalysisTree<
 >;
 
 struct ExpandedDiagnosticValidationInputs<'a> {
-    configuration: &'a ExpandedConfiguration,
+    configuration: &'a ExpandedConfiguration<'a>,
     tree: ExpandedTree<'a>,
     binding_index: carina_core::binding_index::BindingIndex<'a, AbsoluteBindingAddress>,
 }
@@ -529,6 +530,7 @@ impl DiagnosticRun<'_> {
     fn validation_inputs<'a, D>(
         &'a self,
         configuration: &'a carina_core::parser::retained::JudgedFile<
+            '_,
             carina_core::parser::ParsedExportParam,
             D,
             RelativeBindingName,

@@ -547,7 +547,7 @@ pub(crate) fn expression_sink_type(attr_type: &AttributeType, owner: &str) -> Ty
 
 impl<'a, B: BindingAddress> ValidationTypeContext<'a, B> {
     pub fn in_session<E, D>(
-        file: &'a crate::parser::retained::JudgedFile<E, D, B>,
+        file: &'a crate::parser::retained::JudgedFile<'_, E, D, B>,
         session: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     ) -> Self
@@ -562,7 +562,7 @@ impl<'a, B: BindingAddress> ValidationTypeContext<'a, B> {
     }
 
     pub fn new<E, D>(
-        file: &'a crate::parser::retained::JudgedFile<E, D, B>,
+        file: &'a crate::parser::retained::JudgedFile<'_, E, D, B>,
         provider_context: &'a LoadedProviderContext,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     ) -> Self
@@ -580,7 +580,7 @@ impl<'a, B: BindingAddress> ValidationTypeContext<'a, B> {
     /// an incomplete provider custom-type catalog. Structural checks and
     /// successfully loaded owners remain strict; unavailable owners defer.
     pub fn new_providerless<E, D>(
-        file: &'a crate::parser::retained::JudgedFile<E, D, B>,
+        file: &'a crate::parser::retained::JudgedFile<'_, E, D, B>,
         provider_context: &'a ProviderContext,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     ) -> Self
@@ -595,7 +595,7 @@ impl<'a, B: BindingAddress> ValidationTypeContext<'a, B> {
     }
 
     fn with_provider_context<E, D>(
-        judged: &'a crate::parser::retained::JudgedFile<E, D, B>,
+        judged: &'a crate::parser::retained::JudgedFile<'_, E, D, B>,
         provider_context: typecheck::TypecheckProviderContext<'a>,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     ) -> Self
@@ -2738,7 +2738,7 @@ pub fn check_file_integer_arithmetic_values<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
-    judged: &crate::parser::retained::JudgedFile<E, D, B>,
+    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
     binding_index: &BindingIndex<'_, B>,
 ) -> Vec<crate::parser::Located<IntegerArithmeticTypeFinding>> {
     let parsed = judged.file();
@@ -4495,7 +4495,7 @@ pub fn validate_resource_ref_types<
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
-    judged: &crate::parser::retained::JudgedFile<E, D, B>,
+    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
     _argument_names: &HashSet<String>,
     bindings: &BindingIndex<'_, B>,
 ) -> Result<(), ResourceRefTypeValidationError> {
@@ -4557,7 +4557,7 @@ fn validate_resource_ref_types_inner<
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
-    judged: &crate::parser::retained::JudgedFile<E, D, B>,
+    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
     bindings: &BindingIndex<'_, B>,
 ) -> Result<(), ResourceRefTypeValidationError> {
     let parsed = judged.file();
@@ -9617,6 +9617,3 @@ pub mod inference;
 mod named_annotation_tests;
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod round1_tests;

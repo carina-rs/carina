@@ -1695,6 +1695,7 @@ impl DiagnosticRun<'_> {
         &self,
         doc: &Document,
         configuration: &carina_core::parser::retained::JudgedFile<
+            '_,
             ParsedExportParam<ParserPlaceholder, B>,
             D,
             B,

@@ -922,7 +922,7 @@ pub(crate) type ValidationProviderCatalog<'a> =
 pub(crate) trait ValidationProviderCatalogExt {
     fn type_context<'a, E, D, B: BindingAddress>(
         &'a self,
-        file: &'a carina_core::parser::retained::JudgedFile<E, D, B>,
+        file: &'a carina_core::parser::retained::JudgedFile<'_, E, D, B>,
         signatures: &'a carina_core::module_resolver::ResolvedModuleSignatures,
     ) -> validation::ValidationTypeContext<'a, B>
     where
@@ -932,7 +932,7 @@ pub(crate) trait ValidationProviderCatalogExt {
 impl ValidationProviderCatalogExt for ValidationProviderCatalog<'_> {
     fn type_context<'a, E, D, B: BindingAddress>(
         &'a self,
-        file: &'a carina_core::parser::retained::JudgedFile<E, D, B>,
+        file: &'a carina_core::parser::retained::JudgedFile<'_, E, D, B>,
         signatures: &'a carina_core::module_resolver::ResolvedModuleSignatures,
     ) -> validation::ValidationTypeContext<'a, B>
     where
@@ -3095,7 +3095,7 @@ pub fn validate_resource_ref_types_with_ctx<
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     ctx: &WiringContext,
-    judged: &carina_core::parser::retained::JudgedFile<E, D, B>,
+    judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
     argument_names: &HashSet<String>,
 ) -> Vec<AppError> {
     let parsed = judged.file();

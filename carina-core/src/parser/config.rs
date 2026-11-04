@@ -1045,9 +1045,6 @@ impl Default for ProviderCustomTypes {
 }
 
 impl ProviderCustomTypes {
-    pub(crate) fn same_snapshot(&self, other: &Self) -> bool {
-        std::sync::Arc::ptr_eq(&self.state, &other.state)
-    }
     // Unit tests can inject deliberately malformed routing fixtures. Like every
     // loaded catalog, this declares no edges for owners absent from the map.
     // Production construction is single-source through `from_source` below.

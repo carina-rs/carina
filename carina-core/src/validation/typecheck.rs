@@ -1213,11 +1213,8 @@ mod tests {
     fn check_source(expected: &TypeExpr, source: &str) -> Result<(), TypeExprValueError> {
         let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let parsed = crate::parser::parse_and_resolve(source).unwrap();
-        let loaded = crate::config_loader::load_buffer_configuration(
-            &parsed,
-            &crate::schema::SchemaRegistry::new(),
-            &config,
-        );
+        let schemas = crate::schema::SchemaRegistry::new();
+        let loaded = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config);
         let expression = loaded
             .judged()
             .report()
@@ -1271,7 +1268,7 @@ mod tests {
     }
 
     #[test]
-    fn reviewed_inline_named_sink_consumes_judge_policy() {
+    fn inline_named_sink_consumes_judge_policy() {
         let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let parsed = crate::parser::parse_and_resolve(
             "let source = test.r.typed {}\nlet constructed = \"${source.name}\"\n",
@@ -1313,7 +1310,7 @@ mod tests {
     }
 
     #[test]
-    fn reviewed_nested_interpolation_consumes_each_child_judgement() {
+    fn nested_interpolation_consumes_each_child_judgement() {
         let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let parsed = crate::parser::parse_and_resolve("let source = test.r.Typed {}\nlet items = [\"${source.name}\"]\nlet fields = { key = \"${source.name}\" }\n").unwrap();
         let expected = TypeExpr::SchemaType {

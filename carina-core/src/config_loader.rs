@@ -499,6 +499,7 @@ pub struct LoadedConfig {
 /// A source buffer loaded for analysis with the caller's available schemas.
 /// Its file and report are produced together, just like a directory load.
 pub struct BufferConfiguration<
+    'a,
     E = crate::parser::ParsedExportParam,
     D = crate::parser::ParsedDeferredForPhase<
         crate::resource::ParserPlaceholder,
@@ -506,10 +507,10 @@ pub struct BufferConfiguration<
     >,
     B: crate::resource::BindingAddress = crate::resource::RelativeBindingName,
 > {
-    judged: crate::parser::retained::JudgedFile<E, D, B>,
+    judged: crate::parser::retained::JudgedFile<'a, E, D, B>,
 }
 
-impl<E, D, B: crate::resource::BindingAddress> BufferConfiguration<E, D, B> {
+impl<E, D, B: crate::resource::BindingAddress> BufferConfiguration<'_, E, D, B> {
     pub fn parsed(
         &self,
     ) -> &crate::parser::File<
@@ -521,12 +522,13 @@ impl<E, D, B: crate::resource::BindingAddress> BufferConfiguration<E, D, B> {
     > {
         self.judged.file()
     }
-    pub fn judged(&self) -> &crate::parser::retained::JudgedFile<E, D, B> {
+    pub fn judged(&self) -> &crate::parser::retained::JudgedFile<'_, E, D, B> {
         &self.judged
     }
 }
 
 pub fn load_buffer_configuration<
+    'a,
     E: Clone + crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B>,
     D,
     B: crate::resource::BindingAddress,
@@ -538,9 +540,9 @@ pub fn load_buffer_configuration<
         D,
         B,
     >,
-    schemas: &SchemaRegistry,
+    schemas: &'a SchemaRegistry,
     config: &ProviderContext,
-) -> BufferConfiguration<E, D, B>
+) -> BufferConfiguration<'a, E, D, B>
 where
     D: Clone
         + crate::parser::DeferredForPhaseTraversal<

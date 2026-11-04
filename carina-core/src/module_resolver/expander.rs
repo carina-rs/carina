@@ -5316,7 +5316,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round1_composition_substitution_checks_deferred_interpolation() {
+    fn composition_substitution_checks_deferred_interpolation() {
         let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let parsed = crate::parser::parse_and_resolve(
             "let src = mock.test.Source {}\nlet result = \"${src.name}\"",

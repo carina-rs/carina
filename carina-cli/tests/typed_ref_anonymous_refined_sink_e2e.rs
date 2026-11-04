@@ -228,7 +228,7 @@ fn typed_ref_validate_accepts_anonymous_refined_scalar_sink() {
 }
 
 #[test]
-fn round2_deferred_interpolation_checks_resolved_constraints_at_plan() {
+fn deferred_interpolation_checks_resolved_constraints_at_plan() {
     for through_let in [false, true] {
         let rhs = if through_let {
             "constructed"

@@ -114,7 +114,7 @@ fn known_builtin_results_retain_invalid_operand_accesses() {
     assert!(admit_expression(result, &TypeExpr::Int).is_err());
 }
 
-fn round2_report(source: &str) -> (crate::parser::ParsedFile, ExpressionReport) {
+fn source_schema_report(source: &str) -> (crate::parser::ParsedFile, ExpressionReport) {
     let parsed = crate::parser::parse_and_resolve(source).unwrap();
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -131,9 +131,9 @@ fn round2_report(source: &str) -> (crate::parser::ParsedFile, ExpressionReport) 
 }
 
 #[test]
-fn round2_if_admits_every_branch_at_the_sink() {
+fn if_admits_every_branch_at_the_sink() {
     for condition in ["true", "false"] {
-        let (_, report) = round2_report(&format!(
+        let (_, report) = source_schema_report(&format!(
             "let src = mock.test.Source {{}}\nlet result = if {condition} {{ 'selected' }} else {{ \"${{src.name}}\" }}"
         ));
         let result = report.binding(&RelativeBindingName::new("result")).unwrap();
@@ -151,15 +151,16 @@ fn round2_if_admits_every_branch_at_the_sink() {
 }
 
 #[test]
-fn round2_for_admits_the_body_as_the_list_element() {
-    let (_, report) =
-        round2_report("let result = for n in [1, 2] { mock.test.Source { name = \"${n}\" } }");
+fn for_admits_the_body_as_the_list_element() {
+    let (_, report) = source_schema_report(
+        "let result = for n in [1, 2] { mock.test.Source { name = \"${n}\" } }",
+    );
     let result = report.binding(&RelativeBindingName::new("result")).unwrap();
     assert!(admit_expression(result, &TypeExpr::List(Box::new(TypeExpr::Int))).is_err());
 }
 
 #[test]
-fn round2_coalesce_keeps_assignment_and_function_reference_policies() {
+fn coalesce_keeps_assignment_and_function_reference_policies() {
     let sink = TypeExpr::SchemaType {
         owned: crate::parser::OwnedTypeIdentity::provider(
             "mock",
@@ -169,7 +170,7 @@ fn round2_coalesce_keeps_assignment_and_function_reference_policies() {
         .unbounded_witness_for_test(),
     };
     for expression in ["\"${src.name}\" ?? src.name", "src.name ?? \"${src.name}\""] {
-        let (_, report) = round2_report(&format!(
+        let (_, report) = source_schema_report(&format!(
             "let src = mock.test.Source {{}}\nlet result = {expression}"
         ));
         let result = report.binding(&RelativeBindingName::new("result")).unwrap();
@@ -183,7 +184,7 @@ fn round2_coalesce_keeps_assignment_and_function_reference_policies() {
 }
 
 #[test]
-fn round2_literal_access_retains_string_construction_kind() {
+fn literal_access_retains_string_construction_kind() {
     let sink = TypeExpr::SchemaType {
         owned: crate::parser::OwnedTypeIdentity::provider(
             "mock",
@@ -193,7 +194,7 @@ fn round2_literal_access_retains_string_construction_kind() {
         .unbounded_witness_for_test(),
     };
     let (parsed, report) =
-        round2_report("let src = mock.test.Source {}\nlet result = [\"${src.name}\"][0]");
+        source_schema_report("let src = mock.test.Source {}\nlet result = [\"${src.name}\"][0]");
     let result = report.binding(&RelativeBindingName::new("result")).unwrap();
     assert_eq!(
         admit_expression(result, &sink),
@@ -210,9 +211,9 @@ fn round2_literal_access_retains_string_construction_kind() {
 }
 
 #[test]
-fn round2_module_parameter_uses_its_declaration_in_every_instance() {
+fn module_parameter_uses_its_declaration_in_every_instance() {
     let (_, caller) =
-        round2_report("let src = mock.test.Source {}\nlet supplied = \"${src.name}\"");
+        source_schema_report("let src = mock.test.Source {}\nlet supplied = \"${src.name}\"");
     let supplied = caller
         .binding(&RelativeBindingName::new("supplied"))
         .unwrap();
@@ -246,8 +247,8 @@ fn round2_module_parameter_uses_its_declaration_in_every_instance() {
 }
 
 #[test]
-fn round2_missing_child_evidence_is_a_hard_error() {
-    let (_, report) = round2_report("let result = ['one']");
+fn missing_child_evidence_is_a_hard_error() {
+    let (_, report) = source_schema_report("let result = ['one']");
     let result = report.binding(&RelativeBindingName::new("result")).unwrap();
     let projection: Value<ParserPlaceholder, RelativeBindingName> =
         Value::Concrete(crate::resource::ConcreteValue::List(vec![
@@ -265,21 +266,18 @@ fn round2_missing_child_evidence_is_a_hard_error() {
 }
 
 #[test]
-fn round2_analysis_reuses_evidence_and_registry() {
+fn analysis_borrows_registry_and_judges_a_fresh_report() {
     let parsed = crate::parser::parse_and_resolve("let value = 'value'").unwrap();
     let schemas = SchemaRegistry::new();
     let config = config();
     let first = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config);
     let second = crate::config_loader::load_buffer_configuration(first.parsed(), &schemas, &config);
     assert!(
-        std::ptr::eq(
-            schemas.assignability_closures(),
-            first.judged().schemas().assignability_closures()
-        ),
+        std::ptr::eq(&schemas, first.judged().schemas()),
         "registry was deep-cloned"
     );
     assert!(
-        std::ptr::eq(
+        !std::ptr::eq(
             first
                 .judged()
                 .report()
@@ -291,12 +289,12 @@ fn round2_analysis_reuses_evidence_and_registry() {
                 .binding(&RelativeBindingName::new("value"))
                 .unwrap()
         ),
-        "expression was judged again"
+        "new analysis reused an earlier report"
     );
 }
 
 #[test]
-fn round2_composite_collections_preserve_child_construction_kinds() {
+fn composite_collections_preserve_child_construction_kinds() {
     let named = TypeExpr::SchemaType {
         owned: crate::parser::OwnedTypeIdentity::provider(
             "mock",
@@ -319,7 +317,7 @@ fn round2_composite_collections_preserve_child_construction_kinds() {
             TypeExpr::Map(Box::new(named)),
         ),
     ] {
-        let (parsed, report) = round2_report(&format!(
+        let (parsed, report) = source_schema_report(&format!(
             "let src = mock.test.Source {{}}\nlet result = {source}"
         ));
         let expression = report.binding(&RelativeBindingName::new("result")).unwrap();
@@ -335,8 +333,8 @@ fn round2_composite_collections_preserve_child_construction_kinds() {
 }
 
 #[test]
-fn round2_wait_retains_the_target_handle_kind() {
-    let (_, report) = round2_report(
+fn wait_retains_the_target_handle_kind() {
+    let (_, report) = source_schema_report(
         "let src = mock.test.Source {}\nlet ready = wait src { until = src.name == 'ready' }\nlet result = ready",
     );
     let handle = TypeExpr::Ref(crate::parser::ResourceTypePath::new("mock", "test.Source"));
@@ -346,7 +344,7 @@ fn round2_wait_retains_the_target_handle_kind() {
 }
 
 #[test]
-fn round2_directory_merge_judges_every_parameter_in_the_new_scope() {
+fn directory_merge_judges_every_parameter_in_the_new_scope() {
     let context = config();
     let schemas = SchemaRegistry::new();
     let mut first =
@@ -373,13 +371,13 @@ fn round2_directory_merge_judges_every_parameter_in_the_new_scope() {
 }
 
 #[test]
-fn round2_unloaded_function_annotation_keeps_the_scalar_floor() {
+fn unloaded_function_annotation_keeps_the_scalar_floor() {
     let sink = TypeExpr::DottedUnresolved(crate::parser::ResourceTypePath::new(
         "mock",
         "test.Unavailable",
     ));
     for value in ["true", "['value']"] {
-        let (_, report) = round2_report(&format!("let result = {value}"));
+        let (_, report) = source_schema_report(&format!("let result = {value}"));
         let result = report.binding(&RelativeBindingName::new("result")).unwrap();
         assert!(
             crate::validation::typecheck::admit_function_expression(result, &sink, &config())
@@ -390,9 +388,9 @@ fn round2_unloaded_function_annotation_keeps_the_scalar_floor() {
 }
 
 #[test]
-fn round2_deferred_reads_have_resource_evidence() {
+fn deferred_reads_have_resource_evidence() {
     use crate::parser::DeferredForPhaseTraversal;
-    let (parsed, report) = round2_report(
+    let (parsed, report) = source_schema_report(
         "let src = mock.test.Source {}\nlet reads = for n in src.name { read mock.test.Source {} }",
     );
     let reads: Vec<_> = parsed.deferred_for_phase.analysis_resource_refs().collect();
@@ -407,8 +405,8 @@ fn round2_deferred_reads_have_resource_evidence() {
 }
 
 #[test]
-fn round2_folded_function_calls_keep_argument_failure_evidence() {
-    let (_, report) = round2_report(
+fn folded_function_calls_keep_argument_failure_evidence() {
+    let (_, report) = source_schema_report(
         "fn choose(n: Int): String { 'selected' }\nlet src = mock.test.Source {}\nlet result = choose(src.name)",
     );
     let result = report.binding(&RelativeBindingName::new("result")).unwrap();
@@ -419,8 +417,8 @@ fn round2_folded_function_calls_keep_argument_failure_evidence() {
 }
 
 #[test]
-fn round2_declared_string_cannot_enter_an_unloaded_nominal_sink() {
-    let (_, report) = round2_report("arguments { input: String }\nlet result = input");
+fn declared_string_cannot_enter_an_unloaded_nominal_sink() {
+    let (_, report) = source_schema_report("arguments { input: String }\nlet result = input");
     let result = report.binding(&RelativeBindingName::new("result")).unwrap();
     let sink = TypeExpr::DottedUnresolved(crate::parser::ResourceTypePath::new(
         "mock",
@@ -432,13 +430,13 @@ fn round2_declared_string_cannot_enter_an_unloaded_nominal_sink() {
 }
 
 #[test]
-fn round2_collection_failures_survive_a_shape_only_builtin() {
+fn collection_failures_survive_a_shape_only_builtin() {
     for source in [
         "arguments { text: String }\nlet result = length([text, 42])",
         "arguments { text: String }\nlet result = length(text ?? [])",
         "arguments { text: String }\nlet result = length([] ?? text)",
     ] {
-        let (_, report) = round2_report(source);
+        let (_, report) = source_schema_report(source);
         assert!(
             !report.findings().is_empty(),
             "invalid collection operation was erased: {source}"
@@ -447,8 +445,8 @@ fn round2_collection_failures_survive_a_shape_only_builtin() {
 }
 
 #[test]
-fn round2_provider_authority_cannot_supply_a_strings_missing_nominal_identity() {
-    let (_, report) = round2_report("arguments { input: String }\nlet result = input");
+fn provider_authority_cannot_supply_a_strings_missing_nominal_identity() {
+    let (_, report) = source_schema_report("arguments { input: String }\nlet result = input");
     let result = report.binding(&RelativeBindingName::new("result")).unwrap();
     let sink = crate::parser::resolve_custom_type_identity(
         &crate::schema::TypeIdentity::new(Some("mock"), ["test"], "Name"),
@@ -464,9 +462,9 @@ fn round2_provider_authority_cannot_supply_a_strings_missing_nominal_identity() 
 }
 
 #[test]
-fn round2_builtin_collection_shape_survives_missing_element_inference() {
+fn builtin_collection_shape_survives_missing_element_inference() {
     for expression in ["concat(xs, xs)", "flatten([xs])", "values({ names = xs })"] {
-        let (_, report) = round2_report(&format!(
+        let (_, report) = source_schema_report(&format!(
             "arguments {{ xs: list(String) }}\nlet result = {expression}"
         ));
         let result = report.binding(&RelativeBindingName::new("result")).unwrap();
@@ -479,7 +477,7 @@ fn round2_builtin_collection_shape_survives_missing_element_inference() {
             Some(CollectionKind::List),
             "{expression}"
         );
-        let (_, indexed) = round2_report(&format!(
+        let (_, indexed) = source_schema_report(&format!(
             "arguments {{ xs: list(String) }}\nlet result = {expression}[0]"
         ));
         let element = indexed
@@ -493,8 +491,8 @@ fn round2_builtin_collection_shape_survives_missing_element_inference() {
 }
 
 #[test]
-fn round2_invalid_iterable_cannot_produce_admissible_elements() {
-    let (_, report) = round2_report(
+fn invalid_iterable_cannot_produce_admissible_elements() {
+    let (_, report) = source_schema_report(
         "let src = mock.test.Source {}\nlet result = for n in src.name { mock.test.Source {} }",
     );
     let result = report.binding(&RelativeBindingName::new("result")).unwrap();
@@ -506,7 +504,7 @@ fn round2_invalid_iterable_cannot_produce_admissible_elements() {
 
 #[test]
 fn failure_ownership_survives_wrappers_and_delegates_reference_errors() {
-    let (_, report) = round2_report(
+    let (_, report) = source_schema_report(
         "let src = mock.test.Source {}\nlet bad = src.missing\nlet intrinsic = length(['present' ?? 42])",
     );
     assert_eq!(report.findings().len(), 1, "{:?}", report.findings());
@@ -521,8 +519,8 @@ fn failure_ownership_survives_wrappers_and_delegates_reference_errors() {
 }
 
 #[test]
-fn round3_resource_sink_rejects_a_declared_list_without_the_binding_pass() {
-    let (_, report) = round2_report(
+fn resource_sink_rejects_a_declared_list_without_the_binding_pass() {
+    let (_, report) = source_schema_report(
         "arguments { input: list(String) }\nlet target = mock.test.Source { name = input }",
     );
     let target = report.binding(&RelativeBindingName::new("target")).unwrap();
@@ -531,7 +529,7 @@ fn round3_resource_sink_rejects_a_declared_list_without_the_binding_pass() {
 }
 
 #[test]
-fn round3_annotation_sink_rejects_a_declared_list_without_the_binding_pass() {
+fn annotation_sink_rejects_a_declared_list_without_the_binding_pass() {
     let mut parsed = crate::parser::parse_and_resolve(
         "arguments { input: list(String) }\nattributes { output: String = input }",
     )
@@ -545,7 +543,7 @@ fn round3_annotation_sink_rejects_a_declared_list_without_the_binding_pass() {
 }
 
 #[test]
-fn round3_declared_containers_fail_closed_at_scalar_sinks() {
+fn declared_containers_fail_closed_at_scalar_sinks() {
     for ty in [
         "list(String)",
         "map(String)",
@@ -554,7 +552,7 @@ fn round3_declared_containers_fail_closed_at_scalar_sinks() {
         "Ipv4Address",
     ] {
         let (_, report) =
-            round2_report(&format!("arguments {{ input: {ty} }}\nlet result = input"));
+            source_schema_report(&format!("arguments {{ input: {ty} }}\nlet result = input"));
         let result = report.binding(&RelativeBindingName::new("result")).unwrap();
         assert_eq!(result.check_owner(), ExpressionCheckOwner::BindingIndex);
         assert!(admit_expression(result, &TypeExpr::Int).is_err(), "{ty}");
@@ -565,8 +563,8 @@ fn round3_declared_containers_fail_closed_at_scalar_sinks() {
 }
 
 #[test]
-fn round3_module_parameter_judgement_is_independent_of_the_callers_value() {
-    let (_, caller) = round2_report(
+fn module_parameter_judgement_is_independent_of_the_callers_value() {
+    let (_, caller) = source_schema_report(
         "let src = mock.test.Source {}\nlet literal = 'value'\nlet deferred = src.name",
     );
     let mut admissions = Vec::new();
@@ -603,7 +601,7 @@ fn round3_module_parameter_judgement_is_independent_of_the_callers_value() {
 }
 
 #[test]
-fn round3_resolved_nominal_declarations_fail_closed_at_unrelated_scalars() {
+fn resolved_nominal_declarations_fail_closed_at_unrelated_scalars() {
     let named = TypeExpr::SchemaType {
         owned: crate::parser::OwnedTypeIdentity::provider(
             "mock",
@@ -629,8 +627,9 @@ fn round3_resolved_nominal_declarations_fail_closed_at_unrelated_scalars() {
 }
 
 #[test]
-fn round3_boundary_value_check_enforces_binding_owned_admission() {
-    let (parsed, report) = round2_report("arguments { input: list(String) }\nlet result = input");
+fn boundary_value_check_enforces_binding_owned_admission() {
+    let (parsed, report) =
+        source_schema_report("arguments { input: list(String) }\nlet result = input");
     let result = report.binding(&RelativeBindingName::new("result")).unwrap();
     assert_eq!(result.check_owner(), ExpressionCheckOwner::BindingIndex);
     let context = config();
@@ -655,5 +654,19 @@ fn round3_boundary_value_check_enforces_binding_owned_admission() {
     assert!(
         checked.is_err(),
         "the value checker admitted a binding-owned list into String"
+    );
+}
+
+#[test]
+fn interpolated_conditional_waits_for_its_condition() {
+    let parsed = crate::parser::parse_and_resolve(
+        "arguments { enabled: Bool }\nlet result = \"${if enabled { 'valid' } else { 'also' }}\"",
+    )
+    .unwrap();
+    let report = judge_expressions(&parsed, &SchemaRegistry::new(), &config());
+    let result = report.binding(&RelativeBindingName::new("result")).unwrap();
+    assert_eq!(
+        admit_expression(result, &TypeExpr::String),
+        Ok(ExpressionAdmission::DeferredInterpolation)
     );
 }

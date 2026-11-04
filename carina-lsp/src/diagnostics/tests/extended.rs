@@ -17390,7 +17390,7 @@ fn reference_constraints_validate_offline_in_a_directory_configuration() {
 }
 
 #[test]
-fn round1_non_string_interpolation_sinks_across_files() {
+fn non_string_interpolation_sinks_across_files() {
     let engine = coalesce_resource_engine();
     for source in [
         "exports { port: Int = \"${src.identifier}\" }",
@@ -17417,7 +17417,7 @@ fn round1_non_string_interpolation_sinks_across_files() {
 }
 
 #[test]
-fn round1_folded_child_failure_is_reported_in_its_file() {
+fn folded_child_failure_is_reported_in_its_file() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("source.crn"), "let a = 'x'\n").unwrap();
     let source = "let b = a ?? [1, 'y']\n";
@@ -17440,7 +17440,7 @@ fn round1_folded_child_failure_is_reported_in_its_file() {
 }
 
 #[test]
-fn round1_fallback_owns_the_only_typeexpr_diagnostic() {
+fn fallback_owns_the_only_typeexpr_diagnostic() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("child")).unwrap();
     std::fs::write(
@@ -17474,7 +17474,7 @@ fn round1_fallback_owns_the_only_typeexpr_diagnostic() {
 }
 
 #[test]
-fn round1_resource_child_failure_has_one_error_across_files() {
+fn resource_child_failure_has_one_error_across_files() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
     std::fs::write(

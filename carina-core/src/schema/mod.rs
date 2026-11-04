@@ -14727,11 +14727,6 @@ impl std::ops::Deref for OwnerBoundResourceSchema<'_> {
 /// See `notes/specs/2026-05-02-resource-vs-data-source-design.md` (Decision 1-2).
 #[derive(Debug, Clone, Default)]
 pub struct SchemaRegistry {
-    data: Arc<SchemaRegistryData>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct SchemaRegistryData {
     managed: HashMap<(SchemaTypeOwner, String), ValidatedResourceSchema>,
     data_sources: HashMap<(SchemaTypeOwner, String), ValidatedResourceSchema>,
     reference_forms: BTreeMap<String, ReferenceForms>,
@@ -14776,11 +14771,6 @@ impl fmt::Display for SchemaRegistryError {
 impl std::error::Error for SchemaRegistryError {}
 
 impl SchemaRegistry {
-    /// Registry clones share an immutable snapshot. A mutation detaches it.
-    pub(crate) fn same_snapshot(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.data, &other.data)
-    }
-
     pub fn new() -> Self {
         Self::default()
     }
@@ -14790,7 +14780,7 @@ impl SchemaRegistry {
     pub(crate) fn assignability_closures(
         &self,
     ) -> &BTreeMap<SchemaTypeOwner, AssignabilityClosure> {
-        &self.data.assignability_closures
+        &self.assignability_closures
     }
 
     /// Insert one validated schema for test fixtures that intentionally have
@@ -14799,12 +14789,8 @@ impl SchemaRegistry {
     #[doc(hidden)]
     pub fn insert(&mut self, provider: impl Into<String>, schema: ValidatedResourceSchema) {
         let provider = provider.into();
-        Arc::make_mut(&mut self.data)
-            .reference_forms
-            .entry(provider.clone())
-            .or_default();
-        Arc::make_mut(&mut self.data)
-            .assignability_closures
+        self.reference_forms.entry(provider.clone()).or_default();
+        self.assignability_closures
             .entry(SchemaTypeOwner::Provider(provider.clone()))
             .or_default();
         let key = (
@@ -14813,12 +14799,10 @@ impl SchemaRegistry {
         );
         match schema.as_schema().kind {
             SchemaKind::Resource => {
-                Arc::make_mut(&mut self.data).managed.insert(key, schema);
+                self.managed.insert(key, schema);
             }
             SchemaKind::DataSource => {
-                Arc::make_mut(&mut self.data)
-                    .data_sources
-                    .insert(key, schema);
+                self.data_sources.insert(key, schema);
             }
         }
     }
@@ -14832,8 +14816,8 @@ impl SchemaRegistry {
     ) -> Result<(), SchemaRegistryError> {
         let provider = provider.into();
         let incoming = witness.reference_forms();
-        if self.data.witness_backed_reference_forms.contains(&provider)
-            && let Some(existing) = self.data.reference_forms.get(&provider)
+        if self.witness_backed_reference_forms.contains(&provider)
+            && let Some(existing) = self.reference_forms.get(&provider)
             && existing != incoming
         {
             return Err(SchemaRegistryError::ConflictingReferenceForms {
@@ -14843,20 +14827,16 @@ impl SchemaRegistry {
             });
         }
         let owner = SchemaTypeOwner::Provider(provider.clone());
-        if self.data.witness_backed_reference_forms.contains(&provider)
-            && self.data.assignability_closures.get(&owner) != Some(witness.assignability_closure())
+        if self.witness_backed_reference_forms.contains(&provider)
+            && self.assignability_closures.get(&owner) != Some(witness.assignability_closure())
         {
             return Err(SchemaRegistryError::ConflictingAssignabilityEdges { owner: provider });
         }
-        Arc::make_mut(&mut self.data)
-            .assignability_closures
+        self.assignability_closures
             .insert(owner, witness.assignability_closure().clone());
-        Arc::make_mut(&mut self.data)
-            .reference_forms
+        self.reference_forms
             .insert(provider.clone(), incoming.clone());
-        Arc::make_mut(&mut self.data)
-            .witness_backed_reference_forms
-            .insert(provider.clone());
+        self.witness_backed_reference_forms.insert(provider.clone());
         for schema in witness.resources() {
             let key = (
                 SchemaTypeOwner::Provider(provider.clone()),
@@ -14864,14 +14844,10 @@ impl SchemaRegistry {
             );
             match schema.as_schema().kind {
                 SchemaKind::Resource => {
-                    Arc::make_mut(&mut self.data)
-                        .managed
-                        .insert(key, schema.clone());
+                    self.managed.insert(key, schema.clone());
                 }
                 SchemaKind::DataSource => {
-                    Arc::make_mut(&mut self.data)
-                        .data_sources
-                        .insert(key, schema.clone());
+                    self.data_sources.insert(key, schema.clone());
                 }
             }
         }
@@ -14882,17 +14858,17 @@ impl SchemaRegistry {
     /// resource keys. Witness-backed owner form tables and edge closures must
     /// be identical; fixture-only insertions carry no competing declarations.
     pub fn extend(&mut self, other: SchemaRegistry) -> Result<(), SchemaRegistryError> {
-        let SchemaRegistryData {
+        let SchemaRegistry {
             managed,
             data_sources,
             reference_forms,
             witness_backed_reference_forms,
             assignability_closures,
-        } = Arc::unwrap_or_clone(other.data);
+        } = other;
         for (owner, incoming) in &reference_forms {
             if witness_backed_reference_forms.contains(owner)
-                && self.data.witness_backed_reference_forms.contains(owner)
-                && let Some(existing) = self.data.reference_forms.get(owner)
+                && self.witness_backed_reference_forms.contains(owner)
+                && let Some(existing) = self.reference_forms.get(owner)
                 && existing != incoming
             {
                 return Err(SchemaRegistryError::ConflictingReferenceForms {
@@ -14903,8 +14879,8 @@ impl SchemaRegistry {
             }
             let typed_owner = SchemaTypeOwner::Provider(owner.clone());
             if witness_backed_reference_forms.contains(owner)
-                && self.data.witness_backed_reference_forms.contains(owner)
-                && self.data.assignability_closures.get(&typed_owner)
+                && self.witness_backed_reference_forms.contains(owner)
+                && self.assignability_closures.get(&typed_owner)
                     != assignability_closures.get(&typed_owner)
             {
                 return Err(SchemaRegistryError::ConflictingAssignabilityEdges {
@@ -14912,32 +14888,22 @@ impl SchemaRegistry {
                 });
             }
         }
-        Arc::make_mut(&mut self.data).managed.extend(managed);
-        Arc::make_mut(&mut self.data)
-            .data_sources
-            .extend(data_sources);
+        self.managed.extend(managed);
+        self.data_sources.extend(data_sources);
         for (owner, forms) in reference_forms {
             if witness_backed_reference_forms.contains(&owner) {
                 let typed_owner = SchemaTypeOwner::Provider(owner.clone());
-                Arc::make_mut(&mut self.data).assignability_closures.insert(
+                self.assignability_closures.insert(
                     typed_owner.clone(),
                     assignability_closures[&typed_owner].clone(),
                 );
-                Arc::make_mut(&mut self.data)
-                    .reference_forms
-                    .insert(owner.clone(), forms);
-                Arc::make_mut(&mut self.data)
-                    .witness_backed_reference_forms
-                    .insert(owner);
+                self.reference_forms.insert(owner.clone(), forms);
+                self.witness_backed_reference_forms.insert(owner);
             } else {
-                Arc::make_mut(&mut self.data)
-                    .assignability_closures
+                self.assignability_closures
                     .entry(SchemaTypeOwner::Provider(owner.clone()))
                     .or_default();
-                Arc::make_mut(&mut self.data)
-                    .reference_forms
-                    .entry(owner)
-                    .or_insert(forms);
+                self.reference_forms.entry(owner).or_insert(forms);
             }
         }
         Ok(())
@@ -14955,19 +14921,17 @@ impl SchemaRegistry {
             resource_type.to_string(),
         );
         let map = match kind {
-            SchemaKind::Resource => &self.data.managed,
-            SchemaKind::DataSource => &self.data.data_sources,
+            SchemaKind::Resource => &self.managed,
+            SchemaKind::DataSource => &self.data_sources,
         };
         map.get_key_value(&key)
             .map(|((owner, _resource_type), schema)| {
                 let SchemaTypeOwner::Provider(provider) = owner;
                 let reference_forms = self
-                    .data
                     .reference_forms
                     .get(provider)
                     .expect("every admitted schema owner has a reference-form table");
                 let assignability_edges = self
-                    .data
                     .assignability_closures
                     .get(owner)
                     .expect("every admitted schema owner has an assignability closure")
@@ -15052,15 +15016,13 @@ impl SchemaRegistry {
     pub fn iter(
         &self,
     ) -> impl Iterator<Item = (&str, &str, SchemaKind, &ValidatedResourceSchema)> + '_ {
-        self.data
-            .managed
+        self.managed
             .iter()
             .map(|((SchemaTypeOwner::Provider(p), t), s)| {
                 (p.as_str(), t.as_str(), SchemaKind::Resource, s)
             })
             .chain(
-                self.data
-                    .data_sources
+                self.data_sources
                     .iter()
                     .map(|((SchemaTypeOwner::Provider(p), t), s)| {
                         (p.as_str(), t.as_str(), SchemaKind::DataSource, s)
@@ -15069,11 +15031,11 @@ impl SchemaRegistry {
     }
 
     pub fn len(&self) -> usize {
-        self.data.managed.len() + self.data.data_sources.len()
+        self.managed.len() + self.data_sources.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.data.managed.is_empty() && self.data.data_sources.is_empty()
+        self.managed.is_empty() && self.data_sources.is_empty()
     }
 }
 

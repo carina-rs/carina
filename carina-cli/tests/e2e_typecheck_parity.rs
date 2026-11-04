@@ -52,6 +52,13 @@ fn expression_typing_schemas() -> SchemaRegistry {
             .attribute(
                 AttributeSchema::provider_populated("value", AttributeType::string()).build(),
             )
+            .attribute(
+                AttributeSchema::provider_populated(
+                    "names",
+                    AttributeType::list(AttributeType::string()),
+                )
+                .build(),
+            )
             .attribute(AttributeSchema::optional("plain", AttributeType::string()).build())
             .attribute(
                 AttributeSchema::optional(
@@ -121,7 +128,7 @@ fn authored_expression_coalesce_cli_lsp_directory_parity() {
     }
 }
 
-fn reviewed_named_module_sink(through_let: bool) {
+fn named_module_sink(through_let: bool) {
     let rhs = if through_let {
         "constructed"
     } else {
@@ -155,17 +162,125 @@ fn reviewed_named_module_sink(through_let: bool) {
 }
 
 #[test]
-fn reviewed_inline_named_sink_accepts() {
-    reviewed_named_module_sink(false);
+fn inline_named_sink_accepts() {
+    named_module_sink(false);
 }
 
 #[test]
-fn reviewed_let_named_sink_accepts() {
-    reviewed_named_module_sink(true);
+fn let_named_sink_accepts() {
+    named_module_sink(true);
+}
+
+fn loop_refined_sink_parity(expression: &str, accepted: bool) {
+    let fixture = write_fixture(&[
+        ("main.crn", expression),
+        (
+            "source.crn",
+            "let source = test.r.typed {}\nlet roles = { admin = true }\n",
+        ),
+        ("providers.crn", "provider test {}\n"),
+        ("exports.crn", "exports {}\n"),
+        ("backend.crn", "backend local { path = 'state.json' }\n"),
+    ]);
+    let schemas = expression_typing_schemas();
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    assert_eq!(cli.is_empty(), accepted, "{expression}: {cli:#?}");
+    assert_eq!(lsp.is_empty(), accepted, "{expression}: {lsp:#?}");
+    if !accepted {
+        assert_eq!(cli.len(), 1, "{cli:#?}");
+        assert_eq!(lsp.len(), 1, "{lsp:#?}");
+        assert!(cli[0].contains("from source.value"), "{cli:#?}");
+        assert!(lsp[0].message.contains("from source.value"), "{lsp:#?}");
+    }
 }
 
 #[test]
-fn round2_structural_string_kinds_have_cli_lsp_directory_parity() {
+fn bare_loop_map_key_enters_refined_sink_in_cli_and_lsp() {
+    loop_refined_sink_parity(
+        "for k, _ in roles { test.r.typed { role_name = k } }\n",
+        true,
+    );
+}
+
+#[test]
+fn bare_loop_schema_list_element_enters_refined_sink_in_cli_and_lsp() {
+    loop_refined_sink_parity(
+        "for n in source.names { test.r.typed { role_name = n } }\n",
+        true,
+    );
+}
+
+#[test]
+fn loop_reference_list_keeps_source_assignment_checks_in_cli_and_lsp() {
+    loop_refined_sink_parity(
+        "for n in [source.value] { test.r.typed { role_name = n } }\n",
+        false,
+    );
+}
+
+#[test]
+fn attribute_parameter_mismatch_has_exactly_one_lsp_diagnostic() {
+    let source = "attributes { result: Int = \"${source.value}\" }\n";
+    let fixture = write_fixture(&[
+        ("main.crn", source),
+        ("source.crn", "let source = test.r.typed {}\n"),
+        ("providers.crn", "provider test {}\n"),
+    ]);
+    let diagnostics = lsp_diagnostics(
+        &engine_with_schemas(expression_typing_schemas()),
+        &fixture,
+        "main.crn",
+    );
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert!(diagnostics[0].message.contains("Int"), "{diagnostics:#?}");
+}
+
+#[test]
+fn declared_string_sink_policy_cli_lsp_parity() {
+    for (sink, accepted) in [("'admin' | 'guest'", true), ("test.r.RoleName", false)] {
+        let source =
+            format!("arguments {{ name: String }}\nattributes {{ result: {sink} = name }}\n");
+        let fixture = write_fixture(&[
+            (
+                "main.crn",
+                "let template = use { source = './child' }\nlet child = template { name = 'admin' }\n",
+            ),
+            ("providers.crn", "provider test {}\n"),
+            ("exports.crn", "exports {}\n"),
+            ("backend.crn", "backend local { path = 'state.json' }\n"),
+        ]);
+        std::fs::create_dir(fixture.path().join("child")).unwrap();
+        std::fs::write(fixture.path().join("child/main.crn"), &source).unwrap();
+        let schemas = expression_typing_schemas();
+        let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+        let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "child/main.crn");
+        assert_eq!(cli.is_empty(), accepted, "{sink}: {cli:#?}");
+        assert_eq!(lsp.is_empty(), accepted, "{sink}: {lsp:#?}");
+    }
+}
+
+#[test]
+fn struct_literal_leaf_type_mismatch_cli_lsp_parity() {
+    let source = "attributes { result: { leaf: Int } = { leaf = 'bad' } }\n";
+    let fixture = write_fixture(&[("main.crn", source)]);
+    let schemas = SchemaRegistry::new();
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    assert_eq!(cli.len(), 1, "{cli:#?}");
+    assert_eq!(lsp.len(), 1, "{lsp:#?}");
+    assert!(
+        cli[0].contains("leaf") && cli[0].contains("Int"),
+        "{cli:#?}"
+    );
+    assert!(
+        lsp[0].message.contains("leaf") && lsp[0].message.contains("Int"),
+        "{lsp:#?}"
+    );
+}
+
+#[test]
+fn structural_string_kinds_have_cli_lsp_directory_parity() {
     for (expression, accepted) in [
         ("\"${source.value}\"", true),
         ("constructed", true),
@@ -214,7 +329,7 @@ fn round2_structural_string_kinds_have_cli_lsp_directory_parity() {
 }
 
 #[test]
-fn round2_if_and_for_keep_the_non_string_floor_in_cli_and_lsp() {
+fn if_and_for_keep_the_non_string_floor_in_cli_and_lsp() {
     for (sink, expression) in [
         (
             "Int",
@@ -249,7 +364,7 @@ fn round2_if_and_for_keep_the_non_string_floor_in_cli_and_lsp() {
 }
 
 #[test]
-fn round2_declared_module_string_kind_is_independent_of_callers() {
+fn declared_module_string_kind_is_independent_of_callers() {
     let fixture = write_fixture(&[
         (
             "main.crn",
