@@ -114,7 +114,9 @@ enum ExprKind<B: BindingAddress> {
         name: String,
         header: DeclarationLocation,
     },
-    Interpolation,
+    Interpolation {
+        single_reference: bool,
+    },
     EmptyInterpolation,
     Coalesce,
     Call(String),
@@ -198,7 +200,9 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
             ExprKind::List => ExprKind::List,
             ExprKind::Map(keys) => ExprKind::Map(keys),
             ExprKind::NestedBlock { name, header } => ExprKind::NestedBlock { name, header },
-            ExprKind::Interpolation => ExprKind::Interpolation,
+            ExprKind::Interpolation { single_reference } => {
+                ExprKind::Interpolation { single_reference }
+            }
             ExprKind::EmptyInterpolation => ExprKind::EmptyInterpolation,
             ExprKind::Coalesce => ExprKind::Coalesce,
             ExprKind::Call(name) => ExprKind::Call(name),
@@ -640,6 +644,71 @@ fn compile(
     compile_form(pair, file, source, scope)
 }
 
+fn reference_form(pair: Pair<'_, Rule>) -> Option<Pair<'_, Rule>> {
+    match pair.as_rule() {
+        Rule::variable_ref | Rule::namespaced_id => Some(pair),
+        Rule::expression
+        | Rule::coalesce_expr
+        | Rule::pipe_expr
+        | Rule::additive_expr
+        | Rule::multiplicative_expr
+        | Rule::compose_expr
+        | Rule::postfix_expr
+        | Rule::primary => {
+            let mut children = pair.into_inner();
+            let child = children.next()?;
+            children
+                .next()
+                .is_none()
+                .then(|| reference_form(child))
+                .flatten()
+        }
+        _ => None,
+    }
+}
+
+pub(in crate::parser) fn record_interpolation_binding(
+    pair: Pair<'_, Rule>,
+    ctx: &super::ParseContext<'_>,
+    mode: &super::context::ExpressionMode<'_>,
+) {
+    let mut parts = pair
+        .clone()
+        .into_inner()
+        .flat_map(|quoted| quoted.into_inner());
+    let Some(part) = parts.next() else { return };
+    if parts.next().is_some() {
+        return;
+    }
+    let Some(interpolation) = part.into_inner().next() else {
+        return;
+    };
+    if interpolation.as_rule() != Rule::interpolation {
+        return;
+    }
+    let Some(expression) = interpolation
+        .into_inner()
+        .next()
+        .and_then(|wrapper| wrapper.into_inner().next())
+    else {
+        return;
+    };
+    let Some(reference) = reference_form(expression) else {
+        return;
+    };
+    if reference.as_rule() != Rule::variable_ref {
+        return;
+    }
+    let mut parts = reference.into_inner();
+    let Some(name) = parts.next() else { return };
+    if parts.next().is_none() {
+        // Keep provenance only. The interpolation's judgement decides whether
+        // this use is an assignment or an operand rendered to text.
+        let _ =
+            mode.record_bare_binding_at(ctx, name.as_str(), &name, ctx.declaration_location(&pair));
+    }
+}
+
 fn compile_form(
     pair: Pair<'_, Rule>,
     file: &PreprocessedFile,
@@ -906,12 +975,15 @@ fn compile_form(
             source,
         ),
         Rule::string => {
+            let mut has_literal_parts = false;
+            let mut reference_parts = 0;
             let expressions = pair
                 .clone()
                 .into_inner()
                 .flat_map(|quoted| quoted.into_inner())
                 .filter(|part| part.as_rule() == Rule::string_part)
                 .filter_map(|part| part.into_inner().next())
+                .inspect(|part| has_literal_parts |= part.as_rule() == Rule::string_literal)
                 .filter(|part| part.as_rule() == Rule::interpolation)
                 .map(|part| {
                     let expression = part
@@ -920,7 +992,11 @@ fn compile_form(
                         .next()
                         .and_then(|wrapper| wrapper.into_inner().next());
                     match expression {
-                        Some(expression) => compile(expression, file, source, scope),
+                        Some(expression) => {
+                            reference_parts +=
+                                usize::from(reference_form(expression.clone()).is_some());
+                            compile(expression, file, source, scope)
+                        }
                         None => node(&part, ExprKind::EmptyInterpolation, vec![], file, source),
                     }
                 })
@@ -930,7 +1006,11 @@ fn compile_form(
                 if expressions.is_empty() {
                     ExprKind::Scalar(TypeExpr::String)
                 } else {
-                    ExprKind::Interpolation
+                    ExprKind::Interpolation {
+                        single_reference: !has_literal_parts
+                            && expressions.len() == 1
+                            && reference_parts == 1,
+                    }
                 },
                 expressions,
                 file,
@@ -1727,6 +1807,26 @@ mod judgement {
         pub(crate) fn is_string_construction(&self) -> bool {
             matches!(self.kind(), Some(InferredKind::StringConstruction(_)))
                 && self.alternatives.is_empty()
+        }
+        /// Borrow the assigned reference for diagnostics when the judgement
+        /// preserves it through interpolation. Evaluation keeps the stored value.
+        pub fn assignment_value<'a, P: ValueKind, B: BindingAddress>(
+            &self,
+            value: &'a Value<P, B>,
+        ) -> &'a Value<P, B> {
+            let reference_assignment = self.requires_declared_assignment()
+                || (!self.alternatives.is_empty()
+                    && self
+                        .alternatives
+                        .iter()
+                        .all(|branch| branch.requires_declared_assignment()));
+            if reference_assignment
+                && let Value::Deferred(crate::resource::DeferredValue::Interpolation(parts)) = value
+                && let [crate::resource::InterpolationPart::Expr(inner)] = parts.as_slice()
+            {
+                return inner;
+            }
+            value
         }
         pub(crate) fn is_value_dependent(&self) -> bool {
             matches!(
@@ -3064,7 +3164,16 @@ mod judgement {
                     }
                 }
                 ExprKind::EmptyInterpolation => ordinary(Ok(TypeExpr::String), false),
-                ExprKind::Interpolation => ordinary(
+                ExprKind::Interpolation {
+                    single_reference: true,
+                } if children[0].value_shape() == Some(ValueShape::String)
+                    || children[0].failed() =>
+                {
+                    // Only a sole String-family reference preserves the child's
+                    // kind, type, and diagnostic owner. Other scalars stringify.
+                    children[0].clone()
+                }
+                ExprKind::Interpolation { .. } => ordinary(
                     Ok(TypeExpr::String),
                     children.iter().all(JudgedExpr::concrete),
                 )

@@ -103,7 +103,96 @@ fn module_instances_retain_substituted_judgements() {
     );
     assert_eq!(
         crate::parser::retained::admit_expression(deferred, &TypeExpr::String),
+        Ok(crate::parser::retained::ExpressionAdmission::ValueCheck)
+    );
+}
+
+#[test]
+fn single_reference_integer_interpolation_checks_resolved_string_constraints() {
+    let identity = TypeIdentity::new(Some("mock"), ["test"], "Digits");
+    let schema = PatternResourceSchema::new("test.Source")
+        .attribute(PatternAttributeSchema::optional("port", PatternAttributeType::int()).build())
+        .attribute(
+            PatternAttributeSchema::optional(
+                "digits",
+                PatternAttributeType::refined_string(
+                    Some(identity.clone()),
+                    Some("^[0-9]+$".into()),
+                    Some((Some(2), Some(4))),
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let expected = TypeExpr::SchemaType {
+        owned: crate::parser::ResolvedSchemaType::from_schema_declaration(
+            "mock",
+            schema.as_schema().attributes["digits"].attr_type(),
+        )
+        .unwrap(),
+    };
+    let config = loaded_context_for_test(ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            HashSet::from([crate::parser::OwnedTypeIdentity::provider(
+                "mock",
+                identity,
+                crate::schema::RefinedScalarKind::String,
+            )]),
+            Box::new(|_, _| Ok(())),
+        ),
+        ..expression_validation_config()
+    });
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("mock", schema);
+    let parsed = crate::parser::parse_and_resolve(
+        "let src = mock.test.Source {}\nlet port = src.port\nlet result = \"${port}\"",
+    )
+    .unwrap();
+    let report = crate::parser::retained::judge_expressions(&parsed, &schemas, &config);
+    let expression = report.binding(&RelativeBindingName::new("result")).unwrap();
+    assert_eq!(
+        crate::parser::retained::admit_expression(expression, &expected),
         Ok(crate::parser::retained::ExpressionAdmission::DeferredInterpolation)
+    );
+    let authored = parsed.variables["result"]
+        .clone()
+        .resolve_root(&RootScope::new())
+        .into_expanded()
+        .unwrap();
+    for (port, accepted) in [(1, false), (42, true), (12345, false), (-42, false)] {
+        let source = Resource::with_provider("mock", "test.Source", "src", None)
+            .with_binding("src")
+            .with_attribute("port", Value::Concrete(ConcreteValue::Int(port)))
+            .resolve_root(&RootScope::new())
+            .into_expanded(&schemas)
+            .unwrap();
+        let bindings = crate::binding_index::ResolvedBindings::pre_apply_live(
+            crate::binding_index::LivePreApplyInputs {
+                managed: &[source],
+                compositions: &[],
+                managed_current: &HashMap::new(),
+                data_source_values: &crate::data_source_value::DataSourceValues::empty(),
+                remote_bindings: &HashMap::new(),
+                wait_aliases: &[],
+            },
+        );
+        let resolved = deferred_types::with_session_for_test(&config, |session| {
+            crate::resolver::resolve_ref_value_with_config(&authored, &bindings, session)
+        })
+        .unwrap();
+        assert_eq!(
+            resolved,
+            RuntimeValue::Concrete(RuntimeConcreteValue::String(port.to_string().into()))
+        );
+        let checked = typecheck::check_type_expr_value(&expected, &resolved, &config, expression)
+            .require_provider_schemas();
+        assert_eq!(checked.is_ok(), accepted, "{port}: {checked:?}");
+    }
+    assert!(
+        !authored.is_fully_resolved(),
+        "checking must preserve the deferred source"
     );
 }
 
@@ -10454,7 +10543,7 @@ fn expression_validation_directory_file(source: &str) -> ParsedFile {
 #[test]
 fn function_argument_interpolation_is_checked_locally() {
     let result = crate::parser::parse_and_resolve(
-        "fn f(n: Int): Int { n }\nlet src = mock.test.Source {}\nlet result = f(\"${src.name}\")",
+        "fn f(n: Int): Int { n }\nlet src = mock.test.Source {}\nlet result = f(\"${src.name}-inline\")",
     );
     assert!(
         result.is_err(),
@@ -10466,7 +10555,7 @@ fn function_argument_interpolation_is_checked_locally() {
 fn function_return_interpolation_is_checked_across_files() {
     let (_dir, path) = expression_validation_directory(
         "let src = mock.test.Source {}\nlet result = f(src.name)",
-        "fn f(n: String): Int { \"${n}\" }",
+        "fn f(n: String): Int { \"${n}-inline\" }",
     );
     let result = crate::config_loader::parse_directory(&path, &expression_validation_config());
     assert!(
@@ -10478,7 +10567,7 @@ fn function_return_interpolation_is_checked_across_files() {
 #[test]
 fn function_return_interpolation_is_checked_locally() {
     let result = crate::parser::parse_and_resolve(
-        "fn f(n: String): Int { \"${n}\" }\nlet src = mock.test.Source {}\nlet result = f(src.name)",
+        "fn f(n: String): Int { \"${n}-inline\" }\nlet src = mock.test.Source {}\nlet result = f(src.name)",
     );
     assert!(
         result.is_err(),
@@ -10566,12 +10655,19 @@ fn resource_sink_does_not_repeat_child_findings() {
         &schemas,
         &expression_validation_config(),
     );
+    let report = loaded.judged().report();
+    assert!(report.findings().is_empty(), "{:?}", report.findings());
+    let sink = report.binding(&RelativeBindingName::new("sink")).unwrap();
     assert_eq!(
-        loaded.judged().report().findings().len(),
-        1,
-        "the child owns its failure: {:?}",
-        loaded.judged().report().findings()
+        sink.check_owner(),
+        crate::parser::retained::ExpressionCheckOwner::BindingIndex
     );
+    assert!(matches!(
+        sink.static_type(),
+        Err(crate::static_type::InferenceIssue::Failed(
+            inference::InferenceError::UnknownAttribute { .. }
+        ))
+    ));
 }
 
 #[test]
@@ -10625,7 +10721,7 @@ fn deferred_loop_keys_and_indexes_are_not_concrete() {
     );
     for pattern in ["for k, v in src.tags", "for (i, v) in src.names"] {
         let name = if pattern.contains("k,") { "k" } else { "i" };
-        let parsed = crate::parser::parse_and_resolve(&format!("let src = mock.test.Source {{}}\n{pattern} {{ mock.test.Sink {{ name = \"${{{name}}}\" }} }}")).unwrap();
+        let parsed = crate::parser::parse_and_resolve(&format!("let src = mock.test.Source {{}}\n{pattern} {{ mock.test.Sink {{ name = \"${{{name}}}-inline\" }} }}")).unwrap();
         let loaded = crate::config_loader::load_buffer_configuration(
             &parsed,
             &schemas,
@@ -10657,7 +10753,7 @@ fn deferred_loop_keys_and_indexes_are_not_concrete() {
 #[test]
 fn module_argument_interpolation_cannot_bypass_substitution() {
     let (dir, path) = expression_validation_directory(
-        "let template = use { source = './child' }\nlet child = template { n = \"${src.name}\" }",
+        "let template = use { source = './child' }\nlet child = template { n = \"${src.name}-inline\" }",
         "let src = mock.test.Source {}",
     );
     std::fs::create_dir(dir.path().join("child")).unwrap();

@@ -1701,7 +1701,10 @@ impl DiagnosticRun<'_> {
                                     Some(tagged.to_string())
                                 }
                             };
-                            let type_error = match (attr_shape, typecheck_value) {
+                            let type_error = match (
+                                attr_shape,
+                                judged_expression.assignment_value(typecheck_value),
+                            ) {
                                 // Bool type should not receive String
                                 (
                                     carina_core::schema::Shape::Bool,

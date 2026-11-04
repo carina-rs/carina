@@ -133,6 +133,80 @@ fn source_schema_report(source: &str) -> (crate::parser::ParsedFile, ExpressionR
 }
 
 #[test]
+fn single_reference_interpolation_preserves_child_judgement_and_literal_folding() {
+    for definition in [
+        "let x = src.name",
+        "arguments { x: String }",
+        "let x = 'valid'",
+        "let x = 'INVALID'",
+        "let x = src.missing",
+        "let x = 'present' ?? 42",
+    ] {
+        for interpolation in ["\"${x}\"", "\"${ x }\""] {
+            let (parsed, report) = source_schema_report(&format!(
+                "let src = mock.test.Source {{}}\n{definition}\nlet direct = x\nlet wrapped = {interpolation}"
+            ));
+            let direct = report.binding(&RelativeBindingName::new("direct")).unwrap();
+            let wrapped = report
+                .binding(&RelativeBindingName::new("wrapped"))
+                .unwrap();
+            assert_eq!(wrapped.static_type(), direct.static_type(), "{definition}");
+            assert_eq!(wrapped.check_owner(), direct.check_owner(), "{definition}");
+            assert_eq!(
+                wrapped.requires_declared_assignment(),
+                direct.requires_declared_assignment(),
+                "{definition}"
+            );
+            assert_eq!(
+                wrapped.is_string_construction(),
+                direct.is_string_construction(),
+                "{definition}"
+            );
+            for sink in [TypeExpr::String, TypeExpr::Int, TypeExpr::Bool] {
+                assert_eq!(
+                    admit_expression(wrapped, &sink),
+                    admit_expression(direct, &sink),
+                    "{definition}: {sink}"
+                );
+            }
+            if parsed.variables["direct"].is_fully_resolved() {
+                assert_eq!(parsed.variables["wrapped"], parsed.variables["direct"]);
+            }
+        }
+    }
+}
+
+#[test]
+fn single_reference_interpolation_stringifies_non_string_scalars() {
+    for (definition, expected) in [
+        ("let x = 42", Some("42")),
+        ("let x = 1.5", Some("1.5")),
+        ("let x = true", Some("true")),
+        ("let x = 1min", None),
+        ("arguments { x: Int }", None),
+        ("arguments { x: Float }", None),
+        ("arguments { x: Bool }", None),
+    ] {
+        let (parsed, report) =
+            source_schema_report(&format!("{definition}\nlet wrapped = \"${{x}}\""));
+        let wrapped = report
+            .binding(&RelativeBindingName::new("wrapped"))
+            .unwrap();
+        assert_eq!(wrapped.static_type(), Ok(&TypeExpr::String), "{definition}");
+        assert!(wrapped.is_string_construction(), "{definition}");
+        assert!(admit_expression(wrapped, &TypeExpr::String).is_ok());
+        assert!(admit_expression(wrapped, &TypeExpr::Int).is_err());
+        if let Some(expected) = expected {
+            assert_eq!(
+                parsed.variables["wrapped"],
+                Value::Concrete(crate::resource::ConcreteValue::String(expected.into())),
+                "{definition}"
+            );
+        }
+    }
+}
+
+#[test]
 fn if_admits_every_branch_at_the_sink() {
     for condition in ["true", "false"] {
         let (_, report) = source_schema_report(&format!(
@@ -186,7 +260,7 @@ fn coalesce_keeps_assignment_and_function_reference_policies() {
 }
 
 #[test]
-fn literal_access_retains_string_construction_kind() {
+fn literal_access_preserves_interpolation_judgement() {
     let sink = TypeExpr::SchemaType {
         owned: crate::parser::OwnedTypeIdentity::provider(
             "mock",
@@ -195,16 +269,25 @@ fn literal_access_retains_string_construction_kind() {
         )
         .unbounded_witness_for_test(),
     };
-    let (parsed, report) =
-        source_schema_report("let src = mock.test.Source {}\nlet result = [\"${src.name}\"][0]");
-    let result = report.binding(&RelativeBindingName::new("result")).unwrap();
-    assert_eq!(
-        admit_expression(result, &sink),
-        Ok(ExpressionAdmission::DeferredInterpolation)
-    );
-    check_type_expr_value_providerless(&sink, &parsed.variables["result"], &config(), result)
-        .require_provider_schemas()
-        .unwrap();
+    for (interpolation, accepted) in [("\"${src.name}\"", false), ("\"${src.name}-inline\"", true)]
+    {
+        let (parsed, report) = source_schema_report(&format!(
+            "let src = mock.test.Source {{}}\nlet result = [{interpolation}][0]"
+        ));
+        let result = report.binding(&RelativeBindingName::new("result")).unwrap();
+        assert_eq!(admit_expression(result, &sink).is_ok(), accepted);
+        assert_eq!(
+            check_type_expr_value_providerless(
+                &sink,
+                &parsed.variables["result"],
+                &config(),
+                result
+            )
+            .require_provider_schemas()
+            .is_ok(),
+            accepted
+        );
+    }
 }
 
 #[test]
@@ -291,7 +374,7 @@ fn analysis_borrows_registry_and_judges_a_fresh_report() {
 }
 
 #[test]
-fn composite_collections_preserve_child_construction_kinds() {
+fn composite_collections_preserve_child_interpolation_judgements() {
     let named = TypeExpr::SchemaType {
         owned: crate::parser::OwnedTypeIdentity::provider(
             "mock",
@@ -314,18 +397,23 @@ fn composite_collections_preserve_child_construction_kinds() {
             TypeExpr::Map(Box::new(named)),
         ),
     ] {
-        let (parsed, report) = source_schema_report(&format!(
-            "let src = mock.test.Source {{}}\nlet result = {source}"
-        ));
-        let expression = report.binding(&RelativeBindingName::new("result")).unwrap();
-        let result = check_type_expr_value_providerless(
-            &sink,
-            &parsed.variables["result"],
-            &config(),
-            expression,
-        )
-        .require_provider_schemas();
-        assert!(result.is_ok(), "{source}: {result:?}");
+        for (source, accepted) in [
+            (source.to_string(), false),
+            (source.replace("${src.name}", "${src.name}-inline"), true),
+        ] {
+            let (parsed, report) = source_schema_report(&format!(
+                "let src = mock.test.Source {{}}\nlet result = {source}"
+            ));
+            let expression = report.binding(&RelativeBindingName::new("result")).unwrap();
+            let result = check_type_expr_value_providerless(
+                &sink,
+                &parsed.variables["result"],
+                &config(),
+                expression,
+            )
+            .require_provider_schemas();
+            assert_eq!(result.is_ok(), accepted, "{source}: {result:?}");
+        }
     }
 }
 
@@ -591,10 +679,7 @@ fn module_parameter_judgement_is_independent_of_the_callers_value() {
         admissions.push(admit_expression(result, &TypeExpr::String));
     }
     assert_eq!(admissions[0], admissions[1]);
-    assert_eq!(
-        admissions[0],
-        Ok(ExpressionAdmission::DeferredInterpolation)
-    );
+    assert_eq!(admissions[0], Ok(ExpressionAdmission::ValueCheck));
 }
 
 #[test]
@@ -607,9 +692,10 @@ fn resolved_nominal_declarations_fail_closed_at_unrelated_scalars() {
         )
         .unbounded_witness_for_test(),
     };
-    let mut module =
-        crate::parser::parse_and_resolve("arguments { input: String }\nlet result = input")
-            .unwrap();
+    let mut module = crate::parser::parse_and_resolve(
+        "arguments { input: String }\nlet direct = input\nlet result = \"${input}\"",
+    )
+    .unwrap();
     let scope = crate::resource::ModuleInstanceScope::for_call("template", Some("child"), "child");
     module
         .parser_binding_metadata
@@ -618,7 +704,17 @@ fn resolved_nominal_declarations_fail_closed_at_unrelated_scalars() {
         .bind_arguments(&scope, [(RelativeBindingName::new("input"), named.clone())]);
     let report = judge_expressions(&module, &SchemaRegistry::new(), &config());
     let result = report.binding(&RelativeBindingName::new("result")).unwrap();
+    let direct = report.binding(&RelativeBindingName::new("direct")).unwrap();
     assert_eq!(result.static_type(), Ok(&named));
+    assert_eq!(result.check_owner(), direct.check_owner());
+    assert_eq!(
+        result.requires_declared_assignment(),
+        direct.requires_declared_assignment()
+    );
+    assert_eq!(
+        result.is_string_construction(),
+        direct.is_string_construction()
+    );
     assert!(admit_expression(result, &TypeExpr::Int).is_err());
     assert!(admit_expression(result, &TypeExpr::Bool).is_err());
 }

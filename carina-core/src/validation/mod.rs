@@ -1740,11 +1740,15 @@ pub fn binding_use_authority_owns_module_argument<E, D, B: BindingAddress>(
                 argument: owner_argument,
                 value_span: _,
             } if owner == call && owner_argument == argument
-        ) && (use_site.path.segments().len() == 1
-            || report
-                .findings()
-                .iter()
-                .any(|finding| same_authored_use(&finding.use_site, use_site)))
+        ) && !file
+            .expression_report()
+            .expression_in(&use_site.expression_instance, use_site.location())
+            .is_ok_and(crate::parser::retained::JudgedExpr::is_string_construction)
+            && (use_site.path.segments().len() == 1
+                || report
+                    .findings()
+                    .iter()
+                    .any(|finding| same_authored_use(&finding.use_site, use_site)))
     })
 }
 
@@ -1808,6 +1812,23 @@ where
     };
 
     for record in file.bare_binding_uses().records() {
+        let evidence = match &record.authored.owner {
+            crate::parser::BindingUseOwner::Resource(address) => context
+                .expression_report
+                .for_resource(address.resource_id()),
+            crate::parser::BindingUseOwner::ModuleArgument { .. } => Ok(context.expression_report),
+        }
+        .and_then(|report| {
+            report.expression_in(
+                &record.authored.expression_instance,
+                record.authored.location(),
+            )
+        });
+        if evidence.is_ok_and(crate::parser::retained::JudgedExpr::is_string_construction) {
+            // The complete string construction owns its sink constraints;
+            // its reference operands are rendered, not assigned to that sink.
+            continue;
+        }
         let mut result = match &record.authored.owner {
             crate::parser::BindingUseOwner::Resource(address) => {
                 match resource_sink(file, address, &record.authored.path, context.schemas) {
@@ -2032,7 +2053,8 @@ fn unique_union_map_member<'a>(
 /// List or Map value shape. Function arguments likewise have no locally
 /// available signature and deliberately receive `None`: the function's result
 /// sink says nothing sound about its input positions. Secrets preserve their
-/// enclosing sink and interpolation expressions use a string sink.
+/// enclosing sink. Interpolation operands are rendered to text, so only
+/// reference existence is checked below an ordinary string construction.
 pub(crate) fn visit_refs_with_sink<'a, P: PlaceholderKind, B: BindingAddress>(
     value: &GenericValue<P, B>,
     sink: Option<RefSink<'a>>,
@@ -2094,7 +2116,7 @@ fn visit_refs_with_sink_inner<'a, P: PlaceholderKind, B: BindingAddress>(
         GenericValue::Deferred(crate::resource::DeferredValue::Interpolation(parts)) => {
             for part in parts {
                 if let crate::resource::InterpolationPart::Expr(value) = part {
-                    visit_refs_with_sink_inner(value, Some(RefSink::String), usage, f);
+                    visit_refs_with_sink_inner(value, None, usage, f);
                 }
             }
         }
@@ -2207,7 +2229,14 @@ fn visit_computed_accesses_with_sink<'a, B: BindingAddress>(
         GenericValue::Deferred(crate::resource::DeferredValue::Interpolation(parts)) => {
             for part in parts {
                 if let crate::resource::InterpolationPart::Expr(value) = part {
-                    visit_computed_accesses_with_sink(value, Some(RefSink::String), f);
+                    let sink = matches!(
+                        value,
+                        GenericValue::Deferred(crate::resource::DeferredValue::IntegerArithmetic(
+                            _
+                        ))
+                    )
+                    .then_some(RefSink::String);
+                    visit_computed_accesses_with_sink(value, sink, f);
                 }
             }
         }
@@ -2333,6 +2362,7 @@ pub fn check_deferred_access_type<B: BindingAddress>(
     _schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
 ) -> Result<(), DeferredAccessTypeError> {
+    let value = expression.assignment_value(value);
     // Canonical reference-rooted postfix expressions are ResourceRefs. Route
     // those through BindingIndex so managed resources and wait aliases share
     // the same schema/value-source authority. This decision belongs here,
@@ -3154,6 +3184,7 @@ pub fn validate_module_call_argument_ref_types_with_bindings(
         imported_modules,
         bindings,
         UnknownReferencePolicy::Report,
+        None,
     )
 }
 
@@ -3162,6 +3193,7 @@ fn validate_module_call_argument_ref_types_inner(
     imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
     bindings: &BindingIndex<'_>,
     unknown_policy: UnknownReferencePolicy,
+    report: Option<&crate::parser::retained::ExpressionReport>,
 ) -> Vec<ModuleCallRefError> {
     let mut errors = Vec::new();
 
@@ -3191,8 +3223,17 @@ fn validate_module_call_argument_ref_types_inner(
             }
 
             let mut reference_position = 0;
+            let value = report
+                .and_then(|report| {
+                    call.id()
+                        .argument_value_location(argument_name)
+                        .and_then(|location| report.expression(location).ok())
+                })
+                .map_or(value.walker_value(), |expression| {
+                    expression.assignment_value(value.walker_value())
+                });
             visit_refs_with_sink(
-                value.walker_value(),
+                value,
                 declared_sink.map(RefSink::TypeExpr),
                 &mut |path, sink, usage, _candidate| {
                     let current_position = reference_position;
@@ -4704,6 +4745,7 @@ fn validate_resource_ref_types_inner<
                         continue;
                     }
                 };
+                let assignment_value = expression.assignment_value(attr_value);
                 let declared_source = module_source
                     .and_then(crate::resource::ModuleSource::module_call)
                     .and_then(|_call| {
@@ -4711,7 +4753,7 @@ fn validate_resource_ref_types_inner<
                             parsed,
                             resource_id,
                             attr_name,
-                            attr_value,
+                            assignment_value,
                             bindings,
                         )
                     });
@@ -4723,7 +4765,7 @@ fn validate_resource_ref_types_inner<
                 });
                 let string_sink = lift_type_expr(&TypeExpr::String).expect("built-in String lifts");
                 visit_refs_with_sink(
-                    attr_value,
+                    assignment_value,
                     sink,
                     &mut |reference, sink, usage, _candidate_value| {
                         let Some(source) = resolve_resource_reference(
@@ -4803,7 +4845,7 @@ fn validate_resource_ref_types_inner<
                         ));
                     },
                 );
-                visit_computed_accesses_with_sink(attr_value, sink, &mut |access, sink| {
+                visit_computed_accesses_with_sink(assignment_value, sink, &mut |access, sink| {
                     if matches!(
                         access,
                         GenericValue::Deferred(crate::resource::DeferredValue::IntegerArithmetic(
@@ -4837,7 +4879,7 @@ fn validate_resource_ref_types_inner<
                             crate::binding_index::DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Unchecked(reason)) => Err(unchecked_assignment_error(reason)),
                         },
                         None => check_deferred_access_type(access, sink_type,
-                            if std::ptr::eq(access, attr_value)
+                            if std::ptr::eq(access, assignment_value)
                                 && expression.check_owner() == crate::parser::retained::ExpressionCheckOwner::BindingIndex
                                 && expression.requires_declared_assignment()
                             {
@@ -5309,6 +5351,7 @@ pub fn validate_consumer_attribute_param_ref_types_with_bindings<B: BindingAddre
                 .as_ref()
                 .and_then(crate::parser::BoundaryExpression::value),
             expected_type,
+            param.judgement().ok(),
             bindings,
             UnknownReferencePolicy::Report,
             &mut errors,
@@ -5336,6 +5379,7 @@ fn validate_attribute_param_ref_types_inner<P: PlaceholderKind, B: BindingAddres
                 .as_ref()
                 .and_then(crate::parser::BoundaryExpression::value),
             param.static_type.as_ref(),
+            param.judgement().ok(),
             bindings,
             unknown_policy,
             &mut errors,
@@ -5353,6 +5397,7 @@ fn check_attribute_param_refs<P: PlaceholderKind, B: BindingAddress>(
     param_name: &str,
     value: Option<&GenericValue<P, B>>,
     expected_type: Option<&TypeExpr>,
+    expression: Option<&crate::parser::retained::JudgedExpr>,
     bindings: &BindingIndex<'_, B>,
     unknown_policy: UnknownReferencePolicy,
     errors: &mut Vec<String>,
@@ -5360,6 +5405,7 @@ fn check_attribute_param_refs<P: PlaceholderKind, B: BindingAddress>(
     let Some(value) = value else {
         return;
     };
+    let value = expression.map_or(value, |expression| expression.assignment_value(value));
     visit_refs_with_sink(
         value,
         expected_type.map(RefSink::TypeExpr),
@@ -5637,6 +5683,10 @@ fn collect_export_param_ref_type_errors<
         return errors;
     }
     let sink = param.type_expr_opt().map(RefSink::TypeExpr);
+    let value = param
+        .judgement()
+        .ok()
+        .map_or(value, |expression| expression.assignment_value(value));
     visit_refs_with_sink(value, sink, &mut |path, sink, usage, _candidate| {
         check_export_ref(
             param.name(),
@@ -5821,6 +5871,7 @@ pub(crate) fn validate_expansion_boundary_ref_types_with_bindings<
             imported_modules,
             bindings,
             UnknownReferencePolicy::Defer,
+            Some(parsed.expression_report()),
         )
         .into_iter()
         .map(|error| ExpansionBoundaryReferenceError::ModuleCall(Box::new(error))),
@@ -8345,11 +8396,12 @@ impl ModuleCallChecker<'_> {
             owner,
         } = context;
         let reference_call = semantic_call.unwrap_or(authored_call);
-        for error in validate_module_call_argument_ref_types_with_bindings(
+        for error in validate_module_call_argument_ref_types_inner(
             std::slice::from_ref(reference_call),
             signatures,
-            &HashSet::new(),
             bindings,
+            UnknownReferencePolicy::Report,
+            Some(authority_file.expression_report()),
         ) {
             if signatures
                 .get(&authored_call.module_name)

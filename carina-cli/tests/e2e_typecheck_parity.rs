@@ -535,45 +535,50 @@ fn authored_expression_coalesce_cli_lsp_directory_parity() {
 }
 
 fn named_module_sink(through_let: bool) {
-    let rhs = if through_let {
-        "constructed"
-    } else {
-        "\"${source.value}\""
-    };
-    let alias = if through_let {
-        "let constructed = \"${source.value}\"\n"
-    } else {
-        ""
-    };
-    let main = format!(
-        "let source = test.r.typed {{}}\n{alias}let template = use {{ source = './child' }}\nlet child = template {{ role = {rhs} }}\n"
-    );
-    let fixture = write_fixture(&[
-        ("main.crn", &main),
-        ("exports.crn", "exports {}\n"),
-        ("providers.crn", "provider test {}\n"),
-        ("backend.crn", "backend local { path = 'state.json' }\n"),
-    ]);
-    std::fs::create_dir(fixture.path().join("child")).unwrap();
-    std::fs::write(
-        fixture.path().join("child/main.crn"),
-        "arguments { role: test.r.RoleName }\nattributes { result = role }\n",
-    )
-    .unwrap();
-    let schemas = expression_typing_schemas();
-    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
-    assert!(cli.is_empty(), "{main}: {cli:#?}");
-    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
-    assert!(lsp_error_multiset(&lsp).is_empty(), "{main}: {lsp:#?}");
+    for (interpolation, accepted) in [
+        ("\"${source.value}\"", false),
+        ("\"${source.value}-suffix\"", true),
+    ] {
+        let rhs = if through_let {
+            "constructed"
+        } else {
+            interpolation
+        };
+        let alias = format!("let constructed = {interpolation}\n");
+        let main = format!(
+            "let source = test.r.typed {{}}\n{alias}let template = use {{ source = './child' }}\nlet child = template {{ role = {rhs} }}\n"
+        );
+        let fixture = write_fixture(&[
+            ("main.crn", &main),
+            ("exports.crn", "exports {}\n"),
+            ("providers.crn", "provider test {}\n"),
+            ("backend.crn", "backend local { path = 'state.json' }\n"),
+        ]);
+        std::fs::create_dir(fixture.path().join("child")).unwrap();
+        std::fs::write(
+            fixture.path().join("child/main.crn"),
+            "arguments { role: test.r.RoleName }\nattributes { result = role }\n",
+        )
+        .unwrap();
+        let schemas = expression_typing_schemas();
+        let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+        assert_eq!(cli.is_empty(), accepted, "{main}: {cli:#?}");
+        let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+        assert_eq!(
+            lsp_error_multiset(&lsp).is_empty(),
+            accepted,
+            "{main}: {lsp:#?}"
+        );
+    }
 }
 
 #[test]
-fn inline_named_sink_accepts() {
+fn inline_named_sink_preserves_interpolation_policy() {
     named_module_sink(false);
 }
 
 #[test]
-fn let_named_sink_accepts() {
+fn let_named_sink_preserves_interpolation_policy() {
     named_module_sink(true);
 }
 
@@ -688,10 +693,13 @@ fn struct_literal_leaf_type_mismatch_cli_lsp_parity() {
 #[test]
 fn structural_string_kinds_have_cli_lsp_directory_parity() {
     for (expression, accepted) in [
-        ("\"${source.value}\"", true),
-        ("constructed", true),
+        ("\"${source.value}\"", false),
+        ("constructed", false),
         ("source.value", false),
-        ("[\"${source.value}\"][0]", true),
+        ("[\"${source.value}\"][0]", false),
+        ("\"${source.value}-inline\"", true),
+        ("\"a${source.value}\"", true),
+        ("\"${source.value}${source.value}\"", true),
         ("\"${source.value}\" ?? source.value", false),
         ("source.value ?? \"${source.value}\"", false),
         (
@@ -704,7 +712,7 @@ fn structural_string_kinds_have_cli_lsp_directory_parity() {
         ),
         (
             "if true { \"${source.value}\" } else { \"${source.value}\" }",
-            true,
+            false,
         ),
     ] {
         let main = format!("test.r.typed {{ role_name = {expression} }}\n");
@@ -836,8 +844,234 @@ fn authored_expression_inline_awscc_fallback_is_rejected() {
 }
 
 #[test]
-fn authored_expression_deferred_interpolation_inline_let_agree_and_accept() {
-    for interpolation in ["\"${x}\"", "\"${x}-suffix\""] {
+fn single_reference_interpolation_scalar_string_constraints_cli_lsp() {
+    let schemas = single_schema_map(
+        ResourceSchema::new("r.scalar")
+            .attribute(AttributeSchema::provider_populated("port", AttributeType::int()).build())
+            .attribute(AttributeSchema::optional("plain", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "digits",
+                    AttributeType::refined_string(
+                        Some(carina_core::schema::TypeIdentity::new(
+                            Some("test"),
+                            ["r"],
+                            "Digits",
+                        )),
+                        Some("^[0-9]+$".into()),
+                        Some((Some(2), Some(4))),
+                        None,
+                    ),
+                )
+                .build(),
+            ),
+    );
+    let engine = engine_with_schemas(schemas.clone());
+    for module in [false, true] {
+        for (origin, attribute, accepted) in [
+            ("let port = 42", "plain", true),
+            ("let port = source.port", "plain", true),
+            ("let port = 42", "digits", true),
+            ("let port = 1", "digits", false),
+            ("let port = 12345", "digits", false),
+            ("let port = -42", "digits", false),
+            ("let port = source.port", "digits", true),
+        ] {
+            let fixture = write_fixture(&[
+                ("providers.crn", "provider test {}\n"),
+                ("source.crn", "let source = test.r.scalar {}\n"),
+                ("aliases.crn", &format!("{origin}\n")),
+                ("main.crn", ""),
+            ]);
+            if module {
+                std::fs::create_dir(fixture.path().join("child")).unwrap();
+                let ty = if attribute == "plain" {
+                    "String"
+                } else {
+                    "test.r.Digits"
+                };
+                std::fs::write(
+                    fixture.path().join("child/arguments.crn"),
+                    format!("arguments {{ value: {ty} }}\n"),
+                )
+                .unwrap();
+                std::fs::write(
+                    fixture.path().join("child/main.crn"),
+                    "attributes { result = value }\n",
+                )
+                .unwrap();
+            }
+            let source = if module {
+                "let template = use { source = './child' }\nlet sink = template { value = \"${port}\" }\n".to_string()
+            } else {
+                format!("let sink = test.r.scalar {{ {attribute} = \"${{port}}\" }}\n")
+            };
+            std::fs::write(fixture.path().join("main.crn"), &source).unwrap();
+            let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+            assert_eq!(
+                cli.is_empty(),
+                accepted,
+                "{module}: {origin}: {source}: {cli:#?}"
+            );
+            let lsp = lsp_diagnostics(&engine, &fixture, "main.crn");
+            assert_eq!(
+                lsp_error_multiset(&lsp).is_empty(),
+                accepted,
+                "{module}: {origin}: {source}: {lsp:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn single_reference_interpolation_at_module_call_matches_direct_diagnostics() {
+    for (attribute, accepted) in [("value", false), ("role_name", true)] {
+        let fixture = write_fixture(&[
+            ("providers.crn", "provider test {}\n"),
+            ("source.crn", "let source = test.r.typed {}\n"),
+            ("aliases.crn", &format!("let x = source.{attribute}\n")),
+            ("main.crn", ""),
+        ]);
+        std::fs::create_dir(fixture.path().join("child")).unwrap();
+        std::fs::write(
+            fixture.path().join("child/arguments.crn"),
+            "arguments { value: test.r.RoleName }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("child/main.crn"),
+            "attributes { result = value }\n",
+        )
+        .unwrap();
+        let source = |rhs| {
+            format!(
+                "let template = use {{ source = './child' }}\nlet sink = template {{ value = {rhs} }}\n"
+            )
+        };
+        std::fs::write(fixture.path().join("main.crn"), source("x")).unwrap();
+        let schemas = expression_typing_schemas();
+        let engine = engine_with_schemas(schemas.clone());
+        let direct_cli = cli_diagnostics(factories_for(&schemas), &fixture);
+        let direct_lsp = lsp_diagnostics(&engine, &fixture, "main.crn");
+        assert_eq!(direct_cli.is_empty(), accepted, "{direct_cli:#?}");
+        for rhs in ["\"${x}\"", "\"${ x }\""] {
+            std::fs::write(fixture.path().join("main.crn"), source(rhs)).unwrap();
+            let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+            assert_eq!(cli, direct_cli, "{rhs}");
+            let lsp = lsp_diagnostics(&engine, &fixture, "main.crn");
+            assert_eq!(
+                lsp_error_multiset(&lsp),
+                lsp_error_multiset(&direct_lsp),
+                "{lsp:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn single_reference_interpolation_resource_alias_matches_direct_diagnostics() {
+    for (origin, accepted) in [
+        ("let x = source.value\n", false),
+        ("let x = source.role_name\n", true),
+        ("let x = 'valid'\n", true),
+        ("let x = 'INVALID'\n", false),
+    ] {
+        let fixture = write_fixture(&[
+            ("providers.crn", "provider test {}\n"),
+            ("source.crn", "let source = test.r.typed {}\n"),
+            ("aliases.crn", origin),
+            (
+                "main.crn",
+                "let sink = test.r.typed {\n  role_name = x\n}\n",
+            ),
+        ]);
+        let schemas = expression_typing_schemas();
+        let direct_cli = cli_diagnostics(factories_for(&schemas), &fixture);
+        let engine = engine_with_schemas(schemas.clone());
+        let direct_lsp = lsp_diagnostics(&engine, &fixture, "main.crn");
+        assert_eq!(direct_cli.is_empty(), accepted, "{origin}: {direct_cli:#?}");
+        assert_eq!(direct_lsp.is_empty(), accepted, "{origin}: {direct_lsp:#?}");
+        for rhs in ["\"${x}\"", "\"${ x }\""] {
+            std::fs::write(
+                fixture.path().join("main.crn"),
+                format!("let sink = test.r.typed {{\n  role_name = {rhs}\n}}\n"),
+            )
+            .unwrap();
+            let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+            assert_eq!(cli, direct_cli, "{origin}: {rhs}");
+            let lsp = lsp_diagnostics(&engine, &fixture, "main.crn");
+            assert_eq!(lsp.len(), direct_lsp.len(), "{origin}: {rhs}: {lsp:#?}");
+            assert_eq!(lsp_error_multiset(&lsp), lsp_error_multiset(&direct_lsp));
+            for (diagnostic, direct) in lsp.iter().zip(&direct_lsp) {
+                assert_eq!(
+                    diagnostic.range.start, direct.range.start,
+                    "{diagnostic:#?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn single_reference_interpolation_module_argument_matches_direct_diagnostics() {
+    for (ty, attribute, accepted) in [
+        ("String", "value", false),
+        ("test.r.RoleName", "role_name", true),
+    ] {
+        let fixture = write_fixture(&[
+            ("providers.crn", "provider test {}\n"),
+            ("source.crn", "let source = test.r.typed {}\n"),
+            (
+                "main.crn",
+                &format!(
+                    "let template = use {{ source = './child' }}\nlet child = template {{ name = source.{attribute} }}\n"
+                ),
+            ),
+        ]);
+        std::fs::create_dir(fixture.path().join("child")).unwrap();
+        std::fs::write(
+            fixture.path().join("child/arguments.crn"),
+            format!("arguments {{ name: {ty} }}\n"),
+        )
+        .unwrap();
+        let sink = fixture.path().join("child/main.crn");
+        std::fs::write(&sink, "test.r.typed {\n  role_name = name\n}\n").unwrap();
+        let schemas = expression_typing_schemas();
+        let direct_cli = cli_diagnostics(factories_for(&schemas), &fixture);
+        let engine = engine_with_schemas(schemas.clone());
+        let direct_lsp = lsp_diagnostics(&engine, &fixture, "child/main.crn");
+        let siblings = ["main.crn", "source.crn", "child/arguments.crn"];
+        let direct_siblings: Vec<_> = siblings
+            .iter()
+            .map(|sibling| lsp_diagnostics(&engine, &fixture, sibling))
+            .collect();
+        assert_eq!(direct_cli.is_empty(), accepted, "{ty}: {direct_cli:#?}");
+        assert_eq!(
+            lsp_error_multiset(&direct_lsp).values().sum::<usize>(),
+            usize::from(!accepted),
+            "{direct_lsp:#?}"
+        );
+        std::fs::write(&sink, "test.r.typed {\n  role_name = \"${name}\"\n}\n").unwrap();
+        let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+        assert_eq!(cli, direct_cli, "{ty}");
+        let lsp = lsp_diagnostics(&engine, &fixture, "child/main.crn");
+        assert_eq!(lsp.len(), direct_lsp.len(), "{ty}: {lsp:#?}");
+        assert_eq!(lsp_error_multiset(&lsp), lsp_error_multiset(&direct_lsp));
+        for (sibling, direct) in siblings.iter().zip(direct_siblings) {
+            let diagnostics = lsp_diagnostics(&engine, &fixture, sibling);
+            assert_eq!(diagnostics, direct, "{ty}: {sibling}");
+        }
+    }
+}
+
+#[test]
+fn authored_expression_interpolation_inline_let_agree_on_admission() {
+    for (interpolation, accepted) in [
+        ("\"${x}\"", false),
+        ("\"${x}-inline\"", true),
+        ("\"a${x}\"", true),
+        ("\"${x}${x}\"", true),
+    ] {
         for named in [false, true] {
             for through_let in [false, true] {
                 let rhs = if through_let { "alias" } else { interpolation };
@@ -857,9 +1091,13 @@ fn authored_expression_deferred_interpolation_inline_let_agree_and_accept() {
                 ]);
                 let schemas = expression_typing_schemas();
                 let cli = cli_diagnostics(factories_for(&schemas), &fixture);
-                assert!(cli.is_empty(), "{main}: {cli:#?}");
+                assert_eq!(cli.is_empty(), accepted, "{main}: {cli:#?}");
                 let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
-                assert!(lsp_error_multiset(&lsp).is_empty(), "{main}: {lsp:#?}");
+                assert_eq!(
+                    lsp_error_multiset(&lsp).is_empty(),
+                    accepted,
+                    "{main}: {lsp:#?}"
+                );
             }
         }
     }
@@ -898,7 +1136,11 @@ fn authored_expression_plain_reference_and_concrete_interpolation_keep_constrain
 
 #[test]
 fn authored_expression_module_string_interpolation_inline_let_agree() {
-    for rhs in ["\"${x}\"", "\"${x}-suffix\"", "alias"] {
+    for (rhs, accepted) in [
+        ("\"${x}\"", false),
+        ("\"${x}-suffix\"", true),
+        ("alias", false),
+    ] {
         let fixture = write_fixture(&[
             (
                 "main.crn",
@@ -932,9 +1174,13 @@ fn authored_expression_module_string_interpolation_inline_let_agree() {
         .unwrap();
         let schemas = expression_typing_schemas();
         let cli = cli_diagnostics(factories_for(&schemas), &fixture);
-        assert!(cli.is_empty(), "{rhs}: {cli:#?}");
-        let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
-        assert!(lsp_error_multiset(&lsp).is_empty(), "{rhs}: {lsp:#?}");
+        assert_eq!(cli.is_empty(), accepted, "{rhs}: {cli:#?}");
+        let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "child/main.crn");
+        assert_eq!(
+            lsp_error_multiset(&lsp).is_empty(),
+            accepted,
+            "{rhs}: {lsp:#?}"
+        );
     }
 }
 

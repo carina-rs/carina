@@ -661,7 +661,10 @@ fn parse_primary_eval_with_mode_inner(
             let value = parse_duration_literal(inner.as_str(), line)?;
             Ok(EvalValue::from_value(value))
         }
-        Rule::string => parse_string_value(inner, ctx).map(EvalValue::from_value),
+        Rule::string => {
+            crate::parser::retained::record_interpolation_binding(inner.clone(), ctx, mode);
+            parse_string_value(inner, ctx).map(EvalValue::from_value)
+        }
         Rule::function_call => {
             let location = ctx.declaration_location(&inner);
             let (line, column) = inner.line_col();

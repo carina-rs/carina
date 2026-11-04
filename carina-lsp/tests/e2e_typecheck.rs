@@ -21,6 +21,185 @@ use carina_core::schema::{
 use support::fixture::{analyze, engine_with_schemas, single_schema_map, write_fixture};
 
 #[test]
+fn single_reference_interpolation_scalar_constraints_and_module_call() {
+    use carina_core::schema::TypeIdentity;
+    use tower_lsp::lsp_types::DiagnosticSeverity;
+
+    let schemas = single_schema_map(
+        ResourceSchema::new("r.scalar")
+            .attribute(AttributeSchema::provider_populated("port", AttributeType::int()).build())
+            .attribute(
+                AttributeSchema::provider_populated("value", AttributeType::string()).build(),
+            )
+            .attribute(AttributeSchema::optional("plain", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "digits",
+                    AttributeType::refined_string(
+                        Some(TypeIdentity::new(Some("test"), ["r"], "Digits")),
+                        Some("^[0-9]+$".into()),
+                        Some((Some(2), Some(4))),
+                        None,
+                    ),
+                )
+                .build(),
+            ),
+    );
+    let engine = engine_with_schemas(schemas);
+    for module in [false, true] {
+        for (origin, rhs, attribute, accepted) in [
+            ("let port = 42", "\"${port}\"", "plain", true),
+            ("let port = source.port", "\"${port}\"", "plain", true),
+            ("let port = 42", "\"${port}\"", "digits", true),
+            ("let port = 1", "\"${port}\"", "digits", false),
+            ("let port = 12345", "\"${port}\"", "digits", false),
+            ("let port = -42", "\"${port}\"", "digits", false),
+            ("let port = source.port", "\"${port}\"", "digits", true),
+            ("let x = source.value", "\"${x}\"", "digits", false),
+            ("let x = source.digits", "\"${x}\"", "digits", true),
+            ("let x = source.value", "\"${x}-inline\"", "digits", true),
+        ] {
+            let fixture = write_fixture(&[
+                ("providers.crn", "provider test {}\n"),
+                ("source.crn", "let source = test.r.scalar {}\n"),
+                ("aliases.crn", &format!("{origin}\n")),
+                ("main.crn", ""),
+            ]);
+            let source = if module {
+                std::fs::create_dir(fixture.path().join("child")).unwrap();
+                let ty = if attribute == "plain" {
+                    "String"
+                } else {
+                    "test.r.Digits"
+                };
+                std::fs::write(
+                    fixture.path().join("child/arguments.crn"),
+                    format!("arguments {{ value: {ty} }}\n"),
+                )
+                .unwrap();
+                std::fs::write(
+                    fixture.path().join("child/main.crn"),
+                    "attributes { result = value }\n",
+                )
+                .unwrap();
+                format!(
+                    "let template = use {{ source = './child' }}\nlet sink = template {{ value = {rhs} }}\n"
+                )
+            } else {
+                format!("let sink = test.r.scalar {{ {attribute} = {rhs} }}\n")
+            };
+            std::fs::write(fixture.path().join("main.crn"), &source).unwrap();
+            let errors: Vec<_> = analyze(&engine, &fixture, "main.crn")
+                .into_iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+                .collect();
+            assert_eq!(
+                errors.is_empty(),
+                accepted,
+                "{module}: {origin}: {source}: {errors:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn single_reference_interpolation_matches_direct_directory_diagnostic() {
+    use carina_core::schema::TypeIdentity;
+    use tower_lsp::lsp_types::DiagnosticSeverity;
+
+    let schemas = single_schema_map(
+        ResourceSchema::new("r.typed")
+            .attribute(
+                AttributeSchema::provider_populated("value", AttributeType::string()).build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "role_name",
+                    AttributeType::refined_string(
+                        Some(TypeIdentity::new(Some("test"), ["r"], "RoleName")),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            ),
+    );
+    let engine = engine_with_schemas(schemas);
+    for module in [false, true] {
+        for (ty, attribute, accepted) in [
+            ("String", "value", false),
+            ("test.r.RoleName", "role_name", true),
+        ] {
+            let fixture = write_fixture(&[
+                (
+                    "providers.crn",
+                    if module { "provider test {}\n" } else { "" },
+                ),
+                ("source.crn", "let source = test.r.typed {}\n"),
+                ("aliases.crn", &format!("let x = source.{attribute}\n")),
+                ("main.crn", ""),
+            ]);
+            let (file, reference) = if module {
+                std::fs::write(
+                    fixture.path().join("main.crn"),
+                    "let template = use { source = './child' }\nlet child = template { name = x }\n",
+                )
+                .unwrap();
+                std::fs::create_dir(fixture.path().join("child")).unwrap();
+                std::fs::write(
+                    fixture.path().join("child/arguments.crn"),
+                    format!("arguments {{ name: {ty} }}\n"),
+                )
+                .unwrap();
+                ("child/main.crn", "name")
+            } else {
+                ("main.crn", "x")
+            };
+            let sink = fixture.path().join(file);
+            let source = |rhs: &str| {
+                if module {
+                    format!("test.r.typed {{\n  role_name = {rhs}\n}}\n")
+                } else {
+                    format!("attributes {{\n  role_name: test.r.RoleName = {rhs}\n}}\n")
+                }
+            };
+            std::fs::write(&sink, source(reference)).unwrap();
+            let direct: Vec<_> = analyze(&engine, &fixture, file)
+                .into_iter()
+                .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+                .collect();
+            assert_eq!(direct.len(), usize::from(!accepted), "{direct:#?}");
+            let mut siblings = vec!["source.crn", "aliases.crn", "providers.crn"];
+            if module {
+                siblings.extend(["main.crn", "child/arguments.crn"]);
+            }
+            let direct_siblings: Vec<_> = siblings
+                .iter()
+                .map(|sibling| analyze(&engine, &fixture, sibling))
+                .collect();
+            std::fs::write(&sink, source(&format!("\"${{{reference}}}\""))).unwrap();
+            let wrapped: Vec<_> = analyze(&engine, &fixture, file)
+                .into_iter()
+                .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+                .collect();
+            assert_eq!(wrapped.len(), direct.len(), "{module}: {ty}: {wrapped:#?}");
+            for (wrapped, direct) in wrapped.iter().zip(&direct) {
+                assert_eq!(wrapped.message, direct.message);
+                assert_eq!(wrapped.severity, Some(DiagnosticSeverity::ERROR));
+                assert_eq!(wrapped.source, direct.source);
+                assert_eq!(wrapped.code, direct.code);
+                assert_eq!(wrapped.range.start.line, 1);
+            }
+            for (sibling, direct) in siblings.iter().zip(direct_siblings) {
+                let diagnostics = analyze(&engine, &fixture, sibling);
+                assert_eq!(diagnostics, direct, "{module}: {ty}: {sibling}");
+            }
+        }
+    }
+}
+
+#[test]
 fn authored_expression_unsaved_fallback_owns_one_exact_diagnostic() {
     use std::sync::Arc;
     use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Range};

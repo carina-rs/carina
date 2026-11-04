@@ -804,6 +804,22 @@ impl<'a> ExpressionMode<'a> {
         token: &pest::iterators::Pair<'_, Rule>,
     ) -> Option<PendingValueSlot> {
         let sink = self.sink.as_ref()?;
+        self.record_bare_binding_at(
+            ctx,
+            name,
+            token,
+            super::DeclarationLocation::from_pair(token, sink.preprocessed_file, sink.source_file),
+        )
+    }
+
+    pub(super) fn record_bare_binding_at(
+        &self,
+        ctx: &ParseContext<'_>,
+        name: &str,
+        token: &pest::iterators::Pair<'_, Rule>,
+        location: super::DeclarationLocation,
+    ) -> Option<PendingValueSlot> {
+        let sink = self.sink.as_ref()?;
         let (binding, source) = match ctx.lookup_binding(name) {
             ParseBindingRef::Value {
                 value: EvalValue::DeferredForValue { .. },
@@ -847,11 +863,7 @@ impl<'a> ExpressionMode<'a> {
         };
         let authored = BareBindingUse {
             expression_instance: super::retained::ExpressionInstance::Root,
-            location: super::DeclarationLocation::from_pair(
-                token,
-                sink.preprocessed_file,
-                sink.source_file,
-            ),
+            location,
             source_file: SourceFileId::new(sink.source_file.to_path_buf()),
             scope: ctx
                 .binding_scope(name)

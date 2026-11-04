@@ -2918,11 +2918,6 @@ impl<P: ValueKind, B: BindingAddress> AttributeParameter<TypeExpr, P, B> {
     pub fn value_location(&self) -> Option<&super::DeclarationLocation> {
         self.source.value_location.as_ref()
     }
-    pub fn judgement(
-        &self,
-    ) -> Result<&super::retained::JudgedExpr, &super::retained::MissingEvidence> {
-        self.source.judgement.as_ref()
-    }
     pub(crate) fn attach_judgement(&mut self, report: &super::retained::ExpressionReport<B>) {
         self.source.judgement = self
             .source
@@ -2979,6 +2974,12 @@ impl<P: ValueKind, B: BindingAddress> AttributeParameter<TypeExpr, P, B> {
 }
 
 impl<T, P: ValueKind, B: BindingAddress> AttributeParameter<T, P, B> {
+    pub fn judgement(
+        &self,
+    ) -> Result<&super::retained::JudgedExpr, &super::retained::MissingEvidence> {
+        self.source.judgement.as_ref()
+    }
+
     pub(crate) fn value_for_module_if_audit(&self) -> Option<&Value<P, B>> {
         let Self {
             name: _name,
