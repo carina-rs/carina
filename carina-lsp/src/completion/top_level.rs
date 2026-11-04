@@ -459,15 +459,15 @@ impl CompletionProvider {
         if !literal_items.is_empty() {
             return literal_items;
         }
-        // Provider schema types carry an owner-qualified identity. Resolve
-        // that identity through the same owner index used by validation so
+        // Provider schema types carry resolved declaration evidence. Use
+        // its owners with the same enum index used by validation so
         // an enum parameter retains its member declaration instead of being
         // flattened into a generic refined string.
         let resolved_type =
             carina_core::validation::resolve_type_expr(arg_type, provider_ctx.catalog())
                 .unwrap_or_else(|_| arg_type.clone());
-        if let parser::TypeExpr::SchemaType { owned } = &resolved_type
-            && let Ok(Some(declaration)) = provider_ctx.catalog().enum_declaration(owned)
+        if let parser::TypeExpr::SchemaType { owned: witness } = &resolved_type
+            && let Ok(Some(declaration)) = provider_ctx.catalog().enum_declaration(witness)
             && let Some(lifted) = carina_core::validation::lift_type_expr(&resolved_type)
         {
             return self.value_completions_with_declaration(

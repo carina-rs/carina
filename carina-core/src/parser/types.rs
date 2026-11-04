@@ -128,8 +128,8 @@ impl TryFrom<TypeIdentity> for TypeExpr {
 }
 
 /// Resolve an identity using the catalog, retaining only nominal evidence
-/// when that catalog is not loaded. Deserialized annotations retain nominal
-/// identity only, with no loaded provider candidates.
+/// when that catalog is not loaded. Resolved wire annotations already carry
+/// their validated declaration evidence and do not need this lookup to lift.
 pub(crate) fn resolve_custom_type_identity(
     identity: &TypeIdentity,
     config: &ProviderContext,
@@ -145,40 +145,54 @@ pub(crate) fn resolve_custom_type_identity(
         .iter()
         .filter(|owned| owned.identity() == identity)
         .collect::<Vec<_>>();
-    if config.custom_types.may_defer(identity.provider.as_deref()) {
+    if config.custom_types.may_defer(identity.provider.as_deref())
+        || matches.iter().any(|owned| {
+            owned
+                .provider_names()
+                .any(|owner| config.custom_types.may_defer(Some(owner)))
+        })
+    {
         return Ok(Some(TypeExpr::UnloadedSchemaType(UnloadedSchemaType(
             identity.clone(),
             matches.iter().map(|owned| (*owned).clone()).collect(),
         ))));
     }
-    if let Some(resolved) = merge_custom_type_candidates(&matches)? {
-        return Ok(Some(resolved));
+    if let Some(owned) = merge_custom_type_candidates(&matches)? {
+        use super::CustomTypeResolver;
+        return config
+            .custom_types
+            .annotation_declaration(&owned)
+            .map(|owned| Some(TypeExpr::SchemaType { owned }))
+            .map_err(|error| StaticTypeResolutionError::MissingDeclaration {
+                name: owned.authored_name(),
+                reason: error.to_string(),
+            });
     }
     Ok(None)
 }
 
-/// Resolve annotations against resource declarations and the actual provider
-/// catalog. Only an unloaded catalog may retain unresolved nominal evidence.
+/// Resolve annotations against the authoritative provider catalog. Resource
+/// schemas alone omit provider configuration and cannot seal a witness.
 pub fn resolve_type_expr_from_schemas(
     ty: &TypeExpr,
-    schemas: &crate::schema::SchemaRegistry,
+    _schemas: &crate::schema::SchemaRegistry,
     config: &ProviderContext,
 ) -> Result<TypeExpr, StaticTypeResolutionError> {
     let identity = match ty {
         TypeExpr::UnloadedSchemaType(unloaded) => unloaded.identity().clone(),
         TypeExpr::List(inner) => {
-            return resolve_type_expr_from_schemas(inner, schemas, config)
+            return resolve_type_expr_from_schemas(inner, _schemas, config)
                 .map(|inner| TypeExpr::List(Box::new(inner)));
         }
         TypeExpr::Map(inner) => {
-            return resolve_type_expr_from_schemas(inner, schemas, config)
+            return resolve_type_expr_from_schemas(inner, _schemas, config)
                 .map(|inner| TypeExpr::Map(Box::new(inner)));
         }
         TypeExpr::Struct { fields } => {
             return fields
                 .iter()
                 .map(|(name, field)| {
-                    resolve_type_expr_from_schemas(field, schemas, config)
+                    resolve_type_expr_from_schemas(field, _schemas, config)
                         .map(|field| (name.clone(), field))
                 })
                 .collect::<Result<_, _>>()
@@ -187,7 +201,7 @@ pub fn resolve_type_expr_from_schemas(
         TypeExpr::Union(members) => {
             return members
                 .iter()
-                .map(|member| resolve_type_expr_from_schemas(member, schemas, config))
+                .map(|member| resolve_type_expr_from_schemas(member, _schemas, config))
                 .collect::<Result<_, _>>()
                 .map(TypeExpr::Union);
         }
@@ -202,10 +216,6 @@ pub fn resolve_type_expr_from_schemas(
         | TypeExpr::DottedUnresolved(_)
         | TypeExpr::StringLiteral(_) => return Ok(ty.clone()),
     };
-    let candidates = schemas.known_custom_type_declarations(&identity);
-    if let Some(resolved) = merge_custom_type_candidates(&candidates.iter().collect::<Vec<_>>())? {
-        return Ok(resolved);
-    }
     resolve_custom_type_identity(&identity, config)?
         .ok_or_else(|| unknown_custom_type_error(&identity.to_string(), config))
 }
@@ -308,13 +318,13 @@ pub(crate) fn resolve_known_bare_custom_type(
 }
 
 /// Join owners only after their declarations agree on the scalar kind.
-pub(crate) fn merge_custom_type_candidates(
+fn merge_custom_type_candidates(
     matches: &[&super::OwnedTypeIdentity],
-) -> Result<Option<TypeExpr>, StaticTypeResolutionError> {
+) -> Result<Option<super::OwnedTypeIdentity>, StaticTypeResolutionError> {
     let Some(first) = matches.first() else {
         return Ok(None);
     };
-    let mut owners = first.owners().clone();
+    let mut declaration = (*first).clone();
     for owned in &matches[1..] {
         if owned.scalar_kind() != first.scalar_kind() {
             return Err(StaticTypeResolutionError::ConflictingScalarKinds {
@@ -323,11 +333,9 @@ pub(crate) fn merge_custom_type_candidates(
                 second_kind: owned.scalar_kind(),
             });
         }
-        owners = owners.union(owned.owners());
+        declaration = declaration.with_merged_owners(declaration.owners().union(owned.owners()));
     }
-    Ok(Some(TypeExpr::SchemaType {
-        owned: first.with_merged_owners(owners),
-    }))
+    Ok(Some(declaration))
 }
 
 fn custom_type_suggestion_key(id: &TypeIdentity) -> String {

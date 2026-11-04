@@ -215,7 +215,7 @@ lookup({ a = 'one', b = 'two' }, 'c', 'default')  # => 'default'
 
 ### `min`
 
-Returns the smaller of two numbers. If both are integers, returns an integer. If either is a float, returns a float.
+Returns the smaller of two numbers, comparing their exact values without rounding integers. If both are integers, returns an integer. If either is a float, returns a float; if the selected integer cannot be represented exactly as a float, returns an error.
 
 ```
 min(a: Number, b: Number) -> Number
@@ -229,7 +229,7 @@ min(1, 2.5)    # => 1.0
 
 ### `max`
 
-Returns the larger of two numbers. If both are integers, returns an integer. If either is a float, returns a float.
+Returns the larger of two numbers, comparing their exact values without rounding integers. If both are integers, returns an integer. If either is a float, returns a float; if the selected integer cannot be represented exactly as a float, returns an error.
 
 ```
 max(a: Number, b: Number) -> Number

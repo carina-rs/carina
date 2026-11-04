@@ -499,6 +499,39 @@ fn apply_time_patch_omits_reference_form_equivalent_key() {
 }
 
 #[test]
+fn type_aware_exact_numeric_i64_boundary() {
+    for attr_type in [
+        AttributeType::float(),
+        AttributeType::int(),
+        AttributeType::union(vec![AttributeType::int(), AttributeType::float()]),
+    ] {
+        for (integer, float, expected) in [
+            (i64::MAX, 9_223_372_036_854_775_808.0, false),
+            (9_007_199_254_740_993, 9_007_199_254_740_992.0, false),
+            (i64::MIN, -9_223_372_036_854_775_808.0, true),
+            (3, 3.0, true),
+            (3, 3.5, false),
+            (0, f64::NAN, false),
+        ] {
+            let a = Value::Concrete(ConcreteValue::Int(integer));
+            let b = Value::Concrete(ConcreteValue::Float(float));
+            for (a, b) in [(&a, &b), (&b, &a)] {
+                assert_eq!(
+                    type_aware_equal(
+                        a,
+                        b,
+                        Some(&attr_type),
+                        crate::schema::empty_defs_for_schema_walks()
+                    ),
+                    expected,
+                    "{a:?}, {b:?} under {attr_type}",
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn type_aware_int_float_coercion() {
     assert!(type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(42)),

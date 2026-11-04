@@ -1564,7 +1564,7 @@ mod tests {
             None,
         );
         let ty = TypeExpr::SchemaType {
-            owned: crate::parser::OwnedTypeIdentity::from_schema_declaration("test", &declaration)
+            owned: crate::parser::ResolvedSchemaType::from_schema_declaration("test", &declaration)
                 .unwrap(),
         };
         let signature = ModuleSignature {

@@ -738,7 +738,7 @@ fn authored_expression_resource_loop_rejects_mismatched_map_default() {
         let message = rendered(&output);
         assert!(!output.status.success(), "{message}");
         assert!(
-            message.contains("map(String)") && message.contains("map(Bool)"),
+            message.contains("Map<String>") && message.contains("Map<Bool>"),
             "{message}"
         );
     }

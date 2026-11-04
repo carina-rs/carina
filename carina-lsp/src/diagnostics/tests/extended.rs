@@ -9945,6 +9945,208 @@ fn shared_identity_annotation_is_owner_conjunctive_in_multi_file_lsp_analysis() 
     );
 }
 
+fn named_annotation_engine(source_max: u64) -> DiagnosticEngine {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+    let name = |max| {
+        AttributeType::refined_string(
+            Some(TypeIdentity::from_schema_type("aws", "iam.Role", "Name")),
+            None,
+            Some((Some(1), Some(max))),
+            None,
+        )
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("iam.Role")
+            .attribute(AttributeSchema::required("role_name", name(64)).build())
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("NameSource")
+            .attribute(AttributeSchema::provider_populated("name", name(source_max)).build())
+            .validate()
+            .unwrap(),
+    );
+    custom_engine(schemas)
+}
+
+#[test]
+fn computed_access_rejects_heterogeneous_collection_in_lsp_diagnostics() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+    let name = |max| {
+        AttributeType::refined_string(
+            Some(TypeIdentity::from_schema_type("aws", "iam.Role", "Name")),
+            None,
+            Some((Some(1), Some(max))),
+            None,
+        )
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("iam.Role")
+            .attribute(AttributeSchema::required("role_name", name(64)).build())
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("NameSource")
+            .attribute(AttributeSchema::provider_populated("narrow", name(64)).build())
+            .attribute(AttributeSchema::provider_populated("wide", name(128)).build())
+            .attribute(
+                AttributeSchema::provider_populated("names", AttributeType::list(name(64))).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("root");
+    let module = fixture.path().join("module");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&module).unwrap();
+    std::fs::write(root.join("providers.crn"), "provider aws {}\n").unwrap();
+    std::fs::write(root.join("source.crn"), "let src = aws.NameSource {}\n").unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        "arguments {\n  x: aws.iam.Role.Name\n}\naws.iam.Role { role_name = x }\n",
+    )
+    .unwrap();
+    for (fallback, expected_error) in [
+        (
+            "[src.narrow, src.wide]",
+            Some(
+                "collection element types disagree: `aws.iam.Role.Name (length 1..=64)` vs `aws.iam.Role.Name (length 1..=128)`",
+            ),
+        ),
+        (
+            "['ValidName', 1]",
+            Some("collection element types disagree: `String` vs `Int`"),
+        ),
+        ("[src.narrow, src.narrow]", None),
+    ] {
+        for sink in [
+            format!("aws.iam.Role {{ role_name = (src.names ?? {fallback})[1] }}"),
+            format!("role_module {{ x = (src.names ?? {fallback})[1] }}"),
+        ] {
+            let source = format!("let role_module = use {{ source = '../module' }}\n{sink}\n");
+            std::fs::write(root.join("main.crn"), &source).unwrap();
+            let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", &source);
+            match expected_error {
+                Some(expected) => assert!(
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic.severity == Some(DiagnosticSeverity::ERROR)
+                            && diagnostic.message.contains(expected)
+                            && diagnostic.range.start.line == 1
+                    }),
+                    "computed access must report inference failure at {sink}: {diagnostics:#?}",
+                ),
+                None => assert!(
+                    diagnostics.is_empty(),
+                    "a homogeneous bounded fallback must remain valid for {sink}: {diagnostics:#?}",
+                ),
+            }
+        }
+    }
+}
+
+#[test]
+fn named_annotation_diagnostics_match_cli_for_arguments_and_nested_calls() {
+    for source_max in [32, 64, 128] {
+        let engine = named_annotation_engine(source_max);
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("root");
+        let outer = fixture.path().join("outer");
+        let inner = fixture.path().join("inner");
+        for directory in [&root, &outer, &inner] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let inner_source = "arguments {\n  x: aws.iam.Role.Name = 'ValidName'\n}\naws.iam.Role { role_name = x }\n";
+        let outer_source = "arguments {\n  x: aws.iam.Role.Name = 'ValidName'\n}\nlet inner = use { source = '../inner' }\ninner { x = x }\n";
+        let root_source = "let outer = use { source = '../outer' }\nlet source = aws.NameSource {}\nouter { x = source.name }\n";
+        std::fs::write(inner.join("main.crn"), inner_source).unwrap();
+        std::fs::write(outer.join("main.crn"), outer_source).unwrap();
+        std::fs::write(root.join("main.crn"), root_source).unwrap();
+        std::fs::write(root.join("providers.crn"), "provider aws {}\n").unwrap();
+
+        for (directory, source) in [(&inner, inner_source), (&outer, outer_source)] {
+            let diagnostics = analyze_with_buffer(&engine, directory, "main.crn", source);
+            assert!(
+                diagnostics.is_empty(),
+                "width {source_max}, {}: {diagnostics:#?}",
+                directory.display()
+            );
+        }
+        let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", root_source);
+        if source_max <= 64 {
+            assert!(
+                diagnostics.is_empty(),
+                "width {source_max}: {diagnostics:#?}"
+            );
+        } else {
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic
+                        .message
+                        .contains("expected aws.iam.Role.Name (length 1..=64)")
+                        && diagnostic
+                            .message
+                            .contains("got aws.iam.Role.Name (length 1..=128)")
+                }),
+                "wider exact sources must fail in the shared checker: {diagnostics:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn named_annotation_lsp_literals_keep_the_declared_length_bound() {
+    let engine = named_annotation_engine(64);
+    let fixture = tempfile::tempdir().unwrap();
+    let module = fixture.path().join("module");
+    let root = fixture.path().join("root");
+    std::fs::create_dir(&module).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        "arguments {\n  x: aws.iam.Role.Name\n}\nlet role = aws.iam.Role { role_name = x }\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("providers.crn"), "provider aws {}\n").unwrap();
+    let source = format!(
+        "let module = use {{ source = '../module' }}\nlet instance = module {{ x = '{}' }}\n",
+        "A".repeat(65)
+    );
+    std::fs::write(root.join("main.crn"), &source).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", &source);
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("length 65 is outside allowed range [1, 64]")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn named_reference_mismatch_keeps_both_constraint_aware_names_in_lsp() {
+    let engine = named_annotation_engine(128);
+    let diagnostics = engine.analyze(
+        &create_document(
+            "provider aws {}\nlet source = aws.NameSource {}\nlet role = aws.iam.Role { role_name = source.name }\n",
+        ),
+        None,
+    );
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic.message
+            == "Type mismatch: expected aws.iam.Role.Name (length 1..=64), got aws.iam.Role.Name (length 1..=128) (from source.name)"),
+        "{diagnostics:#?}"
+    );
+}
+
 #[test]
 fn registered_bare_provider_type_does_not_remain_a_fail_open_simple_in_lsp() {
     let directory = tempfile::tempdir().expect("bare type fixture");

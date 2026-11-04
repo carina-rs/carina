@@ -202,6 +202,8 @@ fn propagate_secret<B: BindingAddress>(
 /// built-in currently returns those types; add them when one does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinReturnType {
+    /// Preserves the authored type and construction kind of this argument.
+    Argument(usize),
     /// Returns a plain `Value::Concrete(ConcreteValue::String)` (no semantic subtype).
     String,
     /// Returns a `Value::Concrete(ConcreteValue::Int)`.
@@ -482,7 +484,7 @@ register_builtins! {
     secret(secret::builtin_secret, arity: 1) {
         signature: "secret(value: Any) -> Secret",
         description: "Marks a value as secret. The value is sent to the provider but stored only as an Argon2id hash in state.",
-        return_type: BuiltinReturnType::Secret,
+        return_type: BuiltinReturnType::Argument(0),
     },
     split(split::builtin_split, arity: 2) {
         signature: "split(separator: String, string: String) -> list",

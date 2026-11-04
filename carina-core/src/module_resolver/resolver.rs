@@ -182,6 +182,19 @@ impl ResidualModuleResolutionError {
             ModuleErrorCallSource::Unavailable => false,
         }).filter(|call| !matches!(constraint_origin, Some(ConstraintOrigin::LiveCall(identity)) if identity == call.id()))
             .map(|call| crate::parser::Located::new(call.id().module_name_location().clone(), self)).collect();
+        if let ModuleError::ReferenceType(errors) = self.0.root_cause() {
+            for error in errors.iter() {
+                if let crate::validation::ExpansionBoundaryReferenceError::ModuleCall(error) = error
+                {
+                    let call = &error.identity.call;
+                    let location = call
+                        .argument_value_location(&error.identity.argument)
+                        .unwrap_or_else(|| call.declaration_location());
+                    findings.retain(|finding| finding.location().file() != location.file());
+                    findings.push(crate::parser::Located::new(location.clone(), self));
+                }
+            }
+        }
         if let ModuleError::ArgumentValueAccess { diagnostic, .. } = self.0.root_cause() {
             // Keep the authored module operand as well as its caller anchors.
             // In the operand's own file it replaces any broader call anchor.
@@ -1079,6 +1092,10 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     ) -> Result<RefCheckWitness, ModuleError> {
         let imported_modules = self.resolved_module_signatures();
         lift_module_attribute_handles(parsed, &imported_modules);
+        crate::parser::retained::judge_configuration(parsed, self.schemas, self.config());
+        if let Some(error) = parsed.expression_report().first_error() {
+            return Err(ModuleError::Parse(error));
+        }
         let bindings = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
             parsed, self.schemas, None, &imported_modules, self.session,
         );

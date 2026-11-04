@@ -315,8 +315,8 @@ fn round1_instances_retain_each_authored_location() {
         2,
         "one instance overwrote the other: {types:?}"
     );
-    assert!(types.contains(&TypeExpr::Int), "{types:?}");
-    assert!(types.contains(&TypeExpr::String), "{types:?}");
+    let declared = TypeExpr::Union(vec![TypeExpr::Int, TypeExpr::String]);
+    assert_eq!(types, vec![declared.clone(), declared]);
 }
 
 #[test]

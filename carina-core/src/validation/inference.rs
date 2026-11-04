@@ -219,7 +219,7 @@ pub fn bindings_from_parts<S, P: PlaceholderKind + PartialEq, B: BindingAddress>
 /// Infer a value received from runtime/state, where no authored syntax exists.
 /// Authored expressions must consume `JudgedExpr::static_type` instead.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use carina_core::{resource::AuthoredValue, validation::inference::{infer_runtime_type, InferenceBindings},
 ///     schema::SchemaRegistry, parser::ProviderContext};
 /// fn bypass(value: &AuthoredValue, config: &ProviderContext) {
@@ -229,7 +229,7 @@ pub fn bindings_from_parts<S, P: PlaceholderKind + PartialEq, B: BindingAddress>
 ///
 /// Even a placeholder-free authored projection is not runtime provenance.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use carina_core::{resource::ExpandedValue, validation::inference::{infer_runtime_type, InferenceBindings},
 ///     schema::SchemaRegistry, parser::ProviderContext};
 /// fn bypass(value: &ExpandedValue, config: &ProviderContext) {
@@ -307,10 +307,7 @@ struct InferenceSchemaContext<'a> {
 
 fn heterogeneous_collection_error(first: &TypeExpr, next: &TypeExpr) -> InferenceError {
     InferenceError::HeterogeneousCollection {
-        reason: format!(
-            "collection element types disagree: `{}` vs `{}`",
-            first, next
-        ),
+        types: crate::schema::MismatchTypeNames::for_type_exprs(first, next),
     }
 }
 
@@ -321,7 +318,7 @@ fn heterogeneous_collection_error(first: &TypeExpr, next: &TypeExpr) -> Inferenc
 /// intrinsic (for example `split(...)[0]`) can still be checked. Callers use
 /// this instead of manufacturing empty binding/schema registries.
 #[cfg(test)]
-fn infer_type_from_value_without_bindings<P: PlaceholderKind, B: BindingAddress>(
+pub(super) fn infer_type_from_value_without_bindings<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
 ) -> Result<TypeExpr, InferenceIssue> {
     fn infer_collection_without_bindings<'a, P: PlaceholderKind + 'a, B: BindingAddress + 'a>(
@@ -408,10 +405,10 @@ fn infer_type_from_value_without_bindings<P: PlaceholderKind, B: BindingAddress>
                     })
                 })?;
             match return_type {
-                BuiltinReturnType::String => Ok(TypeExpr::String),
+                BuiltinReturnType::String | BuiltinReturnType::Secret => Ok(TypeExpr::String),
                 BuiltinReturnType::Int => Ok(TypeExpr::Int),
                 BuiltinReturnType::StringList => Ok(TypeExpr::List(Box::new(TypeExpr::String))),
-                BuiltinReturnType::Secret => args.first().map_or_else(
+                BuiltinReturnType::Argument(index) => args.get(index).map_or_else(
                     || {
                         Err(InferenceError::UnknownType {
                             reason: format!("built-in `{name}` has no argument to wrap as secret"),
@@ -740,7 +737,9 @@ fn require_integer_arithmetic_operands(
             return Err(InferenceError::InvalidIntegerArithmeticOperand {
                 op,
                 side,
-                actual: operand.to_string(),
+                actual: crate::schema::MismatchTypeNames::for_type_exprs(&TypeExpr::Int, &operand)
+                    .actual()
+                    .to_string(),
                 operator_span,
             }
             .into());
@@ -1082,6 +1081,23 @@ pub(super) fn attribute_type_to_type_expr(
     attr_type: &AttributeType,
     schema_owner: &str,
 ) -> TypeExpr {
+    if let AttrTypeKind::String {
+        binding: crate::schema::RefinementBinding::Annotation(witness),
+        ..
+    }
+    | AttrTypeKind::Int {
+        binding: crate::schema::RefinementBinding::Annotation(witness),
+        ..
+    }
+    | AttrTypeKind::Float {
+        binding: crate::schema::RefinementBinding::Annotation(witness),
+        ..
+    } = attr_type.kind()
+    {
+        return TypeExpr::SchemaType {
+            owned: witness.clone(),
+        };
+    }
     let scalar_identity = match attr_type.kind() {
         AttrTypeKind::UnloadedSchemaType(unloaded) => {
             return TypeExpr::UnloadedSchemaType(unloaded.clone());
@@ -1103,7 +1119,7 @@ pub(super) fn attribute_type_to_type_expr(
     };
     if scalar_identity.is_some() {
         return TypeExpr::SchemaType {
-            owned: crate::parser::OwnedTypeIdentity::from_schema_declaration(
+            owned: crate::parser::ResolvedSchemaType::from_schema_declaration(
                 schema_owner,
                 attr_type,
             )
@@ -1144,7 +1160,7 @@ pub(super) fn attribute_type_to_type_expr(
             to_dsl,
             ..
         } if values.is_none() && (validate.is_some() || to_dsl.is_some()) => TypeExpr::SchemaType {
-            owned: crate::parser::OwnedTypeIdentity::from_declaration(
+            owned: crate::parser::ResolvedSchemaType::from_declaration(
                 schema_owner,
                 crate::parser::IdentifiedCustomTypeDeclaration::new(attr_type)
                     .expect("identified enum declaration"),
@@ -1220,7 +1236,7 @@ fn infer_function_call<P: PlaceholderKind, B: BindingAddress>(
         };
     };
     match return_type {
-        BuiltinReturnType::String => Ok(TypeExpr::String),
+        BuiltinReturnType::String | BuiltinReturnType::Secret => Ok(TypeExpr::String),
         BuiltinReturnType::Int => Ok(TypeExpr::Int),
         BuiltinReturnType::List => Err(InferenceError::UnknownType {
             reason: format!(
@@ -1237,7 +1253,7 @@ fn infer_function_call<P: PlaceholderKind, B: BindingAddress>(
             ),
         }
         .into()),
-        BuiltinReturnType::Secret => args.first().map_or_else(
+        BuiltinReturnType::Argument(index) => args.get(index).map_or_else(
             || {
                 Err(InferenceError::UnknownType {
                     reason: format!("built-in `{name}` has no argument to wrap as secret"),
@@ -1353,13 +1369,16 @@ where
                     Some(crate::parser::BoundaryExpression::Value(_value)) => {
                         let inferred = parameter
                             .value_location()
-                            .and_then(|location| report.expression(location))
-                            .map(|expression| {
-                                expression.static_type().cloned().map_err(Clone::clone)
+                            .ok_or_else(|| {
+                                crate::parser::retained::MissingEvidence::new(
+                                    "export value location",
+                                )
                             })
-                            .unwrap_or(Err(InferenceIssue::NotInferable(
-                                NotInferableReason::MissingValue,
-                            )));
+                            .and_then(|location| report.expression(location))
+                            .map_err(|error| InferenceIssue::Failed(error.into()))
+                            .and_then(|expression| {
+                                expression.static_type().cloned().map_err(Clone::clone)
+                            });
                         match inferred {
                             Ok(type_expr) => {
                                 ExportStaticType::Inferred(StaticType::Known(type_expr))
@@ -1545,9 +1564,11 @@ where
 
         let expression = parameter
             .value_location()
+            .ok_or_else(|| crate::parser::retained::MissingEvidence::new("export value location"))
             .and_then(|location| report.expression(location))
-            .unwrap_or(report.unknown());
-        match expression.static_type().cloned().map_err(Clone::clone) {
+            .map_err(|error| InferenceIssue::Failed(error.into()))
+            .and_then(|expression| expression.static_type().cloned().map_err(Clone::clone));
+        match expression {
             Ok(_type_expr) => {}
             Err(InferenceIssue::NotInferable(_reason)) => {}
             Err(InferenceIssue::Failed(error)) => {
@@ -1852,7 +1873,8 @@ mod tests {
                 name.to_string(),
                 InferenceBinding::Argument {
                     type_expr: TypeExpr::SchemaType {
-                        owned: crate::parser::OwnedTypeIdentity::provider("test", identity, kind),
+                        owned: crate::parser::OwnedTypeIdentity::provider("test", identity, kind)
+                            .unbounded_witness_for_test(),
                     },
                 },
             )]);
@@ -1913,7 +1935,8 @@ mod tests {
                 "awscc",
                 TypeIdentity::bare("VpcId"),
                 crate::schema::RefinedScalarKind::String,
-            ),
+            )
+            .unbounded_witness_for_test(),
         }
     }
 
@@ -2040,10 +2063,17 @@ mod tests {
 
         assert_eq!(without_bindings, with_bindings);
         assert_eq!(
+            without_bindings.as_ref().unwrap_err().to_string(),
+            "collection element types disagree: `String` vs `Int`",
+        );
+        assert_eq!(
             without_bindings,
             Err(InferenceIssue::Failed(
                 InferenceError::HeterogeneousCollection {
-                    reason: "collection element types disagree: `String` vs `Int`".to_string(),
+                    types: crate::schema::MismatchTypeNames::for_type_exprs(
+                        &TypeExpr::String,
+                        &TypeExpr::Int
+                    ),
                 }
             ))
         );
@@ -2263,7 +2293,8 @@ mod tests {
                     "aws",
                     TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
                     crate::schema::RefinedScalarKind::String
-                ),
+                )
+                .unbounded_witness_for_test(),
             }
         );
     }

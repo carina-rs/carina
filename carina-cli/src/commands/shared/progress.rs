@@ -931,7 +931,10 @@ pub(crate) fn format_duration(d: Duration) -> String {
     if secs < 60.0 {
         format!("{:.1}s", secs)
     } else {
+        // Elapsed seconds never carry DSL values; truncation gives whole minutes for the progress line.
         let mins = secs as u64 / 60;
+        // Rounding is acceptable for display-only progress seconds.
+        #[allow(clippy::cast_precision_loss)]
         let remaining = secs - (mins as f64 * 60.0);
         format!("{}m {:.1}s", mins, remaining)
     }

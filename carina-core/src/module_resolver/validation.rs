@@ -1,9 +1,11 @@
 //! Expression evaluator for module `validation` and `require` blocks.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use crate::binding_index::ResolvedBindings;
+use crate::numeric::NumericPair;
 use crate::parser::{
     ArgumentParameter, CompareOp, ModuleCallId, RequireBlock, ValidateExpr, display_string_literal,
 };
@@ -1078,22 +1080,12 @@ fn compare_values<P: PlaceholderKind, B: BindingAddress>(
     let (EvalValue::Value(left), EvalValue::Value(right)) = (left, right) else {
         unreachable!("null values returned above");
     };
+    if let (Value::Concrete(left), Value::Concrete(right)) = (left, right)
+        && let Some(pair) = NumericPair::new(left, right)
+    {
+        return Ok(ordering_satisfies(op, pair.partial_cmp()));
+    }
     match (left, right) {
-        (Value::Concrete(ConcreteValue::Int(left)), Value::Concrete(ConcreteValue::Int(right))) => {
-            compare_ordered(left, op, right)
-        }
-        (
-            Value::Concrete(ConcreteValue::Float(left)),
-            Value::Concrete(ConcreteValue::Float(right)),
-        ) => compare_ordered(left, op, right),
-        (
-            Value::Concrete(ConcreteValue::Int(left)),
-            Value::Concrete(ConcreteValue::Float(right)),
-        ) => compare_ordered(&(*left as f64), op, right),
-        (
-            Value::Concrete(ConcreteValue::Float(left)),
-            Value::Concrete(ConcreteValue::Int(right)),
-        ) => compare_ordered(left, op, &(*right as f64)),
         (
             Value::Concrete(ConcreteValue::Duration(left)),
             Value::Concrete(ConcreteValue::Duration(right)),
@@ -1122,19 +1114,19 @@ fn compare_values<P: PlaceholderKind, B: BindingAddress>(
     }
 }
 
-fn compare_ordered<T: PartialOrd + PartialEq>(
-    left: &T,
-    op: &CompareOp,
-    right: &T,
-) -> Result<bool, String> {
-    Ok(match op {
-        CompareOp::Gte => left >= right,
-        CompareOp::Lte => left <= right,
-        CompareOp::Gt => left > right,
-        CompareOp::Lt => left < right,
-        CompareOp::Eq => left == right,
-        CompareOp::Ne => left != right,
-    })
+fn ordering_satisfies(op: &CompareOp, ordering: Option<Ordering>) -> bool {
+    match op {
+        CompareOp::Gte => matches!(ordering, Some(Ordering::Greater | Ordering::Equal)),
+        CompareOp::Lte => matches!(ordering, Some(Ordering::Less | Ordering::Equal)),
+        CompareOp::Gt => ordering == Some(Ordering::Greater),
+        CompareOp::Lt => ordering == Some(Ordering::Less),
+        CompareOp::Eq => ordering == Some(Ordering::Equal),
+        CompareOp::Ne => ordering != Some(Ordering::Equal),
+    }
+}
+
+fn compare_ordered<T: PartialOrd>(left: &T, op: &CompareOp, right: &T) -> Result<bool, String> {
+    Ok(ordering_satisfies(op, left.partial_cmp(right)))
 }
 
 fn compare_equality<T: PartialEq>(
@@ -1191,6 +1183,101 @@ mod tests {
     use super::*;
 
     type ValidateExpr = crate::parser::ValidateExpr<crate::resource::NoPlaceholder>;
+
+    #[test]
+    fn require_exact_numeric_and_duration_ordering() {
+        for (left, right, expected) in [
+            (
+                ValidateExpr::Int(9_007_199_254_740_993),
+                ValidateExpr::Float(9_007_199_254_740_992.0),
+                [true, false, true, false, false, true],
+            ),
+            (
+                ValidateExpr::Float(9_007_199_254_740_992.0),
+                ValidateExpr::Int(9_007_199_254_740_993),
+                [false, true, false, true, false, true],
+            ),
+            (
+                ValidateExpr::Int(i64::MAX),
+                ValidateExpr::Float(9_223_372_036_854_775_808.0),
+                [false, true, false, true, false, true],
+            ),
+            (
+                ValidateExpr::Duration(std::time::Duration::from_secs(1)),
+                ValidateExpr::Duration(std::time::Duration::from_secs(2)),
+                [false, true, false, true, false, true],
+            ),
+            (
+                ValidateExpr::Duration(std::time::Duration::from_secs(2)),
+                ValidateExpr::Duration(std::time::Duration::from_secs(1)),
+                [true, false, true, false, false, true],
+            ),
+            (
+                ValidateExpr::Duration(std::time::Duration::from_secs(1)),
+                ValidateExpr::Duration(std::time::Duration::from_secs(1)),
+                [false, false, true, true, true, false],
+            ),
+        ] {
+            for (op, expected) in [
+                CompareOp::Gt,
+                CompareOp::Lt,
+                CompareOp::Gte,
+                CompareOp::Lte,
+                CompareOp::Eq,
+                CompareOp::Ne,
+            ]
+            .into_iter()
+            .zip(expected)
+            {
+                let expression = ValidateExpr::Compare {
+                    lhs: Box::new(left.clone()),
+                    op,
+                    rhs: Box::new(right.clone()),
+                };
+                let result = evaluate_constraint(&expression, &HashMap::new(), "ordering");
+                if expected {
+                    assert_eq!(result, ConstraintEvaluation::Satisfied, "{expression:?}");
+                } else {
+                    assert!(
+                        matches!(result, ConstraintEvaluation::Violated(_)),
+                        "{expression:?}: {result:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn require_exact_numeric_nan_only_ne_is_true() {
+        for number in [ValidateExpr::Int(3), ValidateExpr::Float(3.0)] {
+            for (left, right) in [
+                (number.clone(), ValidateExpr::Float(f64::NAN)),
+                (ValidateExpr::Float(f64::NAN), number),
+            ] {
+                for op in [
+                    CompareOp::Gt,
+                    CompareOp::Lt,
+                    CompareOp::Gte,
+                    CompareOp::Lte,
+                    CompareOp::Eq,
+                    CompareOp::Ne,
+                ] {
+                    let expected = matches!(op, CompareOp::Ne);
+                    let expression = ValidateExpr::Compare {
+                        lhs: Box::new(left.clone()),
+                        op,
+                        rhs: Box::new(right.clone()),
+                    };
+                    let result = evaluate_constraint(&expression, &HashMap::new(), "NaN ordering");
+                    assert_eq!(
+                        matches!(result, ConstraintEvaluation::Satisfied),
+                        expected,
+                        "{expression:?}: {result:?}"
+                    );
+                }
+            }
+        }
+    }
 
     fn secret_value() -> Value {
         Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(

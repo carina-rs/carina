@@ -511,33 +511,44 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             .arguments
             .iter()
             .map(|argument| {
-                let supplied = call
-                    .id()
-                    .argument_value_location(&argument.name)
-                    .and_then(|location| expansion_source.caller_judgements.get(location));
-                let default = module
-                    .parser_binding_metadata
-                    .syntax()
-                    .declarations()
-                    .iter()
-                    .find(|declaration| {
-                        declaration.detail().kind()
-                            == crate::config_loader::DeclarationKind::Argument
-                            && declaration.detail().name() == argument.name
-                    })
-                    .and_then(|declaration| declaration.detail().value_location())
-                    .and_then(|location| module_report.expression(location));
-                let judged = supplied
-                    .or(default)
-                    .or_else(|| module_report.parameter(&argument.name))
-                    .unwrap_or(module_report.unknown());
-                (argument.name.clone(), {
-                    let mut judged = judged.clone();
-                    judged.concrete = argument_values[&argument.name].is_fully_resolved();
-                    judged
-                })
+                let evidence =
+                    if let Some(location) = call.id().argument_value_location(&argument.name) {
+                        expansion_source
+                            .caller_judgements
+                            .get(location)
+                            .ok_or_else(|| {
+                                crate::parser::retained::MissingEvidence::new(format!(
+                                    "call argument {}",
+                                    argument.name
+                                ))
+                            })
+                    } else if let Some(location) = module
+                        .parser_binding_metadata
+                        .syntax()
+                        .declarations()
+                        .iter()
+                        .find(|declaration| {
+                            declaration.detail().kind()
+                                == crate::config_loader::DeclarationKind::Argument
+                                && declaration.detail().name() == argument.name
+                        })
+                        .and_then(|declaration| declaration.detail().value_location())
+                    {
+                        module_report.expression(location)
+                    } else {
+                        module_report.parameter(&argument.name)
+                    };
+                evidence
+                    .cloned()
+                    .map(|judged| (argument.name.clone(), judged))
             })
-            .collect();
+            .collect::<Result<_, _>>()
+            .map_err(|error: crate::parser::retained::MissingEvidence| {
+                ModuleError::Parse(ParseError::InvalidExpression {
+                    line: call_line,
+                    message: error.to_string(),
+                })
+            })?;
 
         // Type-check argument values against declared types
         for arg in &module.arguments {
@@ -620,6 +631,17 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 }
             }
             let resolved_type = resolved_parameter.as_type_expr();
+            if let (Some(path), Some(bindings)) = (&argument.caller_reference, binding_index)
+                && let Some(error) = crate::validation::module_argument_reference_error(
+                    call,
+                    &arg.name,
+                    path,
+                    &resolved_type,
+                    bindings,
+                )
+            {
+                return Err(ModuleError::ReferenceType(error));
+            }
             self.typecheck_context()
                 .check(
                     &resolved_type,
@@ -793,6 +815,13 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 argument_judgements.iter().map(|(name, expression)| {
                     (
                         module_instance_scope.resolve(RelativeBindingName::new(name.as_str())),
+                        module
+                            .arguments
+                            .iter()
+                            .find(|argument| argument.name == *name)
+                            .expect("declared module argument")
+                            .static_type
+                            .clone(),
                         expression.clone(),
                     )
                 }),
@@ -913,7 +942,6 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     &module_scope_resolver,
                     self.typecheck_context(),
                     instance.expression_report(),
-                    &argument_judgements,
                 )
             })
             .collect::<Result<_, _>>()
@@ -1253,7 +1281,18 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             call,
             &expanded_call,
             instance_prefix,
-            &super::resolver::RefCheckWitness(HashMap::new()),
+            &super::resolver::RefCheckWitness(
+                call.arguments()
+                    .filter_map(|(name, _)| {
+                        call.id().argument_value_location(name).map(|location| {
+                            (
+                                location.clone(),
+                                crate::parser::retained::missing_judgement_for_test(),
+                            )
+                        })
+                    })
+                    .collect(),
+            ),
             None,
             None,
         )
@@ -3576,7 +3615,6 @@ fn expand_module_composition(
     resolver: &ModuleScopeResolver<'_>,
     provider_context: crate::validation::typecheck::TypecheckProviderContext<'_>,
     judgements: &crate::parser::retained::ExpressionReport<AbsoluteBindingAddress>,
-    arguments_judgements: &HashMap<String, crate::parser::retained::JudgedExpr>,
 ) -> Result<ModuleResolvedLiveComposition, ArgumentSubstitutionError> {
     let crate::resource::LiveComposition {
         id,
@@ -3751,53 +3789,37 @@ fn expand_module_composition(
                     }
                 }
             };
-            let evidence = call_path
-                .immediate()
-                .id
-                .argument_value_location(name)
-                .and_then(|location| judgements.expression(location))
-                .or_else(|| {
-                    argument
-                        .forwarded_parameter()
-                        .and_then(|parameter| arguments_judgements.get(parameter))
+            let parameter = argument
+                .forwarded_parameter()
+                .or_else(|| match argument.value() {
+                    Value::Deferred(DeferredValue::BindingRef { binding }) => {
+                        Some(binding.as_str())
+                    }
+                    _ => None,
                 });
-            if let Some(evidence) = evidence {
-                check_composition_argument_type(
-                    name,
-                    &resolved,
-                    evidence,
-                    provider_context,
-                    resolver.arguments.default_line,
-                )?;
-            } else if resolved.handle().is_some() {
-                check_composition_argument_type(
-                    name,
-                    &resolved,
-                    judgements.unknown(),
-                    provider_context,
-                    resolver.arguments.default_line,
-                )?;
-            } else if let Some(concrete) =
-                crate::validation::typecheck::ResolvedConstraintValue::new(resolved.value())
-            {
-                if let Some(expected) = resolved.declared_type().known() {
-                    provider_context
-                        .check_resolved_constraints_result(expected, &concrete)
-                        .map_err(|error| ArgumentSubstitutionError::Evaluation {
-                            source_file: None,
-                            line: resolver.arguments.default_line,
-                            message: format!("parameter '{name}': {error}"),
-                            parse_error: None,
-                        })?;
+            let evidence =
+                if let Some(location) = call_path.immediate().id.argument_value_location(name) {
+                    judgements.expression(location)
+                } else if let Some(parameter) = parameter {
+                    judgements.parameter(parameter)
+                } else {
+                    Err(crate::parser::retained::MissingEvidence::new(format!(
+                        "composition argument {name}",
+                    )))
                 }
-            } else {
-                return Err(ArgumentSubstitutionError::Evaluation {
+                .map_err(|error| ArgumentSubstitutionError::Evaluation {
                     source_file: None,
                     line: resolver.arguments.default_line,
-                    message: format!("parameter '{name}': authored expression has no judgement"),
+                    message: error.to_string(),
                     parse_error: None,
-                });
-            }
+                })?;
+            check_composition_argument_type(
+                name,
+                &resolved,
+                evidence,
+                provider_context,
+                resolver.arguments.default_line,
+            )?;
             Ok((name.clone(), resolved))
         })
         .collect::<Result<IndexMap<_, _>, ArgumentSubstitutionError>>()?;

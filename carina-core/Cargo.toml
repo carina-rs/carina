@@ -8,6 +8,9 @@ description = "Core library for Carina, a functional infrastructure management t
 repository.workspace = true
 homepage.workspace = true
 
+[lints]
+workspace = true
+
 [features]
 async-io = ["tokio/fs", "tokio/rt"]
 test-shutdown = []

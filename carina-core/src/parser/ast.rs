@@ -1700,11 +1700,16 @@ impl<S, B: BindingAddress> DeferredForExpression<S, ParserPlaceholder, ParserPla
         _context: &super::ProviderContext,
     ) -> Result<DeferredForExpression<S, NoPlaceholder, LoopSlot, B>, crate::resource::ExpansionError>
     {
-        let element_type = self
-            .site()
-            .iterable_location
-            .and_then(|location| report.expression(location))
-            .and_then(directive_element_type);
+        let element_type = match self.site().iterable_location {
+            Some(location) => directive_element_type(
+                report
+                    .for_resource(self.template_resource_id())?
+                    .expression(location)?,
+            ),
+            // Runtime/saved template constructors have no authored iterable;
+            // their directives carry the previously checked loop-slot types.
+            None => None,
+        };
         let Self {
             location,
             header,
@@ -2245,11 +2250,13 @@ pub enum TypeExpr {
     DottedUnresolved(ResourceTypePath),
     /// Provider-defined schema type (e.g., awscc.ec2.VpcId, awscc.ec2.SubnetId).
     ///
-    /// The scalar kind is fixed during resolution. Owners and semantic
+    /// The opaque witness retains resolved scalar constraints, including the
+    /// conjunction of every owner declaration for authored annotations. Exact
+    /// schema projections retain only their source declaration. Owners and semantic
     /// identity remain distinct: AWSCC can own a type in the shared `aws`
     /// identity namespace.
     SchemaType {
-        owned: super::OwnedTypeIdentity,
+        owned: super::ResolvedSchemaType,
     },
     /// Structural record type: `struct { name: type, ... }`.
     ///
@@ -2911,17 +2918,19 @@ impl<P: ValueKind, B: BindingAddress> AttributeParameter<TypeExpr, P, B> {
     pub fn value_location(&self) -> Option<&super::DeclarationLocation> {
         self.source.value_location.as_ref()
     }
-    pub fn judgement(&self) -> &super::retained::JudgedExpr {
-        &self.source.judgement
+    pub fn judgement(
+        &self,
+    ) -> Result<&super::retained::JudgedExpr, &super::retained::MissingEvidence> {
+        self.source.judgement.as_ref()
     }
     pub(crate) fn attach_judgement(&mut self, report: &super::retained::ExpressionReport<B>) {
         self.source.judgement = self
             .source
             .value_location
             .as_ref()
+            .ok_or_else(|| super::retained::MissingEvidence::new("declaration value location"))
             .and_then(|location| report.expression(location))
-            .unwrap_or(report.unknown())
-            .clone();
+            .cloned();
     }
 
     pub fn type_check_location(&self) -> &super::DeclarationLocation {
@@ -2949,13 +2958,15 @@ impl<P: ValueKind, B: BindingAddress> AttributeParameter<TypeExpr, P, B> {
         type_expr: Option<TypeExpr>,
         value: Option<Value<P, B>>,
     ) -> Self {
-        Self::new_in_source(
+        let mut parameter = Self::new_in_source(
             name,
             type_expr,
             value.map(BoundaryExpression::Value),
             SourceSpan::dummy(),
             ModuleCallId::test_dummy_in("test.crn").location,
-        )
+        );
+        parameter.source.judgement = Ok(super::retained::missing_judgement_for_test());
+        parameter
     }
 
     pub fn source_span(&self) -> SourceSpan {
@@ -3043,8 +3054,10 @@ impl<P: ValueKind, B: BindingAddress> ParsedExportParam<P, B> {
     pub fn value_location(&self) -> Option<&super::DeclarationLocation> {
         self.source.value_location.as_ref()
     }
-    pub fn judgement(&self) -> &super::retained::JudgedExpr {
-        &self.source.judgement
+    pub fn judgement(
+        &self,
+    ) -> Result<&super::retained::JudgedExpr, &super::retained::MissingEvidence> {
+        self.source.judgement.as_ref()
     }
     pub fn type_check_location(&self) -> &super::DeclarationLocation {
         &self.source.location
@@ -3071,13 +3084,15 @@ impl<P: ValueKind, B: BindingAddress> ParsedExportParam<P, B> {
         type_expr: Option<TypeExpr>,
         value: Option<Value<P, B>>,
     ) -> Self {
-        Self::new_in_source(
+        let mut parameter = Self::new_in_source(
             name,
             type_expr,
             value.map(BoundaryExpression::Value),
             SourceSpan::dummy(),
             ModuleCallId::test_dummy_in("test.crn").location,
-        )
+        );
+        parameter.source.judgement = Ok(super::retained::missing_judgement_for_test());
+        parameter
     }
 
     pub fn source_span(&self) -> SourceSpan {
@@ -3135,7 +3150,7 @@ pub trait ExportParamLike<P: ValueKind = ParserPlaceholder, B: BindingAddress = 
     fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr>;
     fn inference_failed(&self) -> bool;
     fn value_location(&self) -> Option<&super::DeclarationLocation>;
-    fn judgement(&self) -> &super::retained::JudgedExpr;
+    fn judgement(&self) -> Result<&super::retained::JudgedExpr, &super::retained::MissingEvidence>;
     fn attach_judgement(&mut self, report: &super::retained::ExpressionReport<B>);
     /// Authored export location retained across parser and inference phases.
     fn source_location(&self) -> Option<(&std::path::Path, SourceSpan)> {
@@ -3149,17 +3164,17 @@ impl<P: ValueKind + PartialEq, B: BindingAddress> ExportParamLike<P, B>
     fn value_location(&self) -> Option<&super::DeclarationLocation> {
         self.source.value_location.as_ref()
     }
-    fn judgement(&self) -> &super::retained::JudgedExpr {
-        &self.source.judgement
+    fn judgement(&self) -> Result<&super::retained::JudgedExpr, &super::retained::MissingEvidence> {
+        self.source.judgement.as_ref()
     }
     fn attach_judgement(&mut self, report: &super::retained::ExpressionReport<B>) {
         self.source.judgement = self
             .source
             .value_location
             .as_ref()
+            .ok_or_else(|| super::retained::MissingEvidence::new("declaration value location"))
             .and_then(|location| report.expression(location))
-            .unwrap_or(report.unknown())
-            .clone();
+            .cloned();
     }
     fn name(&self) -> &str {
         &self.name
@@ -4765,16 +4780,18 @@ pub(crate) struct DeclarationSource {
     location: super::DeclarationLocation,
     value_location: Option<super::DeclarationLocation>,
     name_location: super::DeclarationLocation,
-    judgement: super::retained::JudgedExpr,
+    judgement: Result<super::retained::JudgedExpr, super::retained::MissingEvidence>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils", feature = "test-support"))]
 impl Default for DeclarationSource {
     fn default() -> Self {
-        Self::authored(
+        let mut source = Self::authored(
             SourceSpan::dummy(),
             ModuleCallId::test_dummy_in("test.crn").location,
-        )
+        );
+        source.judgement = Ok(super::retained::missing_judgement_for_test());
+        source
     }
 }
 
@@ -5895,10 +5912,7 @@ impl<P: ValueKind, B: BindingAddress> InferredExportParam<P, B> {
             name: name.into(),
             static_type,
             value,
-            source: DeclarationSource::authored(
-                SourceSpan::dummy(),
-                ModuleCallId::test_dummy_in("test.crn").location,
-            ),
+            source: DeclarationSource::default(),
         }
     }
     pub fn source_span(&self) -> SourceSpan {
@@ -5918,17 +5932,17 @@ impl<P: ValueKind + PartialEq, B: BindingAddress> ExportParamLike<P, B>
     fn value_location(&self) -> Option<&super::DeclarationLocation> {
         self.source.value_location.as_ref()
     }
-    fn judgement(&self) -> &super::retained::JudgedExpr {
-        &self.source.judgement
+    fn judgement(&self) -> Result<&super::retained::JudgedExpr, &super::retained::MissingEvidence> {
+        self.source.judgement.as_ref()
     }
     fn attach_judgement(&mut self, report: &super::retained::ExpressionReport<B>) {
         self.source.judgement = self
             .source
             .value_location
             .as_ref()
+            .ok_or_else(|| super::retained::MissingEvidence::new("declaration value location"))
             .and_then(|location| report.expression(location))
-            .unwrap_or(report.unknown())
-            .clone();
+            .cloned();
     }
     fn name(&self) -> &str {
         &self.name
@@ -7621,7 +7635,8 @@ where
         boundary: ParserPlaceholderBoundary,
         schemas: &crate::schema::SchemaRegistry,
         context: &super::ProviderContext,
-    ) -> Vec<crate::resource::DirectiveResolutionError> {
+    ) -> Result<Vec<crate::resource::DirectiveResolutionError>, super::retained::MissingEvidence>
+    {
         let allow_arguments = boundary == ParserPlaceholderBoundary::ModuleDefinition;
         let arguments = self
             .arguments
@@ -7630,17 +7645,10 @@ where
             .collect();
         let report = self.expression_report();
         let mut seen = HashSet::new();
-        self.iter_all_resources()
-            .flat_map(|resource| {
-                let (
-                    id,
-                    directives,
-                    kind,
-                    loop_template,
-                    element_type,
-                    argument_iterable,
-                    iterable,
-                ) = match resource {
+        let mut errors = Vec::new();
+        for resource in self.iter_all_resources() {
+            let (id, directives, kind, loop_template, element_type, argument_iterable, iterable) =
+                match resource {
                     ResourceRef::Resource(resource) => (
                         &resource.id,
                         Some(&resource.directives),
@@ -7666,14 +7674,19 @@ where
                             Some(resource.directives()),
                             crate::schema::SchemaKind::Resource,
                             true,
-                            Some(report)
-                                .and_then(|report| {
-                                    self.deferred_for_sites()
-                                        .find(|site| std::ptr::eq(site.iterable, iterable))
-                                        .and_then(|site| site.iterable_location)
-                                        .and_then(|location| report.expression(location))
-                                })
-                                .and_then(directive_element_type),
+                            match self
+                                .deferred_for_sites()
+                                .find(|site| std::ptr::eq(site.iterable, iterable))
+                                .ok_or_else(|| {
+                                    super::retained::MissingEvidence::new("deferred iterable site")
+                                })?
+                                .iterable_location
+                            {
+                                Some(location) => directive_element_type(
+                                    report.for_resource(resource.id())?.expression(location)?,
+                                ),
+                                None => None,
+                            },
                             super::contains_module_argument_matching(iterable, &mut |_| true),
                             Some(iterable),
                         )
@@ -7688,35 +7701,31 @@ where
                         None,
                     ),
                 };
-                directives
-                    .into_iter()
-                    .flat_map(|directives| {
-                        directives.resolution_errors(
-                            id,
-                            crate::resource::ProviderDirectiveSchema::for_id(schemas, id, kind),
-                            loop_template && !allow_arguments,
+            if let Some(directives) = directives {
+                for mut error in directives.resolution_errors(
+                    id,
+                    crate::resource::ProviderDirectiveSchema::for_id(schemas, id, kind),
+                    loop_template && !allow_arguments,
+                    element_type.as_ref(),
+                    iterable,
+                    context,
+                ) {
+                    if allow_arguments
+                        && error.pending_bool_module_argument(
+                            &arguments,
                             element_type.as_ref(),
-                            iterable,
-                            context,
+                            argument_iterable,
                         )
-                    })
-                    .filter_map(|mut error| {
-                        if allow_arguments
-                            && error.pending_bool_module_argument(
-                                &arguments,
-                                element_type.as_ref(),
-                                argument_iterable,
-                            )
-                        {
-                            None
-                        } else {
-                            Some(error)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .filter(|error| seen.insert(error.diagnostic_key()))
-            .collect()
+                    {
+                        continue;
+                    }
+                    if seen.insert(error.diagnostic_key()) {
+                        errors.push(error);
+                    }
+                }
+            }
+        }
+        Ok(errors)
     }
 }
 
@@ -8478,7 +8487,7 @@ impl<E: IntoExpandedExportParam<AbsoluteBindingAddress>>
             ParserPlaceholderBoundary::ExpandedFile,
             schemas,
             context,
-        );
+        )?;
         if !directive_errors.is_empty() {
             return Err(crate::resource::DirectiveResolutionErrors::new(directive_errors).into());
         }

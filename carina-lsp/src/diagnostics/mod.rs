@@ -25,6 +25,7 @@ use carina_core::resource::{
     RelativeBindingName, Value as GenericValue,
 };
 use carina_core::schema::{SchemaRegistry, TypeError};
+use carina_core::validation::DeferredAccessTypeError;
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
@@ -347,18 +348,34 @@ impl ExpandedDiagnosticValidationInputs<'_> {
             .find(|candidate| candidate.id() == resource_id)?;
         let attributes = resource.attributes();
         let value = attributes.get(attribute)?;
-        let report = self.configuration.report().for_resource(resource_id);
-        let expression =
-            self.tree
-                .resources()
-                .find(|resource| resource.id() == resource_id)
-                .and_then(|resource| {
-                    report.expression(resource.attribute_value_location(
-                        attribute,
-                        &carina_core::schema::FieldPath::new(),
-                    ))
-                })
-                .unwrap_or(report.unknown());
+        let evidence = self
+            .configuration
+            .report()
+            .for_resource(resource_id)
+            .and_then(|report| {
+                self.tree
+                    .resources()
+                    .find(|resource| resource.id() == resource_id)
+                    .ok_or_else(|| {
+                        carina_core::parser::retained::MissingEvidence::for_resource(resource_id)
+                    })
+                    .and_then(|resource| {
+                        report.expression(resource.attribute_value_location(
+                            attribute,
+                            &carina_core::schema::FieldPath::new(),
+                        ))
+                    })
+            });
+        let expression = match evidence {
+            Ok(expression) => expression,
+            Err(error) => {
+                return Some(Err(
+                    carina_core::validation::DeferredAccessTypeError::InvalidAccess {
+                        error: error.into(),
+                    },
+                ));
+            }
+        };
         Some(carina_core::validation::check_deferred_access_type(
             value,
             expected,
@@ -568,16 +585,7 @@ impl DiagnosticRun<'_> {
         let mut diagnostics = Vec::new();
         let provider_validation_deduplicator = ProviderValidationDeduplicator::default();
         let text = doc.text();
-        let buffer_configuration = doc.parsed().map(|parsed| {
-            carina_core::config_loader::load_buffer_configuration(
-                parsed,
-                &self.schemas,
-                self.provider_context.catalog(),
-            )
-        });
-        let buffer_parsed = buffer_configuration
-            .as_ref()
-            .map(|configuration| configuration.parsed());
+        let buffer_parsed = doc.parsed();
         let buffer_analysis =
             buffer_parsed.and_then(|parsed| analysis_tree(doc, parsed, &mut diagnostics));
         let pinned_base = current_file_path
@@ -1031,6 +1039,19 @@ impl DiagnosticRun<'_> {
                     self.provider_context.catalog(),
                 )
             };
+            let directive_errors = match directive_errors {
+                Ok(errors) => errors,
+                Err(error) => {
+                    diagnostics.push(Diagnostic {
+                        range: Range::default(),
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        source: Some("carina".into()),
+                        message: error.to_string(),
+                        ..Default::default()
+                    });
+                    Vec::new()
+                }
+            };
             let mut directive_sites = HashSet::new();
             for error in directive_errors {
                 if !directive_sites.insert((error.resource().to_owned(), error.diagnostic_key())) {
@@ -1063,11 +1084,39 @@ impl DiagnosticRun<'_> {
                     finding.detail().to_string(),
                 ) && !diagnostics.contains(&diagnostic)
                 {
+                    let owner = match expression_report.expression(finding.location()) {
+                        Ok(expression) => expression.boundary_owner(),
+                        Err(_) => None,
+                    };
+                    let owned_range = owner.and_then(|owner| {
+                        render_merged(
+                            doc,
+                            &carina_core::parser::Located::new(owner.clone(), ()),
+                            DiagnosticSeverity::ERROR,
+                            String::new(),
+                        )
+                        .map(|diagnostic| diagnostic.range)
+                    });
+                    if owned_range.is_some_and(|range| {
+                        diagnostics.iter().any(|existing| {
+                            existing.range == range
+                                && existing.severity == Some(DiagnosticSeverity::ERROR)
+                        })
+                    }) {
+                        continue;
+                    }
                     diagnostics.push(diagnostic);
                 }
             }
-            let semantic_view =
-                checks::SemanticView::for_analysis(parsed, merged, base_path.is_some());
+            let semantic_view = checks::SemanticView::for_analysis(
+                if merged.is_none() {
+                    pre_expansion_configuration.parsed()
+                } else {
+                    parsed
+                },
+                merged,
+                base_path.is_some(),
+            );
             let empty_upstream_exports = Default::default();
             let upstream_exports = upstream_resolution
                 .as_ref()
@@ -1142,9 +1191,10 @@ impl DiagnosticRun<'_> {
             // even when no typed resource sink consumes them. Binding and
             // schema authority remains directory-wide, while source anchoring
             // comes from each authored operator.
-            for finding in
-                carina_core::validation::check_file_integer_arithmetic_values(tree, &binding_index)
-            {
+            for finding in carina_core::validation::check_file_integer_arithmetic_values(
+                pre_expansion_configuration.judged(),
+                &binding_index,
+            ) {
                 if let Some(diagnostic) = render_merged(
                     doc,
                     &finding,
@@ -1217,6 +1267,7 @@ impl DiagnosticRun<'_> {
                 doc,
                 preferred_tree,
                 &binding_index,
+                expression_report,
             ));
             let expanded_compositions = expanded_graph.map(|graph| graph.compositions.as_slice());
             let resolver_constraint_findings = match merged_result.as_ref() {
@@ -1293,6 +1344,14 @@ impl DiagnosticRun<'_> {
             diagnostics.extend(render_module_call_findings(doc, &findings));
             if let Some(base_path) = base_path {
                 for error in residual_errors {
+                    if error.element_diagnostic().is_some_and(|element| {
+                        expression_report
+                            .findings()
+                            .iter()
+                            .any(|finding| finding.location() == element.location())
+                    }) {
+                        continue;
+                    }
                     diagnostics.extend(
                         self.module_resolver_error_diagnostics(doc, tree, error, base_path),
                     );
@@ -1424,12 +1483,31 @@ impl DiagnosticRun<'_> {
                     let bn_map = schema.block_name_map();
                     let mut reported_attribute_diagnostics = HashSet::new();
                     for (attr_name, authored_attr_value) in resource_attributes.iter() {
-                        let judged_expression = expression_report
-                            .expression(rref.attribute_value_location(
+                        let judged_expression =
+                            expression_report.expression(rref.attribute_value_location(
                                 attr_name,
                                 &carina_core::schema::FieldPath::new(),
-                            ))
-                            .unwrap_or(expression_report.unknown());
+                            ));
+                        let judged_expression = match judged_expression {
+                            Ok(expression) => expression,
+                            Err(error) => {
+                                let finding = carina_core::parser::Located::new(
+                                    rref.attribute_value_location(
+                                        attr_name,
+                                        &carina_core::schema::FieldPath::new(),
+                                    )
+                                    .clone(),
+                                    error,
+                                );
+                                diagnostics.extend(render_merged(
+                                    doc,
+                                    &finding,
+                                    DiagnosticSeverity::ERROR,
+                                    finding.detail().to_string(),
+                                ));
+                                continue;
+                            }
+                        };
                         let attr_value = if contains_function_call(authored_attr_value) {
                             resolved_resource_attributes
                                 .as_ref()
@@ -1586,6 +1664,18 @@ impl DiagnosticRun<'_> {
                             // the type system).
                             let attr_shape = effective_type.shape();
                             let contains_struct = effective_type.contains_struct();
+                            let mut type_error_severity = DiagnosticSeverity::WARNING;
+                            let mut diagnose_access_error = |error: DeferredAccessTypeError| {
+                                type_error_severity = match &error {
+                                    DeferredAccessTypeError::InvalidAccess { .. } => {
+                                        DiagnosticSeverity::ERROR
+                                    }
+                                    DeferredAccessTypeError::TypeMismatch { .. } => {
+                                        DiagnosticSeverity::WARNING
+                                    }
+                                };
+                                error.to_string()
+                            };
                             let mut diagnose_schema_error = |error: TypeError| {
                                 let tagged = error.with_attribute(attr_name);
                                 if is_duplicate_list_error(&tagged)
@@ -1660,7 +1750,7 @@ impl DiagnosticRun<'_> {
                                                 &binding_index,
                                             )
                                             .err()
-                                            .map(|error| error.to_string())
+                                            .map(&mut diagnose_access_error)
                                         })
                                 }
                                 (
@@ -1694,7 +1784,7 @@ impl DiagnosticRun<'_> {
                                         )
                                     })
                                     .err()
-                                    .map(|error| error.to_string()),
+                                    .map(&mut diagnose_access_error),
                                 (_, Value::Deferred(DeferredValue::BindingRef { binding })) => {
                                     check_resource_ref_type_mismatch(
                                         &binding_index,
@@ -1826,7 +1916,7 @@ impl DiagnosticRun<'_> {
                                 diagnostics.extend(render_merged(
                                     doc,
                                     &finding,
-                                    DiagnosticSeverity::WARNING,
+                                    type_error_severity,
                                     finding.detail().clone(),
                                 ));
                             }
@@ -2046,16 +2136,25 @@ impl DiagnosticRun<'_> {
                 expanded_graph,
             ));
 
-            if let (Some(graph), Some(tree)) = (expanded_graph, expanded_analysis.as_ref()) {
-                diagnostics.extend(self.check_inferred_export_types(doc, graph, tree));
-            } else if let Some(inference_input) = merged.or(if base_path.is_none() {
-                Some(parsed)
-            } else {
-                None
-            }) {
+            if let (Some(configuration), Some(tree)) =
+                (expanded_configuration.as_ref(), expanded_analysis.as_ref())
+            {
                 diagnostics.extend(self.check_inferred_export_types(
                     doc,
-                    inference_input,
+                    configuration.judged(),
+                    tree,
+                ));
+            } else if merged
+                .or(if base_path.is_none() {
+                    Some(parsed)
+                } else {
+                    None
+                })
+                .is_some()
+            {
+                diagnostics.extend(self.check_inferred_export_types(
+                    doc,
+                    pre_expansion_configuration.judged(),
                     preferred_tree,
                 ));
             }
@@ -2422,10 +2521,7 @@ fn is_duplicate_list_error(error: &TypeError) -> bool {
         | TypeError::MapKeyError { inner, key: _ }
         | TypeError::MapValueError { inner, key: _ }
         | TypeError::StructFieldError { inner, field: _ } => is_duplicate_list_error(inner),
-        TypeError::TypeMismatch {
-            expected: _,
-            got: _,
-        }
+        TypeError::TypeMismatch { types: _ }
         | TypeError::BindingShadowsEnumMember(_)
         | TypeError::InvalidEnumVariant {
             value: _,
@@ -2536,9 +2632,8 @@ fn check_resource_ref_type_mismatch(
         }
     };
     Some(format!(
-        "Type mismatch: expected {}, got {} ({})",
-        expected.resolved_type_name(),
-        mismatch.actual_type_name(),
+        "Type mismatch: {} ({})",
+        mismatch.type_names(),
         mismatch.origin_description(path),
     ))
 }

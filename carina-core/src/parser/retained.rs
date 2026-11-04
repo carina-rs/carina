@@ -25,6 +25,23 @@ pub(crate) enum ExpressionInstance {
     Module(Arc<str>),
 }
 
+/// A failed evidence lookup is an invariant error, never deferred authority.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("missing expression evidence: {request}")]
+pub struct MissingEvidence {
+    request: String,
+}
+impl MissingEvidence {
+    pub(crate) fn new(request: impl Into<String>) -> Self {
+        Self {
+            request: request.into(),
+        }
+    }
+    pub fn for_resource(id: &crate::resource::ResourceId) -> Self {
+        Self::new(format!("resource {id}"))
+    }
+}
+
 impl ExpressionInstance {
     pub(crate) fn for_scope(scope: &crate::resource::ModuleInstanceScope) -> Self {
         Self::Module(Arc::from(scope.key()))
@@ -56,9 +73,9 @@ impl ExpressionLocation {
 /// let expression: ExprValue = reduced.into();
 /// ```
 ///
-/// ```compile_fail,E0599
-/// use carina_core::{parser::retained::ExprValue, resource::AuthoredValue};
-/// fn discard_authorship(expression: ExprValue) -> AuthoredValue { expression.into_value() }
+/// ```compile_fail,E0616
+/// use carina_core::parser::retained::ExprValue;
+/// fn discard_authorship(expression: ExprValue) { let _ = expression.payload; }
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExprValue<P: ValueKind = ParserPlaceholder, B: BindingAddress = RelativeBindingName> {
@@ -83,6 +100,7 @@ struct AuthoredExpr<P: ValueKind, B: BindingAddress> {
 enum ExprKind<B: BindingAddress> {
     Scalar(TypeExpr),
     Parameter(TypeExpr),
+    UntypedParameter,
     Binding(B),
     Reference {
         binding: B,
@@ -91,12 +109,17 @@ enum ExprKind<B: BindingAddress> {
     },
     List,
     Map(Vec<String>),
+    NestedBlock {
+        name: String,
+        header: DeclarationLocation,
+    },
     Interpolation,
+    EmptyInterpolation,
     Coalesce,
     Call(String),
     Function {
         name: String,
-        return_type: Option<TypeExpr>,
+        signature: Arc<FunctionSignature>,
     },
     Sequence,
     Access(PathSegment),
@@ -106,13 +129,29 @@ enum ExprKind<B: BindingAddress> {
     },
     Alias,
     Element,
+    Iterable,
     Resource {
         provider: String,
         resource_type: String,
         read: bool,
     },
     Sink(String),
-    Pending,
+    If,
+    For,
+    Wait,
+    Compose,
+    DynamicAccess,
+    ModuleCall,
+    Boolean,
+    Declaration,
+    ProviderDeclaration,
+    Unsupported(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FunctionSignature {
+    parameters: Vec<(String, Option<TypeExpr>)>,
+    return_type: Option<TypeExpr>,
 }
 
 impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
@@ -153,17 +192,21 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
             },
             ExprKind::Scalar(ty) => ExprKind::Scalar(ty),
             ExprKind::Parameter(ty) => ExprKind::Parameter(ty),
+            ExprKind::UntypedParameter => ExprKind::UntypedParameter,
             ExprKind::List => ExprKind::List,
             ExprKind::Map(keys) => ExprKind::Map(keys),
+            ExprKind::NestedBlock { name, header } => ExprKind::NestedBlock { name, header },
             ExprKind::Interpolation => ExprKind::Interpolation,
+            ExprKind::EmptyInterpolation => ExprKind::EmptyInterpolation,
             ExprKind::Coalesce => ExprKind::Coalesce,
             ExprKind::Call(name) => ExprKind::Call(name),
-            ExprKind::Function { name, return_type } => ExprKind::Function { name, return_type },
+            ExprKind::Function { name, signature } => ExprKind::Function { name, signature },
             ExprKind::Sequence => ExprKind::Sequence,
             ExprKind::Access(step) => ExprKind::Access(step),
             ExprKind::Integer { op, location } => ExprKind::Integer { op, location },
             ExprKind::Alias => ExprKind::Alias,
             ExprKind::Element => ExprKind::Element,
+            ExprKind::Iterable => ExprKind::Iterable,
             ExprKind::Resource {
                 provider,
                 resource_type,
@@ -174,7 +217,16 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
                 read,
             },
             ExprKind::Sink(name) => ExprKind::Sink(name),
-            ExprKind::Pending => ExprKind::Pending,
+            ExprKind::If => ExprKind::If,
+            ExprKind::For => ExprKind::For,
+            ExprKind::Wait => ExprKind::Wait,
+            ExprKind::Compose => ExprKind::Compose,
+            ExprKind::DynamicAccess => ExprKind::DynamicAccess,
+            ExprKind::ModuleCall => ExprKind::ModuleCall,
+            ExprKind::Boolean => ExprKind::Boolean,
+            ExprKind::Declaration => ExprKind::Declaration,
+            ExprKind::ProviderDeclaration => ExprKind::ProviderDeclaration,
+            ExprKind::Unsupported(rule) => ExprKind::Unsupported(rule),
         };
         let authored = Arc::new(AuthoredExpr {
             location: authored.location,
@@ -254,8 +306,14 @@ pub struct Expressions<B: BindingAddress = RelativeBindingName> {
     roots: Vec<ExprValue<ParserPlaceholder, B>>,
     definitions: IndexMap<B, ExprValue<ParserPlaceholder, B>>,
     report: Arc<ExpressionReport<B>>,
-    arguments: HashMap<B, JudgedExpr>,
+    arguments: HashMap<B, ArgumentJudgement>,
     instance: ExpressionInstance,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ArgumentJudgement {
+    declared_type: TypeExpr,
+    value: JudgedExpr,
 }
 
 impl<B: BindingAddress> Default for Expressions<B> {
@@ -325,7 +383,7 @@ impl<B: BindingAddress> Expressions<B> {
     pub(crate) fn bind_arguments(
         &mut self,
         scope: &crate::resource::ModuleInstanceScope,
-        arguments: impl IntoIterator<Item = (B, JudgedExpr)>,
+        arguments: impl IntoIterator<Item = (B, TypeExpr, JudgedExpr)>,
     ) {
         self.instance = ExpressionInstance::for_scope(scope);
         fn qualify<P: ValueKind, B: BindingAddress>(
@@ -354,7 +412,16 @@ impl<B: BindingAddress> Expressions<B> {
         for root in self.definitions.values_mut() {
             qualify(root, &self.instance, &mut memo);
         }
-        self.arguments.extend(arguments);
+        self.arguments
+            .extend(arguments.into_iter().map(|(name, declared_type, value)| {
+                (
+                    name,
+                    ArgumentJudgement {
+                        declared_type,
+                        value,
+                    },
+                )
+            }));
         self.report = Arc::new(ExpressionReport::empty());
     }
 }
@@ -365,7 +432,7 @@ impl<B: BindingAddress> Expressions<B> {
 #[derive(Debug, Clone)]
 pub struct JudgedFile<E, D, B: BindingAddress = RelativeBindingName> {
     file: super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
-    schemas: Arc<crate::schema::SchemaRegistry>,
+    schemas: crate::schema::SchemaRegistry,
 }
 
 impl<E, D, B: BindingAddress> JudgedFile<E, D, B> {
@@ -392,7 +459,7 @@ where
         schemas: &crate::schema::SchemaRegistry,
         config: &super::ProviderContext,
     ) -> Self {
-        let schemas = Arc::new(schemas.clone());
+        let schemas = schemas.clone();
         judge_configuration(&mut file, &schemas, config);
         Self { file, schemas }
     }
@@ -445,6 +512,12 @@ pub(crate) fn judge_configuration<
 ) where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
+    if file.expression_report().matches_authority(schemas, config) {
+        let mut report = file.expression_report().clone();
+        report.record_resources(file);
+        file.parser_binding_metadata.syntax.expressions_mut().report = Arc::new(report);
+        return;
+    }
     let mut report = judge_expressions(file, schemas, config);
     for parameter in &file.export_params {
         if let (Some(sink), Some(location)) =
@@ -525,7 +598,94 @@ fn node(
     }
 }
 
+fn lower_blocks(children: Vec<ExprValue>) -> Vec<ExprValue> {
+    let mut groups: IndexMap<String, Vec<ExprValue>> = IndexMap::new();
+    let mut headers = HashMap::new();
+    for child in &children {
+        if let ExprKind::NestedBlock { name, header } = &child.authored.kind {
+            groups
+                .entry(name.clone())
+                .or_default()
+                .push(child.authored.children[0].clone());
+            headers
+                .entry(name.clone())
+                .or_insert_with(|| header.clone());
+        }
+    }
+    let groups: HashMap<_, _> = groups
+        .into_iter()
+        .map(|(name, records)| {
+            let value = ExprValue {
+                authored: Arc::new(AuthoredExpr {
+                    location: ExpressionLocation::new(ExpressionInstance::Root, &headers[&name]),
+                    kind: ExprKind::List,
+                    children: records,
+                }),
+                payload: Projection::Pending,
+            };
+            (name, value)
+        })
+        .collect();
+    children
+        .into_iter()
+        .map(|child| {
+            if let ExprKind::NestedBlock { name, header } = &child.authored.kind {
+                ExprValue {
+                    authored: Arc::new(AuthoredExpr {
+                        location: ExpressionLocation::new(ExpressionInstance::Root, header),
+                        kind: ExprKind::Sink(name.clone()),
+                        children: vec![groups[name].clone()],
+                    }),
+                    payload: Projection::Pending,
+                }
+            } else {
+                child
+            }
+        })
+        .collect()
+}
+
 fn compile(
+    pair: Pair<'_, Rule>,
+    file: &PreprocessedFile,
+    source: &Path,
+    scope: &HashMap<String, ExprValue>,
+) -> ExprValue {
+    // Keep pass-through grammar levels off the large form compiler's stack.
+    // Each still receives its authored location and its own checked evidence.
+    if matches!(
+        pair.as_rule(),
+        Rule::expression
+            | Rule::primary
+            | Rule::coalesce_expr
+            | Rule::pipe_expr
+            | Rule::additive_expr
+            | Rule::multiplicative_expr
+            | Rule::compose_expr
+            | Rule::postfix_expr
+            | Rule::subscripted_id
+            | Rule::validate_expr
+            | Rule::validate_primary
+            | Rule::validate_or_expr
+            | Rule::validate_and_expr
+            | Rule::validate_comparison
+            | Rule::validate_additive_expr
+            | Rule::validate_multiplicative_expr
+    ) || (pair.as_rule() == Rule::validate_not_expr
+        && !pair.as_str().trim_start().starts_with('!'))
+    {
+        let mut parts = pair.clone().into_inner();
+        if let Some(child) = parts.next()
+            && parts.next().is_none()
+        {
+            let child = compile(child, file, source, scope);
+            return node(&pair, ExprKind::Alias, vec![child], file, source);
+        }
+    }
+    compile_form(pair, file, source, scope)
+}
+
+fn compile_form(
     pair: Pair<'_, Rule>,
     file: &PreprocessedFile,
     source: &Path,
@@ -563,7 +723,7 @@ fn compile(
                 children.push(compile(child, file, source, &scope));
             }
         }
-        children
+        lower_blocks(children)
     };
     match pair.as_rule() {
         Rule::expression | Rule::primary => {
@@ -571,7 +731,7 @@ fn compile(
             if children.len() == 1 {
                 node(&pair, ExprKind::Alias, children, file, source)
             } else {
-                node(&pair, ExprKind::Pending, children, file, source)
+                node(&pair, ExprKind::Sequence, children, file, source)
             }
         }
         Rule::coalesce_expr => {
@@ -593,7 +753,10 @@ fn compile(
             }
             value
         }
-        Rule::additive_expr | Rule::multiplicative_expr => {
+        Rule::additive_expr
+        | Rule::multiplicative_expr
+        | Rule::validate_additive_expr
+        | Rule::validate_multiplicative_expr => {
             let mut parts = pair.clone().into_inner();
             let mut value = compile(parts.next().expect("integer operand"), file, source, scope);
             while let Some(operator) = parts.next() {
@@ -633,7 +796,7 @@ fn compile(
             if parts.len() == 1 {
                 parts.into_iter().next().unwrap()
             } else {
-                node(&pair, ExprKind::Pending, parts, file, source)
+                node(&pair, ExprKind::Compose, parts, file, source)
             }
         }
         Rule::postfix_expr | Rule::subscripted_id | Rule::for_iterable => {
@@ -647,12 +810,17 @@ fn compile(
                     .map(|child| compile(child, file, source, scope));
                 let kind = access_step(step)
                     .map(ExprKind::Access)
-                    .unwrap_or(ExprKind::Pending);
+                    .unwrap_or(ExprKind::DynamicAccess);
                 let mut operands = vec![value];
                 operands.extend(operand);
                 value = node(&pair, kind, operands, file, source);
             }
-            node(&pair, ExprKind::Alias, vec![value], file, source)
+            let kind = if pair.as_rule() == Rule::for_iterable {
+                ExprKind::Iterable
+            } else {
+                ExprKind::Alias
+            };
+            node(&pair, kind, vec![value], file, source)
         }
         Rule::variable_ref => {
             let mut parts = pair.clone().into_inner().peekable();
@@ -687,7 +855,7 @@ fn compile(
                         .map(|child| compile(child, file, source, scope));
                     let kind = access_step(step)
                         .map(ExprKind::Access)
-                        .unwrap_or(ExprKind::Pending);
+                        .unwrap_or(ExprKind::DynamicAccess);
                     let mut operands = vec![value];
                     operands.extend(operand);
                     value = node(&pair, kind, operands, file, source);
@@ -718,7 +886,7 @@ fn compile(
                     .map(|child| compile(child, file, source, scope));
                 let kind = access_step(step)
                     .map(ExprKind::Access)
-                    .unwrap_or(ExprKind::Pending);
+                    .unwrap_or(ExprKind::DynamicAccess);
                 let mut operands = vec![value];
                 operands.extend(operand);
                 value = node(&pair, kind, operands, file, source);
@@ -798,7 +966,7 @@ fn compile(
                         .and_then(|wrapper| wrapper.into_inner().next());
                     match expression {
                         Some(expression) => compile(expression, file, source, scope),
-                        None => node(&part, ExprKind::Pending, vec![], file, source),
+                        None => node(&part, ExprKind::EmptyInterpolation, vec![], file, source),
                     }
                 })
                 .collect::<Vec<_>>();
@@ -816,37 +984,42 @@ fn compile(
         }
         Rule::list => node(&pair, ExprKind::List, children(), file, source),
         Rule::map => {
-            let keys = pair
-                .clone()
-                .into_inner()
-                .filter_map(|entry| entry.into_inner().next())
-                .map(|key| {
-                    if key.as_rule() == Rule::string {
-                        super::expressions::string_literal::parse_string_literal(key)
-                            .unwrap_or_default()
-                    } else {
-                        key.as_str().to_string()
-                    }
+            let entries = lower_blocks(
+                pair.clone()
+                    .into_inner()
+                    .map(|entry| {
+                        if entry.as_rule() == Rule::map_entry {
+                            let mut parts = entry.clone().into_inner();
+                            let key = parts.next().expect("map key");
+                            let name = if key.as_rule() == Rule::string {
+                                super::expressions::string_literal::parse_string_literal(
+                                    key.clone(),
+                                )
+                                .unwrap_or_else(|_| key.as_str().to_string())
+                            } else {
+                                key.as_str().to_string()
+                            };
+                            let value =
+                                compile(parts.next().expect("map value"), file, source, scope);
+                            node(&entry, ExprKind::Sink(name), vec![value], file, source)
+                        } else {
+                            compile(entry, file, source, scope)
+                        }
+                    })
+                    .collect(),
+            );
+            let keys = entries
+                .iter()
+                .map(|entry| match &entry.authored.kind {
+                    ExprKind::Sink(name) => name.clone(),
+                    _ => unreachable!("compiled map entry"),
                 })
                 .collect();
-            let children = pair
-                .clone()
-                .into_inner()
-                .map(|entry| {
-                    if entry.as_rule() == Rule::map_entry {
-                        let value = entry
-                            .into_inner()
-                            .find(|child| child.as_rule() == Rule::expression)
-                            .expect("map value");
-                        compile(value, file, source, scope)
-                    } else {
-                        compile(entry, file, source, scope)
-                    }
-                })
-                .collect();
-            node(&pair, ExprKind::Map(keys), children, file, source)
+            node(&pair, ExprKind::Map(keys), entries, file, source)
         }
-        Rule::fn_body => node(&pair, ExprKind::Sequence, children(), file, source),
+        Rule::fn_body | Rule::if_body | Rule::else_clause | Rule::for_body => {
+            node(&pair, ExprKind::Sequence, children(), file, source)
+        }
         Rule::fn_def => {
             let return_type = pair
                 .clone()
@@ -859,6 +1032,7 @@ fn compile(
                     )
                 });
             let mut scope = scope.clone();
+            let mut parameters = Vec::new();
             for parameter in pair
                 .clone()
                 .into_inner()
@@ -873,9 +1047,16 @@ fn compile(
                         &super::ProviderContext::new(crate::EnvironmentSnapshot::new([])),
                     )
                 {
+                    parameters.push((name.as_str().to_string(), Some(ty.clone())));
                     scope.insert(
                         name.as_str().to_string(),
                         node(&name, ExprKind::Parameter(ty), vec![], file, source),
+                    );
+                } else {
+                    parameters.push((name.as_str().to_string(), None));
+                    scope.insert(
+                        name.as_str().to_string(),
+                        node(&name, ExprKind::UntypedParameter, vec![], file, source),
                     );
                 }
             }
@@ -895,7 +1076,10 @@ fn compile(
                         .unwrap()
                         .as_str()
                         .to_string(),
-                    return_type,
+                    signature: Arc::new(FunctionSignature {
+                        parameters,
+                        return_type,
+                    }),
                 },
                 children,
                 file,
@@ -924,9 +1108,9 @@ fn compile(
                 );
             }
             let body = compile(parts.next().expect("loop body"), file, source, &scope);
-            node(&pair, ExprKind::Pending, vec![iterable, body], file, source)
+            node(&pair, ExprKind::For, vec![iterable, body], file, source)
         }
-        Rule::function_call => {
+        Rule::function_call | Rule::validate_function_call => {
             let mut parts = pair.clone().into_inner();
             let name = parts.next().expect("function name").as_str().to_string();
             node(
@@ -973,7 +1157,152 @@ fn compile(
             let value = compile(parts.next().expect("attribute value"), file, source, scope);
             node(&pair, ExprKind::Sink(name), vec![value], file, source)
         }
-        _ => node(&pair, ExprKind::Pending, children(), file, source),
+        Rule::if_expr => node(&pair, ExprKind::If, children(), file, source),
+        Rule::wait_expr => {
+            let mut parts = pair.clone().into_inner();
+            let target = parts.next().expect("wait target");
+            let target = scope.get(target.as_str()).cloned().unwrap_or_else(|| {
+                node(
+                    &target,
+                    ExprKind::Binding(RelativeBindingName::new(target.as_str())),
+                    vec![],
+                    file,
+                    source,
+                )
+            });
+            let mut operands = vec![target];
+            operands.extend(parts.map(|part| compile(part, file, source, scope)));
+            node(&pair, ExprKind::Wait, operands, file, source)
+        }
+        Rule::validate_expr | Rule::validate_primary => {
+            node(&pair, ExprKind::Alias, children(), file, source)
+        }
+        Rule::validate_or_expr
+        | Rule::validate_and_expr
+        | Rule::validate_not_expr
+        | Rule::validate_comparison => {
+            let values = pair
+                .clone()
+                .into_inner()
+                .filter(|part| part.as_rule() != Rule::compare_op)
+                .map(|part| compile(part, file, source, scope))
+                .collect::<Vec<_>>();
+            let kind = if values.len() == 1 && !pair.as_str().trim_start().starts_with('!') {
+                ExprKind::Alias
+            } else {
+                ExprKind::Boolean
+            };
+            node(&pair, kind, values, file, source)
+        }
+        Rule::let_binding
+        | Rule::local_binding
+        | Rule::for_local_binding
+        | Rule::if_local_binding
+        | Rule::fn_local_let
+        | Rule::attributes_param
+        | Rule::exports_param
+        | Rule::module_call_arg
+        | Rule::arg_default_attr => {
+            let values: Vec<_> = pair
+                .clone()
+                .into_inner()
+                .filter(|part| part.as_rule() == Rule::expression)
+                .map(|part| compile(part, file, source, scope))
+                .collect();
+            let kind = if values.is_empty() {
+                ExprKind::Declaration
+            } else {
+                ExprKind::Sequence
+            };
+            node(&pair, kind, values, file, source)
+        }
+        Rule::module_call => node(&pair, ExprKind::ModuleCall, children(), file, source),
+        Rule::nested_block => {
+            let name_pair = pair.clone().into_inner().next().expect("nested block name");
+            let name = name_pair.as_str().to_string();
+            let header = DeclarationLocation::expression_node(&name_pair, file, source);
+            let members = children().into_iter().skip(1).collect::<Vec<_>>();
+            let (fields, mut locals): (Vec<_>, Vec<_>) = members
+                .into_iter()
+                .partition(|member| matches!(member.authored.kind, ExprKind::Sink(_)));
+            let keys = fields
+                .iter()
+                .map(|field| match &field.authored.kind {
+                    ExprKind::Sink(name) => name.clone(),
+                    _ => unreachable!(),
+                })
+                .collect();
+            let record = node(&pair, ExprKind::Map(keys), fields, file, source);
+            locals.push(record);
+            let record = node(&pair, ExprKind::Sequence, locals, file, source);
+            node(
+                &pair,
+                ExprKind::NestedBlock { name, header },
+                vec![record],
+                file,
+                source,
+            )
+        }
+        Rule::provider_block | Rule::provider_expr => node(
+            &pair,
+            ExprKind::ProviderDeclaration,
+            children(),
+            file,
+            source,
+        ),
+        Rule::arguments_block
+        | Rule::arguments_param
+        | Rule::arguments_param_block
+        | Rule::arguments_param_attr
+        | Rule::arg_description_attr
+        | Rule::arg_validation_block
+        | Rule::validation_block_attr
+        | Rule::validation_condition_attr
+        | Rule::validation_error_message_attr
+        | Rule::attributes_block
+        | Rule::exports_block
+        | Rule::backend_block
+        | Rule::require_statement
+        | Rule::wait_attr
+        | Rule::wait_until_attr
+        | Rule::wait_timeout_attr
+        | Rule::wait_depends_on_attr
+        | Rule::upstream_state_expr
+        | Rule::use_expr
+        | Rule::import_state_block
+        | Rule::import_state_attr
+        | Rule::import_to_attr
+        | Rule::import_id_attr
+        | Rule::removed_block
+        | Rule::removed_attr
+        | Rule::moved_block
+        | Rule::moved_attr
+        | Rule::moved_from_attr
+        | Rule::moved_to_attr
+        | Rule::resource_address
+        | Rule::type_expr
+        | Rule::type_expr_atom
+        | Rule::type_simple
+        | Rule::type_generic
+        | Rule::type_ref
+        | Rule::resource_type_path
+        | Rule::type_struct
+        | Rule::struct_field_list
+        | Rule::struct_field
+        | Rule::type_string_literal
+        | Rule::identifier
+        | Rule::discard_pattern
+        | Rule::reference_prefix
+        | Rule::reference_field
+        | Rule::null_literal
+        | Rule::EOI => node(&pair, ExprKind::Declaration, children(), file, source),
+        rule => node(
+            &pair,
+            ExprKind::Unsupported(format!("{rule:?}")),
+            children(),
+            file,
+            source,
+        ),
     }
 }
 
@@ -983,10 +1312,18 @@ fn access_step(pair: Pair<'_, Rule>) -> Option<PathSegment> {
             name: pair.as_str().trim_start_matches('.').to_string(),
         }),
         Rule::index_access => {
-            let index = pair
-                .into_inner()
-                .flatten()
-                .find(|part| matches!(part.as_rule(), Rule::number | Rule::string))?;
+            fn literal(pair: Pair<'_, Rule>) -> Option<Pair<'_, Rule>> {
+                if matches!(pair.as_rule(), Rule::number | Rule::string) {
+                    return Some(pair);
+                }
+                let mut children = pair.into_inner();
+                let child = children.next()?;
+                if children.next().is_some() {
+                    return None;
+                }
+                literal(child)
+            }
+            let index = literal(pair)?;
             let subscript = match index.as_rule() {
                 Rule::number => crate::resource::Subscript::Int {
                     index: index.as_str().parse().ok()?,
@@ -1004,18 +1341,18 @@ fn access_step(pair: Pair<'_, Rule>) -> Option<PathSegment> {
     }
 }
 
-#[cfg(not(test))]
-use judgement::judge_expressions;
-#[cfg(test)]
 pub(crate) use judgement::judge_expressions;
-pub(in crate::parser) use judgement::pending as missing_judgement;
-pub use judgement::{
-    CollectionKind, ExpressionAdmission, ExpressionReport, JudgedExpr, admit_expression,
+pub(in crate::parser) use judgement::unjudged as missing_judgement;
+pub(crate) use judgement::{
+    AdmissionContext, EmptyCoalesceDefault, admit_with_context, coalesce_type,
 };
-pub(crate) use judgement::{EmptyCoalesceDefault, coalesce_type};
-#[cfg(test)]
+pub use judgement::{
+    CollectionKind, ExpressionAdmission, ExpressionCheckOwner, ExpressionReport, JudgedExpr,
+    ProviderAuthorityUnavailable, admit_expression,
+};
+#[cfg(any(test, feature = "test-utils", feature = "test-support"))]
 pub(crate) fn missing_judgement_for_test() -> JudgedExpr {
-    judgement::pending()
+    judgement::constraint_fixture()
 }
 
 // Constructors for judgement evidence are confined to this module. In
@@ -1040,8 +1377,7 @@ mod judgement {
         match (left, default) {
             (Ok(left), Ok(right)) if left == right => Ok(left),
             (Ok(left), Ok(right)) => Err(InferenceError::IncompatibleCoalesceTypes {
-                left: left.to_string(),
-                default: right.to_string(),
+                types: crate::schema::MismatchTypeNames::for_type_exprs(&left, &right),
             }
             .into()),
             (Ok(left @ TypeExpr::List(_)), Err(_))
@@ -1067,9 +1403,82 @@ mod judgement {
     #[derive(Debug, Clone, PartialEq)]
     enum InferredKind {
         Ordinary,
+        // Schema-projected references retain the existing binding check and
+        // apply-time value validation, rather than acquiring a new nominal
+        // declaration obligation at a function boundary.
+        Reference,
+        Literal,
+        EnumIdentifier,
+        ValueDependent,
+        Declaration,
         StringConstruction,
         List,
         Map,
+    }
+
+    /// The intrinsic value shape does not depend on nominal identity or on
+    /// inferring a common element type. In particular an empty list still has
+    /// a list shape, and a heterogeneous record is still a map.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ValueShape {
+        String,
+        Int,
+        Float,
+        Bool,
+        Duration,
+        List,
+        Map,
+        Handle,
+    }
+
+    impl ValueShape {
+        fn of_type(ty: &TypeExpr) -> Option<Self> {
+            use crate::schema::{RawShape, RefinedScalarKind};
+            Some(match ty {
+                TypeExpr::String | TypeExpr::StringLiteral(_) => Self::String,
+                TypeExpr::Int => Self::Int,
+                TypeExpr::Float => Self::Float,
+                TypeExpr::Bool => Self::Bool,
+                TypeExpr::Duration => Self::Duration,
+                TypeExpr::List(_) => Self::List,
+                TypeExpr::Map(_) | TypeExpr::Struct { .. } => Self::Map,
+                TypeExpr::Ref(_) => Self::Handle,
+                TypeExpr::SchemaType { owned } => match owned.scalar_kind() {
+                    RefinedScalarKind::String => Self::String,
+                    RefinedScalarKind::Int => Self::Int,
+                    RefinedScalarKind::Float => Self::Float,
+                },
+                TypeExpr::Simple(name) => match name.declaration().raw_shape() {
+                    RawShape::String { .. } | RawShape::Reference { .. } => Self::String,
+                    RawShape::Int { .. } => Self::Int,
+                    RawShape::Float { .. } => Self::Float,
+                    RawShape::Bool => Self::Bool,
+                    RawShape::Duration => Self::Duration,
+                    RawShape::List { .. } => Self::List,
+                    RawShape::Map { .. } | RawShape::Struct { .. } => Self::Map,
+                    _ => return None,
+                },
+                TypeExpr::Union(members) => {
+                    let shape = Self::of_type(members.first()?)?;
+                    if !members
+                        .iter()
+                        .all(|member| Self::of_type(member) == Some(shape))
+                    {
+                        return None;
+                    }
+                    shape
+                }
+                TypeExpr::DottedUnresolved(_) | TypeExpr::UnloadedSchemaType(_) => return None,
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FailureOwner {
+        Expression,
+        Boundary,
+        BindingIndex,
+        BindingScope,
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -1079,36 +1488,157 @@ mod judgement {
         // A missing inferable type (dynamic calls, heterogeneous records) is
         // distinct from an invalid authored operation such as a bad fallback.
         invalid: bool,
+        // The producer assigns diagnostic ownership when creating a failure.
+        // Wrappers preserve it, so reporting never depends on an ExprKind list.
+        failure_owner: FailureOwner,
     }
 
     /// Admission evidence, constructible only by the recursive judge.
     ///
-    /// ```compile_fail,E0451
+    /// ```compile_fail,E0616
     /// use carina_core::parser::retained::JudgedExpr;
-    /// let forged = JudgedExpr { origin: None, judgement: todo!(), concrete: false, coalesce: None, elements: Default::default(), fields: Default::default() };
+    /// fn overwrite_projection(expression: &mut JudgedExpr) { expression.concrete = true; }
     /// ```
     #[derive(Debug, Clone, PartialEq)]
-    pub struct JudgedExpr {
+    pub struct JudgedExpr(Arc<JudgedExprData>);
+
+    #[doc(hidden)]
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct JudgedExprData {
         origin: Option<ExpressionLocation>,
-        pub(crate) concrete: bool,
+        concrete: bool,
+        reported: bool,
+        direct_reference: bool,
+        boundary_owner: Option<Arc<DeclarationLocation>>,
         judgement: Arc<ExprJudgement>,
         coalesce: Option<Arc<[JudgedExpr; 2]>>,
+        alternatives: Arc<Vec<JudgedExpr>>,
+        member: Option<Arc<JudgedExpr>>,
         elements: Arc<Vec<JudgedExpr>>,
         fields: Arc<IndexMap<String, JudgedExpr>>,
     }
 
+    impl std::ops::Deref for JudgedExpr {
+        type Target = JudgedExprData;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
     impl JudgedExpr {
+        fn data_mut(&mut self) -> &mut JudgedExprData {
+            Arc::make_mut(&mut self.0)
+        }
+        fn failure_owned_by(&mut self, owner: FailureOwner) {
+            Arc::make_mut(&mut self.data_mut().judgement).failure_owner = owner;
+        }
         pub fn static_type(&self) -> Result<&TypeExpr, &InferenceIssue> {
             self.judgement.ty.as_ref()
+        }
+        pub(crate) fn alternatives(&self) -> &[JudgedExpr] {
+            &self.alternatives
+        }
+        pub(crate) fn elements(&self) -> impl Iterator<Item = &JudgedExpr> {
+            self.elements
+                .iter()
+                .chain(self.member.iter().map(Arc::as_ref))
+        }
+        pub(crate) fn fields(&self) -> impl Iterator<Item = (&str, &JudgedExpr)> {
+            self.fields
+                .iter()
+                .map(|(name, field)| (name.as_str(), field))
         }
         pub fn coalesce_operands(&self) -> Option<&[JudgedExpr; 2]> {
             self.coalesce.as_deref()
         }
-        pub fn element(&self, index: usize) -> Option<&JudgedExpr> {
-            self.elements.get(index)
+        pub fn element(&self, index: usize) -> Result<&JudgedExpr, MissingEvidence> {
+            self.elements
+                .get(index)
+                .or(self.member.as_deref())
+                .ok_or_else(|| MissingEvidence::new(format!("list element {index}")))
         }
-        pub fn field(&self, key: &str) -> Option<&JudgedExpr> {
-            self.fields.get(key)
+        pub fn field(&self, key: &str) -> Result<&JudgedExpr, MissingEvidence> {
+            self.fields
+                .get(key)
+                .or(self.member.as_deref())
+                .ok_or_else(|| MissingEvidence::new(format!("field {key}")))
+        }
+        pub fn branch(&self, index: usize) -> Result<&JudgedExpr, MissingEvidence> {
+            self.alternatives
+                .get(index)
+                .ok_or_else(|| MissingEvidence::new(format!("branch {index}")))
+        }
+        pub(crate) fn requires_declared_assignment(&self) -> bool {
+            matches!(
+                self.judgement.kind,
+                InferredKind::Ordinary | InferredKind::Reference
+            ) && self.alternatives.is_empty()
+        }
+        pub(crate) fn is_string_construction(&self) -> bool {
+            self.judgement.kind == InferredKind::StringConstruction && self.alternatives.is_empty()
+        }
+        pub(crate) fn is_value_dependent(&self) -> bool {
+            self.judgement.kind == InferredKind::ValueDependent
+        }
+        pub fn check_owner(&self) -> ExpressionCheckOwner {
+            if self.reported {
+                ExpressionCheckOwner::Reported
+            } else if self.judgement.invalid {
+                match self.judgement.failure_owner {
+                    FailureOwner::Expression | FailureOwner::Boundary => {
+                        ExpressionCheckOwner::Expression
+                    }
+                    FailureOwner::BindingIndex => ExpressionCheckOwner::BindingIndex,
+                    FailureOwner::BindingScope => ExpressionCheckOwner::BindingScope,
+                }
+            } else if self.direct_reference && self.alternatives.is_empty() {
+                ExpressionCheckOwner::BindingIndex
+            } else {
+                ExpressionCheckOwner::Expression
+            }
+        }
+        pub fn boundary_owner(&self) -> Option<&DeclarationLocation> {
+            self.boundary_owner.as_deref()
+        }
+        fn owned_by_bindings(mut self) -> Self {
+            self.data_mut().direct_reference = true;
+            self.failure_owned_by(FailureOwner::BindingIndex);
+            self
+        }
+        fn needs_authored_sink_check(&self) -> bool {
+            (self.judgement.kind == InferredKind::StringConstruction && !self.concrete)
+                || !self.alternatives.is_empty()
+                || self.elements.iter().any(Self::needs_authored_sink_check)
+                || self.fields.values().any(Self::needs_authored_sink_check)
+                || self
+                    .member
+                    .as_deref()
+                    .is_some_and(Self::needs_authored_sink_check)
+        }
+        fn contains_deferred_interpolation(&self) -> bool {
+            (self.judgement.kind == InferredKind::StringConstruction && !self.concrete)
+                || self
+                    .alternatives
+                    .iter()
+                    .any(Self::contains_deferred_interpolation)
+                || self
+                    .elements
+                    .iter()
+                    .any(Self::contains_deferred_interpolation)
+                || self
+                    .fields
+                    .values()
+                    .any(Self::contains_deferred_interpolation)
+                || self
+                    .member
+                    .as_deref()
+                    .is_some_and(Self::contains_deferred_interpolation)
+        }
+        pub fn coalesce_operand(&self, index: usize) -> Result<&JudgedExpr, MissingEvidence> {
+            self.coalesce
+                .as_ref()
+                .and_then(|operands| operands.get(index))
+                .ok_or_else(|| MissingEvidence::new(format!("coalesce operand {index}")))
         }
         pub fn collection_kind(&self) -> Option<CollectionKind> {
             match self.judgement.kind {
@@ -1116,6 +1646,30 @@ mod judgement {
                 InferredKind::Map => Some(CollectionKind::Map),
                 _ => None,
             }
+        }
+        fn value_shape(&self) -> Option<ValueShape> {
+            if let Some(first) = self.alternatives.first() {
+                let shape = first.value_shape()?;
+                return self
+                    .alternatives
+                    .iter()
+                    .all(|branch| branch.value_shape() == Some(shape))
+                    .then_some(shape);
+            }
+            match self.judgement.kind {
+                InferredKind::List => Some(ValueShape::List),
+                InferredKind::Map => Some(ValueShape::Map),
+                _ => self.static_type().ok().and_then(ValueShape::of_type),
+            }
+        }
+        fn type_description(&self) -> String {
+            self.static_type()
+                .map(ToString::to_string)
+                .unwrap_or_else(|_| {
+                    self.value_shape()
+                        .map(|shape| format!("{shape:?}"))
+                        .unwrap_or_else(|| "value-dependent expression".into())
+                })
         }
     }
 
@@ -1125,11 +1679,51 @@ mod judgement {
         Map,
     }
 
+    /// The validator responsible for a diagnostic. This does not change
+    /// admission: failed and missing evidence remain errors at every sink.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ExpressionCheckOwner {
+        Expression,
+        BindingIndex,
+        BindingScope,
+        Reported,
+    }
+
+    /// Opaque proof that a provider schema is unavailable. Missing authored
+    /// evidence cannot construct this token.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ProviderAuthorityUnavailable(UnavailableSchema);
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum UnavailableSchema {
+        Resource {
+            binding: String,
+        },
+        Named {
+            identity: crate::schema::TypeIdentity,
+        },
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum ExpressionAdmission {
         ValueCheck,
         DeferredInterpolation,
-        Pending,
+        ProviderPending(ProviderAuthorityUnavailable),
+    }
+
+    fn combine_admission(
+        left: ExpressionAdmission,
+        right: ExpressionAdmission,
+    ) -> ExpressionAdmission {
+        match (left, right) {
+            (pending @ ExpressionAdmission::ProviderPending(_), _)
+            | (_, pending @ ExpressionAdmission::ProviderPending(_)) => pending,
+            (ExpressionAdmission::DeferredInterpolation, _)
+            | (_, ExpressionAdmission::DeferredInterpolation) => {
+                ExpressionAdmission::DeferredInterpolation
+            }
+            _ => ExpressionAdmission::ValueCheck,
+        }
     }
 
     /// Static admission requires the judge's evidence, never a projection.
@@ -1143,19 +1737,127 @@ mod judgement {
         expression: &JudgedExpr,
         sink: &TypeExpr,
     ) -> Result<ExpressionAdmission, InferenceError> {
-        if let Err(error) = expression.static_type() {
-            return match error {
-                // The sink can check a dynamic result or each field of a
-                // record even when no homogeneous type can be inferred.
-                InferenceIssue::Failed(_) if !expression.judgement.invalid => {
-                    Ok(ExpressionAdmission::ValueCheck)
+        admit_with_context(expression, sink, AdmissionContext::Assignment)
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum AdmissionContext {
+        Assignment,
+        Function,
+    }
+
+    impl JudgedExpr {
+        pub(crate) fn retains_function_value_check(&self, sink: &TypeExpr) -> bool {
+            self.judgement.kind == InferredKind::Reference
+                && self.static_type() == Ok(&TypeExpr::String)
+                && sink.is_string_shaped()
+        }
+    }
+
+    pub(crate) fn admit_with_context(
+        expression: &JudgedExpr,
+        sink: &TypeExpr,
+        context: AdmissionContext,
+    ) -> Result<ExpressionAdmission, InferenceError> {
+        if expression.judgement.invalid
+            && let Err(InferenceIssue::Failed(error)) = expression.static_type()
+        {
+            return Err(error.clone());
+        }
+        if expression.judgement.kind == InferredKind::Declaration {
+            return Err(InferenceError::UnknownType {
+                reason: "declaration is not a value".into(),
+            });
+        }
+        if !expression.alternatives.is_empty() {
+            let mut admission = ExpressionAdmission::ValueCheck;
+            for branch in expression.alternatives.iter() {
+                admission =
+                    combine_admission(admission, admit_with_context(branch, sink, context)?);
+            }
+            return Ok(admission);
+        }
+        if context == AdmissionContext::Function && expression.retains_function_value_check(sink) {
+            return Ok(ExpressionAdmission::ValueCheck);
+        }
+        // Literal-only unions have the language's ordinary String contract.
+        // Named string identities retain their directional assignment rules.
+        if matches!(sink, TypeExpr::Union(members) if !members.is_empty() && members.iter().all(|member| matches!(member, TypeExpr::StringLiteral(_))))
+            && expression.requires_declared_assignment()
+            && expression.static_type() == Ok(&TypeExpr::String)
+        {
+            return Ok(ExpressionAdmission::ValueCheck);
+        }
+        if let TypeExpr::Union(members) = sink {
+            return members
+                .iter()
+                .find_map(|sink| admit_with_context(expression, sink, context).ok())
+                .ok_or_else(|| assignment_error(expression, sink));
+        }
+        // A declared String has no nominal identity, independently of whether
+        // the provider can currently validate the target's scalar constraints.
+        if expression.requires_declared_assignment()
+            && expression.static_type() == Ok(&TypeExpr::String)
+            && !matches!(sink, TypeExpr::String)
+        {
+            return Err(assignment_error(expression, sink));
+        }
+        if let TypeExpr::UnloadedSchemaType(unloaded) = sink {
+            if expression.collection_kind().is_some()
+                || matches!(
+                    expression.static_type(),
+                    Ok(TypeExpr::Bool
+                        | TypeExpr::Duration
+                        | TypeExpr::List(_)
+                        | TypeExpr::Map(_)
+                        | TypeExpr::Struct { .. }
+                        | TypeExpr::Ref(_))
+                )
+            {
+                return Err(assignment_error(expression, sink));
+            }
+            return Ok(ExpressionAdmission::ProviderPending(
+                ProviderAuthorityUnavailable(UnavailableSchema::Named {
+                    identity: unloaded.identity().clone(),
+                }),
+            ));
+        }
+        match (&expression.judgement.kind, sink) {
+            (InferredKind::List, TypeExpr::List(inner)) => {
+                let mut admission = ExpressionAdmission::ValueCheck;
+                for element in expression
+                    .elements
+                    .iter()
+                    .chain(expression.member.iter().map(Arc::as_ref))
+                {
+                    admission =
+                        combine_admission(admission, admit_with_context(element, inner, context)?);
                 }
-                InferenceIssue::Failed(error) => Err(error.clone()),
-                InferenceIssue::NotInferable(_) => Ok(ExpressionAdmission::Pending),
-            };
+                return Ok(admission);
+            }
+            (InferredKind::Map, TypeExpr::Map(inner)) => {
+                let mut admission = ExpressionAdmission::ValueCheck;
+                for field in expression
+                    .fields
+                    .values()
+                    .chain(expression.member.iter().map(Arc::as_ref))
+                {
+                    admission =
+                        combine_admission(admission, admit_with_context(field, inner, context)?);
+                }
+                return Ok(admission);
+            }
+            (InferredKind::Map, TypeExpr::Struct { fields }) => {
+                let _ = fields;
+                return Ok(ExpressionAdmission::ValueCheck);
+            }
+            (InferredKind::List | InferredKind::Map, _) => {
+                return Err(assignment_error(expression, sink));
+            }
+            _ => {}
         }
         if expression.judgement.kind == InferredKind::StringConstruction && !expression.concrete {
-            return if admit_deferred_interpolation(expression, sink) {
+            return if sink.is_string_shaped() || matches!(sink, TypeExpr::Ref(_)) {
                 Ok(ExpressionAdmission::DeferredInterpolation)
             } else {
                 Err(InferenceError::UnknownType {
@@ -1165,19 +1867,104 @@ mod judgement {
                 })
             };
         }
-        Ok(ExpressionAdmission::ValueCheck)
+        if expression.is_value_dependent() {
+            return Ok(ExpressionAdmission::ValueCheck);
+        }
+        match expression.static_type() {
+            Err(InferenceIssue::NotInferable(NotInferableReason::SchemaUnavailable {
+                binding,
+            })) => Ok(ExpressionAdmission::ProviderPending(
+                ProviderAuthorityUnavailable(UnavailableSchema::Resource {
+                    binding: binding.clone(),
+                }),
+            )),
+            Err(InferenceIssue::NotInferable(
+                NotInferableReason::CustomTypeSchemaUnavailable { identity },
+            )) => Ok(ExpressionAdmission::ProviderPending(
+                ProviderAuthorityUnavailable(UnavailableSchema::Named {
+                    identity: identity.clone(),
+                }),
+            )),
+            Err(InferenceIssue::Failed(error))
+                if expression.judgement.kind != InferredKind::ValueDependent
+                    && !matches!(
+                        expression.judgement.kind,
+                        InferredKind::List | InferredKind::Map
+                    ) =>
+            {
+                Err(error.clone())
+            }
+            Err(InferenceIssue::NotInferable(_)) => {
+                Err(MissingEvidence::new("incomplete authored judgement").into())
+            }
+            Err(_) => Ok(ExpressionAdmission::ValueCheck),
+            Ok(actual) => {
+                let shaped = match actual {
+                    TypeExpr::String => {
+                        sink.is_string_shaped()
+                            || matches!(
+                                sink,
+                                TypeExpr::StringLiteral(_)
+                                    | TypeExpr::Ref(_)
+                                    | TypeExpr::UnloadedSchemaType(_)
+                            )
+                    }
+                    TypeExpr::Int => matches!(
+                        sink,
+                        TypeExpr::Int
+                            | TypeExpr::Float
+                            | TypeExpr::Simple(_)
+                            | TypeExpr::SchemaType { .. }
+                            | TypeExpr::DottedUnresolved(_)
+                            | TypeExpr::UnloadedSchemaType(_)
+                    ),
+                    TypeExpr::Bool => matches!(sink, TypeExpr::Bool),
+                    TypeExpr::Float => matches!(
+                        sink,
+                        TypeExpr::Float
+                            | TypeExpr::Simple(_)
+                            | TypeExpr::SchemaType { .. }
+                            | TypeExpr::DottedUnresolved(_)
+                            | TypeExpr::UnloadedSchemaType(_)
+                    ),
+                    TypeExpr::Duration => matches!(sink, TypeExpr::Duration),
+                    TypeExpr::Ref(_) => {
+                        matches!(sink, TypeExpr::Ref(_) | TypeExpr::DottedUnresolved(_))
+                    }
+                    _ => true,
+                };
+                if !shaped {
+                    return Err(assignment_error(expression, sink));
+                }
+                Ok(ExpressionAdmission::ValueCheck)
+            }
+        }
     }
 
-    /// Deferred interpolation may fill String and named string sinks. Once
-    /// it resolves, the resulting value must satisfy the sink's constraints.
-    fn admit_deferred_interpolation(expression: &JudgedExpr, sink: &TypeExpr) -> bool {
-        expression.static_type().is_ok()
-            && expression.judgement.kind == InferredKind::StringConstruction
-            && !expression.concrete
-            && (matches!(sink, TypeExpr::String)
-                || sink.is_string_shaped()
-                || matches!(sink, TypeExpr::Ref(_))
-                || matches!(sink, TypeExpr::Union(members) if members.iter().any(|member| admit_deferred_interpolation(expression, member))))
+    fn assignment_error(expression: &JudgedExpr, sink: &TypeExpr) -> InferenceError {
+        InferenceError::UnknownType {
+            reason: format!(
+                "expected {sink}, got {}",
+                expression
+                    .static_type()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|_| "collection".into())
+            ),
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct JudgementAuthority {
+        schemas: crate::schema::SchemaRegistry,
+        catalog: super::super::ProviderCustomTypes,
+        resource_types: std::collections::HashSet<(String, String)>,
+    }
+    impl PartialEq for JudgementAuthority {
+        fn eq(&self, other: &Self) -> bool {
+            self.schemas.same_snapshot(&other.schemas)
+                && self.catalog.same_snapshot(&other.catalog)
+                && self.resource_types == other.resource_types
+        }
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -1187,12 +1974,12 @@ mod judgement {
         findings: Arc<Vec<Located<InferenceError>>>,
         function_errors: Arc<Vec<Located<InferenceError>>>,
         operands: Arc<HashMap<ExpressionLocation, [JudgedExpr; 2]>>,
-        unknown: JudgedExpr,
         module_attributes: Arc<HashMap<(B, String), JudgedExpr>>,
         resource_reports: Arc<HashMap<crate::resource::ResourceId, Arc<ExpressionReport<B>>>>,
         parameters: Arc<HashMap<String, JudgedExpr>>,
         instance: ExpressionInstance,
         authored: bool,
+        authority: Option<Arc<JudgementAuthority>>,
     }
 
     impl<B: BindingAddress> ExpressionReport<B> {
@@ -1203,15 +1990,18 @@ mod judgement {
                 findings: Arc::default(),
                 function_errors: Arc::default(),
                 operands: Arc::default(),
-                unknown: pending(),
                 module_attributes: Arc::default(),
                 resource_reports: Arc::default(),
                 parameters: Arc::default(),
                 instance: ExpressionInstance::Root,
                 authored: false,
+                authority: None,
             }
         }
         pub(super) fn extend(&mut self, other: Self) {
+            // A merged lexical scope has new binding dependencies even when
+            // both files used the same provider and schema snapshots.
+            self.authority = None;
             Arc::make_mut(&mut self.bindings).extend(Arc::unwrap_or_clone(other.bindings));
             Arc::make_mut(&mut self.expressions).extend(Arc::unwrap_or_clone(other.expressions));
             Arc::make_mut(&mut self.findings).extend(Arc::unwrap_or_clone(other.findings));
@@ -1222,7 +2012,6 @@ mod judgement {
                 .extend(Arc::unwrap_or_clone(other.module_attributes));
             Arc::make_mut(&mut self.resource_reports)
                 .extend(Arc::unwrap_or_clone(other.resource_reports));
-            Arc::make_mut(&mut self.parameters).extend(Arc::unwrap_or_clone(other.parameters));
         }
         pub(super) fn map_bindings<C: BindingAddress>(
             &self,
@@ -1245,6 +2034,7 @@ mod judgement {
             ExpressionReport {
                 instance: self.instance.clone(),
                 authored: self.authored,
+                authority: self.authority.clone(),
                 bindings: self
                     .bindings
                     .iter()
@@ -1255,7 +2045,6 @@ mod judgement {
                 findings: self.findings.clone(),
                 function_errors: self.function_errors.clone(),
                 operands: self.operands.clone(),
-                unknown: self.unknown.clone(),
                 module_attributes: self
                     .module_attributes
                     .iter()
@@ -1271,23 +2060,51 @@ mod judgement {
                 parameters: self.parameters.clone(),
             }
         }
-        pub(super) fn admit_sink(&mut self, location: &DeclarationLocation, sink: &TypeExpr) {
-            if let Some(expression) = self.expression(location)
-                && expression.static_type().is_ok()
-                && let Err(error) = admit_expression(expression, sink)
-                && !self
-                    .findings
-                    .iter()
-                    .any(|finding| finding.location() == location && finding.detail() == &error)
-            {
-                Arc::make_mut(&mut self.findings).push(Located::new(location.clone(), error));
-            }
+        pub(super) fn matches_authority(
+            &self,
+            schemas: &crate::schema::SchemaRegistry,
+            config: &super::super::ProviderContext,
+        ) -> bool {
+            self.authority.as_ref().is_some_and(|authority| {
+                authority.schemas.same_snapshot(schemas)
+                    && authority.catalog.same_snapshot(&config.custom_types)
+                    && authority.resource_types == config.resource_types
+            })
         }
         pub(crate) fn has_authored_judgement(&self) -> bool {
             self.authored
         }
-        pub fn binding(&self, name: &B) -> Option<&JudgedExpr> {
-            self.bindings.get(name)
+        pub(super) fn admit_sink(&mut self, location: &DeclarationLocation, sink: &TypeExpr) {
+            let expression = match self.expression(location) {
+                Ok(expression) => expression,
+                Err(error) => {
+                    Arc::make_mut(&mut self.findings)
+                        .push(Located::new(location.clone(), error.into()));
+                    return;
+                }
+            };
+            if expression.reported {
+                return;
+            }
+            let requires_nominal_identity = expression.requires_declared_assignment()
+                && expression.static_type() == Ok(&TypeExpr::String)
+                && sink.is_string_shaped()
+                && !matches!(sink, TypeExpr::String);
+            if (expression.contains_deferred_interpolation() || requires_nominal_identity)
+                && let Err(error) = admit_expression(expression, sink)
+            {
+                Arc::make_mut(&mut self.findings).push(Located::new(location.clone(), error));
+                if let Some(expression) = Arc::make_mut(&mut self.expressions)
+                    .get_mut(&ExpressionLocation::new(self.instance.clone(), location))
+                {
+                    expression.data_mut().reported = true;
+                }
+            }
+        }
+        pub fn binding(&self, name: &B) -> Result<&JudgedExpr, MissingEvidence> {
+            self.bindings
+                .get(name)
+                .ok_or_else(|| MissingEvidence::new(format!("binding {name}")))
         }
         #[cfg(test)]
         pub(crate) fn types_at_for_test(&self, location: &DeclarationLocation) -> Vec<TypeExpr> {
@@ -1297,26 +2114,45 @@ mod judgement {
                 .filter_map(|(_, expr)| expr.static_type().ok().cloned())
                 .collect()
         }
-        pub fn expression(&self, location: &DeclarationLocation) -> Option<&JudgedExpr> {
+        pub fn expression(
+            &self,
+            location: &DeclarationLocation,
+        ) -> Result<&JudgedExpr, MissingEvidence> {
             self.expression_in(&self.instance, location)
+        }
+        pub(crate) fn instances_at(
+            &self,
+            location: &DeclarationLocation,
+        ) -> Result<Vec<&JudgedExpr>, MissingEvidence> {
+            let instances: Vec<_> = self
+                .expressions
+                .iter()
+                .filter(|(key, _)| &key.authored == location)
+                .map(|(_, expression)| expression)
+                .collect();
+            if instances.is_empty() {
+                Err(MissingEvidence::new(format!(
+                    "all instances at {location:?}"
+                )))
+            } else {
+                Ok(instances)
+            }
         }
         pub(crate) fn expression_in(
             &self,
             instance: &ExpressionInstance,
             location: &DeclarationLocation,
-        ) -> Option<&JudgedExpr> {
+        ) -> Result<&JudgedExpr, MissingEvidence> {
             self.expressions
                 .get(&ExpressionLocation::new(instance.clone(), location))
+                .ok_or_else(|| MissingEvidence::new(format!("{instance:?} at {location:?}")))
         }
         pub(crate) fn require_expression_in(
             &self,
             instance: &ExpressionInstance,
             location: &DeclarationLocation,
         ) -> Result<&JudgedExpr, InferenceError> {
-            self.expression_in(instance, location)
-                .ok_or_else(|| InferenceError::UnknownType {
-                    reason: "authored expression has no judgement".to_string(),
-                })
+            self.expression_in(instance, location).map_err(Into::into)
         }
         pub(crate) fn require_expression(
             &self,
@@ -1324,18 +2160,23 @@ mod judgement {
         ) -> Result<&JudgedExpr, InferenceError> {
             self.require_expression_in(&self.instance, location)
         }
-        pub fn unknown(&self) -> &JudgedExpr {
-            &self.unknown
-        }
-        pub fn for_resource(&self, id: &crate::resource::ResourceId) -> &Self {
+        pub fn for_resource(
+            &self,
+            id: &crate::resource::ResourceId,
+        ) -> Result<&Self, MissingEvidence> {
             self.resource_reports
                 .get(id)
                 .map(Arc::as_ref)
-                .unwrap_or(self)
+                .ok_or_else(|| MissingEvidence::new(format!("resource {id}")))
         }
-        pub fn module_attribute(&self, binding: &B, name: &str) -> Option<&JudgedExpr> {
+        pub fn module_attribute(
+            &self,
+            binding: &B,
+            name: &str,
+        ) -> Result<&JudgedExpr, MissingEvidence> {
             self.module_attributes
                 .get(&(binding.clone(), name.to_string()))
+                .ok_or_else(|| MissingEvidence::new(format!("module {binding} attribute {name}")))
         }
         pub(crate) fn locations(&self) -> HashMap<DeclarationLocation, JudgedExpr> {
             self.expressions
@@ -1344,48 +2185,98 @@ mod judgement {
                 .map(|(key, value)| (key.authored.clone(), value.clone()))
                 .collect()
         }
-        pub(crate) fn parameter(&self, name: &str) -> Option<&JudgedExpr> {
-            self.parameters.get(name)
+        pub(crate) fn parameter(&self, name: &str) -> Result<&JudgedExpr, MissingEvidence> {
+            self.parameters
+                .get(name)
+                .ok_or_else(|| MissingEvidence::new(format!("parameter {name}")))
         }
         pub(crate) fn record_instance<E, D>(
             &mut self,
             file: &super::super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
             binding: Option<&B>,
-        ) {
+        ) where
+            D: super::super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+        {
+            // Prototype IDs are local to the unexpanded module. Publish only
+            // identities present in this contribution, retaining their scope.
+            let ids: std::collections::HashSet<_> = file
+                .iter_all_resources()
+                .chain(file.deferred_for_phase.analysis_resource_refs())
+                .map(|resource| resource.id().clone())
+                .collect();
+            Arc::make_mut(&mut self.resource_reports).retain(|id, _| ids.contains(id));
             if let Some(binding) = binding {
                 for declaration in file.parser_binding_metadata.syntax().declarations() {
                     if declaration.detail().kind()
-                        == crate::config_loader::DeclarationKind::ModuleAttribute
-                        && let Some(expression) = declaration
-                            .detail()
-                            .value_location()
-                            .and_then(|location| self.expression(location))
-                            .cloned()
+                        != crate::config_loader::DeclarationKind::ModuleAttribute
                     {
-                        Arc::make_mut(&mut self.module_attributes).insert(
-                            (binding.clone(), declaration.detail().name().to_string()),
-                            expression.clone(),
-                        );
+                        continue;
+                    }
+                    let evidence = declaration
+                        .detail()
+                        .value_location()
+                        .ok_or_else(|| MissingEvidence::new("module attribute value location"))
+                        .and_then(|location| self.expression(location))
+                        .cloned();
+                    match evidence {
+                        Ok(expression) => {
+                            Arc::make_mut(&mut self.module_attributes).insert(
+                                (binding.clone(), declaration.detail().name().to_string()),
+                                expression,
+                            );
+                        }
+                        Err(error) => {
+                            Arc::make_mut(&mut self.findings)
+                                .push(Located::new(declaration.location().clone(), error.into()));
+                        }
                     }
                 }
             }
-            let mut snapshot = self.clone();
-            snapshot.resource_reports = Arc::default();
-            let snapshot = Arc::new(snapshot);
-            for id in file
-                .resources
-                .iter()
-                .map(|resource| &resource.id)
-                .chain(file.data_sources.iter().map(|source| &source.id))
+            self.record_resources(file);
+        }
+        pub(super) fn record_resources<E, D>(
+            &mut self,
+            file: &super::super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+        ) where
+            D: super::super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+        {
+            let mut snapshots = HashMap::new();
+            for resource in file
+                .iter_all_resources()
+                .chain(file.deferred_for_phase.analysis_resource_refs())
             {
-                Arc::make_mut(&mut self.resource_reports).insert(id.clone(), snapshot.clone());
+                if self.resource_reports.contains_key(resource.id()) {
+                    continue;
+                }
+                let source = match resource {
+                    super::super::ResourceRef::Resource(resource) => {
+                        resource.module_source.as_ref()
+                    }
+                    super::super::ResourceRef::DataSource(source) => source.module_source.as_ref(),
+                    super::super::ResourceRef::Deferred { resource, .. } => {
+                        resource.as_resource().module_source.as_ref()
+                    }
+                    super::super::ResourceRef::LiveComposition(_) => None,
+                };
+                let instance = source
+                    .and_then(crate::resource::ModuleSource::identity_scope)
+                    .map(|scope| ExpressionInstance::for_scope(&scope))
+                    .unwrap_or_else(|| self.instance.clone());
+                let snapshot = snapshots.entry(instance.clone()).or_insert_with(|| {
+                    let mut snapshot = self.clone();
+                    snapshot.instance = instance;
+                    snapshot.resource_reports = Arc::default();
+                    Arc::new(snapshot)
+                });
+                Arc::make_mut(&mut self.resource_reports)
+                    .insert(resource.id().clone(), snapshot.clone());
             }
         }
         pub fn operand(
             &self,
             location: &DeclarationLocation,
             side: crate::integer_arithmetic::IntegerOperandSide,
-        ) -> &JudgedExpr {
+        ) -> Result<&JudgedExpr, MissingEvidence> {
             let index = match side {
                 crate::integer_arithmetic::IntegerOperandSide::Left => 0,
                 crate::integer_arithmetic::IntegerOperandSide::Right => 1,
@@ -1393,16 +2284,18 @@ mod judgement {
             self.operands
                 .get(&ExpressionLocation::new(self.instance.clone(), location))
                 .map(|operands| &operands[index])
-                .unwrap_or(&self.unknown)
+                .ok_or_else(|| {
+                    MissingEvidence::new(format!("integer operand {side:?} at {location:?}"))
+                })
         }
         pub fn access<P: ValueKind>(
             &self,
             access: &crate::resource::AccessExpr<P, B>,
-        ) -> &JudgedExpr {
-            access
+        ) -> Result<&JudgedExpr, MissingEvidence> {
+            let location = access
                 .access_locations()
-                .and_then(|location| self.expression(location.expression_location()))
-                .unwrap_or(&self.unknown)
+                .ok_or_else(|| MissingEvidence::new("access location"))?;
+            self.expression(location.expression_location())
         }
         pub fn findings(&self) -> &[Located<InferenceError>] {
             &self.findings
@@ -1466,40 +2359,24 @@ mod judgement {
         {
             index(expression, &mut authored, &mut visited);
         }
-        // Direct resource references already have an existence/access
-        // diagnostic owned by the resource check. Retain their failed type
-        // evidence without also issuing an expression-level diagnostic.
-        fn reference_chain<B: BindingAddress>(
-            expression: &ExprValue<ParserPlaceholder, B>,
-            owned: &mut std::collections::HashSet<ExpressionLocation>,
-        ) -> bool {
-            let is_reference = match &expression.authored.kind {
-                ExprKind::Reference { .. } => true,
-                ExprKind::Alias | ExprKind::Access(_) => expression
-                    .authored
-                    .children
-                    .first()
-                    .is_some_and(|base| reference_chain(base, owned)),
-                _ => false,
-            };
-            if is_reference {
-                owned.insert(expression.authored.location.clone());
-            }
-            is_reference
-        }
-        let mut resource_references = std::collections::HashSet::new();
-        for expression in authored.values() {
-            if let ExprKind::Sink(_) = &expression.authored.kind
-                && let Some(value) = expression.authored.children.first()
-            {
-                reference_chain(value, &mut resource_references);
-            }
-        }
+        let functions = authored
+            .values()
+            .filter_map(|expression| {
+                if let ExprKind::Function { name, signature } = &expression.authored.kind {
+                    Some((
+                        (expression.authored.location.instance.clone(), name.clone()),
+                        signature.clone(),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
         let mut judge = Judge {
             authored,
             expressions,
             bindings: &bindings,
-            functions: &file.user_functions,
+            functions,
             schemas,
             config,
             memo: HashMap::new(),
@@ -1509,7 +2386,6 @@ mod judgement {
             function_errors: Vec::new(),
             operands: HashMap::new(),
             module_attributes: Some(&expressions.report.module_attributes),
-            resource_references,
         };
         let mut judged_bindings = HashMap::new();
         for (name, expression) in &expressions.definitions {
@@ -1523,24 +2399,23 @@ mod judgement {
             .module_attributes
             .iter()
             .map(|(key, evidence)| {
-                let refreshed = evidence
-                    .origin
-                    .as_ref()
-                    .and_then(|origin| judge.by_location.get(origin))
-                    .unwrap_or(evidence)
-                    .clone();
+                let refreshed = judge.refresh_argument(evidence);
                 (key.clone(), refreshed)
             })
             .collect();
         let mut report = ExpressionReport {
             instance: expressions.instance.clone(),
             authored: true,
+            authority: Some(Arc::new(JudgementAuthority {
+                schemas: schemas.clone(),
+                catalog: config.custom_types.clone(),
+                resource_types: config.resource_types.clone(),
+            })),
             bindings: Arc::new(judged_bindings),
             expressions: Arc::new(judge.by_location),
             findings: Arc::new(judge.findings),
             function_errors: Arc::new(judge.function_errors),
             operands: Arc::new(judge.operands),
-            unknown: pending(),
             module_attributes: Arc::new(module_attributes),
             resource_reports: Arc::default(),
             parameters: file
@@ -1549,18 +2424,7 @@ mod judgement {
                 .map(|argument| {
                     (
                         argument.name.clone(),
-                        JudgedExpr {
-                            origin: None,
-                            judgement: Arc::new(ExprJudgement {
-                                ty: Ok(argument.static_type.clone()),
-                                kind: InferredKind::Ordinary,
-                                invalid: false,
-                            }),
-                            concrete: false,
-                            coalesce: None,
-                            elements: Arc::default(),
-                            fields: Arc::default(),
-                        },
+                        declared(Ok(argument.static_type.clone()), false),
                     )
                 })
                 .collect::<HashMap<_, _>>()
@@ -1578,6 +2442,7 @@ mod judgement {
                 });
             Arc::make_mut(&mut report.resource_reports).insert(id.clone(), snapshot.clone());
         }
+        report.record_instance(file, None);
         report
     }
 
@@ -1585,7 +2450,7 @@ mod judgement {
         authored: HashMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
         expressions: &'a Expressions<B>,
         bindings: &'a InferenceBindings<ParserPlaceholder, B>,
-        functions: &'a HashMap<String, super::super::UserFunction<B>>,
+        functions: HashMap<(ExpressionInstance, String), Arc<FunctionSignature>>,
         schemas: &'a crate::schema::SchemaRegistry,
         config: &'a super::super::ProviderContext,
         memo: HashMap<usize, JudgedExpr>,
@@ -1595,7 +2460,6 @@ mod judgement {
         function_errors: Vec<Located<InferenceError>>,
         operands: HashMap<ExpressionLocation, [JudgedExpr; 2]>,
         module_attributes: Option<&'a HashMap<(B, String), JudgedExpr>>,
-        resource_references: std::collections::HashSet<ExpressionLocation>,
     }
 
     impl<B: BindingAddress> Judge<'_, B> {
@@ -1606,7 +2470,15 @@ mod judgement {
                 return judged.clone();
             }
             if self.visiting.contains(&id) {
-                return pending();
+                let mut failure = declared(
+                    Err(InferenceError::CyclicVirtualBinding {
+                        cycle: vec!["cyclic authored binding".into()],
+                    }
+                    .into()),
+                    false,
+                );
+                failure.failure_owned_by(FailureOwner::BindingIndex);
+                return failure;
             }
             self.visiting.push(id);
             // Always visit every child, even for length(), selected access,
@@ -1617,29 +2489,30 @@ mod judgement {
                 .map(|child| self.judge(child))
                 .collect::<Vec<_>>();
             let mut result = self.infer(expression, &children);
-            result.origin = Some(root.location.clone());
-            if let Projection::Value(value) = &expression.payload {
-                result.concrete = value.is_fully_resolved();
+            result.data_mut().origin = Some(root.location.clone());
+            if matches!(root.kind, ExprKind::Reference { .. }) {
+                result.data_mut().direct_reference =
+                    result.judgement.kind != InferredKind::EnumIdentifier;
+                if result.judgement.kind == InferredKind::Ordinary {
+                    Arc::make_mut(&mut result.data_mut().judgement).kind = InferredKind::Reference;
+                }
+                // The binding pass owns reference existence and field errors.
+                // A containing operation preserves that ownership.
+                result.failure_owned_by(FailureOwner::BindingIndex);
             }
             if let Some(failed) = children.iter().find(|child| child.judgement.invalid) {
-                Arc::make_mut(&mut result.judgement).ty = failed.judgement.ty.clone();
-                Arc::make_mut(&mut result.judgement).invalid = true;
-            } else if let Err(InferenceIssue::Failed(error)) = result.static_type() {
-                Arc::make_mut(&mut result.judgement).invalid = match error {
-                    InferenceError::UnknownType { .. } => false,
-                    InferenceError::HeterogeneousCollection { .. } => {
-                        matches!(root.kind, ExprKind::Coalesce)
-                    }
-                    _ => true,
-                };
+                Arc::make_mut(&mut result.data_mut().judgement).ty = failed.judgement.ty.clone();
+                Arc::make_mut(&mut result.data_mut().judgement).invalid = true;
+                result.data_mut().reported = failed.reported;
+                if failed.judgement.failure_owner == FailureOwner::BindingScope {
+                    result.failure_owned_by(FailureOwner::BindingScope);
+                }
+                result.data_mut().boundary_owner = failed.boundary_owner.clone();
             }
             if result.judgement.invalid
+                && !result.reported
+                && result.judgement.failure_owner == FailureOwner::Expression
                 && let Err(InferenceIssue::Failed(error)) = result.static_type()
-                && !self.resource_references.contains(&root.location)
-                && !children.iter().any(|child| {
-                    child.judgement.invalid
-                        && child.static_type() == Err(&InferenceIssue::Failed(error.clone()))
-                })
             {
                 let location = match error {
                     InferenceError::InvalidIntegerArithmeticOperand { operator_span, .. } => {
@@ -1650,6 +2523,7 @@ mod judgement {
                 }
                 .clone();
                 self.push_finding(location, error.clone());
+                result.data_mut().reported = true;
             }
             self.visiting.pop();
             self.memo.insert(id, result.clone());
@@ -1659,49 +2533,73 @@ mod judgement {
         }
 
         fn refresh_argument(&mut self, evidence: &JudgedExpr) -> JudgedExpr {
-            let Some(authored) = evidence
-                .origin
-                .as_ref()
-                .and_then(|origin| self.authored.get(origin))
-                .copied()
-            else {
+            let Some(origin) = evidence.origin.as_ref() else {
                 return evidence.clone();
             };
-            let mut result = self.judge(authored);
-            result.concrete = evidence.concrete;
-            result
+            match self.authored.get(origin).copied() {
+                Some(authored) => self.judge(authored),
+                None => incomplete("authored argument origin"),
+            }
         }
         fn check_function_sink(
             &mut self,
             expression: &JudgedExpr,
             sink: &TypeExpr,
             location: &DeclarationLocation,
+            owner: &DeclarationLocation,
             context: &str,
-        ) {
-            if expression.static_type().is_ok()
-                && let Err(error) = crate::validation::typecheck::admit_function_expression(
-                    expression,
-                    sink,
-                    self.config,
-                )
-            {
-                let finding = Located::new(
-                    location.clone(),
-                    InferenceError::UnknownType {
-                        reason: format!("{context}: {error}"),
-                    },
-                );
-                // Bootstrap parsing rejects the interpolation policy breach.
-                // Declared-type mismatches belong to configuration validation,
-                // after declarations and sibling files have been resolved.
-                if expression.judgement.kind == InferredKind::StringConstruction
-                    && !expression.concrete
-                    && !self.function_errors.contains(&finding)
-                {
-                    self.function_errors.push(finding.clone());
+        ) -> Option<JudgedExpr> {
+            let error = crate::validation::typecheck::admit_function_expression(
+                expression,
+                sink,
+                self.config,
+            )
+            .err()?;
+            let error = match error {
+                crate::validation::typecheck::FunctionExpressionError::Annotation(error) => {
+                    let mut failed = declared(
+                        Err(InferenceError::UnknownType {
+                            reason: error.to_string(),
+                        }
+                        .into()),
+                        expression.concrete,
+                    );
+                    // Declaration resolution owns this error. It still makes
+                    // the function/call judgement invalid.
+                    failed.data_mut().reported = true;
+                    return Some(failed);
                 }
-                self.push_finding(finding.location().clone(), finding.detail().clone());
+                crate::validation::typecheck::FunctionExpressionError::Expression(error) => error,
+            };
+            if expression.judgement.invalid {
+                return Some(expression.clone());
             }
+            let finding = Located::new(
+                location.clone(),
+                InferenceError::UnknownType {
+                    reason: format!("{context}: {error}"),
+                },
+            );
+            if expression.judgement.kind == InferredKind::StringConstruction
+                && !expression.concrete
+                && !self.function_errors.contains(&finding)
+            {
+                self.function_errors.push(finding.clone());
+            }
+            self.push_finding(finding.location().clone(), finding.detail().clone());
+            let Some(origin) = expression.origin.as_ref() else {
+                return Some(incomplete("function boundary origin"));
+            };
+            let Some(owned) = self.by_location.get_mut(origin) else {
+                return Some(incomplete("function boundary evidence"));
+            };
+            owned.data_mut().reported = true;
+            let owner = Arc::new(owner.clone());
+            owned.data_mut().boundary_owner = Some(owner.clone());
+            let mut failed = declared(Err(finding.detail().clone().into()), expression.concrete);
+            failed.data_mut().reported = true;
+            failed.data_mut().boundary_owner = Some(owner);
+            Some(failed)
         }
 
         fn push_finding(&mut self, location: DeclarationLocation, error: InferenceError) {
@@ -1714,44 +2612,96 @@ mod judgement {
             }
         }
 
+        fn narrow_declared(
+            &self,
+            ty: &TypeExpr,
+            steps: &[PathSegment],
+            binding: &str,
+        ) -> Result<TypeExpr, InferenceIssue> {
+            let mut current = ty.clone();
+            for step in steps {
+                if let TypeExpr::Ref(path) | TypeExpr::DottedUnresolved(path) = &current
+                    && self
+                        .schemas
+                        .get(
+                            &path.provider,
+                            &path.resource_type,
+                            crate::schema::SchemaKind::Resource,
+                        )
+                        .or_else(|| {
+                            self.schemas.get(
+                                &path.provider,
+                                &path.resource_type,
+                                crate::schema::SchemaKind::DataSource,
+                            )
+                        })
+                        .is_none()
+                {
+                    return Err(InferenceIssue::NotInferable(
+                        NotInferableReason::SchemaUnavailable {
+                            binding: binding.to_string(),
+                        },
+                    ));
+                }
+                current = crate::validation::narrow_type_expr(
+                    &current,
+                    std::slice::from_ref(step),
+                    Some(self.schemas),
+                )
+                .ok_or_else(|| InferenceError::InvalidAccess {
+                    base_type: current.to_string(),
+                    step: step.clone(),
+                })?;
+            }
+            Ok(current)
+        }
+
         fn infer(
             &mut self,
             expression: &ExprValue<ParserPlaceholder, B>,
             children: &[JudgedExpr],
         ) -> JudgedExpr {
             let root = &expression.authored;
-            let ordinary = |ty, concrete| JudgedExpr {
-                origin: None,
-                concrete,
-                coalesce: None,
-                elements: Arc::default(),
-                fields: Arc::default(),
-                judgement: Arc::new(ExprJudgement {
-                    ty,
-                    kind: InferredKind::Ordinary,
-                    invalid: false,
-                }),
-            };
+            let ordinary = declared;
             let child_type = |index: usize| {
                 children.get(index).map_or_else(
-                    || pending().judgement.ty.clone(),
+                    || incomplete("operand").judgement.ty.clone(),
                     |child| child.judgement.ty.clone(),
                 )
             };
             match &root.kind {
-                ExprKind::Scalar(ty) => ordinary(Ok(ty.clone()), true),
-                ExprKind::Parameter(ty) => ordinary(Ok(ty.clone()), false),
+                ExprKind::Scalar(ty) => {
+                    let mut value = ordinary(Ok(ty.clone()), true);
+                    Arc::make_mut(&mut value.data_mut().judgement).kind = InferredKind::Literal;
+                    value
+                }
+                ExprKind::Parameter(ty) => ordinary(Ok(ty.clone()), false).owned_by_bindings(),
+                ExprKind::UntypedParameter => value_dependent("unannotated function parameter"),
                 ExprKind::Binding(name) => {
                     if let Some(argument) = self.expressions.arguments.get(name) {
-                        self.refresh_argument(argument)
-                    } else if let Some(definition) = self.expressions.definitions.get(name) {
-                        self.judge(definition)
-                    } else if let Some(InferenceBinding::Argument { type_expr }) =
+                        return ordinary(
+                            Ok(argument.declared_type.clone()),
+                            argument.value.concrete,
+                        )
+                        .owned_by_bindings();
+                    }
+                    if let Some(InferenceBinding::Argument { type_expr }) =
                         self.bindings.get(name.as_str())
                     {
-                        ordinary(Ok(type_expr.clone()), false)
+                        ordinary(
+                            Ok(type_expr.clone()),
+                            self.expressions
+                                .arguments
+                                .get(name)
+                                .is_some_and(|argument| argument.value.concrete),
+                        )
+                        .owned_by_bindings()
+                    } else if let Some(definition) = self.expressions.definitions.get(name) {
+                        self.judge(definition)
                     } else {
-                        pending()
+                        let mut value = ordinary(Ok(TypeExpr::String), true);
+                        Arc::make_mut(&mut value.data_mut().judgement).kind = InferredKind::Literal;
+                        value
                     }
                 }
                 ExprKind::Reference {
@@ -1764,26 +2714,21 @@ mod judgement {
                     })
                     .chain(segments.iter().cloned())
                     .collect::<Vec<_>>();
-                    if let Some(argument) = self.expressions.arguments.get(binding) {
-                        let argument = self.refresh_argument(argument);
+                    if let Some(InferenceBinding::Argument { type_expr }) =
+                        self.bindings.get(binding.as_str())
+                    {
                         return ordinary(
-                            argument
-                                .static_type()
-                                .cloned()
-                                .map_err(Clone::clone)
-                                .and_then(|ty| {
-                                    crate::validation::narrow_type_expr(
-                                        &ty,
-                                        &steps,
-                                        Some(self.schemas),
-                                    )
-                                    .ok_or(
-                                        InferenceIssue::NotInferable(
-                                            NotInferableReason::MissingValue,
-                                        ),
-                                    )
-                                }),
-                            argument.concrete,
+                            self.narrow_declared(type_expr, &steps, binding.as_str()),
+                            self.expressions
+                                .arguments
+                                .get(binding)
+                                .is_some_and(|argument| argument.value.concrete),
+                        );
+                    }
+                    if let Some(argument) = self.expressions.arguments.get(binding) {
+                        return ordinary(
+                            self.narrow_declared(&argument.declared_type, &steps, binding.as_str()),
+                            argument.value.concrete,
                         );
                     }
                     if let Some(attribute) = self.module_attributes.and_then(|attributes| {
@@ -1814,6 +2759,20 @@ mod judgement {
                             attribute.concrete,
                         );
                     }
+                    if matches!(
+                        self.bindings.get(binding.as_str()),
+                        Some(InferenceBinding::UpstreamState | InferenceBinding::ModuleCall)
+                    ) {
+                        let mut result = value_dependent(
+                            "external value is checked at its declared or resolved boundary",
+                        );
+                        Arc::make_mut(&mut result.data_mut().judgement).ty = Err(
+                            InferenceIssue::NotInferable(NotInferableReason::NonInferableBinding {
+                                binding: binding.to_string(),
+                            }),
+                        );
+                        return result;
+                    }
                     if let Some(InferenceBinding::Virtual { attributes }) =
                         self.bindings.get(binding.as_str())
                         && !attributes.contains_key(attribute)
@@ -1827,21 +2786,7 @@ mod judgement {
                             false,
                         );
                     }
-                    if let Some(InferenceBinding::Argument { type_expr }) =
-                        self.bindings.get(binding.as_str())
-                    {
-                        ordinary(
-                            crate::validation::narrow_type_expr(
-                                type_expr,
-                                &steps,
-                                Some(self.schemas),
-                            )
-                            .ok_or(InferenceIssue::NotInferable(
-                                NotInferableReason::MissingValue,
-                            )),
-                            false,
-                        )
-                    } else if self.bindings.contains_key(binding.as_str()) {
+                    if self.bindings.contains_key(binding.as_str()) {
                         ordinary(
                             inference::infer_declared_reference_type(
                                 binding.as_str(),
@@ -1855,90 +2800,171 @@ mod judgement {
                     } else if let Some(definition) = self.expressions.definitions.get(binding) {
                         let base = self.judge(definition);
                         ordinary(
-                            base.judgement.ty.clone().and_then(|ty| {
-                                let mut current = ty;
-                                for step in &steps {
-                                    current = crate::validation::narrow_type_expr(
-                                        &current,
-                                        std::slice::from_ref(step),
-                                        Some(self.schemas),
-                                    )
-                                    .ok_or_else(|| {
-                                        InferenceIssue::Failed(InferenceError::InvalidAccess {
-                                            base_type: current.to_string(),
-                                            step: step.clone(),
-                                        })
-                                    })?;
-                                }
-                                Ok(current)
-                            }),
+                            base.judgement
+                                .ty
+                                .clone()
+                                .and_then(|ty| self.narrow_declared(&ty, &steps, binding.as_str())),
                             base.concrete,
                         )
                     } else {
-                        ordinary(Ok(TypeExpr::String), true)
+                        let mut literal = ordinary(Ok(TypeExpr::String), true);
+                        Arc::make_mut(&mut literal.data_mut().judgement).kind =
+                            InferredKind::EnumIdentifier;
+                        literal
                     }
                 }
-                ExprKind::Interpolation => JudgedExpr {
+                ExprKind::EmptyInterpolation => ordinary(Ok(TypeExpr::String), false),
+                ExprKind::Interpolation => JudgedExpr(Arc::new(JudgedExprData {
                     origin: None,
                     concrete: children.iter().all(|child| child.concrete),
+                    reported: false,
+                    direct_reference: false,
+                    boundary_owner: None,
                     coalesce: None,
+                    alternatives: Arc::default(),
+                    member: None,
                     elements: Arc::default(),
                     fields: Arc::default(),
                     judgement: Arc::new(ExprJudgement {
                         ty: Ok(TypeExpr::String),
                         kind: InferredKind::StringConstruction,
                         invalid: false,
+                        failure_owner: FailureOwner::Expression,
                     }),
-                },
+                })),
                 ExprKind::Coalesce => {
                     let left = child_type(0);
                     let right = child_type(1);
-                    let empty = if root.children[1].authored.children.is_empty() {
-                        match root.children[1].authored.kind {
-                            ExprKind::List => EmptyCoalesceDefault::List,
-                            ExprKind::Map(_) => EmptyCoalesceDefault::Map,
-                            _ => EmptyCoalesceDefault::None,
+                    let right_expression = &children[1];
+                    let empty = match right_expression.collection_kind() {
+                        Some(CollectionKind::List)
+                            if right_expression.elements.is_empty()
+                                && right_expression.member.is_none() =>
+                        {
+                            EmptyCoalesceDefault::List
+                        }
+                        Some(CollectionKind::Map)
+                            if right_expression.fields.is_empty()
+                                && right_expression.member.is_none() =>
+                        {
+                            EmptyCoalesceDefault::Map
+                        }
+                        _ => EmptyCoalesceDefault::None,
+                    };
+                    let incompatible = match (&left, &right) {
+                        (Ok(left), Ok(right)) => left != right,
+                        _ => match (children[0].value_shape(), children[1].value_shape()) {
+                            (Some(left), Some(right)) => left != right,
+                            _ => false,
+                        },
+                    };
+                    let ty = if incompatible {
+                        match (&left, &right) {
+                            (Ok(left), Ok(right)) => {
+                                Err(InferenceError::IncompatibleCoalesceTypes {
+                                    types: crate::schema::MismatchTypeNames::for_type_exprs(
+                                        left, right,
+                                    ),
+                                }
+                                .into())
+                            }
+                            _ => Err(InferenceError::UnknownType {
+                                reason: format!(
+                                    "coalesce default type `{}` does not match left type `{}`",
+                                    children[1].type_description(),
+                                    children[0].type_description()
+                                ),
+                            }
+                            .into()),
                         }
                     } else {
-                        EmptyCoalesceDefault::None
+                        coalesce_type(left, right, empty)
                     };
-                    let ty = coalesce_type(left, right, empty);
-                    let mut result = children.first().cloned().unwrap_or_else(pending);
-                    Arc::make_mut(&mut result.judgement).ty = ty;
-                    result.coalesce = Some(Arc::new([children[0].clone(), children[1].clone()]));
+                    let mut result = alternatives(ty, children);
+                    Arc::make_mut(&mut result.data_mut().judgement).invalid |= incompatible;
+                    result.data_mut().coalesce =
+                        Some(Arc::new([children[0].clone(), children[1].clone()]));
                     result
                 }
                 ExprKind::List | ExprKind::Map(_) => {
-                    let ty = match children.first() {
-                        Some(first) => first.judgement.ty.clone().and_then(|first| {
-                            for child in &children[1..] {
-                                let next = child.static_type().map_err(Clone::clone)?;
-                                if *next != first {
-                                    return Err(InferenceError::HeterogeneousCollection {
-                                        reason: format!("collection element types disagree: `{first}` vs `{next}`"),
+                    let mut shapes = children
+                        .iter()
+                        .filter_map(|child| child.value_shape().map(|shape| (child, shape)));
+                    let incompatible = if matches!(root.kind, ExprKind::List)
+                        && let Some((first, shape)) = shapes.next()
+                    {
+                        shapes.find_map(|(next, next_shape)| {
+                            (shape != next_shape).then(|| {
+                                match (first.static_type(), next.static_type()) {
+                                    (Ok(first), Ok(next)) => {
+                                        InferenceError::HeterogeneousCollection {
+                                            types: crate::schema::MismatchTypeNames::for_type_exprs(
+                                                first, next,
+                                            ),
+                                        }
                                     }
-                                    .into());
+                                    _ => InferenceError::UnknownType {
+                                        reason: format!(
+                                            "collection element types disagree: `{}` vs `{}`",
+                                            first.type_description(),
+                                            next.type_description()
+                                        ),
+                                    },
                                 }
-                            }
-                            Ok(if matches!(root.kind, ExprKind::List) {
-                                TypeExpr::List(Box::new(first))
-                            } else {
-                                TypeExpr::Map(Box::new(first))
                             })
-                        }),
-                        None => Err(InferenceIssue::NotInferable(NotInferableReason::MissingValue)),
+                        })
+                    } else {
+                        None
                     };
+                    let ty = if let Some(error) = &incompatible {
+                        Err(error.clone().into())
+                    } else {
+                        match children.first() {
+                            Some(first) => first.judgement.ty.clone().and_then(|first| {
+                                for child in &children[1..] {
+                                    let next = child.static_type().map_err(Clone::clone)?;
+                                    if *next != first {
+                                        return Err(InferenceError::HeterogeneousCollection {
+                                            types: crate::schema::MismatchTypeNames::for_type_exprs(
+                                                &first, next,
+                                            ),
+                                        }
+                                        .into());
+                                    }
+                                }
+                                Ok(if matches!(root.kind, ExprKind::List) {
+                                    TypeExpr::List(Box::new(first))
+                                } else {
+                                    TypeExpr::Map(Box::new(first))
+                                })
+                            }),
+                            None => Err(InferenceIssue::NotInferable(
+                                NotInferableReason::MissingValue,
+                            )),
+                        }
+                    };
+                    let invalid = incompatible.is_some()
+                        || (matches!(&root.kind, ExprKind::List)
+                            && matches!(
+                                &ty,
+                                Err(InferenceIssue::Failed(
+                                    InferenceError::HeterogeneousCollection { .. }
+                                ))
+                            ));
                     let mut result = ordinary(ty, children.iter().all(|child| child.concrete));
-                    Arc::make_mut(&mut result.judgement).kind =
+                    result.failure_owned_by(FailureOwner::Boundary);
+                    result.data_mut().member = None;
+                    Arc::make_mut(&mut result.data_mut().judgement).invalid = invalid;
+                    Arc::make_mut(&mut result.data_mut().judgement).kind =
                         if matches!(root.kind, ExprKind::List) {
                             InferredKind::List
                         } else {
                             InferredKind::Map
                         };
                     match &root.kind {
-                        ExprKind::List => result.elements = Arc::new(children.to_vec()),
+                        ExprKind::List => result.data_mut().elements = Arc::new(children.to_vec()),
                         ExprKind::Map(keys) => {
-                            result.fields = Arc::new(
+                            result.data_mut().fields = Arc::new(
                                 keys.iter().cloned().zip(children.iter().cloned()).collect(),
                             )
                         }
@@ -1946,54 +2972,86 @@ mod judgement {
                     }
                     result
                 }
-                ExprKind::Call(name) if name == "secret" => {
-                    children.first().cloned().unwrap_or_else(pending)
-                }
-                ExprKind::Function { name, return_type } => {
-                    let body = children.last().cloned().unwrap_or_else(pending);
-                    if let Some(sink) = return_type {
-                        self.check_function_sink(
+                ExprKind::Function { name, signature } => {
+                    let body = children
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| incomplete("authored child"));
+                    if let Some(sink) = &signature.return_type
+                        && let Some(failure) = self.check_function_sink(
                             &body,
                             sink,
                             root.children.last().unwrap().location(),
+                            root.children.last().unwrap().location(),
                             &format!("function '{name}': return value"),
-                        );
+                        )
+                    {
+                        return failure;
                     }
-                    pending()
+                    declaration()
                 }
-                ExprKind::Sequence => children.last().cloned().unwrap_or_else(pending),
+                ExprKind::Sequence => children
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| incomplete("authored child")),
                 ExprKind::Call(name) => {
-                    if let Some(function) = self.functions.get(name) {
-                        for ((parameter, child), authored) in
-                            function.params.iter().zip(children).zip(&root.children)
+                    let mut argument_failure = None;
+                    let signature = self
+                        .functions
+                        .get(&(root.location.instance.clone(), name.clone()))
+                        .cloned();
+                    if let Some(signature) = &signature {
+                        for (((parameter, parameter_type), child), authored) in signature
+                            .parameters
+                            .iter()
+                            .zip(children)
+                            .zip(&root.children)
                         {
-                            if let Some(sink) = &parameter.param_type {
-                                self.check_function_sink(
+                            if let Some(sink) = parameter_type
+                                && let Some(failure) = self.check_function_sink(
                                     child,
                                     sink,
                                     authored.location(),
-                                    &format!("function '{name}': parameter '{}'", parameter.name),
-                                );
+                                    &root.location.authored,
+                                    &format!("function '{name}': parameter '{parameter}'"),
+                                )
+                            {
+                                argument_failure.get_or_insert(failure);
                             }
                         }
                     }
-                    if let Some(InferenceBinding::UserFunction {
-                        return_type: Some(ty),
-                    }) = self.bindings.get(name)
+                    if let Some(failure) = argument_failure {
+                        return failure;
+                    }
+                    if let Some(ty) = signature
+                        .as_ref()
+                        .and_then(|signature| signature.return_type.as_ref())
                     {
                         return ordinary(Ok(ty.clone()), false);
                     }
                     let builtin = crate::builtins::builtin_functions()
                         .iter()
                         .find(|builtin| builtin.name == name);
-                    let ty = match builtin.map(|builtin| builtin.return_type) {
-                        Some(crate::builtins::BuiltinReturnType::String) => Ok(TypeExpr::String),
+                    if let Some(crate::builtins::BuiltinReturnType::Argument(index)) =
+                        builtin.map(|builtin| builtin.return_type)
+                    {
+                        return children
+                            .get(index)
+                            .cloned()
+                            .unwrap_or_else(|| incomplete("builtin argument"));
+                    }
+                    let return_type = builtin.map(|builtin| builtin.return_type);
+                    let ty = match return_type {
+                        Some(
+                            crate::builtins::BuiltinReturnType::String
+                            | crate::builtins::BuiltinReturnType::Secret,
+                        ) => Ok(TypeExpr::String),
                         Some(crate::builtins::BuiltinReturnType::Int) => Ok(TypeExpr::Int),
                         Some(crate::builtins::BuiltinReturnType::StringList) => {
                             Ok(TypeExpr::List(Box::new(TypeExpr::String)))
                         }
                         Some(
-                            crate::builtins::BuiltinReturnType::Secret
+                            crate::builtins::BuiltinReturnType::Argument(_)
                             | crate::builtins::BuiltinReturnType::List
                             | crate::builtins::BuiltinReturnType::Map
                             | crate::builtins::BuiltinReturnType::Any,
@@ -2001,34 +3059,102 @@ mod judgement {
                             reason: format!("built-in `{name}` return type depends on arguments"),
                         }
                         .into()),
-                        None => pending().judgement.ty.clone(),
+                        None if signature.is_some() => {
+                            value_dependent("unannotated function result")
+                                .judgement
+                                .ty
+                                .clone()
+                        }
+                        None => return incomplete("function declaration or builtin signature"),
                     };
-                    ordinary(ty, children.iter().all(|child| child.concrete))
+                    let mut result = ordinary(ty, children.iter().all(|child| child.concrete));
+                    match return_type {
+                        Some(
+                            crate::builtins::BuiltinReturnType::List
+                            | crate::builtins::BuiltinReturnType::Map,
+                        ) => {
+                            Arc::make_mut(&mut result.data_mut().judgement).kind = if matches!(
+                                return_type,
+                                Some(crate::builtins::BuiltinReturnType::List)
+                            ) {
+                                InferredKind::List
+                            } else {
+                                InferredKind::Map
+                            };
+                            Arc::make_mut(&mut result.data_mut().judgement).invalid = false;
+                            result.data_mut().member = Some(Arc::new(value_dependent(
+                                "builtin elements require resolved constraint checks",
+                            )));
+                        }
+                        Some(crate::builtins::BuiltinReturnType::Any) | None => {
+                            Arc::make_mut(&mut result.data_mut().judgement).kind =
+                                InferredKind::ValueDependent;
+                            Arc::make_mut(&mut result.data_mut().judgement).invalid = false;
+                        }
+                        _ => {}
+                    }
+                    result
                 }
-                ExprKind::Access(step) => ordinary(
-                    child_type(0).and_then(|base| {
-                        crate::validation::narrow_type_expr(
-                            &base,
-                            std::slice::from_ref(step),
-                            Some(self.schemas),
-                        )
-                        .ok_or_else(|| {
-                            InferenceError::InvalidAccess {
-                                base_type: base.to_string(),
-                                step: step.clone(),
-                            }
-                            .into()
-                        })
-                    }),
-                    children.first().is_some_and(|child| child.concrete),
-                ),
+                ExprKind::Access(step) => {
+                    let base = &children[0];
+                    if base.judgement.kind == InferredKind::EnumIdentifier {
+                        return base.clone();
+                    }
+                    if base.is_value_dependent() {
+                        return base.clone();
+                    }
+                    let selected = match step {
+                        PathSegment::Subscript {
+                            index: crate::resource::Subscript::Int { index },
+                        } => usize::try_from(*index).ok().and_then(|index| {
+                            base.elements.get(index).or_else(|| {
+                                base.member
+                                    .as_deref()
+                                    .filter(|_| base.value_shape() == Some(ValueShape::List))
+                            })
+                        }),
+                        PathSegment::Subscript {
+                            index: crate::resource::Subscript::Str { key },
+                        } => base.fields.get(key.expose_plaintext()).or_else(|| {
+                            base.member
+                                .as_deref()
+                                .filter(|_| base.value_shape() == Some(ValueShape::Map))
+                        }),
+                        PathSegment::Field { name } => base.fields.get(name).or_else(|| {
+                            base.member
+                                .as_deref()
+                                .filter(|_| base.value_shape() == Some(ValueShape::Map))
+                        }),
+                    };
+                    if let Some(selected) = selected {
+                        return selected.clone();
+                    }
+                    let ty = child_type(0).and_then(|base| {
+                        self.narrow_declared(&base, std::slice::from_ref(step), "access base")
+                    });
+                    let invalid = ty.is_err();
+                    let mut result = ordinary(ty, base.concrete);
+                    Arc::make_mut(&mut result.data_mut().judgement).invalid = invalid;
+                    result.failure_owned_by(match base.judgement.failure_owner {
+                        FailureOwner::BindingIndex => FailureOwner::BindingIndex,
+                        _ => FailureOwner::Boundary,
+                    });
+                    if matches!(
+                        base.static_type(),
+                        Ok(TypeExpr::Ref(_) | TypeExpr::DottedUnresolved(_))
+                    ) {
+                        Arc::make_mut(&mut result.data_mut().judgement).kind =
+                            InferredKind::Reference;
+                    }
+                    result
+                }
                 ExprKind::Integer { op, location } => {
                     let operands = [children[0].clone(), children[1].clone()];
                     self.operands.insert(
                         ExpressionLocation::new(root.location.instance.clone(), location),
                         operands.clone(),
                     );
-                    ordinary(
+                    let mut result = ordinary(
                         inference::judge_integer_operands(
                             *op,
                             location,
@@ -2037,17 +3163,92 @@ mod judgement {
                             self.config,
                         ),
                         children.iter().all(|child| child.concrete),
-                    )
+                    );
+                    Arc::make_mut(&mut result.data_mut().judgement).invalid =
+                        result.static_type().is_err();
+                    result
                 }
-                ExprKind::Alias => children.first().cloned().unwrap_or_else(pending),
-                ExprKind::Element => ordinary(
-                    child_type(0).and_then(|ty| match ty {
-                        TypeExpr::List(inner) | TypeExpr::Map(inner) => Ok(*inner),
-                        _ => pending().judgement.ty.clone(),
-                    }),
-                    false,
-                ),
-                ExprKind::Sink(_) => children.first().cloned().unwrap_or_else(pending),
+                ExprKind::Iterable => {
+                    fn root_binding<B: BindingAddress>(
+                        expression: &ExprValue<ParserPlaceholder, B>,
+                    ) -> Option<&B> {
+                        match &expression.authored.kind {
+                            ExprKind::Binding(binding) | ExprKind::Reference { binding, .. } => {
+                                Some(binding)
+                            }
+                            ExprKind::Alias | ExprKind::Access(_) | ExprKind::DynamicAccess => {
+                                expression.authored.children.first().and_then(root_binding)
+                            }
+                            _ => None,
+                        }
+                    }
+                    if let Some(binding) = root.children.first().and_then(root_binding)
+                        && !self.bindings.contains_key(binding.as_str())
+                        && !self.expressions.definitions.contains_key(binding)
+                        && !self.expressions.arguments.contains_key(binding)
+                    {
+                        let mut failure = ordinary(
+                            Err(InferenceError::UnknownBinding {
+                                binding: binding.to_string(),
+                            }
+                            .into()),
+                            false,
+                        );
+                        failure.failure_owned_by(FailureOwner::BindingScope);
+                        return failure;
+                    }
+                    children
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| incomplete("iterable operand"))
+                }
+                ExprKind::Alias | ExprKind::Wait => children
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| incomplete("authored child")),
+                ExprKind::Element => {
+                    let collection = &children[0];
+                    if collection.is_value_dependent() {
+                        return collection.clone();
+                    }
+                    if let Some(member) = &collection.member {
+                        return (**member).clone();
+                    }
+                    let members = collection
+                        .elements
+                        .iter()
+                        .chain(collection.fields.values())
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !members.is_empty() {
+                        let mut element = members[0].clone();
+                        element.data_mut().alternatives = Arc::new(members);
+                        return element;
+                    }
+                    match child_type(0) {
+                        Ok(TypeExpr::List(inner) | TypeExpr::Map(inner)) => {
+                            ordinary(Ok(*inner), false)
+                        }
+                        Ok(actual) => {
+                            let mut failure = ordinary(
+                                Err(InferenceError::UnknownType {
+                                    reason: format!(
+                                        "for iterable must be a list or map, got {actual}"
+                                    ),
+                                }
+                                .into()),
+                                false,
+                            );
+                            failure.failure_owned_by(FailureOwner::BindingScope);
+                            failure
+                        }
+                        Err(error) => ordinary(Err(error), false),
+                    }
+                }
+                ExprKind::Sink(_) => children
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| incomplete("authored child")),
                 ExprKind::Resource {
                     provider,
                     resource_type,
@@ -2061,9 +3262,127 @@ mod judgement {
                     if let Some(schema) = self.schemas.get(provider, resource_type, kind) {
                         self.admit_resource_children(&root.children, schema);
                     }
-                    pending()
+                    let mut result = ordinary(
+                        Ok(TypeExpr::Ref(super::super::ResourceTypePath::new(
+                            provider,
+                            resource_type,
+                        ))),
+                        false,
+                    );
+                    result.failure_owned_by(FailureOwner::Boundary);
+                    result
                 }
-                ExprKind::Pending => pending(),
+                ExprKind::If => {
+                    let branches = &children[1..];
+                    let mut ty = branches
+                        .first()
+                        .map(|branch| branch.judgement.ty.clone())
+                        .unwrap_or_else(|| incomplete("if branch").judgement.ty.clone());
+                    for branch in branches.iter().skip(1) {
+                        match (&ty, branch.static_type()) {
+                            (Ok(left), Ok(right)) if left != right => {
+                                let mut members = match left {
+                                    TypeExpr::Union(members) => members.clone(),
+                                    left => vec![left.clone()],
+                                };
+                                if !members.contains(right) {
+                                    members.push(right.clone());
+                                }
+                                ty = Ok(TypeExpr::Union(members));
+                            }
+                            (Err(_), Ok(_))
+                                if branches[0].elements.is_empty()
+                                    && branches[0].judgement.kind == InferredKind::List =>
+                            {
+                                ty = branch.judgement.ty.clone()
+                            }
+                            _ => {}
+                        }
+                    }
+                    let mut result = alternatives(ty, branches);
+                    result.data_mut().concrete = children.iter().all(|child| child.concrete);
+                    result
+                }
+                ExprKind::For => {
+                    if let Some(collection) = children.first()
+                        && collection.value_shape().is_some_and(|shape| {
+                            !matches!(shape, ValueShape::List | ValueShape::Map)
+                        })
+                    {
+                        let mut failure = ordinary(
+                            Err(InferenceError::UnknownType {
+                                reason: format!(
+                                    "for iterable must be a list or map, got {}",
+                                    collection.type_description()
+                                ),
+                            }
+                            .into()),
+                            false,
+                        );
+                        // Keep the operand's own type for the precise iterable
+                        // diagnostic; the loop operation is invalid.
+                        failure.failure_owned_by(FailureOwner::BindingScope);
+                        return failure;
+                    }
+                    let body = children
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| incomplete("for body"));
+                    let mut result = ordinary(
+                        body.judgement
+                            .ty
+                            .clone()
+                            .map(|ty| TypeExpr::List(Box::new(ty))),
+                        false,
+                    );
+                    Arc::make_mut(&mut result.data_mut().judgement).invalid =
+                        body.judgement.invalid;
+                    Arc::make_mut(&mut result.data_mut().judgement).kind = InferredKind::List;
+                    result.data_mut().member = Some(Arc::new(body));
+                    result
+                }
+                ExprKind::DynamicAccess => {
+                    let base = &children[0];
+                    if base.is_value_dependent() {
+                        return base.clone();
+                    }
+                    if let Some(member) = &base.member {
+                        return (**member).clone();
+                    }
+                    let candidates: Vec<_> = base
+                        .elements
+                        .iter()
+                        .chain(base.fields.values())
+                        .cloned()
+                        .collect();
+                    if candidates.is_empty() {
+                        return incomplete("dynamic access element");
+                    }
+                    let mut result = candidates[0].clone();
+                    result.data_mut().alternatives = Arc::new(candidates);
+                    result
+                }
+                ExprKind::Boolean => {
+                    let mut result = ordinary(
+                        Ok(TypeExpr::Bool),
+                        children.iter().all(|child| child.concrete),
+                    );
+                    // Conditions retain their dedicated wait/validation checks.
+                    result.failure_owned_by(FailureOwner::Boundary);
+                    result
+                }
+                ExprKind::NestedBlock { .. } => children[0].clone(),
+                ExprKind::ModuleCall => {
+                    let mut result = value_dependent("module call result requires its signature");
+                    result.failure_owned_by(FailureOwner::Boundary);
+                    result
+                }
+                ExprKind::Declaration | ExprKind::ProviderDeclaration | ExprKind::Compose => {
+                    declaration()
+                }
+                ExprKind::Unsupported(rule) => {
+                    incomplete(&format!("unsupported authored rule {rule}"))
+                }
             }
         }
 
@@ -2089,16 +3408,13 @@ mod judgement {
                             let judged = self.judge(value);
                             match admit_expression(&judged, &expected) {
                                 Err(error)
-                                    if judged.judgement.kind
-                                        == InferredKind::StringConstruction
-                                        && !judged.concrete
-                                        && judged.static_type().is_ok() =>
+                                    if judged.needs_authored_sink_check() && !judged.reported =>
                                 {
                                     self.push_finding(value.location().clone(), error);
                                 }
                                 Ok(
                                     ExpressionAdmission::ValueCheck
-                                    | ExpressionAdmission::Pending
+                                    | ExpressionAdmission::ProviderPending(_)
                                     | ExpressionAdmission::DeferredInterpolation,
                                 )
                                 | Err(_) => {}
@@ -2112,20 +3428,134 @@ mod judgement {
         }
     }
 
-    pub(crate) fn pending() -> JudgedExpr {
-        JudgedExpr {
-            origin: None,
-            concrete: false,
-            coalesce: None,
-            elements: Arc::default(),
-            fields: Arc::default(),
-            judgement: Arc::new(ExprJudgement {
-                ty: Err(InferenceIssue::NotInferable(
-                    NotInferableReason::MissingValue,
-                )),
-                kind: InferredKind::Ordinary,
-                invalid: false,
-            }),
+    /// Join source evidence independently of a selected projection. Exact
+    /// containers keep evidence for every index/key any branch can produce.
+    fn alternatives(ty: Result<TypeExpr, InferenceIssue>, branches: &[JudgedExpr]) -> JudgedExpr {
+        if branches.len() == 1 {
+            return branches[0].clone();
         }
+        let mut result = declared(ty, branches.iter().all(|branch| branch.concrete));
+        Arc::make_mut(&mut result.data_mut().judgement).invalid =
+            branches.iter().any(|branch| branch.judgement.invalid);
+        result.data_mut().alternatives = Arc::new(branches.to_vec());
+        let member_sources = branches
+            .iter()
+            .filter_map(|branch| branch.member.as_deref())
+            .cloned()
+            .collect::<Vec<_>>();
+        result.data_mut().member = member_sources
+            .first()
+            .map(|first| Arc::new(alternatives(first.judgement.ty.clone(), &member_sources)));
+        let max_len = branches
+            .iter()
+            .map(|branch| branch.elements.len())
+            .max()
+            .unwrap_or(0);
+        result.data_mut().elements = Arc::new(
+            (0..max_len)
+                .map(|index| {
+                    let sources = branches
+                        .iter()
+                        .filter_map(|branch| {
+                            branch.elements.get(index).or(branch.member.as_deref())
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    alternatives(sources[0].judgement.ty.clone(), &sources)
+                })
+                .collect(),
+        );
+        let mut keys = IndexMap::new();
+        for branch in branches {
+            for key in branch.fields.keys() {
+                keys.insert(key.clone(), ());
+            }
+        }
+        result.data_mut().fields = Arc::new(
+            keys.into_keys()
+                .map(|key| {
+                    let sources = branches
+                        .iter()
+                        .filter_map(|branch| branch.fields.get(&key).or(branch.member.as_deref()))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    (key, alternatives(sources[0].judgement.ty.clone(), &sources))
+                })
+                .collect(),
+        );
+        result
+    }
+
+    fn declared(ty: Result<TypeExpr, InferenceIssue>, concrete: bool) -> JudgedExpr {
+        let member = match &ty {
+            Ok(TypeExpr::List(inner) | TypeExpr::Map(inner)) => {
+                Some(Arc::new(declared(Ok(*inner.clone()), concrete)))
+            }
+            _ => None,
+        };
+        let fields = match &ty {
+            Ok(TypeExpr::Struct { fields }) => fields
+                .iter()
+                .map(|(key, ty)| (key.clone(), declared(Ok(ty.clone()), concrete)))
+                .collect(),
+            _ => IndexMap::new(),
+        };
+        JudgedExpr(Arc::new(JudgedExprData {
+            origin: None,
+            concrete,
+            reported: false,
+            direct_reference: false,
+            boundary_owner: None,
+            coalesce: None,
+            alternatives: Arc::default(),
+            member,
+            elements: Arc::default(),
+            fields: Arc::new(fields),
+            judgement: Arc::new(ExprJudgement {
+                invalid: matches!(ty, Err(InferenceIssue::Failed(_))),
+                ty,
+                kind: InferredKind::Ordinary,
+                failure_owner: FailureOwner::Expression,
+            }),
+        }))
+    }
+    pub(crate) fn unjudged() -> Result<JudgedExpr, MissingEvidence> {
+        Err(MissingEvidence::new("declaration has not been judged"))
+    }
+    fn incomplete(request: &str) -> JudgedExpr {
+        let mut result = declared(
+            Err(InferenceError::from(MissingEvidence::new(request)).into()),
+            false,
+        );
+        Arc::make_mut(&mut result.data_mut().judgement).invalid = true;
+        result
+    }
+    #[cfg(any(test, feature = "test-utils", feature = "test-support"))]
+    pub(super) fn constraint_fixture() -> JudgedExpr {
+        let mut result = value_dependent("constraint-check fixture");
+        Arc::make_mut(&mut result.data_mut().judgement).ty = Err(InferenceIssue::NotInferable(
+            NotInferableReason::NonInferableBinding {
+                binding: "constraint-check fixture".into(),
+            },
+        ));
+        result
+    }
+    pub(super) fn value_dependent(reason: &str) -> JudgedExpr {
+        let mut result = declared(
+            Err(InferenceError::UnknownType {
+                reason: reason.into(),
+            }
+            .into()),
+            false,
+        );
+        Arc::make_mut(&mut result.data_mut().judgement).kind = InferredKind::ValueDependent;
+        Arc::make_mut(&mut result.data_mut().judgement).invalid = false;
+        result
+    }
+    fn declaration() -> JudgedExpr {
+        let mut result = value_dependent("declaration is not a value");
+        Arc::make_mut(&mut result.data_mut().judgement).kind = InferredKind::Declaration;
+        result.failure_owned_by(FailureOwner::Boundary);
+        result
     }
 }

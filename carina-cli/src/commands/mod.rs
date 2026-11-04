@@ -894,14 +894,22 @@ pub(crate) fn validate_and_resolve_errors_inner(
     } else {
         carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
     };
-    for error in parsed.directive_resolution_errors(
+    let directive_errors = parsed.directive_resolution_errors(
         placeholder_boundary,
         ctx.schemas(),
         enriched_context.catalog(),
-    ) {
-        errors.push(AppError::from(carina_core::resource::ExpansionError::from(
+    );
+    match directive_errors {
+        Ok(directive_errors) => {
+            for error in directive_errors {
+                errors.push(AppError::from(carina_core::resource::ExpansionError::from(
+                    error,
+                )));
+            }
+        }
+        Err(error) => errors.push(AppError::from(carina_core::resource::ExpansionError::from(
             error,
-        )));
+        ))),
     }
     if let Err(leftovers) = parsed.validate_expansion_boundary(placeholder_boundary) {
         errors.extend(leftovers.into_errors().into_iter().map(AppError::from));
@@ -989,9 +997,13 @@ pub(crate) fn validate_and_resolve_errors_inner(
                 enriched_context.catalog(),
             ),
         );
-        if let Err(message) = carina_core::validation::validate_resource_ref_types(
+        let configuration = carina_core::config_loader::load_buffer_configuration(
             parsed,
             ctx.schemas(),
+            enriched_context.catalog(),
+        );
+        if let Err(message) = carina_core::validation::validate_resource_ref_types(
+            configuration.judged(),
             &HashSet::new(),
             &bindings,
         ) {

@@ -31,13 +31,14 @@ pub enum ExpandedGraphResolutionError {
     #[error("{owner}: expected a managed resource handle; '{reference}' is a wait")]
     WaitHandle { owner: String, reference: String },
     #[error(
-        "{owner}: expected resource handle {expected}; got resource handle {actual} from '{reference}'"
+        "{owner}: expected resource handle {}; got resource handle {} from '{reference}'",
+        types.expected(),
+        types.actual()
     )]
     HandleTypeMismatch {
         owner: String,
         reference: String,
-        expected: Box<ResourceTypePath>,
-        actual: Box<ResourceTypePath>,
+        types: crate::schema::MismatchTypeNames,
     },
     #[error("module handle output '{output}' belongs to missing composition '{composition}'")]
     MissingComposition { output: String, composition: String },
@@ -453,8 +454,10 @@ impl ExpandedBindingIndex {
             return Err(ExpandedGraphResolutionError::HandleTypeMismatch {
                 owner: owner.to_string(),
                 reference: handle.diagnostic_name().to_string(),
-                expected: Box::new(handle.resource_type().clone()),
-                actual: Box::new(actual),
+                types: crate::schema::MismatchTypeNames::for_resource_types(
+                    handle.resource_type(),
+                    &actual,
+                ),
             });
         }
         Ok(id)
@@ -959,8 +962,10 @@ fn resolve_pending_output(
         return Err(ExpandedGraphResolutionError::HandleTypeMismatch {
             owner: format!("module output '{key}'"),
             reference: output.handle.diagnostic_name().to_string(),
-            expected: Box::new(output.handle.resource_type().clone()),
-            actual: Box::new(actual_resource_type),
+            types: crate::schema::MismatchTypeNames::for_resource_types(
+                output.handle.resource_type(),
+                &actual_resource_type,
+            ),
         });
     }
     let result = ResolvedHandleTarget {

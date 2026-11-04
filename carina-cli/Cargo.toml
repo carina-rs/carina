@@ -8,6 +8,9 @@ description = "CLI for Carina, a functional infrastructure management tool"
 repository.workspace = true
 homepage.workspace = true
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "carina"
 path = "src/main.rs"

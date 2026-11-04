@@ -165,6 +165,132 @@ fn reviewed_let_named_sink_accepts() {
 }
 
 #[test]
+fn round2_structural_string_kinds_have_cli_lsp_directory_parity() {
+    for (expression, accepted) in [
+        ("\"${source.value}\"", true),
+        ("constructed", true),
+        ("source.value", false),
+        ("[\"${source.value}\"][0]", true),
+        ("\"${source.value}\" ?? source.value", false),
+        ("source.value ?? \"${source.value}\"", false),
+        (
+            "if true { \"${source.value}\" } else { source.value }",
+            false,
+        ),
+        (
+            "if false { source.value } else { \"${source.value}\" }",
+            false,
+        ),
+        (
+            "if true { \"${source.value}\" } else { \"${source.value}\" }",
+            true,
+        ),
+    ] {
+        let main = format!("test.r.typed {{ role_name = {expression} }}\n");
+        let fixture = write_fixture(&[
+            ("main.crn", &main),
+            ("source.crn", "let source = test.r.typed {}\n"),
+            ("alias.crn", "let constructed = \"${source.value}\"\n"),
+            ("providers.crn", "provider test {}\n"),
+            ("exports.crn", "exports {}\n"),
+            ("backend.crn", "backend local { path = 'state.json' }\n"),
+        ]);
+        let schemas = expression_typing_schemas();
+        let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+        let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+        assert_eq!(cli.is_empty(), accepted, "{expression}: {cli:#?}");
+        let type_diagnostics: Vec<_> = lsp
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.message.contains("RoleName") && diagnostic.message.contains("String")
+            })
+            .collect();
+        assert_eq!(
+            type_diagnostics.is_empty(),
+            accepted,
+            "{expression}: {lsp:#?}"
+        );
+    }
+}
+
+#[test]
+fn round2_if_and_for_keep_the_non_string_floor_in_cli_and_lsp() {
+    for (sink, expression) in [
+        (
+            "Int",
+            "if true { \"${source.value}\" } else { \"${source.value}\" }",
+        ),
+        (
+            "Bool",
+            "if false { \"${source.value}\" } else { \"${source.value}\" }",
+        ),
+        (
+            "list(Int)",
+            "[if true { \"${source.value}\" } else { \"${source.value}\" }]",
+        ),
+        (
+            "list(Int)",
+            "for n in [1, 2] { test.r.typed { name = \"${n}\" } }",
+        ),
+    ] {
+        let main = format!("exports {{ result: {sink} = {expression} }}\n");
+        let fixture = write_fixture(&[
+            ("main.crn", &main),
+            ("source.crn", "let source = test.r.typed {}\n"),
+            ("providers.crn", "provider test {}\n"),
+            ("backend.crn", "backend local { path = 'state.json' }\n"),
+        ]);
+        let schemas = expression_typing_schemas();
+        let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+        let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+        assert!(!cli.is_empty(), "{main}");
+        assert!(!lsp_error_multiset(&lsp).is_empty(), "{main}: {lsp:#?}");
+    }
+}
+
+#[test]
+fn round2_declared_module_string_kind_is_independent_of_callers() {
+    let fixture = write_fixture(&[
+        (
+            "main.crn",
+            "let template = use { source = './child' }\nlet first = template { name = 'valid' }\nlet second = template { name = \"${source.value}\" }\n",
+        ),
+        ("source.crn", "let source = test.r.typed {}\n"),
+        ("providers.crn", "provider test {}\n"),
+        ("exports.crn", "exports {}\n"),
+        ("backend.crn", "backend local { path = 'state.json' }\n"),
+    ]);
+    std::fs::create_dir(fixture.path().join("child")).unwrap();
+    std::fs::write(
+        fixture.path().join("child/main.crn"),
+        "arguments { name: String }\nattributes { result: test.r.RoleName = name }\n",
+    )
+    .unwrap();
+    let schemas = expression_typing_schemas();
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let standalone_cli = cli_diagnostics_at(factories_for(&schemas), &fixture.path().join("child"));
+    let engine = engine_with_schemas(schemas);
+    let lsp = lsp_diagnostics(&engine, &fixture, "main.crn");
+    let standalone = lsp_diagnostics(&engine, &fixture, "child/main.crn");
+    let mismatch = |message: &str| message.contains("RoleName") && message.contains("String");
+    assert!(cli.iter().any(|message| mismatch(message)), "{cli:#?}");
+    assert!(
+        standalone_cli.iter().any(|message| mismatch(message)),
+        "{standalone_cli:#?}"
+    );
+    assert!(
+        lsp.iter().any(|diagnostic| mismatch(&diagnostic.message)),
+        "{lsp:#?}"
+    );
+    assert!(
+        standalone
+            .iter()
+            .any(|diagnostic| mismatch(&diagnostic.message)),
+        "{standalone:#?}"
+    );
+}
+
+#[test]
 fn authored_expression_inline_awscc_fallback_is_rejected() {
     let fixture = write_fixture(&[
         ("main.crn", "awscc.s3.Bucket { bucket_name = a ?? 42 }\n"),

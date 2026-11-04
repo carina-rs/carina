@@ -2492,9 +2492,13 @@ mod tests {
             |session| {
                 let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
                 let bindings = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(parsed, schemas, Some(exports), &signatures, session);
-                crate::validation::validate_resource_ref_types(
+                let configuration = crate::config_loader::load_buffer_configuration(
                     parsed,
                     schemas,
+                    session.as_provider_context(),
+                );
+                crate::validation::validate_resource_ref_types(
+                    configuration.judged(),
                     &std::collections::HashSet::new(),
                     &bindings,
                 )
@@ -2891,9 +2895,10 @@ mod tests {
         };
         let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
         let bindings = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures(&parsed, &schemas, &exports, &signatures, &catalog);
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
         let errs = crate::validation::validate_resource_ref_types(
-            &parsed,
-            &schemas,
+            configuration.judged(),
             &std::collections::HashSet::new(),
             &bindings,
         )
@@ -4862,7 +4867,9 @@ mod tests {
         assert_eq!(
             exports["ups"]["out"].static_type,
             UpstreamExportType::Static(ExportStaticType::Inferred(consumer_inferred_type(
-                TypeExpr::List(Box::new(TypeExpr::SchemaType { owned })),
+                TypeExpr::List(Box::new(TypeExpr::SchemaType {
+                    owned: owned.unbounded_witness_for_test()
+                })),
             )))
         );
     }

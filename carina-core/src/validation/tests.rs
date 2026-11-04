@@ -189,15 +189,20 @@ fn reviewed_deferred_directive_consumes_judged_iterable_type() {
         .expression_report()
         .expression(site.iterable_location.unwrap());
     assert_eq!(
-        expression.map(|expression| expression.static_type()),
+        expression
+            .as_ref()
+            .ok()
+            .map(|expression| expression.static_type()),
         Some(Ok(&TypeExpr::Map(Box::new(TypeExpr::String)))),
         "{expression:?}"
     );
-    let errors = graph.directive_resolution_errors(
-        crate::parser::ParserPlaceholderBoundary::ExpandedFile,
-        &schemas,
-        &config,
-    );
+    let errors = graph
+        .directive_resolution_errors(
+            crate::parser::ParserPlaceholderBoundary::ExpandedFile,
+            &schemas,
+            &config,
+        )
+        .unwrap();
     assert!(
         !errors.is_empty(),
         "loop String was admitted to a Bool directive"
@@ -470,7 +475,12 @@ fn ref_validation_rejects_missing_provenance_without_panicking() {
                 let schemas = SchemaRegistry::new();
                 let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
                 let bindings = BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(&parsed, &schemas, None, &signatures, session);
-                validate_resource_ref_types(&parsed, &schemas, &HashSet::new(), &bindings)
+                let configuration = crate::config_loader::load_buffer_configuration(
+                    &parsed,
+                    &schemas,
+                    session.as_provider_context(),
+                );
+                validate_resource_ref_types(configuration.judged(), &HashSet::new(), &bindings)
             },
         )
     }));
@@ -807,7 +817,12 @@ fn validate_resource_ref_types_for_test<
                 .iter()
                 .map(|argument| argument.name.clone())
                 .collect();
-            super::validate_resource_ref_types(parsed, schemas, &argument_names, &bindings)
+            let configuration = crate::config_loader::load_buffer_configuration(
+                parsed,
+                schemas,
+                session.as_provider_context(),
+            );
+            super::validate_resource_ref_types(configuration.judged(), &argument_names, &bindings)
                 .map_err(|error| error.to_string())
         },
     )
@@ -1510,7 +1525,8 @@ fn iam_policy_arn_type_expr() -> TypeExpr {
             "test",
             TypeIdentity::bare("IamPolicyArn"),
             crate::schema::RefinedScalarKind::String,
-        ),
+        )
+        .unbounded_witness_for_test(),
     }
 }
 
@@ -1649,7 +1665,8 @@ fn lift_schema_type_preserves_int_kind_without_registry() {
             "test",
             identity.clone(),
             crate::schema::RefinedScalarKind::Int,
-        ),
+        )
+        .unbounded_witness_for_test(),
     };
     let lifted =
         lift_type_expr(&type_expr).expect("an identified Int must lift without a schema registry");
@@ -1931,7 +1948,9 @@ fn unloaded_schema_nominals_defer_values_and_resolve_when_catalog_loads() {
     };
     assert_eq!(
         resolve_type_expr(&ty, &loaded).unwrap(),
-        TypeExpr::SchemaType { owned }
+        TypeExpr::SchemaType {
+            owned: owned.unbounded_witness_for_test()
+        }
     );
     assert!(
         resolve_type_expr(
@@ -1973,7 +1992,8 @@ fn lift_type_expr_maps_schema_identity_directionally() {
             "aws",
             TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id"),
             crate::schema::RefinedScalarKind::String,
-        ),
+        )
+        .unbounded_witness_for_test(),
     };
     let vpc_id = AttributeType::refined_string(
         Some(TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id")),
@@ -4777,7 +4797,7 @@ fn rendered_typecheck_result_schema_type_accepts_string() {
         crate::schema::RefinedScalarKind::String,
     );
     let schema_type = TypeExpr::SchemaType {
-        owned: owned.clone(),
+        owned: owned.clone().unbounded_witness_for_test(),
     };
     let context = context_with_accepting_custom_type_resolver(HashSet::from([owned]));
     let result = rendered_typecheck_result(
@@ -4795,7 +4815,8 @@ fn rendered_typecheck_result_schema_type_rejects_bool() {
             "awscc",
             TypeIdentity::from_schema_type("awscc", "ec2", "VpcId"),
             crate::schema::RefinedScalarKind::String,
-        ),
+        )
+        .unbounded_witness_for_test(),
     };
     let result = rendered_typecheck_result(
         &schema_type,
@@ -4813,7 +4834,8 @@ fn rendered_typecheck_result_schema_type_rejects_int() {
             "awscc",
             TypeIdentity::from_schema_type("awscc", "ec2", "VpcId"),
             crate::schema::RefinedScalarKind::String,
-        ),
+        )
+        .unbounded_witness_for_test(),
     };
     let result = rendered_typecheck_result(
         &schema_type,
@@ -5960,7 +5982,8 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
             "test",
             identity.clone(),
             crate::schema::RefinedScalarKind::String,
-        ),
+        )
+        .unbounded_witness_for_test(),
     };
     let enum_type = AttributeType::enum_(
         identity.clone(),
@@ -6323,7 +6346,8 @@ fn post_expansion_composition_argument_schema_types_use_directional_relation() {
             "aws",
             TypeIdentity::from_schema_type("aws", path, "Id"),
             crate::schema::RefinedScalarKind::String,
-        ),
+        )
+        .unbounded_witness_for_test(),
     };
     let mut source = make_composition("inner", &[]);
     source.signature.attributes.insert(
@@ -6382,7 +6406,8 @@ fn composition_ref_error_dedup_uses_the_full_call_path() {
             "aws",
             TypeIdentity::from_schema_type("aws", path, "Id"),
             crate::schema::RefinedScalarKind::String,
-        ),
+        )
+        .unbounded_witness_for_test(),
     };
     let mut source = make_composition("source", &[]);
     source.signature.attributes.insert(
@@ -6482,7 +6507,8 @@ fn post_expansion_module_attribute_error_is_per_declaration_and_names_module() {
             "aws",
             TypeIdentity::from_schema_type("aws", path, "Id"),
             crate::schema::RefinedScalarKind::String,
-        ),
+        )
+        .unbounded_witness_for_test(),
     };
     let mut parsed = empty_parsed();
     for instance in ["one", "two", "three"] {
@@ -6588,7 +6614,8 @@ fn post_expansion_module_attribute_dedup_keeps_distinct_errors() {
             "aws",
             TypeIdentity::from_schema_type("aws", "ec2.SecurityGroup", "Id"),
             crate::schema::RefinedScalarKind::String,
-        ),
+        )
+        .unbounded_witness_for_test(),
     };
     let mut parsed = empty_parsed();
 
@@ -6663,7 +6690,8 @@ fn post_expansion_anonymous_call_error_uses_module_label() {
             "aws",
             TypeIdentity::from_schema_type("aws", path, "Id"),
             crate::schema::RefinedScalarKind::String,
-        ),
+        )
+        .unbounded_witness_for_test(),
     };
     let mut source = make_composition("source", &[]);
     source.signature.attributes.insert(
@@ -6787,7 +6815,8 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
                         "aws",
                         TypeIdentity::from_schema_type("aws", "ec2.Subnet", "Id"),
                         crate::schema::RefinedScalarKind::String,
-                    ),
+                    )
+                    .unbounded_witness_for_test(),
                 }))),
                 default: None,
                 description: None,
@@ -7358,7 +7387,8 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
                     "mock",
                     TypeIdentity::bare("RecoveryProbe"),
                     crate::schema::RefinedScalarKind::String,
-                ),
+                )
+                .unbounded_witness_for_test(),
             },
         ))),
         value: Some(RuntimeValue::Concrete(RuntimeConcreteValue::StringList(
@@ -9818,7 +9848,12 @@ fn resolve_type_expr_keeps_schema_owner_separate_from_identity_namespace() {
     )
     .expect("the semantic identity's authored path must resolve");
 
-    assert_eq!(resolved, TypeExpr::SchemaType { owned });
+    assert_eq!(
+        resolved,
+        TypeExpr::SchemaType {
+            owned: owned.unbounded_witness_for_test()
+        }
+    );
     assert_eq!(resolved.to_string(), "aws.ec2.VpcId");
 }
 
@@ -9900,7 +9935,12 @@ fn resolve_type_expr_promotes_a_bare_provider_type_to_an_owned_key() {
     )
     .expect("the unique bare provider identity must resolve");
 
-    assert_eq!(resolved, TypeExpr::SchemaType { owned });
+    assert_eq!(
+        resolved,
+        TypeExpr::SchemaType {
+            owned: owned.unbounded_witness_for_test()
+        }
+    );
     assert_eq!(resolved.to_string(), "VpcId");
 }
 
@@ -9936,8 +9976,7 @@ fn attribute_reference_message_fixture(module_directory: &str) -> CompositionAtt
                 RootScope::new().resolve("source".into()),
             ),
             kind: ModuleCallRefErrorKind::TypeMismatch {
-                expected: "String".to_string(),
-                actual: "Int".to_string(),
+                types: MismatchTypeNames::for_type_exprs(&TypeExpr::String, &TypeExpr::Int),
                 declared: None,
             },
         },
@@ -9998,8 +10037,7 @@ fn module_reference_coverage_uses_typed_call_identity_not_display_text() {
     )
     .expect("second fixture parse");
     let kind = ModuleCallRefErrorKind::TypeMismatch {
-        expected: "String".to_string(),
-        actual: "Int".to_string(),
+        types: MismatchTypeNames::for_type_exprs(&TypeExpr::String, &TypeExpr::Int),
         declared: None,
     };
     let path = ReferencePath::Binding("source".into());
@@ -10111,12 +10149,7 @@ fn deferred_loop_placeholder_access_checks_after_materialization() {
     let schemas = SchemaRegistry::new();
     let provider = crate::parser::LoadedProviderContext::empty_for_test();
     let index = BindingIndex::from_parsed(&parsed, &schemas, &provider);
-    let report = crate::parser::retained::judge_expressions(
-        &parsed,
-        &schemas,
-        provider.as_provider_context(),
-    );
-    let inference = report.unknown().clone();
+    let inference = crate::parser::retained::missing_judgement_for_test();
     let expected = crate::schema::CompiledAttributeType::string();
     let field = PathSegment::Field {
         name: "action".into(),

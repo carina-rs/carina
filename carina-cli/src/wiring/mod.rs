@@ -3095,16 +3095,16 @@ pub fn validate_resource_ref_types_with_ctx<
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     ctx: &WiringContext,
-    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    judged: &carina_core::parser::retained::JudgedFile<E, D, B>,
     argument_names: &HashSet<String>,
 ) -> Vec<AppError> {
+    let parsed = judged.file();
     let bindings = carina_core::binding_index::BindingIndex::from_parsed(
         parsed,
         ctx.schemas(),
         ctx.provider_context().as_provider_context(),
     );
-    match validation::validate_resource_ref_types(parsed, ctx.schemas(), argument_names, &bindings)
-    {
+    match validation::validate_resource_ref_types(judged, argument_names, &bindings) {
         Ok(()) => Vec::new(),
         Err(validation::ResourceRefTypeValidationError::Validation(message)) => {
             split_validation_message(&message)
@@ -4559,9 +4559,13 @@ pub(crate) fn validate_module_internal_ref_types(
         let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
             &parsed, ctx.schemas(), None, &imported, config,
         );
-        if let Err(joined) = validation::validate_resource_ref_types(
+        let configuration = carina_core::config_loader::load_buffer_configuration(
             &parsed,
             ctx.schemas(),
+            config.catalog(),
+        );
+        if let Err(joined) = validation::validate_resource_ref_types(
+            configuration.judged(),
             &HashSet::new(),
             &bindings,
         ) {

@@ -228,6 +228,75 @@ fn typed_ref_validate_accepts_anonymous_refined_scalar_sink() {
 }
 
 #[test]
+fn round2_deferred_interpolation_checks_resolved_constraints_at_plan() {
+    for through_let in [false, true] {
+        let rhs = if through_let {
+            "constructed"
+        } else {
+            "\"${producer.typed_out}\""
+        };
+        let scenario = Scenario::new(&format!("  x = {rhs}"));
+        fs::write(
+            scenario.project.path().join("aliases.crn"),
+            "let constructed = \"${producer.typed_out}\"\n",
+        )
+        .unwrap();
+        assert!(scenario.validate().is_empty());
+
+        let providers = carina_core::provider::loaded_provider_snapshot_from_factories(
+            Arc::new(vec![
+                Box::new(TypedRefMockFactory) as Box<dyn ProviderFactory>
+            ]),
+            carina_core::schema::SchemaRegistry::new(),
+            carina_core::EnvironmentSnapshot::empty(),
+        );
+        let engine = carina_lsp::diagnostics::DiagnosticEngine::new(
+            Arc::new(providers),
+            vec!["mock".into()],
+        );
+        let path = scenario.project.path().join("consumer.crn");
+        let doc = carina_lsp::document::Document::new_with_path(
+            fs::read_to_string(&path).unwrap(),
+            path.clone(),
+            Arc::new(carina_core::parser::ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        let diagnostics = engine.analyze(&doc, Some(&path));
+        assert!(
+            !diagnostics.iter().any(|diagnostic| diagnostic.severity
+                == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)),
+            "{diagnostics:#?}"
+        );
+
+        scenario.seed_output("bad-id");
+        let fixture = scenario.plan();
+        assert_eq!(
+            fixture.plan.errors().len(),
+            1,
+            "{:?}",
+            fixture.plan.errors()
+        );
+        assert!(
+            matches!(&fixture.plan.errors()[0].kind, PlanErrorKind::ResolvedValueConstraint { message, .. } if message.as_str().contains("pattern"))
+        );
+        carina_state::BackendLock::local_default()
+            .save(&carina_core::paths::ResolvedPath::new(scenario.project.path()).unwrap())
+            .unwrap();
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run_plan_with_factories(
+                &TestCommandRuntime::new(),
+                scenario.project.path(),
+                factories(),
+            ));
+        assert!(
+            matches!(result, Err(carina_cli::error::AppError::Validation(message)) if message == "plan failed with 1 error(s)")
+        );
+    }
+}
+
+#[test]
 fn typed_ref_int_validate_accepts_anonymous_ranged_sink() {
     let errors = Scenario::new("  port = producer.typed_port").validate();
     assert!(errors.is_empty(), "{}", errors.join("\n"));

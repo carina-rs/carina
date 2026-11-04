@@ -1,5 +1,6 @@
 use super::SnapshotValue as Value;
 use super::*;
+use crate::numeric::float_as_exact_i64;
 
 #[derive(Clone, Copy)]
 pub(crate) struct SavedValueViews<'a> {
@@ -1017,8 +1018,7 @@ fn numeric_pairing_hash(value: &Value) -> Option<u64> {
     match value {
         Value::Concrete(ConcreteValue::Int(value)) => Some(pairing_component_hash(0x06, value)),
         Value::Concrete(ConcreteValue::Float(value)) => {
-            let integer = *value as i64;
-            if integer as f64 == *value {
+            if let Some(integer) = float_as_exact_i64(*value) {
                 Some(pairing_component_hash(0x06, &integer))
             } else {
                 Some(pairing_component_hash(0x07, &value.to_bits()))
@@ -1219,4 +1219,34 @@ pub(crate) fn pair_list_elements_with_uniqueness<
         .map(ComparisonItem::comparison_snapshot)
         .collect::<Vec<_>>();
     pair_list_elements_with_uniqueness_snapshot(&desired, &saved, attr_type, defs, context)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numeric_pairing_hash_exact_numeric_i64_boundary() {
+        assert_ne!(
+            numeric_pairing_hash(&Value::Concrete(ConcreteValue::Float(
+                9_223_372_036_854_775_808.0
+            ))),
+            numeric_pairing_hash(&Value::Concrete(ConcreteValue::Int(i64::MAX))),
+        );
+    }
+
+    #[test]
+    fn numeric_pairing_hash_exact_numeric_integral_equivalence() {
+        for (integer, float) in [
+            (3, 3.0),
+            (-3, -3.0),
+            (0, -0.0),
+            (i64::MIN, -9_223_372_036_854_775_808.0),
+        ] {
+            assert_eq!(
+                numeric_pairing_hash(&Value::Concrete(ConcreteValue::Float(float))),
+                numeric_pairing_hash(&Value::Concrete(ConcreteValue::Int(integer))),
+            );
+        }
+    }
 }
