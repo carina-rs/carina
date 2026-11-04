@@ -4545,12 +4545,6 @@ pub(crate) fn validate_module_internal_ref_types(
             continue;
         }
 
-        if let Err(joined) =
-            validation::validate_attribute_params_with_context(&parsed.attribute_params, config)
-        {
-            errors.extend(prefixed_validation_messages(&joined, &prefix));
-        }
-
         let imported = module_resolver::load_resolved_module_signatures(
             &parsed,
             module.module_path(),
@@ -4578,11 +4572,16 @@ pub(crate) fn validate_module_internal_ref_types(
                 }
             }
         }
-        if let Err(joined) = validation::validate_attribute_param_ref_types_with_bindings(
-            &parsed.attribute_params,
-            &bindings,
-        ) {
-            errors.extend(prefixed_validation_messages(&joined, &prefix));
+        for parameter in &configuration.judged().file().attribute_params {
+            let parameters = std::slice::from_ref(parameter);
+            let values = validation::validate_attribute_params_with_context(parameters, config);
+            let references =
+                validation::validate_attribute_param_ref_types_with_bindings(parameters, &bindings);
+            // Both checks run. A reference rejection already enforces this
+            // boundary and supplies its precise origin and nested failures.
+            if let Err(joined) = references.and(values) {
+                errors.extend(prefixed_validation_messages(&joined, &prefix));
+            }
         }
     }
     errors

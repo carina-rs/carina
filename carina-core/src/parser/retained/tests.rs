@@ -224,6 +224,7 @@ fn round2_module_parameter_uses_its_declaration_in_every_instance() {
         )
         .unbounded_witness_for_test(),
     };
+    assert!(admit_expression(supplied, &TypeExpr::String).is_ok());
     let mut module =
         crate::parser::parse_and_resolve("arguments { input: String }\nlet result = input")
             .unwrap();
@@ -235,11 +236,7 @@ fn round2_module_parameter_uses_its_declaration_in_every_instance() {
         .expressions_mut()
         .bind_arguments(
             &scope,
-            [(
-                RelativeBindingName::new("input"),
-                TypeExpr::String,
-                supplied.clone(),
-            )],
+            [(RelativeBindingName::new("input"), TypeExpr::String)],
         );
     let report = judge_expressions(&module, &SchemaRegistry::new(), &config());
     let result = report.binding(&RelativeBindingName::new("result")).unwrap();
@@ -521,4 +518,142 @@ fn failure_ownership_survives_wrappers_and_delegates_reference_errors() {
     let reference = report.binding(&RelativeBindingName::new("bad")).unwrap();
     assert_eq!(reference.check_owner(), ExpressionCheckOwner::BindingIndex);
     assert!(admit_expression(reference, &TypeExpr::Int).is_err());
+}
+
+#[test]
+fn round3_resource_sink_rejects_a_declared_list_without_the_binding_pass() {
+    let (_, report) = round2_report(
+        "arguments { input: list(String) }\nlet target = mock.test.Source { name = input }",
+    );
+    let target = report.binding(&RelativeBindingName::new("target")).unwrap();
+    let handle = TypeExpr::Ref(crate::parser::ResourceTypePath::new("mock", "test.Source"));
+    assert!(admit_expression(target, &handle).is_err());
+}
+
+#[test]
+fn round3_annotation_sink_rejects_a_declared_list_without_the_binding_pass() {
+    let mut parsed = crate::parser::parse_and_resolve(
+        "arguments { input: list(String) }\nattributes { output: String = input }",
+    )
+    .unwrap();
+    judge_configuration(&mut parsed, &SchemaRegistry::new(), &config());
+    let expression = parsed.attribute_params[0].judgement().unwrap();
+    assert!(
+        admit_expression(expression, &TypeExpr::List(Box::new(TypeExpr::String))).is_err(),
+        "the rejected String sink must remain rejected even against its source type"
+    );
+}
+
+#[test]
+fn round3_declared_containers_fail_closed_at_scalar_sinks() {
+    for ty in [
+        "list(String)",
+        "map(String)",
+        "struct { label: String }",
+        "list(String) | map(String)",
+        "Ipv4Address",
+    ] {
+        let (_, report) =
+            round2_report(&format!("arguments {{ input: {ty} }}\nlet result = input"));
+        let result = report.binding(&RelativeBindingName::new("result")).unwrap();
+        assert_eq!(result.check_owner(), ExpressionCheckOwner::BindingIndex);
+        assert!(admit_expression(result, &TypeExpr::Int).is_err(), "{ty}");
+        if ty != "Ipv4Address" {
+            assert!(admit_expression(result, &TypeExpr::String).is_err(), "{ty}");
+        }
+    }
+}
+
+#[test]
+fn round3_module_parameter_judgement_is_independent_of_the_callers_value() {
+    let (_, caller) = round2_report(
+        "let src = mock.test.Source {}\nlet literal = 'value'\nlet deferred = src.name",
+    );
+    let mut admissions = Vec::new();
+    for name in ["literal", "deferred"] {
+        assert!(
+            admit_expression(
+                caller.binding(&RelativeBindingName::new(name)).unwrap(),
+                &TypeExpr::String
+            )
+            .is_ok()
+        );
+        let mut module = crate::parser::parse_and_resolve(
+            "arguments { input: String }\nlet result = \"${input}\"",
+        )
+        .unwrap();
+        let scope = crate::resource::ModuleInstanceScope::for_call("template", Some(name), name);
+        module
+            .parser_binding_metadata
+            .syntax
+            .expressions_mut()
+            .bind_arguments(
+                &scope,
+                [(RelativeBindingName::new("input"), TypeExpr::String)],
+            );
+        let report = judge_expressions(&module, &SchemaRegistry::new(), &config());
+        let result = report.binding(&RelativeBindingName::new("result")).unwrap();
+        admissions.push(admit_expression(result, &TypeExpr::String));
+    }
+    assert_eq!(admissions[0], admissions[1]);
+    assert_eq!(
+        admissions[0],
+        Ok(ExpressionAdmission::DeferredInterpolation)
+    );
+}
+
+#[test]
+fn round3_resolved_nominal_declarations_fail_closed_at_unrelated_scalars() {
+    let named = TypeExpr::SchemaType {
+        owned: crate::parser::OwnedTypeIdentity::provider(
+            "mock",
+            crate::schema::TypeIdentity::new(Some("mock"), ["test"], "Name"),
+            crate::schema::RefinedScalarKind::String,
+        )
+        .unbounded_witness_for_test(),
+    };
+    let mut module =
+        crate::parser::parse_and_resolve("arguments { input: String }\nlet result = input")
+            .unwrap();
+    let scope = crate::resource::ModuleInstanceScope::for_call("template", Some("child"), "child");
+    module
+        .parser_binding_metadata
+        .syntax
+        .expressions_mut()
+        .bind_arguments(&scope, [(RelativeBindingName::new("input"), named.clone())]);
+    let report = judge_expressions(&module, &SchemaRegistry::new(), &config());
+    let result = report.binding(&RelativeBindingName::new("result")).unwrap();
+    assert_eq!(result.static_type(), Ok(&named));
+    assert!(admit_expression(result, &TypeExpr::Int).is_err());
+    assert!(admit_expression(result, &TypeExpr::Bool).is_err());
+}
+
+#[test]
+fn round3_boundary_value_check_enforces_binding_owned_admission() {
+    let (parsed, report) = round2_report("arguments { input: list(String) }\nlet result = input");
+    let result = report.binding(&RelativeBindingName::new("result")).unwrap();
+    assert_eq!(result.check_owner(), ExpressionCheckOwner::BindingIndex);
+    let context = config();
+    let location = parsed
+        .parser_binding_metadata
+        .syntax()
+        .expressions()
+        .binding(&RelativeBindingName::new("result"))
+        .unwrap()
+        .location()
+        .clone();
+    let checked = crate::validation::typecheck::TypecheckProviderContext::providerless(&context)
+        .check_boundary_values_at(
+            &TypeExpr::String,
+            &parsed.variables["result"],
+            result,
+            crate::validation::deferred_types::ProviderTypeCheckSite::new(
+                location,
+                "attribute 'output'",
+            ),
+        );
+    assert!(
+        checked.is_err(),
+        "the value checker admitted a binding-owned list into String"
+    );
 }

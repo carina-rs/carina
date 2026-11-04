@@ -812,17 +812,11 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             .expressions_mut()
             .bind_arguments(
                 &module_instance_scope,
-                argument_judgements.iter().map(|(name, expression)| {
+                module.arguments.iter().map(|argument| {
                     (
-                        module_instance_scope.resolve(RelativeBindingName::new(name.as_str())),
-                        module
-                            .arguments
-                            .iter()
-                            .find(|argument| argument.name == *name)
-                            .expect("declared module argument")
-                            .static_type
-                            .clone(),
-                        expression.clone(),
+                        module_instance_scope
+                            .resolve(RelativeBindingName::new(argument.name.as_str())),
+                        argument.static_type.clone(),
                     )
                 }),
             );
@@ -1287,7 +1281,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                         call.id().argument_value_location(name).map(|location| {
                             (
                                 location.clone(),
-                                crate::parser::retained::missing_judgement_for_test(),
+                                crate::parser::retained::value_dependent_judgement_for_test(),
                             )
                         })
                     })

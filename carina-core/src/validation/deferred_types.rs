@@ -832,7 +832,7 @@ mod tests {
                     &value,
                     context.catalog(),
                     super::super::typecheck::TypecheckInference::Judged(
-                        &crate::parser::retained::missing_judgement_for_test(),
+                        &crate::parser::retained::value_dependent_judgement_for_test(),
                     ),
                 )
                 .record_at(

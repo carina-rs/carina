@@ -436,7 +436,7 @@ fn rendered_typecheck_result(
         value,
         typecheck::TypecheckProviderContext::for_parser(config),
         typecheck::TypecheckInference::Judged(
-            &crate::parser::retained::missing_judgement_for_test(),
+            &crate::parser::retained::value_dependent_judgement_for_test(),
         ),
     )
     .require_provider_schemas()
@@ -1909,7 +1909,7 @@ fn unloaded_schema_nominals_defer_values_and_resolve_when_catalog_loads() {
         &value,
         typecheck::TypecheckProviderContext::for_parser(&context),
         typecheck::TypecheckInference::Judged(
-            &crate::parser::retained::missing_judgement_for_test(),
+            &crate::parser::retained::value_dependent_judgement_for_test(),
         ),
     )
     .require_provider_schemas()
@@ -4392,7 +4392,7 @@ fn bare_builtin_custom_types_report_scalar_kind_mismatches() {
                 crate::EnvironmentSnapshot::empty(),
             )),
             typecheck::TypecheckInference::Judged(
-                &crate::parser::retained::missing_judgement_for_test(),
+                &crate::parser::retained::value_dependent_judgement_for_test(),
             ),
         )
         .require_provider_schemas()
@@ -10149,7 +10149,7 @@ fn deferred_loop_placeholder_access_checks_after_materialization() {
     let schemas = SchemaRegistry::new();
     let provider = crate::parser::LoadedProviderContext::empty_for_test();
     let index = BindingIndex::from_parsed(&parsed, &schemas, &provider);
-    let inference = crate::parser::retained::missing_judgement_for_test();
+    let inference = crate::parser::retained::value_dependent_judgement_for_test();
     let expected = crate::schema::CompiledAttributeType::string();
     let field = PathSegment::Field {
         name: "action".into(),

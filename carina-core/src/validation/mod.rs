@@ -2286,7 +2286,7 @@ pub fn check_deferred_access_type<B: BindingAddress>(
     check_inferred_assignment(
         value,
         expected,
-        expression.static_type().cloned().map_err(Clone::clone),
+        expression.static_type().cloned(),
         binding_index,
     )
 }
@@ -2488,7 +2488,6 @@ fn prove_integer_operand<B: BindingAddress>(
         })?
         .static_type()
         .cloned()
-        .map_err(Clone::clone)
     {
         Ok(TypeExpr::Int) => Ok(()),
         Ok(TypeExpr::UnloadedSchemaType(_))
@@ -4893,7 +4892,7 @@ fn deferred_iterable_shape(
         GenericValue::Concrete(crate::resource::ConcreteValue::Map(_)) => {
             Ok(DeferredIterableShape::Map)
         }
-        _ => inference::infer_type_from_value(
+        _ => inference::infer_projected_type(
             value,
             bindings,
             schemas,
@@ -4915,7 +4914,6 @@ fn deferred_iterable_shape_for_phase(
     expression
         .static_type()
         .cloned()
-        .map_err(Clone::clone)
         .map(iterable_shape_from_type)
 }
 
@@ -7794,7 +7792,6 @@ struct ModuleBoundaryCheckContext<'a, 'bindings, E> {
     binding_use_report: &'a BindingUseReport,
     bindings: &'a BindingIndex<'bindings>,
     owner: ModuleCallFindingOwner,
-    reference_checks: ModuleCallReferenceChecks,
 }
 
 struct ModuleReferenceCheckContext<'a, 'bindings, E> {
@@ -7880,6 +7877,19 @@ impl ModuleCallChecker<'_> {
 
             self.check_binding_use_findings(authored_call, binding_use_report, &owner);
 
+            if reference_checks == ModuleCallReferenceChecks::Enabled {
+                self.check_reference_types(
+                    authored_call,
+                    ModuleReferenceCheckContext {
+                        semantic_call,
+                        authority_file,
+                        signatures,
+                        binding_use_report,
+                        bindings,
+                        owner: owner.clone(),
+                    },
+                );
+            }
             if let Some(signature) = signatures.get(&authored_call.module_name) {
                 self.check_call(
                     authored_call,
@@ -7890,27 +7900,12 @@ impl ModuleCallChecker<'_> {
                         binding_use_report,
                         bindings,
                         owner: owner.clone(),
-                        reference_checks,
                     },
                 );
             }
 
-            match reference_checks {
-                ModuleCallReferenceChecks::Enabled => {
-                    self.check_reference_types(
-                        authored_call,
-                        ModuleReferenceCheckContext {
-                            semantic_call,
-                            authority_file,
-                            signatures,
-                            binding_use_report,
-                            bindings,
-                            owner: owner.clone(),
-                        },
-                    );
-                    self.check_nested_module(authority_file, checked_call, base_dir, &owner.root)?;
-                }
-                ModuleCallReferenceChecks::Skipped => {}
+            if reference_checks == ModuleCallReferenceChecks::Enabled {
+                self.check_nested_module(authority_file, checked_call, base_dir, &owner.root)?;
             }
         }
 
@@ -7989,7 +7984,6 @@ impl ModuleCallChecker<'_> {
             binding_use_report,
             bindings,
             owner,
-            reference_checks,
         } = context;
 
         let call_label = module_call_label(authored_call);
@@ -8176,19 +8170,15 @@ impl ModuleCallChecker<'_> {
                         .expect("authored argument expression"),
                 )
                 .map_err(|error| typecheck::TypeExprValueError::InvalidAccess { error });
-            if let Ok(expression) = &inference
-                && (matches!(
-                    expression.check_owner(),
-                    crate::parser::retained::ExpressionCheckOwner::Reported
-                        | crate::parser::retained::ExpressionCheckOwner::BindingScope
-                ) || (expression.check_owner()
-                    == crate::parser::retained::ExpressionCheckOwner::BindingIndex
-                    && reference_checks == ModuleCallReferenceChecks::Enabled))
-            {
-                // The reference pass below owns this boundary, or the judge
-                // already owns an intrinsic failure at its authored location.
-                continue;
-            }
+            let location = authored_call
+                .id()
+                .argument_value_location(argument)
+                .expect("authored argument expression");
+            let reports_here = !self.findings.iter().any(|finding| finding.anchor.location() == location && finding.owners.contains(&owner))
+                && !inference.as_ref().is_ok_and(|expression| {
+                    matches!(expression.static_type(), Err(crate::static_type::InferenceIssue::Failed(error))
+                        if authority_file.expression_report().findings().iter().any(|finding| finding.detail() == &error))
+                });
             if let Err(error) = inference.and_then(|expression| {
                 self.provider_context.check_at(
                     &resolved_parameter.as_type_expr(),
@@ -8203,7 +8193,8 @@ impl ModuleCallChecker<'_> {
                         format!("{call_label} argument '{argument}'"),
                     ),
                 )
-            }) {
+            }) && reports_here
+            {
                 self.push_finding(ModuleCallFinding::argument_value(
                     ModuleCallFindingKind::ValueType,
                     owner.clone(),

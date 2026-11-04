@@ -1446,11 +1446,6 @@ impl DiagnosticRun<'_> {
                             continue;
                         }
                     };
-                    if expression.check_owner()
-                        != carina_core::parser::retained::ExpressionCheckOwner::Expression
-                    {
-                        continue;
-                    }
                     let type_error = match self.provider_context.loaded_context() {
                         Some(provider_context) => typecheck::check_type_expr_value(
                             type_expr,
@@ -1475,7 +1470,10 @@ impl DiagnosticRun<'_> {
                         )
                         .err(),
                     };
-                    if let Some(type_error) = type_error {
+                    if let Some(type_error) = type_error
+                        && expression.check_owner()
+                            == carina_core::parser::retained::ExpressionCheckOwner::Expression
+                    {
                         let finding = carina_core::parser::Located::new(
                             record_for(attr_param).location().clone(),
                             type_error,
@@ -1602,11 +1600,6 @@ impl DiagnosticRun<'_> {
                     continue;
                 }
             };
-            if expression.check_owner()
-                == carina_core::parser::retained::ExpressionCheckOwner::Reported
-            {
-                continue;
-            }
             if param.static_type.as_ref().is_some_and(|ty| {
                 carina_core::validation::resolve_type_expr(ty, self.provider_context.catalog())
                     .is_err()
@@ -1641,7 +1634,10 @@ impl DiagnosticRun<'_> {
                     self.export_value_error(semantic_param, value_bindings)
                 }
             };
-            if let Some(message) = message {
+            if let Some(message) = message
+                && expression.check_owner()
+                    != carina_core::parser::retained::ExpressionCheckOwner::Reported
+            {
                 let finding = carina_core::parser::Located::new(name_location(param), message);
                 diagnostics.extend(render_merged(
                     doc,
@@ -1660,6 +1656,12 @@ impl DiagnosticRun<'_> {
         param: &ParsedExportParam<ParserPlaceholder, B>,
         value_bindings: &GenericResolvedBindings<ParserPlaceholder, B>,
     ) -> Option<String> {
+        let error = carina_core::validation::check_export_values_pre_apply(
+            std::slice::from_ref(param),
+            value_bindings,
+            self.provider_context,
+        )
+        .err();
         if param.judgement().is_ok_and(|expression| {
             expression.check_owner()
                 == carina_core::parser::retained::ExpressionCheckOwner::BindingIndex
@@ -1686,12 +1688,7 @@ impl DiagnosticRun<'_> {
             };
             return secret.then(|| format!("export '{}' cannot hold a secret value", param.name));
         }
-        carina_core::validation::check_export_values_pre_apply(
-            std::slice::from_ref(param),
-            value_bindings,
-            self.provider_context,
-        )
-        .err()
+        error
     }
 
     pub(super) fn check_inferred_export_types<D, B: BindingAddress>(

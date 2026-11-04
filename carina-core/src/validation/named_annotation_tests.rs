@@ -380,7 +380,7 @@ fn exact_schema_projections_keep_their_declaration_instead_of_sibling_constraint
         &text("A".repeat(80)),
         snapshot.provider_context(),
         typecheck::TypecheckInference::Judged(
-            &crate::parser::retained::missing_judgement_for_test(),
+            &crate::parser::retained::value_dependent_judgement_for_test(),
         ),
     )
     .require_provider_schemas()
@@ -398,7 +398,7 @@ fn exact_schema_projections_keep_their_declaration_instead_of_sibling_constraint
         &text("A".repeat(80)),
         snapshot.provider_context(),
         typecheck::TypecheckInference::Judged(
-            &crate::parser::retained::missing_judgement_for_test(),
+            &crate::parser::retained::value_dependent_judgement_for_test(),
         ),
     )
     .require_provider_schemas()
@@ -438,7 +438,7 @@ fn exact_projection_value_validation_keeps_its_callback_without_sibling_callback
         &value,
         snapshot.provider_context(),
         typecheck::TypecheckInference::Judged(
-            &crate::parser::retained::missing_judgement_for_test(),
+            &crate::parser::retained::value_dependent_judgement_for_test(),
         ),
     )
     .require_provider_schemas()
@@ -449,7 +449,7 @@ fn exact_projection_value_validation_keeps_its_callback_without_sibling_callback
         &value,
         snapshot.provider_context(),
         typecheck::TypecheckInference::Judged(
-            &crate::parser::retained::missing_judgement_for_test(),
+            &crate::parser::retained::value_dependent_judgement_for_test(),
         ),
     )
     .require_provider_schemas()
@@ -550,7 +550,7 @@ fn review_projection_serde_rebinds_exact_callbacks_and_enum_semantics() {
                     &text("INVALID"),
                     snapshot.provider_context(),
                     typecheck::TypecheckInference::Judged(
-                        &crate::parser::retained::missing_judgement_for_test()
+                        &crate::parser::retained::value_dependent_judgement_for_test()
                     ),
                 )
                 .require_provider_schemas()
@@ -565,7 +565,7 @@ fn review_projection_serde_rebinds_exact_callbacks_and_enum_semantics() {
                 &text("VALID"),
                 missing.provider_context(),
                 typecheck::TypecheckInference::Judged(
-                    &crate::parser::retained::missing_judgement_for_test()
+                    &crate::parser::retained::value_dependent_judgement_for_test()
                 ),
             )
             .require_provider_schemas()
@@ -629,7 +629,7 @@ fn review_projection_serde_keeps_reference_semantics_and_rejects_ambiguous_callb
         &text("VALID"),
         ambiguous.provider_context(),
         typecheck::TypecheckInference::Judged(
-            &crate::parser::retained::missing_judgement_for_test(),
+            &crate::parser::retained::value_dependent_judgement_for_test(),
         ),
     )
     .require_provider_schemas()
@@ -666,7 +666,7 @@ fn review_enum_witness_constraints_apply_to_canonical_api_spelling() {
             &value,
             snapshot.provider_context(),
             typecheck::TypecheckInference::Judged(
-                &crate::parser::retained::missing_judgement_for_test(),
+                &crate::parser::retained::value_dependent_judgement_for_test(),
             ),
         )
         .require_provider_schemas()
@@ -697,7 +697,7 @@ fn review_enum_values_validate_canonical_scalar_against_retained_witness() {
                     &value,
                     lax.provider_context(),
                     typecheck::TypecheckInference::Judged(
-                        &crate::parser::retained::missing_judgement_for_test(),
+                        &crate::parser::retained::value_dependent_judgement_for_test(),
                     ),
                 )
                 .require_provider_schemas();
@@ -734,7 +734,7 @@ fn assert_enum_witness_masks_env_value(base: DraftType, expected: &str) {
             value,
             &context,
             typecheck::TypecheckInference::Judged(
-                &crate::parser::retained::missing_judgement_for_test(),
+                &crate::parser::retained::value_dependent_judgement_for_test(),
             ),
         )
         .require_provider_schemas()
@@ -1263,7 +1263,7 @@ fn coalesce_and_collection_inference_mismatches_distinguish_named_constraints() 
             "collection element types disagree: `aws.iam.Role.Name (length 1..=64)` vs `aws.iam.Role.Name (length 1..=128)`",
         ),
     ] {
-        let error = inference::infer_type_from_value(
+        let error = inference::infer_projected_type(
             &value,
             &bindings,
             snapshot.schema_registry(),
@@ -1375,7 +1375,7 @@ fn enum_resource_binding_mismatch_keeps_the_exact_enum_name() {
 }
 
 #[test]
-fn inference_without_bindings_retains_constraints_for_coalesce_collections_and_branches() {
+fn production_inference_retains_constraints_for_coalesce_collections_and_branches() {
     let snapshot = snapshot(vec![("p", vec![string(1, 64, None), string(1, 128, None)])]);
     let first = typed_function_result(inference::attribute_type_to_type_expr(
         declaration(&snapshot, "p", 0),
@@ -1413,7 +1413,13 @@ fn inference_without_bindings_retains_constraints_for_coalesce_collections_and_b
         ))),
     ];
     for value in values {
-        let error = inference::infer_type_from_value_without_bindings(&value).unwrap_err();
+        let error = inference::infer_projected_type(
+            &value,
+            &inference::InferenceBindings::new(),
+            snapshot.schema_registry(),
+            snapshot.provider_context().as_provider_context(),
+        )
+        .unwrap_err();
         let message = error.to_string();
         assert!(
             message.contains("aws.iam.Role.Name (length 1..=64)"),
@@ -1422,16 +1428,6 @@ fn inference_without_bindings_retains_constraints_for_coalesce_collections_and_b
         assert!(
             message.contains("aws.iam.Role.Name (length 1..=128)"),
             "{message}"
-        );
-        assert_eq!(
-            error,
-            inference::infer_type_from_value(
-                &value,
-                &inference::InferenceBindings::new(),
-                snapshot.schema_registry(),
-                snapshot.provider_context().as_provider_context(),
-            )
-            .unwrap_err(),
         );
     }
 }
@@ -1639,7 +1635,7 @@ fn integer_operand_mismatches_do_not_hide_a_named_strings_constraints() {
         context,
     )
     .unwrap();
-    let error = inference::infer_type_from_value(
+    let error = inference::infer_projected_type(
         &parsed.variables["result"],
         &inference::bindings_from_parsed(&parsed),
         snapshot.schema_registry(),

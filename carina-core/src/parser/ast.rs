@@ -2965,7 +2965,7 @@ impl<P: ValueKind, B: BindingAddress> AttributeParameter<TypeExpr, P, B> {
             SourceSpan::dummy(),
             ModuleCallId::test_dummy_in("test.crn").location,
         );
-        parameter.source.judgement = Ok(super::retained::missing_judgement_for_test());
+        parameter.source.judgement = Ok(super::retained::value_dependent_judgement_for_test());
         parameter
     }
 
@@ -3091,7 +3091,7 @@ impl<P: ValueKind, B: BindingAddress> ParsedExportParam<P, B> {
             SourceSpan::dummy(),
             ModuleCallId::test_dummy_in("test.crn").location,
         );
-        parameter.source.judgement = Ok(super::retained::missing_judgement_for_test());
+        parameter.source.judgement = Ok(super::retained::value_dependent_judgement_for_test());
         parameter
     }
 
@@ -4790,7 +4790,7 @@ impl Default for DeclarationSource {
             SourceSpan::dummy(),
             ModuleCallId::test_dummy_in("test.crn").location,
         );
-        source.judgement = Ok(super::retained::missing_judgement_for_test());
+        source.judgement = Ok(super::retained::value_dependent_judgement_for_test());
         source
     }
 }
