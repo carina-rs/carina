@@ -9970,6 +9970,87 @@ fn named_annotation_engine(source_max: u64) -> DiagnosticEngine {
 }
 
 #[test]
+fn computed_access_rejects_heterogeneous_collection_in_lsp_diagnostics() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+    let name = |max| {
+        AttributeType::refined_string(
+            Some(TypeIdentity::from_schema_type("aws", "iam.Role", "Name")),
+            None,
+            Some((Some(1), Some(max))),
+            None,
+        )
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("iam.Role")
+            .attribute(AttributeSchema::required("role_name", name(64)).build())
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("NameSource")
+            .attribute(AttributeSchema::provider_populated("narrow", name(64)).build())
+            .attribute(AttributeSchema::provider_populated("wide", name(128)).build())
+            .attribute(
+                AttributeSchema::provider_populated("names", AttributeType::list(name(64))).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("root");
+    let module = fixture.path().join("module");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&module).unwrap();
+    std::fs::write(root.join("providers.crn"), "provider aws {}\n").unwrap();
+    std::fs::write(root.join("source.crn"), "let src = aws.NameSource {}\n").unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        "arguments {\n  x: aws.iam.Role.Name\n}\naws.iam.Role { role_name = x }\n",
+    )
+    .unwrap();
+    for (fallback, expected_error) in [
+        (
+            "[src.narrow, src.wide]",
+            Some(
+                "collection element types disagree: `aws.iam.Role.Name (length 1..=64)` vs `aws.iam.Role.Name (length 1..=128)`",
+            ),
+        ),
+        (
+            "['ValidName', 1]",
+            Some("collection element types disagree: `String` vs `Int`"),
+        ),
+        ("[src.narrow, src.narrow]", None),
+    ] {
+        for sink in [
+            format!("aws.iam.Role {{ role_name = (src.names ?? {fallback})[1] }}"),
+            format!("role_module {{ x = (src.names ?? {fallback})[1] }}"),
+        ] {
+            let source = format!("let role_module = use {{ source = '../module' }}\n{sink}\n");
+            std::fs::write(root.join("main.crn"), &source).unwrap();
+            let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", &source);
+            match expected_error {
+                Some(expected) => assert!(
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic.severity == Some(DiagnosticSeverity::ERROR)
+                            && diagnostic.message.contains(expected)
+                            && diagnostic.range.start.line == 1
+                    }),
+                    "computed access must report inference failure at {sink}: {diagnostics:#?}",
+                ),
+                None => assert!(
+                    diagnostics.is_empty(),
+                    "a homogeneous bounded fallback must remain valid for {sink}: {diagnostics:#?}",
+                ),
+            }
+        }
+    }
+}
+
+#[test]
 fn named_annotation_diagnostics_match_cli_for_arguments_and_nested_calls() {
     for source_max in [32, 64, 128] {
         let engine = named_annotation_engine(source_max);

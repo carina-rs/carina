@@ -63,9 +63,29 @@ impl ProviderFactory for AwsTestFactory {
         );
         vec![
             ResourceSchema::new("iam.Role")
-                .attribute(AttributeSchema::required("role_name", role_name).build())
+                .attribute(AttributeSchema::required("role_name", role_name.clone()).build())
                 .validate()
                 .expect("bounded IAM role name schema"),
+            ResourceSchema::new("NameSource")
+                .attribute(AttributeSchema::provider_populated("narrow", role_name.clone()).build())
+                .attribute(
+                    AttributeSchema::provider_populated(
+                        "wide",
+                        AttributeType::refined_string(
+                            Some(TypeIdentity::from_schema_type("aws", "iam.Role", "Name")),
+                            None,
+                            Some((Some(1), Some(128))),
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .attribute(
+                    AttributeSchema::provider_populated("names", AttributeType::list(role_name))
+                        .build(),
+                )
+                .validate()
+                .expect("name source schema with distinct exact bounds"),
         ]
     }
 }
@@ -187,4 +207,45 @@ let role = aws.iam.Role {
         "a valid literal must satisfy the bounded aws.iam.Role.Name attribute:\n{}",
         diagnostics.join("\n"),
     );
+}
+
+#[test]
+fn computed_access_rejects_heterogeneous_collection_in_directory_validation() {
+    for (fallback, expected_error) in [
+        (
+            "[src.narrow, src.wide]",
+            Some(
+                "collection element types disagree: `aws.iam.Role.Name (length 1..=64)` vs `aws.iam.Role.Name (length 1..=128)`",
+            ),
+        ),
+        (
+            "['ValidName', 1]",
+            Some("collection element types disagree: `String` vs `Int`"),
+        ),
+        ("[src.narrow, src.narrow]", None),
+    ] {
+        for sink in [
+            format!("aws.iam.Role {{ role_name = (src.names ?? {fallback})[1] }}"),
+            format!("role_module {{ x = (src.names ?? {fallback})[1] }}"),
+        ] {
+            let source = format!(
+                "let role_module = use {{ source = '../module' }}\nlet src = aws.NameSource {{}}\n{sink}\n"
+            );
+            let diagnostics = Fixture::new(NAMED_ARGUMENT_MODULE, &source).validate();
+            match expected_error {
+                Some(expected) => assert!(
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.contains(expected)),
+                    "computed access must propagate inference failure for {sink}:\n{}",
+                    diagnostics.join("\n"),
+                ),
+                None => assert!(
+                    diagnostics.is_empty(),
+                    "a homogeneous bounded fallback must remain valid for {sink}:\n{}",
+                    diagnostics.join("\n"),
+                ),
+            }
+        }
+    }
 }

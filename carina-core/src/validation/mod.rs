@@ -2236,14 +2236,14 @@ pub fn check_deferred_access_type<B: BindingAddress>(
         }
         Err(crate::static_type::InferenceIssue::Failed(
             error @ (inference::InferenceError::InvalidIntegerArithmeticOperand { .. }
+            | inference::InferenceError::HeterogeneousCollection { .. }
             | inference::InferenceError::UnknownType { .. }),
         )) => return Err(DeferredAccessTypeError::InvalidAccess { error }),
         // Dynamic result types and unavailable authorities cannot be checked
         // soundly at this phase. Spell every inference variant out so adding a
         // new failure reason forces an explicit checked/unchecked decision.
         Err(crate::static_type::InferenceIssue::Failed(
-            inference::InferenceError::HeterogeneousCollection { .. }
-            | inference::InferenceError::UnknownBinding { .. }
+            inference::InferenceError::UnknownBinding { .. }
             | inference::InferenceError::CyclicVirtualBinding { .. },
         ))
         | Err(crate::static_type::InferenceIssue::NotInferable(

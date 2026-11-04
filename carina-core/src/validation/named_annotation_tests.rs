@@ -1082,6 +1082,123 @@ fn computed_access_mismatch_keeps_inferred_constraints_and_nested_path() {
 }
 
 #[test]
+fn computed_access_rejects_heterogeneous_collection_in_validation() {
+    let snapshot = snapshot(vec![(
+        "p",
+        vec![
+            string(1, 64, None),
+            string(1, 128, None),
+            DraftType::list(string(1, 64, None)),
+        ],
+    )]);
+    let context = snapshot.provider_context().as_provider_context();
+    for (fallback, expected_error) in [
+        (
+            "[source.value0, source.value1]",
+            Some(
+                "collection element types disagree: `aws.iam.Role.Name (length 1..=64)` vs `aws.iam.Role.Name (length 1..=128)`",
+            ),
+        ),
+        (
+            "['ValidName', 1]",
+            Some("collection element types disagree: `String` vs `Int`"),
+        ),
+        ("[source.value0, source.value0]", None),
+    ] {
+        let parsed = crate::parser::parse(
+            &format!(
+                "let source = p.Values {{}}\nlet sink = p.Values {{ value0 = (source.value2 ?? {fallback})[1] }}\n"
+            ),
+            context,
+        )
+        .expect("computed access fixture must parse");
+        let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
+        let result = validate_resource_ref_types(
+            &parsed,
+            snapshot.schema_registry(),
+            &HashSet::new(),
+            &bindings,
+        );
+        match expected_error {
+            Some(expected) => {
+                let error = result.expect_err("computed access must propagate inference failure");
+                assert!(error.to_string().contains(expected), "{error}");
+            }
+            None => result.expect("a homogeneous bounded fallback must remain valid"),
+        }
+    }
+}
+
+#[test]
+fn computed_access_rejects_heterogeneous_collection_in_typecheck() {
+    let snapshot = snapshot(vec![("p", vec![string(1, 64, None), string(1, 128, None)])]);
+    let expected = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 0), "p");
+    let narrow = typed_function_result(expected.clone());
+    let wide = typed_function_result(inference::attribute_type_to_type_expr(
+        declaration(&snapshot, "p", 1),
+        "p",
+    ));
+    for (elements, expected_error) in [
+        (
+            vec![narrow.clone(), wide],
+            Some(
+                "collection element types disagree: `aws.iam.Role.Name (length 1..=64)` vs `aws.iam.Role.Name (length 1..=128)`",
+            ),
+        ),
+        (
+            vec![text("ValidName"), integer(1)],
+            Some("collection element types disagree: `String` vs `Int`"),
+        ),
+        (vec![narrow.clone(), narrow.clone()], None),
+    ] {
+        let access = crate::resource::apply_value_path_segment(
+            Value::Deferred(crate::resource::DeferredValue::Coalesce {
+                value: Box::new(list(vec![narrow.clone(), narrow.clone()])),
+                default: Box::new(list(elements)),
+            }),
+            crate::resource::PathSegment::Subscript {
+                index: crate::resource::Subscript::Int { index: 1 },
+            },
+            1,
+            crate::resource::AccessMissPolicy::Error,
+        )
+        .unwrap()
+        .into_value()
+        .unwrap();
+        let bindings = inference::InferenceBindings::new();
+        for inference in [
+            typecheck::TypecheckInference::Available {
+                bindings: &bindings,
+                schemas: snapshot.schema_registry(),
+            },
+            typecheck::TypecheckInference::Unavailable,
+        ] {
+            let result = typecheck::check_type_expr_value(
+                &expected,
+                &access,
+                snapshot.provider_context(),
+                inference,
+            )
+            .require_provider_schemas();
+            match expected_error {
+                Some(expected) => {
+                    let error =
+                        result.expect_err("computed access must propagate inference failure");
+                    assert!(matches!(
+                        error,
+                        typecheck::TypeExprValueError::InvalidAccess {
+                            error: inference::InferenceError::HeterogeneousCollection { .. }
+                        }
+                    ));
+                    assert_eq!(error.to_string(), expected);
+                }
+                None => result.expect("a homogeneous bounded fallback must remain valid"),
+            }
+        }
+    }
+}
+
+#[test]
 fn coalesce_and_collection_inference_mismatches_distinguish_named_constraints() {
     let snapshot = snapshot(vec![("p", vec![string(1, 64, None), string(1, 128, None)])]);
     let bindings = inference::InferenceBindings::from([(

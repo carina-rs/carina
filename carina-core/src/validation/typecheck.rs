@@ -591,13 +591,13 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
                 Err(crate::static_type::InferenceIssue::Failed(
                     error @ (super::inference::InferenceError::InvalidAccess { .. }
                     | super::inference::InferenceError::UnknownAttribute { .. }
+                    | super::inference::InferenceError::HeterogeneousCollection { .. }
                     | super::inference::InferenceError::InvalidIntegerArithmeticOperand {
                         ..
                     }),
                 )) => Mismatch(TypeExprValueError::InvalidAccess { error }),
                 Err(crate::static_type::InferenceIssue::Failed(
                     super::inference::InferenceError::UnknownType { .. }
-                    | super::inference::InferenceError::HeterogeneousCollection { .. }
                     | super::inference::InferenceError::IncompatibleCoalesceTypes { .. }
                     | super::inference::InferenceError::UnknownBinding { .. }
                     | super::inference::InferenceError::CyclicVirtualBinding { .. },
