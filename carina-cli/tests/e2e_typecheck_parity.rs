@@ -895,14 +895,14 @@ fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &Schema
             &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
             context,
         );
-        let binding_use_report = carina_core::validation::check_bare_binding_uses(
+        let configuration = carina_core::config_loader::load_buffer_configuration(
             &directory.parsed,
+            schemas,
+            context.as_provider_context(),
+        );
+        let binding_use_report = carina_core::validation::check_bare_binding_uses(
             &carina_core::validation::ValidationTypeContext::new(
-                directory
-                    .parsed
-                    .judged()
-                    .expect("loader-owned expression report"),
-                schemas,
+                configuration.judged(),
                 context,
                 &signatures,
             ),

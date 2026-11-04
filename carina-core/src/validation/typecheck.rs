@@ -86,9 +86,23 @@ pub(crate) fn admit_function_expression(
     match crate::parser::retained::admit_expression(expression, expected)? {
         ExpressionAdmission::DeferredInterpolation | ExpressionAdmission::Pending => Ok(()),
         ExpressionAdmission::ValueCheck => {
+            // Literals are inputs to the sink's value/constraint check, not
+            // declared sources that must already carry its named identity.
+            if expression.concrete {
+                return Ok(());
+            }
+            // Annotation resolution owns unavailable/invalid declarations.
+            // Comparing their provisional spelling would turn provider
+            // deferrals into premature assignment errors.
+            let Ok(Some(expected)) = super::resolve_parameter_type_for_check(expected, config)
+            else {
+                return Ok(());
+            };
+            let expected = expected.as_type_expr();
             if let Ok(actual) = expression.static_type()
+                && let Ok(actual) = super::resolve_type_expr(actual, config)
                 && matches!(
-                    inferred_type_assignment(expected, actual, &config.custom_types),
+                    inferred_type_assignment(&expected, &actual, &config.custom_types),
                     crate::schema::TypeAssignability::Mismatch
                 )
             {

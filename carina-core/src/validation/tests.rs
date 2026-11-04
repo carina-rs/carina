@@ -723,7 +723,7 @@ fn module_call_findings_for_test(
     let parsed = &fixture;
     let binding_use_report = check_bare_binding_uses(&ValidationTypeContext::new(
         crate::config_loader::load_buffer_configuration(
-            &parsed,
+            parsed,
             &schemas,
             provider_context.as_provider_context(),
         )
@@ -1562,7 +1562,7 @@ fn refined_int_module_argument_report(annotation: &str, sink: TypeExpr) -> Bindi
         crate::config_loader::load_buffer_configuration(
             &parsed,
             &schemas,
-            &provider_context.as_provider_context(),
+            provider_context.as_provider_context(),
         )
         .judged(),
         &provider_context,
@@ -2473,7 +2473,7 @@ fn binding_diagnostics_preserve_symlink_parent_source_spelling() {
         crate::config_loader::load_buffer_configuration(
             &parsed,
             &schemas,
-            &provider.as_provider_context(),
+            provider.as_provider_context(),
         )
         .judged(),
         &provider,
@@ -2551,7 +2551,7 @@ let generated = for item in items {
     let judged_configuration = crate::config_loader::load_buffer_configuration(
         &parsed,
         &schemas,
-        &provider_context.as_provider_context(),
+        provider_context.as_provider_context(),
     );
     let context = ValidationTypeContext::new(
         judged_configuration.judged(),
@@ -5496,7 +5496,7 @@ fn check_module_calls_reports_nested_file_type_resolution_errors() {
         crate::config_loader::load_buffer_configuration(
             &parsed,
             &schemas,
-            &provider_context.as_provider_context(),
+            provider_context.as_provider_context(),
         )
         .judged(),
         &provider_context,

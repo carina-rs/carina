@@ -13,6 +13,9 @@ use indexmap::IndexMap;
 use pest::iterators::{Pair, Pairs};
 use std::{collections::HashMap, path::Path, sync::Arc};
 
+#[cfg(test)]
+mod tests;
+
 /// The expansion scope is part of expression identity, even when two module
 /// instances originate at the same authored source location.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -91,7 +94,10 @@ enum ExprKind<B: BindingAddress> {
     Interpolation,
     Coalesce,
     Call(String),
-    Function(Option<TypeExpr>),
+    Function {
+        name: String,
+        return_type: Option<TypeExpr>,
+    },
     Sequence,
     Access(PathSegment),
     Integer {
@@ -152,7 +158,7 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
             ExprKind::Interpolation => ExprKind::Interpolation,
             ExprKind::Coalesce => ExprKind::Coalesce,
             ExprKind::Call(name) => ExprKind::Call(name),
-            ExprKind::Function(ty) => ExprKind::Function(ty),
+            ExprKind::Function { name, return_type } => ExprKind::Function { name, return_type },
             ExprKind::Sequence => ExprKind::Sequence,
             ExprKind::Access(step) => ExprKind::Access(step),
             ExprKind::Integer { op, location } => ExprKind::Integer { op, location },
@@ -881,7 +887,16 @@ fn compile(
                 .collect();
             node(
                 &pair,
-                ExprKind::Function(return_type),
+                ExprKind::Function {
+                    name: pair
+                        .clone()
+                        .into_inner()
+                        .next()
+                        .unwrap()
+                        .as_str()
+                        .to_string(),
+                    return_type,
+                },
                 children,
                 file,
                 source,
@@ -940,7 +955,9 @@ fn compile(
                     resource_type: resource_type.to_string(),
                     read: pair.as_rule() == Rule::read_resource_expr,
                 },
-                children(),
+                // The qualified resource type is a declaration, not a value
+                // reference whose provider head can be shadowed by a binding.
+                children().into_iter().skip(1).collect(),
                 file,
                 source,
             )
@@ -1059,6 +1076,9 @@ mod judgement {
     struct ExprJudgement {
         ty: Result<TypeExpr, InferenceIssue>,
         kind: InferredKind,
+        // A missing inferable type (dynamic calls, heterogeneous records) is
+        // distinct from an invalid authored operation such as a bad fallback.
+        invalid: bool,
     }
 
     /// Admission evidence, constructible only by the recursive judge.
@@ -1125,6 +1145,11 @@ mod judgement {
     ) -> Result<ExpressionAdmission, InferenceError> {
         if let Err(error) = expression.static_type() {
             return match error {
+                // The sink can check a dynamic result or each field of a
+                // record even when no homogeneous type can be inferred.
+                InferenceIssue::Failed(_) if !expression.judgement.invalid => {
+                    Ok(ExpressionAdmission::ValueCheck)
+                }
                 InferenceIssue::Failed(error) => Err(error.clone()),
                 InferenceIssue::NotInferable(_) => Ok(ExpressionAdmission::Pending),
             };
@@ -1411,7 +1436,12 @@ mod judgement {
         D: super::super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
         let expressions = file.parser_binding_metadata.syntax().expressions();
-        let bindings = inference::bindings_from_parsed(file);
+        let mut bindings = inference::bindings_from_parsed(file);
+        for wait in &file.wait_bindings {
+            if let Some(target) = bindings.get(wait.target.as_str()).cloned() {
+                bindings.insert(wait.binding.to_string(), target);
+            }
+        }
         fn index<'a, B: BindingAddress>(
             expression: &'a ExprValue<ParserPlaceholder, B>,
             authored: &mut HashMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
@@ -1436,6 +1466,35 @@ mod judgement {
         {
             index(expression, &mut authored, &mut visited);
         }
+        // Direct resource references already have an existence/access
+        // diagnostic owned by the resource check. Retain their failed type
+        // evidence without also issuing an expression-level diagnostic.
+        fn reference_chain<B: BindingAddress>(
+            expression: &ExprValue<ParserPlaceholder, B>,
+            owned: &mut std::collections::HashSet<ExpressionLocation>,
+        ) -> bool {
+            let is_reference = match &expression.authored.kind {
+                ExprKind::Reference { .. } => true,
+                ExprKind::Alias | ExprKind::Access(_) => expression
+                    .authored
+                    .children
+                    .first()
+                    .is_some_and(|base| reference_chain(base, owned)),
+                _ => false,
+            };
+            if is_reference {
+                owned.insert(expression.authored.location.clone());
+            }
+            is_reference
+        }
+        let mut resource_references = std::collections::HashSet::new();
+        for expression in authored.values() {
+            if let ExprKind::Sink(_) = &expression.authored.kind
+                && let Some(value) = expression.authored.children.first()
+            {
+                reference_chain(value, &mut resource_references);
+            }
+        }
         let mut judge = Judge {
             authored,
             expressions,
@@ -1450,6 +1509,7 @@ mod judgement {
             function_errors: Vec::new(),
             operands: HashMap::new(),
             module_attributes: Some(&expressions.report.module_attributes),
+            resource_references,
         };
         let mut judged_bindings = HashMap::new();
         for (name, expression) in &expressions.definitions {
@@ -1494,6 +1554,7 @@ mod judgement {
                             judgement: Arc::new(ExprJudgement {
                                 ty: Ok(argument.static_type.clone()),
                                 kind: InferredKind::Ordinary,
+                                invalid: false,
                             }),
                             concrete: false,
                             coalesce: None,
@@ -1534,6 +1595,7 @@ mod judgement {
         function_errors: Vec<Located<InferenceError>>,
         operands: HashMap<ExpressionLocation, [JudgedExpr; 2]>,
         module_attributes: Option<&'a HashMap<(B, String), JudgedExpr>>,
+        resource_references: std::collections::HashSet<ExpressionLocation>,
     }
 
     impl<B: BindingAddress> Judge<'_, B> {
@@ -1559,22 +1621,31 @@ mod judgement {
             if let Projection::Value(value) = &expression.payload {
                 result.concrete = value.is_fully_resolved();
             }
-            if let Some(failed) = children
-                .iter()
-                .find(|child| matches!(child.judgement.ty, Err(InferenceIssue::Failed(_))))
-            {
+            if let Some(failed) = children.iter().find(|child| child.judgement.invalid) {
                 Arc::make_mut(&mut result.judgement).ty = failed.judgement.ty.clone();
+                Arc::make_mut(&mut result.judgement).invalid = true;
+            } else if let Err(InferenceIssue::Failed(error)) = result.static_type() {
+                Arc::make_mut(&mut result.judgement).invalid = match error {
+                    InferenceError::UnknownType { .. } => false,
+                    InferenceError::HeterogeneousCollection { .. } => {
+                        matches!(root.kind, ExprKind::Coalesce)
+                    }
+                    _ => true,
+                };
             }
-            if !matches!(root.kind, ExprKind::Coalesce)
+            if result.judgement.invalid
                 && let Err(InferenceIssue::Failed(error)) = result.static_type()
-                && !children
-                    .iter()
-                    .any(|child| child.static_type() == Err(&InferenceIssue::Failed(error.clone())))
+                && !self.resource_references.contains(&root.location)
+                && !children.iter().any(|child| {
+                    child.judgement.invalid
+                        && child.static_type() == Err(&InferenceIssue::Failed(error.clone()))
+                })
             {
                 let location = match error {
                     InferenceError::InvalidIntegerArithmeticOperand { operator_span, .. } => {
                         operator_span.location().unwrap_or(&root.location.authored)
                     }
+                    _ if matches!(root.kind, ExprKind::Coalesce) => root.children[1].location(),
                     _ => &root.location.authored,
                 }
                 .clone();
@@ -1605,6 +1676,7 @@ mod judgement {
             expression: &JudgedExpr,
             sink: &TypeExpr,
             location: &DeclarationLocation,
+            context: &str,
         ) {
             if expression.static_type().is_ok()
                 && let Err(error) = crate::validation::typecheck::admit_function_expression(
@@ -1613,8 +1685,19 @@ mod judgement {
                     self.config,
                 )
             {
-                let finding = Located::new(location.clone(), error);
-                if !self.function_errors.contains(&finding) {
+                let finding = Located::new(
+                    location.clone(),
+                    InferenceError::UnknownType {
+                        reason: format!("{context}: {error}"),
+                    },
+                );
+                // Bootstrap parsing rejects the interpolation policy breach.
+                // Declared-type mismatches belong to configuration validation,
+                // after declarations and sibling files have been resolved.
+                if expression.judgement.kind == InferredKind::StringConstruction
+                    && !expression.concrete
+                    && !self.function_errors.contains(&finding)
+                {
                     self.function_errors.push(finding.clone());
                 }
                 self.push_finding(finding.location().clone(), finding.detail().clone());
@@ -1646,6 +1729,7 @@ mod judgement {
                 judgement: Arc::new(ExprJudgement {
                     ty,
                     kind: InferredKind::Ordinary,
+                    invalid: false,
                 }),
             };
             let child_type = |index: usize| {
@@ -1803,6 +1887,7 @@ mod judgement {
                     judgement: Arc::new(ExprJudgement {
                         ty: Ok(TypeExpr::String),
                         kind: InferredKind::StringConstruction,
+                        invalid: false,
                     }),
                 },
                 ExprKind::Coalesce => {
@@ -1817,17 +1902,7 @@ mod judgement {
                     } else {
                         EmptyCoalesceDefault::None
                     };
-                    let owns_mismatch =
-                        matches!((&left, &right), (Ok(left), Ok(right)) if left != right);
                     let ty = coalesce_type(left, right, empty);
-                    if owns_mismatch && let Err(InferenceIssue::Failed(error)) = &ty {
-                        let location = root.children[1].location().clone();
-                        if !self.findings.iter().any(|finding| {
-                            finding.location() == &location && finding.detail() == error
-                        }) {
-                            self.findings.push(Located::new(location, error.clone()));
-                        }
-                    }
                     let mut result = children.first().cloned().unwrap_or_else(pending);
                     Arc::make_mut(&mut result.judgement).ty = ty;
                     result.coalesce = Some(Arc::new([children[0].clone(), children[1].clone()]));
@@ -1874,47 +1949,31 @@ mod judgement {
                 ExprKind::Call(name) if name == "secret" => {
                     children.first().cloned().unwrap_or_else(pending)
                 }
-                ExprKind::Function(return_type) => {
+                ExprKind::Function { name, return_type } => {
                     let body = children.last().cloned().unwrap_or_else(pending);
                     if let Some(sink) = return_type {
                         self.check_function_sink(
                             &body,
                             sink,
                             root.children.last().unwrap().location(),
+                            &format!("function '{name}': return value"),
                         );
                     }
                     pending()
                 }
                 ExprKind::Sequence => children.last().cloned().unwrap_or_else(pending),
                 ExprKind::Call(name) => {
-                    if name == "lookup"
-                        && let Some(first) = children.first()
-                    {
-                        match first.static_type() {
-                            Ok(TypeExpr::Map(inner)) => {
-                                return ordinary(
-                                    Ok(*inner.clone()),
-                                    children.iter().all(|child| child.concrete),
-                                );
-                            }
-                            Ok(actual) => {
-                                return ordinary(
-                                    Err(InferenceError::UnknownType {
-                                        reason: format!("lookup expects a map, got {actual}"),
-                                    }
-                                    .into()),
-                                    false,
-                                );
-                            }
-                            Err(_) => {}
-                        }
-                    }
                     if let Some(function) = self.functions.get(name) {
                         for ((parameter, child), authored) in
                             function.params.iter().zip(children).zip(&root.children)
                         {
                             if let Some(sink) = &parameter.param_type {
-                                self.check_function_sink(child, sink, authored.location());
+                                self.check_function_sink(
+                                    child,
+                                    sink,
+                                    authored.location(),
+                                    &format!("function '{name}': parameter '{}'", parameter.name),
+                                );
                             }
                         }
                     }
@@ -1924,26 +1983,27 @@ mod judgement {
                     {
                         return ordinary(Ok(ty.clone()), false);
                     }
-                    let ty = crate::builtins::builtin_functions()
+                    let builtin = crate::builtins::builtin_functions()
                         .iter()
-                        .find(|builtin| builtin.name == name)
-                        .and_then(|builtin| match builtin.return_type {
-                            crate::builtins::BuiltinReturnType::String => Some(TypeExpr::String),
-                            crate::builtins::BuiltinReturnType::Int => Some(TypeExpr::Int),
-                            crate::builtins::BuiltinReturnType::StringList => {
-                                Some(TypeExpr::List(Box::new(TypeExpr::String)))
-                            }
+                        .find(|builtin| builtin.name == name);
+                    let ty = match builtin.map(|builtin| builtin.return_type) {
+                        Some(crate::builtins::BuiltinReturnType::String) => Ok(TypeExpr::String),
+                        Some(crate::builtins::BuiltinReturnType::Int) => Ok(TypeExpr::Int),
+                        Some(crate::builtins::BuiltinReturnType::StringList) => {
+                            Ok(TypeExpr::List(Box::new(TypeExpr::String)))
+                        }
+                        Some(
                             crate::builtins::BuiltinReturnType::Secret
                             | crate::builtins::BuiltinReturnType::List
                             | crate::builtins::BuiltinReturnType::Map
-                            | crate::builtins::BuiltinReturnType::Any => None,
-                        });
-                    ordinary(
-                        ty.ok_or(InferenceIssue::NotInferable(
-                            NotInferableReason::MissingValue,
-                        )),
-                        children.iter().all(|child| child.concrete),
-                    )
+                            | crate::builtins::BuiltinReturnType::Any,
+                        ) => Err(InferenceError::UnknownType {
+                            reason: format!("built-in `{name}` return type depends on arguments"),
+                        }
+                        .into()),
+                        None => pending().judgement.ty.clone(),
+                    };
+                    ordinary(ty, children.iter().all(|child| child.concrete))
                 }
                 ExprKind::Access(step) => ordinary(
                     child_type(0).and_then(|base| {
@@ -2064,6 +2124,7 @@ mod judgement {
                     NotInferableReason::MissingValue,
                 )),
                 kind: InferredKind::Ordinary,
+                invalid: false,
             }),
         }
     }

@@ -528,7 +528,7 @@ impl<E, D, B: crate::resource::BindingAddress> BufferConfiguration<E, D, B> {
 
 pub fn load_buffer_configuration<
     E: Clone + crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B>,
-    D: Clone,
+    D,
     B: crate::resource::BindingAddress,
 >(
     parsed: &crate::parser::File<
@@ -542,7 +542,8 @@ pub fn load_buffer_configuration<
     config: &ProviderContext,
 ) -> BufferConfiguration<E, D, B>
 where
-    D: crate::parser::DeferredForPhaseTraversal<
+    D: Clone
+        + crate::parser::DeferredForPhaseTraversal<
             crate::resource::ParserPlaceholder,
             crate::resource::ParserPlaceholder,
             B,
