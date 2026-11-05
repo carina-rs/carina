@@ -69,7 +69,10 @@ pub(in crate::parser) fn parse_provider_block(
                     message: format!("Provider '{name}': '{key}' must be a string literal"),
                 });
             }
-            let value = parse_expression(value_pair, ctx)?;
+            let value = parse_expression(value_pair, ctx)?
+                .projection()
+                .expect("materialized parser expression")
+                .clone();
             attribute_lines.insert(key.clone(), attr_line);
             attributes.insert(key, value);
         }

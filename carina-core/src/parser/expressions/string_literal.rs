@@ -178,6 +178,9 @@ pub(crate) fn parse_string_value(
                                 "interpolation expression",
                             )?;
                             parse_expression(expr_pair, ctx)?
+                                .projection()
+                                .expect("materialized parser expression")
+                                .clone()
                         }
                         None => Value::Deferred(DeferredValue::Placeholder(
                             ParserPlaceholder::EmptyInterpolation { source },

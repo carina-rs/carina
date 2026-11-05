@@ -432,6 +432,63 @@ fn present_read_only_attribute_stays_present_while_producer_updates() {
 }
 
 #[test]
+fn authored_expression_correct_fallback_preserves_selected_values_identities_and_plan() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    write_common_files(&project);
+    fs::write(project.join("origin.crn"), "let first = 'present'\n").unwrap();
+    fs::write(project.join("aliases.crn"), "let a = first\n").unwrap();
+    fs::write(
+        project.join("exports.crn"),
+        "exports { selected = chosen }\n",
+    )
+    .unwrap();
+    let source = |rhs: &str| {
+        format!("let chosen = {rhs}\nmock.test.resource {{ name = chosen comment = chosen }}\n")
+    };
+    fs::write(project.join("main.crn"), source("a")).unwrap();
+    assert_success(
+        &run_cli(&project, &["init", "."]),
+        "init plan equivalence fixture",
+    );
+    let plain = run_cli(&project, &["plan", "."]);
+    assert_success(&plain, "plan plain value");
+    fs::write(project.join("main.crn"), source("a ?? 'fallback'")).unwrap();
+    let coalesced = run_cli(&project, &["plan", "."]);
+    assert_success(&coalesced, "plan coalesced value");
+    assert_eq!(
+        coalesced.stdout, plain.stdout,
+        "a correctly typed unselected fallback changed the plan"
+    );
+}
+
+#[test]
+fn authored_expression_known_left_wrong_fallback_fails_binary_validate_and_plan() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    write_common_files(&project);
+    fs::write(project.join("origin.crn"), "let first = 'present'\n").unwrap();
+    fs::write(project.join("aliases.crn"), "let a = first\n").unwrap();
+    fs::write(project.join("exports.crn"), "exports {}\n").unwrap();
+    fs::write(
+        project.join("main.crn"),
+        "let unused = a ?? 42\nmock.test.resource { name = 'sink' comment = a ?? 42 }\n",
+    )
+    .unwrap();
+    assert_success(
+        &run_cli(&project, &["init", "."]),
+        "init expression fixture",
+    );
+    for operation in ["validate", "plan"] {
+        let output = assert_failure(&run_cli(&project, &[operation, "."]), operation);
+        assert!(
+            output.contains("String") && output.contains("Int"),
+            "{output}"
+        );
+    }
+}
+
+#[test]
 fn wrong_typed_coalesce_default_is_rejected_before_apply() {
     let root = tempfile::tempdir().expect("create temporary root");
     let project = root.path().join("project");

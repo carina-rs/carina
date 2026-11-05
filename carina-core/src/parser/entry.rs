@@ -29,8 +29,7 @@ use super::resolve::{
     finalize_provider_configs, resolve_provider_unresolved_attributes, resolve_resource_refs,
 };
 use crate::eval_value::{
-    EvalValue, EvalValueError, ParsedSinkValue, UnexpandedStructuralHandle,
-    UnexpandedStructuralHandleMetadata,
+    EvalValue, EvalValueError, UnexpandedStructuralHandle, UnexpandedStructuralHandleMetadata,
 };
 use crate::parser::{
     ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value,
@@ -1448,12 +1447,23 @@ fn parse_with_seeded_bindings_inner(
         .map(crate::resource::RelativeBindingName::new)
         .collect();
     parser_binding_metadata.syntax = Box::new(syntax);
+    parser_binding_metadata
+        .syntax
+        .attach_expression_projections(&parsed.variables);
     parsed.parser_binding_metadata = parser_binding_metadata;
     parsed.warnings = warnings;
     *parsed.parsed_deferred_for_expressions_mut() = ctx.parsed_deferred_for_expressions;
     parsed.deferred_module_ifs = ctx.deferred_module_ifs;
     let binding_scope = crate::binding_index::BindingNameSet::from_parsed(&parsed);
     parsed.set_loop_binding_scope(binding_scope.iter_names().map(str::to_string).collect());
+    super::retained::judge_configuration(
+        &mut parsed,
+        &crate::schema::SchemaRegistry::new(),
+        config,
+    );
+    if let Some(error) = parsed.expression_report().first_function_error() {
+        return Err(error);
+    }
     // The parser never synthesizes composition resources, so its default
     // expansion trace remains empty until module expansion (#3306).
     Ok(parsed)
@@ -1588,29 +1598,32 @@ fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[BindingSeed<'_>]) {
     }
 }
 
-/// Parse an expression. The result is a fully-reduced `Value`: any
-/// closure that surfaces during evaluation surfaces here as a
-/// parse-time error. Use [`parse_expression_eval`] in pipe/compose
-/// paths where partial applications are legitimate intermediates.
+/// Retain an expression before reducing its provisional value. Unfinished
+/// closures remain parser errors; pipe/compose intermediates use
+/// [`parse_expression_eval`].
 pub(crate) fn parse_expression(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
-) -> Result<Value, ParseError> {
+) -> Result<super::retained::ExprValue, ParseError> {
     let line = pair.line_col().0;
-    let eval = parse_expression_eval(pair, ctx)?;
-    eval.into_value()
-        .map_err(|error| ParseError::from_eval_value(error, line))
+    ctx.evaluate_retained_expression(pair.clone(), || {
+        let eval = parse_expression_eval(pair, ctx)?;
+        eval.into_value()
+            .map_err(|error| ParseError::from_eval_value(error, line))
+    })
 }
 
 pub(crate) fn parse_expression_in_sink(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
     mode: &ExpressionMode<'_>,
-) -> Result<ParsedSinkValue, ParseError> {
+) -> Result<super::retained::SinkExpression, ParseError> {
     let line = pair.line_col().0;
-    parse_expression_eval_with_mode(pair, ctx, mode)?
-        .into_sink_value()
-        .map_err(|error| ParseError::from_eval_value(error, line))
+    ctx.evaluate_retained_sink(pair.clone(), || {
+        parse_expression_eval_with_mode(pair, ctx, mode)?
+            .into_sink_value()
+            .map_err(|error| ParseError::from_eval_value(error, line))
+    })
 }
 
 /// Parse an expression and return the raw `EvalValue`, preserving any

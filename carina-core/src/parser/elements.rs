@@ -702,6 +702,12 @@ pub(crate) enum AccessLocations {
     Selection(DeclarationLocation),
 }
 impl AccessLocations {
+    pub(crate) fn expression_location(&self) -> &DeclarationLocation {
+        match self {
+            Self::Reference(locations) => locations.occurrence(),
+            Self::Selection(location) => location,
+        }
+    }
     pub(in crate::parser) fn from_pair(
         pair: &Pair<'_, Rule>,
         file: &PreprocessedFile,
@@ -812,6 +818,7 @@ pub enum ConfigurationBlock {
 pub struct SyntaxInventory<
     B: crate::resource::BindingAddress = crate::resource::RelativeBindingName,
 > {
+    expressions: super::retained::Expressions<B>,
     declarations: Vec<Located<DeclarationRecord>>,
     // Keep authored names for declaration diagnostics, and scope membership
     // in the binding phase so module expansion cannot leak private names.
@@ -829,6 +836,7 @@ pub struct SyntaxInventory<
 impl<B: crate::resource::BindingAddress> Default for SyntaxInventory<B> {
     fn default() -> Self {
         Self {
+            expressions: Default::default(),
             declarations: Vec::new(),
             binding_names: Vec::new(),
             type_annotations: Vec::new(),
@@ -844,6 +852,22 @@ impl<B: crate::resource::BindingAddress> Default for SyntaxInventory<B> {
     }
 }
 impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
+    pub fn expressions(&self) -> &super::retained::Expressions<B> {
+        &self.expressions
+    }
+    pub(crate) fn expressions_mut(&mut self) -> &mut super::retained::Expressions<B> {
+        &mut self.expressions
+    }
+
+    pub(super) fn attach_expression_projections(
+        &mut self,
+        values: &indexmap::IndexMap<
+            String,
+            crate::resource::Value<crate::resource::ParserPlaceholder, B>,
+        >,
+    ) {
+        self.expressions.attach_binding_projections(values);
+    }
     pub fn configuration_blocks(&self) -> &[Located<ConfigurationBlock>] {
         &self.configuration_blocks
     }
@@ -878,6 +902,7 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
         &self.upstream_sources
     }
     pub(crate) fn extend(&mut self, other: Self) {
+        self.expressions.extend(other.expressions);
         self.declarations.extend(other.declarations);
         self.binding_names.extend(other.binding_names);
         self.type_annotations.extend(other.type_annotations);
@@ -895,6 +920,7 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
         map: &mut impl FnMut(B) -> C,
     ) -> SyntaxInventory<C> {
         SyntaxInventory {
+            expressions: self.expressions.map_bindings(map),
             declarations: self.declarations,
             binding_names: self.binding_names.into_iter().map(&mut *map).collect(),
             type_annotations: self.type_annotations,
@@ -932,6 +958,7 @@ impl SyntaxInventory {
         file: &PreprocessedFile,
         source: &Path,
     ) -> Self {
+        let expressions = super::retained::Expressions::from_pairs(pairs.clone(), file, source);
         let declarations = declaration_inventory(pairs.clone(), file, source);
         use crate::validation::{
             TypeResolutionContext as Context, TypeResolutionDeclarationKind as Kind,
@@ -975,6 +1002,7 @@ impl SyntaxInventory {
                 .map(|declaration| crate::resource::RelativeBindingName::new(declaration.name()))
                 .collect(),
             declarations,
+            expressions,
             type_annotations,
             ..Self::default()
         };

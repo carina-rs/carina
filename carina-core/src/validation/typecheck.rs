@@ -3,36 +3,65 @@
 use std::fmt;
 
 use crate::ValueDescription;
+use crate::parser::retained::{JudgedExpr, MissingEvidence};
 use crate::parser::{
     LoadedProviderContext, ProviderContext, TypeExpr, validate_builtin_custom_type,
     validate_schema_custom_type_with_context,
 };
-use crate::resource::{
-    BindingAddress, ConcreteValue, DeferredValue, NoPlaceholder, PlaceholderKind,
-    RelativeBindingName, Value,
-};
+use crate::resource::{BindingAddress, ConcreteValue, DeferredValue, PlaceholderKind, Value};
 
-/// Static authority available while checking deferred computed values.
-/// Callers without a binding/schema view must say so explicitly rather than
-/// passing empty registries that look authoritative.
-pub enum TypecheckInference<
-    'a,
-    P: PlaceholderKind = NoPlaceholder,
-    B: BindingAddress = RelativeBindingName,
-> {
-    Available {
-        bindings: &'a super::inference::InferenceBindings<P, B>,
-        schemas: &'a crate::schema::SchemaRegistry,
-    },
-    Unavailable,
+// This mode is private to the checker. Only a ResolvedConstraintValue can
+// enter the resolved branch; authored APIs always require JudgedExpr.
+#[derive(Clone, Copy)]
+enum ValueCheckEvidence<'a> {
+    Authored(&'a JudgedExpr),
+    Resolved,
 }
 
-impl<P: PlaceholderKind, B: BindingAddress> Copy for TypecheckInference<'_, P, B> {}
-
-impl<P: PlaceholderKind, B: BindingAddress> Clone for TypecheckInference<'_, P, B> {
-    fn clone(&self) -> Self {
-        *self
+impl<'a> ValueCheckEvidence<'a> {
+    fn step(
+        self,
+        f: impl FnOnce(&'a JudgedExpr) -> Result<&'a JudgedExpr, MissingEvidence>,
+    ) -> Result<Self, MissingEvidence> {
+        match self {
+            Self::Authored(expression) => f(expression).map(Self::Authored),
+            Self::Resolved => Ok(self),
+        }
     }
+}
+
+/// A resolved projection can be checked for concrete constraints. This type
+/// cannot wrap deferred authored values and provides no static admission.
+pub(crate) struct ResolvedConstraintValue<'a, P: PlaceholderKind, B: BindingAddress>(
+    &'a Value<P, B>,
+);
+impl<'a, P: PlaceholderKind, B: BindingAddress> ResolvedConstraintValue<'a, P, B> {
+    pub(crate) fn new(value: &'a Value<P, B>) -> Option<Self> {
+        value.is_fully_resolved().then_some(Self(value))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum FunctionExpressionError {
+    #[error(transparent)]
+    Annotation(#[from] crate::static_type::StaticTypeResolutionError),
+    #[error(transparent)]
+    Expression(#[from] crate::static_type::InferenceError),
+}
+
+pub(crate) fn admit_function_expression(
+    expression: &JudgedExpr,
+    expected: &TypeExpr,
+    config: &ProviderContext,
+) -> Result<crate::parser::retained::ExpressionAdmission, FunctionExpressionError> {
+    let sink = super::resolve_type_expr(expected, config)?;
+    crate::parser::retained::admit_with_context(
+        expression,
+        &sink,
+        crate::parser::retained::AdmissionContext::Function,
+        config,
+    )
+    .map_err(Into::into)
 }
 
 /// Provider authority available to internal value-checking pipelines.
@@ -102,7 +131,7 @@ impl<'a> TypecheckProviderContext<'a> {
         self,
         expected: &TypeExpr,
         value: &Value<P, B>,
-        inference: TypecheckInference<'_, P, B>,
+        inference: &JudgedExpr,
     ) -> Result<(), TypeExprValueError> {
         let check = check_type_expr_value_inner(expected, value, self, inference);
         if let Self::Session(session) = self
@@ -117,7 +146,7 @@ impl<'a> TypecheckProviderContext<'a> {
         self,
         expected: &TypeExpr,
         value: &Value<P, B>,
-        inference: TypecheckInference<'_, P, B>,
+        inference: &JudgedExpr,
         site: super::deferred_types::ProviderTypeCheckSite,
     ) -> Result<(), TypeExprValueError> {
         let check = check_type_expr_value_inner(expected, value, self, inference);
@@ -128,6 +157,63 @@ impl<'a> TypecheckProviderContext<'a> {
                 Some(session) => check.record_at(session, site),
                 None => check.require_provider_schemas(),
             }
+        }
+    }
+
+    /// The module boundary pairs this value-constraint pass with BindingIndex
+    /// reference validation. Every child still requires authored evidence.
+    pub(crate) fn check_boundary_values_at<P: PlaceholderKind, B: BindingAddress>(
+        self,
+        expected: &TypeExpr,
+        value: &Value<P, B>,
+        expression: &JudgedExpr,
+        site: super::deferred_types::ProviderTypeCheckSite,
+    ) -> Result<(), TypeExprValueError> {
+        let check = check_type_expr_value_inner_with_mode(
+            expected,
+            value,
+            self.as_provider_context(),
+            ValueCheckEvidence::Authored(expression),
+            if self.requires_provider_schemas() {
+                ProviderCustomTypeValidation::Loaded
+            } else {
+                ProviderCustomTypeValidation::Providerless
+            },
+        );
+        match self.session() {
+            Some(session) if !self.requires_provider_schemas() => check.record_at(session, site),
+            _ => check.require_provider_schemas(),
+        }
+    }
+
+    pub(crate) fn check_resolved_constraints<P: PlaceholderKind, B: BindingAddress>(
+        self,
+        expected: &TypeExpr,
+        value: &ResolvedConstraintValue<'_, P, B>,
+    ) -> TypeExprValueCheck<'a> {
+        check_type_expr_value_inner_with_mode(
+            expected,
+            value.0,
+            self.as_provider_context(),
+            ValueCheckEvidence::Resolved,
+            if self.requires_provider_schemas() {
+                ProviderCustomTypeValidation::Loaded
+            } else {
+                ProviderCustomTypeValidation::Providerless
+            },
+        )
+    }
+
+    pub(crate) fn check_resolved_constraints_at<P: PlaceholderKind, B: BindingAddress>(
+        self,
+        expected: &TypeExpr,
+        value: &ResolvedConstraintValue<'_, P, B>,
+        site: super::deferred_types::ProviderTypeCheckSite,
+    ) -> Result<(), TypeExprValueError> {
+        let check = self.check_resolved_constraints(expected, value);
+        match self.session() {
+            Some(session) if !self.requires_provider_schemas() => check.record_at(session, site),
+            _ => check.require_provider_schemas(),
         }
     }
 
@@ -281,6 +367,9 @@ impl<'s> TypeExprValueCheck<'s> {
                         Self::Assignable | Self::Mismatch(_) => evidence,
                     })
                 }
+                Self::Mismatch(TypeExprValueError::InvalidAccess {
+                    error: crate::static_type::InferenceError::MissingEvidence(_),
+                }) => return check,
                 Self::Mismatch(_) => {}
             }
         }
@@ -420,17 +509,25 @@ impl fmt::Display for TypeExprValueError {
 ///
 /// Unresolved values defer until the binding/reference validation or
 /// evaluation phase that has their types.
+///
+/// Authored checks require evidence produced from the complete expression.
+/// There is no provisional variant that an authored caller can select.
+///
+/// ```compile_fail,E0603
+/// use carina_core::validation::typecheck::ValueCheckEvidence;
+/// let bypass = ValueCheckEvidence::Resolved;
+/// ```
 pub fn check_type_expr_value<'s, P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
     value: &Value<P, B>,
     config: &'s LoadedProviderContext,
-    inference: TypecheckInference<'_, P, B>,
+    inference: &JudgedExpr,
 ) -> TypeExprValueCheck<'s> {
     check_type_expr_value_inner_with_mode(
         expected,
         value,
         config.as_provider_context(),
-        inference,
+        ValueCheckEvidence::Authored(inference),
         ProviderCustomTypeValidation::Loaded,
     )
 }
@@ -444,13 +541,13 @@ pub fn check_type_expr_value_providerless<'s, P: PlaceholderKind, B: BindingAddr
     expected: &TypeExpr,
     value: &Value<P, B>,
     config: &'s ProviderContext,
-    inference: TypecheckInference<'_, P, B>,
+    inference: &JudgedExpr,
 ) -> TypeExprValueCheck<'s> {
     check_type_expr_value_inner_with_mode(
         expected,
         value,
         config,
-        inference,
+        ValueCheckEvidence::Authored(inference),
         ProviderCustomTypeValidation::Providerless,
     )
 }
@@ -465,13 +562,13 @@ fn check_type_expr_value_inner<'s, P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
     value: &Value<P, B>,
     config: TypecheckProviderContext<'s>,
-    inference: TypecheckInference<'_, P, B>,
+    inference: &JudgedExpr,
 ) -> TypeExprValueCheck<'s> {
     check_type_expr_value_inner_with_mode(
         expected,
         value,
         config.as_provider_context(),
-        inference,
+        ValueCheckEvidence::Authored(inference),
         if config.requires_provider_schemas() {
             ProviderCustomTypeValidation::Loaded
         } else {
@@ -499,11 +596,120 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
     expected: &TypeExpr,
     value: &Value<P, B>,
     config: &'s ProviderContext,
-    inference: TypecheckInference<'_, P, B>,
+    inference: ValueCheckEvidence<'_>,
     provider_custom_types: ProviderCustomTypeValidation,
 ) -> TypeExprValueCheck<'s> {
     use TypeExprValueCheck::{Assignable, Mismatch};
-    let check = |expected: &TypeExpr, value: &Value<P, B>| {
+    let ValueCheckEvidence::Authored(expression) = inference else {
+        return check_constraint_value(expected, value, config, inference, provider_custom_types);
+    };
+    let admission = crate::parser::retained::admit_with_context(
+        expression,
+        expected,
+        crate::parser::retained::AdmissionContext::Assignment,
+        config,
+    );
+    match admission {
+        Err(error) => {
+            // Concrete recursion may supply a more precise field/index diagnostic,
+            // but it can never turn a rejected admission into success or deferral.
+            let retains_children = matches!(
+                value,
+                Value::Deferred(DeferredValue::ModuleIf(_) | DeferredValue::Coalesce { .. })
+                    | Value::Concrete(ConcreteValue::List(_) | ConcreteValue::Map(_))
+            );
+            if matches!(
+                error,
+                crate::static_type::InferenceError::MissingEvidence(_)
+            ) || (!retains_children
+                && matches!(
+                    error,
+                    crate::static_type::InferenceError::HeterogeneousCollection { .. }
+                ))
+            {
+                return Mismatch(TypeExprValueError::InvalidAccess { error });
+            }
+            if retains_children {
+                let diagnostic = check_constraint_value(
+                    expected,
+                    value,
+                    config,
+                    inference,
+                    provider_custom_types,
+                );
+                if matches!(diagnostic, Mismatch(_)) {
+                    return diagnostic;
+                }
+            }
+            match expression.static_type() {
+                Ok(actual)
+                    if !value.is_fully_resolved()
+                        && matches!(
+                            inferred_type_assignment(expected, actual, &config.custom_types),
+                            crate::schema::TypeAssignability::Mismatch
+                        ) =>
+                {
+                    inferred_value_check(expected, actual, value, config)
+                }
+                _ => Mismatch(mismatch(expected, value)),
+            }
+        }
+        Ok(admission) => {
+            if matches!(
+                expression.static_type(),
+                Err(crate::static_type::InferenceIssue::NotInferable(
+                    crate::static_type::NotInferableReason::CustomTypeSchemaUnavailable { .. }
+                ))
+            ) {
+                return deferred_provider_check(expected, value);
+            }
+            if !value.is_fully_resolved()
+                && (expression.requires_declared_assignment()
+                    || (expression.is_string_construction()
+                        && admission
+                            == crate::parser::retained::ExpressionAdmission::DeferredInterpolation))
+            {
+                return match admission {
+                    crate::parser::retained::ExpressionAdmission::ProviderPending(_) => {
+                        deferred_provider_check(expected, value)
+                    }
+                    _ => Assignable,
+                };
+            }
+            let inference = if value.is_fully_resolved()
+                && (expression.is_value_dependent() || expression.requires_declared_assignment())
+            {
+                ValueCheckEvidence::Resolved
+            } else {
+                inference
+            };
+            check_constraint_value(expected, value, config, inference, provider_custom_types)
+        }
+    }
+}
+
+fn check_constraint_value<'s, P: PlaceholderKind, B: BindingAddress>(
+    expected: &TypeExpr,
+    value: &Value<P, B>,
+    config: &'s ProviderContext,
+    inference: ValueCheckEvidence<'_>,
+    provider_custom_types: ProviderCustomTypeValidation,
+) -> TypeExprValueCheck<'s> {
+    use TypeExprValueCheck::{Assignable, Mismatch};
+    let check_with = |expected: &TypeExpr,
+                      value: &Value<P, B>,
+                      evidence: Result<
+        ValueCheckEvidence<'_>,
+        crate::parser::retained::MissingEvidence,
+    >| {
+        let inference = match evidence {
+            Ok(inference) => inference,
+            Err(error) => {
+                return Mismatch(TypeExprValueError::InvalidAccess {
+                    error: error.into(),
+                });
+            }
+        };
         check_type_expr_value_inner_with_mode(
             expected,
             value,
@@ -512,6 +718,8 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
             provider_custom_types,
         )
     };
+    let check =
+        |expected: &TypeExpr, value: &Value<P, B>| check_with(expected, value, Ok(inference));
     if let TypeExpr::UnloadedSchemaType(_) = expected {
         return match super::resolve_type_expr(expected, config) {
             Ok(TypeExpr::UnloadedSchemaType(_)) => {
@@ -528,11 +736,13 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
                     ) => deferred_provider_check(expected, value),
                     Value::Concrete(_) => Mismatch(mismatch(expected, value)),
                     Value::Deferred(DeferredValue::Secret(inner)) => check(expected, inner),
-                    Value::Deferred(DeferredValue::ModuleIf(deferred)) => TypeExprValueCheck::all(
-                        deferred.values()[1..]
-                            .iter()
-                            .map(|value| check(expected, value)),
-                    ),
+                    Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                        TypeExprValueCheck::all(deferred.values()[1..].iter().enumerate().map(
+                            |(index, value)| {
+                                check_with(expected, value, inference.step(|e| e.branch(index)))
+                            },
+                        ))
+                    }
                     Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                         TypeExprValueCheck::all(
                             [value.as_ref(), default.as_ref()]
@@ -555,11 +765,9 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
     }
     match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
-            return TypeExprValueCheck::all(
-                deferred.values()[1..]
-                    .iter()
-                    .map(|branch| check(expected, branch)),
-            );
+            return TypeExprValueCheck::all(deferred.values()[1..].iter().enumerate().map(
+                |(index, branch)| check_with(expected, branch, inference.step(|e| e.branch(index))),
+            ));
         }
         Value::Deferred(DeferredValue::ResourceRef { .. }) => {
             return if matches!(expected, TypeExpr::StringLiteral(_) | TypeExpr::Ref(_)) {
@@ -575,72 +783,15 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => return Assignable,
-        Value::Deferred(DeferredValue::Access(_)) => {
-            let inferred = match inference {
-                TypecheckInference::Available { bindings, schemas } => {
-                    super::inference::infer_type_from_value_with_provider_context(
-                        value, bindings, schemas, config,
-                    )
-                }
-                TypecheckInference::Unavailable => {
-                    super::inference::infer_type_from_value_without_bindings(value)
-                }
-            };
-            return match inferred {
-                Ok(actual) => inferred_value_check(expected, &actual, value, config),
-                Err(crate::static_type::InferenceIssue::Failed(
-                    error @ (super::inference::InferenceError::InvalidAccess { .. }
-                    | super::inference::InferenceError::UnknownAttribute { .. }
-                    | super::inference::InferenceError::HeterogeneousCollection { .. }
-                    | super::inference::InferenceError::InvalidIntegerArithmeticOperand {
-                        ..
-                    }),
-                )) => Mismatch(TypeExprValueError::InvalidAccess { error }),
-                Err(crate::static_type::InferenceIssue::Failed(
-                    super::inference::InferenceError::UnknownType { .. }
-                    | super::inference::InferenceError::IncompatibleCoalesceTypes { .. }
-                    | super::inference::InferenceError::UnknownBinding { .. }
-                    | super::inference::InferenceError::CyclicVirtualBinding { .. },
-                )) => Assignable,
-                Err(crate::static_type::InferenceIssue::NotInferable(
-                    crate::static_type::NotInferableReason::CustomTypeSchemaUnavailable { .. },
-                )) => deferred_provider_check(expected, value),
-                Err(crate::static_type::InferenceIssue::NotInferable(
-                    crate::static_type::NotInferableReason::MissingValue
-                    | crate::static_type::NotInferableReason::PlaceholderTypeUnavailable { .. }
-                    | crate::static_type::NotInferableReason::NonInferableBinding { .. }
-                    | crate::static_type::NotInferableReason::SchemaUnavailable { .. },
-                )) => Assignable,
-            };
-        }
-        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
-            let inferred = match inference {
-                TypecheckInference::Available { bindings, schemas } => {
-                    super::inference::infer_type_from_value_with_provider_context(
-                        value, bindings, schemas, config,
-                    )
-                }
-                TypecheckInference::Unavailable => {
-                    super::inference::infer_type_from_value_without_bindings(value)
-                }
-            };
-            return match inferred {
-                Ok(actual) => inferred_value_check(expected, &actual, value, config),
-                Err(crate::static_type::InferenceIssue::Failed(error)) => {
-                    Mismatch(TypeExprValueError::InvalidAccess { error })
-                }
-                Err(crate::static_type::InferenceIssue::NotInferable(
-                    crate::static_type::NotInferableReason::CustomTypeSchemaUnavailable { .. },
-                )) if !matches!(
-                    inferred_type_assignment(expected, &TypeExpr::Int, &config.custom_types),
-                    crate::schema::TypeAssignability::Mismatch
-                ) =>
-                {
-                    deferred_provider_check(expected, value)
-                }
-                Err(crate::static_type::InferenceIssue::NotInferable(_)) => {
-                    Mismatch(mismatch(expected, value))
-                }
+        Value::Deferred(
+            DeferredValue::Access(_)
+            | DeferredValue::IntegerArithmetic(_)
+            | DeferredValue::Interpolation(_),
+        ) => {
+            // Static admission already consumed all authored operands and branches.
+            return match inference {
+                ValueCheckEvidence::Authored(_) => Assignable,
+                ValueCheckEvidence::Resolved => Mismatch(mismatch(expected, value)),
             };
         }
         Value::Deferred(DeferredValue::BindingRef { .. }) => return Assignable,
@@ -648,15 +799,15 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
             return TypeExprValueCheck::all(
                 [value.as_ref(), default.as_ref()]
                     .into_iter()
-                    .map(|value| check(expected, value)),
+                    .enumerate()
+                    .map(|(index, value)| {
+                        check_with(
+                            expected,
+                            value,
+                            inference.step(|e| e.coalesce_operand(index)),
+                        )
+                    }),
             );
-        }
-        Value::Deferred(DeferredValue::Interpolation(_)) => {
-            return if accepts_interpolation(expected) {
-                Assignable
-            } else {
-                Mismatch(mismatch(expected, value))
-            };
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
             return match check(expected, inner) {
@@ -706,7 +857,8 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
         TypeExpr::List(inner) => match value {
             Value::Concrete(ConcreteValue::List(items)) => {
                 TypeExprValueCheck::all(items.iter().enumerate().map(|(index, item)| {
-                    check(inner, item).prepend(TypeExprValuePathSegment::ListIndex(index))
+                    check_with(inner, item, inference.step(|e| e.element(index)))
+                        .prepend(TypeExprValuePathSegment::ListIndex(index))
                 }))
             }
             Value::Concrete(ConcreteValue::StringList(items)) => {
@@ -720,7 +872,8 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
         TypeExpr::Map(inner) => match value {
             Value::Concrete(ConcreteValue::Map(entries)) => {
                 TypeExprValueCheck::all(entries.iter().map(|(key, item)| {
-                    check(inner, item).prepend(TypeExprValuePathSegment::MapKey(key.clone()))
+                    check_with(inner, item, inference.step(|e| e.field(key)))
+                        .prepend(TypeExprValuePathSegment::MapKey(key.clone()))
                 }))
             }
             _ => Mismatch(mismatch(expected, value)),
@@ -816,8 +969,10 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
                 }
                 TypeExprValueCheck::all(fields.iter().map(|(field, field_type)| {
                     match entries.get(field) {
-                        Some(value) => check(field_type, value)
-                            .prepend(TypeExprValuePathSegment::StructField(field.clone())),
+                        Some(value) => {
+                            check_with(field_type, value, inference.step(|e| e.field(field)))
+                                .prepend(TypeExprValuePathSegment::StructField(field.clone()))
+                        }
                         None => Mismatch(TypeExprValueError::MissingStructField {
                             path: Vec::new(),
                             field: field.clone(),
@@ -865,11 +1020,12 @@ fn inferred_value_check<'s, P: PlaceholderKind, B: BindingAddress>(
 /// Internal parser seam preserving deferred provider evidence. The caller
 /// consumes the outcome using the authority carried by `config`; public
 /// validation and resolver APIs use the witness-carrying entry points above.
+#[cfg(test)]
 pub(crate) fn check_type_expr_value_with_context<'s, P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
     value: &Value<P, B>,
     config: TypecheckProviderContext<'s>,
-    inference: TypecheckInference<'_, P, B>,
+    inference: &JudgedExpr,
 ) -> TypeExprValueCheck<'s> {
     check_type_expr_value_inner(expected, value, config, inference)
 }
@@ -952,17 +1108,11 @@ fn custom_type_validation_mismatch<P: PlaceholderKind, B: BindingAddress>(
     }
 }
 
-fn accepts_interpolation(expected: &TypeExpr) -> bool {
-    expected.is_string_shaped()
-        || matches!(expected, TypeExpr::Ref(_))
-        || matches!(expected, TypeExpr::Union(members) if members.iter().any(accepts_interpolation))
-}
-
 fn is_qualified_enum_identifier(identifier: &str) -> bool {
     identifier.contains('.')
 }
 
-fn inferred_type_assignment<'s>(
+pub(crate) fn inferred_type_assignment<'s>(
     expected: &'s TypeExpr,
     actual: &'s TypeExpr,
     catalog: &crate::parser::ProviderCustomTypes,
@@ -1020,19 +1170,38 @@ mod tests {
     use crate::parser::ResourceTypePath;
     use crate::resource::{
         ApplyTimeUnknown, AuthoredConcreteValue as ConcreteValue,
-        AuthoredDeferredValue as DeferredValue, AuthoredInterpolationPart as InterpolationPart,
-        AuthoredValue as Value, CanonicalEnumValue, RelativeBindingName,
+        AuthoredDeferredValue as DeferredValue, AuthoredValue as Value, CanonicalEnumValue,
+        RelativeBindingName,
     };
     use crate::schema::TypeIdentity;
 
     fn check(expected: &TypeExpr, value: &Value) -> Result<(), TypeExprValueError> {
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let missing = crate::parser::retained::value_dependent_judgement_for_test();
         check_type_expr_value_inner(
             expected,
             value,
-            TypecheckProviderContext::for_parser(&ProviderContext::new(
-                crate::EnvironmentSnapshot::empty(),
-            )),
-            TypecheckInference::Unavailable,
+            TypecheckProviderContext::for_parser(&config),
+            &missing,
+        )
+        .require_provider_schemas()
+    }
+
+    fn check_source(expected: &TypeExpr, source: &str) -> Result<(), TypeExprValueError> {
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_and_resolve(source).unwrap();
+        let schemas = crate::schema::SchemaRegistry::new();
+        let loaded = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config);
+        let expression = loaded
+            .judged()
+            .report()
+            .binding(&RelativeBindingName::new("result"))
+            .unwrap();
+        check_type_expr_value_inner(
+            expected,
+            &loaded.parsed().variables["result"],
+            TypecheckProviderContext::for_parser(&config),
+            expression,
         )
         .require_provider_schemas()
     }
@@ -1068,9 +1237,79 @@ mod tests {
             expected,
             value,
             TypecheckProviderContext::for_parser(config),
-            TypecheckInference::Unavailable,
+            &crate::parser::retained::value_dependent_judgement_for_test(),
         )
         .require_provider_schemas()
+    }
+
+    #[test]
+    fn inline_named_sink_consumes_judge_policy() {
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_and_resolve(
+            "let source = test.r.typed {}\nlet constructed = \"${source.name}\"\n",
+        )
+        .unwrap();
+        let report = crate::parser::retained::judge_expressions(
+            &parsed,
+            &crate::schema::SchemaRegistry::new(),
+            &config,
+        );
+        let expression = report
+            .binding(&RelativeBindingName::new("constructed"))
+            .unwrap();
+        let expected = TypeExpr::SchemaType {
+            owned: crate::parser::OwnedTypeIdentity::provider(
+                "test",
+                TypeIdentity::new(Some("test"), ["r"], "RoleName"),
+                crate::schema::RefinedScalarKind::String,
+            )
+            .unbounded_witness_for_test(),
+        };
+        let judged = crate::parser::retained::admit_expression(expression, &expected).is_ok();
+        let location = parsed
+            .parser_binding_metadata
+            .syntax()
+            .expressions()
+            .binding(&RelativeBindingName::new("constructed"))
+            .unwrap()
+            .location();
+        let inline = check_type_expr_value_inner(
+            &expected,
+            &parsed.variables["constructed"],
+            TypecheckProviderContext::for_parser(&config),
+            report.expression(location).unwrap(),
+        )
+        .require_provider_schemas()
+        .is_ok();
+        assert_eq!(inline, judged, "inline admission diverged from the judge");
+    }
+
+    #[test]
+    fn nested_interpolation_consumes_each_child_judgement() {
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_and_resolve("let source = test.r.Typed {}\nlet items = [\"${source.name}\"]\nlet fields = { key = \"${source.name}\" }\n").unwrap();
+        let expected = TypeExpr::SchemaType {
+            owned: crate::parser::OwnedTypeIdentity::provider(
+                "test",
+                TypeIdentity::new(Some("test"), ["r"], "RoleName"),
+                crate::schema::RefinedScalarKind::String,
+            )
+            .unbounded_witness_for_test(),
+        };
+        let report = parsed.expression_report();
+        for (name, sink) in [
+            ("items", TypeExpr::List(Box::new(expected.clone()))),
+            ("fields", TypeExpr::Map(Box::new(expected.clone()))),
+        ] {
+            let result = check_type_expr_value_inner(
+                &sink,
+                &parsed.variables[name],
+                TypecheckProviderContext::for_parser(&config),
+                report.binding(&RelativeBindingName::new(name)).unwrap(),
+            )
+            .require_provider_schemas();
+            assert!(result.is_ok(), "{name}: {result:?}");
+        }
     }
 
     #[test]
@@ -1118,7 +1357,7 @@ mod tests {
                 expected,
                 value,
                 &config,
-                TypecheckInference::Unavailable,
+                &crate::parser::retained::value_dependent_judgement_for_test(),
             )
         };
         let value = Value::Concrete(ConcreteValue::Int(3));
@@ -1177,13 +1416,13 @@ mod tests {
             &expected,
             &value,
             TypecheckProviderContext::for_parser(&config),
-            TypecheckInference::Unavailable,
+            &crate::parser::retained::value_dependent_judgement_for_test(),
         );
         let providerless = check_type_expr_value_providerless(
             &expected,
             &value,
             &config,
-            TypecheckInference::Unavailable,
+            &crate::parser::retained::value_dependent_judgement_for_test(),
         );
         assert_eq!(providerless, unloaded);
         assert!(
@@ -1218,7 +1457,7 @@ mod tests {
                         &expected,
                         &value,
                         &config,
-                        TypecheckInference::Unavailable,
+                        &crate::parser::retained::value_dependent_judgement_for_test(),
                     ),
                     TypeExprValueCheck::Mismatch(_)
                 ),
@@ -1245,7 +1484,7 @@ mod tests {
             &expected,
             &string("account"),
             &config,
-            TypecheckInference::Unavailable,
+            &crate::parser::retained::value_dependent_judgement_for_test(),
         );
         assert!(
             matches!(&result, TypeExprValueCheck::Mismatch(_)),
@@ -1374,72 +1613,26 @@ mod tests {
         assert!(crate::parser::IdentifiedCustomTypeDeclaration::new(&declaration).is_none());
     }
 
-    fn split_result_element_access() -> Value {
-        use crate::resource::{PathSegment, Subscript};
-
-        crate::resource::apply_postfix_access(
-            Value::Deferred(DeferredValue::FunctionCall {
-                name: crate::builtins::BuiltinFunction::split,
-                args: vec![
-                    string("/").into(),
-                    Value::resource_ref("role", "arn", vec![]).into(),
-                ],
-                source_line: (0).into(),
-            }),
-            PathSegment::Subscript {
-                index: Subscript::Int { index: 1 },
-            },
-            0,
-            crate::resource::AccessMissPolicy::Error,
-        )
-        .unwrap()
-    }
-
     #[test]
     fn postfix_access_uses_inferred_element_type_for_typecheck() {
-        let value = split_result_element_access();
+        let source = "let role = mock.test.Source {}\nlet result = split('/', role.arn)[1]";
 
-        check(&TypeExpr::String, &value).expect("an element of split() is assignable to String");
-        check(&TypeExpr::Int, &value).expect_err("an element of split() is not assignable to Int");
+        check_source(&TypeExpr::String, source)
+            .expect("an element of split() is assignable to String");
+        check_source(&TypeExpr::Int, source)
+            .expect_err("an element of split() is not assignable to Int");
     }
 
     #[test]
     fn postfix_access_on_known_type_rejects_incompatible_step() {
-        use crate::resource::{PathSegment, Subscript};
+        let list_with_string_key =
+            "let q = mock.test.Source {}\nlet result = split('/', q.identifier)['key']";
+        let field_on_string = "let q = mock.test.Source {}\nlet result = upper(q.identifier).field";
 
-        let list_with_string_key = crate::resource::apply_postfix_access(
-            Value::Deferred(DeferredValue::FunctionCall {
-                name: crate::builtins::BuiltinFunction::split,
-                args: vec![
-                    string("/").into(),
-                    Value::resource_ref("q", "identifier", vec![]).into(),
-                ],
-                source_line: (0).into(),
-            }),
-            PathSegment::Subscript {
-                index: Subscript::Str { key: "key".into() },
-            },
-            1,
-            crate::resource::AccessMissPolicy::Error,
-        )
-        .unwrap();
-        let field_on_string = crate::resource::apply_postfix_access(
-            Value::Deferred(DeferredValue::FunctionCall {
-                name: crate::builtins::BuiltinFunction::upper,
-                args: vec![Value::resource_ref("q", "identifier", vec![]).into()],
-                source_line: (0).into(),
-            }),
-            PathSegment::Field {
-                name: "field".to_string(),
-            },
-            1,
-            crate::resource::AccessMissPolicy::Error,
-        )
-        .unwrap();
-
-        check(&TypeExpr::String, &list_with_string_key)
+        check_source(&TypeExpr::String, list_with_string_key)
             .expect_err("a string key cannot select from list(String)");
-        check(&TypeExpr::String, &field_on_string).expect_err("a String does not expose fields");
+        check_source(&TypeExpr::String, field_on_string)
+            .expect_err("a String does not expose fields");
     }
 
     fn all_type_shapes() -> Vec<TypeExpr> {
@@ -1483,14 +1676,14 @@ mod tests {
             &expected,
             &value,
             TypecheckProviderContext::for_parser(&config),
-            TypecheckInference::Unavailable,
+            &crate::parser::retained::value_dependent_judgement_for_test(),
         )
         .require_provider_schemas();
         let providerless = check_type_expr_value_providerless(
             &expected,
             &value,
             &config,
-            TypecheckInference::Unavailable,
+            &crate::parser::retained::value_dependent_judgement_for_test(),
         );
 
         assert!(matches!(unloaded,
@@ -1524,7 +1717,7 @@ mod tests {
                 TypecheckProviderContext::for_session(session).check(
                     expected,
                     value,
-                    TypecheckInference::Unavailable,
+                    &crate::parser::retained::value_dependent_judgement_for_test(),
                 )
             },
         )
@@ -1755,9 +1948,7 @@ mod tests {
             .is_ok()
         );
 
-        let interpolation = Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Literal("value".into()),
-        ]));
+        let interpolation = "let q = mock.test.Source {}\nlet result = \"value${q.identifier}\"";
         for expected in [
             TypeExpr::String,
             crate::parser::bare_type_for_test("ipv4_address".to_string()),
@@ -1775,7 +1966,7 @@ mod tests {
                 TypeExpr::String,
             ]),
         ] {
-            assert!(check(&expected, &interpolation).is_ok(), "{expected}");
+            assert!(check_source(&expected, interpolation).is_ok(), "{expected}");
         }
         for expected in [
             TypeExpr::Bool,
@@ -1791,7 +1982,10 @@ mod tests {
                 TypeExpr::StringLiteral("prod".to_string()),
             ]),
         ] {
-            assert!(check(&expected, &interpolation).is_err(), "{expected}");
+            assert!(
+                check_source(&expected, interpolation).is_err(),
+                "{expected}"
+            );
         }
     }
 

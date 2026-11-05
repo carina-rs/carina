@@ -1696,10 +1696,20 @@ impl<S, B: BindingAddress> DeferredForExpression<S, ParserPlaceholder, ParserPla
     fn into_expanded(
         self,
         schemas: &crate::schema::SchemaRegistry,
-        bindings: &crate::validation::inference::InferenceBindings<ParserPlaceholder, B>,
-        context: &super::ProviderContext,
+        report: &super::retained::ExpressionReport<B>,
+        _context: &super::ProviderContext,
     ) -> Result<DeferredForExpression<S, NoPlaceholder, LoopSlot, B>, crate::resource::ExpansionError>
     {
+        let element_type = match self.site().iterable_location {
+            Some(location) => directive_element_type(
+                report
+                    .for_resource(self.template_resource_id())?
+                    .expression(location)?,
+            ),
+            // Runtime/saved template constructors have no authored iterable;
+            // their directives carry the previously checked loop-slot types.
+            None => None,
+        };
         let Self {
             location,
             header,
@@ -1709,7 +1719,6 @@ impl<S, B: BindingAddress> DeferredForExpression<S, ParserPlaceholder, ParserPla
             template_resource,
             deferred_effect_id: _,
         } = self;
-        let element_type = directive_element_type(&iterable, bindings, schemas, context);
         let template_resource = template_resource.try_map_resource(|resource| {
             resource.into_loop_template(schemas, element_type.as_ref())
         })?;
@@ -2894,6 +2903,31 @@ pub struct AttributeParameter<
 }
 
 impl<P: ValueKind, B: BindingAddress> AttributeParameter<TypeExpr, P, B> {
+    pub(crate) fn with_name_location(mut self, location: super::DeclarationLocation) -> Self {
+        self.source.name_location = location;
+        self
+    }
+    pub fn name_location(&self) -> &super::DeclarationLocation {
+        &self.source.name_location
+    }
+
+    pub(crate) fn with_value_location(mut self, location: super::DeclarationLocation) -> Self {
+        self.source.value_location = Some(location);
+        self
+    }
+    pub fn value_location(&self) -> Option<&super::DeclarationLocation> {
+        self.source.value_location.as_ref()
+    }
+    pub(crate) fn attach_judgement(&mut self, report: &super::retained::ExpressionReport<B>) {
+        self.source.judgement = self
+            .source
+            .value_location
+            .as_ref()
+            .ok_or_else(|| super::retained::MissingEvidence::new("declaration value location"))
+            .and_then(|location| report.expression(location))
+            .cloned();
+    }
+
     pub fn type_check_location(&self) -> &super::DeclarationLocation {
         &self.source.location
     }
@@ -2919,13 +2953,15 @@ impl<P: ValueKind, B: BindingAddress> AttributeParameter<TypeExpr, P, B> {
         type_expr: Option<TypeExpr>,
         value: Option<Value<P, B>>,
     ) -> Self {
-        Self::new_in_source(
+        let mut parameter = Self::new_in_source(
             name,
             type_expr,
             value.map(BoundaryExpression::Value),
             SourceSpan::dummy(),
             ModuleCallId::test_dummy_in("test.crn").location,
-        )
+        );
+        parameter.source.judgement = Ok(super::retained::value_dependent_judgement_for_test());
+        parameter
     }
 
     pub fn source_span(&self) -> SourceSpan {
@@ -2938,6 +2974,12 @@ impl<P: ValueKind, B: BindingAddress> AttributeParameter<TypeExpr, P, B> {
 }
 
 impl<T, P: ValueKind, B: BindingAddress> AttributeParameter<T, P, B> {
+    pub fn judgement(
+        &self,
+    ) -> Result<&super::retained::JudgedExpr, &super::retained::MissingEvidence> {
+        self.source.judgement.as_ref()
+    }
+
     pub(crate) fn value_for_module_if_audit(&self) -> Option<&Value<P, B>> {
         let Self {
             name: _name,
@@ -2998,6 +3040,26 @@ pub struct ParsedExportParam<
 }
 
 impl<P: ValueKind, B: BindingAddress> ParsedExportParam<P, B> {
+    pub(crate) fn with_name_location(mut self, location: super::DeclarationLocation) -> Self {
+        self.source.name_location = location;
+        self
+    }
+    pub fn name_location(&self) -> &super::DeclarationLocation {
+        &self.source.name_location
+    }
+
+    pub(crate) fn with_value_location(mut self, location: super::DeclarationLocation) -> Self {
+        self.source.value_location = Some(location);
+        self
+    }
+    pub fn value_location(&self) -> Option<&super::DeclarationLocation> {
+        self.source.value_location.as_ref()
+    }
+    pub fn judgement(
+        &self,
+    ) -> Result<&super::retained::JudgedExpr, &super::retained::MissingEvidence> {
+        self.source.judgement.as_ref()
+    }
     pub fn type_check_location(&self) -> &super::DeclarationLocation {
         &self.source.location
     }
@@ -3023,13 +3085,15 @@ impl<P: ValueKind, B: BindingAddress> ParsedExportParam<P, B> {
         type_expr: Option<TypeExpr>,
         value: Option<Value<P, B>>,
     ) -> Self {
-        Self::new_in_source(
+        let mut parameter = Self::new_in_source(
             name,
             type_expr,
             value.map(BoundaryExpression::Value),
             SourceSpan::dummy(),
             ModuleCallId::test_dummy_in("test.crn").location,
-        )
+        );
+        parameter.source.judgement = Ok(super::retained::value_dependent_judgement_for_test());
+        parameter
     }
 
     pub fn source_span(&self) -> SourceSpan {
@@ -3086,6 +3150,9 @@ pub trait ExportParamLike<P: ValueKind = ParserPlaceholder, B: BindingAddress = 
     fn type_expr_opt(&self) -> Option<&TypeExpr>;
     fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr>;
     fn inference_failed(&self) -> bool;
+    fn value_location(&self) -> Option<&super::DeclarationLocation>;
+    fn judgement(&self) -> Result<&super::retained::JudgedExpr, &super::retained::MissingEvidence>;
+    fn attach_judgement(&mut self, report: &super::retained::ExpressionReport<B>);
     /// Authored export location retained across parser and inference phases.
     fn source_location(&self) -> Option<(&std::path::Path, SourceSpan)> {
         None
@@ -3095,6 +3162,21 @@ pub trait ExportParamLike<P: ValueKind = ParserPlaceholder, B: BindingAddress = 
 impl<P: ValueKind + PartialEq, B: BindingAddress> ExportParamLike<P, B>
     for ParsedExportParam<P, B>
 {
+    fn value_location(&self) -> Option<&super::DeclarationLocation> {
+        self.source.value_location.as_ref()
+    }
+    fn judgement(&self) -> Result<&super::retained::JudgedExpr, &super::retained::MissingEvidence> {
+        self.source.judgement.as_ref()
+    }
+    fn attach_judgement(&mut self, report: &super::retained::ExpressionReport<B>) {
+        self.source.judgement = self
+            .source
+            .value_location
+            .as_ref()
+            .ok_or_else(|| super::retained::MissingEvidence::new("declaration value location"))
+            .and_then(|location| report.expression(location))
+            .cloned();
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -3901,6 +3983,7 @@ pub enum BareBindingKind {
 /// lookup. This data is parser-only and never enters [`Value`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BareBindingUse {
+    pub(crate) expression_instance: super::retained::ExpressionInstance,
     pub(in crate::parser) location: super::DeclarationLocation,
     pub source_file: SourceFileId,
     pub scope: BindingScopeId,
@@ -3973,6 +4056,12 @@ impl From<&BindingUseOwner> for BindingUseOwnerKey {
 }
 
 impl<B: BindingAddress> ParsedBindingUses<B> {
+    pub(crate) fn in_instance(&mut self, scope: &crate::resource::ModuleInstanceScope) {
+        for record in &mut self.records {
+            record.authored.expression_instance =
+                super::retained::ExpressionInstance::for_scope(scope);
+        }
+    }
     pub(crate) fn record(
         &mut self,
         authored: BareBindingUse,
@@ -4690,15 +4779,20 @@ pub(crate) struct DeclarationSource {
     pub(crate) file: PathBuf,
     pub(crate) span: SourceSpan,
     location: super::DeclarationLocation,
+    value_location: Option<super::DeclarationLocation>,
+    name_location: super::DeclarationLocation,
+    judgement: Result<super::retained::JudgedExpr, super::retained::MissingEvidence>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils", feature = "test-support"))]
 impl Default for DeclarationSource {
     fn default() -> Self {
-        Self::authored(
+        let mut source = Self::authored(
             SourceSpan::dummy(),
             ModuleCallId::test_dummy_in("test.crn").location,
-        )
+        );
+        source.judgement = Ok(super::retained::value_dependent_judgement_for_test());
+        source
     }
 }
 
@@ -4707,7 +4801,10 @@ impl DeclarationSource {
         Self {
             file: location.file().path().to_path_buf(),
             span,
+            name_location: location.clone(),
             location,
+            value_location: None,
+            judgement: super::retained::missing_judgement(),
         }
     }
 }
@@ -5791,6 +5888,9 @@ impl<P: ValueKind + PartialEq, B: BindingAddress> PartialEq for InferredExportPa
 }
 
 impl<P: ValueKind, B: BindingAddress> InferredExportParam<P, B> {
+    pub fn name_location(&self) -> &super::DeclarationLocation {
+        &self.source.name_location
+    }
     pub(crate) fn from_parsed(
         parameter: &ParsedExportParam<P, B>,
         static_type: ExportStaticType,
@@ -5813,10 +5913,7 @@ impl<P: ValueKind, B: BindingAddress> InferredExportParam<P, B> {
             name: name.into(),
             static_type,
             value,
-            source: DeclarationSource::authored(
-                SourceSpan::dummy(),
-                ModuleCallId::test_dummy_in("test.crn").location,
-            ),
+            source: DeclarationSource::default(),
         }
     }
     pub fn source_span(&self) -> SourceSpan {
@@ -5833,6 +5930,21 @@ impl<P: ValueKind, B: BindingAddress> InferredExportParam<P, B> {
 impl<P: ValueKind + PartialEq, B: BindingAddress> ExportParamLike<P, B>
     for InferredExportParam<P, B>
 {
+    fn value_location(&self) -> Option<&super::DeclarationLocation> {
+        self.source.value_location.as_ref()
+    }
+    fn judgement(&self) -> Result<&super::retained::JudgedExpr, &super::retained::MissingEvidence> {
+        self.source.judgement.as_ref()
+    }
+    fn attach_judgement(&mut self, report: &super::retained::ExpressionReport<B>) {
+        self.source.judgement = self
+            .source
+            .value_location
+            .as_ref()
+            .ok_or_else(|| super::retained::MissingEvidence::new("declaration value location"))
+            .and_then(|location| report.expression(location))
+            .cloned();
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -7506,16 +7618,9 @@ where
     }
 }
 
-fn directive_element_type<B: BindingAddress>(
-    iterable: &Value<ParserPlaceholder, B>,
-    bindings: &crate::validation::inference::InferenceBindings<ParserPlaceholder, B>,
-    schemas: &crate::schema::SchemaRegistry,
-    context: &super::ProviderContext,
-) -> Option<TypeExpr> {
-    match crate::validation::inference::infer_type_from_value(iterable, bindings, schemas, context)
-        .ok()?
-    {
-        TypeExpr::List(element) | TypeExpr::Map(element) => Some(*element),
+fn directive_element_type(expression: &super::retained::JudgedExpr) -> Option<TypeExpr> {
+    match expression.static_type().ok()? {
+        TypeExpr::List(element) | TypeExpr::Map(element) => Some(*element.clone()),
         _ => None,
     }
 }
@@ -7531,26 +7636,20 @@ where
         boundary: ParserPlaceholderBoundary,
         schemas: &crate::schema::SchemaRegistry,
         context: &super::ProviderContext,
-    ) -> Vec<crate::resource::DirectiveResolutionError> {
+    ) -> Result<Vec<crate::resource::DirectiveResolutionError>, super::retained::MissingEvidence>
+    {
         let allow_arguments = boundary == ParserPlaceholderBoundary::ModuleDefinition;
         let arguments = self
             .arguments
             .iter()
             .map(|argument| (argument.name.as_str(), &argument.static_type))
             .collect();
-        let bindings = crate::validation::inference::bindings_from_parsed(self);
+        let report = self.expression_report();
         let mut seen = HashSet::new();
-        self.iter_all_resources()
-            .flat_map(|resource| {
-                let (
-                    id,
-                    directives,
-                    kind,
-                    loop_template,
-                    element_type,
-                    argument_iterable,
-                    iterable,
-                ) = match resource {
+        let mut errors = Vec::new();
+        for resource in self.iter_all_resources() {
+            let (id, directives, kind, loop_template, element_type, argument_iterable, iterable) =
+                match resource {
                     ResourceRef::Resource(resource) => (
                         &resource.id,
                         Some(&resource.directives),
@@ -7576,7 +7675,19 @@ where
                             Some(resource.directives()),
                             crate::schema::SchemaKind::Resource,
                             true,
-                            directive_element_type(iterable, &bindings, schemas, context),
+                            match self
+                                .deferred_for_sites()
+                                .find(|site| std::ptr::eq(site.iterable, iterable))
+                                .ok_or_else(|| {
+                                    super::retained::MissingEvidence::new("deferred iterable site")
+                                })?
+                                .iterable_location
+                            {
+                                Some(location) => directive_element_type(
+                                    report.for_resource(resource.id())?.expression(location)?,
+                                ),
+                                None => None,
+                            },
                             super::contains_module_argument_matching(iterable, &mut |_| true),
                             Some(iterable),
                         )
@@ -7591,35 +7702,31 @@ where
                         None,
                     ),
                 };
-                directives
-                    .into_iter()
-                    .flat_map(|directives| {
-                        directives.resolution_errors(
-                            id,
-                            crate::resource::ProviderDirectiveSchema::for_id(schemas, id, kind),
-                            loop_template && !allow_arguments,
+            if let Some(directives) = directives {
+                for mut error in directives.resolution_errors(
+                    id,
+                    crate::resource::ProviderDirectiveSchema::for_id(schemas, id, kind),
+                    loop_template && !allow_arguments,
+                    element_type.as_ref(),
+                    iterable,
+                    context,
+                ) {
+                    if allow_arguments
+                        && error.pending_bool_module_argument(
+                            &arguments,
                             element_type.as_ref(),
-                            iterable,
-                            context,
+                            argument_iterable,
                         )
-                    })
-                    .filter_map(|mut error| {
-                        if allow_arguments
-                            && error.pending_bool_module_argument(
-                                &arguments,
-                                element_type.as_ref(),
-                                argument_iterable,
-                            )
-                        {
-                            None
-                        } else {
-                            Some(error)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .filter(|error| seen.insert(error.diagnostic_key()))
-            .collect()
+                    {
+                        continue;
+                    }
+                    if seen.insert(error.diagnostic_key()) {
+                        errors.push(error);
+                    }
+                }
+            }
+        }
+        Ok(errors)
     }
 }
 
@@ -8381,12 +8488,12 @@ impl<E: IntoExpandedExportParam<AbsoluteBindingAddress>>
             ParserPlaceholderBoundary::ExpandedFile,
             schemas,
             context,
-        );
+        )?;
         if !directive_errors.is_empty() {
             return Err(crate::resource::DirectiveResolutionErrors::new(directive_errors).into());
         }
-        let directive_bindings = crate::validation::inference::bindings_from_parsed(&self);
         self.validate_expansion_boundary(ParserPlaceholderBoundary::ExpandedFile)?;
+        let directive_report = self.expression_report().clone();
 
         let File {
             providers,
@@ -8472,7 +8579,7 @@ impl<E: IntoExpandedExportParam<AbsoluteBindingAddress>>
                         .expressions
                         .into_iter()
                         .map(|expression| {
-                            expression.into_expanded(schemas, &directive_bindings, context)
+                            expression.into_expanded(schemas, &directive_report, context)
                         })
                         .collect::<Result<_, _>>()?,
                 ),
@@ -9867,7 +9974,11 @@ mod substitute_placeholder_tests {
             .unwrap()
             .into_expanded(
                 &crate::schema::SchemaRegistry::new(),
-                &std::collections::HashMap::new(),
+                &crate::parser::retained::judge_expressions(
+                    &crate::parser::RootBindingResolvedParsedFile::default(),
+                    &crate::schema::SchemaRegistry::new(),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                ),
                 &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .unwrap();
