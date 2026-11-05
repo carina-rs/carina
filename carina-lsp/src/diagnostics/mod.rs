@@ -1871,20 +1871,16 @@ impl DiagnosticRun<'_> {
                                     },
                                     _value,
                                 ) => None,
-                                // Lists use the path-tagged collector below, including
-                                // nested lists whose leaf error needs every index.
+                                // Collections use the path-tagged collector below,
+                                // including count bounds and nested leaf errors.
                                 (
                                     carina_core::schema::Shape::List { .. },
                                     Value::Concrete(ConcreteValue::List(_)),
-                                ) => None,
-                                // Validate Map value types
-                                (
+                                )
+                                | (
                                     carina_core::schema::Shape::Map { .. },
                                     Value::Concrete(ConcreteValue::Map(_)),
-                                ) if !contains_struct => effective_attribute
-                                    .validate(attr_value)
-                                    .err()
-                                    .map(|e| e.with_attribute(attr_name).to_string()),
+                                ) => None,
                                 // Validate Union static values (non-ResourceRef, non-BindingRef).
                                 // Ref-shaped values are unresolved at this
                                 // checkpoint and must not be type-checked
@@ -1935,19 +1931,18 @@ impl DiagnosticRun<'_> {
                             // carina#3349 — a raw match arm would silently
                             // drop `Ref` and skip the entire pass.
                             if contains_struct
-                                || (matches!(
-                                    effective_type.shape(),
-                                    carina_core::schema::Shape::List {
-                                        element_type: _,
-                                        ordered: _,
-                                        constraints: _
-                                    }
-                                ) && matches!(
-                                    attr_value,
-                                    Value::Concrete(
-                                        ConcreteValue::List(_) | ConcreteValue::StringList(_)
+                                || matches!(
+                                    (effective_type.shape(), attr_value),
+                                    (
+                                        carina_core::schema::Shape::List { .. },
+                                        Value::Concrete(
+                                            ConcreteValue::List(_) | ConcreteValue::StringList(_)
+                                        )
+                                    ) | (
+                                        carina_core::schema::Shape::Map { .. },
+                                        Value::Concrete(ConcreteValue::Map(_))
                                     )
-                                ))
+                                )
                             {
                                 let (nested_diagnostics, reported_duplicate) = self
                                     .validate_container_value(

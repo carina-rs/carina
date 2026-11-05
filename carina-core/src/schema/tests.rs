@@ -32,6 +32,178 @@ use crate::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
 
+fn map_entries(count: usize) -> Value {
+    Value::Concrete(ConcreteValue::Map(
+        (0..count)
+            .map(|index| (format!("key_{index}"), string_value("value")))
+            .collect(),
+    ))
+}
+
+#[test]
+fn map_length_max_accepts_ten_entries() {
+    let map = AttributeType::refined_map(
+        AttributeType::string(),
+        AttributeType::string(),
+        Some((None, Some(10))),
+    );
+    let value = map_entries(10);
+    assert!(map.validate(&value).is_ok());
+    assert!(Schema::flat(map).validate_collect(&value).is_empty());
+}
+
+#[test]
+fn map_length_max_rejects_eleven_entries() {
+    let map = AttributeType::refined_map(
+        AttributeType::string(),
+        AttributeType::string(),
+        Some((None, Some(10))),
+    );
+    let value = map_entries(11);
+    let error = map
+        .validate(&value)
+        .expect_err("11 entries must exceed max 10");
+    assert!(matches!(
+        error,
+        TypeError::LengthOutOfRange {
+            length: 11,
+            min: None,
+            max: Some(10),
+            attribute: None,
+            ..
+        }
+    ));
+    assert!(
+        error
+            .to_string()
+            .contains("length 11 is outside allowed range [, 10]")
+    );
+    let errors = Schema::flat(map).validate_collect(&value);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(matches!(
+        errors[0].1,
+        TypeError::LengthOutOfRange { length: 11, .. }
+    ));
+}
+
+#[test]
+fn map_length_min_rejects_too_few_entries() {
+    let map = AttributeType::refined_map(
+        AttributeType::string(),
+        AttributeType::string(),
+        Some((Some(2), None)),
+    );
+    assert!(map.validate(&map_entries(2)).is_ok());
+    let value = map_entries(1);
+    assert!(matches!(
+        map.validate(&value),
+        Err(TypeError::LengthOutOfRange {
+            length: 1,
+            min: Some(2),
+            max: None,
+            ..
+        })
+    ));
+    let errors = Schema::flat(map).validate_collect(&value);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+}
+
+#[test]
+fn map_length_unbounded_preserves_validation() {
+    for map in [
+        AttributeType::map(AttributeType::string()),
+        AttributeType::refined_map(AttributeType::string(), AttributeType::string(), None),
+    ] {
+        for count in [0, 11, 100] {
+            let value = map_entries(count);
+            assert!(map.validate(&value).is_ok());
+            assert!(
+                Schema::flat(map.clone())
+                    .validate_collect(&value)
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[test]
+fn map_length_is_checked_for_every_validation_purpose() {
+    let map = AttributeType::refined_map(
+        AttributeType::string(),
+        AttributeType::string(),
+        Some((Some(1), Some(10))),
+    );
+    for purpose in [
+        CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+        CanonicalizationPurpose::ProviderConfig {
+            provider_name: "mock",
+        },
+        CanonicalizationPurpose::WaitRhs,
+        CanonicalizationPurpose::Desired(DesiredValueSource::ProviderOutput),
+        CanonicalizationPurpose::State,
+    ] {
+        for count in [0, 11] {
+            assert!(
+                fit_value_to_type_on_path(
+                    &map,
+                    &map_entries(count),
+                    empty_defs_for_schema_walks(),
+                    FieldAncestry::WRITABLE,
+                    purpose,
+                    &mut Vec::new(),
+                )
+                .is_none(),
+                "{count} entries must fail the map bound"
+            );
+        }
+    }
+}
+
+#[test]
+fn map_length_collector_keeps_entry_errors() {
+    let map = AttributeType::refined_map(
+        AttributeType::string(),
+        AttributeType::string(),
+        Some((None, Some(0))),
+    );
+    let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "key".into(),
+        Value::Concrete(ConcreteValue::Int(7)),
+    )])));
+    let errors = Schema::flat(map).validate_collect(&value);
+    assert!(
+        errors
+            .iter()
+            .any(|(_, error)| matches!(error, TypeError::LengthOutOfRange { length: 1, .. })),
+        "{errors:?}"
+    );
+    assert!(errors.iter().any(|(_, error)| matches!(error, TypeError::MapValueError { inner, .. } if matches!(inner.as_ref(), TypeError::TypeMismatch { .. }))), "{errors:?}");
+}
+
+#[test]
+fn map_length_schema_admission_matches_list_for_inverted_bounds() {
+    let length = Some((Some(10), Some(1)));
+    let list = ValidatedConfigSchema::validate(BTreeMap::from([(
+        "value".into(),
+        PatternAttributeType::refined_list(
+            PatternAttributeType::string(),
+            true,
+            length,
+            ListElements::AllowDuplicates,
+        ),
+    )]));
+    let map = ValidatedConfigSchema::validate(BTreeMap::from([(
+        "value".into(),
+        PatternAttributeType::refined_map(
+            PatternAttributeType::string(),
+            PatternAttributeType::string(),
+            length,
+        ),
+    )]));
+    assert!(list.is_ok(), "List currently admits inverted length bounds");
+    assert!(map.is_ok(), "Map must follow List schema admission");
+}
+
 // Stage A storage/admission tests; stage B judgement tests are separate.
 mod assignability_edges_stage_a {
     use crate::schema::{
@@ -9682,9 +9854,11 @@ fn contains_unrefined_primitive(attr: &AttributeType) -> bool {
             ..
         } => true,
         AttrTypeKind::List { element_type, .. } => contains_unrefined_primitive(element_type),
-        AttrTypeKind::Map { key, value } => {
-            contains_unrefined_primitive(key) || contains_unrefined_primitive(value)
-        }
+        AttrTypeKind::Map {
+            key,
+            value,
+            constraints: _,
+        } => contains_unrefined_primitive(key) || contains_unrefined_primitive(value),
         AttrTypeKind::Union(members) => members
             .as_raw_slice()
             .iter()

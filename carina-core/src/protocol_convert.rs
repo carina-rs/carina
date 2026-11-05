@@ -730,7 +730,7 @@ fn protocol_to_type_identity(identity: &str) -> TypeIdentity {
     TypeIdentity::from_dotted(identity)
 }
 
-/// Project one aggregate provider-schema witness onto the version-21 envelope.
+/// Project one aggregate provider-schema witness onto the version-22 envelope.
 pub fn provider_schema_to_protocol(
     witness: &ValidatedProviderSchemaWitness,
 ) -> Result<protocol::ProviderSchemaEnvelope, ProtocolConvertError> {
@@ -793,7 +793,7 @@ fn protocol_to_assignability_edge(
     .map_err(SchemaDecodeError::InvalidProviderSchema)
 }
 
-/// Decode the version-21 provider-schema envelope and jointly admit resource,
+/// Decode the version-22 provider-schema envelope and jointly admit resource,
 /// config, reference-form, and assignability declarations.
 pub fn protocol_to_provider_schema_witness(
     envelope: &protocol::ProviderSchemaEnvelope,
@@ -1020,9 +1020,14 @@ pub fn attribute_type_to_protocol(
             elements: constraints.elements(),
             validate: None,
         }),
-        RawShape::Map { key, value } => Ok(protocol::AttributeType::Map {
+        RawShape::Map {
+            key,
+            value,
+            constraints,
+        } => Ok(protocol::AttributeType::Map {
             inner: Box::new(attribute_type_to_protocol(value)?),
             key: Box::new(attribute_type_to_protocol(key)?),
+            length: constraints.length(),
         }),
         RawShape::Struct {
             name,
@@ -1475,9 +1480,10 @@ pub fn protocol_to_attribute_type(
                 *elements,
             ))
         }
-        protocol::AttributeType::Map { inner, key } => Ok(DraftAttributeType::map_with_key(
+        protocol::AttributeType::Map { inner, key, length } => Ok(DraftAttributeType::refined_map(
             protocol_to_attribute_type(key)?,
             protocol_to_attribute_type(inner)?,
+            *length,
         )),
         protocol::AttributeType::Struct {
             name,
@@ -1736,6 +1742,7 @@ fn protocol_legacy_custom_to_core(
         protocol::AttributeType::Map {
             inner: _base_inner,
             key: _base_key,
+            length: _base_length,
         } => Err(SchemaDecodeError::unsupported_custom_base(
             enclosing_name,
             "Map",
@@ -3172,6 +3179,66 @@ mod tests {
     };
 
     #[test]
+    fn map_length_round_trip_through_protocol_json() {
+        for length in [Some((Some(0), Some(10))), Some((Some(2), None)), None] {
+            let wire = serde_json::from_value(serde_json::json!({
+                "type": "map", "inner": {"type": "String"},
+                "key": {"type": "String"}, "length": length,
+            }))
+            .unwrap();
+            let schema =
+                protocol_to_config_schema(BTreeMap::from([("value".into(), wire)])).unwrap();
+            let original = &schema.parts()["value"];
+            let wire = attribute_type_to_protocol(original).unwrap();
+            let json = serde_json::to_value(&wire).unwrap();
+            assert_eq!(json["length"], serde_json::to_value(length).unwrap());
+            let decoded_wire = serde_json::from_value(json.clone()).unwrap();
+            let decoded =
+                protocol_to_config_schema(BTreeMap::from([("value".into(), decoded_wire)]))
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(
+                    attribute_type_to_protocol(&decoded.parts()["value"]).unwrap()
+                )
+                .unwrap(),
+                json
+            );
+        }
+    }
+
+    #[test]
+    fn map_length_missing_json_decodes_as_unbounded() {
+        let wire = serde_json::from_value(serde_json::json!({
+            "type": "map", "inner": {"type": "String"}, "key": {"type": "String"},
+        }))
+        .unwrap();
+        let schema = protocol_to_config_schema(BTreeMap::from([("value".into(), wire)])).unwrap();
+        let value: Value = Value::Concrete(ConcreteValue::Map(
+            (0..11)
+                .map(|i| {
+                    (
+                        format!("key_{i}"),
+                        Value::Concrete(ConcreteValue::String("value".into())),
+                    )
+                })
+                .collect(),
+        ));
+        assert!(
+            schema
+                .rootless_type("value")
+                .unwrap()
+                .validate(&value)
+                .is_ok()
+        );
+        assert!(
+            serde_json::to_value(attribute_type_to_protocol(&schema.parts()["value"]).unwrap())
+                .unwrap()
+                .get("length")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn list_elements_refinements_round_trip_through_json() {
         use crate::schema::ListElements;
         for elements in [ListElements::AllowDuplicates, ListElements::Unique] {
@@ -4524,6 +4591,7 @@ mod tests {
             (
                 "map",
                 protocol::AttributeType::Map {
+                    length: None,
                     inner: Box::new(identity_struct()),
                     key: Box::new(protocol::AttributeType::String {
                         pattern: None,
@@ -4640,6 +4708,7 @@ mod tests {
                 RawShape::Map {
                     key: _key,
                     value: _value,
+                    constraints: _constraints,
                 } => panic!("unexpected Map builtin wire shape for {identity}"),
                 RawShape::Struct {
                     name: _name,

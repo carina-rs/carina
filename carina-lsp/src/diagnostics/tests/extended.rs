@@ -17390,6 +17390,133 @@ fn reference_constraints_validate_offline_in_a_directory_configuration() {
 }
 
 #[test]
+fn map_length_diagnostics_in_directory_configuration() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    let params = AttributeType::refined_map(
+        AttributeType::string(),
+        AttributeType::string(),
+        Some((Some(0), Some(10))),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Request")
+            .attribute(AttributeSchema::required("params", params).build())
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    for count in [10, 11] {
+        let entries = (0..count)
+            .map(|i| format!("    key_{i} = 'value'\n"))
+            .collect::<String>();
+        let source = format!("mock.Request {{\n  params = {{\n{entries}  }}\n}}\n");
+        std::fs::write(directory.path().join("main.crn"), &source).unwrap();
+        let diagnostics = analyze_with_buffer(&engine, directory.path(), "main.crn", &source);
+        if count == 10 {
+            assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        } else {
+            let errors = diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+            assert!(errors[0].message.contains("params"), "{diagnostics:#?}");
+            assert!(
+                errors[0]
+                    .message
+                    .contains("length 11 is outside allowed range [0, 10]"),
+                "{diagnostics:#?}"
+            );
+            // The duplicate Warning for the same error is carina-rs/carina#4265.
+            assert!(
+                diagnostics.iter().all(|diagnostic| diagnostic
+                    .message
+                    .contains("length 11 is outside allowed range [0, 10]")),
+                "{diagnostics:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn map_and_list_length_diagnostics_keep_whole_resource_errors() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ListElements, ResourceSchema};
+    let length = Some((Some(1), Some(2)));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Request")
+            .attribute(
+                AttributeSchema::required(
+                    "params",
+                    AttributeType::refined_map(
+                        AttributeType::string(),
+                        AttributeType::string(),
+                        length,
+                    ),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::required(
+                    "items",
+                    AttributeType::refined_list(
+                        AttributeType::string(),
+                        true,
+                        length,
+                        ListElements::AllowDuplicates,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    for count in [0, 1, 2, 3] {
+        let entries = (0..count)
+            .map(|index| format!("key_{index} = 'value' "))
+            .collect::<String>();
+        let items = vec!["'value'"; count].join(", ");
+        let source =
+            format!("mock.Request {{\n  params = {{ {entries}}}\n  items = [{items}]\n}}\n");
+        let diagnostics = engine.analyze(&create_document(&source), None);
+        if (1..=2).contains(&count) {
+            assert!(diagnostics.is_empty(), "{count}: {diagnostics:#?}");
+            continue;
+        }
+        let severities_for = |attribute| {
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains(&format!("'{attribute}'")))
+                .map(|diagnostic| diagnostic.severity)
+                .collect::<Vec<_>>()
+        };
+        let map_severities = severities_for("params");
+        assert_eq!(map_severities, severities_for("items"), "{diagnostics:#?}");
+        assert_eq!(
+            map_severities
+                .iter()
+                .filter(|severity| **severity == Some(DiagnosticSeverity::ERROR))
+                .count(),
+            1,
+            "{count}: {diagnostics:#?}"
+        );
+        assert!(
+            diagnostics.iter().all(|diagnostic| diagnostic
+                .message
+                .contains(&format!("length {count} is outside allowed range [1, 2]"))),
+            "{count}: {diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
 fn non_string_interpolation_sinks_across_files() {
     let engine = coalesce_resource_engine();
     for source in [

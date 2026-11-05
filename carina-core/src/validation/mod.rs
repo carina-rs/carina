@@ -296,7 +296,11 @@ impl<'a> RefSink<'a> {
                     validate: _,
                     to_dsl: _,
                 }
-                | Shape::Map { key: _, value: _ }
+                | Shape::Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Shape::Struct { name: _ }
                 | Shape::Bool
                 | Shape::Duration => None,
@@ -343,6 +347,7 @@ impl<'a> RefSink<'a> {
                 Shape::Map {
                     value: inner,
                     key: _,
+                    constraints: _,
                 } => Some(Self::EffectiveType {
                     attr_type: inner,
                     defs,
