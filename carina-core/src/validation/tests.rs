@@ -322,12 +322,29 @@ fn authored_expression_judges_coalesce_before_enclosing_reduction() {
             .binding(&RelativeBindingName::new("result"))
             .unwrap()
             .static_type();
-        if !matches!(
-            result,
-            Err(crate::static_type::InferenceIssue::Failed(
-                inference::InferenceError::IncompatibleCoalesceTypes { .. }
-            ))
-        ) {
+        let expected_failure = if expression.starts_with("secret(") {
+            for rendered in [
+                result.as_ref().unwrap_err().to_string(),
+                format!("{result:?}"),
+            ] {
+                assert!(!rendered.contains("present"), "{rendered}");
+                assert!(!rendered.contains("42"), "{rendered}");
+            }
+            matches!(
+                result,
+                Err(crate::static_type::InferenceIssue::Failed(
+                    inference::InferenceError::InsideSecret { .. }
+                ))
+            )
+        } else {
+            matches!(
+                result,
+                Err(crate::static_type::InferenceIssue::Failed(
+                    inference::InferenceError::IncompatibleCoalesceTypes { .. }
+                ))
+            )
+        };
+        if !expected_failure {
             missed.push(format!("{expression}: {result:?}"));
         }
     }
@@ -3478,23 +3495,29 @@ fn postfix_function_result_type_is_checked_against_resource_attribute_type() {
 
 #[test]
 fn secret_preserves_its_argument_type_through_postfix_access() {
-    let parsed = crate::parser::parse(
-        r#"
-            let q = mock.test.Queue { identifier = "a-b" }
-            mock.test.Consumer {
-                value = secret(split("-", q.identifier))[0]
-            }
-        "#,
-        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-    )
-    .expect("secret-wrapped computed collection must parse");
     let (_, schemas) = postfix_access_validation_fixture(
         Value::Concrete(ConcreteValue::String("unused".into())),
         PatternAttributeType::string(),
     );
-
-    validate_resource_ref_types_for_test(&parsed, &schemas)
-        .expect("secret(list(String))[0] must infer as String");
+    for collection in [
+        r#"secret(split("-", q.identifier))"#,
+        r#"secret(secret(split("-", q.identifier)))"#,
+        "private_values",
+    ] {
+        let parsed = crate::parser::parse(
+            &format!(
+                r#"
+                    let q = mock.test.Queue {{ identifier = "a-b" }}
+                    let private_values = secret(split("-", q.identifier))
+                    mock.test.Consumer {{ value = {collection}[0] }}
+                "#,
+            ),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("secret-wrapped computed collection must parse");
+        validate_resource_ref_types_for_test(&parsed, &schemas)
+            .unwrap_or_else(|error| panic!("{collection}[0] must infer as String: {error}"));
+    }
 }
 
 #[test]

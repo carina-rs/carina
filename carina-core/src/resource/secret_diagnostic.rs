@@ -26,6 +26,12 @@ impl<E: InsideSecret> InsideSecret for Vec<E> {
     }
 }
 
+impl<A: InsideSecret, B: InsideSecret> InsideSecret for (A, B) {
+    fn inside_secret(self) -> Self {
+        (self.0.inside_secret(), self.1.inside_secret())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SecretDiagnosticError<E> {
     Public(E),

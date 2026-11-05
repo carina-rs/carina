@@ -239,6 +239,16 @@ pub enum SecretRehydrationError {
     Serialization(#[from] SerializationError),
 }
 
+impl InsideSecret for SecretRehydrationError {
+    fn inside_secret(self) -> Self {
+        match self {
+            Self::UnavailableSecret(error) => Self::UnavailableSecret(error.inside_secret()),
+            Self::Serialization(error) => Self::Serialization(error.inside_secret()),
+            error => error,
+        }
+    }
+}
+
 /// A rehydration failure annotated with its saved-plan location.
 #[derive(Debug)]
 pub struct SecretRehydrationSiteError {
@@ -870,29 +880,10 @@ fn serialize_secret_payload<P: crate::resource::StateValueLeaf>(
     persist_secrets: bool,
     encoding: JsonEncoding,
 ) -> Result<serde_json::Value, SerializationError> {
-    serialize_secret_plaintext(
-        secret.expose_plaintext(),
-        previous,
-        persist_secrets,
-        encoding,
-    )
-    .map_err(InsideSecret::inside_secret)
-}
-
-fn serialize_secret_plaintext<P: crate::resource::StateValueLeaf>(
-    value: &Value<P>,
-    previous: Option<PersistedView<'_>>,
-    persist_secrets: bool,
-    encoding: JsonEncoding,
-) -> Result<serde_json::Value, SerializationError> {
     if persist_secrets {
-        let plaintext = crate::resource::state_value_snapshot(value).to_value_at("secret")?;
-        let previous = previous.and_then(PersistedView::redacted_secret_hash);
-        Ok(persisted_secret_json(
-            &RedactedSecretHash::reuse_or_generate(&plaintext, previous.as_ref())?,
-        ))
+        secret.try_inspect(|value| persist_secret_json(value, previous))
     } else {
-        value_to_json_inner(value, None, false, encoding)
+        secret.try_inspect(|value| value_to_json_inner(value, None, false, encoding))
     }
 }
 
@@ -900,15 +891,28 @@ fn serialize_secret_plaintext<P: crate::resource::StateValueLeaf>(
 ///
 /// This is the single digest-selection point for state writeback. Callers walk
 /// containers and pass the previous value at the same path.
-pub(crate) fn persist_secret_json(
-    plaintext: &Value,
+pub(crate) fn persist_secret_json<P: crate::resource::StateValueLeaf>(
+    plaintext: &Value<P>,
     previous: Option<PersistedView<'_>>,
 ) -> Result<serde_json::Value, SerializationError> {
     let previous = previous.and_then(PersistedView::redacted_secret_hash);
-    Ok(persisted_secret_json(
-        &RedactedSecretHash::reuse_or_generate(plaintext, previous.as_ref())
-            .map_err(SerializationError::inside_secret)?,
-    ))
+    crate::resource::SecretPayload::from(Box::new(crate::resource::state_value_snapshot(plaintext)))
+        .try_inspect(|value| {
+            Ok(persisted_secret_json(&hash_secret_value(
+                &value.to_value_at("secret")?,
+                previous.as_ref(),
+            )?))
+        })
+}
+
+fn hash_secret_value<P: PlaceholderKind>(
+    value: &Value<P>,
+    previous: Option<&RedactedSecretHash>,
+) -> Result<RedactedSecretHash, SerializationError> {
+    match value {
+        Value::Deferred(DeferredValue::Secret(payload)) => payload.hash(previous),
+        value => crate::resource::SecretPayload::from(Box::new(value.clone())).hash(previous),
+    }
 }
 
 fn persisted_secret_json(hash: &RedactedSecretHash) -> serde_json::Value {
@@ -2261,10 +2265,7 @@ fn merge_secrets_into_observation_json_inner(
                     .ok_or(SerializationError::SecretNotAllowed {
                         context: SerializationContext::StateWriteback,
                     })?;
-            persist_secret_json(
-                &observed_value.to_value_at("provider observation")?,
-                previous,
-            )
+            persist_secret_json(&observed_value, previous)
         }
         Value::Concrete(ConcreteValue::Map(desired_map)) => {
             let Some(observed_map) = observed.as_map() else {
@@ -2334,10 +2335,7 @@ fn mask_mismatched_observation_shape(
         .ok_or(SerializationError::SecretNotAllowed {
             context: SerializationContext::StateWriteback,
         })?;
-    persist_secret_json(
-        &observed_value.to_value_at("provider observation")?,
-        previous,
-    )
+    persist_secret_json(&observed_value, previous)
 }
 
 fn merge_secrets_into_provider_json_inner(
@@ -2347,8 +2345,9 @@ fn merge_secrets_into_provider_json_inner(
 ) -> Result<serde_json::Value, SerializationError> {
     match desired {
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            if !secret_value_requires_provider_material(inner.expose_plaintext()) {
-                return persist_secret_json(inner.expose_plaintext(), previous);
+            if !inner.visit(secret_value_requires_provider_material) {
+                let previous = previous.and_then(PersistedView::redacted_secret_hash);
+                return Ok(persisted_secret_json(&inner.hash(previous.as_ref())?));
             }
             if provider.is_redacted_secret() {
                 return Ok(provider.to_owned_json());
@@ -2359,7 +2358,7 @@ fn merge_secrets_into_provider_json_inner(
                     .ok_or(SerializationError::SecretNotAllowed {
                         context: SerializationContext::StateWriteback,
                     })?;
-            persist_secret_json(&provider_value.to_value_at("provider response")?, previous)
+            persist_secret_json(&provider_value, previous)
         }
         Value::Concrete(ConcreteValue::Map(desired_map)) => {
             if let Some(provider_map) = provider.as_map() {
@@ -2449,7 +2448,7 @@ fn secret_value_requires_provider_material(value: &Value) -> bool {
                 || secret_value_requires_provider_material(default)
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            secret_value_requires_provider_material(inner.expose_plaintext())
+            inner.visit(secret_value_requires_provider_material)
         }
         Value::Concrete(ConcreteValue::List(values)) => {
             values.iter().any(secret_value_requires_provider_material)
@@ -2481,9 +2480,12 @@ fn redact_snapshot_secrets<P: PlaceholderKind>(
     value: &SnapshotValue<P>,
 ) -> Result<SnapshotValue<P>, SerializationError> {
     match value {
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            redact_secret_leaf(&inner.expose_plaintext().to_value_at("secret")?)
-        }
+        Value::Deferred(DeferredValue::Secret(inner)) => inner.try_inspect(|value| {
+            Ok(SnapshotValue::redacted(hash_secret_value(
+                &value.to_value_at("secret")?,
+                None,
+            )?))
+        }),
         Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { .. })) => {
             Ok(value.clone())
         }
@@ -2584,14 +2586,6 @@ fn redact_secrets_only<P: PlaceholderKind>(
     value: &Value<P>,
 ) -> Result<SnapshotValue<P>, SerializationError> {
     redact_snapshot_secrets(&value.to_snapshot())
-}
-
-fn redact_secret_leaf<P: PlaceholderKind>(
-    inner: &Value<P>,
-) -> Result<SnapshotValue<P>, SerializationError> {
-    Ok(SnapshotValue::redacted(
-        RedactedSecretHash::reuse_or_generate(inner, None)?,
-    ))
 }
 
 /// Canonical hash material for a secret that is still deferred. Tags keep
@@ -2762,7 +2756,7 @@ fn canonical_secret_template<P: PlaceholderKind>(
             tagged("access", JsonValue::Object(encoded))
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            canonical_secret_template(inner.expose_plaintext())?
+            inner.try_inspect(canonical_secret_template)?
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => tagged(
             "unknown",
@@ -3024,13 +3018,8 @@ impl<'a> SecretRedactionGuide<'a> {
             return None;
         }
         match self {
-            Self::Evaluated(Value::Deferred(DeferredValue::Secret(inner))) => {
-                Some(inner.expose_plaintext())
-            }
-            _ => Some(match source {
-                Value::Deferred(DeferredValue::Secret(inner)) => inner.expose_plaintext(),
-                _ => source,
-            }),
+            Self::Evaluated(value @ Value::Deferred(DeferredValue::Secret(_))) => Some(value),
+            _ => Some(source),
         }
     }
 
@@ -3096,9 +3085,10 @@ fn redact_with_guide(
 ) -> Result<SnapshotValue, SerializationError> {
     if let Some(secret_value) = guide.secret_value(source) {
         let previous = guide.previous_hash();
-        return Ok(SnapshotValue::redacted(
-            RedactedSecretHash::reuse_or_generate(secret_value, previous.as_ref())?,
-        ));
+        return Ok(SnapshotValue::redacted(hash_secret_value(
+            secret_value,
+            previous.as_ref(),
+        )?));
     }
 
     match source {
@@ -3176,12 +3166,13 @@ fn redact_snapshot_with_guide(
     if guide.protects_whole_value(matches!(source, Value::Deferred(DeferredValue::Secret(_)))) {
         // Sensitivity covers the complete value, including plaintext siblings
         // of existing hashes. Only an evaluated guide can supply missing material.
-        if let SecretRedactionGuide::Evaluated(Value::Deferred(DeferredValue::Secret(inner))) =
+        if let SecretRedactionGuide::Evaluated(value @ Value::Deferred(DeferredValue::Secret(_))) =
             guide
         {
-            return redact_with_guide(inner.expose_plaintext(), guide);
+            return redact_with_guide(value, guide);
         }
-        return redact_with_guide(&source.to_value_at("state")?, guide);
+        return crate::resource::SecretPayload::from(Box::new(source.clone()))
+            .try_inspect(|source| redact_with_guide(&source.to_value_at("state")?, guide));
     }
     match source {
         Value::Concrete(ConcreteValue::Map(values)) => {
@@ -3496,26 +3487,33 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
         )
         && let Value::Deferred(DeferredValue::Secret(inner)) = candidate
     {
-        rehydrate_redacted_secrets_impl(
-            saved,
-            inner.expose_plaintext(),
-            SecretRehydrationInput::EvaluatedHashMaterial,
-        )?;
+        inner.try_inspect(|value| {
+            rehydrate_redacted_secrets_impl(
+                saved,
+                value,
+                SecretRehydrationInput::EvaluatedHashMaterial,
+            )
+        })?;
         return Ok(candidate.clone());
     }
 
     match saved {
         Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { .. })) => {
-            let hash_material = match input {
-                SecretRehydrationInput::Evaluated => match candidate {
-                    Value::Deferred(DeferredValue::Secret(inner)) => inner.expose_plaintext(),
-                    _ => return Err(SecretRehydrationError::ExpectedSecret),
-                },
-                SecretRehydrationInput::EvaluatedHashMaterial
-                | SecretRehydrationInput::Plaintext => candidate,
-            };
+            if input == SecretRehydrationInput::Evaluated {
+                let Value::Deferred(DeferredValue::Secret(inner)) = candidate else {
+                    return Err(SecretRehydrationError::ExpectedSecret);
+                };
+                inner.try_inspect(|value| {
+                    rehydrate_redacted_secrets_impl(
+                        saved,
+                        value,
+                        SecretRehydrationInput::EvaluatedHashMaterial,
+                    )
+                })?;
+                return Ok(candidate.clone());
+            }
             if find_unavailable_evaluation(
-                hash_material,
+                candidate,
                 UnavailableCoalescePolicy::IncludeDefault,
                 UnavailableSecretPolicy::Include,
             )
@@ -3523,7 +3521,7 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
             {
                 return Err(SecretRehydrationError::EvaluationUnavailable);
             }
-            if !saved.verify_secret(hash_material)? {
+            if !saved.verify_secret(candidate)? {
                 return Err(SecretRehydrationError::HashMismatch);
             }
             Ok(candidate.clone())
@@ -6517,17 +6515,11 @@ fn first_enum_identifier_inner<H: ValueKind, B: BindingAddress>(
         Value::Concrete(ConcreteValue::Map(map)) => map
             .values()
             .find_map(|value| first_enum_identifier_inner(value, scope)),
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            let mut result = None;
-            inner.visit(|secret_value, scope| {
-                let _ = scope;
-                result = Some(first_enum_identifier_inner(
-                    secret_value,
-                    DiagnosticScope::Secret,
-                ));
-            });
-            result.expect("secret visit")
-        }
+        Value::Deferred(DeferredValue::Secret(inner)) => inner
+            .try_inspect(|value| {
+                first_enum_identifier_inner(value, DiagnosticScope::Secret).ok_or(())
+            })
+            .ok(),
         Value::Deferred(DeferredValue::Access(access)) => {
             first_enum_identifier_inner(access.base(), scope)
         }
@@ -11632,8 +11624,12 @@ mod tests {
     fn separate_saved_plan_placeholders_get_distinct_random_salts() {
         let inner = Value::Concrete(ConcreteValue::String("SAME_IMPORT_SECRET".into()));
         assert_ne!(
-            RedactedSecretHash::reuse_or_generate(&inner, None).unwrap(),
-            RedactedSecretHash::reuse_or_generate(&inner, None).unwrap(),
+            crate::resource::SecretPayload::from(Box::new(inner.clone()))
+                .hash(None)
+                .unwrap(),
+            crate::resource::SecretPayload::from(Box::new(inner.clone()))
+                .hash(None)
+                .unwrap(),
             "independent placeholders must not reveal equal plaintexts",
         );
     }
@@ -15405,6 +15401,182 @@ mod secret_template_regression_tests {
 #[cfg(test)]
 mod unknown_secret_diagnostic_tests {
     use super::*;
+
+    fn invalid_secret() -> Value {
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::Float(f64::INFINITY))).into(),
+        ))
+    }
+
+    fn assert_masked_hash_error(error: SerializationError) {
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains("value: inf"), "{rendered}");
+        }
+        assert!(
+            matches!(
+                error,
+                SerializationError::InsideSecret {
+                    kind: SecretSerializationErrorKind::NonFiniteFloat,
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    fn unavailable_provider_material() -> PersistedValue {
+        PersistedValue {
+            encoded: serde_json::json!({
+                "private_hash_path": persisted_secret_json(&RedactedSecretHash::generate(b"valid")),
+            }),
+        }
+    }
+
+    fn assert_masked_unavailable(error: SerializationError) {
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains("private_hash_path"), "{rendered}");
+        }
+        assert!(
+            matches!(error, SerializationError::UnavailableSecret(error) if error.path() == "(secret)")
+        );
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_observation_hashing_masks_unavailable_paths() {
+        assert_masked_unavailable(
+            merge_secrets_into_observation_json(
+                &invalid_secret(),
+                &unavailable_provider_material(),
+                None,
+            )
+            .unwrap_err(),
+        );
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_provider_hashing_masks_unavailable_paths() {
+        let desired = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::root_resource_ref("producer", "private_attr", vec![])).into(),
+        ));
+        assert_masked_unavailable(
+            merge_secrets_into_provider_json(&desired, &unavailable_provider_material(), None)
+                .unwrap_err(),
+        );
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_mismatched_observation_hashing_masks_unavailable_paths() {
+        assert_masked_unavailable(
+            mask_mismatched_observation_shape(
+                &invalid_secret(),
+                unavailable_provider_material().view(),
+                None,
+            )
+            .unwrap_err(),
+        );
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_provider_secret_hashing_masks_unavailable_paths() {
+        assert_masked_unavailable(
+            crate::provider::hash_provider_json_as_secret(&unavailable_provider_material(), None)
+                .unwrap_err(),
+        );
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_snapshot_hashing_masks_errors() {
+        assert_masked_hash_error(redact_secrets_in_value(&invalid_secret()).unwrap_err());
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_guided_hashing_masks_errors() {
+        let plain = Value::Concrete(ConcreteValue::Float(f64::INFINITY)).to_snapshot();
+        let shape = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("authority".into()))).into(),
+        ));
+        assert_masked_hash_error(redact_plaintext_using_secret_shape(&plain, &shape).unwrap_err());
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_guided_hashing_masks_unavailable_paths() {
+        let source: SnapshotValue = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "private_hash_path".into(),
+            SnapshotValue::redacted(RedactedSecretHash::generate(b"valid")),
+        )])));
+        let shape = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("authority".into()))).into(),
+        ));
+        let error = redact_plaintext_using_secret_shape(&source, &shape).unwrap_err();
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains("private_hash_path"), "{rendered}");
+        }
+        assert!(
+            matches!(error, SerializationError::UnavailableSecret(error) if error.path() == "(secret)")
+        );
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_evaluated_hashing_masks_errors() {
+        let source = Value::Concrete(ConcreteValue::String("source".into())).to_snapshot();
+        assert_masked_hash_error(
+            redact_snapshot_with_guide(&source, SecretRedactionGuide::Evaluated(&invalid_secret()))
+                .unwrap_err(),
+        );
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_template_hashing_masks_nested_errors() {
+        let value: Value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::Float(f64::INFINITY))).into(),
+        ));
+        let error = canonical_secret_template(&value).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SerializationError::InsideSecret {
+                    kind: SecretSerializationErrorKind::NonFiniteFloat,
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_rehydration_masks_hashing_errors() {
+        let saved = SnapshotValue::redacted(RedactedSecretHash::generate(b"valid"));
+        let error = rehydrate_redacted_secrets_impl(
+            &saved,
+            &invalid_secret(),
+            SecretRehydrationInput::Evaluated,
+        )
+        .unwrap_err();
+        let SecretRehydrationError::Serialization(error) = error else {
+            panic!("{error:?}")
+        };
+        assert_masked_hash_error(error);
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_structural_rehydration_masks_hashing_errors() {
+        let saved: SnapshotValue =
+            Value::Concrete(ConcreteValue::List(vec![SnapshotValue::redacted(
+                RedactedSecretHash::generate(b"valid"),
+            )]));
+        let candidate: Value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Float(f64::INFINITY),
+            )])))
+            .into(),
+        ));
+        let error =
+            rehydrate_redacted_secrets_impl(&saved, &candidate, SecretRehydrationInput::Evaluated)
+                .unwrap_err();
+        let SecretRehydrationError::Serialization(error) = error else {
+            panic!("{error:?}")
+        };
+        assert_masked_hash_error(error);
+    }
+
     #[test]
     fn secret_origin_4275_unknown_secret_keeps_upstream_reason() {
         let path =

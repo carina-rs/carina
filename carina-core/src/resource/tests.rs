@@ -51,6 +51,42 @@ fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
 }
 
 #[test]
+fn secret_origin_4275_round2_fully_resolved_check_masks_secret_path() {
+    let reference = Value::root_resource_ref("private_producer", "private_attr", vec![]);
+    let public_error = assert_value_fully_resolved(&reference).unwrap_err();
+    assert!(
+        public_error
+            .to_string()
+            .contains("private_producer.private_attr")
+    );
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(reference).into()));
+    let error = assert_value_fully_resolved(&secret).unwrap_err();
+    for rendered in [error.to_string(), format!("{error:?}")] {
+        assert!(!rendered.contains("private_"), "{rendered}");
+    }
+    assert!(matches!(
+        error,
+        crate::value::SerializationError::InsideSecret { .. }
+    ));
+}
+
+#[test]
+fn secret_origin_4275_round2_deferred_projection_keeps_payload_opaque() {
+    let value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::root_resource_ref(
+            "private_producer",
+            "private_attr",
+            vec![],
+        ))
+        .into(),
+    ));
+    let projected = value.as_deferred().unwrap();
+    assert!(matches!(projected, DeferredValueRef::Secret(_)));
+    let rendered = format!("{projected:?}");
+    assert!(!rendered.contains("private_"), "{rendered}");
+}
+
+#[test]
 fn desired_leaf_deferral_keeps_containers_structural() {
     let reference = Value::root_resource_ref("peer", "id", vec![]);
     let unknown = Value::Deferred(DeferredValue::Unknown(

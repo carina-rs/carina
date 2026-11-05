@@ -402,9 +402,7 @@ fn contains_deferred_user_function_call(value: &Value) -> bool {
             )
         }),
         Value::Deferred(DeferredValue::Secret(value)) => {
-            let mut found = false;
-            value.visit(|value, _scope| found = contains_deferred_user_function_call(value));
-            found
+            value.visit(contains_deferred_user_function_call)
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             contains_deferred_user_function_call(access.base())
@@ -520,7 +518,7 @@ pub(crate) fn contains_module_argument_matching<B: BindingAddress>(
             matches!(part, crate::resource::InterpolationPart::Expr(value) if contains_module_argument_matching(value, predicate))
         }),
         GenericValue::Deferred(DeferredValue::Secret(inner)) => {
-            { let mut result = None; inner.visit(|secret_value, scope| { let _ = scope; result = Some(contains_module_argument_matching(secret_value, predicate)); }); result.expect("secret visit") }
+            inner.visit(|secret_value| { contains_module_argument_matching(secret_value, predicate) })
         }
         GenericValue::Deferred(DeferredValue::Coalesce { value, default }) => {
             contains_module_argument_matching(value, predicate)
@@ -1396,7 +1394,7 @@ pub fn contains_function_call(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
             matches!(part, crate::resource::InterpolationPart::Expr(value) if contains_function_call(value))
         }),
-        Value::Deferred(DeferredValue::Secret(inner)) => { let mut result = None; inner.visit(|secret_value, scope| { let _ = scope; result = Some(contains_function_call(secret_value)); }); result.expect("secret visit") },
+        Value::Deferred(DeferredValue::Secret(inner)) => { inner.visit(|secret_value| { contains_function_call(secret_value) }) },
         Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
             contains_function_call(expression.lhs()) || contains_function_call(expression.rhs())
         }

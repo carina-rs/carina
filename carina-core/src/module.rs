@@ -598,7 +598,7 @@ impl RootConfigSignature {
             }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 // Mirror deps::collect_dependencies for secret-wrapped values.
-                inner.visit(|value, _scope| {
+                inner.visit(|value| {
                     Self::collect_typed_dependencies(from, attr_key, value, graph, binding_types)
                 });
             }
@@ -1222,7 +1222,7 @@ impl ModuleSignature {
             }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 // Mirror deps::collect_dependencies for secret-wrapped values.
-                inner.visit(|value, _scope| {
+                inner.visit(|value| {
                     Self::collect_typed_dependencies(
                         from,
                         attr_key,

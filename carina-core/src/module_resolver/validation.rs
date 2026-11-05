@@ -868,12 +868,7 @@ fn is_recursively_concrete<P: PlaceholderKind, B: BindingAddress>(value: &Value<
         Value::Concrete(ConcreteValue::List(items)) => items.iter().all(is_recursively_concrete),
         Value::Concrete(ConcreteValue::Map(map)) => map.values().all(is_recursively_concrete),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            let mut result = None;
-            inner.visit(|secret_value, scope| {
-                let _ = scope;
-                result = Some(is_recursively_concrete(secret_value));
-            });
-            result.expect("secret visit")
+            inner.visit(|secret_value| is_recursively_concrete(secret_value))
         }
         Value::Concrete(_) => true,
         Value::Deferred(_) => false,
@@ -927,15 +922,7 @@ impl<P: PlaceholderKind, B: BindingAddress> EvalValue<P, B> {
         match self {
             Self::Value(Value::Concrete(ConcreteValue::Bool(value))) => Ok(value),
             Self::Value(Value::Deferred(DeferredValue::Secret(payload))) => {
-                let mut result = None;
-                payload.visit(|value, scope| {
-                    result = Some(
-                        EvalValue::Value(value.clone())
-                            .bool(context)
-                            .map_err(|error| scope.protect_error(error)),
-                    )
-                });
-                result.expect("secret visit")
+                payload.try_inspect(|value| EvalValue::Value(value.clone()).bool(context))
             }
             other => Err(format!(
                 "{context} must be boolean, got {}",
@@ -947,15 +934,7 @@ impl<P: PlaceholderKind, B: BindingAddress> EvalValue<P, B> {
         match self {
             Self::Value(Value::Concrete(ConcreteValue::Int(_))) => Ok(()),
             Self::Value(Value::Deferred(DeferredValue::Secret(payload))) => {
-                let mut result = None;
-                payload.visit(|value, scope| {
-                    result = Some(
-                        EvalValue::Value(value.clone())
-                            .require_int(context)
-                            .map_err(|error| scope.protect_error(error)),
-                    )
-                });
-                result.expect("secret visit")
+                payload.try_inspect(|value| EvalValue::Value(value.clone()).require_int(context))
             }
             other => Err(format!("{context} must be int, got {}", other.kind_name())),
         }
@@ -1112,32 +1091,22 @@ fn compare_values<P: PlaceholderKind, B: BindingAddress>(
         unreachable!("null values returned above");
     };
     if let Value::Deferred(DeferredValue::Secret(payload)) = left {
-        let mut result = None;
-        payload.visit(|value, scope| {
-            result = Some(
-                compare_values(
-                    &EvalValue::Value(value.clone()),
-                    op,
-                    &EvalValue::Value(right.clone()),
-                )
-                .map_err(|error| scope.protect_error(error)),
+        return payload.try_inspect(|value| {
+            compare_values(
+                &EvalValue::Value(value.clone()),
+                op,
+                &EvalValue::Value(right.clone()),
             )
         });
-        return result.expect("secret visit");
     }
     if let Value::Deferred(DeferredValue::Secret(payload)) = right {
-        let mut result = None;
-        payload.visit(|value, scope| {
-            result = Some(
-                compare_values(
-                    &EvalValue::Value(left.clone()),
-                    op,
-                    &EvalValue::Value(value.clone()),
-                )
-                .map_err(|error| scope.protect_error(error)),
+        return payload.try_inspect(|value| {
+            compare_values(
+                &EvalValue::Value(left.clone()),
+                op,
+                &EvalValue::Value(value.clone()),
             )
         });
-        return result.expect("secret visit");
     }
     if let (Value::Concrete(left), Value::Concrete(right)) = (left, right)
         && let Some(pair) = NumericPair::new(left, right)

@@ -7462,7 +7462,10 @@ fn deposed_encoders_return_unavailable_secret_errors() {
         let error = result.expect_err("unavailable material must be returned, not panic");
         assert!(matches!(error, ResourceStateEncodingError::Serialization(
             SerializationError::UnavailableSecret(ref error)
-        ) if error.path().ends_with(".nested")));
+        ) if error.path() == "(secret)"));
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains("nested"), "{rendered}");
+        }
     }
 }
 

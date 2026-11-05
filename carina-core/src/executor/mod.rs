@@ -789,7 +789,7 @@ fn visit_unknowns(value: &Value, f: &mut impl FnMut(&ApplyTimeUnknown)) {
         }
         Value::Deferred(DeferredValue::Access(access)) => visit_unknowns(access.base(), f),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            inner.visit(|value, _scope| visit_unknowns(value, f))
+            inner.visit(|value| visit_unknowns(value, f))
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             visit_unknowns(value, f);
@@ -954,6 +954,13 @@ impl ReportedError {
 
 impl crate::resource::InsideSecret for ReportedError {
     fn inside_secret(self) -> Self {
+        if let Some(error) = self.as_error().downcast_ref::<ContextError>() {
+            return error
+                .source
+                .clone()
+                .inside_secret()
+                .with_context(error.context.to_string());
+        }
         // Preserve typed, safe context through reporting wrappers. Each source
         // error owns its protection policy, including public upstream reasons.
         let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(self.as_error());

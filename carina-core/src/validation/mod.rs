@@ -2183,9 +2183,10 @@ fn visit_refs_with_sink_inner<'a, P: PlaceholderKind, B: BindingAddress>(
                 visit_refs_with_sink_inner(access.base(), None, usage, scope, f);
             }
         }
-        GenericValue::Deferred(crate::resource::DeferredValue::Secret(inner)) => {
-            inner.visit(|value, scope| visit_refs_with_sink_inner(value, sink, usage, scope, f))
-        }
+        GenericValue::Deferred(crate::resource::DeferredValue::Secret(inner)) => inner
+            .visit_reference_inventory(|value, scope| {
+                visit_refs_with_sink_inner(value, sink, usage, scope, f)
+            }),
         GenericValue::Deferred(crate::resource::DeferredValue::Coalesce { value, default }) => {
             let value_usage = if value.is_coalesce_optional_operand() {
                 crate::resource::ResourceRefUsage::CoalesceValue
@@ -2441,15 +2442,13 @@ fn visit_computed_accesses_with_sink<'a, B: BindingAddress, E: InsideSecret>(
         }
         GenericValue::Deferred(DeferredValue::Secret(inner)) => {
             findings.extend(
-                {
-                    let mut result = None;
-                    inner.visit(|secret_value, scope| {
-                        let _ = scope;
-                        result = Some(visit_computed_accesses_with_sink(secret_value, sink, f));
-                    });
-                    result.expect("secret visit")
-                }
-                .inside_secret(),
+                inner
+                    .try_inspect(|value| {
+                        Err::<(), _>(visit_computed_accesses_with_sink(value, sink, f))
+                    })
+                    .err()
+                    .into_iter()
+                    .flatten(),
             );
         }
         GenericValue::Deferred(DeferredValue::Coalesce { value, default }) => {
@@ -2820,21 +2819,9 @@ fn prove_integer_operand<B: BindingAddress>(
         )) => Some(binding_index.postfix_ref_type(path)),
         GenericValue::Deferred(crate::resource::DeferredValue::Secret(inner)) => {
             return {
-                let mut result = None;
-                inner.visit(|secret_value, scope| {
-                    let _ = scope;
-                    result = Some(
-                        (prove_integer_operand(
-                            secret_value,
-                            expression,
-                            side,
-                            report,
-                            binding_index,
-                        ))
-                        .map_err(|error| scope.protect_error(error)),
-                    );
-                });
-                result.expect("secret visit")
+                inner.try_inspect(|secret_value| {
+                    prove_integer_operand(secret_value, expression, side, report, binding_index)
+                })
             };
         }
         GenericValue::Deferred(crate::resource::DeferredValue::Coalesce { value, default }) => {
@@ -4301,8 +4288,8 @@ mod user_function_refs {
                 }
             }
             crate::resource::Value::Deferred(crate::resource::DeferredValue::Secret(inner)) => {
-                let mut local = Vec::new();
-                inner.visit(|value, scope| {
+                let result = inner.try_inspect(|value| {
+                    let mut local = Vec::new();
                     check_function_calls(
                         value,
                         result_sink,
@@ -4311,9 +4298,9 @@ mod user_function_refs {
                         unknown_policy,
                         &mut local,
                     );
-                    local = scope.protect_error(std::mem::take(&mut local));
+                    Err::<(), _>(local)
                 });
-                errors.extend(local);
+                errors.extend(result.err().into_iter().flatten());
             }
             crate::resource::Value::Deferred(crate::resource::DeferredValue::Access(access)) => {
                 check_function_calls(
@@ -7454,12 +7441,7 @@ pub fn value_contains_unresolved_ref<P: PlaceholderKind>(value: &GenericValue<P>
         | GenericValue::Deferred(crate::resource::DeferredValue::Unknown(_))
         | GenericValue::Deferred(crate::resource::DeferredValue::Placeholder(_)) => true,
         GenericValue::Deferred(crate::resource::DeferredValue::Secret(inner)) => {
-            let mut result = None;
-            inner.visit(|secret_value, scope| {
-                let _ = scope;
-                result = Some(value_contains_unresolved_ref(secret_value));
-            });
-            result.expect("secret visit")
+            inner.visit(|secret_value| value_contains_unresolved_ref(secret_value))
         }
         GenericValue::Concrete(crate::resource::ConcreteValue::List(items)) => {
             items.iter().any(value_contains_unresolved_ref)
@@ -9313,12 +9295,7 @@ fn module_call_value_is_context_free(value: &Value) -> bool {
             })
         }
         crate::resource::Value::Deferred(crate::resource::DeferredValue::Secret(inner)) => {
-            let mut result = None;
-            inner.visit(|secret_value, scope| {
-                let _ = scope;
-                result = Some(module_call_value_is_context_free(secret_value));
-            });
-            result.expect("secret visit")
+            inner.visit(module_call_value_is_context_free)
         }
         crate::resource::Value::Deferred(crate::resource::DeferredValue::Coalesce {
             value,

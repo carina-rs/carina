@@ -128,12 +128,9 @@ fn classify_non_static_if_condition(
             },
         ),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            let mut result = None;
-            inner.visit(|secret_value, scope| {
-                let _ = scope;
-                result = Some(classify(secret_value, visiting_functions));
-            });
-            result.expect("secret visit")
+            let mut dependency = IfConditionDependency::Static;
+            inner.visit(|value| dependency = classify(value, visiting_functions));
+            dependency
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             classify(value, visiting_functions).combine(classify(default, visiting_functions))
@@ -262,12 +259,7 @@ pub(crate) fn is_static_value<B: BindingAddress>(
         | GenericValue::Deferred(GenericDeferredValue::Unknown(_))
         | GenericValue::Deferred(GenericDeferredValue::Placeholder(_)) => false,
         GenericValue::Deferred(GenericDeferredValue::Secret(inner)) => {
-            let mut result = None;
-            inner.visit(|secret_value, scope| {
-                let _ = scope;
-                result = Some(is_static_value(secret_value));
-            });
-            result.expect("secret visit")
+            inner.visit(|secret_value| is_static_value(secret_value))
         }
     }
 }

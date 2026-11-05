@@ -1,6 +1,5 @@
 //! Conversions between carina-core types and Wasmtime-generated WIT types.
 
-use carina_core::resource::InsideSecret;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
@@ -404,8 +403,7 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
             })
         }
         CoreValue::Deferred(DeferredValue::Secret(inner)) => {
-            let json = core_value_to_json(inner.expose_plaintext())
-                .map_err(SerializationError::inside_secret)?;
+            let json = inner.try_inspect(core_value_to_json)?;
             let json_str =
                 serde_json::to_string(&json).expect("serde_json::Value -> String is infallible");
             Ok(wit::Value::SecretVal(json_str))
@@ -788,9 +786,7 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
         // that decode `list-val` / `map-val` see the inner JSON shape;
         // `secret-val` is the channel used to mark the *attribute* itself
         // as a secret.
-        CoreValue::Deferred(DeferredValue::Secret(inner)) => {
-            core_value_to_json(inner.expose_plaintext()).map_err(SerializationError::inside_secret)
-        }
+        CoreValue::Deferred(DeferredValue::Secret(inner)) => inner.try_inspect(core_value_to_json),
         CoreValue::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }

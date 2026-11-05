@@ -437,6 +437,8 @@ pub struct AnalysisTreeError {
 /// construct an error or mint a scoped diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AnalysisTreeErrorKind {
+    #[error("{}", crate::resource::INSIDE_SECRET_MESSAGE)]
+    InsideSecret,
     #[error("missing parser syntax provenance for {element}")]
     MissingSyntaxProvenance { element: String },
     #[error("missing declaration provenance for {kind:?} {id}")]
@@ -451,6 +453,12 @@ pub enum AnalysisTreeErrorKind {
         declaration: DeclarationLocation,
         element: String,
     },
+}
+
+impl crate::resource::InsideSecret for AnalysisTreeError {
+    fn inside_secret(self) -> Self {
+        Self::new(AnalysisTreeErrorKind::InsideSecret)
+    }
 }
 
 pub enum AnalysisTreeDiagnostic<'a> {
@@ -706,14 +714,7 @@ fn require_integer_operator_provenance<P: ValueKind, B: BindingAddress>(
                 check(argument.walker_value())?;
             }
         }
-        Value::Deferred(DeferredValue::Secret(value)) => {
-            let mut result = None;
-            value.visit(|secret_value, scope| {
-                let _ = scope;
-                result = Some(check(secret_value));
-            });
-            result.expect("secret visit")
-        }?,
+        Value::Deferred(DeferredValue::Secret(value)) => value.try_inspect(check)?,
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             check(value)?;
             check(default)?;
@@ -757,18 +758,9 @@ where
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
             let first = references.len();
-            {
-                let mut result = None;
-                inner.visit(|secret_value, scope| {
-                    let _ = scope;
-                    result = Some(collect_iterable_result_references(
-                        secret_value,
-                        context,
-                        references,
-                    ));
-                });
-                result.expect("secret visit")
-            }?;
+            inner.try_inspect(|secret_value| {
+                collect_iterable_result_references(secret_value, context, references)
+            })?;
             for reference in &mut references[first..] {
                 reference.reference.diagnostic_scope = crate::resource::DiagnosticScope::Secret;
             }
@@ -2634,6 +2626,33 @@ where
 #[cfg(test)]
 mod location_tests {
     use super::*;
+
+    #[test]
+    fn secret_origin_4275_round2_iterable_provenance_masks_secret_path() {
+        use crate::resource::{DeferredValue, ExpandedValue};
+        let reference =
+            ExpandedValue::root_resource_ref("private_producer", "private_attr", vec![]);
+        let mut references = Vec::new();
+        let public_error =
+            collect_iterable_result_references(&reference, "iterable", &mut references)
+                .unwrap_err();
+        assert!(
+            public_error
+                .to_string()
+                .contains("private_producer.private_attr")
+        );
+        let secret = ExpandedValue::Deferred(DeferredValue::Secret(Box::new(reference).into()));
+        let error =
+            collect_iterable_result_references(&secret, "iterable", &mut references).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(crate::resource::INSIDE_SECRET_MESSAGE)
+        );
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains("private_"), "{rendered}");
+        }
+    }
 
     #[test]
     fn integer_operator_without_parser_provenance_fails_at_seal() {

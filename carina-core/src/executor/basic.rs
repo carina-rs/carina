@@ -278,14 +278,7 @@ fn needs_apply_resolution(value: &Value) -> bool {
             | DeferredValue::Access(_)
             | DeferredValue::Unknown(_),
         ) => true,
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            let mut result = None;
-            inner.visit(|secret_value, scope| {
-                let _ = scope;
-                result = Some(needs_apply_resolution(secret_value));
-            });
-            result.expect("secret visit")
-        }
+        Value::Deferred(DeferredValue::Secret(inner)) => inner.visit(needs_apply_resolution),
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(needs_apply_resolution),
         Value::Concrete(ConcreteValue::Map(map)) => map.values().any(needs_apply_resolution),
         Value::Concrete(
@@ -406,20 +399,14 @@ fn assert_fully_resolved(
             }
             Ok(())
         }
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            let mut result = None;
-            inner.visit(|secret_value, scope| {
-                result = Some(
-                    assert_fully_resolved(secret_value, attribute_key, bindings).map_err(|error| {
-                        scope.protect_error(error).with_context(format!(
-                            "Attribute '{attribute_key}': {}",
-                            crate::resource::INSIDE_SECRET_MESSAGE
-                        ))
-                    }),
-                );
-            });
-            result.expect("secret visit")
-        }
+        Value::Deferred(DeferredValue::Secret(inner)) => inner
+            .try_inspect(|value| assert_fully_resolved(value, attribute_key, bindings))
+            .map_err(|error| {
+                error.with_context(format!(
+                    "Attribute '{attribute_key}': {}",
+                    crate::resource::INSIDE_SECRET_MESSAGE,
+                ))
+            }),
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
         Value::Deferred(DeferredValue::ModuleIf(_)) => Err(ReportedError::message(format!(
             "Attribute '{}' contains an unresolved module-template conditional",
@@ -605,7 +592,7 @@ fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
         Value::Deferred(DeferredValue::ResourceRef { path }) => out.push(path.binding()),
         Value::Deferred(DeferredValue::BindingRef { binding }) => out.push(binding.as_str()),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            inner.visit(|value, _scope| collect_unresolved_bindings(value, out))
+            inner.visit(|value| collect_unresolved_bindings(value, out))
         }
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             deferred

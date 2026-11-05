@@ -366,17 +366,9 @@ fn infer_projected_type_with_visiting<P: PlaceholderKind, B: BindingAddress>(
         Value::Concrete(ConcreteValue::Bool(_)) => Ok(TypeExpr::Bool),
         Value::Concrete(ConcreteValue::Duration(_)) => Ok(TypeExpr::Duration),
         Value::Deferred(DeferredValue::Interpolation(_)) => Ok(TypeExpr::String),
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            let mut result = None;
-            inner.visit(|secret_value, scope| {
-                let _ = scope;
-                result = Some(
-                    (infer_projected_type_with_visiting(secret_value, bindings, context, visiting))
-                        .map_err(|error| scope.protect_error(error)),
-                );
-            });
-            result.expect("secret visit")
-        }
+        Value::Deferred(DeferredValue::Secret(inner)) => inner.try_inspect(|secret_value| {
+            infer_projected_type_with_visiting(secret_value, bindings, context, visiting)
+        }),
 
         Value::Concrete(ConcreteValue::List(items)) => {
             infer_collection(items, bindings, context, visiting, TypeExpr::List)

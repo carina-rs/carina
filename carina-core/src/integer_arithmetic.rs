@@ -395,11 +395,7 @@ where
 fn concrete_integer<P: ValueKind, B: BindingAddress>(value: &Value<P, B>) -> Option<i64> {
     match value {
         Value::Concrete(ConcreteValue::Int(value)) => Some(*value),
-        Value::Deferred(DeferredValue::Secret(payload)) => {
-            let mut number = None;
-            payload.visit(|value, _scope| number = concrete_integer(value));
-            number
-        }
+        Value::Deferred(DeferredValue::Secret(payload)) => payload.visit(concrete_integer),
         _ => None,
     }
 }
@@ -439,17 +435,9 @@ fn validate_operand_shape_at_stage<P: ValueKind, B: BindingAddress>(
 ) -> Result<(), IntegerOperandError> {
     match value {
         Value::Concrete(ConcreteValue::Int(_)) => Ok(()),
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            let mut result = None;
-            inner.visit(|secret_value, scope| {
-                let _ = scope;
-                result = Some(
-                    (validate_operand_shape_at_stage(secret_value, side, admission))
-                        .map_err(|error| scope.protect_error(error)),
-                );
-            });
-            result.expect("secret visit")
-        }
+        Value::Deferred(DeferredValue::Secret(inner)) => inner.try_inspect(|secret_value| {
+            validate_operand_shape_at_stage(secret_value, side, admission)
+        }),
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             validate_operand_shape_at_stage(deferred.then_value(), side, admission)?;
             validate_operand_shape_at_stage(deferred.else_value(), side, admission)

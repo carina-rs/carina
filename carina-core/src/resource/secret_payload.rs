@@ -1,6 +1,24 @@
 //! The only access boundary for a secret's value.
 use super::{BindingAddress, DiagnosticScope, InsideSecret, Value, ValueKind};
 
+mod scalar_read {
+    pub trait Sealed {}
+    impl Sealed for () {}
+    impl Sealed for bool {}
+    impl Sealed for usize {}
+    impl Sealed for i64 {}
+    impl<T: Sealed> Sealed for Option<T> {}
+}
+
+/// Infallible scalar results permitted by [`SecretPayload::visit`].
+/// Error-bearing and value-bearing results must use the protected accessors.
+pub trait SecretReadResult: scalar_read::Sealed {}
+impl SecretReadResult for () {}
+impl SecretReadResult for bool {}
+impl SecretReadResult for usize {}
+impl SecretReadResult for i64 {}
+impl<T: SecretReadResult> SecretReadResult for Option<T> {}
+
 /// A value walker cannot implicitly read or discard the secret wrapper.
 ///
 /// ```compile_fail
@@ -44,14 +62,69 @@ impl<P: ValueKind, B: BindingAddress> SecretPayload<P, B> {
             .map_err(InsideSecret::inside_secret)
     }
 
-    /// Inspect a value with the diagnostic scope that must accompany findings.
-    pub fn visit<'a>(&'a self, visit: impl FnOnce(&'a Value<P, B>, DiagnosticScope)) {
+    /// Inspect a value, protecting every error at the boundary.
+    ///
+    /// ```compile_fail
+    /// use carina_core::resource::{SecretPayload, NoPlaceholder, AbsoluteBindingAddress};
+    /// struct UnprotectedError(String);
+    /// fn walk(payload: &SecretPayload<NoPlaceholder, AbsoluteBindingAddress>) {
+    ///     let _ = payload.try_inspect(|value| Err::<(), _>(UnprotectedError(format!("{value:?}"))));
+    /// }
+    /// ```
+    pub fn try_inspect<'a, R, E: InsideSecret>(
+        &'a self,
+        inspect: impl FnOnce(&'a Value<P, B>) -> Result<R, E>,
+    ) -> Result<R, E> {
+        inspect(&self.value).map_err(InsideSecret::inside_secret)
+    }
+
+    /// Read a scalar without exposing an error channel.
+    ///
+    /// ```compile_fail
+    /// use carina_core::resource::{SecretPayload, NoPlaceholder, AbsoluteBindingAddress};
+    /// fn walk(payload: &SecretPayload<NoPlaceholder, AbsoluteBindingAddress>) {
+    ///     payload.visit(|value| Err::<(), _>(format!("{value:?}")));
+    /// }
+    /// ```
+    pub fn visit<'a, R: SecretReadResult>(&'a self, visit: impl FnOnce(&'a Value<P, B>) -> R) -> R {
+        visit(&self.value)
+    }
+
+    /// Populate a reference inventory with the scope required by each finding.
+    pub(crate) fn visit_reference_inventory<'a>(
+        &'a self,
+        visit: impl FnOnce(&'a Value<P, B>, DiagnosticScope),
+    ) {
         visit(&self.value, DiagnosticScope::Secret);
     }
 
-    /// Explicit escape hatch for hashing, transport, persistence, and tests.
+    /// Explicit escape hatch for transport, persistence, and tests.
     pub fn expose_plaintext(&self) -> &Value<P, B> {
         &self.value
+    }
+}
+
+impl<P: super::PlaceholderKind> SecretPayload<P, super::AbsoluteBindingAddress> {
+    /// Hash protected material, reusing a matching digest when available.
+    pub fn hash(
+        &self,
+        previous: Option<&super::RedactedSecretHash>,
+    ) -> Result<super::RedactedSecretHash, crate::value::SerializationError> {
+        self.try_inspect(|value| {
+            crate::value::canonical_secret_hash_material(value)
+                .map(|material| super::RedactedSecretHash::reuse_or_generate(&material, previous))
+        })
+    }
+
+    /// Verify protected material without exposing serialization diagnostics.
+    pub fn verify_hash(
+        &self,
+        hash: &super::RedactedSecretHash,
+    ) -> Result<bool, crate::value::SerializationError> {
+        self.try_inspect(|value| {
+            crate::value::canonical_secret_hash_material(value)
+                .map(|material| hash.verify(material))
+        })
     }
 }
 
@@ -83,6 +156,12 @@ mod tests {
             mapped.expose_plaintext(),
             Value::Deferred(DeferredValue::Secret(_))
         ));
-        payload.visit(|_, scope| assert_eq!(scope, DiagnosticScope::Secret));
+        payload.visit_reference_inventory(|_, scope| assert_eq!(scope, DiagnosticScope::Secret));
+        let error = payload
+            .try_inspect(|value| Err::<(), _>(format!("{value:?} private-error")))
+            .unwrap_err();
+        assert_eq!(error, crate::resource::INSIDE_SECRET_MESSAGE);
+        assert!(payload.visit(|value| matches!(value, Value::Deferred(DeferredValue::Secret(_)))));
+        assert_eq!(payload.try_inspect(|_| Ok::<_, String>(42)).unwrap(), 42);
     }
 }

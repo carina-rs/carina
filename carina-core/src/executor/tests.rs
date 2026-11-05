@@ -43,6 +43,35 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::shutdown::ShutdownToken;
+
+#[test]
+fn secret_origin_4275_round2_reported_error_keeps_safe_outer_context() {
+    use crate::resource::InsideSecret;
+    let error = ReportedError::context(
+        "Attribute 'password': provider dispatch failed",
+        SerializationError::UnresolvedResourceRef {
+            path: "private_producer.private_attr".into(),
+            context: crate::value::SerializationContext::WasmBoundary,
+        },
+    )
+    .with_context("Creating test.widget.example")
+    .inside_secret();
+    let rendered = render_error_chain(error.as_error());
+    assert!(
+        rendered.contains("Creating test.widget.example"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("Attribute 'password': provider dispatch failed"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(crate::resource::INSIDE_SECRET_MESSAGE),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("private_"), "{rendered}");
+    assert!(!format!("{error:?}").contains("private_"));
+}
 use crate::shutdown::testing::{TestShutdownTrigger as ShutdownTrigger, shutdown_channel};
 
 fn uncancelled_shutdown() -> ShutdownToken {
@@ -1084,9 +1113,21 @@ fn resolved_resource_constructor_rejects_nested_deferred() {
         .expect_err("nested deferred values must not construct a ResolvedResource");
 
     assert!(
-        matches!(err, SerializationError::UnresolvedResourceRef { .. }),
-        "expected UnresolvedResourceRef, got {err:?}"
+        matches!(
+            err,
+            SerializationError::InsideSecret {
+                kind: crate::value::SecretSerializationErrorKind::UnresolvedResourceRef,
+            }
+        ),
+        "expected protected UnresolvedResourceRef, got {err:?}"
     );
+    for rendered in [err.to_string(), format!("{err:?}")] {
+        assert!(!rendered.contains("cert"), "{rendered}");
+        assert!(
+            !rendered.contains("domain_validation_options"),
+            "{rendered}"
+        );
+    }
 }
 
 // -----------------------------------------------------------------------

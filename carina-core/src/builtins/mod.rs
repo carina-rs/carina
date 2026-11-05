@@ -23,8 +23,7 @@ mod upper_lower;
 use crate::eval_value::EvalValue;
 use crate::parser::ProviderContext;
 use crate::resource::{
-    BindingAddress, ConcreteValue, DeferredValue, InterpolationPart, NoPlaceholder, Value,
-    ValueString,
+    BindingAddress, ConcreteValue, DeferredValue, InsideSecret, NoPlaceholder, Value,
 };
 
 /// Authored builtin syntax. Secret is an intrinsic value constructor and
@@ -109,168 +108,38 @@ impl Builtin {
     }
 }
 
-/// Mark every string exposed from a `Secret` argument as diagnostic-only.
-///
-/// Builtin handlers still receive the plaintext needed for computation, but
-/// any handler-owned diagnostic can only render these strings through the
-/// safe [`ValueString`] diagnostic API. Runtime equality, hashing, and
-/// serialization remain byte-for-byte identical to an ordinary string.
-fn mark_secret_input_strings<B: BindingAddress>(
-    value: Value<NoPlaceholder, B>,
-) -> Value<NoPlaceholder, B> {
-    match value {
-        Value::Concrete(ConcreteValue::String(value)) => Value::Concrete(ConcreteValue::String(
-            ValueString::diagnostic_sensitive(value.into_plaintext()),
-        )),
-        Value::Concrete(ConcreteValue::StringList(values)) => {
-            Value::Concrete(ConcreteValue::StringList(
-                values
-                    .into_iter()
-                    .map(|value| ValueString::diagnostic_sensitive(value.into_plaintext()))
-                    .collect(),
-            ))
-        }
-        Value::Concrete(ConcreteValue::List(values)) => Value::Concrete(ConcreteValue::List(
-            values.into_iter().map(mark_secret_input_strings).collect(),
-        )),
-        Value::Concrete(ConcreteValue::Map(values)) => Value::Concrete(ConcreteValue::Map(
-            values
-                .into_iter()
-                .map(|(key, value)| (key, mark_secret_input_strings(value)))
-                .collect(),
-        )),
-        Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            Value::Deferred(DeferredValue::Interpolation(
-                parts
-                    .into_iter()
-                    .map(|part| match part {
-                        InterpolationPart::Literal(value) => InterpolationPart::Literal(
-                            ValueString::diagnostic_sensitive(value.into_plaintext()),
-                        ),
-                        InterpolationPart::Expr(value) => {
-                            InterpolationPart::Expr(mark_secret_input_strings(value))
-                        }
-                    })
-                    .collect(),
-            ))
-        }
-        Value::Deferred(DeferredValue::FunctionCall {
-            name,
-            args,
-            source_line,
-        }) => Value::Deferred(DeferredValue::FunctionCall {
-            name,
-            args: args
-                .iter()
-                .map(|argument| {
-                    argument
-                        .try_map_value(|value| {
-                            Ok::<_, std::convert::Infallible>(mark_secret_input_strings(
-                                value.clone(),
-                            ))
-                        })
-                        .expect("infallible function-argument rewrite")
-                })
-                .collect(),
-            source_line,
-        }),
-        Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function,
-            functions,
-            args,
-            source_line,
-        }) => Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function,
-            functions,
-            args: args
-                .iter()
-                .map(|argument| {
-                    argument
-                        .try_map_value(|value| {
-                            Ok::<_, std::convert::Infallible>(mark_secret_input_strings(
-                                value.clone(),
-                            ))
-                        })
-                        .expect("infallible function-argument rewrite")
-                })
-                .collect(),
-            source_line,
-        }),
-        Value::Deferred(DeferredValue::Access(access)) => {
-            let original = Value::Deferred(DeferredValue::Access(access.clone()));
-            let step = match access.step().clone() {
-                crate::resource::PathSegment::Subscript {
-                    index: crate::resource::Subscript::Str { key },
-                } => crate::resource::PathSegment::Subscript {
-                    index: crate::resource::Subscript::Str {
-                        key: ValueString::diagnostic_sensitive(key.into_plaintext()),
-                    },
-                },
-                other => other,
-            };
-            access
-                .rebuild(
-                    mark_secret_input_strings(access.base().clone()),
-                    step,
-                    crate::resource::AccessMissPolicy::Error,
-                )
-                .unwrap_or(original)
-        }
-        Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
-            inner
-                .try_map(|value| {
-                    Ok::<_, std::convert::Infallible>(mark_secret_input_strings(value.clone()))
-                })
-                .unwrap(),
-        )),
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
-            let deferred = deferred.map(|value| mark_secret_input_strings(value.clone()));
-            Value::Deferred(DeferredValue::ModuleIf(Box::new(deferred)))
-        }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            let lhs = mark_secret_input_strings(expression.lhs().clone());
-            let rhs = mark_secret_input_strings(expression.rhs().clone());
-            let original = Value::Deferred(DeferredValue::IntegerArithmetic(expression.clone()));
-            expression
-                .evaluate_with_operands(lhs, rhs)
-                .unwrap_or(original)
-        }
-        value => value,
-    }
-}
-
 /// Built-ins evaluate secret inputs through their plaintext inner values, but
 /// the result remains secret. This keeps the sensitivity tag attached across
 /// every transformation instead of making each handler remember to preserve
 /// it. Nested wrappers are normalized to one wrapper.
-fn peel_secret_arguments<B: BindingAddress>(
+fn evaluate_secret_arguments<B: BindingAddress>(
     args: Vec<Value<NoPlaceholder, B>>,
-) -> (Vec<Value<NoPlaceholder, B>>, bool) {
-    let mut contained_secret = false;
-    let args = args
+    handler: impl FnOnce(&[Value<NoPlaceholder, B>]) -> Result<Value<NoPlaceholder, B>, String>,
+) -> Result<EvalValue<B>, String> {
+    let contained_secret = args.iter().any(crate::value::contains_secret);
+    let lowered = args
         .into_iter()
-        .map(|value| lower_builtin_secret_argument(value, &mut contained_secret))
-        .collect();
-    (args, contained_secret)
+        .map(lower_builtin_secret_argument)
+        .collect::<Result<Vec<_>, _>>()?;
+    handler(&lowered)
+        .map(|value| EvalValue::from_expanded_value(propagate_secret(value, contained_secret)))
+        .map_err(|error| {
+            if contained_secret {
+                error.inside_secret()
+            } else {
+                error
+            }
+        })
 }
 
 fn lower_builtin_secret_argument<B: BindingAddress>(
     value: Value<NoPlaceholder, B>,
-    contained_secret: &mut bool,
-) -> Value<NoPlaceholder, B> {
+) -> Result<Value<NoPlaceholder, B>, String> {
     match value {
         Value::Deferred(DeferredValue::Secret(payload)) => {
-            *contained_secret = true;
-            let mut lowered = None;
-            payload.visit(|value, _scope| {
-                lowered = Some(lower_builtin_secret_argument(
-                    mark_secret_input_strings(value.clone()),
-                    contained_secret,
-                ))
-            });
-            lowered.expect("secret visit")
+            payload.try_inspect(|value| lower_builtin_secret_argument(value.clone()))
         }
-        value => value,
+        value => Ok(value),
     }
 }
 
@@ -336,20 +205,14 @@ pub struct BuiltinFunctionInfo {
 /// from one definition, ensuring they never get out of sync.
 macro_rules! register_builtins {
     (@evaluate env, $handler:expr, $lowered:expr, $config:expr) => {
-        $handler(&$lowered, &$config.environment).map(EvalValue::from_expanded_value)
+        evaluate_secret_arguments($lowered, |args| $handler(args, &$config.environment))
     };
-    (@evaluate decrypt, $handler:expr, $lowered:expr, $config:expr) => {{
-        let (lowered, contained_secret) = peel_secret_arguments($lowered);
-        $handler(&lowered, $config).map(|value| {
-            EvalValue::from_expanded_value(propagate_secret(value, contained_secret))
-        })
-    }};
-    (@evaluate $name:ident, $handler:expr, $lowered:expr, $config:expr) => {{
-        let (lowered, contained_secret) = peel_secret_arguments($lowered);
-        $handler(&lowered).map(|value| {
-            EvalValue::from_expanded_value(propagate_secret(value, contained_secret))
-        })
-    }};
+    (@evaluate decrypt, $handler:expr, $lowered:expr, $config:expr) => {
+        evaluate_secret_arguments($lowered, |args| $handler(args, $config))
+    };
+    (@evaluate $name:ident, $handler:expr, $lowered:expr, $config:expr) => {
+        evaluate_secret_arguments($lowered, $handler)
+    };
     (@collect [$($info:tt)*] [$($functions:tt)*]) => {
         register_builtins!(@generate [$($info)*] [$($functions)*]);
     };
@@ -782,6 +645,28 @@ mod tests {
     }
 
     #[test]
+    fn secret_origin_4275_round2_builtin_handler_errors_are_masked() {
+        let integer = 9_007_199_254_740_993;
+        let args = [
+            secret(Value::Concrete(ConcreteValue::Int(integer))),
+            Value::Concrete(ConcreteValue::Float(0.5)),
+        ];
+        let error = evaluate_builtin_to_value("max", &args).unwrap_err();
+        assert!(!error.contains(&integer.to_string()), "{error}");
+        assert_eq!(error, crate::resource::INSIDE_SECRET_MESSAGE);
+
+        let public_args = [
+            Value::Concrete(ConcreteValue::Int(integer)),
+            args[1].clone(),
+        ];
+        let public_error = evaluate_builtin_to_value("max", &public_args).unwrap_err();
+        assert!(
+            public_error.contains(&integer.to_string()),
+            "{public_error}"
+        );
+    }
+
+    #[test]
     fn test_registry_and_dispatch_are_in_sync() {
         // Every function listed in builtin_functions() must be accepted by
         // evaluate_builtin_with_config() (i.e. not return "Unknown built-in function").
@@ -924,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn secret_input_errors_keep_builtin_reason_without_exposing_values() {
+    fn secret_input_errors_are_masked_without_exposing_values() {
         let marker = "hunter2SECRET";
         let cases = [
             (
@@ -935,7 +820,7 @@ mod tests {
                     secret(Value::Concrete(ConcreteValue::Int(424_242))),
                     Value::Concrete(ConcreteValue::Int(0)),
                 ],
-                "resulting prefix length",
+                crate::resource::INSIDE_SECRET_MESSAGE,
                 "424242",
             ),
             (
@@ -946,7 +831,7 @@ mod tests {
                     Value::Concrete(ConcreteValue::List(vec![])),
                     string("extra"),
                 ],
-                "expects 2 arguments",
+                crate::resource::INSIDE_SECRET_MESSAGE,
                 marker,
             ),
             (
@@ -956,7 +841,7 @@ mod tests {
                     secret(string(marker)),
                     Value::Concrete(ConcreteValue::List(vec![])),
                 ],
-                "first argument must be a field accessor",
+                crate::resource::INSIDE_SECRET_MESSAGE,
                 marker,
             ),
         ];
@@ -986,7 +871,7 @@ mod tests {
         let error = evaluate_builtin_to_value("map", &[string(".missing"), secret_map])
             .expect_err("missing field must fail");
 
-        assert!(error.contains("field 'missing' not found"), "{error}");
+        assert_eq!(error, crate::resource::INSIDE_SECRET_MESSAGE);
         assert!(!error.contains(marker), "nested secret leaked: {error}");
     }
 }

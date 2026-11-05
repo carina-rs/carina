@@ -151,18 +151,9 @@ fn value_depends_on_module_output(
             variables,
             visiting_variables,
         ),
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            let mut found = false;
-            inner.visit(|value, _scope| {
-                found = value_depends_on_module_output(
-                    value,
-                    module_bindings,
-                    variables,
-                    visiting_variables,
-                )
-            });
-            found
-        }
+        Value::Deferred(DeferredValue::Secret(inner)) => inner.visit(|value| {
+            value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
+        }),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
                 || value_depends_on_module_output(
@@ -299,7 +290,7 @@ impl<'a> ContextFreeValue<'a> {
                     matches!(part, carina_core::resource::InterpolationPart::Literal(_))
                         || matches!(part, carina_core::resource::InterpolationPart::Expr(value) if is_context_free(value))
                 }),
-                Value::Deferred(DeferredValue::Secret(inner)) => { let mut found = false; inner.visit(|value, _scope| found = is_context_free(value)); found },
+                Value::Deferred(DeferredValue::Secret(inner)) => inner.visit(is_context_free),
                 Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                     is_context_free(value) && is_context_free(default)
                 }
@@ -424,11 +415,7 @@ fn contains_matching_function_call(value: &Value, matches_name: &impl Fn(&str) -
             )
         }),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            let mut found = false;
-            inner.visit(|value, _scope| {
-                found = contains_matching_function_call(value, matches_name)
-            });
-            found
+            inner.visit(|value| contains_matching_function_call(value, matches_name))
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             contains_matching_function_call(value, matches_name)

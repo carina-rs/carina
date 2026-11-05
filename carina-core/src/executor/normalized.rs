@@ -239,14 +239,7 @@ pub fn is_value_fully_concrete_for_expansion(value: &Value) -> bool {
             DeferredValue::Unavailable { .. } => false,
             DeferredValue::ResolvedFunctionCall { .. } => false,
             DeferredValue::Access(_) => false,
-            DeferredValue::Secret(inner) => {
-                let mut result = None;
-                inner.visit(|secret_value, scope| {
-                    let _ = scope;
-                    result = Some(is_value_fully_concrete_for_expansion(secret_value));
-                });
-                result.expect("secret visit")
-            }
+            DeferredValue::Secret(inner) => inner.visit(is_value_fully_concrete_for_expansion),
 
             DeferredValue::Unknown(_) => false,
             DeferredValue::Placeholder(never) => match *never {},

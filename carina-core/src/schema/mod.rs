@@ -556,8 +556,8 @@ fn walk_custom_lookup_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
     // may validate the plaintext, but diagnostics crossing back out of this
     // boundary must discard every user-derived value/message.
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        let mut secret_errors = Vec::new();
-        inner.visit(|value, scope| {
+        let result = inner.try_inspect(|value| {
+            let mut secret_errors = Vec::new();
             walk_custom_lookup_on_path(
                 attr_type,
                 value,
@@ -567,9 +567,9 @@ fn walk_custom_lookup_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
                 &mut secret_errors,
                 visited_refs,
             );
-            secret_errors = scope.protect_error(std::mem::take(&mut secret_errors));
+            Err::<(), _>(secret_errors)
         });
-        errors.extend(secret_errors);
+        errors.extend(result.err().into_iter().flatten());
         return;
     }
     if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
@@ -2388,8 +2388,8 @@ impl Schema {
         visited_refs: &mut Vec<&'a str>,
     ) {
         if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-            let mut secret_errors = Vec::new();
-            inner.visit(|value, _scope| {
+            let result = inner.try_inspect(|value| {
+                let mut secret_errors = Vec::new();
                 Self::collect_attr_into_on_path(
                     attr,
                     defs,
@@ -2398,13 +2398,10 @@ impl Schema {
                     ancestry.inside_secret(),
                     &mut secret_errors,
                     visited_refs,
-                )
+                );
+                Err::<(), _>(secret_errors)
             });
-            out.extend(
-                secret_errors
-                    .into_iter()
-                    .map(|(path, error)| (path, error.inside_secret())),
-            );
+            out.extend(result.err().into_iter().flatten());
             return;
         }
         // Peel Ref so the downstream arms never have to think about it.
@@ -2765,20 +2762,16 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>
 ) -> Result<(), TypeError> {
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
         return {
-            let mut result = None;
-            inner.visit(|secret_value, scope| {
-                let _ = scope;
-                result = Some(validation_error_with_defs_on_path(
+            inner.try_inspect(|secret_value| {
+                validation_error_with_defs_on_path(
                     attr,
                     secret_value,
                     defs,
                     ancestry.inside_secret(),
                     visited_refs,
-                ));
-            });
-            result.expect("secret visit")
-        }
-        .map_err(TypeError::inside_secret);
+                )
+            })
+        };
     }
     if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
         validate_attr_with_defs_and_ancestry(attr, value, defs, ancestry)?;
@@ -4053,15 +4046,7 @@ impl PatternAttributeType<Compiled> {
         value: &Value<P, B>,
     ) -> Result<(), TypeError> {
         if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-            return {
-                let mut result = None;
-                inner.visit(|secret_value, scope| {
-                    let _ = scope;
-                    result = Some(self.validate_leaf_value(secret_value));
-                });
-                result.expect("secret visit")
-            }
-            .map_err(TypeError::inside_secret);
+            return inner.try_inspect(|secret_value| self.validate_leaf_value(secret_value));
         }
         if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
             self.validate_leaf_value(value)?;
@@ -5713,18 +5698,19 @@ fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: Binding
         | AT::Ref(_) => {}
     }
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        let mut fit = None;
-        inner.visit(|value, _scope| {
-            fit = inspect_value_structure_on_path(
-                attr,
-                value,
-                defs,
-                ancestry.inside_secret(),
-                purpose,
-                visited_refs,
-            )
-        });
-        let inner = fit?;
+        let inner = inner
+            .try_inspect(|value| {
+                inspect_value_structure_on_path(
+                    attr,
+                    value,
+                    defs,
+                    ancestry.inside_secret(),
+                    purpose,
+                    visited_refs,
+                )
+                .ok_or(())
+            })
+            .ok()?;
         let exactness = inner.exactness;
         return Some(Fit::with_kind(
             exactness,
@@ -11729,7 +11715,7 @@ fn project_write_only_leaves<'schema, R: PatternForm, P: crate::resource::ValueK
     leaves: &mut Vec<(LeafPath, Value<P>, &'schema PatternAttributeType<R>)>,
 ) {
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        inner.visit(|value, _scope| {
+        inner.visit(|value| {
             project_write_only_leaves(attr_type, value, defs, path, ref_chain, true, leaves)
         });
         return;

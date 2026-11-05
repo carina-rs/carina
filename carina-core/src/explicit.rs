@@ -3870,8 +3870,14 @@ mod tests {
             )
         });
         assert!(
-            matches!(result, Err(crate::differ::ComparisonError::Secret(crate::value::SerializationError::UnavailableSecret(error))) if error.path() == "comparison.secret.opaque")
+            matches!(&result, Err(crate::differ::ComparisonError::Secret(crate::value::SerializationError::UnavailableSecret(error))) if error.path() == "(secret)")
         );
+        for rendered in [
+            result.as_ref().unwrap_err().to_string(),
+            format!("{result:?}"),
+        ] {
+            assert!(!rendered.contains("opaque"), "{rendered}");
+        }
     }
 
     #[test]

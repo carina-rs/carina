@@ -1712,10 +1712,10 @@ fn deterministic_value_string<P: crate::resource::ValueKind, B: BindingAddress>(
             access.step().to_plaintext_dot_string()
         ),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            format!(
-                "Secret({})",
-                deterministic_value_string(inner.expose_plaintext())
-            )
+            let mut material = String::from("Secret(");
+            inner.visit(|value| material.push_str(&deterministic_value_string(value)));
+            material.push(')');
+            material
         }
 
         Value::Deferred(DeferredValue::Unknown(reason)) => {

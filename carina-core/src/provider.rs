@@ -1968,7 +1968,7 @@ fn hash_provider_view_as_secret(
     let plaintext = provider_value
         .decode_value()
         .ok_or(SerializationError::NullProviderSecret)?;
-    crate::value::persist_secret_json(&plaintext.to_value_at("provider secret")?, previous)
+    crate::value::persist_secret_json(&plaintext, previous)
 }
 
 /// Saved attributes decoded from persisted state but not yet reconciled
@@ -10088,8 +10088,11 @@ mod tests {
         let error = hash_provider_json_as_secret(&provider, Some(&previous)).unwrap_err();
         assert!(
             matches!(error, SerializationError::UnavailableSecret(ref error)
-            if error.path() == "provider secret.token")
+            if error.path() == "(secret)")
         );
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains("token"), "{rendered}");
+        }
         let map = |value: &PersistedValue| {
             PersistedValue::from_serialized_json(serde_json::json!({"protected": value.as_json()}))
                 .unwrap()
@@ -10107,8 +10110,11 @@ mod tests {
                     .expect_err("an unavailable provider secret must not retain stale evidence");
             assert!(
                 matches!(error, SerializationError::UnavailableSecret(ref error)
-                if error.path().ends_with(".token"))
+                if error.path() == "(secret)")
             );
+            for rendered in [error.to_string(), format!("{error:?}")] {
+                assert!(!rendered.contains("token"), "{rendered}");
+            }
         }
     }
 

@@ -2929,12 +2929,9 @@ fn expanded_if_dependency(value: &ModuleResolvedValue) -> ExpandedIfDependency {
             },
         ),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            let mut result = None;
-            inner.visit(|secret_value, scope| {
-                let _ = scope;
-                result = Some(expanded_if_dependency(secret_value));
-            });
-            result.expect("secret visit")
+            let mut dependency = ExpandedIfDependency::Static;
+            inner.visit(|value| dependency = expanded_if_dependency(value));
+            dependency
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             expanded_if_dependency(value).combine(expanded_if_dependency(default))

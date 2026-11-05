@@ -230,17 +230,9 @@ impl<P: PlaceholderKind, B: BindingAddress> SnapshotValue<P, B> {
                 .iter()
                 .enumerate()
                 .find_map(|(i, value)| value.first_secret_path(&format!("{path}[{i}]"))),
-            Self::Deferred(DeferredValue::Secret(value)) => {
-                let mut result = None;
-                value.visit(|secret_value, scope| {
-                    result = Some(
-                        secret_value
-                            .first_secret_path(path)
-                            .map(|path| scope.protect_error(path)),
-                    );
-                });
-                result.expect("secret visit")
-            }
+            Self::Deferred(DeferredValue::Secret(value)) => value
+                .try_inspect(|value| value.first_secret_path(path).map_or(Ok(()), Err))
+                .err(),
             Self::Deferred(DeferredValue::Coalesce { value, default }) => value
                 .first_secret_path(&format!("{path}.value"))
                 .or_else(|| default.first_secret_path(&format!("{path}.default"))),
@@ -301,7 +293,7 @@ impl<P: PlaceholderKind> SnapshotValue<P> {
         material: &Value<P>,
     ) -> Result<bool, crate::value::SerializationError> {
         match self.secret_hash() {
-            Some(hash) => Ok(hash.verify(crate::value::canonical_secret_hash_material(material)?)),
+            Some(hash) => super::SecretPayload::from(Box::new(material.clone())).verify_hash(hash),
             None => Ok(false),
         }
     }

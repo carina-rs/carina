@@ -2615,6 +2615,14 @@ pub struct ImportIdentifierError {
     got: String,
 }
 
+impl crate::resource::InsideSecret for ImportIdentifierError {
+    fn inside_secret(self) -> Self {
+        Self {
+            got: crate::resource::INSIDE_SECRET_MESSAGE.into(),
+        }
+    }
+}
+
 /// Resolve an [`Effect::Import`] identifier to the concrete string the
 /// provider's `read()` needs, or return a structured error describing
 /// which deferred segment prevented resolution.
@@ -2636,7 +2644,7 @@ pub fn resolve_import_identifier(
         Value::Concrete(ConcreteValue::String(s)) => Ok(s.expose_plaintext()),
         Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Ok(s.as_str()),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            resolve_import_identifier(inner.expose_plaintext())
+            inner.try_inspect(resolve_import_identifier)
         }
         other => Err(ImportIdentifierError {
             got: crate::value::format_value_with_key(other, Some("id")),
@@ -2654,6 +2662,21 @@ mod tests {
 
     type Value = crate::resource::ExpandedValue;
     type DeferredValue = crate::resource::ExpandedDeferredValue;
+
+    #[test]
+    fn secret_origin_4275_round2_import_identifier_masks_invalid_secret() {
+        let value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::Int(424_242))).into(),
+        ));
+        let error = resolve_import_identifier(&value).unwrap_err();
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains("424242"), "{rendered}");
+            assert!(
+                rendered.contains(crate::resource::INSIDE_SECRET_MESSAGE),
+                "{rendered}"
+            );
+        }
+    }
 
     const EFFECT_VARIANT_COUNT: usize = 12;
 

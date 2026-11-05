@@ -9013,7 +9013,10 @@ mod plan_serialization_error_tests {
                 SerializationError::UnavailableSecret(error) => error.clone(),
                 other => panic!("expected typed unavailable-secret error, got {other:?}"),
             };
-            assert_eq!(expected.path(), "state.token");
+            assert_eq!(expected.path(), "(secret)");
+            for rendered in [error.to_string(), format!("{error:?}")] {
+                assert!(!rendered.contains("token"), "{rendered}");
+            }
             let error = match flag {
                 Some(flag) => super::map_plan_save_error(error.into(), flag),
                 None => AppError::from(error),

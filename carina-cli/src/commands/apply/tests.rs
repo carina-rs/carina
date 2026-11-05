@@ -10774,7 +10774,7 @@ mod saved_plan_version_tests {
             rejected_saved_plan_message(&plan_path, &json, "format 38 must require replanning")
                 .await;
         assert!(
-            message.contains("Unsupported plan file version: 38 (expected 40)"),
+            message.contains("Unsupported plan file version: 38 (expected 41)"),
             "{message}"
         );
         assert!(!message.contains("corrupted"), "{message}");
@@ -10864,7 +10864,7 @@ mod saved_plan_version_tests {
         );
     }
 
-    /// Main's v39 and older lack the canonical source identity; reject their
+    /// Format 40 and older predate typed-only secret nodes; reject their
     /// headers before attempting to decode any format-specific payload.
     #[tokio::test]
     async fn previous_emitted_and_older_plan_versions_are_rejected_before_payload_decoding() {
@@ -10872,12 +10872,12 @@ mod saved_plan_version_tests {
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            40,
-            "carina#4202 requires format 40 for source identity on top of carina#3803 format 39",
+            41,
+            "carina#4275 requires format 41 for typed secret nodes on top of carina#4202 format 40",
         );
-        let previous = 39;
+        let previous = 40;
 
-        for older_version in [previous, 38, 37, 36, 35, 34, 33, 32] {
+        for older_version in [previous, 39, 38, 37, 36, 35, 34, 33, 32] {
             let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
             let old_plan = serde_json::json!({
                 "version": older_version,

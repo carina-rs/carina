@@ -116,7 +116,8 @@ fn analysis_tree_rejects_unlocated_data_wait_and_nested_declarations() {
             AnalysisTreeErrorKind::MissingWaitProvenance { .. } => {
                 assert_eq!(expected, AnalysisItemKind::Wait)
             }
-            error @ (AnalysisTreeErrorKind::MissingElementProvenance { .. }
+            error @ (AnalysisTreeErrorKind::InsideSecret
+            | AnalysisTreeErrorKind::MissingElementProvenance { .. }
             | AnalysisTreeErrorKind::MissingSyntaxProvenance { .. }) => {
                 panic!("unexpected element invariant: {error}")
             }

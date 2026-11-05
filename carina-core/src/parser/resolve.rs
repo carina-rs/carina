@@ -1444,9 +1444,7 @@ fn collect_reference_roots(
             }
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            inner.visit(|value, _scope| {
-                collect_reference_roots(value, variables, structural, roots)
-            });
+            inner.visit(|value| collect_reference_roots(value, variables, structural, roots));
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             collect_reference_roots(value, variables, structural, roots);
@@ -1806,7 +1804,16 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
             source_line,
             ..
         }) => {
-            if defer_unknown_functions {
+            // External inputs can remain unavailable below a secret until
+            // planning/apply. Deterministic builtin failures still fail validation.
+            if defer_unknown_functions
+                || (scope.is_secret()
+                    && matches!(
+                        name,
+                        crate::builtins::BuiltinFunction::env
+                            | crate::builtins::BuiltinFunction::decrypt
+                    ))
+            {
                 Ok(value.clone())
             } else {
                 Err(unavailable_builtin_error(*name, reason, *source_line))
@@ -2602,6 +2609,26 @@ let item = mock.test.resource {
                 .contains(&format!("environment variable '{MISSING_ENV}' is not set")),
             "strict pass lost the original builtin diagnostic: {error}",
         );
+    }
+
+    #[test]
+    fn secret_origin_4275_round3_strict_resolution_rejects_recorded_static_failure() {
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let mut parsed =
+            parsed_with_comment(r#"secret(cidr_subnet("private-invalid-cidr", 1, 1))"#);
+        resolve_resource_refs_defer_unknown_functions(&mut parsed, &config)
+            .expect("permissive pass retains the protected failure");
+        let error = resolve_resource_refs_with_config(&mut parsed, &config)
+            .expect_err("a deterministic builtin failure must fail the strict pass");
+        assert!(
+            error
+                .to_string()
+                .contains(crate::resource::INSIDE_SECRET_MESSAGE),
+            "{error}"
+        );
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains("private-invalid-cidr"), "{rendered}");
+        }
     }
 
     #[test]

@@ -223,6 +223,68 @@ pub(crate) fn parse_postfix_eval(
     parse_postfix_eval_with_mode(pair, ctx, &ExpressionMode::untyped())
 }
 
+#[derive(Clone, Copy)]
+enum AccessProvenanceMode {
+    Postfix { has_steps: bool },
+    Primary(Rule),
+}
+
+/// Postfix selection preserves secret wrappers, so its selected access can sit
+/// below one or more payloads. Stamp the selected node through the same boundary.
+fn with_access_provenance(
+    mut value: Value,
+    locations: &impl Fn() -> crate::parser::AccessLocations,
+    mode: AccessProvenanceMode,
+) -> Value {
+    let reference_syntax = |rule| {
+        matches!(
+            rule,
+            Rule::namespaced_id | Rule::subscripted_id | Rule::variable_ref
+        )
+    };
+    match &mut value {
+        Value::Deferred(DeferredValue::Secret(payload)) => {
+            *payload = payload
+                .try_map(|inner| {
+                    Ok::<_, std::convert::Infallible>(with_access_provenance(
+                        inner.clone(),
+                        locations,
+                        mode,
+                    ))
+                })
+                .unwrap();
+        }
+        Value::Deferred(DeferredValue::Access(access)) => {
+            let stamp = match mode {
+                AccessProvenanceMode::Postfix { has_steps } => has_steps,
+                AccessProvenanceMode::Primary(rule) => {
+                    reference_syntax(rule) && access.access_locations().is_none()
+                }
+            };
+            if stamp {
+                access.set_access_locations(locations());
+            }
+        }
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            let (stamp_missing, extend) = match mode {
+                AccessProvenanceMode::Postfix { has_steps } => (true, has_steps),
+                AccessProvenanceMode::Primary(rule) => {
+                    (reference_syntax(rule), rule == Rule::subscripted_id)
+                }
+            };
+            if path.reference_locations().is_none() && stamp_missing {
+                if let crate::parser::AccessLocations::Reference(locations) = locations() {
+                    path.set_reference_locations(locations);
+                }
+            } else if extend && let Some(reference) = path.reference_locations() {
+                path.set_reference_locations(reference.with_access(locations()));
+            }
+        }
+        _ => {}
+    }
+    value
+}
+
 pub(crate) fn parse_postfix_eval_with_mode(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
@@ -249,28 +311,15 @@ pub(crate) fn parse_postfix_eval_with_mode(
     // occurs in a typed attribute.
     let value = parse_primary_eval_with_mode(base, ctx, untyped_mode.as_ref().unwrap_or(mode))?;
     let has_steps = !steps.is_empty();
-    let mut result = apply_postfix_steps(value, steps, ctx)?;
-    if let EvalValue::User(Value::Deferred(DeferredValue::Access(access))) = &mut result
-        && has_steps
-    {
-        access.set_access_locations(ctx.access_locations(&syntax));
-    }
-    if let EvalValue::User(Value::Deferred(DeferredValue::ResourceRef { path })) = &mut result {
-        if path.reference_locations().is_none() {
-            if let crate::parser::AccessLocations::Reference(locations) =
-                ctx.access_locations(&syntax)
-            {
-                path.set_reference_locations(locations);
-            }
-        } else if has_steps {
-            path.set_reference_locations(
-                path.reference_locations()
-                    .expect("checked reference provenance")
-                    .with_access(ctx.access_locations(&syntax)),
-            );
-        }
-    }
-    Ok(result)
+    let result = apply_postfix_steps(value, steps, ctx)?;
+    Ok(match result {
+        EvalValue::User(value) => EvalValue::User(with_access_provenance(
+            value,
+            &|| ctx.access_locations(&syntax),
+            AccessProvenanceMode::Postfix { has_steps },
+        )),
+        other => other,
+    })
 }
 
 /// Lower a `namespaced_id` pair to its `EvalValue`, attaching any
@@ -414,37 +463,15 @@ pub(crate) fn parse_primary_eval_with_mode(
     } else {
         pair.clone()
     };
-    let mut result = parse_primary_eval_with_mode_inner(pair, ctx, mode)?;
-    if let EvalValue::User(Value::Deferred(DeferredValue::Access(access))) = &mut result
-        && matches!(
-            syntax.as_rule(),
-            Rule::namespaced_id | Rule::subscripted_id | Rule::variable_ref
-        )
-        && access.access_locations().is_none()
-    {
-        access.set_access_locations(ctx.access_locations(&syntax));
-    }
-    if let EvalValue::User(Value::Deferred(DeferredValue::ResourceRef { path })) = &mut result {
-        if path.reference_locations().is_none()
-            && matches!(
-                syntax.as_rule(),
-                Rule::namespaced_id | Rule::subscripted_id | Rule::variable_ref
-            )
-        {
-            if let crate::parser::AccessLocations::Reference(locations) =
-                ctx.access_locations(&syntax)
-            {
-                path.set_reference_locations(locations);
-            }
-        } else if syntax.as_rule() == Rule::subscripted_id {
-            path.set_reference_locations(
-                path.reference_locations()
-                    .expect("checked reference provenance")
-                    .with_access(ctx.access_locations(&syntax)),
-            );
-        }
-    }
-    Ok(result)
+    let result = parse_primary_eval_with_mode_inner(pair, ctx, mode)?;
+    Ok(match result {
+        EvalValue::User(value) => EvalValue::User(with_access_provenance(
+            value,
+            &|| ctx.access_locations(&syntax),
+            AccessProvenanceMode::Primary(syntax.as_rule()),
+        )),
+        other => other,
+    })
 }
 
 fn parse_primary_eval_with_mode_inner(

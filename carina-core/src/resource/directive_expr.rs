@@ -529,12 +529,7 @@ fn loop_expression_is_local<P: PlaceholderKind, B: BindingAddress>(value: &Value
         }
         Value::Deferred(DeferredValue::Access(access)) => loop_expression_is_local(access.base()),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            let mut result = None;
-            inner.visit(|secret_value, scope| {
-                let _ = scope;
-                result = Some(loop_expression_is_local(secret_value));
-            });
-            result.expect("secret visit")
+            inner.visit(|secret_value| loop_expression_is_local(secret_value))
         }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             parts.iter().all(|part| match part {

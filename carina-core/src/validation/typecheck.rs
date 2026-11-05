@@ -601,19 +601,21 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
 ) -> TypeExprValueCheck<'s> {
     use TypeExprValueCheck::{Assignable, Mismatch};
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        let mut checked = None;
-        inner.visit(|value, _scope| {
-            checked = Some(check_type_expr_value_inner_with_mode(
+        let checked = inner.try_inspect(|value| {
+            match check_type_expr_value_inner_with_mode(
                 expected,
                 value,
                 config,
                 inference,
                 provider_custom_types,
-            ))
+            ) {
+                Mismatch(_) => Err(()),
+                checked => Ok(checked),
+            }
         });
-        return match checked.expect("secret visit") {
-            Mismatch(_) => Mismatch(mismatch(expected, value)),
-            TypeExprValueCheck::Deferred(mut deferred) => {
+        return match checked {
+            Err(()) => Mismatch(mismatch(expected, value)),
+            Ok(TypeExprValueCheck::Deferred(mut deferred)) => {
                 fn protect<P: PlaceholderKind, B: BindingAddress>(
                     deferred: &mut TypeExprValueDeferral<'_>,
                     secret: &Value<P, B>,
@@ -627,7 +629,8 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
                 protect(&mut deferred, value);
                 TypeExprValueCheck::Deferred(deferred)
             }
-            Assignable => Assignable,
+            Ok(Assignable) => Assignable,
+            Ok(Mismatch(_)) => unreachable!("mismatches cross the protected error channel"),
         };
     }
 

@@ -391,8 +391,15 @@ impl<R: ReferenceEquality> ComparisonContext<'_, R> {
         }
     }
 
-    fn secret_matches_state(&self, inner: &Value, state: &Value) -> bool {
-        match secret_matches_state(inner, state) {
+    fn secret_matches_state(
+        &self,
+        payload: &crate::resource::SecretPayload<
+            crate::resource::SnapshotLeaf,
+            crate::resource::AbsoluteBindingAddress,
+        >,
+        state: &Value,
+    ) -> bool {
+        match payload.try_inspect(|value| secret_matches_state(value, state)) {
             Ok(equal) => equal,
             Err(error) => {
                 self.errors.retain(error.into());
@@ -874,10 +881,10 @@ fn type_aware_equal_on_path<'a, R: ReferenceEquality>(
     // Secret comparison: compare the desired secret with the typed hash
     // decoded from state. Desired carries `DeferredValue::Secret(inner)`.
     if let Value::Deferred(DeferredValue::Secret(inner)) = a {
-        return context.secret_matches_state(inner.expose_plaintext(), b);
+        return context.secret_matches_state(inner, b);
     }
     if let Value::Deferred(DeferredValue::Secret(inner)) = b {
-        return context.secret_matches_state(inner.expose_plaintext(), a);
+        return context.secret_matches_state(inner, a);
     }
 
     // Retain top-level Ref names across non-consuming Union recursion. Each
@@ -1418,14 +1425,7 @@ fn contains_pending_reread(value: &Value) -> bool {
             .iter()
             .any(|argument| contains_pending_reread(argument.walker_value())),
         Value::Deferred(DeferredValue::Access(access)) => contains_pending_reread(access.base()),
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            let mut result = None;
-            inner.visit(|secret_value, scope| {
-                let _ = scope;
-                result = Some(contains_pending_reread(secret_value));
-            });
-            result.expect("secret visit")
-        }
+        Value::Deferred(DeferredValue::Secret(inner)) => inner.visit(contains_pending_reread),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             contains_pending_reread(value) || contains_pending_reread(default)
         }
@@ -1672,14 +1672,7 @@ fn has_observable_content(value: &Value) -> bool {
         }
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(has_observable_content),
         Value::Concrete(ConcreteValue::StringList(items)) => !items.is_empty(),
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            let mut result = None;
-            inner.visit(|secret_value, scope| {
-                let _ = scope;
-                result = Some(has_observable_content(secret_value));
-            });
-            result.expect("secret visit")
-        }
+        Value::Deferred(DeferredValue::Secret(inner)) => inner.visit(has_observable_content),
         Value::Deferred(DeferredValue::ModuleIf(_)) => true,
         Value::Concrete(ConcreteValue::String(_))
         | Value::Concrete(ConcreteValue::EnumIdentifier(_))
@@ -2276,7 +2269,7 @@ mod tests {
         for verdict in [planning, observation, authoring, recorded] {
             assert!(matches!(verdict, Err(ComparisonError::Secret(
                 SerializationError::UnavailableSecret(ref error)
-            )) if error.path() == "comparison.secret.opaque"));
+            )) if error.path() == "(secret)"));
         }
     }
 

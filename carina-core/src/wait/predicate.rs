@@ -369,16 +369,9 @@ fn unresolved_enum_identifier<B: BindingAddress>(
             .iter()
             .find_map(|argument| unresolved_enum_identifier(argument.walker_value())),
         Value::Deferred(DeferredValue::Access(access)) => unresolved_enum_identifier(access.base()),
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            let mut result = None;
-            inner.visit(|secret_value, scope| {
-                result = Some(
-                    unresolved_enum_identifier(secret_value)
-                        .map(|finding| scope.protect_error(finding)),
-                );
-            });
-            result.expect("secret visit")
-        }
+        Value::Deferred(DeferredValue::Secret(inner)) => inner
+            .try_inspect(|value| unresolved_enum_identifier(value).map_or(Ok(()), Err))
+            .err(),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             unresolved_enum_identifier(value).or_else(|| unresolved_enum_identifier(default))
         }

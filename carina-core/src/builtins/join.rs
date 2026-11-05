@@ -89,16 +89,7 @@ fn join_scalar<B: BindingAddress>(
             Ok((crate::value::render_duration(*value).into(), false))
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            let (text, _) = {
-                let mut result = None;
-                inner.visit(|secret_value, scope| {
-                    let _ = scope;
-                    result = Some(
-                        (join_scalar(secret_value)).map_err(|error| scope.protect_error(error)),
-                    );
-                });
-                result.expect("secret visit")
-            }?;
+            let (text, _) = inner.try_inspect(join_scalar)?;
             Ok((
                 ValueString::diagnostic_sensitive(text.into_plaintext()),
                 true,

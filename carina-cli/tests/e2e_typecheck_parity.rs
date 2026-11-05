@@ -520,10 +520,18 @@ fn authored_expression_coalesce_cli_lsp_directory_parity() {
             let schemas = expression_typing_schemas();
             let cli = cli_diagnostics(factories_for(&schemas), &fixture);
             assert_eq!(cli.len(), 1, "{expression}: {cli:#?}");
-            assert!(
-                cli[0].contains("String") && cli[0].contains("Int"),
-                "{cli:#?}"
-            );
+            if expression.starts_with("secret(") {
+                assert_eq!(
+                    cli[0].lines().last(),
+                    Some(carina_core::resource::INSIDE_SECRET_MESSAGE),
+                    "{cli:#?}",
+                );
+            } else {
+                assert!(
+                    cli[0].contains("String") && cli[0].contains("Int"),
+                    "{cli:#?}"
+                );
+            }
             let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
             assert_eq!(
                 lsp_error_multiset(&lsp),
