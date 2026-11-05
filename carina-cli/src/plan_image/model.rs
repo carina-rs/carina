@@ -342,8 +342,11 @@ pub(crate) fn build_model(input: PlanImageInput<'_>) -> GraphModel {
         .zip(input.unresolved_resources)
         .map(|(resolved, unresolved)| (resolved.resolved_id(), unresolved))
         .collect();
-    let executor_edges =
-        build_plan_scheduler_dependency_edges(input.plan.effects(), &unresolved_resources);
+    let executor_edges = build_plan_scheduler_dependency_edges(
+        input.plan.effects(),
+        &unresolved_resources,
+        input.plan.replacement_scheduling(),
+    );
     let mut ordering_edge_set = HashSet::new();
     for (parent, child) in executor_edges {
         if parent.phase == PlanSchedulerPhase::DeferredReplaceTeardown

@@ -671,7 +671,7 @@ mod tests {
     use crate::effect::SchedulerKey;
     use crate::effect::{ChangedCreateOnly, DeferredReplaceDelete, NonEmptyDeletes};
     use crate::parser::{ExpandedDeferredForExpression as DeferredForExpression, ForBinding};
-    use crate::plan::{Plan, ReplacementDelete, ReplacementGroup};
+    use crate::plan::{Plan, ReplacementGroup};
     use crate::resource::{
         Directives, ExpandedConcreteValue as ConcreteValue, ExpandedDeferredValue as DeferredValue,
         ExpandedValue as Value, LoopSlot, PathSegment, RelativeBindingName, ResolvedResource,
@@ -974,34 +974,37 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::Create(resolved(igw)));
         plan.add_replacement(ReplacementGroup {
-            create: resolved(create),
-            delete: ReplacementDelete {
-                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                    "ec2.Vpc", "vpc-old",
-                )),
-                identifier: crate::effect::fixture_applied_identifier("vpc-123"),
-                directives: Directives::default(),
-                binding: Some(absolute("vpc_old")),
-                dependencies: crate::test_support::persisted([SchedulerKey::with_identity(
-                    "ec2.InternetGateway",
-                    "igw",
-                )]),
-                explicit_dependencies: std::iter::once(SchedulerKey::with_identity(
-                    "ec2.InternetGateway",
-                    "igw",
-                ))
-                .collect(),
-            },
-            create_before_destroy: true,
             changed_create_only: ChangedCreateOnly::new(vec!["cidr_block".to_string()]).unwrap(),
             cascade_ref_hints: Vec::new(),
-            temporary_name: None,
             permanent_name_override: None,
             consumer_updates: Default::default(),
-            previous_attributes: crate::test_support::snapshot_attributes(HashMap::from([(
-                "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
-            )])),
+            replacement: {
+                let mut old = crate::effect::DeferredReplaceDelete {
+                    blocked_by_updates: Default::default(),
+                    previous_attributes: Default::default(),
+                    id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                        "ec2.Vpc", "vpc-old",
+                    )),
+                    identifier: crate::effect::fixture_applied_identifier("vpc-123"),
+                    directives: Directives::default(),
+                    binding: Some(absolute("vpc_old")),
+                    dependencies: crate::test_support::persisted([SchedulerKey::with_identity(
+                        "ec2.InternetGateway",
+                        "igw",
+                    )]),
+                    explicit_dependencies: std::iter::once(SchedulerKey::with_identity(
+                        "ec2.InternetGateway",
+                        "igw",
+                    ))
+                    .collect(),
+                };
+                old.previous_attributes =
+                    crate::test_support::snapshot_attributes(HashMap::from([(
+                        "cidr_block".to_string(),
+                        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+                    )]));
+                crate::test_support::checked_replacement(resolved(create), old, true)
+            },
         });
 
         let graph = build_dependency_graph(&plan);
@@ -1131,6 +1134,7 @@ mod tests {
         plan.add(Effect::DeferredReplace(Box::new(
             crate::test_support::compiled_replace(
                 NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                    previous_attributes: Default::default(),
                     id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                         "route53.Record",
                         "validation_records[0]",
@@ -1204,6 +1208,7 @@ mod tests {
         plan.add(Effect::DeferredReplace(Box::new(
             crate::test_support::compiled_replace(
                 NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                    previous_attributes: Default::default(),
                     id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                         "route53.Record",
                         "validation_records[0]",

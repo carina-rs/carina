@@ -7,7 +7,7 @@ use crate::resource::ResolvedResourceId;
 
 use super::UnresolvedResource;
 use super::deferred_dispatch::{DeferredDispatchResult, PureMetaCtx, dispatch_deferred_create};
-use super::parallel::apply_deferred_replace_delete_deps;
+use super::parallel::apply_deferred_gate_deps;
 use crate::effect::deps::{
     DependencyAnalysis, DependencyAnalysisFailure, ScheduleInputs, UnresolvedRequiredDependency,
     build_effect_dependency_analysis, relax_update_update_edges,
@@ -53,7 +53,7 @@ impl<'a, S> PureMetaStep<'a, S> {
 
 pub(super) enum PureMetaOutcome<S> {
     NotPureMeta,
-    Materialized(Vec<Effect<S>>),
+    Materialized(super::deferred_dispatch::DeferredMaterialization<S>),
     Failed(super::DeferredCreateFailure),
 }
 
@@ -101,15 +101,17 @@ pub(super) fn build_scheduler_deps<S>(
     effects: &[Effect<S>],
     unresolved_resources: &HashMap<ResolvedResourceId, UnresolvedResource<S>>,
     deferred_replace_delete_deps: &[(usize, usize)],
+    replacements: &crate::replacement::ReplacementScheduling,
 ) -> SchedulerDeps {
     finish_scheduler_deps(
         effects,
         build_effect_dependency_analysis(
             effects,
             unresolved_resources.keys(),
-            ScheduleInputs::Apply,
+            ScheduleInputs::Apply(replacements),
         ),
         deferred_replace_delete_deps,
+        replacements,
     )
 }
 
@@ -117,6 +119,7 @@ pub(super) fn build_scheduler_deps_from_resources(
     effects: &[Effect],
     unresolved_resources: &HashMap<ResolvedResourceId, &UnresolvedResource>,
     deferred_replace_delete_deps: &[(usize, usize)],
+    replacements: &crate::replacement::ReplacementScheduling,
 ) -> SchedulerDeps {
     let effect_refs: Vec<_> = effects.iter().collect();
     finish_scheduler_deps(
@@ -124,9 +127,10 @@ pub(super) fn build_scheduler_deps_from_resources(
         build_effect_dependency_analysis(
             &effect_refs,
             unresolved_resources.keys(),
-            ScheduleInputs::Apply,
+            ScheduleInputs::Apply(replacements),
         ),
         deferred_replace_delete_deps,
+        replacements,
     )
 }
 
@@ -134,6 +138,7 @@ fn finish_scheduler_deps<S>(
     effects: &[Effect<S>],
     analysis: Result<DependencyAnalysis, DependencyAnalysisFailure>,
     deferred_replace_delete_deps: &[(usize, usize)],
+    _replacements: &crate::replacement::ReplacementScheduling,
 ) -> SchedulerDeps {
     let (mut analysis, unresolved) = match analysis {
         Ok(analysis) => (analysis, Vec::new()),
@@ -141,7 +146,7 @@ fn finish_scheduler_deps<S>(
     };
     relax_update_update_edges(effects, &mut analysis);
     let mut deps_of = analysis.into_deps_of();
-    apply_deferred_replace_delete_deps(effects, &mut deps_of, deferred_replace_delete_deps);
+    apply_deferred_gate_deps(effects, &mut deps_of, deferred_replace_delete_deps);
     SchedulerDeps {
         deps_of,
         unresolved,

@@ -86,10 +86,20 @@ impl Scenario {
 }
 
 fn replacement_config(name: &str) -> String {
+    // This fixture tests admitted CBD. Distinct physical names exercise the
+    // Attribute class without needing a temporary name.
+    let child_prefix = if name == "yy" {
+        "off".to_string()
+    } else {
+        format!("off-{name}")
+    };
     format!(
         r#"let src = mock.test.resource {{ name = "{name}" }}
 let rs = for _, t in (src.tags ?? {{ a = "x" }}) {{
-  mock.test.resource {{ name = "off-${{t}}" }}
+  mock.test.resource {{
+    name = "{child_prefix}-${{t}}"
+    directives {{ create_before_destroy = true }}
+  }}
 }}
 "#,
     )

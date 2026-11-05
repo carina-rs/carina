@@ -341,6 +341,7 @@ fn build_deferred_replace_plan() -> Plan {
     plan.add(Effect::DeferredReplace(Box::new(
         crate::compiled_replace_fixture(
             NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                previous_attributes: Default::default(),
                 id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "route53.Record",
                     "old-record-0",
@@ -525,10 +526,10 @@ fn snapshot_deferred_for_anonymous() {
 fn snapshot_deferred_replace() {
     let plan = build_deferred_replace_plan();
     let output = render_tui(&plan, 120, 32, 1);
-    assert!(output.contains("+/-"));
+    assert!(output.contains("-/+"));
     assert!(
         output.contains(
-            "+/- aws.route53.Record validation_records[*] (N records after cert applies)"
+            "-/+ aws.route53.Record validation_records[*] (N records after cert applies)"
         )
     );
     assert!(output.contains("<- for opt in cert.domain_validation_options"));

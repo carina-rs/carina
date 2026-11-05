@@ -58,9 +58,9 @@ impl<S> UnresolvedResource<S> {
 /// graph nodes that intentionally have no destroy effect; distinguishing them
 /// from an absent address keeps missing targets fallible without inventing
 /// no-op effects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScheduleInputs<'a> {
-    Apply,
+    Apply(&'a crate::replacement::ReplacementScheduling),
     Destroy {
         aliases: &'a [DestroyWaitAlias],
         kept_targets: &'a KeptDestroyTargets,
@@ -612,7 +612,7 @@ where
         .collect::<HashSet<_>>();
     let mut instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets> = HashMap::new();
     let aliases = match inputs {
-        ScheduleInputs::Apply => &[][..],
+        ScheduleInputs::Apply(_) => &[][..],
         ScheduleInputs::Destroy {
             aliases,
             kept_targets,
@@ -674,12 +674,44 @@ where
 
     let analyzer = DependencyAnalyzer::new(instance_to_idx, delete_blockers_by_id, known_graph_ids);
     let mut analysis = DependencyAnalysis::new(effects.len() + aliases.len());
-    add_same_identity_replacement_order_edges(effects, &mut analysis);
+    if let ScheduleInputs::Apply(replacements) = inputs {
+        let mut replacement_edges = HashMap::new();
+        let admitted_pairs = replacements.order_edges(effects, &mut replacement_edges);
+        for (dependent, dependencies) in replacement_edges {
+            for dependency in dependencies {
+                analysis.add_edge(dependent, dependency, ReadsSet::unknown());
+            }
+        }
+        for (create_idx, effect) in effects.iter().enumerate() {
+            let Effect::Create(target) = effect.as_ref() else {
+                continue;
+            };
+            for (delete_idx, old) in effects.iter().enumerate() {
+                if matches!(old.as_ref(), Effect::Delete { id, generation: crate::effect::EffectGeneration::Current, .. } if target.id == **id)
+                    && !admitted_pairs.contains(&(create_idx, delete_idx))
+                {
+                    // An empty capability cannot admit raw replacement endpoints.
+                    analysis
+                        .unresolved_required
+                        .push(UnresolvedRequiredDependency {
+                            effect_index: create_idx,
+                            id: target.resolved_id(),
+                        });
+                    analysis
+                        .unresolved_required
+                        .push(UnresolvedRequiredDependency {
+                            effect_index: delete_idx,
+                            id: target.resolved_id(),
+                        });
+                }
+            }
+        }
+    }
 
     for (idx, effect) in effects.iter().enumerate() {
         let effect = effect.as_ref();
         match inputs {
-            ScheduleInputs::Apply => {
+            ScheduleInputs::Apply(_) => {
                 analyzer.collect_from_schedule_edges(
                     effects,
                     effect.apply_edges(),
@@ -712,24 +744,6 @@ where
         Ok(analysis)
     } else {
         Err(DependencyAnalysisFailure(Box::new(analysis)))
-    }
-}
-
-fn add_same_identity_replacement_order_edges<S, E: AsRef<Effect<S>>>(
-    effects: &[E],
-    analysis: &mut DependencyAnalysis,
-) {
-    let mut previous_by_instance: HashMap<EffectInstanceKey, usize> = HashMap::new();
-    for (idx, effect) in effects.iter().enumerate() {
-        let effect = effect.as_ref();
-        if !matches!(effect, Effect::Create(_) | Effect::Delete { .. }) {
-            continue;
-        }
-
-        let instance = effect.instance_key();
-        if let Some(previous) = previous_by_instance.insert(instance, idx) {
-            analysis.add_edge(idx, previous, ReadsSet::unknown());
-        }
     }
 }
 
@@ -910,7 +924,7 @@ mod tests {
         let deps = build_effect_dependency_analysis(
             &[delete_target, dependent_delete],
             std::iter::empty(),
-            ScheduleInputs::Apply,
+            ScheduleInputs::Apply(&Default::default()),
         )
         .expect("dependency analysis must resolve")
         .into_deps_of();
@@ -926,7 +940,7 @@ mod tests {
         let deps = build_effect_dependency_analysis(
             &[create_target, dependent_delete],
             std::iter::empty(),
-            ScheduleInputs::Apply,
+            ScheduleInputs::Apply(&Default::default()),
         )
         .expect("dependency analysis must resolve")
         .into_deps_of();
@@ -941,7 +955,7 @@ mod tests {
         let deps = build_effect_dependency_analysis(
             &[update_target, dependent_delete],
             std::iter::empty(),
-            ScheduleInputs::Apply,
+            ScheduleInputs::Apply(&Default::default()),
         )
         .expect("dependency analysis must resolve")
         .into_deps_of();
@@ -956,9 +970,12 @@ mod tests {
     fn apply_orphan_delete_with_missing_persisted_dependency_is_a_typed_warning() {
         let delete = delete_effect("orphan", &["vanished"], &[]);
 
-        let analysis =
-            build_effect_dependency_analysis(&[delete], std::iter::empty(), ScheduleInputs::Apply)
-                .expect("a vanished persisted destroy dependency must not abort apply");
+        let analysis = build_effect_dependency_analysis(
+            &[delete],
+            std::iter::empty(),
+            ScheduleInputs::Apply(&Default::default()),
+        )
+        .expect("a vanished persisted destroy dependency must not abort apply");
 
         assert!(analysis.deps_of(0).expect("delete analysis").is_empty());
         let [warning] = analysis.unresolved_delete_ordering() else {
@@ -975,9 +992,12 @@ mod tests {
     #[test]
     fn dependency_analysis_api_does_not_require_compositions() {
         let effects = [create_effect("standalone")];
-        let analysis =
-            build_effect_dependency_analysis(&effects, std::iter::empty(), ScheduleInputs::Apply)
-                .expect("composition-independent dependency analysis must resolve");
+        let analysis = build_effect_dependency_analysis(
+            &effects,
+            std::iter::empty(),
+            ScheduleInputs::Apply(&Default::default()),
+        )
+        .expect("composition-independent dependency analysis must resolve");
 
         assert_eq!(analysis.deps_of(0), Some(&HashSet::new()));
     }
@@ -993,8 +1013,12 @@ mod tests {
             UnresolvedResource::from_pre_resolve(Resource::from_id(resource.id.clone())),
         )]);
 
-        build_effect_dependency_analysis(&[effect], origins.keys(), ScheduleInputs::Apply)
-            .expect("resolved origin keys must be accepted without a runtime conversion");
+        build_effect_dependency_analysis(
+            &[effect],
+            origins.keys(),
+            ScheduleInputs::Apply(&Default::default()),
+        )
+        .expect("resolved origin keys must be accepted without a runtime conversion");
     }
 
     #[test]
@@ -1005,7 +1029,7 @@ mod tests {
         let deps = build_effect_dependency_analysis(
             &[parent_delete, child_delete],
             std::iter::empty(),
-            ScheduleInputs::Apply,
+            ScheduleInputs::Apply(&Default::default()),
         )
         .expect("dependency analysis must resolve")
         .into_deps_of();
@@ -1024,7 +1048,7 @@ mod tests {
         let deps = build_effect_dependency_analysis(
             &[consumer, delete],
             std::iter::empty(),
-            ScheduleInputs::Apply,
+            ScheduleInputs::Apply(&Default::default()),
         )
         .expect("dependency analysis must resolve")
         .into_deps_of();
@@ -1040,9 +1064,12 @@ mod tests {
     fn delete_apply_edge_for_blocked_by_updates_rejects_missing_target() {
         let delete = delete_effect("old_web_acl", &[], &["missing_consumer"]);
 
-        let failure =
-            build_effect_dependency_analysis(&[delete], std::iter::empty(), ScheduleInputs::Apply)
-                .expect_err("a required delete gate must not be silently dropped");
+        let failure = build_effect_dependency_analysis(
+            &[delete],
+            std::iter::empty(),
+            ScheduleInputs::Apply(&Default::default()),
+        )
+        .expect_err("a required delete gate must not be silently dropped");
 
         assert_eq!(failure.unresolved().len(), 1);
         assert_eq!(failure.unresolved()[0].effect_index(), 0);
@@ -1086,7 +1113,7 @@ mod tests {
         let deps = build_effect_dependency_analysis(
             &[create, consumer, delete],
             std::iter::empty(),
-            ScheduleInputs::Apply,
+            ScheduleInputs::Apply(&Default::default()),
         )
         .expect("dependency analysis must resolve")
         .into_deps_of();
@@ -1407,7 +1434,7 @@ mod tests {
         let deps = build_effect_dependency_analysis(
             &[delete, create],
             std::iter::empty(),
-            ScheduleInputs::Apply,
+            ScheduleInputs::Apply(&Default::default()),
         )
         .expect("dependency analysis must resolve")
         .into_deps_of();
@@ -1460,10 +1487,13 @@ mod tests {
             })
             .collect();
 
-        let deps =
-            build_effect_dependency_analysis(&effects, unresolved.keys(), ScheduleInputs::Apply)
-                .expect("dependency analysis must resolve")
-                .into_deps_of();
+        let deps = build_effect_dependency_analysis(
+            &effects,
+            unresolved.keys(),
+            ScheduleInputs::Apply(&Default::default()),
+        )
+        .expect("dependency analysis must resolve")
+        .into_deps_of();
 
         assert!(
             deps[&2].contains(&1),
@@ -1491,9 +1521,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let mut analysis =
-            build_effect_dependency_analysis(&effects, unresolved.keys(), ScheduleInputs::Apply)
-                .expect("dependency analysis must resolve");
+        let mut analysis = build_effect_dependency_analysis(
+            &effects,
+            unresolved.keys(),
+            ScheduleInputs::Apply(&Default::default()),
+        )
+        .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
 
         assert!(!analysis.into_deps_of()[&1].contains(&0));
@@ -1615,7 +1648,7 @@ mod tests {
         let deps = build_effect_dependency_analysis(
             &[delete, consumer],
             std::iter::empty(),
-            ScheduleInputs::Apply,
+            ScheduleInputs::Apply(&Default::default()),
         )
         .expect("dependency analysis must resolve")
         .into_deps_of();

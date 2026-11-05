@@ -204,11 +204,7 @@ mod graph_fixtures {
         template: Box<ExpandedDeferredForExpression>,
     ) -> DeferredReplacePayload {
         let payload = compiled_loop(template);
-        DeferredReplacePayload {
-            deletes,
-            template: payload.template,
-            dependency_template: payload.dependency_template,
-        }
+        DeferredReplacePayload::new(deletes, payload.template, payload.dependency_template)
     }
     pub fn persisted(
         rows: impl IntoIterator<Item = ResolvedResourceId>,

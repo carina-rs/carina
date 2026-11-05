@@ -5341,6 +5341,7 @@ mod apply_state_save_tests {
 
     fn deferred_replace_delete(id: &ResourceId) -> DeferredReplaceDelete {
         DeferredReplaceDelete {
+            previous_attributes: Default::default(),
             id: carina_core::resource::ResolvedResourceId::new(id.clone()),
             identifier: crate::fixture_applied_identifier("old-record-id"),
             directives: Directives::default(),

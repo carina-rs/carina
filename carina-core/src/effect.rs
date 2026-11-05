@@ -12,6 +12,7 @@ pub(crate) mod value_stage;
 
 #[cfg(test)]
 use crate::resource::Resource;
+use std::collections::HashMap;
 use std::{
     collections::{BTreeSet, HashSet},
     ops::Deref,
@@ -208,6 +209,9 @@ pub struct TemporaryName {
 /// fields later without re-shaping `DeferredReplace` itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeferredReplaceDelete {
+    /// Prior snapshot retained for replacement naming and recovery.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub previous_attributes: HashMap<String, crate::resource::SnapshotValue>,
     pub id: ResolvedResourceId,
     pub identifier: AppliedIdentifier,
     #[serde(default)]
@@ -291,6 +295,9 @@ impl std::error::Error for EmptyDeletes {}
 pub struct NonEmptyDeletes(NonEmptyVec<DeferredReplaceDelete>);
 
 impl NonEmptyDeletes {
+    pub(crate) fn iter_mut(&mut self) -> std::slice::IterMut<'_, DeferredReplaceDelete> {
+        self.0.as_mut_slice().iter_mut()
+    }
     /// Construct a non-empty absorbed delete list.
     pub fn try_new(deletes: Vec<DeferredReplaceDelete>) -> Result<Self, EmptyDeletes> {
         NonEmptyVec::from_vec(deletes).map(Self).ok_or(EmptyDeletes)
@@ -396,19 +403,105 @@ impl<'de, S: serde::de::DeserializeOwned, V: PlanValueKind> Deserialize<'de>
     }
 }
 
-/// Payload for [`Effect::DeferredReplace`].
-#[derive(Debug, Clone, PartialEq)]
+/// Payload for [`Effect::DeferredReplace`]. Requests remain unadmitted until
+/// individual children have materialized. The preview is display-only evidence.
+#[derive(Debug, Clone)]
 pub struct DeferredReplacePayload<S = ModuleSource, V: PlanValueKind = NoPlaceholder> {
     pub dependency_template: crate::resource::DeferredDependencyTemplate,
-    /// Pre-apply iterations being destroyed.
-    pub deletes: NonEmptyDeletes,
-    /// The for-expression body, replayed against the upstream state.
-    pub template: Box<DeferredForExpression<S, V, V::Template>>,
+    pub request:
+        crate::replacement::ReplacementRequest<Box<DeferredForExpression<S, V, V::Template>>>,
+    preview: Option<crate::replacement::CheckedReplacement<ResolvedResourceId>>,
 }
-
+impl<S: PartialEq, V: PlanValueKind> PartialEq for DeferredReplacePayload<S, V> {
+    fn eq(&self, other: &Self) -> bool {
+        self.request == other.request && self.dependency_template == other.dependency_template
+    }
+}
 impl<S, V: PlanValueKind> DeferredReplacePayload<S, V> {
+    pub fn new(
+        deletes: NonEmptyDeletes,
+        template: Box<DeferredForExpression<S, V, V::Template>>,
+        dependency_template: crate::resource::DeferredDependencyTemplate,
+    ) -> Self {
+        let mut payload = Self {
+            dependency_template,
+            request: crate::replacement::ReplacementRequest::new(template, deletes),
+            preview: None,
+        };
+        // A schema-free default can admit delete-first; a CBD request remains
+        // unchosen until the caller supplies its provider registry.
+        let _ = payload.preflight(&crate::schema::SchemaRegistry::new());
+        payload
+    }
     pub fn id(&self) -> &ResolvedResourceId {
         self.template.deferred_effect_id()
+    }
+    pub fn preflight(
+        &mut self,
+        registry: &crate::schema::SchemaRegistry,
+    ) -> Result<(), crate::plan::CreateBeforeDestroyError> {
+        let crate::resource::LoopDirective::Resolved(requested) = self
+            .template
+            .template_resource()
+            .directives()
+            .create_before_destroy
+        else {
+            self.preview = None;
+            if self.request.required_by().is_none() {
+                return Ok(());
+            }
+            return self.preflight_order(true, registry);
+        };
+        self.preflight_order(requested, registry)
+    }
+    fn preflight_order(
+        &mut self,
+        requested: bool,
+        registry: &crate::schema::SchemaRegistry,
+    ) -> Result<(), crate::plan::CreateBeforeDestroyError> {
+        let old = &self.deletes[0];
+        let template_id = self.template.template_resource_id();
+        let target_id = ResolvedResourceId::with_provider_identity(
+            template_id.provider.clone(),
+            template_id.resource_type.clone(),
+            old.id.identity().clone(),
+            template_id.provider_instance.clone(),
+        );
+        let target: crate::resource::ResolvedResource =
+            crate::resource::ResolvedResource::from_id(target_id);
+        let mut resource = target.as_resource().clone();
+        resource.directives.create_before_destroy = requested;
+        resource.binding = old.binding.clone();
+        let mut request = crate::replacement::ReplacementRequest::new(
+            target.replace_inner(resource),
+            self.deletes.clone(),
+        );
+        if let Some(dependent) = self.request.required_by() {
+            request = request.require_create_first(dependent);
+        }
+        let checked = crate::replacement::resolve_replacement(request, registry)?;
+        self.preview = Some(checked.into_scheduling());
+        Ok(())
+    }
+    pub fn display_glyph(&self) -> &'static str {
+        match &self.preview {
+            Some(checked) => {
+                Effect::<ModuleSource>::replace_display_glyph(checked.is_create_first())
+            }
+            None => "~",
+        }
+    }
+}
+impl<S, V: PlanValueKind> std::ops::Deref for DeferredReplacePayload<S, V> {
+    type Target =
+        crate::replacement::ReplacementRequest<Box<DeferredForExpression<S, V, V::Template>>>;
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
+}
+impl<S, V: PlanValueKind> std::ops::DerefMut for DeferredReplacePayload<S, V> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.request
     }
 }
 
@@ -417,8 +510,18 @@ impl<S: Serialize + Clone, V: PlanValueKind> Serialize for DeferredReplacePayloa
     where
         Ser: serde::Serializer,
     {
-        let mut state = serializer.serialize_struct("DeferredReplacePayload", 4)?;
+        let mut state = serializer.serialize_struct(
+            "DeferredReplacePayload",
+            if self.request.required_by().is_some() {
+                5
+            } else {
+                4
+            },
+        )?;
         state.serialize_field("deletes", &self.deletes)?;
+        if let Some(dependent) = self.request.required_by() {
+            state.serialize_field("required_by", dependent)?;
+        }
         state.serialize_field("id", &self.template.deferred_effect_wire_id())?;
         state.serialize_field("template", &self.template)?;
         state.serialize_field("dependency_template", &self.dependency_template)?;
@@ -437,6 +540,8 @@ impl<'de, S: serde::de::DeserializeOwned, V: PlanValueKind> Deserialize<'de>
         #[serde(bound(deserialize = "S: serde::de::DeserializeOwned, V: PlanValueKind"))]
         struct Wire<S, V: PlanValueKind> {
             deletes: NonEmptyDeletes,
+            #[serde(default)]
+            required_by: Option<String>,
             id: ResolvedResourceId,
             template: Box<DeferredForExpression<S, V, V::Template>>,
             dependency_template: crate::resource::DeferredDependencyTemplate,
@@ -444,16 +549,17 @@ impl<'de, S: serde::de::DeserializeOwned, V: PlanValueKind> Deserialize<'de>
 
         let Wire {
             deletes,
+            required_by,
             id,
             template,
             dependency_template,
         } = Wire::deserialize(deserializer)?;
         validate_deferred_effect_id::<De::Error, S, V>(&id, &template)?;
-        Ok(Self {
-            deletes,
-            template,
-            dependency_template,
-        })
+        let mut payload = Self::new(deletes, template, dependency_template);
+        if let Some(dependent) = required_by {
+            payload.request = payload.request.require_create_first(dependent);
+        }
+        Ok(payload)
     }
 }
 
@@ -1530,6 +1636,9 @@ impl UnresolvedSavedEffect {
             }
             Self::DeferredReplace(mut payload) => {
                 payload.template.resolve_template_ignore_changes(schemas)?;
+                payload
+                    .preflight(schemas)
+                    .map_err(crate::resource::ResolvedResourceError::Replacement)?;
                 Effect::DeferredReplace(payload)
             }
         })
@@ -1617,14 +1726,14 @@ impl<V: PlanValueKind> From<Effect<ModuleSource, V>> for Effect<SavedModuleSourc
             }),
             Effect::DeferredReplace(payload) => {
                 let DeferredReplacePayload {
-                    deletes,
-                    template,
+                    request,
                     dependency_template,
+                    preview,
                 } = *payload;
                 Self::DeferredReplace(Box::new(DeferredReplacePayload {
-                    deletes,
+                    request: request.map_target(|template| Box::new((*template).into())),
                     dependency_template,
-                    template: Box::new((*template).into()),
+                    preview,
                 }))
             }
         }
@@ -1986,6 +2095,7 @@ impl EffectWithSource<ModuleSource> {
             (
                 Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
                     NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                        previous_attributes: Default::default(),
                         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                             "route53.Record",
                             "validation_records[0]"
@@ -2025,7 +2135,7 @@ impl<S, V: PlanValueKind> EffectWithSource<S, V> {
             Effect::ReleaseListKeys { .. } => "!",
             Effect::Wait { .. } => ">",
             Effect::DeferredCreate(_) => "+",
-            Effect::DeferredReplace(_) => "+/-",
+            Effect::DeferredReplace(payload) => payload.display_glyph(),
         }
     }
 
@@ -2761,8 +2871,9 @@ mod tests {
 
     fn deferred_replace_effect() -> Effect {
         let payload = compiled_deferred_for_template(deferred_for_template_at(None, 0));
-        Effect::DeferredReplace(Box::new(DeferredReplacePayload {
-            deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+        Effect::DeferredReplace(Box::new(DeferredReplacePayload::new(
+            NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                previous_attributes: Default::default(),
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "route53.Record",
                     "validation_records[0]",
@@ -2777,9 +2888,9 @@ mod tests {
                 blocked_by_updates: Default::default(),
             }])
             .expect("test fixture has one delete"),
-            template: payload.template,
-            dependency_template: payload.dependency_template,
-        }))
+            payload.template,
+            payload.dependency_template,
+        )))
     }
 
     #[test]
@@ -3083,6 +3194,7 @@ mod tests {
         let template = deferred_for_template_at(None, 0);
         let effect = Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
             NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                previous_attributes: Default::default(),
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "route53.Record",
                     "validation_records[0]",
@@ -3108,6 +3220,7 @@ mod tests {
         let template = deferred_for_template_at(None, 0);
         let effect = Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
             NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                previous_attributes: Default::default(),
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "route53.Record",
                     "validation_records[0]",

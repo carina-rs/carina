@@ -12169,3 +12169,6 @@ fn saved_plan_reloaded_resolved_data_source_retains_folded_module_dependency() {
         "a folded module data-source input must remain deferred after saved-plan reload",
     );
 }
+
+#[path = "tests/issue_4283.rs"]
+mod issue_4283;

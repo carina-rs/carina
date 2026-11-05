@@ -5000,7 +5000,7 @@ impl CurrentStateEntry {
 }
 
 #[derive(Debug)]
-enum PlanSaveError {
+pub(crate) enum PlanSaveError {
     Serialization(carina_core::value::SerializationError),
     CompositionSourceIdentity(carina_core::resource::CompositionSourceIdentityError),
     ProviderEvidence(ProviderEvidenceError),
@@ -5060,7 +5060,7 @@ fn build_plan_file<E>(
 
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-fn build_plan_file_from_parts<E, R>(
+pub(crate) fn build_plan_file_from_parts<E, R>(
     path: &ResolvedPath,
     parsed: &carina_core::parser::ExpandedFile<E>,
     provider_configs: &ResolvedProviderConfigs,
@@ -5186,7 +5186,7 @@ fn build_plan_file_contents<E>(
         };
         Ok(redacted)
     };
-    let redacted_managed_states = ctx
+    let mut redacted_managed_states = ctx
         .managed_current
         .iter()
         .filter_map(|(id, current)| {
@@ -5200,6 +5200,19 @@ fn build_plan_file_contents<E>(
             state.map(|state| redact_current_state(id, state).map(|state| (id.clone(), state)))
         })
         .collect::<Result<HashMap<_, _>, carina_core::value::SerializationError>>()?;
+    for effect in ctx.plan.effects() {
+        if let Effect::DeferredReplace(payload) = effect {
+            for old in payload.deletes.iter() {
+                let state = SnapshotState::existing(
+                    old.id.as_inner().clone(),
+                    old.previous_attributes.clone(),
+                );
+                redacted_managed_states
+                    .entry(old.id.as_inner().clone())
+                    .or_insert(redact_current_state(old.id.as_inner(), &state)?);
+            }
+        }
+    }
     let redacted_managed_current = ctx
         .managed_current
         .iter()

@@ -243,6 +243,24 @@ fn validation_deferred_for_expression() -> crate::parser::ExpandedDeferredForExp
     )
 }
 
+fn coexisting_validation_deferred_for_expression() -> crate::parser::ExpandedDeferredForExpression {
+    let mut template = validation_deferred_for_expression();
+    template.template_directives_mut().create_before_destroy =
+        crate::resource::LoopDirective::Resolved(true);
+    template
+}
+static COEXISTING_TEST_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "",
+        PatternResourceSchema::new("test")
+            .with_coexisting_replacement()
+            .validate()
+            .unwrap(),
+    );
+    registry
+});
+
 fn anonymous_deferred_collision_fixture() -> (
     crate::parser::ExpandedDeferredForExpression,
     ResolvedBindings,
@@ -355,7 +373,20 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
             .iter()
             .map(|(id, resource)| (id.clone(), resource))
             .collect();
-        let actual = build_plan_scheduler_dependency_edges(&effects, &borrowed);
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "",
+            PatternResourceSchema::new("test")
+                .with_coexisting_replacement()
+                .validate()
+                .unwrap(),
+        );
+        let replacements =
+            crate::replacement::ReplacementScheduling::resolve(&effects, &schemas, |_| {
+                HashMap::new()
+            })
+            .unwrap();
+        let actual = build_plan_scheduler_dependency_edges(&effects, &borrowed, &replacements);
 
         assert_eq!(actual, expected, "scheduler-edge export drifted for {case}");
         actual
@@ -408,7 +439,8 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
         BTreeSet::from([(primary(0), primary(1))]),
     );
 
-    let replacement = make_resource("replacement", &[]);
+    let mut replacement = make_resource("replacement", &[]);
+    replacement.directives.create_before_destroy = true;
     assert_matches_executor(
         "replacement pair",
         vec![
@@ -435,6 +467,7 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
             create_effect(cert.clone()),
             Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
                 NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                    previous_attributes: Default::default(),
                     id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                         "test",
                         "validation_records[0]",
@@ -2470,7 +2503,7 @@ async fn execute_lifecycle_fixture_with_observer(
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
-        schemas: &TEST_SCHEMAS,
+        schemas: &COEXISTING_TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
         precompleted_success_count: 0,
         checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
@@ -2978,7 +3011,8 @@ async fn create_not_created_skips_dependents_and_writes_nothing() {
 #[tokio::test]
 async fn create_before_destroy_outcome_unknown_records_replacement_create_state() {
     let provider = MockProvider::new();
-    let source = make_resource("source", &[]);
+    let mut source = make_resource("source", &[]);
+    source.directives.create_before_destroy = true;
     let source_id = source.id.clone();
     let directives = Directives::default().with_create_before_destroy(true);
     let mut plan = Plan::new();
@@ -9250,10 +9284,13 @@ fn test_build_dependency_levels_consistent_with_dependency_map() {
     let plan = create_plan_from_fixture_resources(vec![a, b, c, d]);
 
     let levels = build_dependency_levels(plan.effects(), &HashMap::new());
-    let dep_map =
-        build_dependency_analysis(plan.effects(), std::iter::empty(), ScheduleInputs::Apply)
-            .expect("dependency analysis must resolve")
-            .into_deps_of();
+    let dep_map = build_dependency_analysis(
+        plan.effects(),
+        std::iter::empty(),
+        ScheduleInputs::Apply(plan.replacement_scheduling()),
+    )
+    .expect("dependency analysis must resolve")
+    .into_deps_of();
 
     // Verify levels are consistent with the dependency map:
     // For every effect, its level must be greater than all its dependencies' levels.
@@ -9439,9 +9476,13 @@ fn test_dependency_analysis_respects_delete_dependencies() {
         blocked_by_updates: Default::default(),
     });
 
-    let deps = build_dependency_analysis(plan.effects(), std::iter::empty(), ScheduleInputs::Apply)
-        .expect("dependency analysis must resolve")
-        .into_deps_of();
+    let deps = build_dependency_analysis(
+        plan.effects(),
+        std::iter::empty(),
+        ScheduleInputs::Apply(plan.replacement_scheduling()),
+    )
+    .expect("dependency analysis must resolve")
+    .into_deps_of();
 
     // vpc delete (idx 0) must depend on subnet delete (idx 1)
     // because subnet must be deleted before vpc (reverse dependency)
@@ -9960,7 +10001,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
     let deps = build_dependency_analysis(
         plan.effects(),
         unresolved_resources.keys(),
-        ScheduleInputs::Apply,
+        ScheduleInputs::Apply(plan.replacement_scheduling()),
     )
     .expect("dependency analysis must resolve")
     .into_deps_of();
@@ -11245,6 +11286,7 @@ fn legacy_unbound_deferred_replace(
 ) -> Effect {
     Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
         NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+            previous_attributes: Default::default(),
             id: crate::resource::ResolvedResourceId::new(legacy_id.clone()),
             identifier: crate::effect::fixture_applied_identifier("existing"),
             directives: Directives::default(),
@@ -11259,7 +11301,7 @@ fn legacy_unbound_deferred_replace(
 }
 
 #[tokio::test]
-async fn unbound_deferred_replace_creates_children_before_deleting_legacy_rows() {
+async fn unbound_deferred_replace_deletes_conflicting_legacy_rows_before_creating_children() {
     let (template, bindings, schemas, child) = anonymous_deferred_collision_fixture();
     let child_id = child.id.clone();
     let legacy_id = ResourceId::with_provider_identity("mock", "test.Child", "_values[0]", None);
@@ -11300,9 +11342,9 @@ async fn unbound_deferred_replace_creates_children_before_deleting_legacy_rows()
 
     let calls = provider.calls();
     assert!(
-        call_position(&calls, "create", &child_id.to_string())
-            < call_position(&calls, "delete", &legacy_id.to_string()),
-        "anonymous children must exist before their legacy rows are deleted; calls: {calls:?}",
+        call_position(&calls, "delete", &legacy_id.to_string())
+            < call_position(&calls, "create", &child_id.to_string()),
+        "Conflicting anonymous children must delete their legacy rows before creation; calls: {calls:?}",
     );
 }
 
@@ -11562,6 +11604,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
         crate::test_support::compiled_replace(
             NonEmptyDeletes::try_new(vec![
                 DeferredReplaceDelete {
+                    previous_attributes: Default::default(),
                     id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                         "test",
                         "validation_records[0]",
@@ -11574,6 +11617,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
                     blocked_by_updates: Default::default(),
                 },
                 DeferredReplaceDelete {
+                    previous_attributes: Default::default(),
                     id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                         "test",
                         "validation_records[1]",
@@ -11587,7 +11631,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
                 },
             ])
             .expect("fixture has deletes"),
-            Box::new(validation_deferred_for_expression()),
+            Box::new(coexisting_validation_deferred_for_expression()),
         ),
     )));
 
@@ -11604,7 +11648,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
-        schemas: &TEST_SCHEMAS,
+        schemas: &COEXISTING_TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
         precompleted_success_count: 0,
         checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
@@ -11672,6 +11716,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
     plan.add(Effect::DeferredReplace(Box::new(
         crate::test_support::compiled_replace(
             NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                previous_attributes: Default::default(),
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "test",
                     "validation_records[0]",
@@ -11684,7 +11729,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
                 blocked_by_updates: Default::default(),
             }])
             .expect("fixture has one delete"),
-            Box::new(validation_deferred_for_expression()),
+            Box::new(coexisting_validation_deferred_for_expression()),
         ),
     )));
 
@@ -11701,7 +11746,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
-        schemas: &TEST_SCHEMAS,
+        schemas: &COEXISTING_TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
         precompleted_success_count: 0,
         checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
@@ -11932,6 +11977,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
     plan.add(Effect::DeferredReplace(Box::new(
         crate::test_support::compiled_replace(
             NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                previous_attributes: Default::default(),
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "test",
                     "validation_records[0]",
@@ -12744,5 +12790,339 @@ async fn deferred_create_reports_iterable_reference_when_binding_missing() {
         }),
         "events: {:?}",
         observer.events(),
+    );
+}
+
+async fn conflicting_deferred_case(
+    fail_delete: bool,
+    fail_expansion: bool,
+    map: bool,
+) -> (ExecutionResult, Vec<(String, String)>) {
+    let cert_id = ResourceId::with_identity("test", "cert");
+    let mut cert_state = State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(HashMap::from([(
+            "domain_validation_options".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(indexmap::IndexMap::from([(
+                    "resource_record".to_string(),
+                    Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+                        (
+                            "name".to_string(),
+                            Value::Concrete(ConcreteValue::String("_name".into())),
+                        ),
+                        (
+                            "value".to_string(),
+                            Value::Concrete(ConcreteValue::String("_value".into())),
+                        ),
+                    ]))),
+                )])),
+            )])),
+        )])),
+    )
+    .with_identifier("cert-id");
+    if map {
+        let crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(mut options)) =
+            cert_state
+                .attributes
+                .remove("domain_validation_options")
+                .unwrap()
+        else {
+            unreachable!()
+        };
+        cert_state.attributes.insert(
+            "domain_validation_options".into(),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(
+                indexmap::IndexMap::from([("stable".into(), options.remove(0))]),
+            )),
+        );
+    }
+    let validation_id = ResourceId::with_identity(
+        "test",
+        if map {
+            "validation_records.stable"
+        } else {
+            "validation_records[0]"
+        },
+    );
+    let validation_state =
+        State::existing(validation_id.clone(), HashMap::new()).with_identifier("new-validation");
+    let provider = MockProvider::new();
+    if fail_expansion {
+        cert_state.attributes.clear();
+    }
+    provider.push_create(Ok(cert_state));
+    provider.push_create(Ok(validation_state));
+    provider
+        .push_read(Ok(State::existing(validation_id.clone(), HashMap::new())
+            .with_identifier("old-validation-0")));
+    provider.push_delete(if fail_delete {
+        Err(ProviderError::api_error("old child delete failed"))
+    } else {
+        Ok(())
+    });
+    provider.push_delete(Ok(()));
+
+    let mut cert = Resource::new("test", "cert");
+    cert.binding = Some(absolute_binding("cert"));
+    let mut plan = Plan::new();
+    plan.add(create_effect(cert));
+    plan.add(Effect::DeferredReplace(Box::new(
+        crate::test_support::compiled_replace(
+            NonEmptyDeletes::try_new(vec![
+                DeferredReplaceDelete {
+                    previous_attributes: Default::default(),
+                    id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                        "test",
+                        "validation_records[0]",
+                    )),
+                    identifier: crate::effect::fixture_applied_identifier("old-validation-0"),
+                    directives: Directives::default(),
+                    binding: Some(absolute_binding("validation_records[0]")),
+                    dependencies: Default::default(),
+                    explicit_dependencies: Default::default(),
+                    blocked_by_updates: Default::default(),
+                },
+                DeferredReplaceDelete {
+                    previous_attributes: Default::default(),
+                    id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                        "test",
+                        "validation_records[1]",
+                    )),
+                    identifier: crate::effect::fixture_applied_identifier("old-validation-1"),
+                    directives: Directives::default(),
+                    binding: Some(absolute_binding("validation_records[1]")),
+                    dependencies: Default::default(),
+                    explicit_dependencies: Default::default(),
+                    blocked_by_updates: Default::default(),
+                },
+            ])
+            .expect("fixture has deletes"),
+            Box::new(validation_deferred_for_expression()),
+        ),
+    )));
+
+    if map {
+        for effect in plan.effects_mut() {
+            if let Effect::DeferredReplace(payload) = effect {
+                let template = validation_deferred_for_expression();
+                let mapped = crate::parser::DeferredForExpression::new(
+                    Some("main.crn".into()),
+                    1,
+                    "for _, opt in cert.domain_validation_options".into(),
+                    template.target().clone(),
+                    template.iterable.clone(),
+                    crate::parser::ForBinding::Map("_".into(), "opt".into()),
+                    template.template_resource().as_resource().clone(),
+                );
+                let mut old = payload.deletes[0].clone();
+                old.id = ResolvedResourceId::new(validation_id.clone());
+                old.binding = Some(absolute_binding("validation_records.stable"));
+                **payload = crate::test_support::compiled_replace(
+                    NonEmptyDeletes::try_new(vec![old]).unwrap(),
+                    Box::new(mapped),
+                );
+            }
+        }
+    }
+    if fail_delete {
+        for effect in plan.effects_mut() {
+            if let Effect::DeferredReplace(payload) = effect {
+                payload.deletes =
+                    NonEmptyDeletes::try_new(vec![payload.deletes[0].clone()]).unwrap();
+            }
+        }
+    }
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        PatternResourceSchema::new("test")
+            .with_conflicting_replacement()
+            .validate()
+            .unwrap(),
+    );
+    let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        managed_current: HashMap::new(),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
+    };
+    let observer = MockObserver::new();
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    (result, provider.calls())
+}
+
+#[tokio::test]
+async fn issue_4283_conflicting_deferred_child_is_delete_first() {
+    let (result, calls) = conflicting_deferred_case(false, false, false).await;
+    assert_eq!(result.failure_count(), 0, "calls: {calls:?}");
+    assert!(
+        call_position(&calls, "delete", "test.validation_records[0]")
+            < call_position(&calls, "create", "test.validation_records[0]"),
+        "calls: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|(op, id)| op == "delete" && id == "test.validation_records[1]"),
+        "a removed iteration remains an ordinary delete: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn issue_4283_failed_old_delete_blocks_conflicting_child_create() {
+    let (result, calls) = conflicting_deferred_case(true, false, false).await;
+    assert_eq!(result.failure_count(), 1, "calls: {calls:?}");
+    assert!(
+        calls
+            .iter()
+            .any(|(op, id)| op == "delete" && id == "test.validation_records[0]")
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|(op, id)| op == "create" && id == "test.validation_records[0]")
+    );
+}
+
+#[tokio::test]
+async fn issue_4283_failed_expansion_preserves_absorbed_old_children() {
+    let (result, calls) = conflicting_deferred_case(false, true, false).await;
+    assert_eq!(result.failure_count(), 1, "calls: {calls:?}");
+    assert!(
+        calls
+            .iter()
+            .all(|(_, id)| !id.starts_with("test.validation_records[")),
+        "calls: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn issue_4283_conflicting_map_child_is_delete_first() {
+    let (result, calls) = conflicting_deferred_case(false, false, true).await;
+    assert_eq!(result.failure_count(), 0, "calls: {calls:?}");
+    assert!(
+        call_position(&calls, "delete", "test.validation_records.stable")
+            < call_position(&calls, "create", "test.validation_records.stable"),
+        "calls: {calls:?}"
+    );
+}
+
+#[test]
+fn issue_4283_deferred_prior_snapshot_redacts_secrets() {
+    let old = DeferredReplaceDelete {
+        id: test_resolved_id("test", "validation_records[0]"),
+        identifier: crate::effect::fixture_applied_identifier("old-child"),
+        directives: Default::default(),
+        binding: Some(absolute_binding("validation_records[0]")),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+        previous_attributes: HashMap::from([(
+            "secret".into(),
+            crate::resource::SnapshotValue::Deferred(crate::resource::DeferredValue::Secret(
+                Box::new(crate::resource::SnapshotValue::Concrete(
+                    crate::resource::ConcreteValue::String("OLD_CHILD_SECRET_PLAINTEXT".into()),
+                )),
+            )),
+        )]),
+    };
+    let effect = Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
+        NonEmptyDeletes::try_new(vec![old]).unwrap(),
+        Box::new(validation_deferred_for_expression()),
+    )));
+    let redacted = crate::value::redact_secrets_in_effect(&effect).unwrap();
+    let json = serde_json::to_string(&redacted).unwrap();
+    assert!(
+        !json.contains("OLD_CHILD_SECRET_PLAINTEXT"),
+        "historical child snapshots must not leak into saved plans"
+    );
+    let Effect::DeferredReplace(payload) = redacted else {
+        unreachable!()
+    };
+    assert!(
+        payload.deletes[0]
+            .previous_attributes
+            .values()
+            .any(crate::value::contains_redacted_secret)
+    );
+}
+
+#[test]
+fn issue_4283_deferred_prior_snapshot_uses_persisted_secret_shape() {
+    let id = test_resolved_id("test", "validation_records[0]");
+    let secret: crate::resource::SnapshotValue = crate::resource::Value::Deferred(
+        crate::resource::DeferredValue::Secret(Box::new(crate::resource::Value::Concrete(
+            crate::resource::ConcreteValue::String("OLD_CHILD_SECRET_PLAINTEXT".into()),
+        ))),
+    );
+    let guide = crate::value::redact_secrets_in_state(&State::existing(
+        id.as_inner().clone(),
+        HashMap::from([("secret".into(), secret)]),
+    ))
+    .unwrap();
+    let old = DeferredReplaceDelete {
+        id: id.clone(),
+        identifier: crate::effect::fixture_applied_identifier("old-child"),
+        directives: Default::default(),
+        binding: Some(absolute_binding("validation_records[0]")),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+        previous_attributes: HashMap::from([(
+            "secret".into(),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                "OLD_CHILD_SECRET_PLAINTEXT".into(),
+            )),
+        )]),
+    };
+    let mut plan = Plan::new();
+    plan.add(Effect::DeferredReplace(Box::new(
+        crate::test_support::compiled_replace(
+            NonEmptyDeletes::try_new(vec![old]).unwrap(),
+            Box::new(validation_deferred_for_expression()),
+        ),
+    )));
+    let redacted = crate::value::redact_secrets_in_plan_with_desired_and_historical(
+        &plan,
+        &HashMap::<
+            ResourceId,
+            crate::resource::Resource<
+                ModuleSource,
+                crate::resource::SnapshotLeaf,
+                AbsoluteBindingAddress,
+                (),
+            >,
+        >::new(),
+        &HashMap::from([(id.into_inner(), guide)]),
+    )
+    .unwrap();
+    let Effect::DeferredReplace(payload) = &redacted.effects()[0] else {
+        unreachable!()
+    };
+    assert!(
+        payload.deletes[0]
+            .previous_attributes
+            .values()
+            .any(crate::value::contains_redacted_secret)
+    );
+    assert!(
+        !serde_json::to_string(&redacted)
+            .unwrap()
+            .contains("OLD_CHILD_SECRET_PLAINTEXT")
     );
 }

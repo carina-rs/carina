@@ -80,7 +80,7 @@ pub(super) fn expand_deferred_replace_effects<S: Clone>(
     }
 }
 
-pub(super) fn apply_deferred_replace_delete_deps<S>(
+pub(super) fn apply_deferred_gate_deps<S>(
     effects: &[Effect<S>],
     deps_of: &mut HashMap<usize, HashSet<usize>>,
     deferred_replace_delete_deps: &[(usize, usize)],
@@ -121,7 +121,7 @@ pub(super) fn apply_deferred_replace_delete_deps<S>(
     }
 
     for &(gate_idx, delete_idx) in deferred_replace_delete_deps {
-        let Some(Effect::DeferredReplace(payload)) = effects.get(gate_idx) else {
+        let Some(Effect::DeferredReplace(_payload)) = effects.get(gate_idx) else {
             continue;
         };
 
@@ -130,42 +130,6 @@ pub(super) fn apply_deferred_replace_delete_deps<S>(
             // therefore skip the deletes instead of destroying live state
             // before the replacement shape is known.
             deps_of.entry(delete_idx).or_default().insert(gate_idx);
-        }
-
-        let is_unbound = matches!(
-            payload.template.target(),
-            crate::parser::DeferredForTarget::Unbound { .. }
-        );
-
-        let Some(delete_id) = effects.get(delete_idx).map(Effect::resource_id) else {
-            continue;
-        };
-        for (create_idx, effect) in effects.iter().enumerate() {
-            let Effect::Create(resource) = effect else {
-                continue;
-            };
-            let same_live_id = resource.id == *delete_id;
-            let replaces_legacy_loop_row = is_unbound
-                && resource.id.provider == delete_id.provider
-                && resource.id.resource_type == delete_id.resource_type
-                && resource.id.provider_instance == delete_id.provider_instance
-                && resource.id.identity().is_some_and(|identity| {
-                    resource
-                        .loop_provenance
-                        .legacy_candidates(identity)
-                        .iter()
-                        .any(|legacy| delete_id.identity_str() == Some(legacy.exact_state_name()))
-                });
-            if !same_live_id && !replaces_legacy_loop_row {
-                continue;
-            }
-            // DeferredReplace materializes the replacement create after the
-            // delete placeholder is already in the scheduler. The generic
-            // same-identity rule would otherwise order create after delete.
-            if same_live_id && let Some(create_deps) = deps_of.get_mut(&create_idx) {
-                create_deps.remove(&delete_idx);
-            }
-            deps_of.entry(delete_idx).or_default().insert(create_idx);
         }
     }
 }
@@ -248,7 +212,7 @@ pub(super) fn build_dependency_levels(
     let deps_of = crate::effect::deps::build_effect_dependency_analysis(
         effects,
         unresolved_resources.keys(),
-        crate::effect::deps::ScheduleInputs::Apply,
+        crate::effect::deps::ScheduleInputs::Apply(&Default::default()),
     )
     .expect("dependency analysis must resolve")
     .into_deps_of();
@@ -517,12 +481,51 @@ pub(super) async fn execute_effects_sequential<
     let module_gate = input.compositions.module_constraint_gate();
     let type_checks = input.type_checks;
 
+    let admitted = match input.plan.admit_replacement_effects(input.schemas) {
+        Ok(replacements) => replacements,
+        Err(error) => {
+            let effect = input
+                .plan
+                .effects()
+                .iter()
+                .find(|effect| matches!(effect, Effect::Create(_) | Effect::DeferredReplace(_)))
+                .expect("replacement admission errors have replacement endpoints");
+            {
+                record_effect_failure(
+                    &mut accumulated,
+                    observer,
+                    effect,
+                    EffectFailureKind::deferred(super::DeferredCreateFailure::Replacement {
+                        error,
+                    }),
+                    FailureEventContext {
+                        recovery: None,
+                        duration: std::time::Duration::ZERO,
+                        progress: ProgressInfo {
+                            completed: 0,
+                            total: input.plan.effects().len(),
+                        },
+                    },
+                );
+            }
+            return (accumulated.finish(&input.checkpoint_sink), false);
+        }
+    };
+    let (admitted_effects, mut replacements, temporary_names) = admitted.into_parts();
+    for (id, name) in temporary_names {
+        accumulated.mutate(|result| {
+            result
+                .permanent_name_overrides
+                .entry(id)
+                .or_default()
+                .insert(name.attribute, name.temporary_value);
+        });
+    }
     let ExpandedEffects {
-        effects: expanded_effects,
+        mut effects,
         deferred_replace_delete_deps,
         source_effect_indices: _,
-    } = expand_deferred_replace_effects(input.plan.effects());
-    let mut effects = expanded_effects;
+    } = expand_deferred_replace_effects(&admitted_effects);
     let mut total = count_runtime_effects(&effects, &input.data_source_values);
     let completed = AtomicUsize::new(0);
 
@@ -580,6 +583,7 @@ pub(super) async fn execute_effects_sequential<
         &effects,
         resource_origins,
         &deferred_replace_delete_deps,
+        &replacements,
     );
 
     // Build effect index -> binding name mapping for resolving dependency names
@@ -737,7 +741,33 @@ pub(super) async fn execute_effects_sequential<
                 continue;
             }
 
+            let ordinary_old = effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    Effect::Delete {
+                        id,
+                        identifier,
+                        generation: crate::effect::EffectGeneration::Current,
+                        directives,
+                        binding,
+                        dependencies,
+                        explicit_dependencies,
+                        blocked_by_updates,
+                    } => Some(crate::effect::DeferredReplaceDelete {
+                        id: id.clone(),
+                        identifier: identifier.clone(),
+                        directives: directives.clone(),
+                        binding: binding.clone(),
+                        dependencies: dependencies.clone(),
+                        explicit_dependencies: explicit_dependencies.clone(),
+                        blocked_by_updates: blocked_by_updates.clone(),
+                        previous_attributes: Default::default(),
+                    }),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
             let dispatch_ctx = PureMetaCtx {
+                ordinary_old: &ordinary_old,
                 identity_inputs: super::deferred_dispatch::DeferredIdentityInputs {
                     provider_configs: input.provider_configs,
                     factories: input.factories,
@@ -767,7 +797,12 @@ pub(super) async fn execute_effects_sequential<
                     completed_synchronous_dispatch = true;
                     break;
                 }
-                PureMetaOutcome::Materialized(children) => {
+                PureMetaOutcome::Materialized(
+                    super::deferred_dispatch::DeferredMaterialization {
+                        children,
+                        replacements: admitted,
+                    },
+                ) => {
                     let template = match &effect {
                         Effect::DeferredCreate(payload) => payload.template.as_ref(),
                         Effect::DeferredReplace(payload) => payload.template.as_ref(),
@@ -793,6 +828,18 @@ pub(super) async fn execute_effects_sequential<
                         completed_synchronous_dispatch = true;
                         break;
                     }
+                    for checked in admitted {
+                        if let Some(name) = checked.temporary_name() {
+                            accumulated.mutate(|result| {
+                                result
+                                    .permanent_name_overrides
+                                    .entry(checked.target().id.clone())
+                                    .or_default()
+                                    .insert(name.attribute.clone(), name.temporary_value.clone());
+                            });
+                        }
+                        replacements.insert(checked);
+                    }
                     if !children.is_empty() {
                         total += count_actionable_effects(&children);
                         for child in children {
@@ -813,6 +860,7 @@ pub(super) async fn execute_effects_sequential<
                             &effects,
                             resource_origins,
                             &deferred_replace_delete_deps,
+                            &replacements,
                         );
                         deps_of = rebuilt.deps_of;
                         for dependency in rebuilt.unresolved {
@@ -1489,7 +1537,7 @@ mod tests {
             (2usize, HashSet::new()),
         ]);
 
-        apply_deferred_replace_delete_deps(&effects, &mut deps_of, &[]);
+        apply_deferred_gate_deps(&effects, &mut deps_of, &[]);
 
         assert_eq!(deps_of.get(&1), Some(&HashSet::from([0])));
         assert_eq!(deps_of.get(&2), Some(&HashSet::from([0])));
@@ -1760,9 +1808,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let mut analysis =
-            build_dependency_analysis(&effects, unresolved.keys(), ScheduleInputs::Apply)
-                .expect("dependency analysis must resolve");
+        let mut analysis = build_dependency_analysis(
+            &effects,
+            unresolved.keys(),
+            ScheduleInputs::Apply(&Default::default()),
+        )
+        .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
         analysis.into_deps_of().remove(&1).unwrap()
     }
@@ -1963,7 +2014,7 @@ mod tests {
                 let deps = build_dependency_analysis(
                     plan.effects(),
                     unresolved.keys(),
-                    ScheduleInputs::Apply,
+                    ScheduleInputs::Apply(&Default::default()),
                 )
                 .expect("dependency analysis must resolve")
                 .into_deps_of();
@@ -2160,9 +2211,12 @@ mod tests {
             ),
         ]);
 
-        let analysis =
-            build_dependency_analysis(&effects, unresolved.keys(), ScheduleInputs::Apply)
-                .expect("dependency analysis must resolve");
+        let analysis = build_dependency_analysis(
+            &effects,
+            unresolved.keys(),
+            ScheduleInputs::Apply(&Default::default()),
+        )
+        .expect("dependency analysis must resolve");
         assert!(
             analysis
                 .reads_for_edge(1, 0)
@@ -2269,9 +2323,12 @@ mod tests {
                 _ => unreachable!(),
             }),
         )]);
-        let mut analysis =
-            build_dependency_analysis(&effects, unresolved.keys(), ScheduleInputs::Apply)
-                .expect("dependency analysis must resolve");
+        let mut analysis = build_dependency_analysis(
+            &effects,
+            unresolved.keys(),
+            ScheduleInputs::Apply(&Default::default()),
+        )
+        .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
         let deps_of = analysis.into_deps_of();
 
@@ -2284,9 +2341,12 @@ mod tests {
     #[test]
     fn relax_update_update_edges_handles_empty_plan() {
         let effects: Vec<Effect> = Vec::new();
-        let mut analysis =
-            build_dependency_analysis(&effects, std::iter::empty(), ScheduleInputs::Apply)
-                .expect("dependency analysis must resolve");
+        let mut analysis = build_dependency_analysis(
+            &effects,
+            std::iter::empty(),
+            ScheduleInputs::Apply(&Default::default()),
+        )
+        .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
         assert!(analysis.into_deps_of().is_empty());
     }
@@ -2295,9 +2355,12 @@ mod tests {
     fn relax_update_update_edges_handles_single_update_without_parent() {
         let effect = update_effect("only", &[], &["tags"]);
         let effects = vec![effect];
-        let mut analysis =
-            build_dependency_analysis(&effects, std::iter::empty(), ScheduleInputs::Apply)
-                .expect("dependency analysis must resolve");
+        let mut analysis = build_dependency_analysis(
+            &effects,
+            std::iter::empty(),
+            ScheduleInputs::Apply(&Default::default()),
+        )
+        .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
         assert!(analysis.into_deps_of()[&0].is_empty());
     }
@@ -2309,9 +2372,12 @@ mod tests {
             update_effect("parent", &[], &["tags"]),
             Effect::Create(resolved(child)),
         ];
-        let mut analysis =
-            build_dependency_analysis(&effects, std::iter::empty(), ScheduleInputs::Apply)
-                .expect("dependency analysis must resolve");
+        let mut analysis = build_dependency_analysis(
+            &effects,
+            std::iter::empty(),
+            ScheduleInputs::Apply(&Default::default()),
+        )
+        .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
         assert!(analysis.into_deps_of()[&0].is_empty());
     }
@@ -2394,9 +2460,13 @@ mod tests {
             UnresolvedResource::from_pre_resolve(role_policy),
         );
 
-        let deps_of = build_dependency_analysis(&effects, unresolved.keys(), ScheduleInputs::Apply)
-            .expect("dependency analysis must resolve")
-            .into_deps_of();
+        let deps_of = build_dependency_analysis(
+            &effects,
+            unresolved.keys(),
+            ScheduleInputs::Apply(&Default::default()),
+        )
+        .expect("dependency analysis must resolve")
+        .into_deps_of();
 
         assert!(
             deps_of[&1].contains(&0),

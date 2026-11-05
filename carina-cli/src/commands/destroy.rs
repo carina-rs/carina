@@ -1725,7 +1725,7 @@ async fn run_destroy_locked(
 
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-async fn run_destroy_locked_with_ctx(
+pub(crate) async fn run_destroy_locked_with_ctx(
     validated_config: ValidatedConfig<carina_core::parser::ExpandedInferredFile>,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,

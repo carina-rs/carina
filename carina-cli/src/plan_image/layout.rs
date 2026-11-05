@@ -2496,6 +2496,7 @@ mod tests {
         let scheduler_edges = carina_core::executor::build_plan_scheduler_dependency_edges(
             fixture.plan.effects(),
             &unresolved,
+            fixture.plan.replacement_scheduling(),
         );
         if fixture_name == "deferred_for_with_paired_destroy" {
             assert!(scheduler_edges.iter().any(|(from, to)| {

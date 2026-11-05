@@ -370,31 +370,35 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(cert.clone())));
-    plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
-        dependency_template,
-        deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
-            id: carina_core::resource::ResolvedResourceId::new(validation_id.clone()),
-            identifier: AppliedIdentifier::new("old-validation-id")
-                .expect("fixture identifier is non-empty"),
-            directives: Directives::default(),
-            binding: Some(absolute_binding("validation_records[0]")),
-            dependencies: carina_core::resource::PersistedDestroyDependencies::decode_persisted(
-                [carina_core::resource::ResolvedResourceId::new(
-                    cert.id.clone(),
-                )]
-                .into_iter()
+    plan.add(Effect::DeferredReplace(Box::new(
+        DeferredReplacePayload::new(
+            NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                previous_attributes: Default::default(),
+                id: carina_core::resource::ResolvedResourceId::new(validation_id.clone()),
+                identifier: AppliedIdentifier::new("old-validation-id")
+                    .expect("fixture identifier is non-empty"),
+                directives: Directives::default(),
+                binding: Some(absolute_binding("validation_records[0]")),
+                dependencies:
+                    carina_core::resource::PersistedDestroyDependencies::decode_persisted(
+                        [carina_core::resource::ResolvedResourceId::new(
+                            cert.id.clone(),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    )
+                    .unwrap(),
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: std::iter::once(
+                    carina_core::resource::ResolvedResourceId::new(consumer.id.clone()),
+                )
                 .collect(),
-            )
-            .unwrap(),
-            explicit_dependencies: Default::default(),
-            blocked_by_updates: std::iter::once(carina_core::resource::ResolvedResourceId::new(
-                consumer.id.clone(),
-            ))
-            .collect(),
-        }])
-        .expect("fixture has one delete"),
-        template: Box::new(template),
-    })));
+            }])
+            .expect("fixture has one delete"),
+            Box::new(template),
+            dependency_template,
+        ),
+    )));
     plan.add(Effect::Update {
         identifier: AppliedIdentifier::new("consumer-id").expect("fixture identifier is non-empty"),
         from: Box::new(consumer_from.clone().to_snapshot()),

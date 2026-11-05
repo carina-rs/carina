@@ -7080,7 +7080,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                 let analysis = carina_core::effect::deps::build_effect_dependency_analysis(
                     plan.effects(),
                     resolved_desired_ids.ids.iter(),
-                    carina_core::effect::deps::ScheduleInputs::Apply,
+                    carina_core::effect::deps::ScheduleInputs::Apply(plan.replacement_scheduling()),
                 );
                 let analysis = match analysis {
                     Ok(analysis) => analysis,

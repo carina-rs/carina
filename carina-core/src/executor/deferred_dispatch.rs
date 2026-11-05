@@ -25,6 +25,13 @@ pub(super) struct DeferredIdentityInputs<'a> {
 /// upstream state.
 #[derive(Debug)]
 pub enum DeferredCreateFailure {
+    Replacement {
+        error: crate::plan::CreateBeforeDestroyError,
+    },
+    ReplacementRequired {
+        dependent: String,
+        error: crate::plan::CreateBeforeDestroyError,
+    },
     /// Every candidate was complete, but a direct iterable reference was
     /// absent and there was no coalesce fallback.
     IterableAbsent {
@@ -154,6 +161,16 @@ impl DeferredAnonymousIdentityGuard {
 impl std::fmt::Display for DeferredCreateFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            DeferredCreateFailure::Replacement { error: _error } => {
+                formatter.write_str("replacement admission failed")
+            }
+            DeferredCreateFailure::ReplacementRequired {
+                dependent,
+                error: _error,
+            } => write!(
+                formatter,
+                "create_before_destroy required by dependent `{dependent}`"
+            ),
             DeferredCreateFailure::IterableAbsent {
                 file,
                 line,
@@ -244,6 +261,11 @@ fn source_location(file: Option<&str>, line: usize) -> String {
 impl std::error::Error for DeferredCreateFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Replacement { error }
+            | Self::ReplacementRequired {
+                error,
+                dependent: _,
+            } => Some(error),
             Self::ValueAccess { error } => Some(error),
             Self::Directives { error } => Some(error),
             Self::ResolveResource { error } => Some(error),
@@ -392,11 +414,85 @@ pub(super) fn materialize_deferred_create<
         .collect()
 }
 
+pub(super) struct DeferredMaterialization<S> {
+    pub(super) children: Vec<Effect<S>>,
+    pub(super) replacements:
+        Vec<crate::replacement::CheckedReplacement<crate::resource::ResolvedResource<S>>>,
+}
+
+fn admit_materialized<S: Clone>(
+    effect: &Effect<S>,
+    mut children: Vec<Effect<S>>,
+    schemas: &crate::schema::SchemaRegistry,
+    ordinary_old: &[crate::effect::DeferredReplaceDelete],
+) -> Result<DeferredMaterialization<S>, DeferredCreateFailure> {
+    let mut replacements = Vec::new();
+    let (old_instances, required_by, is_unbound) = match effect {
+        Effect::DeferredReplace(payload) => (
+            &payload.deletes[..],
+            payload.request.required_by(),
+            matches!(payload.template.target(), DeferredForTarget::Unbound { .. }),
+        ),
+        Effect::DeferredCreate(payload) => (
+            ordinary_old,
+            None,
+            matches!(payload.template.target(), DeferredForTarget::Unbound { .. }),
+        ),
+        _ => unreachable!("only deferred gates materialize children"),
+    };
+    for child in &mut children {
+        let Effect::Create(resource) = child else {
+            continue;
+        };
+        let old = old_instances
+            .iter()
+            .filter(|old| {
+                resource.id == *old.id
+                    || (is_unbound
+                        && resource.id.provider == old.id.provider
+                        && resource.id.resource_type == old.id.resource_type
+                        && resource.id.provider_instance == old.id.provider_instance
+                        && resource.id.identity().is_some_and(|identity| {
+                            resource
+                                .loop_provenance
+                                .legacy_candidates(identity)
+                                .iter()
+                                .any(|legacy| old.id.identity_str() == legacy.exact_state_name())
+                        }))
+            })
+            .cloned()
+            .collect();
+        let Ok(old) = crate::effect::NonEmptyDeletes::try_new(old) else {
+            continue;
+        };
+        let mut request = crate::replacement::ReplacementRequest::new(resource.clone(), old);
+        if let Some(dependent) = required_by {
+            request = request.require_create_first(dependent);
+        }
+        let checked =
+            crate::replacement::resolve_replacement(request, schemas).map_err(|error| {
+                match required_by {
+                    Some(dependent) => DeferredCreateFailure::ReplacementRequired {
+                        dependent: dependent.to_string(),
+                        error,
+                    },
+                    None => DeferredCreateFailure::Replacement { error },
+                }
+            })?;
+        *resource = checked.target().clone();
+        replacements.push(checked);
+    }
+    Ok(DeferredMaterialization {
+        children,
+        replacements,
+    })
+}
+
 /// Result of synchronously dispatching a deferred scheduler-meta effect.
 pub(super) enum DeferredDispatchResult<S> {
     /// DeferredCreate or DeferredReplace create children were materialized and
     /// should be appended to the scheduler queue.
-    Materialized(Vec<Effect<S>>),
+    Materialized(DeferredMaterialization<S>),
     /// Deferred-for materialization failed before any child effects existed.
     MaterializeFailed(DeferredCreateFailure),
 }
@@ -404,6 +500,7 @@ pub(super) enum DeferredDispatchResult<S> {
 /// Shared inputs required to materialize deferred scheduler-meta effects.
 pub(super) struct PureMetaCtx<'a> {
     pub(super) identity_inputs: DeferredIdentityInputs<'a>,
+    pub(super) ordinary_old: &'a [crate::effect::DeferredReplaceDelete],
 }
 
 /// Dispatch a DeferredCreate meta-effect by materializing its runtime
@@ -411,14 +508,22 @@ pub(super) struct PureMetaCtx<'a> {
 pub(super) fn dispatch_deferred_create<
     S: Clone + crate::resource::AnonymousIdentityModuleSource,
 >(
-    _effect: &Effect<S>,
+    effect: &Effect<S>,
     template: &DeferredForExpression<S>,
     dependencies: &crate::resource::DeferredDependencyTemplate,
     bindings: &ResolvedBindings,
     ctx: &PureMetaCtx<'_>,
 ) -> DeferredDispatchResult<S> {
     match materialize_deferred_create(template, dependencies, bindings, &ctx.identity_inputs) {
-        Ok(children) => DeferredDispatchResult::Materialized(children),
+        Ok(children) => match admit_materialized(
+            effect,
+            children,
+            ctx.identity_inputs.schemas,
+            ctx.ordinary_old,
+        ) {
+            Ok(materialized) => DeferredDispatchResult::Materialized(materialized),
+            Err(error) => DeferredDispatchResult::MaterializeFailed(error),
+        },
         Err(err) => DeferredDispatchResult::MaterializeFailed(err),
     }
 }

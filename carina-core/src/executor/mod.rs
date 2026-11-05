@@ -65,6 +65,7 @@ pub struct PlanSchedulerEndpoint {
 pub fn build_plan_scheduler_dependency_edges(
     plan_effects: &[Effect],
     unresolved_resources: &HashMap<ResolvedResourceId, &UnresolvedResource>,
+    replacements: &crate::replacement::ReplacementScheduling,
 ) -> BTreeSet<(PlanSchedulerEndpoint, PlanSchedulerEndpoint)> {
     let parallel::ExpandedEffects {
         effects,
@@ -79,6 +80,7 @@ pub fn build_plan_scheduler_dependency_edges(
         &effects,
         unresolved_resources,
         &deferred_replace_delete_deps,
+        replacements,
     );
 
     deps_of
@@ -543,9 +545,15 @@ impl RuntimeCompositions<'_> {
         effects: &[Effect<S>],
         unresolved_resources: &HashMap<ResolvedResourceId, UnresolvedResource<S>>,
         deferred_replace_delete_deps: &[(usize, usize)],
+        replacements: &crate::replacement::ReplacementScheduling,
     ) -> scheduler::SchedulerDeps {
         let _ = self;
-        scheduler::build_scheduler_deps(effects, unresolved_resources, deferred_replace_delete_deps)
+        scheduler::build_scheduler_deps(
+            effects,
+            unresolved_resources,
+            deferred_replace_delete_deps,
+            replacements,
+        )
     }
 }
 

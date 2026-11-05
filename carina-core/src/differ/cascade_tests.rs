@@ -1017,7 +1017,7 @@ fn binding_spelling_collision_does_not_link_apply_dag_to_anonymous_replace() {
     let analysis = crate::effect::deps::build_effect_dependency_analysis(
         fixture.plan.effects(),
         unresolved.keys(),
-        crate::effect::deps::ScheduleInputs::Apply,
+        crate::effect::deps::ScheduleInputs::Apply(fixture.plan.replacement_scheduling()),
     )
     .expect("fixture dependency graph is valid");
 
@@ -1153,7 +1153,7 @@ fn deferred_for_dependent_promotes_replaced_producer_to_cbd_and_avoids_cycle() {
     let deps = build_dependency_analysis(
         plan.effects(),
         unresolved_resources.keys(),
-        ScheduleInputs::Apply,
+        ScheduleInputs::Apply(plan.replacement_scheduling()),
     )
     .expect("all scheduler dependencies must resolve")
     .into_deps_of();
@@ -1396,7 +1396,7 @@ fn assert_deferred_create_cbd_is_acyclic(plan: &Plan, producer: &ResourceId) {
     let deps = build_effect_dependency_analysis(
         plan.effects(),
         std::iter::empty::<&ResolvedResourceId>(),
-        ScheduleInputs::Apply,
+        ScheduleInputs::Apply(plan.replacement_scheduling()),
     )
     .unwrap()
     .into_deps_of();
@@ -1679,4 +1679,243 @@ fn resolve_cascade_targets(
     targets
         .resolve_graph(&graph)
         .expect("cascade loop dependencies")
+}
+
+#[test]
+fn issue_4283_known_conflicting_child_cbd_rejected_before_parent_applies() {
+    use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
+    use crate::resource::{LoopSlot, ModuleSource, ResolvedResource};
+
+    let mut schemas = base_schemas(false);
+    schemas.insert(
+        "",
+        PatternResourceSchema::new("ec2.Subnet")
+            .with_conflicting_replacement()
+            .validate()
+            .unwrap(),
+    );
+    let (managed_vpc, unresolved_vpc) = vpc_resources(false);
+    let vpc_id = managed_vpc.id.clone();
+    let vpc_state = standard_states().remove(&vpc_id).unwrap();
+
+    let child_id = ResourceId::with_identity("ec2.Subnet", "subnets.a");
+    let child_state = state(
+        &child_id,
+        &[
+            ("name", string("subnet-a")),
+            ("vpc_id", string("vpc-old")),
+            ("cidr_block", string("10.1.1.0/24")),
+            ("availability_zone", string("us-east-1a")),
+        ],
+        "subnet-old",
+    )
+    .with_dependency_bindings(crate::test_support::persisted([ResolvedResourceId::new(
+        vpc_id.clone(),
+    )]));
+    let orphans = Orphans::from([Orphan::from_state(
+        child_state,
+        Some(absolute_binding("subnets.a")),
+        crate::resource::PersistedDirectives::default(),
+    )]);
+
+    let template_resource: crate::resource::Resource<
+        ModuleSource,
+        LoopSlot,
+        crate::resource::AbsoluteBindingAddress,
+    > = crate::resource::Resource::new("ec2.Subnet", "subnets")
+        .with_absolute_binding(absolute_binding("subnets"));
+    let mut template_resource = template_resource;
+    template_resource.directives.create_before_destroy =
+        crate::resource::LoopDirective::Resolved(true);
+    let deferred = DeferredForExpression::new(
+        Some("main.crn".to_string()),
+        2,
+        "for _, subnet in vpc.subnets".to_string(),
+        DeferredForTarget::bound(absolute_binding("subnets")).expect("fixture binding is valid"),
+        ref_value("vpc", "subnets"),
+        ForBinding::Map("_".to_string(), "subnet".to_string()),
+        template_resource,
+    );
+
+    let managed = ResolvedResource::collect_resolved([managed_vpc])
+        .expect("fixture source identity is resolved");
+    let unresolved = ResolvedResource::collect_resolved([unresolved_vpc.clone()])
+        .expect("fixture source identity is resolved");
+    let (schemas, provider) = crate::provider::comparison_fixture_for_test(
+        &schemas,
+        managed.iter().map(|resource| &resource.id),
+    );
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        HashMap::from([(vpc_id.clone(), vpc_state)]),
+        &schemas,
+        &[],
+    );
+    let desired = crate::resource::plan_input_desired_resources(&managed, &schemas);
+    let plan = create_plan_with_cascades(
+        &desired,
+        CascadeDependents::new(
+            &unresolved,
+            resolve_cascade_targets(
+                DeferredCreateTargets::partition_for_expansion(
+                    crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
+                        deferred.clone(),
+                    ]),
+                    |_| DeferredForExpansionChoice::Retain,
+                )
+                .1,
+                &unresolved,
+            ),
+        ),
+        &[],
+        &provider,
+        PlanPriorStates::new(&current, &orphans),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &[],
+        &HashSet::new(),
+        &crate::references::prepare_empty_for_tests(),
+    )
+    .expect("test provider hints should succeed")
+    .finish(|_| {});
+
+    assert!(
+        plan.has_errors(),
+        "a statically known Conflicting child CBD request must fail before any parent applies"
+    );
+    assert!(
+        plan.errors()
+            .iter()
+            .any(|error| matches!(error.kind, PlanErrorKind::ReplacementCannotCoexist(_))),
+        "errors: {:?}",
+        plan.errors()
+    );
+}
+
+#[test]
+fn issue_4283_static_and_cascaded_conflicting_leaves_stay_delete_first() {
+    for cascade in [false, true] {
+        let mut schemas = base_schemas(cascade);
+        schemas.insert(
+            "",
+            PatternResourceSchema::new("ec2.Subnet")
+                .attribute(
+                    PatternAttributeSchema::optional("vpc_id", PatternAttributeType::string())
+                        .create_only()
+                        .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::optional(
+                        "availability_zone",
+                        PatternAttributeType::string(),
+                    )
+                    .create_only()
+                    .build(),
+                )
+                .with_conflicting_replacement()
+                .validate()
+                .unwrap(),
+        );
+        let (parent, parent_authored) = vpc_resources(true);
+        let (mut child, mut child_authored) = subnet_resources(cascade, false);
+        if !cascade {
+            child.set_attr("availability_zone", string("us-east-1b"));
+            child_authored.set_attr("availability_zone", string("us-east-1b"));
+        }
+        let id = child.id.clone();
+        let plan = plan_for(
+            vec![parent, child],
+            vec![parent_authored, child_authored],
+            standard_states(),
+            &schemas,
+        );
+        assert!(!plan.has_errors(), "errors: {:?}", plan.errors());
+        let replacement = replacement_metadata(&plan, &id);
+        assert!(!replacement.create_before_destroy);
+        assert!(replacement.temporary_name.is_none());
+    }
+}
+
+#[test]
+fn issue_4283_conflicting_cascaded_child_rejects_own_cbd_or_grandchild_requirement() {
+    for explicit in [true, false] {
+        let mut schemas = base_schemas(true);
+        schemas.insert(
+            "",
+            PatternResourceSchema::new("ec2.Subnet")
+                .attribute(
+                    PatternAttributeSchema::optional("vpc_id", PatternAttributeType::string())
+                        .create_only()
+                        .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::provider_populated(
+                        "subnet_id",
+                        PatternAttributeType::string(),
+                    )
+                    .build(),
+                )
+                .with_conflicting_replacement()
+                .validate()
+                .unwrap(),
+        );
+        schemas.insert(
+            "",
+            PatternResourceSchema::new("test.Consumer")
+                .attribute(
+                    PatternAttributeSchema::optional("subnet_id", PatternAttributeType::string())
+                        .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let (parent, parent_authored) = vpc_resources(true);
+        let (mut child, mut child_authored) = subnet_resources(true, false);
+        child.directives.create_before_destroy = explicit;
+        child_authored.directives.create_before_destroy = explicit;
+        let mut states = standard_states();
+        states
+            .get_mut(&child.id)
+            .unwrap()
+            .attributes
+            .insert("subnet_id".into(), string("subnet-old").to_snapshot());
+        let mut managed = vec![parent, child];
+        let mut authored = vec![parent_authored, child_authored];
+        if !explicit {
+            let consumer = Resource::new("test.Consumer", "consumer")
+                .with_root_binding("consumer")
+                .with_attribute("subnet_id", string("subnet-old"));
+            let desired = Resource::new("test.Consumer", "consumer")
+                .with_root_binding("consumer")
+                .with_attribute("subnet_id", ref_value("subnet", "subnet_id"));
+            states.insert(
+                consumer.id.clone(),
+                state(
+                    &consumer.id,
+                    &[("subnet_id", string("subnet-old"))],
+                    "consumer-id",
+                ),
+            );
+            managed.push(consumer);
+            authored.push(desired);
+        }
+        let plan = plan_for(managed, authored, states, &schemas);
+        assert!(
+            plan.has_errors(),
+            "a Conflicting child's own create-first requirement must be rejected"
+        );
+        assert!(
+            plan.errors().iter().any(|error| if explicit {
+                matches!(error.kind, PlanErrorKind::ReplacementCannotCoexist(_))
+            } else {
+                matches!(
+                    error.kind,
+                    PlanErrorKind::CreateBeforeDestroyRequiredByDependent { .. }
+                )
+            }),
+            "errors: {:?}",
+            plan.errors()
+        );
+    }
 }

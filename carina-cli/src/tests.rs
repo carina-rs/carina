@@ -4182,6 +4182,7 @@ fn plan_file_with_bound_deferred_template() -> PlanFile {
 
 fn plan_file_with_bound_deferred_replace_template() -> PlanFile {
     let delete = DeferredReplaceDelete {
+        previous_attributes: Default::default(),
         id: carina_core::resource::ResolvedResourceId::with_provider_identity(
             "mock",
             "test.resource",
