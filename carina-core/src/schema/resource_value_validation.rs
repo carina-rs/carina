@@ -697,7 +697,16 @@ impl fmt::Debug for BindingValueValidation {
 #[derive(Clone, PartialEq)]
 enum LeafInput {
     Value(Value),
-    MapKey(String),
+    MapKey(Value),
+}
+
+impl LeafInput {
+    fn new(kind: CallbackInputKind, value: Value) -> Self {
+        match kind {
+            CallbackInputKind::Value => Self::Value(value),
+            CallbackInputKind::MapKey => Self::MapKey(value),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -705,6 +714,7 @@ struct CheckedBindingLeaf {
     kind: CallbackInputKind,
     path: FieldPath,
     origin: Option<DeclarationLocation>,
+    operand_path: Vec<usize>,
     declaration: String,
     native: Option<CustomValidator>,
     input: LeafInput,
@@ -716,6 +726,7 @@ struct CheckedCallback {
     kind: CallbackInputKind,
     path: FieldPath,
     origin: Option<DeclarationLocation>,
+    operand_path: Vec<usize>,
     callback: CallbackIdentity,
     input: Value,
     result: Result<(), TypeError>,
@@ -756,6 +767,7 @@ impl PartialEq for CheckedBindingLeaf {
         self.kind == other.kind
             && self.path == other.path
             && self.origin == other.origin
+            && self.operand_path == other.operand_path
             && self.declaration == other.declaration
             && same_callback(self.native.as_ref(), other.native.as_ref())
             && self.input == other.input
@@ -919,6 +931,7 @@ struct ValueWalk<'a> {
     recorded: Vec<CheckedBindingLeaf>,
     bindings: Vec<ResourceBindingValidation>,
     origin: Option<DeclarationLocation>,
+    operand_path: Vec<usize>,
     expression_root: Option<JudgedExpr>,
     expression_path: FieldPath,
     callbacks: Vec<CheckedCallback>,
@@ -933,6 +946,7 @@ impl<'a> ValueWalk<'a> {
             recorded: Vec::new(),
             bindings: Vec::new(),
             origin: None,
+            operand_path: Vec::new(),
             expression_root: None,
             expression_path: FieldPath::new(),
             callbacks: Vec::new(),
@@ -976,6 +990,7 @@ impl<'a> ValueWalk<'a> {
         if let Some(checked) = self.callbacks.iter().find(|checked| {
             checked.path == *path
                 && checked.origin == self.origin
+                && checked.operand_path == self.operand_path
                 && checked.kind == kind
                 && checked.callback == callback
                 && checked.input == *input
@@ -1000,6 +1015,7 @@ impl<'a> ValueWalk<'a> {
                 kind,
                 path: path.clone(),
                 origin: self.origin.clone(),
+                operand_path: self.operand_path.clone(),
                 callback,
                 input: input.clone(),
                 result: result.clone(),
@@ -1185,11 +1201,13 @@ fn check_input_inner<'a, P: PlaceholderKind, B: BindingAddress>(
                         .and_then(Value::try_into_address_free_absolute)
                 })
                 .flatten()
-                .map(LeafInput::Value)
+                .map(|value| LeafInput::new(walk.input_kind, value))
         }
         // Key lifting may invoke a native enum validator. Cache the authored
         // key before lifting so both accepted and rejected resolutions reuse it.
-        CheckInput::MapKey(key) => Some(LeafInput::MapKey((*key).into())),
+        CheckInput::MapKey(key) => Some(LeafInput::MapKey(Value::Concrete(ConcreteValue::String(
+            (*key).into(),
+        )))),
     };
     let declaration = input
         .as_ref()
@@ -1202,6 +1220,7 @@ fn check_input_inner<'a, P: PlaceholderKind, B: BindingAddress>(
             leaf.kind == walk.input_kind
                 && leaf.path == *path
                 && leaf.origin == walk.origin
+                && leaf.operand_path == walk.operand_path
                 && Some(&leaf.declaration) == declaration.as_ref()
                 && Some(&leaf.input) == input.as_ref()
                 && same_callback(leaf.native.as_ref(), native_callback(resolution.attr))
@@ -1256,6 +1275,7 @@ fn check_input_inner<'a, P: PlaceholderKind, B: BindingAddress>(
             kind: walk.input_kind,
             path: path.clone(),
             origin: walk.origin.clone(),
+            operand_path: walk.operand_path.clone(),
             declaration,
             native: native_callback(resolution.attr).cloned(),
             input,
@@ -1349,23 +1369,11 @@ fn check_operand<'a, P: PlaceholderKind, B: BindingAddress>(
     let previous_origin = std::mem::replace(&mut walk.origin, origin);
     let previous_root = std::mem::replace(&mut walk.expression_root, expression);
     let previous_path = std::mem::replace(&mut walk.expression_path, path.clone());
-    // Rootless schema validation has no authored identity to cache across
-    // distinct operands. Keep callbacks reusable inside each operand only.
-    let previous_recorded = walk
-        .origin
-        .is_none()
-        .then(|| std::mem::take(&mut walk.recorded));
-    let previous_callbacks = walk
-        .origin
-        .is_none()
-        .then(|| std::mem::take(&mut walk.callbacks));
+    // The operand position identifies rootless operands as well as authored
+    // ones. Retain their results when a Union checks another alternative.
+    walk.operand_path.push(index);
     let checked = check_value(attr, value, defs, ancestry, path, walk, &mut Vec::new());
-    if let Some(recorded) = previous_recorded {
-        walk.recorded = recorded;
-    }
-    if let Some(callbacks) = previous_callbacks {
-        walk.callbacks = callbacks;
-    }
+    walk.operand_path.pop();
     walk.origin = previous_origin;
     walk.expression_root = previous_root;
     walk.expression_path = previous_path;
@@ -1402,33 +1410,23 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
         return left;
     }
     if let Value::Deferred(DeferredValue::ModuleIf(deferred)) = value {
-        let mut checked = CheckedValue::accepted(attr, FitExactness::EXACT, FitKind::Deferred);
-        let mut fits = Vec::new();
-        for (index, branch) in deferred.values()[1..].iter().enumerate() {
-            let branch = check_operand(attr, branch, defs, ancestry, path, walk, index);
-            if let Some(fit) = branch.fit {
-                fits.push(fit);
-            }
-            checked.primary = checked.primary.or(branch.primary);
-            checked.local.extend(branch.local);
-            checked.external.extend(branch.external);
-        }
-        checked.fit = if fits.len() == 2 {
-            let else_value = fits.pop().unwrap();
-            let then_value = fits.pop().unwrap();
+        let mut checked = check_operand(attr, deferred.then_value(), defs, ancestry, path, walk, 0);
+        let other = check_operand(attr, deferred.else_value(), defs, ancestry, path, walk, 1);
+        checked.fit = checked.fit.zip(other.fit).map(|(then_value, else_value)| {
             let mut exactness = then_value.exactness;
             exactness.combine(else_value.exactness);
-            Some(Fit::with_kind(
+            Fit::with_kind(
                 exactness,
                 attr,
                 FitKind::Conditional {
                     then_value: Box::new(then_value),
                     else_value: Box::new(else_value),
                 },
-            ))
-        } else {
-            None
-        };
+            )
+        });
+        checked.primary = checked.primary.or(other.primary);
+        checked.local.extend(other.local);
+        checked.external.extend(other.external);
         return checked;
     }
     let Some(concrete) = value.as_concrete() else {
@@ -1672,8 +1670,22 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
             let mut best_failure: Option<BestUnionMemberFailures> = None;
             let mut best_external: Option<Vec<PathFinding>> = None;
             for member in members.as_raw_slice() {
-                let mut checked =
-                    check_value(member, value, defs, ancestry, path, walk, visited_refs);
+                let mut checked = match walk.input_kind {
+                    CallbackInputKind::Value => {
+                        check_value(member, value, defs, ancestry, path, walk, visited_refs)
+                    }
+                    // Lifted keys retain key classification, and cannot use
+                    // the value's binding outcomes or expression evidence.
+                    CallbackInputKind::MapKey => check_input(
+                        member,
+                        CheckInput::Value(value),
+                        defs,
+                        ancestry,
+                        path,
+                        walk,
+                        visited_refs,
+                    ),
+                };
                 if let Some(fit) = checked.fit.take() {
                     if best_fit.as_ref().is_none_or(|best| {
                         checked.external.len() < best.external.len()

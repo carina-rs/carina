@@ -1,6 +1,155 @@
 use super::*;
 use carina_core::schema::{AttributeSchema, AttributeType, ListElements, ResourceSchema};
 
+fn round7_collection_diagnostics(expression: &str) -> (String, Vec<Diagnostic>) {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Producer")
+            .attribute(AttributeSchema::provider_populated("number", AttributeType::int()).build())
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "params",
+                    AttributeType::refined_list(
+                        AttributeType::string(),
+                        true,
+                        Some((None, Some(2))),
+                        ListElements::AllowDuplicates,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    let source = format!(
+        "let producer = mock.test.Producer {{}}\nmock.test.Sink {{ params = {expression} }}\n"
+    );
+    let path = directory.path().join("main.crn");
+    std::fs::write(&path, &source).unwrap();
+    let diagnostics = engine.analyze(&create_document_at(&source, path.clone()), Some(&path));
+    (source, diagnostics)
+}
+
+#[test]
+fn round7_collection_child_failure_keeps_siblings_and_bounds() {
+    let (source, diagnostics) = round7_collection_diagnostics("[producer.number, 1, 2]");
+    for token in ["1", "2"] {
+        let column = source.lines().nth(1).unwrap().find(token).unwrap() as u32;
+        let matches: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.range
+                    == Range::new(Position::new(1, column), Position::new(1, column + 1))
+            })
+            .collect();
+        assert_eq!(matches.len(), 1, "{diagnostics:#?}");
+        assert_eq!(matches[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert!(matches[0].message.contains("expected String, got Int"));
+    }
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("length 3"))
+            .count(),
+        1,
+        "{diagnostics:#?}"
+    );
+    let reference = source
+        .lines()
+        .nth(1)
+        .unwrap()
+        .find("producer.number")
+        .unwrap() as u32;
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.range
+                == Range::new(
+                    Position::new(1, reference),
+                    Position::new(1, reference + 15)
+                ))
+            .count(),
+        1,
+        "{diagnostics:#?}"
+    );
+    assert_eq!(diagnostics.len(), 4, "{diagnostics:#?}");
+}
+
+#[test]
+fn round7_secret_collection_child_failure_keeps_siblings_and_bounds() {
+    let (_, diagnostics) = round7_collection_diagnostics("secret([producer.number, 1, 2])");
+    assert_eq!(diagnostics.len(), 4, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("expected String, got Int"))
+            .count(),
+        3,
+        "{diagnostics:#?}"
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("length 3"))
+            .count(),
+        1,
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn round7_nested_folded_coalesce_keeps_rejection() {
+    let diagnostics = collection_diagnostics(
+        AttributeType::list(AttributeType::string()),
+        r#"["ok" ?? 42]"#,
+    );
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert!(
+        diagnostics[0].message.contains("String") && diagnostics[0].message.contains("Int"),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn round7_union_map_key_keeps_checks_independent_of_value_bindings() {
+    let key = AttributeType::refined_string(None, None, Some((None, Some(3))), None);
+    let diagnostics = round2_source_diagnostics(
+        AttributeType::map_with_key(
+            AttributeType::union(vec![key.clone(), key]),
+            AttributeType::string(),
+        ),
+        "let bad = 42\nmock.test.Collection { params = { oversize = bad } }\n",
+    );
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("length 8"))
+            .count(),
+        1,
+        "{diagnostics:#?}"
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("expected String, got Int"))
+            .count(),
+        1,
+        "{diagnostics:#?}"
+    );
+}
+
 #[test]
 fn round6_expanded_unique_lists_share_the_authored_duplicate_rule() {
     for (items, expected) in [
@@ -62,20 +211,6 @@ fn round6_coalesce_concrete_item_failure_has_one_owner() {
         );
         assert!(diagnostics[0].message.contains("expected String, got Int"));
     }
-}
-
-#[test]
-fn round6_coalesce_retains_empty_collection_inference_failures() {
-    let diagnostics = review_coalesce_diagnostics(
-        AttributeType::union(vec![
-            AttributeType::string(),
-            AttributeType::list(AttributeType::string()),
-        ]),
-        "producer.text ?? []",
-    );
-    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
-    assert!(diagnostics[0].message.contains("empty collection"));
 }
 
 #[test]

@@ -869,6 +869,15 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     defer_unknown_functions: bool,
     preserve_failed_user_calls: bool,
 ) -> Result<(), ParseError> {
+    if !preserve_failed_user_calls {
+        // This value projection can fold a selected coalesce operand. Keep
+        // its authored inference rejection until the value walk can see both.
+        parsed
+            .parser_binding_metadata
+            .syntax
+            .expressions_mut()
+            .evaluate_resource_operands();
+    }
     let syntax = parsed.parser_binding_metadata.syntax().clone();
     let locate_named = |kind, name: &str, error: ParseError| match syntax
         .declarations()

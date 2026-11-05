@@ -1454,7 +1454,7 @@ fn parse_with_seeded_bindings_inner(
     parser_binding_metadata.syntax = Box::new(syntax);
     parser_binding_metadata
         .syntax
-        .attach_expression_projections(&parsed.variables);
+        .attach_expression_projections(&parsed.variables, preserve_resource_expressions);
     parsed.parser_binding_metadata = parser_binding_metadata;
     parsed.warnings = warnings;
     *parsed.parsed_deferred_for_expressions_mut() = ctx.parsed_deferred_for_expressions;

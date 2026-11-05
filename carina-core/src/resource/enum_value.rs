@@ -372,7 +372,18 @@ impl EnumValueResolver<'_, Compiled> {
                     values,
                     dsl_aliases,
                 ),
-                extra_message: None,
+                extra_message: validate
+                    .and_then(|callback| {
+                        run(
+                            callback,
+                            &crate::resource::Value::Concrete(
+                                crate::resource::ConcreteValue::String(text.clone()),
+                            ),
+                        )
+                        .err()
+                    })
+                    .map(crate::schema::validation_error_message)
+                    .map(crate::provider_text::ProviderText::new),
             });
         }
         let valid: Vec<&str> = values.into_iter().flatten().map(String::as_str).collect();

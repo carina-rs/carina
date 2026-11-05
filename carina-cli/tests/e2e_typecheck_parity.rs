@@ -45,6 +45,212 @@ fn write_fixture(files: &[(&str, &str)]) -> TempDir {
     dir
 }
 
+fn round7_cli_errors(schemas: &SchemaRegistry, source: &str) -> Vec<String> {
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider mock {}\n"),
+        ("main.crn", source),
+    ]);
+    let diagnostics = carina_cli::commands::validate::validate_diagnostics_with_factories(
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        carina_cli::wiring::LoadedProviderFactory::for_test(factories_for(schemas)),
+        HashMap::new(),
+    );
+    assert!(
+        diagnostics.warnings.is_empty(),
+        "{:?}",
+        diagnostics.warnings
+    );
+    diagnostics
+        .errors
+        .iter()
+        .map(|error| {
+            carina_cli::error::format_error_with_source_chain(error)
+                .replace(fixture.path().to_str().unwrap(), "<fixture>")
+        })
+        .collect()
+}
+
+#[test]
+fn round7_cli_collection_child_failure_matches_origin_main() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Producer")
+            .attribute(AttributeSchema::provider_populated("number", AttributeType::int()).build())
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "params",
+                    AttributeType::refined_list(
+                        AttributeType::string(),
+                        true,
+                        Some((None, Some(2))),
+                        carina_core::schema::ListElements::AllowDuplicates,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    for expression in [
+        "[producer.number, 1, 2]",
+        "secret([producer.number, 1, 2])",
+        "if true { [producer.number] } else { [42] }",
+    ] {
+        let source = format!(
+            "let producer = mock.test.Producer {{}}\nmock.test.Sink {{ params = {expression} }}\n"
+        );
+        let errors = round7_cli_errors(&schemas, &source);
+        assert_eq!(
+            errors,
+            ["<fixture>/main.crn at line 2\nexpected String, got Int"],
+            "{expression}"
+        );
+    }
+}
+
+#[test]
+fn round7_cli_nested_folded_coalesce_matches_origin_main() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(
+                AttributeSchema::optional("params", AttributeType::list(AttributeType::string()))
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    for (expression, prefix, line) in [
+        (r#"["ok" ?? 42]"#, "", 1),
+        (
+            r#"["ok" ?? length(producer.params)]"#,
+            "let producer = mock.test.Sink { params = [\"known\"] }\n",
+            2,
+        ),
+    ] {
+        let source = format!("{prefix}mock.test.Sink {{ params = {expression} }}\n");
+        let errors = round7_cli_errors(&schemas, &source);
+        assert_eq!(
+            errors,
+            [format!(
+                "<fixture>/main.crn at line {line}\ncoalesce default type `Int` does not match left type `String`"
+            )],
+            "{expression}"
+        );
+    }
+}
+
+#[test]
+fn round7_cli_quoted_closed_enum_matches_origin_main() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "params",
+                    AttributeType::enum_(
+                        carina_core::schema::TypeIdentity::new(Some("mock"), ["test"], "Event"),
+                        Some(vec!["ok".into()]),
+                        vec![],
+                        Some(carina_core::schema::validator(|_| {
+                            Err(carina_core::schema::TypeError::ValidationFailed {
+                                message: "closed enum rejection".into(),
+                            })
+                        })),
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let errors = round7_cli_errors(&schemas, r#"mock.test.Sink { params = "bad" }"#);
+    assert_eq!(
+        errors,
+        [
+            "mock.test.Sink.<pending>: 'params' (Event) expects an enum identifier, got a string literal 'bad'. Use one of: mock.test.Event.ok"
+        ]
+    );
+}
+
+#[test]
+fn round7_cli_union_map_key_bridge_matches_origin_main() {
+    let identity = carina_core::schema::TypeIdentity::bare("VpcId");
+    for (index, key) in [
+        AttributeType::refined_string(Some(identity.clone()), None, None, None),
+        AttributeType::enum_(
+            identity.clone(),
+            Some(vec!["bad".into()]),
+            vec![],
+            None,
+            None,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let schema = round6_bridge_schema(AttributeType::map_with_key(
+            AttributeType::union(vec![key.clone(), key]),
+            AttributeType::string(),
+        ));
+        let fixture = write_fixture(&[
+            ("providers.crn", "provider awsccmock {}\n"),
+            (
+                "main.crn",
+                "awsccmock.test.Sink { params = { bad = \"ok\" } }\n",
+            ),
+        ]);
+        assert_eq!(
+            round6_cli_bridge_errors(&schema, &fixture),
+            if index == 0 {
+                vec![]
+            } else {
+                vec!["awsccmock.test.Sink.<pending>: Map key 'bad': 'params' (VpcId) expects an enum identifier, got a string literal 'bad'. Use one of: bad".to_string()]
+            }
+        );
+    }
+}
+
+#[test]
+fn round7_cli_union_map_key_value_binding_matches_origin_main() {
+    let key = AttributeType::refined_string(None, None, Some((None, Some(3))), None);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "params",
+                    AttributeType::map_with_key(
+                        AttributeType::union(vec![key.clone(), key]),
+                        AttributeType::string(),
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let errors = round7_cli_errors(
+        &schemas,
+        "let bad = 42\nmock.test.Sink { params = { oversize = bad } }\n",
+    );
+    assert_eq!(
+        errors,
+        ["<fixture>/main.crn at line 2\nType mismatch: expected String, got Int"]
+    );
+}
+
 fn round6_bridge_schema(field_type: AttributeType) -> ValidatedResourceSchema {
     ResourceSchema::new("test.Sink")
         .attribute(AttributeSchema::optional("params", field_type).build())

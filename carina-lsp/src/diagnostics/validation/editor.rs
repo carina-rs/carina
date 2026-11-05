@@ -115,7 +115,7 @@ fn deferred_findings(
         // Concrete operands belong to the core value walk. Only deferred
         // operands need editor inference, so a bad concrete default cannot
         // be re-emitted here as a second type mismatch.
-        Value::Deferred(DeferredValue::Coalesce { .. }) => {
+        Value::Deferred(DeferredValue::Coalesce { .. } | DeferredValue::ModuleIf(_)) => {
             let before = findings.len();
             for (index, operand) in expression.operands() {
                 match judged
@@ -131,29 +131,16 @@ fn deferred_findings(
                     )),
                 }
             }
-            if findings.len() == before
+            if matches!(
+                expression.value(),
+                Value::Deferred(DeferredValue::Coalesce { .. })
+            ) && findings.len() == before
                 && let Err(error) = check(expression, top_level, judged)
             {
                 findings.push(Located::new(
                     resource.attribute_key_location(name).clone(),
                     EditorFinding::DeferredAccess(error),
                 ));
-            }
-        }
-        Value::Deferred(DeferredValue::ModuleIf(_)) => {
-            for (index, operand) in expression.operands() {
-                match judged
-                    .coalesce_operand(index)
-                    .or_else(|_| judged.branch(index))
-                {
-                    Ok(evidence) => {
-                        deferred_findings(resource, name, operand, false, evidence, check, findings)
-                    }
-                    Err(error) => findings.push(Located::new(
-                        resource.attribute_key_location(name).clone(),
-                        EditorFinding::DeferredAccess(AccessTypeFinding::missing_evidence(error)),
-                    )),
-                }
             }
         }
         Value::Deferred(_) => {

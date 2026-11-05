@@ -92,8 +92,15 @@ enum Projection<P: ValueKind, B: BindingAddress> {
 #[derive(Debug, Clone, PartialEq)]
 struct AuthoredExpr<P: ValueKind, B: BindingAddress> {
     location: ExpressionLocation,
+    resource_operands: ResourceOperands,
     kind: ExprKind<B>,
     children: Vec<ExprValue<P, B>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceOperands {
+    Evaluated,
+    Preserved,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -236,6 +243,7 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
         };
         let authored = Arc::new(AuthoredExpr {
             location: authored.location,
+            resource_operands: authored.resource_operands,
             kind,
             children: authored
                 .children
@@ -372,11 +380,50 @@ impl<B: BindingAddress> Expressions<B> {
     pub(super) fn attach_binding_projections(
         &mut self,
         values: &IndexMap<String, Value<ParserPlaceholder, B>>,
+        preserve_resource_expressions: bool,
     ) {
+        self.set_resource_operands(if preserve_resource_expressions {
+            ResourceOperands::Preserved
+        } else {
+            ResourceOperands::Evaluated
+        });
         for (binding, expression) in &mut self.definitions {
             if let Some(value) = values.get(binding.as_str()) {
                 expression.payload = Projection::Value(value.clone());
             }
+        }
+    }
+
+    pub(super) fn evaluate_resource_operands(&mut self) {
+        self.set_resource_operands(ResourceOperands::Evaluated);
+    }
+
+    fn set_resource_operands(&mut self, retention: ResourceOperands) {
+        fn set<B: BindingAddress>(
+            expression: &mut ExprValue<ParserPlaceholder, B>,
+            retention: ResourceOperands,
+            memo: &mut HashMap<usize, Arc<AuthoredExpr<ParserPlaceholder, B>>>,
+        ) {
+            if expression.authored.resource_operands == retention {
+                return;
+            }
+            let id = Arc::as_ptr(&expression.authored) as usize;
+            if let Some(authored) = memo.get(&id) {
+                expression.authored = authored.clone();
+                return;
+            }
+            let mut authored = (*expression.authored).clone();
+            authored.resource_operands = retention;
+            for child in &mut authored.children {
+                set(child, retention, memo);
+            }
+            let authored = Arc::new(authored);
+            memo.insert(id, authored.clone());
+            expression.authored = authored;
+        }
+        let mut memo = HashMap::new();
+        for expression in self.roots.iter_mut().chain(self.definitions.values_mut()) {
+            set(expression, retention, &mut memo);
         }
     }
 
@@ -550,6 +597,7 @@ fn node(
                 ExpressionInstance::Root,
                 &DeclarationLocation::expression_node(pair, file, source),
             ),
+            resource_operands: ResourceOperands::Evaluated,
             kind,
             children,
         }),
@@ -577,6 +625,7 @@ fn lower_blocks(children: Vec<ExprValue>) -> Vec<ExprValue> {
             let value = ExprValue {
                 authored: Arc::new(AuthoredExpr {
                     location: ExpressionLocation::new(ExpressionInstance::Root, &headers[&name]),
+                    resource_operands: ResourceOperands::Evaluated,
                     kind: ExprKind::List,
                     children: records,
                 }),
@@ -592,6 +641,7 @@ fn lower_blocks(children: Vec<ExprValue>) -> Vec<ExprValue> {
                 ExprValue {
                     authored: Arc::new(AuthoredExpr {
                         location: ExpressionLocation::new(ExpressionInstance::Root, header),
+                        resource_operands: ResourceOperands::Evaluated,
                         kind: ExprKind::Sink(name.clone()),
                         children: vec![groups[name].clone()],
                     }),
@@ -1544,6 +1594,12 @@ mod judgement {
         Compatibility,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum RejectionTarget {
+        Expression,
+        Descendant,
+    }
+
     #[derive(Debug, Clone, PartialEq)]
     enum ExprJudgement {
         Typed {
@@ -1561,6 +1617,7 @@ mod judgement {
             source: Box<ExprJudgement>,
             error: InferenceError,
             owner: FailureOwner,
+            target: RejectionTarget,
         },
         ValueDependent {
             reason: NotInferableReason,
@@ -1722,11 +1779,12 @@ mod judgement {
                 _ => None,
             }
         }
-        fn reject(&mut self, error: InferenceError, owner: FailureOwner) {
+        fn reject(&mut self, error: InferenceError, owner: FailureOwner, target: RejectionTarget) {
             self.data_mut().judgement = ExprJudgement::Rejected {
                 source: Box::new(self.judgement.clone()),
                 error,
                 owner,
+                target,
             };
         }
         fn sink_owner(&self, sink: &TypeExpr) -> (FailureOwner, Option<&DeclarationLocation>) {
@@ -1827,7 +1885,15 @@ mod judgement {
         }
 
         pub(crate) fn value_failure_owner(&self) -> bool {
-            self.failure().is_some_and(|(_, owner)| {
+            // A sink rejection at a child cannot own this expression's
+            // independent constraints or suppress validation of its siblings.
+            !matches!(
+                self.judgement,
+                ExprJudgement::Rejected {
+                    target: RejectionTarget::Descendant,
+                    ..
+                }
+            ) && self.failure().is_some_and(|(_, owner)| {
                 matches!(
                     owner,
                     FailureOwner::Expression
@@ -2531,7 +2597,7 @@ mod judgement {
                 if let Some(expression) = Arc::make_mut(&mut self.expressions)
                     .get_mut(&ExpressionLocation::new(self.instance.clone(), location))
                 {
-                    expression.reject(error, owner);
+                    expression.reject(error, owner, RejectionTarget::Expression);
                 }
             }
         }
@@ -3746,7 +3812,7 @@ mod judgement {
                     result.report_at(FailureOwner::Boundary);
                     if let Some(failure) = rejection {
                         let (error, owner) = failure.failure().expect("rejected resource sink");
-                        result.reject(error.clone(), owner);
+                        result.reject(error.clone(), owner, RejectionTarget::Descendant);
                     }
                     result
                 }
@@ -3865,16 +3931,29 @@ mod judgement {
             sink: &TypeExpr,
             location: &DeclarationLocation,
             named_string: bool,
+            resource_operands: ResourceOperands,
         ) {
             match sink {
                 TypeExpr::List(inner) => {
                     for child in Arc::make_mut(&mut expression.data_mut().elements) {
-                        self.route_resource_value_failures(child, inner, location, false);
+                        self.route_resource_value_failures(
+                            child,
+                            inner,
+                            location,
+                            false,
+                            resource_operands,
+                        );
                     }
                 }
                 TypeExpr::Map(inner) => {
                     for child in Arc::make_mut(&mut expression.data_mut().fields).values_mut() {
-                        self.route_resource_value_failures(child, inner, location, false);
+                        self.route_resource_value_failures(
+                            child,
+                            inner,
+                            location,
+                            false,
+                            resource_operands,
+                        );
                     }
                 }
                 TypeExpr::Struct { fields } => {
@@ -3882,7 +3961,13 @@ mod judgement {
                         if let Some(child) =
                             Arc::make_mut(&mut expression.data_mut().fields).get_mut(name)
                         {
-                            self.route_resource_value_failures(child, sink, location, false);
+                            self.route_resource_value_failures(
+                                child,
+                                sink,
+                                location,
+                                false,
+                                resource_operands,
+                            );
                         }
                     }
                 }
@@ -3890,7 +3975,13 @@ mod judgement {
             }
             if let Some(operands) = &mut expression.data_mut().coalesce {
                 for operand in Arc::make_mut(operands) {
-                    self.route_resource_value_failures(operand, sink, location, named_string);
+                    self.route_resource_value_failures(
+                        operand,
+                        sink,
+                        location,
+                        named_string,
+                        resource_operands,
+                    );
                 }
             }
             let Some((error, _)) = expression.failure() else {
@@ -3924,12 +4015,13 @@ mod judgement {
                         })
                         .collect::<Vec<_>>();
                     if rejected.iter().any(|rejected| *rejected) {
-                        // A selected, valid concrete left operand still needs the
-                        // retained judgement to reject its otherwise-lost default.
+                        // Hand off a selected valid left value only when the
+                        // parser kept its default for the resource-value walk.
+                        // Folded defaults still need their inference rejection.
                         (!operands[0].concrete()
                             || rejected[0]
-                            || expression.value_location() != Some(location))
-                        .then_some(FailureOwner::Boundary)
+                            || resource_operands == ResourceOperands::Preserved)
+                            .then_some(FailureOwner::Boundary)
                     } else {
                         Some(FailureOwner::Compatibility)
                     }
@@ -3988,6 +4080,7 @@ mod judgement {
                                         ..
                                     } | crate::schema::RawShape::Reference { .. }
                                 ),
+                                value.authored.resource_operands,
                             );
                             let admission = admit_with_context(
                                 &judged,
@@ -4015,8 +4108,15 @@ mod judgement {
                                         error.clone(),
                                     );
                                 }
+                                let target = if failure_location.is_some()
+                                    && failure_location != judged.value_location()
+                                {
+                                    RejectionTarget::Descendant
+                                } else {
+                                    RejectionTarget::Expression
+                                };
                                 let mut rejected = judged;
-                                rejected.reject(error, owner);
+                                rejected.reject(error, owner, target);
                                 self.by_location
                                     .insert(value.authored.location.clone(), rejected.clone());
                                 self.memo.insert(

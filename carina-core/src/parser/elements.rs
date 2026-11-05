@@ -865,8 +865,10 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
             String,
             crate::resource::Value<crate::resource::ParserPlaceholder, B>,
         >,
+        preserve_resource_expressions: bool,
     ) {
-        self.expressions.attach_binding_projections(values);
+        self.expressions
+            .attach_binding_projections(values, preserve_resource_expressions);
     }
     pub fn configuration_blocks(&self) -> &[Located<ConfigurationBlock>] {
         &self.configuration_blocks
