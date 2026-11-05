@@ -53,7 +53,7 @@ use crate::schema::{
     Shape, ShapeWalkBudget, TypeIdentity,
 };
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-utils"))]
 pub use binding_address::absolute_binding_address_for_test;
 pub use binding_address::{AbsoluteBindingAddress, BindingAddress, RelativeBindingName};
 pub(crate) use binding_address::{
@@ -1805,12 +1805,12 @@ impl AccessPath<RelativeBindingName> {
         Self::from_binding(binding.into(), attribute, segments)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn resolve_root(self, scope: &RootScope) -> AccessPath<AbsoluteBindingAddress> {
         self.resolve_bindings(&mut |binding| scope.resolve(binding))
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(feature = "test-utils")]
     pub fn resolve_root_for_test(self) -> AccessPath<AbsoluteBindingAddress> {
         self.resolve_root(&RootScope::new())
     }
@@ -6757,12 +6757,12 @@ impl<P: ValueKind> Value<P, RelativeBindingName> {
         })
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn resolve_root(self, scope: &RootScope) -> Value<P, AbsoluteBindingAddress> {
         self.resolve_bindings(&mut |binding| scope.resolve(binding))
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(feature = "test-utils")]
     pub fn resolve_root_for_test(self) -> Value<P, AbsoluteBindingAddress> {
         self.resolve_root(&RootScope::new())
     }
@@ -9039,12 +9039,12 @@ pub type AuthoredResource<S = ModuleSource> = Resource<S, ParserPlaceholder, Rel
 pub type ExpandedResource<S = ModuleSource> = Resource<S, NoPlaceholder, AbsoluteBindingAddress>;
 
 impl<S, P: ValueKind> Resource<S, P, RelativeBindingName> {
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn resolve_root(self, scope: &RootScope) -> Resource<S, P, AbsoluteBindingAddress> {
         self.resolve_bindings(&mut |binding| scope.resolve(binding))
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(feature = "test-utils")]
     pub fn resolve_root_for_test(self) -> Resource<S, P, AbsoluteBindingAddress> {
         self.resolve_root(&RootScope::new())
     }
@@ -9615,7 +9615,7 @@ impl<S, P: ValueKind, B: BindingAddress, D> Resource<S, P, B, D> {
         }
     }
 }
-#[cfg(any(test, feature = "test-utils", feature = "test-support"))]
+#[cfg(any(test, feature = "test-utils"))]
 impl<S, P: ValueKind, B: BindingAddress> Resource<S, P, B> {
     pub fn into_resolved_dependency_phase_for_test(self) -> Resource<S, P, B, ()> {
         self.with_dependency_phase(())

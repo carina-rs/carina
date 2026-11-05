@@ -473,7 +473,7 @@ impl DeferredDependencyTemplate {
             self.persisted_explicit.clone(),
         ))
     }
-    #[cfg(any(test, feature = "test-utils", feature = "test-support"))]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn empty_for_test() -> Self {
         Self::from_graph(
             Default::default(),
