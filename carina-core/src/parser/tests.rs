@@ -21233,13 +21233,16 @@ fn directive_functions_resolve_in_deferred_if_resource_and_read_bodies() {
                     &crate::schema::SchemaRegistry::new(),
                     &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
                 )
+                .unwrap()
                 .is_empty(),
             "{:?}",
-            parsed.directive_resolution_errors(
-                super::ParserPlaceholderBoundary::ModuleDefinition,
-                &crate::schema::SchemaRegistry::new(),
-                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
-            )
+            parsed
+                .directive_resolution_errors(
+                    super::ParserPlaceholderBoundary::ModuleDefinition,
+                    &crate::schema::SchemaRegistry::new(),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
+                )
+                .unwrap()
         );
     }
 }
@@ -21254,13 +21257,16 @@ fn module_iterable_loop_directives_wait_for_argument_substitution() {
                 &crate::schema::SchemaRegistry::new(),
                 &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
             )
+            .unwrap()
             .is_empty(),
         "{:?}",
-        parsed.directive_resolution_errors(
-            super::ParserPlaceholderBoundary::ModuleDefinition,
-            &crate::schema::SchemaRegistry::new(),
-            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
-        )
+        parsed
+            .directive_resolution_errors(
+                super::ParserPlaceholderBoundary::ModuleDefinition,
+                &crate::schema::SchemaRegistry::new(),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
+            )
+            .unwrap()
     );
     assert!(
         parsed
@@ -21269,6 +21275,7 @@ fn module_iterable_loop_directives_wait_for_argument_substitution() {
                 &crate::schema::SchemaRegistry::new(),
                 &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
             )
+            .unwrap()
             .is_empty()
     );
 }

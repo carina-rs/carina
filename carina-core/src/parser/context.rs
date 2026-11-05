@@ -133,7 +133,7 @@ pub(crate) struct ParseContext<'cfg, Source = AuthoredDiagnosticSource> {
     /// control-flow expressions defer only that provisional case; the final
     /// parse runs with this disabled and reports the classified error.
     pub(super) defer_provisional_static_conditions: bool,
-    pub(super) preserve_resource_value_branches: bool,
+    pub(super) preserve_resource_expressions: bool,
     /// Shared parser-side provenance recorder. Real lexical child contexts
     /// share it; expression parsing never clones the context merely to change
     /// sink behavior.
@@ -204,6 +204,32 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
 
     pub(super) fn source_file(&self) -> &std::path::Path {
         &self.diagnostic_source.path
+    }
+
+    pub(super) fn evaluate_retained_expression(
+        &self,
+        pair: pest::iterators::Pair<'_, Rule>,
+        reduce: impl FnOnce() -> Result<Value, ParseError>,
+    ) -> Result<super::retained::ExprValue, ParseError> {
+        super::retained::evaluate(
+            pair,
+            &self.diagnostic_source.file,
+            &self.diagnostic_source.path,
+            reduce,
+        )
+    }
+
+    pub(super) fn evaluate_retained_sink(
+        &self,
+        pair: pest::iterators::Pair<'_, Rule>,
+        reduce: impl FnOnce() -> Result<crate::eval_value::ParsedSinkValue, ParseError>,
+    ) -> Result<super::retained::SinkExpression, ParseError> {
+        super::retained::evaluate_sink(
+            pair,
+            &self.diagnostic_source.file,
+            &self.diagnostic_source.path,
+            reduce,
+        )
     }
 
     pub(super) fn access_locations(
@@ -307,7 +333,7 @@ impl<'cfg, Source: Clone> ParseContext<'cfg, Source> {
             seeded_bindings: HashSet::new(),
             pending_function_type_checks: Rc::new(RefCell::new(Vec::new())),
             defer_provisional_static_conditions: false,
-            preserve_resource_value_branches: false,
+            preserve_resource_expressions: false,
             parsed_binding_uses: Rc::new(RefCell::new(ParsedBindingUses::default())),
             binding_scope: BindingScopeId::root(&source_file),
             binding_scope_source_file: source_file,
@@ -609,7 +635,6 @@ struct ExpressionSink<'a> {
     source_file: &'a std::path::Path,
     preprocessed_file: &'a super::PreprocessedFile,
     structural: StructuralSinkMode,
-    branches: Vec<super::ValueBranch>,
 }
 
 impl ExpressionMode<'_> {
@@ -636,7 +661,6 @@ impl<'a> ExpressionMode<'a> {
                 source_file,
                 preprocessed_file,
                 structural: StructuralSinkMode::Pending,
-                branches: Vec::new(),
             }),
             source: Some(IntegerOperandContext {
                 source_file,
@@ -667,7 +691,6 @@ impl<'a> ExpressionMode<'a> {
                 source_file,
                 preprocessed_file,
                 structural,
-                branches: Vec::new(),
             }),
             source: Some(IntegerOperandContext {
                 source_file,
@@ -722,7 +745,6 @@ impl<'a> ExpressionMode<'a> {
             sink: Some(ExpressionSink {
                 root_path: path.clone(),
                 path,
-                branches: Vec::new(),
                 ..sink.clone()
             }),
             source: self.source,
@@ -741,22 +763,6 @@ impl<'a> ExpressionMode<'a> {
 
     pub(super) fn at_list_index(&self, index: usize) -> Self {
         self.with_segment(AttributePathSegment::ListIndex(index))
-    }
-
-    pub(super) fn at_branch(&self, branch: super::ValueBranch) -> Self {
-        let mut mode = self.clone();
-        if let Some(sink) = &mut mode.sink {
-            sink.branches.push(branch);
-        }
-        mode
-    }
-
-    pub(super) fn fold_value_branch(&self, ctx: &ParseContext, records: std::ops::Range<usize>) {
-        if let Some(sink) = &self.sink {
-            ctx.parsed_binding_uses
-                .borrow_mut()
-                .fold_value_branch(records, sink.branches.len() - 1);
-        }
     }
 
     pub(super) fn has_resource_sink(&self) -> bool {
@@ -806,6 +812,22 @@ impl<'a> ExpressionMode<'a> {
         token: &pest::iterators::Pair<'_, Rule>,
     ) -> Option<PendingValueSlot> {
         let sink = self.sink.as_ref()?;
+        self.record_bare_binding_at(
+            ctx,
+            name,
+            token,
+            super::DeclarationLocation::from_pair(token, sink.preprocessed_file, sink.source_file),
+        )
+    }
+
+    pub(super) fn record_bare_binding_at(
+        &self,
+        ctx: &ParseContext<'_>,
+        name: &str,
+        token: &pest::iterators::Pair<'_, Rule>,
+        location: super::DeclarationLocation,
+    ) -> Option<PendingValueSlot> {
+        let sink = self.sink.as_ref()?;
         let (binding, source) = match ctx.lookup_binding(name) {
             ParseBindingRef::Value {
                 value: EvalValue::DeferredForValue { .. },
@@ -848,11 +870,8 @@ impl<'a> ExpressionMode<'a> {
             ParseBindingRef::Unbound => return None,
         };
         let authored = BareBindingUse {
-            location: super::DeclarationLocation::from_pair(
-                token,
-                sink.preprocessed_file,
-                sink.source_file,
-            ),
+            expression_instance: super::retained::ExpressionInstance::Root,
+            location,
             source_file: SourceFileId::new(sink.source_file.to_path_buf()),
             scope: ctx
                 .binding_scope(name)
@@ -863,7 +882,6 @@ impl<'a> ExpressionMode<'a> {
             name: name.to_string(),
             span: SourceSpan::from_pest(token, sink.preprocessed_file),
             binding,
-            branches: sink.branches.clone(),
         };
         let pending_slot = (matches!(&source, BareBindingSource::Structural(_))
             && sink.structural == StructuralSinkMode::Pending)

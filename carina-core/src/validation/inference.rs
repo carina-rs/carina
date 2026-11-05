@@ -8,30 +8,15 @@
 //! completion) see a definitive type per export instead of having to
 //! re-derive it. See `notes/specs/2026-05-03-typeexpr-stage2-design.md`.
 //!
-//! Inference rules:
-//!
-//! - `Value::Concrete(ConcreteValue::String)/Int/Bool/Float` → corresponding `TypeExpr` primitive.
-//! - `Value::Concrete(ConcreteValue::List(items))` → `List(T)` where `T` is the unified element
-//!   type. Heterogeneous lists fail inference.
-//! - `Value::Concrete(ConcreteValue::Map(entries))` → `Map(T)` where `T` unifies value types.
-//! - `Value::Deferred(DeferredValue::ResourceRef{ binding, attribute, field_path })` → walk
-//!   the binding's resource schema, descend `field_path`, convert the
-//!   reached `AttributeType` into a `TypeExpr`.
-//! - `Value::Deferred(DeferredValue::Interpolation(_))` → `TypeExpr::String` (interpolation
-//!   results are always strings; users who need a specific Custom
-//!   identity must annotate to narrow).
-//! - `Value::Deferred(DeferredValue::Secret(_))` → the wrapped value's type; sensitivity is
-//!   orthogonal to its list/map/scalar shape.
-//! - `Value::Deferred(DeferredValue::FunctionCall{ name, .. })` → consult `builtins`'s
-//!   `BuiltinReturnType`. `String/Int/List/Map/Secret` map to the
-//!   corresponding `TypeExpr` primitive, while `Secret` preserves its argument type; `Any` (`lookup`, `min`,
-//!   `max`, `map`) is "depends on arguments" — counts as inference
-//!   failure.
+//! Export types come exclusively from the authored expression report produced
+//! by the loader/expander. Value-based inference is a separate API requiring
+//! `RuntimeTypeInput`, which state readers provide. It cannot accept authored
+//! or expanded configuration projections.
 
 use std::collections::HashMap;
 
 use crate::builtins::{BuiltinReturnType, builtin_functions};
-use crate::parser::TypeExpr;
+use crate::parser::{ExportParamLike, TypeExpr};
 use crate::provider::ProviderLoadedSchemaRegistry;
 use crate::resource::{
     BindingAddress, ConcreteValue, DeferredValue, NoPlaceholder, PlaceholderKind,
@@ -231,29 +216,67 @@ pub fn bindings_from_parts<S, P: PlaceholderKind + PartialEq, B: BindingAddress>
     out
 }
 
-/// Try to synthesize a `TypeExpr` from a `Value`. Returns `Err` if the
-/// value's type cannot be statically determined — the caller is
-/// expected to either fall back to a user-supplied annotation or
-/// surface the error as "type annotation required" at the offending
-/// field.
-pub fn infer_type_from_value<P: PlaceholderKind, B: BindingAddress>(
-    value: &Value<P, B>,
-    bindings: &InferenceBindings<P, B>,
+/// Infer a value received from runtime/state, where no authored syntax exists.
+/// Authored expressions must consume `JudgedExpr::static_type` instead.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{resource::AuthoredValue, validation::inference::{infer_runtime_type, InferenceBindings},
+///     schema::SchemaRegistry, parser::ProviderContext};
+/// fn bypass(value: &AuthoredValue, config: &ProviderContext) {
+///     infer_runtime_type(value, &InferenceBindings::new(), &SchemaRegistry::new(), config);
+/// }
+/// ```
+///
+/// Even a placeholder-free authored projection is not runtime provenance.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{resource::ExpandedValue, validation::inference::{infer_runtime_type, InferenceBindings},
+///     schema::SchemaRegistry, parser::ProviderContext};
+/// fn bypass(value: &ExpandedValue, config: &ProviderContext) {
+///     infer_runtime_type(value, &InferenceBindings::new(), &SchemaRegistry::new(), config);
+/// }
+/// ```
+pub fn infer_runtime_type<B: BindingAddress>(
+    input: RuntimeTypeInput<'_, B>,
+    bindings: &InferenceBindings<NoPlaceholder, B>,
     schemas: &SchemaRegistry,
     provider_context: &crate::parser::ProviderContext,
 ) -> Result<TypeExpr, InferenceIssue> {
-    infer_type_from_value_with_provider_context(value, bindings, schemas, provider_context)
+    infer_projected_type(input.value(), bindings, schemas, provider_context)
+}
+
+/// Runtime provenance for value-based inference. Expanded authored values
+/// cannot be supplied directly; state readers provide this input.
+#[derive(Clone, Copy)]
+pub struct RuntimeTypeInput<'a, B: BindingAddress = crate::resource::AbsoluteBindingAddress> {
+    value: &'a Value<NoPlaceholder, B>,
+}
+
+impl<'a> RuntimeTypeInput<'a> {
+    pub fn state_attribute(state: &'a crate::resource::State, name: &str) -> Option<Self> {
+        state.attributes.get(name).map(|value| Self { value })
+    }
+}
+
+impl<'a, B: BindingAddress> RuntimeTypeInput<'a, B> {
+    pub(crate) fn value(&self) -> &'a Value<NoPlaceholder, B> {
+        self.value
+    }
+    #[cfg(test)]
+    pub(crate) fn computed_for_test(value: &'a Value<NoPlaceholder, B>) -> Self {
+        Self { value }
+    }
 }
 
 /// Infer with the same provider catalog that owns the binding/type check.
-pub fn infer_type_from_value_with_provider_context<P: PlaceholderKind, B: BindingAddress>(
+pub(super) fn infer_projected_type<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &InferenceBindings<P, B>,
     schemas: &SchemaRegistry,
     provider_context: &crate::parser::ProviderContext,
 ) -> Result<TypeExpr, InferenceIssue> {
     let mut visiting = indexmap::IndexSet::new();
-    infer_type_from_value_with_visiting(
+    infer_projected_type_with_visiting(
         value,
         bindings,
         InferenceSchemaContext {
@@ -276,179 +299,7 @@ fn heterogeneous_collection_error(first: &TypeExpr, next: &TypeExpr) -> Inferenc
     }
 }
 
-/// Infer only from the value's own shape and builtin metadata.
-///
-/// This explicitly has no binding/schema authority: references therefore
-/// remain unknown, while literals and computed values whose return shape is
-/// intrinsic (for example `split(...)[0]`) can still be checked. Callers use
-/// this instead of manufacturing empty binding/schema registries.
-pub(crate) fn infer_type_from_value_without_bindings<P: PlaceholderKind, B: BindingAddress>(
-    value: &Value<P, B>,
-) -> Result<TypeExpr, InferenceIssue> {
-    fn infer_collection_without_bindings<'a, P: PlaceholderKind + 'a, B: BindingAddress + 'a>(
-        values: impl IntoIterator<Item = &'a Value<P, B>>,
-        wrap: impl FnOnce(Box<TypeExpr>) -> TypeExpr,
-    ) -> Result<TypeExpr, InferenceIssue> {
-        let mut values = values.into_iter();
-        let Some(first) = values.next() else {
-            return Err(InferenceError::UnknownType {
-                reason: "empty collection has no inferable element type".to_string(),
-            }
-            .into());
-        };
-        let element = infer_type_from_value_without_bindings(first)?;
-        for value in values {
-            let next = infer_type_from_value_without_bindings(value)?;
-            if next != element {
-                return Err(heterogeneous_collection_error(&element, &next).into());
-            }
-        }
-        Ok(wrap(Box::new(element)))
-    }
-
-    match value {
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
-            let then_type = infer_type_from_value_without_bindings(deferred.then_value())?;
-            let else_type = infer_type_from_value_without_bindings(deferred.else_value())?;
-            if then_type == else_type {
-                Ok(then_type)
-            } else {
-                Err(heterogeneous_collection_error(&then_type, &else_type).into())
-            }
-        }
-        Value::Concrete(ConcreteValue::String(_))
-        | Value::Concrete(ConcreteValue::EnumIdentifier(_))
-        | Value::Concrete(ConcreteValue::CanonicalEnum(_))
-        | Value::Deferred(DeferredValue::Interpolation(_)) => Ok(TypeExpr::String),
-        Value::Concrete(ConcreteValue::Int(_)) => Ok(TypeExpr::Int),
-        // The result shape is intrinsic even when this deliberately
-        // authority-free inferer cannot prove deferred operands. Final
-        // directory validation uses `infer_type_from_value` below and rejects
-        // every operand that is not proven Int.
-        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => Ok(TypeExpr::Int),
-        Value::Concrete(ConcreteValue::Float(_)) => Ok(TypeExpr::Float),
-        Value::Concrete(ConcreteValue::Bool(_)) => Ok(TypeExpr::Bool),
-        Value::Concrete(ConcreteValue::Duration(_)) => Ok(TypeExpr::Duration),
-        Value::Concrete(ConcreteValue::List(items)) => {
-            infer_collection_without_bindings(items, TypeExpr::List)
-        }
-        Value::Concrete(ConcreteValue::StringList(_)) => {
-            Ok(TypeExpr::List(Box::new(TypeExpr::String)))
-        }
-        Value::Concrete(ConcreteValue::Map(entries)) => {
-            infer_collection_without_bindings(entries.values(), TypeExpr::Map)
-        }
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            infer_type_from_value_without_bindings(inner)
-        }
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            let left = infer_type_from_value_without_bindings(value)?;
-            match infer_type_from_value_without_bindings(default) {
-                Ok(right) if right == left => Ok(left),
-                Ok(right) => Err(InferenceError::IncompatibleCoalesceTypes {
-                    types: crate::schema::MismatchTypeNames::for_type_exprs(&left, &right),
-                }
-                .into()),
-                Err(InferenceIssue::Failed(InferenceError::UnknownType { .. }))
-                    if matches!(
-                        (default.as_ref(), &left),
-                        (
-                            Value::Concrete(ConcreteValue::List(items)),
-                            TypeExpr::List(_)
-                        ) if items.is_empty()
-                    ) || matches!(
-                        (default.as_ref(), &left),
-                        (
-                            Value::Concrete(ConcreteValue::Map(entries)),
-                            TypeExpr::Map(_)
-                        ) if entries.is_empty()
-                    ) =>
-                {
-                    Ok(left)
-                }
-                Err(error) => Err(error),
-            }
-        }
-        Value::Deferred(
-            DeferredValue::FunctionCall { name, args, .. }
-            | DeferredValue::Unavailable { name, args, .. },
-        ) => {
-            let return_type = builtin_functions()
-                .iter()
-                .find(|function| function.name == name.as_str())
-                .map(|function| function.return_type)
-                .ok_or_else(|| {
-                    InferenceIssue::from(InferenceError::UnknownType {
-                        reason: format!("unknown built-in function `{name}`"),
-                    })
-                })?;
-            match return_type {
-                BuiltinReturnType::String => Ok(TypeExpr::String),
-                BuiltinReturnType::Int => Ok(TypeExpr::Int),
-                BuiltinReturnType::StringList => Ok(TypeExpr::List(Box::new(TypeExpr::String))),
-                BuiltinReturnType::Secret => args.first().map_or_else(
-                    || {
-                        Err(InferenceError::UnknownType {
-                            reason: format!("built-in `{name}` has no argument to wrap as secret"),
-                        }
-                        .into())
-                    },
-                    |argument| infer_type_from_value_without_bindings(argument.walker_value()),
-                ),
-                BuiltinReturnType::List | BuiltinReturnType::Map | BuiltinReturnType::Any => {
-                    Err(InferenceError::UnknownType {
-                        reason: format!("built-in `{name}` return type depends on arguments"),
-                    }
-                    .into())
-                }
-            }
-        }
-        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
-            function.return_type.clone().ok_or_else(|| {
-                InferenceIssue::from(InferenceError::UnknownType {
-                    reason: format!(
-                        "user function `{}` has no declared return type",
-                        function.name
-                    ),
-                })
-            })
-        }
-        Value::Deferred(DeferredValue::Access(access)) => {
-            let base_type = infer_type_from_value_without_bindings(access.base())?;
-            super::narrow_type_expr(&base_type, std::slice::from_ref(access.step()), None)
-                .ok_or_else(|| {
-                    InferenceIssue::from(InferenceError::InvalidAccess {
-                        base_type: base_type.to_string(),
-                        step: access.step().clone(),
-                    })
-                })
-        }
-        Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
-            match placeholder.inference_type_authority() {
-                crate::resource::PlaceholderTypeAuthority::MissingExpression => {
-                    Err(InferenceError::UnknownType {
-                        reason: placeholder.to_string(),
-                    }
-                    .into())
-                }
-                crate::resource::PlaceholderTypeAuthority::Binding(_)
-                | crate::resource::PlaceholderTypeAuthority::AwaitingSubstitution => Err(
-                    InferenceIssue::NotInferable(NotInferableReason::PlaceholderTypeUnavailable {
-                        placeholder: placeholder.to_string(),
-                    }),
-                ),
-            }
-        }
-        Value::Deferred(DeferredValue::ResourceRef { .. })
-        | Value::Deferred(DeferredValue::BindingRef { .. })
-        | Value::Deferred(DeferredValue::Unknown(_)) => Err(InferenceError::UnknownType {
-            reason: "value requires binding/schema authority".to_string(),
-        }
-        .into()),
-    }
-}
-
-/// Internal core of [`infer_type_from_value`] threading the
+/// Internal core of [`infer_projected_type`] threading the
 /// currently-being-resolved `Virtual` binding chain through the
 /// recursive calls. Cycle detection lives on the `Virtual` arm of
 /// [`infer_resource_ref_with_visiting`] (#2497); every other arm just
@@ -456,7 +307,7 @@ pub(crate) fn infer_type_from_value_without_bindings<P: PlaceholderKind, B: Bind
 /// `Virtual` recursion returns, so unrelated sibling traversals (two
 /// list elements that each resolve through different `Virtual`
 /// bindings) do not see each other.
-fn infer_type_from_value_with_visiting<P: PlaceholderKind, B: BindingAddress>(
+fn infer_projected_type_with_visiting<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &InferenceBindings<P, B>,
     context: InferenceSchemaContext<'_>,
@@ -465,13 +316,13 @@ fn infer_type_from_value_with_visiting<P: PlaceholderKind, B: BindingAddress>(
     let schemas = context.schemas;
     match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
-            let then_type = infer_type_from_value_with_visiting(
+            let then_type = infer_projected_type_with_visiting(
                 deferred.then_value(),
                 bindings,
                 context,
                 visiting,
             )?;
-            let else_type = infer_type_from_value_with_visiting(
+            let else_type = infer_projected_type_with_visiting(
                 deferred.else_value(),
                 bindings,
                 context,
@@ -492,13 +343,13 @@ fn infer_type_from_value_with_visiting<P: PlaceholderKind, B: BindingAddress>(
         Value::Concrete(ConcreteValue::Int(_)) => Ok(TypeExpr::Int),
         Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
             let lhs = require_proven_integer_operand(
-                infer_type_from_value_with_visiting(expression.lhs(), bindings, context, visiting),
+                infer_projected_type_with_visiting(expression.lhs(), bindings, context, visiting),
                 expression.op(),
                 crate::integer_arithmetic::IntegerOperandSide::Left,
                 expression.operator_span(),
             )?;
             let rhs = require_proven_integer_operand(
-                infer_type_from_value_with_visiting(expression.rhs(), bindings, context, visiting),
+                infer_projected_type_with_visiting(expression.rhs(), bindings, context, visiting),
                 expression.op(),
                 crate::integer_arithmetic::IntegerOperandSide::Right,
                 expression.operator_span(),
@@ -516,7 +367,7 @@ fn infer_type_from_value_with_visiting<P: PlaceholderKind, B: BindingAddress>(
         Value::Concrete(ConcreteValue::Duration(_)) => Ok(TypeExpr::Duration),
         Value::Deferred(DeferredValue::Interpolation(_)) => Ok(TypeExpr::String),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            infer_type_from_value_with_visiting(inner, bindings, context, visiting)
+            infer_projected_type_with_visiting(inner, bindings, context, visiting)
         }
 
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -544,32 +395,18 @@ fn infer_type_from_value_with_visiting<P: PlaceholderKind, B: BindingAddress>(
         }
         .into()),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            let left = infer_type_from_value_with_visiting(value, bindings, context, visiting)?;
-            match infer_type_from_value_with_visiting(default, bindings, context, visiting) {
-                Ok(right) if right == left => Ok(left),
-                Ok(right) => Err(InferenceError::IncompatibleCoalesceTypes {
-                    types: crate::schema::MismatchTypeNames::for_type_exprs(&left, &right),
+            let left = infer_projected_type_with_visiting(value, bindings, context, visiting);
+            let right = infer_projected_type_with_visiting(default, bindings, context, visiting);
+            let empty = match default.as_ref() {
+                Value::Concrete(ConcreteValue::List(items)) if items.is_empty() => {
+                    crate::parser::retained::EmptyCoalesceDefault::List
                 }
-                .into()),
-                Err(InferenceIssue::Failed(InferenceError::UnknownType { .. }))
-                    if matches!(
-                        (default.as_ref(), &left),
-                        (
-                            Value::Concrete(ConcreteValue::List(items)),
-                            TypeExpr::List(_)
-                        ) if items.is_empty()
-                    ) || matches!(
-                        (default.as_ref(), &left),
-                        (
-                            Value::Concrete(ConcreteValue::Map(entries)),
-                            TypeExpr::Map(_)
-                        ) if entries.is_empty()
-                    ) =>
-                {
-                    Ok(left)
+                Value::Concrete(ConcreteValue::Map(entries)) if entries.is_empty() => {
+                    crate::parser::retained::EmptyCoalesceDefault::Map
                 }
-                Err(error) => Err(error),
-            }
+                _ => crate::parser::retained::EmptyCoalesceDefault::None,
+            };
+            crate::parser::retained::coalesce_type(left, right, empty)
         }
         Value::Deferred(
             DeferredValue::FunctionCall { name, args, .. }
@@ -587,7 +424,7 @@ fn infer_type_from_value_with_visiting<P: PlaceholderKind, B: BindingAddress>(
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             let base_type =
-                infer_type_from_value_with_visiting(access.base(), bindings, context, visiting)?;
+                infer_projected_type_with_visiting(access.base(), bindings, context, visiting)?;
             super::narrow_type_expr(
                 &base_type,
                 std::slice::from_ref(access.step()),
@@ -662,6 +499,43 @@ fn require_proven_integer_operand(
         }
         .into()),
     }
+}
+
+pub(crate) fn judge_integer_operands(
+    op: crate::integer_arithmetic::IntegerOp,
+    location: &crate::parser::DeclarationLocation,
+    operands: &[crate::parser::retained::JudgedExpr; 2],
+    schemas: &SchemaRegistry,
+    provider_context: &crate::parser::ProviderContext,
+) -> Result<TypeExpr, InferenceIssue> {
+    for operand in operands {
+        if let Err(InferenceIssue::NotInferable(reason)) = operand.static_type() {
+            return Err(InferenceIssue::NotInferable(reason.clone()));
+        }
+    }
+    let span = crate::integer_arithmetic::IntegerOperatorSpan::authored(location.clone());
+    let lhs = require_proven_integer_operand(
+        operands[0].static_type().cloned(),
+        op,
+        crate::integer_arithmetic::IntegerOperandSide::Left,
+        span.clone(),
+    )?;
+    let rhs = require_proven_integer_operand(
+        operands[1].static_type().cloned(),
+        op,
+        crate::integer_arithmetic::IntegerOperandSide::Right,
+        span.clone(),
+    )?;
+    require_integer_arithmetic_operands(
+        op,
+        span,
+        &lhs,
+        &rhs,
+        InferenceSchemaContext {
+            schemas,
+            provider_context,
+        },
+    )
 }
 
 fn require_integer_arithmetic_operands(
@@ -758,7 +632,7 @@ where
     // can add an explicit annotation to the export.
     let mut iter = items.into_iter();
     let first = match iter.next() {
-        Some(v) => infer_type_from_value_with_visiting(v, bindings, context, visiting)?,
+        Some(v) => infer_projected_type_with_visiting(v, bindings, context, visiting)?,
         None => {
             return Err(InferenceError::UnknownType {
                 reason: "empty collection — element type cannot be inferred".to_string(),
@@ -767,7 +641,7 @@ where
         }
     };
     for next in iter {
-        let next_type = infer_type_from_value_with_visiting(next, bindings, context, visiting)?;
+        let next_type = infer_projected_type_with_visiting(next, bindings, context, visiting)?;
         if next_type != first {
             return Err(heterogeneous_collection_error(&first, &next_type).into());
         }
@@ -828,7 +702,7 @@ fn infer_resource_ref_with_visiting<P: PlaceholderKind, B: BindingAddress>(
                 return Err(InferenceError::CyclicVirtualBinding { cycle }.into());
             }
             let inner_type_result =
-                infer_type_from_value_with_visiting(inner, bindings, context, visiting);
+                infer_projected_type_with_visiting(inner, bindings, context, visiting);
             visiting.shift_remove(binding);
             let inner_type = inner_type_result?;
             return super::narrow_type_expr(&inner_type, segments, Some(schemas)).ok_or_else(
@@ -847,7 +721,49 @@ fn infer_resource_ref_with_visiting<P: PlaceholderKind, B: BindingAddress>(
             .into());
         }
     };
-    let Some(schema) = lookup_schema(schemas, target.0, target.1) else {
+    infer_schema_reference(binding, attribute, segments, target.0, target.1, schemas)
+}
+
+pub(crate) fn infer_declared_reference_type<P: PlaceholderKind, B: BindingAddress>(
+    binding: &str,
+    attribute: &str,
+    segments: &[crate::resource::PathSegment],
+    bindings: &InferenceBindings<P, B>,
+    schemas: &SchemaRegistry,
+) -> Result<TypeExpr, InferenceIssue> {
+    match bindings.get(binding) {
+        Some(InferenceBinding::Resource {
+            provider,
+            resource_type,
+        }) => infer_schema_reference(
+            binding,
+            attribute,
+            segments,
+            provider,
+            resource_type,
+            schemas,
+        ),
+        Some(_) => Err(InferenceIssue::NotInferable(
+            NotInferableReason::NonInferableBinding {
+                binding: binding.to_string(),
+            },
+        )),
+        None => Err(InferenceError::UnknownBinding {
+            binding: binding.to_string(),
+        }
+        .into()),
+    }
+}
+
+fn infer_schema_reference(
+    binding: &str,
+    attribute: &str,
+    segments: &[crate::resource::PathSegment],
+    provider: &str,
+    resource_type: &str,
+    schemas: &SchemaRegistry,
+) -> Result<TypeExpr, InferenceIssue> {
+    let Some(schema) = lookup_schema(schemas, provider, resource_type) else {
         return Err(InferenceIssue::NotInferable(
             NotInferableReason::SchemaUnavailable {
                 binding: binding.to_string(),
@@ -906,7 +822,7 @@ fn infer_resource_ref_with_visiting<P: PlaceholderKind, B: BindingAddress>(
             ) => value,
             _ => {
                 return Err(InferenceError::InvalidAccess {
-                    base_type: attribute_type_to_type_expr(resolved, target.0).to_string(),
+                    base_type: attribute_type_to_type_expr(resolved, provider).to_string(),
                     step: seg.clone(),
                 }
                 .into());
@@ -940,7 +856,7 @@ fn infer_resource_ref_with_visiting<P: PlaceholderKind, B: BindingAddress>(
         }
         .into());
     }
-    Ok(attribute_type_to_type_expr(current, target.0))
+    Ok(attribute_type_to_type_expr(current, provider))
 }
 
 fn lookup_schema<'a>(
@@ -1149,7 +1065,7 @@ fn infer_function_call<P: PlaceholderKind, B: BindingAddress>(
         };
     };
     match return_type {
-        BuiltinReturnType::String => Ok(TypeExpr::String),
+        BuiltinReturnType::String | BuiltinReturnType::Secret => Ok(TypeExpr::String),
         BuiltinReturnType::Int => Ok(TypeExpr::Int),
         BuiltinReturnType::List => Err(InferenceError::UnknownType {
             reason: format!(
@@ -1166,7 +1082,7 @@ fn infer_function_call<P: PlaceholderKind, B: BindingAddress>(
             ),
         }
         .into()),
-        BuiltinReturnType::Secret => args.first().map_or_else(
+        BuiltinReturnType::Argument(index) => args.get(index).map_or_else(
             || {
                 Err(InferenceError::UnknownType {
                     reason: format!("built-in `{name}` has no argument to wrap as secret"),
@@ -1174,7 +1090,7 @@ fn infer_function_call<P: PlaceholderKind, B: BindingAddress>(
                 .into())
             },
             |inner| {
-                infer_type_from_value_with_visiting(
+                infer_projected_type_with_visiting(
                     inner.walker_value(),
                     bindings,
                     context,
@@ -1215,13 +1131,13 @@ where
             B,
         >,
 {
-    let inferred_exports =
-        infer_export_params(&parsed, schemas, provider_context).into_parameters();
+    let judged = crate::parser::retained::JudgedFile::new(parsed, schemas, provider_context);
+    let inferred_exports = infer_export_params(&judged).into_parameters();
     // Single phase-axis surface (carina#3126): only `export_params`
     // changes phase; every other field moves through `map_export_params`
     // so a new `File<E>` field cannot be silently dropped on the
     // parser→inferred relabel.
-    parsed.map_export_params(|_| inferred_exports)
+    judged.into_file().map_export_params(|_| inferred_exports)
 }
 
 /// Export parameters inferred with a caller-supplied schema registry.
@@ -1244,22 +1160,14 @@ impl<B: BindingAddress> SchemaCheckedExportParams<B> {
     }
 }
 
-/// Borrowing variant of [`apply_inference`] that returns just the
-/// inferred export parameters. The full
-/// `InferredFile` reconstruction in `apply_inference` clones every
-/// non-export field; consumers that only need the export-side typecheck
-/// (LSP diagnostics, in particular) should use this instead to avoid
-/// the per-keystroke deep-clone.
+/// Infer export types from a schema-judged configuration without cloning its file.
 pub fn infer_export_params<D, B: BindingAddress>(
-    parsed: &crate::parser::File<
+    judged: &crate::parser::retained::JudgedFile<
+        '_,
         crate::parser::ParsedExportParam<crate::resource::ParserPlaceholder, B>,
-        crate::resource::ParserPlaceholder,
-        crate::resource::ParserPlaceholder,
         D,
         B,
     >,
-    schemas: &SchemaRegistry,
-    provider_context: &crate::parser::ProviderContext,
 ) -> SchemaCheckedExportParams<B>
 where
     D: crate::parser::DeferredForPhaseTraversal<
@@ -1268,7 +1176,8 @@ where
             B,
         >,
 {
-    let bindings = bindings_from_parsed(parsed);
+    let parsed = judged.file();
+    let report = judged.report();
     let parameters = parsed
         .export_params
         .iter()
@@ -1287,11 +1196,31 @@ where
                     None => ExportStaticType::Inferred(StaticType::Unchecked(
                         InferredUncheckedReason::NotInferable(NotInferableReason::MissingValue),
                     )),
-                    Some(crate::parser::BoundaryExpression::Value(value)) => {
-                        match infer_type_from_value(value, &bindings, schemas, provider_context) {
+                    Some(crate::parser::BoundaryExpression::Value(_value)) => {
+                        let inferred = parameter
+                            .value_location()
+                            .ok_or_else(|| {
+                                crate::parser::retained::MissingEvidence::new(
+                                    "export value location",
+                                )
+                            })
+                            .and_then(|location| report.expression(location))
+                            .map_err(|error| InferenceIssue::Failed(error.into()))
+                            .and_then(|expression| expression.static_type().cloned());
+                        match inferred {
                             Ok(type_expr) => {
                                 ExportStaticType::Inferred(StaticType::Known(type_expr))
                             }
+                            // The expression itself is valid. An unannotated
+                            // export additionally requires a static type, so
+                            // this boundary owns the annotation failure.
+                            Err(InferenceIssue::NotInferable(
+                                NotInferableReason::ValueDependent { reason },
+                            )) => ExportStaticType::Inferred(StaticType::Unchecked(
+                                InferredUncheckedReason::InferenceFailed(
+                                    InferenceError::UnknownType { reason },
+                                ),
+                            )),
                             Err(issue) => {
                                 ExportStaticType::Inferred(StaticType::Unchecked(issue.into()))
                             }
@@ -1319,7 +1248,6 @@ where
 #[derive(Debug, Clone)]
 pub struct ExportParamsInferredWithLoadedProviderSchemas<B: BindingAddress = RelativeBindingName> {
     inferred: SchemaCheckedExportParams<B>,
-    declarations: Vec<crate::parser::Located<crate::parser::DeclarationRecord>>,
 }
 
 impl<B: BindingAddress> ExportParamsInferredWithLoadedProviderSchemas<B> {
@@ -1332,7 +1260,6 @@ impl<B: BindingAddress> ExportParamsInferredWithLoadedProviderSchemas<B> {
     pub fn checked_exports(&self) -> ExportsInferredWithLoadedProviderSchemas<'_, B> {
         ExportsInferredWithLoadedProviderSchemas {
             parameters: self.parameters(),
-            declarations: self.declarations.clone(),
         }
     }
 
@@ -1362,15 +1289,19 @@ pub fn infer_export_params_with_loaded_provider_schemas<D, B: BindingAddress>(
     provider_context: &crate::parser::ProviderContext,
 ) -> ExportParamsInferredWithLoadedProviderSchemas<B>
 where
-    D: crate::parser::DeferredForPhaseTraversal<
+    D: Clone
+        + crate::parser::DeferredForPhaseTraversal<
             crate::resource::ParserPlaceholder,
             crate::resource::ParserPlaceholder,
             B,
         >,
 {
     ExportParamsInferredWithLoadedProviderSchemas {
-        declarations: tree.syntax().declarations().to_vec(),
-        inferred: infer_export_params(tree.file(), schemas.schemas(), provider_context),
+        inferred: infer_export_params(&crate::parser::retained::JudgedFile::new(
+            tree.file().clone(),
+            schemas.schemas(),
+            provider_context,
+        )),
     }
 }
 
@@ -1390,7 +1321,6 @@ impl std::fmt::Display for AttachedInferenceFailure<'_> {
 #[derive(Debug, Clone)]
 pub struct ExportsInferredWithLoadedProviderSchemas<'a, B: BindingAddress = RelativeBindingName> {
     parameters: &'a [crate::parser::InferredExportParam<crate::resource::ParserPlaceholder, B>],
-    declarations: Vec<crate::parser::Located<crate::parser::DeclarationRecord>>,
 }
 
 pub fn attached_inference_failures<'a, B: BindingAddress>(
@@ -1407,27 +1337,13 @@ pub fn attached_inference_failures<'a, B: BindingAddress>(
             )) => None,
             ExportStaticType::Inferred(StaticType::Unchecked(
                 InferredUncheckedReason::InferenceFailed(error),
-            )) => {
-                let declaration = checked
-                    .declarations
-                    .iter()
-                    .find(|declaration| {
-                        declaration.kind() == crate::config_loader::DeclarationKind::Export
-                            && declaration.name() == parameter.name
-                            && declaration.location().file().path() == parameter.source_file()
-                            && parameter
-                                .source_span()
-                                .contains(declaration.location().span())
-                    })
-                    .expect("every inferred export has a parser-owned name location");
-                Some(crate::parser::Located::new(
-                    declaration.location().clone(),
-                    AttachedInferenceFailure {
-                        name: &parameter.name,
-                        error,
-                    },
-                ))
-            }
+            )) => Some(crate::parser::Located::new(
+                parameter.name_location().clone(),
+                AttachedInferenceFailure {
+                    name: &parameter.name,
+                    error,
+                },
+            )),
         })
 }
 
@@ -1452,17 +1368,16 @@ where
             B,
         >,
 {
-    let declarations = crate::parser::AnalysisTree::try_from_file(parsed)?
-        .syntax()
-        .declarations()
-        .to_vec();
-    let bindings = bindings_from_parsed(parsed);
+    crate::parser::retained::judge_configuration(parsed, schemas.schemas(), provider_context);
+    drop(crate::parser::AnalysisTree::try_from_file(parsed)?);
+    let report = parsed.expression_report().clone();
 
     for parameter in &mut parsed.export_params {
         let retry = match &parameter.static_type {
             ExportStaticType::Inferred(StaticType::Unchecked(
                 InferredUncheckedReason::NotInferable(
                     NotInferableReason::MissingValue
+                    | NotInferableReason::ValueDependent { .. }
                     | NotInferableReason::PlaceholderTypeUnavailable { .. },
                 ),
             )) => false,
@@ -1482,11 +1397,17 @@ where
         if !retry {
             continue;
         }
-        let Some(value) = &parameter.value else {
+        let Some(_value) = &parameter.value else {
             continue;
         };
 
-        match infer_type_from_value(value, &bindings, schemas.schemas(), provider_context) {
+        let expression = parameter
+            .value_location()
+            .ok_or_else(|| crate::parser::retained::MissingEvidence::new("export value location"))
+            .and_then(|location| report.expression(location))
+            .map_err(|error| InferenceIssue::Failed(error.into()))
+            .and_then(|expression| expression.static_type().cloned());
+        match expression {
             Ok(_type_expr) => {}
             Err(InferenceIssue::NotInferable(_reason)) => {}
             Err(InferenceIssue::Failed(error)) => {
@@ -1499,7 +1420,6 @@ where
 
     Ok(ExportsInferredWithLoadedProviderSchemas {
         parameters: &parsed.export_params,
-        declarations,
     })
 }
 
@@ -1572,7 +1492,7 @@ mod tests {
             crate::parser::AnalysisTreeErrorKind::MissingResourceProvenance { .. }
         ));
     }
-    use crate::parser::{ModuleCall, ProviderContext};
+    use crate::parser::ProviderContext;
     use crate::resource::{
         AuthoredAccessPath as AccessPath, AuthoredConcreteValue as ConcreteValue,
         AuthoredDeferredValue as DeferredValue, AuthoredInterpolationPart as InterpolationPart,
@@ -1598,7 +1518,7 @@ mod tests {
                 AccessMissPolicy::Defer,
             )
             .unwrap();
-            let inferred = infer_type_from_value(
+            let inferred = infer_projected_type(
                 &value,
                 &InferenceBindings::new(),
                 &SchemaRegistry::new(),
@@ -1613,12 +1533,6 @@ mod tests {
                 ),
                 "a placeholder without authority cannot prove an invalid type: {inferred:?}"
             );
-            assert!(matches!(
-                infer_type_from_value_without_bindings(&value),
-                Err(InferenceIssue::NotInferable(
-                    NotInferableReason::PlaceholderTypeUnavailable { .. }
-                ))
-            ));
         }
 
         for placeholder in [
@@ -1708,7 +1622,7 @@ mod tests {
         )
         .expect("parser-stage bare references remain pending until validation");
         assert!(matches!(
-            infer_type_from_value(&bare, &InferenceBindings::new(), &SchemaRegistry::new(), &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())),
+            infer_projected_type(&bare, &InferenceBindings::new(), &SchemaRegistry::new(), &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())),
             Err(InferenceIssue::Failed(
                 InferenceError::InvalidIntegerArithmeticOperand {
                     side: crate::integer_arithmetic::IntegerOperandSide::Left,
@@ -1745,7 +1659,7 @@ mod tests {
         )
         .expect("resource arithmetic is structurally valid");
         assert_eq!(
-            infer_type_from_value(
+            infer_projected_type(
                 &deferred,
                 &bindings,
                 &schemas,
@@ -1809,7 +1723,7 @@ mod tests {
                 IntegerOperatorSpan::synthetic(),
             )
             .expect("a typed module argument is structurally valid before inference");
-            infer_type_from_value(
+            infer_projected_type(
                 &expression,
                 &bindings,
                 &schemas,
@@ -1873,7 +1787,7 @@ mod tests {
 
     #[test]
     fn literal_string_inferred_as_string() {
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Concrete(ConcreteValue::String("hello".into())),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
@@ -1884,7 +1798,7 @@ mod tests {
 
     #[test]
     fn literal_int_inferred_as_int() {
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Concrete(ConcreteValue::Int(42)),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
@@ -1895,7 +1809,7 @@ mod tests {
 
     #[test]
     fn literal_bool_inferred_as_bool() {
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Concrete(ConcreteValue::Bool(true)),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
@@ -1908,7 +1822,7 @@ mod tests {
     fn interpolation_inferred_as_string() {
         // Build an Interpolation. The inner shape doesn't matter — the
         // result is always String. Use one literal part.
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Deferred(DeferredValue::Interpolation(vec![
                 InterpolationPart::Literal("hello".into()),
             ])),
@@ -1921,7 +1835,7 @@ mod tests {
 
     #[test]
     fn secret_inferred_as_string() {
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
                 ConcreteValue::String("hidden".into()),
             )))),
@@ -1934,7 +1848,7 @@ mod tests {
 
     #[test]
     fn list_of_strings_inferred_as_list_string() {
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Concrete(ConcreteValue::List(vec![
                 Value::Concrete(ConcreteValue::String("a".into())),
                 Value::Concrete(ConcreteValue::String("b".into())),
@@ -1952,7 +1866,7 @@ mod tests {
             Value::Concrete(ConcreteValue::String("a".into())),
             Value::Concrete(ConcreteValue::Int(1)),
         ]));
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &value,
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
@@ -1967,26 +1881,24 @@ mod tests {
     }
 
     #[test]
-    fn mixed_collection_without_bindings_matches_main_inference_error() {
+    fn production_collection_inference_retains_mismatch_names() {
         let value = Value::Concrete(ConcreteValue::List(vec![
             Value::Concrete(ConcreteValue::String("a".into())),
             Value::Concrete(ConcreteValue::Int(1)),
         ]));
-        let without_bindings = infer_type_from_value_without_bindings(&value);
-        let with_bindings = infer_type_from_value(
+        let inferred = infer_projected_type(
             &value,
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
 
-        assert_eq!(without_bindings, with_bindings);
         assert_eq!(
-            without_bindings.as_ref().unwrap_err().to_string(),
+            inferred.as_ref().unwrap_err().to_string(),
             "collection element types disagree: `String` vs `Int`",
         );
         assert_eq!(
-            without_bindings,
+            inferred,
             Err(InferenceIssue::Failed(
                 InferenceError::HeterogeneousCollection {
                     types: crate::schema::MismatchTypeNames::for_type_exprs(
@@ -2009,7 +1921,7 @@ mod tests {
             "b".to_string(),
             Value::Concrete(ConcreteValue::String("y".into())),
         );
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Concrete(ConcreteValue::Map(entries)),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
@@ -2026,7 +1938,7 @@ mod tests {
             Value::Concrete(ConcreteValue::String("x".into())),
         );
         entries.insert("b".to_string(), Value::Concrete(ConcreteValue::Int(1)));
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Concrete(ConcreteValue::Map(entries)),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
@@ -2061,7 +1973,7 @@ mod tests {
         );
 
         let path = AccessPath::with_fields("vpc", "tags", vec!["environment".to_string()]);
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("vpc"),
             &schemas,
@@ -2077,7 +1989,7 @@ mod tests {
         // user typo-confused `[lookup(...), "extra"]` (where the user
         // meant `lookup` to return `Int`) silently lock the export to
         // String. All-or-nothing is the safer default.
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Concrete(ConcreteValue::List(vec![
                 Value::Deferred(DeferredValue::FunctionCall {
                     name: crate::builtins::BuiltinFunction::lookup,
@@ -2098,7 +2010,7 @@ mod tests {
 
     #[test]
     fn empty_list_fails_inference() {
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Concrete(ConcreteValue::List(vec![])),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
@@ -2128,7 +2040,7 @@ mod tests {
         });
 
         assert_eq!(
-            infer_type_from_value(
+            infer_projected_type(
                 &value,
                 &bindings,
                 &SchemaRegistry::new(),
@@ -2155,7 +2067,7 @@ mod tests {
             default: Box::new(Value::Concrete(ConcreteValue::String("not-a-list".into()))),
         });
 
-        let error = infer_type_from_value(
+        let error = infer_projected_type(
             &value,
             &bindings,
             &SchemaRegistry::new(),
@@ -2174,7 +2086,7 @@ mod tests {
         // `vpc.vpc_id` where vpc is `awscc.ec2.Vpc` and `vpc_id` is
         // identified as bare `VpcId` still carries the `awscc` schema owner.
         let path = AccessPath::new("vpc", "vpc_id");
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("vpc"),
             &schemas_with_vpc(),
@@ -2186,7 +2098,7 @@ mod tests {
     #[test]
     fn resource_ref_to_string_attr_inferred_as_string() {
         let path = AccessPath::new("vpc", "cidr_block");
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("vpc"),
             &schemas_with_vpc(),
@@ -2240,7 +2152,7 @@ mod tests {
     #[test]
     fn resource_ref_unknown_binding_errors() {
         let path = AccessPath::new("missing", "vpc_id");
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &InferenceBindings::new(),
             &schemas_with_vpc(),
@@ -2257,7 +2169,7 @@ mod tests {
     #[test]
     fn resource_ref_unknown_attribute_errors() {
         let path = AccessPath::new("vpc", "missing");
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("vpc"),
             &schemas_with_vpc(),
@@ -2274,7 +2186,7 @@ mod tests {
     #[test]
     fn function_call_join_inferred_as_string() {
         // `join` returns String per builtins metadata.
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Deferred(DeferredValue::FunctionCall {
                 name: crate::builtins::BuiltinFunction::join,
                 args: vec![],
@@ -2303,7 +2215,7 @@ mod tests {
             AccessMissPolicy::Error,
         )
         .expect("valid concrete list access");
-        let inferred = infer_type_from_value(
+        let inferred = infer_projected_type(
             &value,
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
@@ -2335,7 +2247,7 @@ mod tests {
         .expect("deferred split result remains accessible");
 
         assert_eq!(
-            infer_type_from_value(
+            infer_projected_type(
                 &value,
                 &InferenceBindings::new(),
                 &SchemaRegistry::new(),
@@ -2360,7 +2272,7 @@ mod tests {
             AccessMissPolicy::Error,
         )
         .expect("valid concrete map access");
-        let inferred = infer_type_from_value(
+        let inferred = infer_projected_type(
             &value,
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
@@ -2393,7 +2305,7 @@ mod tests {
             AccessMissPolicy::Error,
         )
         .expect("unknown bases remain deferred");
-        let inferred = infer_type_from_value(
+        let inferred = infer_projected_type(
             &value,
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
@@ -2410,7 +2322,7 @@ mod tests {
     fn function_call_lookup_fails_inference() {
         // `lookup` returns Any — depends on arguments. Annotation
         // required.
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Deferred(DeferredValue::FunctionCall {
                 name: crate::builtins::BuiltinFunction::lookup,
                 args: vec![],
@@ -2447,7 +2359,7 @@ mod tests {
             vec![],
             vec![crate::resource::Subscript::Int { index: 0 }],
         );
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("vpc"),
             &schemas,
@@ -2461,7 +2373,7 @@ mod tests {
         // A typo'd binding (`mian` instead of `main`) must surface as
         // `UnknownBinding` rather than silently degrading to `None`.
         let path = AccessPath::new("mian", "vpc_id");
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("main"),
             &schemas_with_vpc(),
@@ -2485,7 +2397,7 @@ mod tests {
         let mut bindings = InferenceBindings::new();
         bindings.insert("network".to_string(), InferenceBinding::UpstreamState);
         let path = AccessPath::new("network", "vpc_id");
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &bindings,
             &SchemaRegistry::new(),
@@ -2517,7 +2429,7 @@ mod tests {
         );
 
         let path = AccessPath::new("vpc", "polymorphic");
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &binding_to_vpc("vpc"),
             &schemas,
@@ -2614,7 +2526,7 @@ mod tests {
             },
         );
         let path = AccessPath::new("policy", "policy_document");
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &Value::Deferred(DeferredValue::ResourceRef { path }),
             &bindings,
             &schemas,
@@ -2659,21 +2571,10 @@ mod tests {
 
     #[test]
     fn apply_inference_fills_inferable_export_with_inferred_type() {
-        let mut parsed = crate::parser::ParsedFile::default();
-        let res = crate::resource::Resource::with_provider("awscc", "ec2.Vpc", "main", None)
-            .with_binding("main");
-        parsed.resources.push(res); // allow: direct — fixture test inspection
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "vpc_id".to_string(),
-                None,
-                Some(Value::resource_ref(
-                    "main".to_string(),
-                    "vpc_id".to_string(),
-                    vec![],
-                )),
-            ));
+        let parsed = crate::parser::parse_and_resolve(
+            "let main = awscc.ec2.Vpc {}\nexports { vpc_id = main.vpc_id }",
+        )
+        .unwrap();
 
         let inferred = apply_inference(
             parsed,
@@ -2691,18 +2592,7 @@ mod tests {
     fn apply_inference_attaches_failure_to_inferred_export() {
         use crate::static_type::{ExportStaticType, InferredUncheckedReason, StaticType};
 
-        let mut parsed = crate::parser::ParsedFile::default();
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "zone_id".to_string(),
-                None,
-                Some(Value::Deferred(DeferredValue::FunctionCall {
-                    name: crate::builtins::BuiltinFunction::lookup,
-                    args: vec![],
-                    source_line: (0).into(),
-                })),
-            ));
+        let parsed = crate::parser::parse_and_resolve("arguments { entries: String }\nexports { zone_id = lookup(entries, 'key', 'fallback') }").unwrap();
 
         let inferred = apply_inference(
             parsed,
@@ -2722,21 +2612,10 @@ mod tests {
     fn apply_inference_preserves_declared_and_inferred_origins() {
         use crate::static_type::{ExportStaticType, StaticType};
 
-        let mut parsed = crate::parser::ParsedFile::default();
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "declared".to_string(),
-                Some(TypeExpr::String),
-                Some(Value::Concrete(ConcreteValue::String("declared".into()))),
-            ));
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "inferred".to_string(),
-                None,
-                Some(Value::Concrete(ConcreteValue::String("inferred".into()))),
-            ));
+        let parsed = crate::parser::parse_and_resolve(
+            "exports { declared: String = 'declared' inferred = 'inferred' }",
+        )
+        .unwrap();
 
         let inferred = apply_inference(
             parsed,
@@ -2821,48 +2700,13 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
 
     #[test]
     fn apply_inference_keeps_not_inferable_reasons_distinct() {
-        use crate::parser::UpstreamState;
         use crate::static_type::{
             ExportStaticType, InferredUncheckedReason, NotInferableReason, StaticType,
         };
 
-        let mut parsed = crate::parser::ParsedFile::default();
-        parsed.upstream_states.push(UpstreamState {
-            binding: "upstream".into(),
-            source: std::path::PathBuf::from("../upstream"),
-        });
-        let resource = crate::resource::Resource::with_provider("awscc", "ec2.Vpc", "main", None)
-            .with_binding("main");
-        parsed.resources.push(resource); // allow: direct — fixture test inspection
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "missing".to_string(),
-                None,
-                None,
-            ));
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "upstream".to_string(),
-                None,
-                Some(Value::resource_ref(
-                    "upstream".to_string(),
-                    "value".to_string(),
-                    vec![],
-                )),
-            ));
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "schema".to_string(),
-                None,
-                Some(Value::resource_ref(
-                    "main".to_string(),
-                    "vpc_id".to_string(),
-                    vec![],
-                )),
-            ));
+        let mut parsed = crate::parser::parse_and_resolve("let upstream = upstream_state { source = '../upstream' }\nlet main = awscc.ec2.Vpc {}\nexports { missing = 'removed' upstream = upstream.value schema = main.vpc_id }").unwrap();
+        // A removed export value retains its parser-owned declaration identity.
+        parsed.export_params[0].value = None;
 
         let inferred = apply_inference(
             parsed,
@@ -2979,14 +2823,8 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
 
     #[test]
     fn apply_inference_preserves_explicit_annotation() {
-        let mut parsed = crate::parser::ParsedFile::default();
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "vpc_id".to_string(),
-                Some(crate::parser::bare_type_for_test("vpc_id".to_string())),
-                Some(Value::Concrete(ConcreteValue::String("vpc-abc".into()))),
-            ));
+        let parsed =
+            crate::parser::parse_and_resolve("exports { vpc_id: VpcId = 'vpc-abc' }").unwrap();
 
         let inferred = apply_inference(
             parsed,
@@ -3014,74 +2852,27 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
         // the `Virtual` binding (which post-expansion exposes the
         // module's attribute set), and surfaced a misleading
         // "unknown binding" diagnostic.
-        let mut parsed = crate::parser::ParsedFile::default();
-        // Concrete role resource with prefixed binding (post-expansion shape).
-        let role = crate::resource::Resource::with_provider(
-            "awscc",
-            "ec2.Vpc",
-            "github_actions_carina.role",
-            None,
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("child")).unwrap();
+        std::fs::write(
+            directory.path().join("child/main.crn"),
+            "let role = awscc.ec2.Vpc {}\nattributes { role_id = role.vpc_id }",
         )
-        .with_binding("github_actions_carina.role");
-        parsed.resources.push(role); // allow: direct — fixture test inspection
-        // Virtual resource that exposes the module's attributes.
-        // `vpc_id` here stands in for the module-exposed attribute that
-        // points at the inner role's schema attribute. carina#3181:
-        // compositions are a distinct typestate in `compositions`.
-        let mut virt_attrs: indexmap::IndexMap<
-            String,
-            crate::resource::AuthoredLiveCompositionAttribute,
-        > = indexmap::IndexMap::new();
-        virt_attrs.insert(
-            "role_id".to_string(),
-            crate::resource::AuthoredLiveCompositionAttribute::from_value(
-                Value::resource_ref(
-                    "github_actions_carina.role".to_string(),
-                    "vpc_id".to_string(),
-                    vec![],
-                ),
-                None,
-            ),
-        );
-        let virt: crate::resource::AuthoredLiveComposition = crate::resource::LiveComposition {
-            id: crate::resource::ResolvedResourceId::new(
-                crate::resource::ResourceId::with_identity("_virtual", "github_actions_carina"),
-            ),
-            signature: crate::resource::LiveCompositionSignature {
-                arguments: indexmap::IndexMap::new(),
-                attributes: virt_attrs,
-                pending_constraints: Vec::new(),
-            },
-            binding: Some("github_actions_carina".into()),
-            dependency_bindings: Default::default(),
-            module_name: "github_module".to_string(),
-            instance: "github_actions_carina".to_string(),
-            call_path: crate::resource::AuthoredCompositionCallPath::direct(
-                crate::resource::AuthoredCompositionCall {
-                    id: crate::parser::ModuleCallId::test_dummy_in("inference.crn"),
-                    module_name: "github_module".to_string(),
-                    binding: Some("github_actions_carina".into()),
-                    instance: "github_actions_carina".to_string(),
-                    module_source: None,
-                    module_directory: None,
-                    loop_origin: None,
-                },
-            ),
-            quoted_string_attrs: std::collections::HashSet::new(),
-            declaration: Default::default(),
-        };
-        parsed.compositions.push(virt); // allow: direct — fixture test inspection
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "role_id".to_string(),
-                None,
-                Some(Value::resource_ref(
-                    "github_actions_carina".to_string(),
-                    "role_id".to_string(),
-                    vec![],
-                )),
-            ));
+        .unwrap();
+        std::fs::write(directory.path().join("main.crn"), "let github_module = use { source = './child' }\nlet github_actions_carina = github_module {}\nexports { role_id = github_actions_carina.role_id }").unwrap();
+        let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
+        let parsed =
+            crate::validation::deferred_types::with_session_for_test(&context, |session| {
+                crate::module_resolver::resolve_modules_with_providerless_config(
+                    parsed,
+                    &path,
+                    session,
+                    &schemas_with_vpc(),
+                )
+            })
+            .unwrap();
 
         let inferred = apply_inference(
             parsed,
@@ -3107,23 +2898,7 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
         // without a noisy `unknown binding` error. A post-expansion consumer
         // such as the LSP can run inference against the `Virtual` arm exercised
         // by the sibling test above; the CLI retry remains report-only.
-        let mut parsed = crate::parser::ParsedFile::default();
-        parsed.module_calls.push(ModuleCall::test(
-            "github_module".to_string(),
-            Some("github_actions_carina".to_string()),
-            std::collections::HashMap::new(),
-        ));
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "role_arn".to_string(),
-                None,
-                Some(Value::resource_ref(
-                    "github_actions_carina".to_string(),
-                    "role_arn".to_string(),
-                    vec![],
-                )),
-            ));
+        let parsed = crate::parser::parse_and_resolve("let github_module = use { source = './child' }\nlet github_actions_carina = github_module {}\nexports { role_arn = github_actions_carina.role_arn }").unwrap();
 
         let inferred = apply_inference(
             parsed,
@@ -3145,14 +2920,9 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
         // Export with no value and no annotation: nothing to infer from
         // → a typed non-failure reason (the value-less shape is the
         // parser-tombstoned state, not an inference failure).
-        let mut parsed = crate::parser::ParsedFile::default();
-        parsed
-            .export_params
-            .push(crate::parser::ParsedExportParam::dummy(
-                "vpc_id".to_string(),
-                None,
-                None,
-            ));
+        let mut parsed =
+            crate::parser::parse_and_resolve("exports { vpc_id = 'removed' }").unwrap();
+        parsed.export_params[0].value = None;
 
         let inferred = apply_inference(
             parsed,
@@ -3205,7 +2975,7 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
         );
 
         let entry = Value::resource_ref("a".to_string(), "x".to_string(), vec![]);
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &entry,
             &bindings,
             &SchemaRegistry::new(),
@@ -3246,7 +3016,7 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
         );
 
         let entry = Value::resource_ref("a".to_string(), "x".to_string(), vec![]);
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &entry,
             &bindings,
             &SchemaRegistry::new(),
@@ -3289,7 +3059,7 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
             Value::resource_ref("a".to_string(), "x".to_string(), vec![]),
             Value::resource_ref("b".to_string(), "y".to_string(), vec![]),
         ]));
-        let r = infer_type_from_value(
+        let r = infer_projected_type(
             &entries,
             &bindings,
             &SchemaRegistry::new(),

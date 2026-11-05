@@ -565,6 +565,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
         parsed.parsed(),
         base_dir,
         &enriched_context.catalog().environment,
+        ctx.schemas(),
     );
 
     let mut errors: Vec<AppError> = Vec::new();
@@ -656,6 +657,19 @@ pub(crate) fn validate_and_resolve_errors_inner(
             .push(carina_core::validation::ModuleCallFinding::from_type_resolution(diagnostic));
     }
     extend_module_call_errors(&mut errors, root_type_resolution_findings);
+    let configuration = carina_core::config_loader::load_buffer_configuration(
+        parsed.parsed(),
+        ctx.schemas(),
+        enriched_context.catalog(),
+    );
+    let expression_report = configuration.judged().report();
+    errors.extend(
+        expression_report
+            .findings()
+            .iter()
+            .cloned()
+            .map(|finding| AppError::ExpressionType(Box::new(finding))),
+    );
     if let Err(error) = parsed.resolve_resource_refs_in_session(enriched_context) {
         errors.push(AppError::Config(error.to_string()));
     }
@@ -681,11 +695,37 @@ pub(crate) fn validate_and_resolve_errors_inner(
     // argument error. This authority is mandatory even for destroy/state
     // recovery paths (`skip_resource_validation`): the flag may skip provider
     // resource checks, but it cannot mint validation readiness.
-    let binding_use_report = carina_core::validation::check_bare_binding_uses(
+    let binding_configuration = carina_core::config_loader::load_buffer_configuration(
         parsed.parsed(),
-        &enriched_context.type_context(parsed.parsed(), ctx.schemas(), &imported_module_signatures),
+        ctx.schemas(),
+        enriched_context.catalog(),
+    );
+    let binding_use_report = carina_core::validation::check_bare_binding_uses(
+        &enriched_context.type_context(binding_configuration.judged(), &imported_module_signatures),
     );
     extend_binding_use_errors(&mut errors, &binding_use_report);
+    for module in module_walk.iter() {
+        let module_parsed = &module.loaded().parsed;
+        let module_signatures = module_resolver::load_resolved_module_signatures(
+            module_parsed,
+            module.module_path(),
+            enriched_context.catalog(),
+        );
+        let configuration = carina_core::config_loader::load_buffer_configuration(
+            module_parsed,
+            ctx.schemas(),
+            enriched_context.catalog(),
+        );
+        let report = carina_core::validation::check_bare_binding_uses(
+            &enriched_context.type_context(configuration.judged(), &module_signatures),
+        );
+        errors.extend(
+            report
+                .resource_findings()
+                .map(|finding| AppError::BindingUse(Box::new(finding))),
+        );
+    }
+
     let authored_module_call_findings = {
         let module_call_bindings =
             carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
@@ -834,9 +874,13 @@ pub(crate) fn validate_and_resolve_errors_inner(
     // the same authority over that final graph. The wiring transition later
     // consumes this exact file through `resolve_bare_binding_uses`; both calls
     // use the same mandatory provider context.
-    let binding_use_report = carina_core::validation::check_expanded_bare_binding_uses(
+    let configuration = carina_core::config_loader::load_buffer_configuration(
         &parsed,
-        &enriched_context.type_context(&parsed, ctx.schemas(), &imported_module_signatures),
+        ctx.schemas(),
+        enriched_context.catalog(),
+    );
+    let binding_use_report = carina_core::validation::check_expanded_bare_binding_uses(
+        &enriched_context.type_context(configuration.judged(), &imported_module_signatures),
     );
     extend_binding_use_errors(&mut errors, &binding_use_report);
     extend_expanded_binding_use_errors(
@@ -885,14 +929,22 @@ pub(crate) fn validate_and_resolve_errors_inner(
     } else {
         carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
     };
-    for error in parsed.directive_resolution_errors(
+    let directive_errors = parsed.directive_resolution_errors(
         placeholder_boundary,
         ctx.schemas(),
         enriched_context.catalog(),
-    ) {
-        errors.push(AppError::from(carina_core::resource::ExpansionError::from(
+    );
+    match directive_errors {
+        Ok(directive_errors) => {
+            for error in directive_errors {
+                errors.push(AppError::from(carina_core::resource::ExpansionError::from(
+                    error,
+                )));
+            }
+        }
+        Err(error) => errors.push(AppError::from(carina_core::resource::ExpansionError::from(
             error,
-        )));
+        ))),
     }
     if let Err(leftovers) = parsed.validate_expansion_boundary(placeholder_boundary) {
         errors.extend(leftovers.into_errors().into_iter().map(AppError::from));
@@ -984,9 +1036,13 @@ pub(crate) fn validate_and_resolve_errors_inner(
                 enriched_context.catalog(),
             ),
         );
-        if let Err(message) = carina_core::validation::validate_resource_ref_types(
+        let configuration = carina_core::config_loader::load_buffer_configuration(
             parsed,
             ctx.schemas(),
+            enriched_context.catalog(),
+        );
+        if let Err(message) = carina_core::validation::validate_resource_ref_types(
+            configuration.judged(),
             &HashSet::new(),
             &bindings,
         ) {
@@ -1736,12 +1792,13 @@ child { values = [source] }
             },
         )]);
         let schemas = carina_core::schema::SchemaRegistry::new();
+        let catalog = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let configuration =
+            carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
         let report = carina_core::validation::check_bare_binding_uses(
-            &parsed,
             &carina_core::validation::ValidationTypeContext::new_providerless(
-                &parsed,
-                &schemas,
-                &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+                configuration.judged(),
+                &catalog,
                 &signatures,
             ),
         );

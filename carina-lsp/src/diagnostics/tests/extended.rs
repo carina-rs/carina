@@ -1687,8 +1687,18 @@ fn backend_schema_check_skips_directories_with_multiple_backend_blocks() {
 fn render_value_type_error(
     engine: &DiagnosticEngine,
     type_expr: &TypeExpr,
-    value: &Value,
+    source: &str,
 ) -> Option<String> {
+    let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let parsed = carina_core::parser::parse_file(source, Path::new("test.crn"), &config).unwrap();
+    let loaded =
+        carina_core::config_loader::load_buffer_configuration(&parsed, &engine.schemas, &config);
+    let expression = loaded
+        .judged()
+        .report()
+        .binding(&carina_core::resource::RelativeBindingName::new("fixture"))
+        .unwrap();
+    let value = &loaded.parsed().variables["fixture"];
     carina_core::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
@@ -1698,7 +1708,7 @@ fn render_value_type_error(
                         type_expr,
                         value,
                         provider_context,
-                        carina_core::validation::typecheck::TypecheckInference::Unavailable,
+                        expression,
                     )
                     .require_provider_schemas()
                 }
@@ -1706,7 +1716,7 @@ fn render_value_type_error(
                     type_expr,
                     value,
                     &engine.provider_context,
-                    carina_core::validation::typecheck::TypecheckInference::Unavailable,
+                    expression,
                 )
                 .record_deferred(session),
             };
@@ -5155,8 +5165,8 @@ fn shared_typecheck_ipv4_address_invalid() {
     let type_expr = carina_core::parser::TypeExpr::Simple(
         carina_core::parser::BuiltinTypeName::lookup("ipv4_address").unwrap(),
     );
-    let value = Value::Concrete(ConcreteValue::String("not-an-ip".into()));
-    let result = render_value_type_error(&engine, &type_expr, &value);
+    let source = "let fixture = 'not-an-ip'";
+    let result = render_value_type_error(&engine, &type_expr, source);
     assert!(
         result.is_some(),
         "Should return error for invalid ipv4_address"
@@ -5169,8 +5179,8 @@ fn shared_typecheck_ipv4_address_valid() {
     let type_expr = carina_core::parser::TypeExpr::Simple(
         carina_core::parser::BuiltinTypeName::lookup("ipv4_address").unwrap(),
     );
-    let value = Value::Concrete(ConcreteValue::String("192.168.1.1".into()));
-    let result = render_value_type_error(&engine, &type_expr, &value);
+    let source = "let fixture = '192.168.1.1'";
+    let result = render_value_type_error(&engine, &type_expr, source);
     assert!(
         result.is_none(),
         "Should not return error for valid ipv4_address. Got: {:?}",
@@ -5184,8 +5194,8 @@ fn shared_typecheck_ipv6_cidr_invalid() {
     let type_expr = carina_core::parser::TypeExpr::Simple(
         carina_core::parser::BuiltinTypeName::lookup("ipv6_cidr").unwrap(),
     );
-    let value = Value::Concrete(ConcreteValue::String("not-a-cidr".into()));
-    let result = render_value_type_error(&engine, &type_expr, &value);
+    let source = "let fixture = 'not-a-cidr'";
+    let result = render_value_type_error(&engine, &type_expr, source);
     assert!(
         result.is_some(),
         "Should return error for invalid ipv6_cidr"
@@ -5198,8 +5208,8 @@ fn shared_typecheck_ipv6_cidr_valid() {
     let type_expr = carina_core::parser::TypeExpr::Simple(
         carina_core::parser::BuiltinTypeName::lookup("ipv6_cidr").unwrap(),
     );
-    let value = Value::Concrete(ConcreteValue::String("2001:db8::/32".into()));
-    let result = render_value_type_error(&engine, &type_expr, &value);
+    let source = "let fixture = '2001:db8::/32'";
+    let result = render_value_type_error(&engine, &type_expr, source);
     assert!(
         result.is_none(),
         "Should not return error for valid ipv6_cidr. Got: {:?}",
@@ -5213,8 +5223,8 @@ fn shared_typecheck_ipv6_address_invalid() {
     let type_expr = carina_core::parser::TypeExpr::Simple(
         carina_core::parser::BuiltinTypeName::lookup("ipv6_address").unwrap(),
     );
-    let value = Value::Concrete(ConcreteValue::String("not-an-ipv6".into()));
-    let result = render_value_type_error(&engine, &type_expr, &value);
+    let source = "let fixture = 'not-an-ipv6'";
+    let result = render_value_type_error(&engine, &type_expr, source);
     assert!(
         result.is_some(),
         "Should return error for invalid ipv6_address"
@@ -5227,8 +5237,8 @@ fn shared_typecheck_ipv6_address_valid() {
     let type_expr = carina_core::parser::TypeExpr::Simple(
         carina_core::parser::BuiltinTypeName::lookup("ipv6_address").unwrap(),
     );
-    let value = Value::Concrete(ConcreteValue::String("2001:db8::1".into()));
-    let result = render_value_type_error(&engine, &type_expr, &value);
+    let source = "let fixture = '2001:db8::1'";
+    let result = render_value_type_error(&engine, &type_expr, source);
     assert!(
         result.is_none(),
         "Should not return error for valid ipv6_address. Got: {:?}",
@@ -5243,11 +5253,8 @@ fn shared_typecheck_list_ipv4_address_invalid() {
         carina_core::parser::TypeExpr::List(Box::new(carina_core::parser::TypeExpr::Simple(
             carina_core::parser::BuiltinTypeName::lookup("ipv4_address").unwrap(),
         )));
-    let value = Value::Concrete(ConcreteValue::List(vec![
-        Value::Concrete(ConcreteValue::String("192.168.1.1".into())),
-        Value::Concrete(ConcreteValue::String("bad-ip".into())),
-    ]));
-    let result = render_value_type_error(&engine, &type_expr, &value);
+    let source = "let fixture = ['192.168.1.1', 'bad-ip']";
+    let result = render_value_type_error(&engine, &type_expr, source);
     assert!(
         result.is_some(),
         "Should return error for invalid ipv4_address in list"
@@ -5266,11 +5273,8 @@ fn shared_typecheck_list_ipv6_cidr_valid() {
         carina_core::parser::TypeExpr::List(Box::new(carina_core::parser::TypeExpr::Simple(
             carina_core::parser::BuiltinTypeName::lookup("ipv6_cidr").unwrap(),
         )));
-    let value = Value::Concrete(ConcreteValue::List(vec![
-        Value::Concrete(ConcreteValue::String("2001:db8::/32".into())),
-        Value::Concrete(ConcreteValue::String("::/0".into())),
-    ]));
-    let result = render_value_type_error(&engine, &type_expr, &value);
+    let source = "let fixture = ['2001:db8::/32', '::/0']";
+    let result = render_value_type_error(&engine, &type_expr, source);
     assert!(
         result.is_none(),
         "Should not return error for valid ipv6_cidr list. Got: {:?}",
@@ -6776,7 +6780,7 @@ fn unloaded_bare_attribute_interpolation_reports_only_providers_not_loaded() {
         r#"
 arguments { x: String }
 attributes {
-  value: SomeBareProviderType = "${x}"
+  value: SomeBareProviderType = "${x}-inline"
 }
 "#,
     );
@@ -17345,4 +17349,120 @@ fn reference_constraints_validate_offline_in_a_directory_configuration() {
             "resolver identity must not trigger custom validation: {diagnostics:?}"
         );
     }
+}
+
+#[test]
+fn non_string_interpolation_sinks_across_files() {
+    let engine = coalesce_resource_engine();
+    for source in [
+        "exports { port: Int = \"${src.identifier}-inline\" }",
+        "attributes { port: Bool = \"${src.identifier}-inline\" }",
+        "let result = f(\"${src.identifier}-inline\")",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("source.crn"),
+            "let src = mock.test.resource { name = 'source' }\nfn f(n: Int): Int { n }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("main.crn"), source).unwrap();
+        let diagnostics = analyze_with_buffer(&engine, dir.path(), "main.crn", source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)
+                    && (d.message.contains("expected Int") || d.message.contains("expected Bool"))),
+            "{source}: {diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn folded_child_failure_is_reported_in_its_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("source.crn"), "let a = 'x'\n").unwrap();
+    let source = "let b = a ?? [1, 'y']\n";
+    std::fs::write(dir.path().join("main.crn"), source).unwrap();
+    let diagnostics = analyze_with_buffer(&test_engine(), dir.path(), "main.crn", source);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .count(),
+        1,
+        "{diagnostics:#?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("collection element types disagree")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn fallback_owns_the_only_typeexpr_diagnostic() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("child")).unwrap();
+    std::fs::write(
+        dir.path().join("child/main.crn"),
+        "arguments { value: String }\nattributes { result = value }\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    std::fs::write(
+        dir.path().join("source.crn"),
+        "let src = mock.test.resource { name = 'source' }\n",
+    )
+    .unwrap();
+    let source = "let template = use { source = './child' }\nlet child = template { value = \"${src.identifier ?? 42}\" }\n";
+    std::fs::write(dir.path().join("main.crn"), source).unwrap();
+    let diagnostics =
+        analyze_with_buffer(&coalesce_resource_engine(), dir.path(), "main.crn", source);
+    let errors = diagnostics
+        .iter()
+        .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+        .collect::<Vec<_>>();
+    assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+    assert!(
+        errors[0].message.contains("coalesce default"),
+        "{diagnostics:#?}"
+    );
+    assert!(
+        !errors[0].message.contains("expected String, got String"),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn resource_child_failure_has_one_error_across_files() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    std::fs::write(
+        directory.path().join("source.crn"),
+        "let src = mock.test.resource { name = 'source' }\n",
+    )
+    .unwrap();
+    let source = "let sink = mock.test.resource { name = \"${src.no_such_attr}-inline\" }\n";
+    std::fs::write(directory.path().join("main.crn"), source).unwrap();
+    let diagnostics = analyze_with_buffer(
+        &coalesce_resource_engine(),
+        directory.path(),
+        "main.crn",
+        source,
+    );
+    let errors = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        errors.len(),
+        1,
+        "the child owns its failure: {diagnostics:#?}"
+    );
+    assert!(
+        errors[0].message.contains("no_such_attr"),
+        "{diagnostics:#?}"
+    );
 }

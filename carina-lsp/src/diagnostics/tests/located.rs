@@ -180,8 +180,6 @@ fn substituted_integer_operator_keeps_its_file_when_coordinates_coincide() {
                 resource,
                 "enabled",
                 schema,
-                &carina_core::validation::inference::bindings_from_parsed(&consumer),
-                &engine.schemas,
                 &bindings,
                 &carina_core::parser::ResourceValueEvaluator::from_analysis(&tree, session),
             )

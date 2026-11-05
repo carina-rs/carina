@@ -38,6 +38,7 @@ pub use expander::{instance_prefix_for_call, reconcile_anonymous_module_instance
 pub use loader::{
     LoadedModule, derive_module_name, get_parsed_file, load_directory_module, load_module,
     load_module_from_directory, load_module_with_diagnostics,
+    load_module_with_diagnostics_and_schemas,
 };
 pub use resolver::{
     ModuleCallConstraintReport, ModuleCallConstraintReports, ModuleResolutionDiagnosticResult,

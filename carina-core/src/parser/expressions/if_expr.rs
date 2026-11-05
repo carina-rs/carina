@@ -393,7 +393,10 @@ fn parse_if_body(
             let value = parse_expression(
                 next_pair(&mut binding_inner, "binding value", "if local binding")?,
                 &local_ctx,
-            )?;
+            )?
+            .projection()
+            .expect("materialized parser expression")
+            .clone();
             local_ctx.set_variable(name, value);
             continue;
         }
@@ -431,7 +434,10 @@ fn parse_if_body(
                 Ok(IfBodyResult::ModuleCall(call))
             }
             (IfBodyForm::Value, Rule::expression) => {
-                let value = parse_expression(inner, &local_ctx)?;
+                let value = parse_expression(inner, &local_ctx)?
+                    .projection()
+                    .expect("materialized parser expression")
+                    .clone();
                 Ok(IfBodyResult::Value(value))
             }
             (IfBodyForm::ResourceProducingFor, Rule::expression) => {
@@ -503,20 +509,12 @@ pub(crate) fn parse_if_value_expr_with_mode(
     let else_body = else_body.expect("value if branch shape requires an else branch");
 
     if decision.is_none() {
-        let then_value = parse_if_body_value_with_mode(
-            if_body,
-            ctx,
-            &mode.at_branch(crate::parser::ValueBranch::Then),
-        )?
-        .into_value()
-        .map_err(|error| ParseError::from_eval_value(error, condition_line))?;
-        let else_value = parse_if_body_value_with_mode(
-            else_body,
-            ctx,
-            &mode.at_branch(crate::parser::ValueBranch::Else),
-        )?
-        .into_value()
-        .map_err(|error| ParseError::from_eval_value(error, condition_line))?;
+        let then_value = parse_if_body_value_with_mode(if_body, ctx, mode)?
+            .into_value()
+            .map_err(|error| ParseError::from_eval_value(error, condition_line))?;
+        let else_value = parse_if_body_value_with_mode(else_body, ctx, mode)?
+            .into_value()
+            .map_err(|error| ParseError::from_eval_value(error, condition_line))?;
         return Ok(EvalValue::from_value(Value::Deferred(
             DeferredValue::ModuleIf(Box::new(DeferredValueIf::new(
                 DeferredIfCondition::new_with_source_expression(
@@ -558,7 +556,10 @@ fn parse_if_body_value_with_mode(
             let value = parse_expression(
                 next_pair(&mut binding_inner, "binding value", "if local binding")?,
                 &local_ctx,
-            )?;
+            )?
+            .projection()
+            .expect("materialized parser expression")
+            .clone();
             local_ctx.set_variable(name, value);
             continue;
         }

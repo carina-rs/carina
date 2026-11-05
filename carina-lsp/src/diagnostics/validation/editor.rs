@@ -61,9 +61,11 @@ pub(in crate::diagnostics) fn attribute_findings(
     name: &str,
     value: &Value,
     arithmetic: Vec<Located<IntegerArithmeticTypeFinding>>,
+    judged: &carina_core::parser::retained::JudgedExpr,
     mut access_check: impl FnMut(
         UnresolvedExpression<'_, carina_core::resource::RelativeBindingName>,
         bool,
+        &carina_core::parser::retained::JudgedExpr,
     ) -> Result<(), AccessTypeFinding>,
 ) -> Vec<Located<EditorFinding>> {
     if !arithmetic.is_empty() {
@@ -78,12 +80,16 @@ pub(in crate::diagnostics) fn attribute_findings(
             .collect();
     }
     let mut findings = Vec::new();
+    if !judged.editor_owns_check(value) {
+        return findings;
+    }
     if let Some(expression) = UnresolvedExpression::new(value) {
         deferred_findings(
             resource,
             name,
             expression,
             true,
+            judged,
             &mut access_check,
             &mut findings,
         );
@@ -91,14 +97,17 @@ pub(in crate::diagnostics) fn attribute_findings(
     findings
 }
 
+#[allow(clippy::too_many_arguments)]
 fn deferred_findings(
     resource: &AnalysisResourceRef<'_>,
     name: &str,
     expression: UnresolvedExpression<'_, carina_core::resource::RelativeBindingName>,
     top_level: bool,
+    judged: &carina_core::parser::retained::JudgedExpr,
     check: &mut impl FnMut(
         UnresolvedExpression<'_, carina_core::resource::RelativeBindingName>,
         bool,
+        &carina_core::parser::retained::JudgedExpr,
     ) -> Result<(), AccessTypeFinding>,
     findings: &mut Vec<Located<EditorFinding>>,
 ) {
@@ -108,11 +117,22 @@ fn deferred_findings(
         // be re-emitted here as a second type mismatch.
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
             let before = findings.len();
-            for operand in expression.operands() {
-                deferred_findings(resource, name, operand, false, check, findings);
+            for (index, operand) in expression.operands() {
+                match judged
+                    .coalesce_operand(index)
+                    .or_else(|_| judged.branch(index))
+                {
+                    Ok(evidence) => {
+                        deferred_findings(resource, name, operand, false, evidence, check, findings)
+                    }
+                    Err(error) => findings.push(Located::new(
+                        resource.attribute_key_location(name).clone(),
+                        EditorFinding::DeferredAccess(AccessTypeFinding::missing_evidence(error)),
+                    )),
+                }
             }
             if findings.len() == before
-                && let Err(error) = check(expression, top_level)
+                && let Err(error) = check(expression, top_level, judged)
             {
                 findings.push(Located::new(
                     resource.attribute_key_location(name).clone(),
@@ -121,12 +141,23 @@ fn deferred_findings(
             }
         }
         Value::Deferred(DeferredValue::ModuleIf(_)) => {
-            for operand in expression.operands() {
-                deferred_findings(resource, name, operand, false, check, findings);
+            for (index, operand) in expression.operands() {
+                match judged
+                    .coalesce_operand(index)
+                    .or_else(|_| judged.branch(index))
+                {
+                    Ok(evidence) => {
+                        deferred_findings(resource, name, operand, false, evidence, check, findings)
+                    }
+                    Err(error) => findings.push(Located::new(
+                        resource.attribute_key_location(name).clone(),
+                        EditorFinding::DeferredAccess(AccessTypeFinding::missing_evidence(error)),
+                    )),
+                }
             }
         }
         Value::Deferred(_) => {
-            if let Err(error) = check(expression, top_level) {
+            if let Err(error) = check(expression, top_level, judged) {
                 findings.push(Located::new(
                     resource.attribute_key_location(name).clone(),
                     EditorFinding::DeferredAccess(error),

@@ -15619,6 +15619,7 @@ impl PatternResourceSchema<Compiled> {
             mode,
             selected,
             &[],
+            &HashMap::new(),
             &mut |_, _, _| {},
         )
         .errors

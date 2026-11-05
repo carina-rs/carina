@@ -955,11 +955,11 @@ fn review_binding_collection(
     );
     let parsed = crate::parser::parse(source, context).unwrap();
     let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &registry, context);
     let bindings = crate::validation::check_bare_binding_uses(
-        &parsed,
         &crate::validation::ValidationTypeContext::new_providerless(
-            &parsed,
-            &registry,
+            configuration.judged(),
             context,
             &signatures,
         ),
@@ -971,7 +971,14 @@ fn review_binding_collection(
         .get("mock", "test.Sink", SchemaKind::Resource)
         .unwrap()
         .collect_validation_inputs_with_resolver(
-            bindings.resource_value_inputs(parsed.bare_binding_uses(), resource, &values),
+            bindings
+                .resource_value_inputs(
+                    parsed.bare_binding_uses(),
+                    resource,
+                    &values,
+                    configuration.judged().report(),
+                )
+                .unwrap(),
             &|_| false,
             context.custom_type_resolver(),
         )
@@ -1024,11 +1031,11 @@ fn binding_precheck_findings_keep_authored_targets_with_and_without_runtime_valu
         let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let parsed = crate::parser::parse(&source, &context).unwrap();
         let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &context);
         let bindings = crate::validation::check_bare_binding_uses(
-            &parsed,
             &crate::validation::ValidationTypeContext::new_providerless(
-                &parsed,
-                &schemas,
+                configuration.judged(),
                 &context,
                 &signatures,
             ),
@@ -1042,7 +1049,14 @@ fn binding_precheck_findings_keep_authored_targets_with_and_without_runtime_valu
             .get("mock", "test.Sink", SchemaKind::Resource)
             .unwrap()
             .collect_validation_inputs_with_resolver(
-                bindings.resource_value_inputs(parsed.bare_binding_uses(), resource, &values),
+                bindings
+                    .resource_value_inputs(
+                        parsed.bare_binding_uses(),
+                        resource,
+                        &values,
+                        configuration.judged().report(),
+                    )
+                    .unwrap(),
                 &|_| false,
                 context.custom_type_resolver(),
             );

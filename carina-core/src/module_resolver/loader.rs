@@ -46,11 +46,19 @@ pub fn load_module_with_diagnostics(
     path: &ResolvedPath,
     config: &ProviderContext,
 ) -> Option<LoadedModule> {
+    load_module_with_diagnostics_and_schemas(path, config, &crate::schema::SchemaRegistry::new())
+}
+
+pub fn load_module_with_diagnostics_and_schemas(
+    path: &ResolvedPath,
+    config: &ProviderContext,
+    schemas: &crate::schema::SchemaRegistry,
+) -> Option<LoadedModule> {
     let path = path.clone();
     if !path.is_dir() {
         return None;
     }
-    load_directory_module_with_diagnostics_and_config(&path, config, &Default::default())
+    load_directory_module_with_diagnostics_and_config(&path, config, &Default::default(), schemas)
 }
 
 /// Collect `.crn` file paths directly inside `dir_path`, sorted by path.
@@ -75,8 +83,13 @@ pub fn load_directory_module(
     dir_path: &ResolvedPath,
     config: &ProviderContext,
 ) -> Option<ParsedFile> {
-    load_directory_module_with_diagnostics_and_config(dir_path, config, &Default::default())
-        .map(|loaded| loaded.parsed)
+    load_directory_module_with_diagnostics_and_config(
+        dir_path,
+        config,
+        &Default::default(),
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .map(|loaded| loaded.parsed)
 }
 
 /// Load a module signature using the caller's provider catalog.
@@ -94,8 +107,13 @@ pub(crate) fn load_module_with_overrides(
     if !path.is_dir() {
         return None;
     }
-    load_directory_module_with_diagnostics_and_config(path, config, overrides)
-        .map(|loaded| loaded.parsed)
+    load_directory_module_with_diagnostics_and_config(
+        path,
+        config,
+        overrides,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .map(|loaded| loaded.parsed)
 }
 
 pub(super) fn source_paths_with_overrides(
@@ -120,6 +138,7 @@ fn load_directory_module_with_diagnostics_and_config(
     dir_path: &ResolvedPath,
     config: &ProviderContext,
     overrides: &crate::config_loader::SourceOverrides,
+    schemas: &crate::schema::SchemaRegistry,
 ) -> Option<LoadedModule> {
     let paths = source_paths_with_overrides(dir_path, overrides).ok()?;
     let mut files: Vec<(PathBuf, String)> = Vec::with_capacity(paths.len());
@@ -137,6 +156,7 @@ fn load_directory_module_with_diagnostics_and_config(
         crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
     }
 
+    crate::parser::retained::judge_configuration(&mut merged, schemas, config);
     if merged.arguments.is_empty() && merged.attribute_params.is_empty() {
         None
     } else {

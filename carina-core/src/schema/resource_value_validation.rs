@@ -5,7 +5,7 @@
 //! results; it never retries validation to recover a diagnostic.
 
 use super::*;
-use crate::parser::ValueBranch;
+use crate::parser::{DeclarationLocation, retained::JudgedExpr};
 
 /// Which parser-owned location should anchor a resource value finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,7 +73,7 @@ impl ValueFindingAnchor {
 pub struct ValueFindingPath {
     source: FieldPath,
     sensitive: bool,
-    branches: Vec<ValueBranch>,
+    origin: Option<Arc<DeclarationLocation>>,
     map_keys: Vec<usize>,
     authored_depth: Option<usize>,
 }
@@ -83,13 +83,13 @@ impl ValueFindingPath {
         Self {
             source,
             sensitive: false,
-            branches: Vec::new(),
+            origin: None,
             map_keys: Vec::new(),
             authored_depth: None,
         }
     }
-    pub(crate) fn with_branches(mut self, branches: &[ValueBranch]) -> Self {
-        self.branches = branches.to_vec();
+    pub(crate) fn with_origin(mut self, origin: Option<DeclarationLocation>) -> Self {
+        self.origin = origin.map(Arc::new);
         self
     }
 
@@ -97,7 +97,7 @@ impl ValueFindingPath {
         let left = &self.source.steps()[..self.authored_depth.unwrap_or(self.source.steps().len())];
         let right =
             &other.source.steps()[..other.authored_depth.unwrap_or(other.source.steps().len())];
-        self.branches == other.branches
+        self.origin == other.origin
             && self
                 .map_keys
                 .iter()
@@ -314,6 +314,7 @@ pub struct ResourceValueInputs<'a, P: PlaceholderKind, B: BindingAddress> {
     pub(crate) attributes: &'a HashMap<String, Value<P, B>>,
     pub(crate) pending: HashSet<String>,
     pub(crate) bindings: Vec<ResourceBindingValidation>,
+    pub(crate) expressions: HashMap<String, JudgedExpr>,
 }
 
 impl<'a, P: PlaceholderKind, B: BindingAddress> ResourceValueInputs<'a, P, B> {
@@ -322,6 +323,7 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> ResourceValueInputs<'a, P, B> {
             attributes,
             pending: HashSet::new(),
             bindings: Vec::new(),
+            expressions: HashMap::new(),
         }
     }
 }
@@ -467,6 +469,7 @@ impl PatternResourceSchema<Compiled> {
             ValueEntryValidation::FullInput,
             None,
             &inputs.bindings,
+            &inputs.expressions,
             project,
         );
         report.errors.extend(values.errors);
@@ -481,7 +484,7 @@ impl PatternResourceSchema<Compiled> {
                     target: ResourceValueTarget::Attribute {
                         authored_attribute: binding.attribute.clone(),
                         path: ValueFindingPath::new(binding.path.clone())
-                            .with_branches(&binding.branches),
+                            .with_origin(binding.origin.clone()),
                         anchor: ValueFindingAnchor::BindingToken(binding.anchor_for(&binding.path)),
                     },
                     error: error.clone(),
@@ -538,6 +541,7 @@ impl PatternResourceSchema<Compiled> {
         mode: ValueEntryValidation,
         selected: Option<&HashSet<String>>,
         bindings: &[ResourceBindingValidation],
+        expressions: &HashMap<String, JudgedExpr>,
         project: &mut Project,
     ) -> ResourceValueReport {
         let mut report = ResourceValueReport::default();
@@ -574,6 +578,7 @@ impl PatternResourceSchema<Compiled> {
                 continue;
             };
             let mut walk = ValueWalk::new(Some(lookup));
+            walk.expression_root = expressions.get(name).cloned();
             walk.bindings = bindings
                 .iter()
                 .filter(|binding| binding.attribute == *name)
@@ -585,7 +590,9 @@ impl PatternResourceSchema<Compiled> {
                 .flat_map(|binding| {
                     binding.checked().into_iter().flat_map(|checked| {
                         checked.leaves.iter().cloned().map(|mut leaf| {
-                            leaf.branches.splice(0..0, binding.branches.clone());
+                            if leaf.origin.is_none() {
+                                leaf.origin = binding.origin.clone();
+                            }
                             leaf
                         })
                     })
@@ -599,7 +606,9 @@ impl PatternResourceSchema<Compiled> {
                 .flat_map(|binding| {
                     binding.checked().into_iter().flat_map(|checked| {
                         checked.callbacks.iter().cloned().map(|mut callback| {
-                            callback.branches.splice(0..0, binding.branches.clone());
+                            if callback.origin.is_none() {
+                                callback.origin = binding.origin.clone();
+                            }
                             callback
                         })
                     })
@@ -695,7 +704,7 @@ enum LeafInput {
 struct CheckedBindingLeaf {
     kind: CallbackInputKind,
     path: FieldPath,
-    branches: Vec<ValueBranch>,
+    origin: Option<DeclarationLocation>,
     declaration: String,
     native: Option<CustomValidator>,
     input: LeafInput,
@@ -706,7 +715,7 @@ struct CheckedBindingLeaf {
 struct CheckedCallback {
     kind: CallbackInputKind,
     path: FieldPath,
-    branches: Vec<ValueBranch>,
+    origin: Option<DeclarationLocation>,
     callback: CallbackIdentity,
     input: Value,
     result: Result<(), TypeError>,
@@ -746,7 +755,7 @@ impl PartialEq for CheckedBindingLeaf {
     fn eq(&self, other: &Self) -> bool {
         self.kind == other.kind
             && self.path == other.path
-            && self.branches == other.branches
+            && self.origin == other.origin
             && self.declaration == other.declaration
             && same_callback(self.native.as_ref(), other.native.as_ref())
             && self.input == other.input
@@ -853,7 +862,7 @@ pub(crate) struct ResourceBindingValidation {
     pub attribute: String,
     pub path: FieldPath,
     pub location: crate::parser::DeclarationLocation,
-    pub branches: Vec<ValueBranch>,
+    pub origin: Option<DeclarationLocation>,
     pub outcome: ResourceBindingValueOutcome,
 }
 
@@ -909,7 +918,9 @@ struct ValueWalk<'a> {
     previous: Vec<CheckedBindingLeaf>,
     recorded: Vec<CheckedBindingLeaf>,
     bindings: Vec<ResourceBindingValidation>,
-    branches: Vec<ValueBranch>,
+    origin: Option<DeclarationLocation>,
+    expression_root: Option<JudgedExpr>,
+    expression_path: FieldPath,
     callbacks: Vec<CheckedCallback>,
     input_kind: CallbackInputKind,
 }
@@ -921,10 +932,23 @@ impl<'a> ValueWalk<'a> {
             previous: Vec::new(),
             recorded: Vec::new(),
             bindings: Vec::new(),
-            branches: Vec::new(),
+            origin: None,
+            expression_root: None,
+            expression_path: FieldPath::new(),
             callbacks: Vec::new(),
             input_kind: CallbackInputKind::Value,
         }
+    }
+
+    fn expression_at(&self, path: &FieldPath) -> Option<&JudgedExpr> {
+        let mut expression = self.expression_root.as_ref()?;
+        for step in &path.steps()[self.expression_path.steps().len()..] {
+            expression = match step {
+                FieldPathStep::Index(index) => expression.element(*index).ok()?,
+                FieldPathStep::Field(name) => expression.field(name).ok()?,
+            };
+        }
+        Some(expression)
     }
 
     fn native_validation(
@@ -951,7 +975,7 @@ impl<'a> ValueWalk<'a> {
         let kind = self.input_kind;
         if let Some(checked) = self.callbacks.iter().find(|checked| {
             checked.path == *path
-                && checked.branches == self.branches
+                && checked.origin == self.origin
                 && checked.kind == kind
                 && checked.callback == callback
                 && checked.input == *input
@@ -975,7 +999,7 @@ impl<'a> ValueWalk<'a> {
             self.callbacks.push(CheckedCallback {
                 kind,
                 path: path.clone(),
-                branches: self.branches.clone(),
+                origin: self.origin.clone(),
                 callback,
                 input: input.clone(),
                 result: result.clone(),
@@ -991,6 +1015,7 @@ pub(crate) fn check_binding_value<P: PlaceholderKind, B: BindingAddress>(
     defs: &BTreeMap<String, CompiledAttributeType>,
     ancestry: FieldAncestry,
     path: &FieldPath,
+    expression: Option<JudgedExpr>,
     validation: &mut BindingValueValidation,
 ) -> Result<(), TypeError> {
     if ancestry.provider_populated {
@@ -1000,6 +1025,8 @@ pub(crate) fn check_binding_value<P: PlaceholderKind, B: BindingAddress>(
         .to_expanded()
         .and_then(Value::try_into_address_free_absolute);
     let mut walk = ValueWalk::new(None);
+    walk.expression_root = expression;
+    walk.expression_path = path.clone();
     let checked = check_value(
         attr,
         value,
@@ -1023,12 +1050,21 @@ fn check_value<'a, P: PlaceholderKind, B: BindingAddress>(
     walk: &mut ValueWalk<'_>,
     visited_refs: &mut Vec<&'a str>,
 ) -> CheckedValue<'a> {
-    if walk.bindings.iter().any(|binding| {
-        binding.path == *path
-            && binding.branches == walk.branches
-            && matches!(binding.outcome, ResourceBindingValueOutcome::Rejected(_))
-    }) {
-        return CheckedValue::accepted(attr, FitExactness::EXACT, FitKind::Deferred);
+    if walk
+        .expression_at(path)
+        .is_some_and(JudgedExpr::value_failure_owner)
+        || walk.bindings.iter().any(|binding| {
+            binding.path == *path
+                && binding.origin == walk.origin
+                && matches!(binding.outcome, ResourceBindingValueOutcome::Rejected(_))
+        })
+    {
+        return match resolve_refs_on_path(attr, defs, &mut Vec::new()) {
+            Ok(resolved) => {
+                CheckedValue::accepted(resolved.attr, FitExactness::EXACT, FitKind::Deferred)
+            }
+            Err(error) => CheckedValue::rejected(path, error.into_validation_error()),
+        };
     }
     // The editor can hand off an authored binding token rather than its
     // substituted value. Keep the binding authority's source at this seam,
@@ -1036,7 +1072,7 @@ fn check_value<'a, P: PlaceholderKind, B: BindingAddress>(
     let binding = walk
         .bindings
         .iter()
-        .find(|binding| binding.path == *path && binding.branches == walk.branches)
+        .find(|binding| binding.path == *path && binding.origin == walk.origin)
         .cloned();
     let source = binding
         .as_ref()
@@ -1095,8 +1131,8 @@ fn check_input<'a, P: PlaceholderKind, B: BindingAddress>(
     }
     let mut checked = check_input_inner(attr, value, defs, ancestry, path, walk, visited_refs);
     for finding in checked.local.iter_mut().chain(&mut checked.external) {
-        if finding.path.branches.is_empty() {
-            finding.path.branches = walk.branches.clone();
+        if finding.path.origin.is_none() {
+            finding.path.origin = walk.origin.clone().map(Arc::new);
         }
     }
     walk.input_kind = previous_kind;
@@ -1165,7 +1201,7 @@ fn check_input_inner<'a, P: PlaceholderKind, B: BindingAddress>(
         .find(|leaf| {
             leaf.kind == walk.input_kind
                 && leaf.path == *path
-                && leaf.branches == walk.branches
+                && leaf.origin == walk.origin
                 && Some(&leaf.declaration) == declaration.as_ref()
                 && Some(&leaf.input) == input.as_ref()
                 && same_callback(leaf.native.as_ref(), native_callback(resolution.attr))
@@ -1219,7 +1255,7 @@ fn check_input_inner<'a, P: PlaceholderKind, B: BindingAddress>(
         walk.recorded.push(CheckedBindingLeaf {
             kind: walk.input_kind,
             path: path.clone(),
-            branches: walk.branches.clone(),
+            origin: walk.origin.clone(),
             declaration,
             native: native_callback(resolution.attr).cloned(),
             input,
@@ -1287,6 +1323,55 @@ fn apply_leaf_lookup(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn check_operand<'a, P: PlaceholderKind, B: BindingAddress>(
+    attr: &'a CompiledAttributeType,
+    value: &Value<P, B>,
+    defs: &'a BTreeMap<String, CompiledAttributeType>,
+    ancestry: FieldAncestry,
+    path: &FieldPath,
+    walk: &mut ValueWalk<'_>,
+    index: usize,
+) -> CheckedValue<'a> {
+    let expression = walk
+        .expression_at(path)
+        .and_then(|expression| {
+            expression
+                .coalesce_operand(index)
+                .or_else(|_| expression.branch(index))
+                .ok()
+        })
+        .cloned();
+    let origin = expression
+        .as_ref()
+        .and_then(JudgedExpr::value_location)
+        .cloned();
+    let previous_origin = std::mem::replace(&mut walk.origin, origin);
+    let previous_root = std::mem::replace(&mut walk.expression_root, expression);
+    let previous_path = std::mem::replace(&mut walk.expression_path, path.clone());
+    // Rootless schema validation has no authored identity to cache across
+    // distinct operands. Keep callbacks reusable inside each operand only.
+    let previous_recorded = walk
+        .origin
+        .is_none()
+        .then(|| std::mem::take(&mut walk.recorded));
+    let previous_callbacks = walk
+        .origin
+        .is_none()
+        .then(|| std::mem::take(&mut walk.callbacks));
+    let checked = check_value(attr, value, defs, ancestry, path, walk, &mut Vec::new());
+    if let Some(recorded) = previous_recorded {
+        walk.recorded = recorded;
+    }
+    if let Some(callbacks) = previous_callbacks {
+        walk.callbacks = callbacks;
+    }
+    walk.origin = previous_origin;
+    walk.expression_root = previous_root;
+    walk.expression_path = previous_path;
+    checked
+}
+
 fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
     attr: &'a CompiledAttributeType,
     value: &Value<P, B>,
@@ -1297,12 +1382,8 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
     visited_refs: &mut Vec<&'a str>,
 ) -> CheckedValue<'a> {
     if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
-        walk.branches.push(ValueBranch::CoalesceValue);
-        let mut left = check_value(attr, value, defs, ancestry, path, walk, &mut Vec::new());
-        walk.branches.pop();
-        walk.branches.push(ValueBranch::CoalesceDefault);
-        let right = check_value(attr, default, defs, ancestry, path, walk, &mut Vec::new());
-        walk.branches.pop();
+        let mut left = check_operand(attr, value, defs, ancestry, path, walk, 0);
+        let right = check_operand(attr, default, defs, ancestry, path, walk, 1);
         left.fit = left.fit.zip(right.fit).map(|(value, default)| {
             let mut exactness = value.exactness;
             exactness.combine(default.exactness);
@@ -1323,13 +1404,8 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
     if let Value::Deferred(DeferredValue::ModuleIf(deferred)) = value {
         let mut checked = CheckedValue::accepted(attr, FitExactness::EXACT, FitKind::Deferred);
         let mut fits = Vec::new();
-        for (branch, identity) in deferred.values()[1..]
-            .iter()
-            .zip([ValueBranch::Then, ValueBranch::Else])
-        {
-            walk.branches.push(identity);
-            let branch = check_value(attr, branch, defs, ancestry, path, walk, &mut Vec::new());
-            walk.branches.pop();
+        for (index, branch) in deferred.values()[1..].iter().enumerate() {
+            let branch = check_operand(attr, branch, defs, ancestry, path, walk, index);
             if let Some(fit) = branch.fit {
                 fits.push(fit);
             }

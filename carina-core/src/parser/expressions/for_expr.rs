@@ -807,7 +807,10 @@ pub(crate) fn parse_for_body(
                 let value = parse_expression(
                     next_pair(&mut binding_inner, "binding value", "for local binding")?,
                     &local_ctx,
-                )?;
+                )?
+                .projection()
+                .expect("materialized parser expression")
+                .clone();
                 local_ctx.set_variable(name, value);
             }
             Rule::resource_expr => {

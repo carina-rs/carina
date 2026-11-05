@@ -37,7 +37,10 @@ pub(in crate::parser) fn parse_use_expr(
                 message: format!("`use` block only accepts a `source` attribute, got `{key}`"),
             });
         }
-        let value = parse_expression(value_pair, ctx)?;
+        let value = parse_expression(value_pair, ctx)?
+            .projection()
+            .expect("materialized parser expression")
+            .clone();
         let Value::Concrete(ConcreteValue::String(path)) = value else {
             return Err(ParseError::InvalidExpression {
                 line: attr_line,

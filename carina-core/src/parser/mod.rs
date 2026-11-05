@@ -11,7 +11,6 @@ pub use analysis::{
 };
 mod ast;
 pub(crate) use ast::ParserSeedMetadata;
-pub(crate) use ast::ValueBranch;
 mod blocks;
 mod config;
 mod context;
@@ -34,6 +33,7 @@ mod functions;
 mod grammar;
 mod let_binding;
 mod resolve;
+pub mod retained;
 mod scalar_constraints;
 pub(crate) use resolve::resolve_resource_refs_in_session_unsealed;
 pub use resolve::{

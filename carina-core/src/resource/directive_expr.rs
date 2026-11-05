@@ -897,6 +897,8 @@ impl std::error::Error for DirectiveResolutionErrors {}
 #[derive(Debug, thiserror::Error)]
 pub enum ExpansionError {
     #[error(transparent)]
+    MissingEvidence(#[from] crate::parser::retained::MissingEvidence),
+    #[error(transparent)]
     Placeholders(#[from] LeftoverPlaceholders),
     #[error(transparent)]
     Directives(#[from] DirectiveResolutionErrors),
@@ -917,6 +919,7 @@ impl ExpansionError {
         impl Display for Located<'_> {
             fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
                 match self.0 {
+                    ExpansionError::MissingEvidence(error) => error.fmt(f),
                     ExpansionError::Placeholders(errors) => errors.located().fmt(f),
                     ExpansionError::Directives(errors) => errors.fmt(f),
                 }
