@@ -284,6 +284,31 @@ fn round6_cli_bridge_errors(schema: &ValidatedResourceSchema, fixture: &TempDir)
 }
 
 #[test]
+fn round8_cli_union_aggregates_local_and_provider_results_like_origin_main() {
+    let schema = round6_bridge_schema(AttributeType::union(vec![
+        AttributeType::int(),
+        AttributeType::refined_string(
+            Some(carina_core::schema::TypeIdentity::bare("VpcId")),
+            None,
+            None,
+            None,
+        ),
+    ]));
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider awsccmock {}\n"),
+        ("main.crn", "awsccmock.test.Sink { params = \"bad\" }\n"),
+    ]);
+    // origin/main 429766820: schema/mod.rs::validate_value_entries first
+    // accepts the String arm, then walk_custom_lookup_on_path's Union arm
+    // independently accepts the Int arm's empty provider-error buffer.
+    // These are the complete CLI errors and warnings for this directory.
+    assert_eq!(
+        round6_cli_bridge_errors(&schema, &fixture),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
 fn round6_cli_map_key_bridge_coverage_matches_origin_main() {
     let identity = carina_core::schema::TypeIdentity::bare("VpcId");
     for key in [

@@ -1,6 +1,50 @@
 use super::*;
 use carina_core::schema::{AttributeSchema, AttributeType, ListElements, ResourceSchema};
 
+#[test]
+fn round8_concrete_containers_check_retained_deferred_children_at_their_sinks() {
+    for (sink, expression) in [
+        (
+            AttributeType::list(AttributeType::string()),
+            "[length(producer.items)]",
+        ),
+        (
+            AttributeType::list(AttributeType::string()),
+            "[\"ok\", length(producer.items), 42]",
+        ),
+        (
+            AttributeType::map(AttributeType::string()),
+            "{ count = length(producer.items) }",
+        ),
+        (
+            AttributeType::list(AttributeType::string()),
+            "secret([length(producer.items)])",
+        ),
+    ] {
+        let diagnostics = review_coalesce_diagnostics(sink, expression);
+        let expected = if expression.contains("42") { 2 } else { 1 };
+        assert_eq!(
+            diagnostics.len(),
+            expected,
+            "{expression}: {diagnostics:#?}"
+        );
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.message.contains("String") && diagnostic.message.contains("Int")
+            }),
+            "{expression}: {diagnostics:#?}"
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| { diagnostic.severity == Some(DiagnosticSeverity::WARNING) })
+                .count(),
+            1,
+            "{expression}: {diagnostics:#?}"
+        );
+    }
+}
+
 fn round7_collection_diagnostics(expression: &str) -> (String, Vec<Diagnostic>) {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(

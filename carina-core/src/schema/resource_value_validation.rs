@@ -5,7 +5,10 @@
 //! results; it never retries validation to recover a diagnostic.
 
 use super::*;
-use crate::parser::{DeclarationLocation, retained::JudgedExpr};
+use crate::parser::{
+    DeclarationLocation,
+    retained::{JudgedExpr, MissingEvidence, ValueChild},
+};
 
 /// Which parser-owned location should anchor a resource value finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,7 +317,24 @@ pub struct ResourceValueInputs<'a, P: PlaceholderKind, B: BindingAddress> {
     pub(crate) attributes: &'a HashMap<String, Value<P, B>>,
     pub(crate) pending: HashSet<String>,
     pub(crate) bindings: Vec<ResourceBindingValidation>,
-    pub(crate) expressions: HashMap<String, JudgedExpr>,
+    pub(crate) expressions: ValueExpressions,
+}
+
+pub(crate) enum ValueExpressions {
+    Authored(HashMap<String, JudgedExpr>),
+    ResolvedOnly,
+}
+
+impl ValueExpressions {
+    pub(crate) fn get(&self, name: &str) -> Result<Option<&JudgedExpr>, MissingEvidence> {
+        match self {
+            Self::Authored(expressions) => expressions
+                .get(name)
+                .map(Some)
+                .ok_or_else(|| MissingEvidence::new(format!("attribute {name}"))),
+            Self::ResolvedOnly => Ok(None),
+        }
+    }
 }
 
 impl<'a, P: PlaceholderKind, B: BindingAddress> ResourceValueInputs<'a, P, B> {
@@ -323,7 +343,7 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> ResourceValueInputs<'a, P, B> {
             attributes,
             pending: HashSet::new(),
             bindings: Vec::new(),
-            expressions: HashMap::new(),
+            expressions: ValueExpressions::ResolvedOnly,
         }
     }
 }
@@ -352,6 +372,7 @@ impl ResourceValueReport {
     }
 }
 
+#[derive(Clone)]
 struct PathFinding {
     path: ValueFindingPath,
     anchor: ValueFindingAnchor,
@@ -391,6 +412,21 @@ struct CheckedValue<'a> {
     primary: Option<TypeError>,
     local: Vec<PathFinding>,
     external: Vec<PathFinding>,
+    lookup_admission: LookupAdmission,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LookupAdmission {
+    Ready,
+    RejectedLocally,
+}
+
+impl LookupAdmission {
+    fn combine(&mut self, other: Self) {
+        if other == Self::RejectedLocally {
+            *self = other;
+        }
+    }
 }
 
 impl<'a> CheckedValue<'a> {
@@ -404,6 +440,7 @@ impl<'a> CheckedValue<'a> {
             primary: None,
             local: Vec::new(),
             external: Vec::new(),
+            lookup_admission: LookupAdmission::Ready,
         }
     }
 
@@ -413,6 +450,7 @@ impl<'a> CheckedValue<'a> {
             primary: Some(error.clone()),
             local: vec![PathFinding::new(path, error)],
             external: Vec::new(),
+            lookup_admission: LookupAdmission::Ready,
         }
     }
 
@@ -541,7 +579,7 @@ impl PatternResourceSchema<Compiled> {
         mode: ValueEntryValidation,
         selected: Option<&HashSet<String>>,
         bindings: &[ResourceBindingValidation],
-        expressions: &HashMap<String, JudgedExpr>,
+        expressions: &ValueExpressions,
         project: &mut Project,
     ) -> ResourceValueReport {
         let mut report = ResourceValueReport::default();
@@ -577,43 +615,33 @@ impl PatternResourceSchema<Compiled> {
                 }
                 continue;
             };
-            let mut walk = ValueWalk::new(Some(lookup));
-            walk.expression_root = expressions.get(name).cloned();
+            let evidence = match expressions.get(name) {
+                Ok(Some(expression)) => Ok(ValueEvidence::Authored(expression.clone())),
+                Ok(None) => Ok(ValueEvidence::resolved_only(value)),
+                Err(error) => Err(error),
+            };
+            let mut walk = ValueWalk::new(Some(lookup), evidence, FieldPath::new(), value);
             walk.bindings = bindings
                 .iter()
                 .filter(|binding| binding.attribute == *name)
                 .cloned()
                 .collect();
-            walk.previous = walk
-                .bindings
-                .iter()
-                .flat_map(|binding| {
-                    binding.checked().into_iter().flat_map(|checked| {
-                        checked.leaves.iter().cloned().map(|mut leaf| {
-                            if leaf.origin.is_none() {
-                                leaf.origin = binding.origin.clone();
-                            }
-                            leaf
-                        })
-                    })
-                })
-                .collect();
             // Native callback results do not depend on portable refinements
             // in another union declaration. Carry readiness outcomes across.
-            walk.callbacks = walk
-                .bindings
-                .iter()
-                .flat_map(|binding| {
-                    binding.checked().into_iter().flat_map(|checked| {
-                        checked.callbacks.iter().cloned().map(|mut callback| {
-                            if callback.origin.is_none() {
-                                callback.origin = binding.origin.clone();
-                            }
-                            callback
-                        })
-                    })
-                })
-                .collect();
+            for binding in &walk.bindings {
+                if let Some(checked) = binding.checked() {
+                    walk.previous.extend_with(&checked.leaves, |leaf| {
+                        if leaf.origin.is_none() {
+                            leaf.origin = binding.origin.clone();
+                        }
+                    });
+                    walk.callbacks.extend_with(&checked.callbacks, |callback| {
+                        if callback.origin.is_none() {
+                            callback.origin = binding.origin.clone();
+                        }
+                    });
+                }
+            }
             let mut checked = if attribute.is_read_only() && mode == ValueEntryValidation::FullInput
             {
                 CheckedValue::rejected(
@@ -682,8 +710,8 @@ impl PatternResourceSchema<Compiled> {
 #[derive(Clone, Default, PartialEq)]
 pub(crate) struct BindingValueValidation {
     source: Option<Value>,
-    leaves: Vec<CheckedBindingLeaf>,
-    callbacks: Vec<CheckedCallback>,
+    leaves: ValidationCache<CheckedBindingLeaf>,
+    callbacks: ValidationCache<CheckedCallback>,
 }
 
 impl fmt::Debug for BindingValueValidation {
@@ -711,10 +739,8 @@ impl LeafInput {
 
 #[derive(Clone)]
 struct CheckedBindingLeaf {
-    kind: CallbackInputKind,
     path: FieldPath,
     origin: Option<DeclarationLocation>,
-    operand_path: Vec<usize>,
     declaration: String,
     native: Option<CustomValidator>,
     input: LeafInput,
@@ -726,7 +752,6 @@ struct CheckedCallback {
     kind: CallbackInputKind,
     path: FieldPath,
     origin: Option<DeclarationLocation>,
-    operand_path: Vec<usize>,
     callback: CallbackIdentity,
     input: Value,
     result: Result<(), TypeError>,
@@ -764,14 +789,107 @@ impl fmt::Debug for CheckedBindingLeaf {
 }
 impl PartialEq for CheckedBindingLeaf {
     fn eq(&self, other: &Self) -> bool {
-        self.kind == other.kind
-            && self.path == other.path
+        self.path == other.path
             && self.origin == other.origin
-            && self.operand_path == other.operand_path
             && self.declaration == other.declaration
             && same_callback(self.native.as_ref(), other.native.as_ref())
             && self.input == other.input
             && self.result == other.result
+    }
+}
+
+/// Authored cache entries are identified only by retained expressions. Inputs
+/// without syntax use a separate cache, keyed by the borrowed input occurrence
+/// and its value/path. No branch or operand stack is inferred from a Value.
+#[derive(Clone, PartialEq)]
+struct ValidationCache<T> {
+    authored: Vec<(JudgedExpr, T)>,
+    resolved: Vec<(ResolvedInputId, T)>,
+}
+
+impl<T> Default for ValidationCache<T> {
+    fn default() -> Self {
+        Self {
+            authored: Vec::new(),
+            resolved: Vec::new(),
+        }
+    }
+}
+
+impl<T: Clone> ValidationCache<T> {
+    fn find(&self, evidence: &ValueEvidence, matches: impl Fn(&T) -> bool) -> Option<&T> {
+        match evidence {
+            ValueEvidence::Authored(expression) => self
+                .authored
+                .iter()
+                .find(|(retained, result)| {
+                    retained.same_value_expression(expression) && matches(result)
+                })
+                .map(|(_, result)| result),
+            ValueEvidence::ResolvedOnly(input) => self
+                .resolved
+                .iter()
+                .find(|(retained, result)| retained == input && matches(result))
+                .map(|(_, result)| result),
+        }
+    }
+
+    fn push(&mut self, evidence: ValueEvidence, result: T) {
+        match evidence {
+            ValueEvidence::Authored(expression) => self.authored.push((expression, result)),
+            ValueEvidence::ResolvedOnly(input) => self.resolved.push((input, result)),
+        }
+    }
+
+    fn extend_with(&mut self, other: &Self, update: impl Fn(&mut T)) {
+        for (expression, mut result) in other.authored.clone() {
+            update(&mut result);
+            self.authored.push((expression, result));
+        }
+        for (input, mut result) in other.resolved.clone() {
+            update(&mut result);
+            self.resolved.push((input, result));
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.authored.is_empty() && self.resolved.is_empty()
+    }
+}
+
+impl<T> fmt::Debug for ValidationCache<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ValidationCache")
+            .field("authored", &self.authored.len())
+            .field("resolved", &self.resolved.len())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+enum ValueEvidence {
+    Authored(JudgedExpr),
+    ResolvedOnly(ResolvedInputId),
+}
+
+impl ValueEvidence {
+    fn resolved_only<T>(input: &T) -> Self {
+        Self::ResolvedOnly(ResolvedInputId::new(input))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ResolvedInputId(usize);
+
+impl ResolvedInputId {
+    fn new<T>(input: &T) -> Self {
+        Self(std::ptr::from_ref(input).addr())
+    }
+}
+
+fn evidence_error(error: MissingEvidence) -> TypeError {
+    TypeError::ValidationFailed {
+        message: error.to_string().into(),
     }
 }
 fn same_callback(left: Option<&CustomValidator>, right: Option<&CustomValidator>) -> bool {
@@ -798,6 +916,7 @@ struct LeafResult {
     // Binding readiness checks portable/native constraints only. Provider
     // lookups belong to resource validation, which also aggregates missing inputs.
     external: Option<Vec<TypeError>>,
+    lookup_admission: LookupAdmission,
 }
 #[derive(Clone, Debug, PartialEq)]
 enum LeafFit {
@@ -827,6 +946,7 @@ impl LeafResult {
         Some(Self {
             fit,
             primary: checked.primary.clone(),
+            lookup_admission: checked.lookup_admission,
             external: lookup_checked.then(|| {
                 checked
                     .external
@@ -838,6 +958,7 @@ impl LeafResult {
     }
     fn restore<'a>(&self, attr: &'a CompiledAttributeType, path: &FieldPath) -> CheckedValue<'a> {
         CheckedValue {
+            lookup_admission: self.lookup_admission,
             fit: self.fit.as_ref().map(|(exactness, kind)| {
                 Fit::with_kind(
                     *exactness,
@@ -927,42 +1048,52 @@ impl ResourceBindingValidation {
 
 struct ValueWalk<'a> {
     lookup: Option<CustomTypeLookup<'a>>,
-    previous: Vec<CheckedBindingLeaf>,
-    recorded: Vec<CheckedBindingLeaf>,
+    previous: ValidationCache<CheckedBindingLeaf>,
+    recorded: ValidationCache<CheckedBindingLeaf>,
     bindings: Vec<ResourceBindingValidation>,
     origin: Option<DeclarationLocation>,
-    operand_path: Vec<usize>,
-    expression_root: Option<JudgedExpr>,
+    expression_root: Result<ValueEvidence, MissingEvidence>,
     expression_path: FieldPath,
-    callbacks: Vec<CheckedCallback>,
+    projection_root: ResolvedInputId,
+    callbacks: ValidationCache<CheckedCallback>,
     input_kind: CallbackInputKind,
 }
 
 impl<'a> ValueWalk<'a> {
-    fn new(lookup: Option<CustomTypeLookup<'a>>) -> Self {
+    fn new<T>(
+        lookup: Option<CustomTypeLookup<'a>>,
+        expression_root: Result<ValueEvidence, MissingEvidence>,
+        expression_path: FieldPath,
+        projection: &T,
+    ) -> Self {
         Self {
             lookup,
-            previous: Vec::new(),
-            recorded: Vec::new(),
+            previous: ValidationCache::default(),
+            recorded: ValidationCache::default(),
             bindings: Vec::new(),
             origin: None,
-            operand_path: Vec::new(),
-            expression_root: None,
-            expression_path: FieldPath::new(),
-            callbacks: Vec::new(),
+            expression_root,
+            expression_path,
+            projection_root: ResolvedInputId::new(projection),
+            callbacks: ValidationCache::default(),
             input_kind: CallbackInputKind::Value,
         }
     }
 
-    fn expression_at(&self, path: &FieldPath) -> Option<&JudgedExpr> {
-        let mut expression = self.expression_root.as_ref()?;
+    fn expression_at(&self, path: &FieldPath) -> Result<ValueEvidence, MissingEvidence> {
+        let mut expression = match self.expression_root.clone()? {
+            ValueEvidence::Authored(expression) => expression,
+            resolved @ ValueEvidence::ResolvedOnly(_) => return Ok(resolved),
+        };
         for step in &path.steps()[self.expression_path.steps().len()..] {
-            expression = match step {
-                FieldPathStep::Index(index) => expression.element(*index).ok()?,
-                FieldPathStep::Field(name) => expression.field(name).ok()?,
+            expression = match expression.value_child(step)? {
+                ValueChild::Authored(child) => child.clone(),
+                ValueChild::ComputedOutput => {
+                    return Ok(ValueEvidence::ResolvedOnly(self.projection_root));
+                }
             };
         }
-        Some(expression)
+        Ok(ValueEvidence::Authored(expression))
     }
 
     fn native_validation(
@@ -987,10 +1118,10 @@ impl<'a> ValueWalk<'a> {
         validate: impl FnOnce() -> Result<(), TypeError>,
     ) -> Result<(), TypeError> {
         let kind = self.input_kind;
-        if let Some(checked) = self.callbacks.iter().find(|checked| {
+        let evidence = self.expression_at(path).map_err(evidence_error)?;
+        if let Some(checked) = self.callbacks.find(&evidence, |checked| {
             checked.path == *path
                 && checked.origin == self.origin
-                && checked.operand_path == self.operand_path
                 && checked.kind == kind
                 && checked.callback == callback
                 && checked.input == *input
@@ -1011,15 +1142,17 @@ impl<'a> ValueWalk<'a> {
                 Err(_) => false,
             };
         if completed_callback {
-            self.callbacks.push(CheckedCallback {
-                kind,
-                path: path.clone(),
-                origin: self.origin.clone(),
-                operand_path: self.operand_path.clone(),
-                callback,
-                input: input.clone(),
-                result: result.clone(),
-            });
+            self.callbacks.push(
+                evidence,
+                CheckedCallback {
+                    kind,
+                    path: path.clone(),
+                    origin: self.origin.clone(),
+                    callback,
+                    input: input.clone(),
+                    result: result.clone(),
+                },
+            );
         }
         result
     }
@@ -1031,7 +1164,7 @@ pub(crate) fn check_binding_value<P: PlaceholderKind, B: BindingAddress>(
     defs: &BTreeMap<String, CompiledAttributeType>,
     ancestry: FieldAncestry,
     path: &FieldPath,
-    expression: Option<JudgedExpr>,
+    expression: Result<JudgedExpr, MissingEvidence>,
     validation: &mut BindingValueValidation,
 ) -> Result<(), TypeError> {
     if ancestry.provider_populated {
@@ -1040,9 +1173,12 @@ pub(crate) fn check_binding_value<P: PlaceholderKind, B: BindingAddress>(
     validation.source = value
         .to_expanded()
         .and_then(Value::try_into_address_free_absolute);
-    let mut walk = ValueWalk::new(None);
-    walk.expression_root = expression;
-    walk.expression_path = path.clone();
+    let mut walk = ValueWalk::new(
+        None,
+        expression.map(ValueEvidence::Authored),
+        path.clone(),
+        value,
+    );
     let checked = check_value(
         attr,
         value,
@@ -1066,9 +1202,11 @@ fn check_value<'a, P: PlaceholderKind, B: BindingAddress>(
     walk: &mut ValueWalk<'_>,
     visited_refs: &mut Vec<&'a str>,
 ) -> CheckedValue<'a> {
-    if walk
-        .expression_at(path)
-        .is_some_and(JudgedExpr::value_failure_owner)
+    let evidence = match walk.expression_at(path) {
+        Ok(evidence) => evidence,
+        Err(error) => return CheckedValue::rejected(path, evidence_error(error)),
+    };
+    if matches!(evidence, ValueEvidence::Authored(expression) if expression.value_failure_owner())
         || walk.bindings.iter().any(|binding| {
             binding.path == *path
                 && binding.origin == walk.origin
@@ -1212,26 +1350,28 @@ fn check_input_inner<'a, P: PlaceholderKind, B: BindingAddress>(
     let declaration = input
         .as_ref()
         .map(|_| resolution.attr.declaration_fingerprint());
+    let evidence = match walk.expression_at(path) {
+        Ok(evidence) => evidence,
+        Err(error) => return CheckedValue::rejected(path, evidence_error(error)),
+    };
+    let matches = |leaf: &CheckedBindingLeaf| {
+        leaf.path == *path
+            && leaf.origin == walk.origin
+            && Some(&leaf.declaration) == declaration.as_ref()
+            && Some(&leaf.input) == input.as_ref()
+            && same_callback(leaf.native.as_ref(), native_callback(resolution.attr))
+    };
     let cached = walk
         .recorded
-        .iter()
-        .chain(&walk.previous)
-        .find(|leaf| {
-            leaf.kind == walk.input_kind
-                && leaf.path == *path
-                && leaf.origin == walk.origin
-                && leaf.operand_path == walk.operand_path
-                && Some(&leaf.declaration) == declaration.as_ref()
-                && Some(&leaf.input) == input.as_ref()
-                && same_callback(leaf.native.as_ref(), native_callback(resolution.attr))
-        })
+        .find(&evidence, matches)
+        .or_else(|| walk.previous.find(&evidence, matches))
         .cloned();
     if let Some(mut cached) = cached {
         let mut checked = cached.result.restore(resolution.attr, path);
         if cached.result.external.is_none() && walk.lookup.is_some() {
             apply_leaf_lookup(&mut checked, resolution.attr, &cached.input, path, walk);
             cached.result = LeafResult::capture(&checked, true).expect("cached scalar leaf");
-            walk.recorded.push(cached);
+            walk.recorded.push(evidence, cached);
         }
         visited_refs.truncate(resolution.restore_len);
         return checked;
@@ -1271,16 +1411,17 @@ fn check_input_inner<'a, P: PlaceholderKind, B: BindingAddress>(
         declaration,
         LeafResult::capture(&checked, walk.lookup.is_some()),
     ) {
-        walk.recorded.push(CheckedBindingLeaf {
-            kind: walk.input_kind,
-            path: path.clone(),
-            origin: walk.origin.clone(),
-            operand_path: walk.operand_path.clone(),
-            declaration,
-            native: native_callback(resolution.attr).cloned(),
-            input,
-            result,
-        });
+        walk.recorded.push(
+            evidence,
+            CheckedBindingLeaf {
+                path: path.clone(),
+                origin: walk.origin.clone(),
+                declaration,
+                native: native_callback(resolution.attr).cloned(),
+                input,
+                result,
+            },
+        );
     }
     visited_refs.truncate(resolution.restore_len);
     checked
@@ -1293,16 +1434,22 @@ fn apply_leaf_lookup(
     path: &FieldPath,
     walk: &mut ValueWalk<'_>,
 ) {
-    // A provider declaration bridge may check portable constraints too. Only
-    // a successful local fit is eligible; rejected leaves keep their result.
-    if checked.fit.is_none() {
-        return;
-    }
     // Provider bridges have always covered Map values. Key lifting and native
     // key validators run above, but a bridge must not add new key constraints.
     let LeafInput::Value(input) = input else {
         return;
     };
+    if checked.fit.is_none() {
+        if matches!(&attr.kind,
+            AttrTypeKind::String { binding, .. } | AttrTypeKind::Int { binding, .. } | AttrTypeKind::Float { binding, .. }
+            if binding.identity().is_some() && binding.callback().is_none())
+        {
+            // Portable admission has already failed. It is neither another
+            // provider diagnostic nor a successful independent Union arm.
+            checked.lookup_admission = LookupAdmission::RejectedLocally;
+        }
+        return;
+    }
     let Some(lookup) = walk.lookup else {
         return;
     };
@@ -1343,6 +1490,11 @@ fn apply_leaf_lookup(
     }
 }
 
+enum RetainedOperand {
+    Coalesce(usize),
+    Conditional(usize),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_operand<'a, P: PlaceholderKind, B: BindingAddress>(
     attr: &'a CompiledAttributeType,
@@ -1351,32 +1503,36 @@ fn check_operand<'a, P: PlaceholderKind, B: BindingAddress>(
     ancestry: FieldAncestry,
     path: &FieldPath,
     walk: &mut ValueWalk<'_>,
-    index: usize,
+    operand: RetainedOperand,
 ) -> CheckedValue<'a> {
-    let expression = walk
+    let expression = match walk
         .expression_at(path)
-        .and_then(|expression| {
-            expression
-                .coalesce_operand(index)
-                .or_else(|_| expression.branch(index))
-                .ok()
-        })
-        .cloned();
-    let origin = expression
-        .as_ref()
-        .and_then(JudgedExpr::value_location)
-        .cloned();
+        .and_then(|evidence| match evidence {
+            ValueEvidence::Authored(expression) => match operand {
+                RetainedOperand::Coalesce(index) => expression.coalesce_operand(index),
+                RetainedOperand::Conditional(index) => expression.branch(index),
+            }
+            .cloned()
+            .map(ValueEvidence::Authored),
+            ValueEvidence::ResolvedOnly(_) => Ok(ValueEvidence::resolved_only(value)),
+        }) {
+        Ok(expression) => expression,
+        Err(error) => return CheckedValue::rejected(path, evidence_error(error)),
+    };
+    let origin = match &expression {
+        ValueEvidence::Authored(expression) => expression.value_location().cloned(),
+        ValueEvidence::ResolvedOnly(_) => None,
+    };
     let previous_origin = std::mem::replace(&mut walk.origin, origin);
-    let previous_root = std::mem::replace(&mut walk.expression_root, expression);
+    let previous_root = std::mem::replace(&mut walk.expression_root, Ok(expression));
     let previous_path = std::mem::replace(&mut walk.expression_path, path.clone());
-    // The operand position identifies rootless operands as well as authored
-    // ones. Retain their results when a Union checks another alternative.
-    walk.operand_path.push(index);
+    let previous_projection =
+        std::mem::replace(&mut walk.projection_root, ResolvedInputId::new(value));
     let checked = check_value(attr, value, defs, ancestry, path, walk, &mut Vec::new());
-    walk.operand_path.pop();
     walk.origin = previous_origin;
     walk.expression_root = previous_root;
     walk.expression_path = previous_path;
+    walk.projection_root = previous_projection;
     checked
 }
 
@@ -1390,8 +1546,24 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
     visited_refs: &mut Vec<&'a str>,
 ) -> CheckedValue<'a> {
     if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
-        let mut left = check_operand(attr, value, defs, ancestry, path, walk, 0);
-        let right = check_operand(attr, default, defs, ancestry, path, walk, 1);
+        let mut left = check_operand(
+            attr,
+            value,
+            defs,
+            ancestry,
+            path,
+            walk,
+            RetainedOperand::Coalesce(0),
+        );
+        let right = check_operand(
+            attr,
+            default,
+            defs,
+            ancestry,
+            path,
+            walk,
+            RetainedOperand::Coalesce(1),
+        );
         left.fit = left.fit.zip(right.fit).map(|(value, default)| {
             let mut exactness = value.exactness;
             exactness.combine(default.exactness);
@@ -1405,13 +1577,30 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
             )
         });
         left.primary = left.primary.or(right.primary);
+        left.lookup_admission.combine(right.lookup_admission);
         left.local.extend(right.local);
         left.external.extend(right.external);
         return left;
     }
     if let Value::Deferred(DeferredValue::ModuleIf(deferred)) = value {
-        let mut checked = check_operand(attr, deferred.then_value(), defs, ancestry, path, walk, 0);
-        let other = check_operand(attr, deferred.else_value(), defs, ancestry, path, walk, 1);
+        let mut checked = check_operand(
+            attr,
+            deferred.then_value(),
+            defs,
+            ancestry,
+            path,
+            walk,
+            RetainedOperand::Conditional(0),
+        );
+        let other = check_operand(
+            attr,
+            deferred.else_value(),
+            defs,
+            ancestry,
+            path,
+            walk,
+            RetainedOperand::Conditional(1),
+        );
         checked.fit = checked.fit.zip(other.fit).map(|(then_value, else_value)| {
             let mut exactness = then_value.exactness;
             exactness.combine(else_value.exactness);
@@ -1425,6 +1614,7 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
             )
         });
         checked.primary = checked.primary.or(other.primary);
+        checked.lookup_admission.combine(other.lookup_admission);
         checked.local.extend(other.local);
         checked.external.extend(other.external);
         return checked;
@@ -1544,6 +1734,7 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                     walk,
                     &mut Vec::new(),
                 );
+                checked.lookup_admission.combine(child.lookup_admission);
                 if let Some(error) = child.primary {
                     checked
                         .primary
@@ -1616,6 +1807,7 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                     walk,
                     &mut Vec::new(),
                 );
+                checked.lookup_admission.combine(child.lookup_admission);
                 for finding in child.local.iter_mut().chain(&mut child.external) {
                     finding.path.map_keys.insert(0, path.steps().len());
                 }
@@ -1670,6 +1862,12 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
             let mut best_failure: Option<BestUnionMemberFailures> = None;
             let mut best_external: Option<Vec<PathFinding>> = None;
             for member in members.as_raw_slice() {
+                let lookup = walk.lookup;
+                // Once the independent provider aggregate has a successful
+                // arm, only local fits remain to be checked.
+                if best_external.as_ref().is_some_and(Vec::is_empty) {
+                    walk.lookup = None;
+                }
                 let mut checked = match walk.input_kind {
                     CallbackInputKind::Value => {
                         check_value(member, value, defs, ancestry, path, walk, visited_refs)
@@ -1686,6 +1884,15 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                         visited_refs,
                     ),
                 };
+                walk.lookup = lookup;
+                if resolve_refs_on_path(member, defs, &mut visited_refs.clone()).is_ok()
+                    && checked.lookup_admission == LookupAdmission::Ready
+                    && best_external
+                        .as_ref()
+                        .is_none_or(|best| checked.external.len() < best.len())
+                {
+                    best_external = Some(checked.external.clone());
+                }
                 if let Some(fit) = checked.fit.take() {
                     if best_fit.as_ref().is_none_or(|best| {
                         checked.external.len() < best.external.len()
@@ -1703,7 +1910,7 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                         best_fit = Some(checked);
                     }
                     if best_fit.as_ref().is_some_and(|best| {
-                        best.external.is_empty()
+                        best_external.as_ref().is_some_and(Vec::is_empty)
                             && best
                                 .fit
                                 .as_ref()
@@ -1712,15 +1919,6 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                         break;
                     }
                 } else if let Some(error) = checked.primary {
-                    // Provider lookup has independent Union alternatives:
-                    // retain its smallest failure set even when every arm
-                    // also fails locally, without walking any arm again.
-                    if best_external
-                        .as_ref()
-                        .is_none_or(|best| checked.external.len() < best.len())
-                    {
-                        best_external = Some(checked.external);
-                    }
                     let judgement = union_member_judgement_on_path(
                         member,
                         concrete,
@@ -1731,7 +1929,7 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                     BestUnionMemberFailures::record(&mut best_failure, judgement, error);
                 }
             }
-            if let Some(checked) = best_fit {
+            let mut checked = if let Some(checked) = best_fit {
                 checked
             } else {
                 let error = best_failure
@@ -1739,10 +1937,15 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                     .unwrap_or_else(|| {
                         TypeError::value_type_mismatch(attr.type_name(), value.type_name())
                     });
-                let mut checked = CheckedValue::rejected(path, error);
-                checked.external = best_external.unwrap_or_default();
-                checked
-            }
+                CheckedValue::rejected(path, error)
+            };
+            checked.lookup_admission = if best_external.is_some() {
+                LookupAdmission::Ready
+            } else {
+                LookupAdmission::RejectedLocally
+            };
+            checked.external = best_external.unwrap_or_default();
+            checked
         }
         (AttrTypeKind::Enum { identity, .. }, _) => {
             let resolver = EnumValueResolver::with_defs(attr, defs);
@@ -1876,6 +2079,7 @@ fn check_list<'a, P: PlaceholderKind, B: BindingAddress>(
         }
     }
     for child in children {
+        checked.lookup_admission.combine(child.lookup_admission);
         checked.local.extend(child.local);
         checked.external.extend(child.external);
     }

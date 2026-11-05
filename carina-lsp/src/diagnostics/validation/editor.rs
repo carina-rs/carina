@@ -143,7 +143,7 @@ fn deferred_findings(
                 ));
             }
         }
-        Value::Deferred(_) => {
+        Value::Deferred(_) | Value::Concrete(_) => {
             if let Err(error) = check(expression, top_level, judged) {
                 findings.push(Located::new(
                     resource.attribute_key_location(name).clone(),
@@ -151,7 +151,6 @@ fn deferred_findings(
                 ));
             }
         }
-        _ => {}
     }
 }
 

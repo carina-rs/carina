@@ -1429,7 +1429,7 @@ fn access_step(pair: Pair<'_, Rule>) -> Option<PathSegment> {
 pub(crate) use judgement::judge_expressions;
 pub(in crate::parser) use judgement::unjudged as missing_judgement;
 pub(crate) use judgement::{
-    AdmissionContext, EmptyCoalesceDefault, admit_with_context, coalesce_type,
+    AdmissionContext, EmptyCoalesceDefault, ValueChild, admit_with_context, coalesce_type,
 };
 pub use judgement::{
     CollectionKind, ExpressionAdmission, ExpressionCheckOwner, ExpressionReport, JudgedExpr,
@@ -1683,6 +1683,17 @@ mod judgement {
     #[derive(Debug, Clone, PartialEq)]
     pub struct JudgedExpr(Arc<JudgedExprData>);
 
+    pub(crate) enum ValueChild<'a> {
+        Authored(&'a JudgedExpr),
+        ComputedOutput,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ValueChildrenSource {
+        Authored,
+        ComputedOutput,
+    }
+
     #[doc(hidden)]
     #[derive(Debug, Clone)]
     pub struct JudgedExprData {
@@ -1690,6 +1701,7 @@ mod judgement {
         boundary_owner: Option<Arc<DeclarationLocation>>,
         judgement: ExprJudgement,
         value_result: bool,
+        value_children: ValueChildrenSource,
         authority: Option<Arc<super::super::ProviderContext>>,
         coalesce: Option<Arc<[JudgedExpr; 2]>>,
         alternatives: Arc<Vec<JudgedExpr>>,
@@ -1704,6 +1716,7 @@ mod judgement {
                 && self.boundary_owner == other.boundary_owner
                 && self.judgement == other.judgement
                 && self.value_result == other.value_result
+                && self.value_children == other.value_children
                 && match (&self.authority, &other.authority) {
                     (Some(left), Some(right)) => Arc::ptr_eq(left, right),
                     (None, None) => true,
@@ -1952,6 +1965,16 @@ mod judgement {
             self.origin.as_ref().map(|origin| &origin.authored)
         }
 
+        /// Identity comes from retained syntax, including the expansion
+        /// instance. Synthetic evidence is equal only to the same retained
+        /// node, regardless of the values later projected from it.
+        pub(crate) fn same_value_expression(&self, other: &Self) -> bool {
+            match (&self.origin, &other.origin) {
+                (Some(left), Some(right)) => left == right,
+                _ => Arc::ptr_eq(&self.0, &other.0),
+            }
+        }
+
         /// Identify a value operand from the retained authored tree. Binding
         /// uses carry tokens, not an independent parser branch stack.
         pub(crate) fn value_operand_at<P: ValueKind, B: BindingAddress>(
@@ -2027,6 +2050,33 @@ mod judgement {
                 .get(index)
                 .or(self.member.as_deref())
                 .ok_or_else(|| MissingEvidence::new(format!("list element {index}")))
+        }
+        /// Computed collection results have values but no authored item
+        /// expressions. This classification comes from retained call evidence,
+        /// never from a failed child lookup on a projected container.
+        pub(crate) fn value_child(
+            &self,
+            step: &crate::schema::FieldPathStep,
+        ) -> Result<ValueChild<'_>, MissingEvidence> {
+            if self.value_children == ValueChildrenSource::ComputedOutput {
+                return Ok(ValueChild::ComputedOutput);
+            }
+            let (child, request) = match step {
+                crate::schema::FieldPathStep::Index(index) => {
+                    (self.elements.get(*index), format!("list element {index}"))
+                }
+                crate::schema::FieldPathStep::Field(name) => {
+                    (self.fields.get(name), format!("field {name}"))
+                }
+            };
+            if let Some(child) = child {
+                Ok(ValueChild::Authored(child))
+            } else {
+                self.member
+                    .as_deref()
+                    .map(ValueChild::Authored)
+                    .ok_or_else(|| MissingEvidence::new(request))
+            }
         }
         pub fn field(&self, key: &str) -> Result<&JudgedExpr, MissingEvidence> {
             self.fields
@@ -3046,6 +3096,21 @@ mod judgement {
                 };
             }
             let mut result = self.infer(expression, &children);
+            if let ExprKind::Call(name) = &root.kind {
+                let preserves_argument = !self
+                    .functions
+                    .contains_key(&(root.location.instance.clone(), name.clone()))
+                    && crate::builtins::builtin_functions().iter().any(|builtin| {
+                        builtin.name == name
+                            && matches!(
+                                builtin.return_type,
+                                crate::builtins::BuiltinReturnType::Argument(_)
+                            )
+                    });
+                if !preserves_argument {
+                    result.data_mut().value_children = ValueChildrenSource::ComputedOutput;
+                }
+            }
             result.data_mut().value_result |=
                 matches!(root.kind, ExprKind::Integer { .. } | ExprKind::Call(_));
             result.data_mut().origin = Some(root.location.clone());
@@ -3764,8 +3829,10 @@ mod judgement {
                         .cloned()
                         .collect::<Vec<_>>();
                     if !members.is_empty() {
-                        let mut element = members[0].clone();
-                        element.data_mut().alternatives = Arc::new(members);
+                        let mut element = alternatives(members[0].static_type().cloned(), &members);
+                        // Merge retained children without minting another
+                        // diagnostic owner for the loop's source judgement.
+                        element.data_mut().judgement = members[0].judgement.clone();
                         return loop_element(element);
                     }
                     match child_type(0) {
@@ -4166,6 +4233,12 @@ mod judgement {
             return branches[0].clone();
         }
         let mut result = declared(ty, branches.iter().all(|branch| branch.concrete()));
+        if branches
+            .iter()
+            .any(|branch| branch.value_children == ValueChildrenSource::ComputedOutput)
+        {
+            result.data_mut().value_children = ValueChildrenSource::ComputedOutput;
+        }
         result.data_mut().authority = branches.first().and_then(|branch| branch.authority.clone());
         result.data_mut().alternatives = Arc::new(branches.to_vec());
         let member_sources = branches
@@ -4287,6 +4360,7 @@ mod judgement {
         JudgedExpr(Arc::new(JudgedExprData {
             origin: None,
             value_result: false,
+            value_children: ValueChildrenSource::Authored,
             boundary_owner: None,
             judgement,
             authority: None,

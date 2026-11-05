@@ -881,20 +881,26 @@ impl BindingUseReport {
         let owns = |use_site: &crate::parser::BareBindingUse| matches!(&use_site.owner, BindingUseOwner::Resource(address) if address.resource_id() == resource.id());
         let mut inputs = crate::schema::ResourceValueInputs::new(attributes);
         let report = report.for_resource(resource.id())?;
+        let mut expressions = std::collections::HashMap::new();
         for name in attributes.keys() {
             let expression = report.expression(
                 resource.attribute_value_location(name, &crate::schema::FieldPath::new()),
             )?;
-            inputs.expressions.insert(name.clone(), expression.clone());
+            expressions.insert(name.clone(), expression.clone());
         }
+        inputs.expressions =
+            crate::schema::resource_value_validation::ValueExpressions::Authored(expressions);
         let operand_origin = |use_site: &crate::parser::BareBindingUse| {
+            let Some(value) = attributes.get(use_site.path.root_name()) else {
+                return Ok(None);
+            };
             inputs
                 .expressions
                 .get(use_site.path.root_name())
-                .and_then(|expression| {
-                    attributes
-                        .get(use_site.path.root_name())
-                        .and_then(|value| expression.value_operand_at(value, use_site.location()))
+                .map(|expression| {
+                    expression.and_then(|expression| {
+                        expression.value_operand_at(value, use_site.location())
+                    })
                 })
         };
 
@@ -926,7 +932,7 @@ impl BindingUseReport {
                 attribute: finding.use_site.path.root_name().into(),
                 path: binding_field_path(&finding.use_site.path),
                 location: finding.use_site.location().clone(),
-                origin: operand_origin(&finding.use_site),
+                origin: operand_origin(&finding.use_site)?,
                 outcome: ResourceBindingValueOutcome::Rejected(error),
             });
         }
@@ -945,7 +951,7 @@ impl BindingUseReport {
                 attribute: use_site.path.root_name().into(),
                 path: binding_field_path(&use_site.path),
                 location: use_site.location().clone(),
-                origin: operand_origin(use_site),
+                origin: operand_origin(use_site)?,
                 outcome: ResourceBindingValueOutcome::Checked(checked.clone()),
             });
         }
@@ -1769,7 +1775,6 @@ fn validate_bound_schema_value<B: BindingAddress>(
         context
             .expression_report
             .expression_in(&use_site.expression_instance, use_site.location())
-            .ok()
             .cloned(),
         validation,
     )
@@ -2667,6 +2672,14 @@ impl<'a, B: BindingAddress> UnresolvedExpression<'a, B> {
                 .any(|branch| Self::new(branch).is_some())
                 .then_some(Self { value, sensitive }),
             GenericValue::Deferred(_) => Some(Self { value, sensitive }),
+            GenericValue::Concrete(crate::resource::ConcreteValue::List(items)) => items
+                .iter()
+                .any(|item| Self::new(item).is_some())
+                .then_some(Self { value, sensitive }),
+            GenericValue::Concrete(crate::resource::ConcreteValue::Map(entries)) => entries
+                .values()
+                .any(|item| Self::new(item).is_some())
+                .then_some(Self { value, sensitive }),
             _ => None,
         }
     }
@@ -2708,9 +2721,6 @@ pub fn check_editor_access_type<B: BindingAddress>(
     schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
 ) -> Result<(), AccessTypeFinding> {
-    if !judged.editor_owns_check(expression.value()) {
-        return Ok(());
-    }
     let finding = |error| AccessTypeFinding {
         error: if expression.sensitive {
             match error {
@@ -2759,6 +2769,12 @@ fn check_editor_operands<'a, B: BindingAddress + 'a>(
         let evidence = evidence.map_err(|error| DeferredAccessTypeError::InvalidAccess {
             error: error.into(),
         })?;
+        // Nested reference assignments already have a sink-specific owner.
+        // Computed children still need editor inference at this child sink.
+        if evidence.check_owner() == crate::parser::retained::ExpressionCheckOwner::BindingIndex {
+            fit = EditorExpressionFit::ValueReportFailure;
+            continue;
+        }
         if check_editor_expression(operand, expected, evidence, schemas, binding_index)?
             == EditorExpressionFit::ValueReportFailure
         {
@@ -2829,7 +2845,7 @@ fn check_editor_expression<B: BindingAddress>(
     if let Some(element) = expected.collection_element() {
         let fit = match value {
             GenericValue::Concrete(crate::resource::ConcreteValue::List(items)) => {
-                check_editor_operands(
+                let fit = check_editor_operands(
                     items
                         .iter()
                         .enumerate()
@@ -2837,23 +2853,40 @@ fn check_editor_expression<B: BindingAddress>(
                     element,
                     schemas,
                     binding_index,
-                )?
+                )?;
+                if !items.is_empty() {
+                    return Ok(fit);
+                }
+                fit
             }
             GenericValue::Concrete(crate::resource::ConcreteValue::Map(entries)) => {
-                check_editor_operands(
+                let fit = check_editor_operands(
                     entries
                         .iter()
                         .map(|(name, value)| (value, judged.field(name))),
                     element,
                     schemas,
                     binding_index,
-                )?
+                )?;
+                if !entries.is_empty() {
+                    return Ok(fit);
+                }
+                fit
             }
             _ => EditorExpressionFit::FitsSink,
         };
         if fit == EditorExpressionFit::ValueReportFailure {
             return Ok(fit);
         }
+    } else if matches!(
+        value,
+        GenericValue::Concrete(
+            crate::resource::ConcreteValue::List(_) | crate::resource::ConcreteValue::Map(_)
+        )
+    ) {
+        // Concrete records and union containers have their own schema walk.
+        // Their aggregate inferred type cannot replace declared child sinks.
+        return Ok(EditorExpressionFit::ValueReportFailure);
     }
     match check_deferred_access_type(value, expected, judged, schemas, binding_index) {
         Ok(()) => Ok(EditorExpressionFit::FitsSink),

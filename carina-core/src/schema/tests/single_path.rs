@@ -6,6 +6,243 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
+fn round8_authored_coalesce_callbacks_use_each_retained_child_once() {
+    for native in [true, false] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let identity = TypeIdentity::bare("Counted");
+        let leaf = if native {
+            AttributeType::refined_string_with_validator(
+                identity.clone(),
+                None,
+                None,
+                validator(move |_| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+                None,
+            )
+        } else {
+            AttributeType::refined_string(Some(identity), None, None, None)
+        };
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("test.Sink")
+                .attribute(
+                    AttributeSchema::optional(
+                        "params",
+                        AttributeType::union(vec![
+                            AttributeType::refined_list(
+                                leaf.clone(),
+                                true,
+                                Some((Some(2), None)),
+                                ListElements::AllowDuplicates,
+                            ),
+                            AttributeType::list(leaf),
+                        ]),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let files = vec![
+            (
+                std::path::PathBuf::from("providers.crn"),
+                "provider mock {}\n".to_owned(),
+            ),
+            (
+                std::path::PathBuf::from("main.crn"),
+                "mock.test.Sink { params = [\"same\" ?? \"same\"] }\n".to_owned(),
+            ),
+        ];
+        let parsed_files = crate::config_loader::parse_directory_files(&files, &context).unwrap();
+        let parsed = parsed_files
+            .iter()
+            .find(|(path, _)| path.ends_with("main.crn"))
+            .unwrap()
+            .1
+            .parsed();
+        let configuration =
+            crate::config_loader::load_buffer_configuration(parsed, &schemas, &context);
+        let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+        let bindings = crate::validation::check_bare_binding_uses(
+            &crate::validation::ValidationTypeContext::new_providerless(
+                configuration.judged(),
+                &context,
+                &signatures,
+            ),
+        );
+        let tree = crate::parser::AnalysisTree::try_from_file(parsed).unwrap();
+        let resource = tree.resources().next().unwrap();
+        let values = resource.resolved_attributes();
+        let inputs = bindings
+            .resource_value_inputs(
+                parsed.bare_binding_uses(),
+                resource,
+                &values,
+                configuration.judged().report(),
+            )
+            .unwrap();
+        calls.store(0, Ordering::SeqCst);
+        let resolver = |_: CustomTypeValidationTarget<'_>, _: &Value| {
+            assert!(!native);
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        let findings = schemas
+            .get("mock", "test.Sink", SchemaKind::Resource)
+            .unwrap()
+            .collect_validation_inputs_with_resolver(inputs, &|_| false, &resolver);
+        assert!(findings.is_empty(), "native={native}: {findings:#?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "native={native}");
+    }
+}
+
+#[test]
+fn round8_resolved_string_list_reuses_callbacks_across_union_arms() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let leaf = AttributeType::refined_string_with_validator(
+        TypeIdentity::bare("Counted"),
+        None,
+        None,
+        validator(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Err(TypeError::ValidationFailed {
+                message: "rejected".into(),
+            })
+        }),
+        None,
+    );
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "params",
+                    AttributeType::union(vec![
+                        AttributeType::list(leaf.clone()),
+                        AttributeType::refined_list(
+                            leaf,
+                            true,
+                            Some((Some(3), None)),
+                            ListElements::AllowDuplicates,
+                        ),
+                    ]),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let values: HashMap<String, Value> = HashMap::from([(
+        "params".into(),
+        Value::Concrete(ConcreteValue::StringList(vec![
+            "same".into(),
+            "same".into(),
+        ])),
+    )]);
+    let findings = registry
+        .get("mock", "test.Sink", SchemaKind::Resource)
+        .unwrap()
+        .collect_validation_with_resolver(
+            &values,
+            &|_| false,
+            &|_: CustomTypeValidationTarget<'_>, _: &Value| {
+                panic!("native validation must not use a provider bridge")
+            },
+        );
+    assert!(!findings.is_empty());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "one callback per resolved list item"
+    );
+}
+
+#[test]
+fn round8_authored_walk_requires_retained_children_for_projected_operands() {
+    let text = || Value::Concrete(ConcreteValue::String("ok".into()));
+    for (sink, source, value, missing) in [
+        (
+            AttributeType::string(),
+            "mock.test.Sink { params = \"ok\" }",
+            Value::Deferred(crate::resource::DeferredValue::Coalesce {
+                value: Box::new(text()),
+                default: Box::new(text()),
+            }),
+            "coalesce operand",
+        ),
+        (
+            AttributeType::list(AttributeType::string()),
+            "mock.test.Sink { params = [\"ok\"] }",
+            Value::Concrete(ConcreteValue::List(vec![text(), text()])),
+            "list element 1",
+        ),
+        (
+            AttributeType::list(AttributeType::string()),
+            "mock.test.Sink { params = secret([\"ok\"]) }",
+            Value::Concrete(ConcreteValue::List(vec![text(), text()])),
+            "list element 1",
+        ),
+    ] {
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("test.Sink")
+                .attribute(AttributeSchema::optional("params", sink).build())
+                .validate()
+                .unwrap(),
+        );
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse(source, &context).unwrap();
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &context);
+        let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+        let bindings = crate::validation::check_bare_binding_uses(
+            &crate::validation::ValidationTypeContext::new_providerless(
+                configuration.judged(),
+                &context,
+                &signatures,
+            ),
+        );
+        let tree = crate::parser::AnalysisTree::try_from_file(&parsed).unwrap();
+        let resource = tree.resources().next().unwrap();
+        // Deliberately supply a projection whose extra children have no
+        // authored evidence. It must never be treated as a rootless input.
+        let values = HashMap::from([("params".into(), value)]);
+        let inputs = bindings
+            .resource_value_inputs(
+                parsed.bare_binding_uses(),
+                resource,
+                &values,
+                configuration.judged().report(),
+            )
+            .unwrap();
+        let findings = schemas
+            .get("mock", "test.Sink", SchemaKind::Resource)
+            .unwrap()
+            .collect_validation_inputs_with_resolver(
+                inputs,
+                &|_| false,
+                context.custom_type_resolver(),
+            );
+        assert!(!findings.is_empty(), "{source}: {findings:#?}");
+        assert!(
+            findings.iter().any(|finding| {
+                let message = finding.error.to_string();
+                message.contains("missing expression evidence") && message.contains(missing)
+            }),
+            "{source}: {findings:#?}"
+        );
+    }
+}
+
+#[test]
 fn round7_nested_coalesce_callbacks_are_reused_across_union_arms() {
     for native in [true, false] {
         let calls = Arc::new(AtomicUsize::new(0));

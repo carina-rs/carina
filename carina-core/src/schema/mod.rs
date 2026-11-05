@@ -15619,7 +15619,7 @@ impl PatternResourceSchema<Compiled> {
             mode,
             selected,
             &[],
-            &HashMap::new(),
+            &resource_value_validation::ValueExpressions::ResolvedOnly,
             &mut |_, _, _| {},
         )
         .errors
