@@ -276,22 +276,30 @@ impl<T: ProviderWirePayload> fmt::Debug for WireReady<T> {
     }
 }
 
-// Secret is a transport annotation supported by WIT. Check its complete
-// plaintext while retaining the original core tree for provenance and SDK
-// opaque-leaf views. Nested annotations are transparent inside WIT JSON.
-fn plaintext(value: &Value) -> Value {
+// Check the transport projection while retaining original annotations in core.
+// Every recursive secret conversion protects errors at its own payload boundary.
+fn project_plaintext(value: &Value) -> Result<protocol::Value, ProtocolConvertError> {
     match value {
-        Value::Deferred(DeferredValue::Secret(inner)) => plaintext(inner.expose_plaintext()),
-        Value::Concrete(ConcreteValue::List(values)) => {
-            Value::Concrete(ConcreteValue::List(values.iter().map(plaintext).collect()))
-        }
-        Value::Concrete(ConcreteValue::Map(values)) => Value::Concrete(ConcreteValue::Map(
-            values
-                .iter()
-                .map(|(key, value)| (key.clone(), plaintext(value)))
-                .collect(),
-        )),
-        value => value.clone(),
+        Value::Deferred(DeferredValue::Secret(payload)) => payload.try_inspect(project_plaintext),
+        Value::Concrete(ConcreteValue::List(values)) => values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                project_plaintext(value)
+                    .map_err(|error| error.at_value_path(WirePathSegment::Index(index)))
+            })
+            .collect::<Result<_, _>>()
+            .map(protocol::Value::List),
+        Value::Concrete(ConcreteValue::Map(values)) => values
+            .iter()
+            .map(|(key, value)| {
+                project_plaintext(value)
+                    .map(|value| (key.clone(), value))
+                    .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone().into())))
+            })
+            .collect::<Result<_, _>>()
+            .map(protocol::Value::Map),
+        value => try_core_to_protocol_value(value),
     }
 }
 
@@ -300,40 +308,12 @@ fn project_value(
     target: &ProviderWireTarget,
     attribute: &str,
 ) -> Result<WireValue, ProviderWireError> {
-    let projected = try_core_to_protocol_value(&plaintext(value)).map_err(|error| {
-        ProviderWireError::new(target, attribute, hide_secret_path(value, error))
-    })?;
+    let projected = project_plaintext(value)
+        .map_err(|error| ProviderWireError::new(target, attribute, error))?;
     Ok(WireValue {
         value: projected,
         secret: matches!(value, Value::Deferred(DeferredValue::Secret(_))),
     })
-}
-
-// Preserve public path prefixes, but discard every error segment beneath a
-// secret, including the stored conversion error's Debug/source representation.
-fn hide_secret_path(value: &Value, error: ProtocolConvertError) -> ProtocolConvertError {
-    use ProtocolConvertError::ValuePath;
-    use WirePathSegment::{Index, Key, Secret};
-    match (value, error) {
-        (Value::Deferred(DeferredValue::Secret(_)), error) => {
-            error.into_leaf_error().at_value_path(Secret)
-        }
-        (
-            Value::Concrete(ConcreteValue::List(values)),
-            ValuePath {
-                segment: Index(index),
-                error,
-            },
-        ) => hide_secret_path(&values[index], *error).at_value_path(Index(index)),
-        (
-            Value::Concrete(ConcreteValue::Map(values)),
-            ValuePath {
-                segment: Key(key),
-                error,
-            },
-        ) => hide_secret_path(&values[key.lookup_key()], *error).at_value_path(Key(key)),
-        (_, error) => error,
-    }
 }
 
 fn project_attributes(

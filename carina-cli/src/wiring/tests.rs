@@ -26,6 +26,36 @@ fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress
 }
 
 #[test]
+fn review3_resolved_constraint_origins_mask_secret_paths() {
+    let schema = PatternResourceSchema::new("test.Resource")
+        .attribute(PatternAttributeSchema::optional("attr", PatternAttributeType::string()).build())
+        .validate()
+        .unwrap();
+    let reference = Value::Deferred(DeferredValue::ResourceRef {
+        path: carina_core::resource::AccessPath::new("private_source", "token")
+            .resolve_root_for_test(),
+    });
+    let error = TypeError::PatternMismatch {
+        value: "bad".into(),
+        pattern: "^ok$".into(),
+        attribute: Some("attr".into()),
+        type_name: None,
+    };
+    let public = IndexMap::from([("attr".into(), reference.clone())]);
+    assert_eq!(
+        resolved_constraint_context(&error, &public, schema.as_schema()),
+        (vec!["attr".into()], vec!["private_source.token".into()])
+    );
+    let protected = IndexMap::from([(
+        "attr".into(),
+        Value::Deferred(DeferredValue::Secret(Box::new(reference).into())),
+    )]);
+    let (_, origins) = resolved_constraint_context(&error, &protected, schema.as_schema());
+    assert_eq!(origins, vec!["(secret)"]);
+    assert!(!format!("{origins:?}").contains("private_source"));
+}
+
+#[test]
 fn throttling_error_uses_wire_message_before_display_truncation() {
     for marker in ["ThrottlingException", "Rate exceeded"] {
         let mut wire = ProviderError::api_error("request failed").to_wire();
@@ -9680,7 +9710,7 @@ fn resolve_data_source_refs_for_refresh_defers_unresolved_apply_time_input() {
     assert_eq!(resource.id.resource_type, "Lookup");
     assert_eq!(unresolved.len(), 1);
     assert_eq!(unresolved[0].attribute, "filter");
-    assert_eq!(unresolved[0].paths[0].to_dot_string(), "target.generated");
+    assert_eq!(unresolved[0].diagnostic_references(), ["target.generated"]);
 }
 
 #[test]
@@ -9722,7 +9752,7 @@ fn resolve_data_source_refs_for_refresh_defers_bare_binding_ref_to_new_resource(
         panic!("bare BindingRef to a new resource must defer: {resolved:?}");
     };
     assert_eq!(unresolved[0].attribute, "filter");
-    assert_eq!(unresolved[0].bindings, vec![absolute_binding("target")]);
+    assert_eq!(unresolved[0].diagnostic_references(), ["target"]);
 }
 
 #[test]
@@ -9763,7 +9793,11 @@ fn resolve_data_source_refs_for_refresh_defers_unknown_input_instead_of_calling_
         panic!("Unknown input must not be treated as provider-ready: {resolved:?}");
     };
     assert_eq!(unresolved[0].attribute, "filter");
-    assert_eq!(unresolved[0].unknowns, vec![reason]);
+    assert!(unresolved[0].has_unknowns());
+    assert_eq!(
+        serde_json::to_value(&unresolved[0]).unwrap()["unknowns"],
+        serde_json::to_value(vec![reason]).unwrap()
+    );
 }
 
 #[test]
@@ -9810,7 +9844,7 @@ fn resolve_data_source_refs_for_refresh_defers_resolvable_interpolation_when_tar
     let DataSourceRefreshResolution::DeferredToApply { unresolved, .. } = &resolved[0] else {
         panic!("value-resolvable input that references a new resource must defer: {resolved:?}");
     };
-    assert_eq!(unresolved[0].paths[0].to_dot_string(), "target.role_name");
+    assert_eq!(unresolved[0].diagnostic_references(), ["target.role_name"]);
 }
 
 #[test]

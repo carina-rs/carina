@@ -296,7 +296,7 @@ pub struct TypedDependency {
 
 impl std::fmt::Debug for TypedDependency {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let protected = matches!(self.diagnostic_path, DiagnosticPath::Protected);
+        let protected = self.diagnostic_path.is_secret();
         f.debug_struct("TypedDependency")
             .field("target", &if protected { "(secret)" } else { &self.target })
             .field("target_type", &self.target_type)
@@ -342,9 +342,10 @@ impl TypedDependencyGraph {
             .flatten()
             .filter(|dependency| dependency.target == target)
         {
-            match &dependency.diagnostic_path {
-                DiagnosticPath::Public(_) => return target,
-                DiagnosticPath::Protected => protected = true,
+            if dependency.diagnostic_path.is_secret() {
+                protected = true;
+            } else {
+                return target;
             }
         }
         if protected { "(secret)" } else { target }
@@ -2115,7 +2116,8 @@ mod tests {
         graph.add_edge(
             "web_sg".to_string(),
             TypedDependency {
-                diagnostic_path: DiagnosticPath::Public(ReferencePath::Binding("vpc".into())),
+                diagnostic_path: crate::resource::DiagnosticScope::Public
+                    .path(ReferencePath::Binding("vpc".into())),
                 target: "vpc".to_string(),
                 target_type: Some(ResourceTypePath::new("aws", "vpc")),
                 attribute: String::new(),

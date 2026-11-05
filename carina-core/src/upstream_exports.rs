@@ -159,6 +159,9 @@ impl UpstreamFieldError {
     /// Location-free phrasing shared by CLI and LSP — the LSP diagnostic
     /// range already tells the user *where*, so it only needs *what*.
     pub fn diagnostic_message(&self) -> String {
+        if self.binding == "(secret)" {
+            return crate::resource::INSIDE_SECRET_MESSAGE.into();
+        }
         let suggestion = self
             .suggestion
             .as_ref()
@@ -601,28 +604,29 @@ fn check_upstream_state_field_references_inner<
         if usage == crate::resource::ResourceRefUsage::CoalesceValue {
             return;
         }
-        let path = reference.path();
-        let binding = path.binding_address();
-        let field = path.attribute();
-        let Some(keys) = exports.get(binding) else {
-            return;
-        };
-        if keys.contains_key(field) {
-            return;
-        }
-        let known = known_by_binding
-            .get(binding.as_str())
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        errors.push(Located::new(
-            reference.prefix_location().clone(),
-            UpstreamFieldError {
-                location: context.to_string(),
-                binding: binding.to_string(),
-                field: field.to_string(),
-                suggestion: suggest_similar_name(field, known),
-            },
-        ));
+        errors.extend(reference.collect_diagnostics(|path, errors| {
+            let binding = path.binding_address();
+            let field = path.attribute();
+            let Some(keys) = exports.get(binding) else {
+                return;
+            };
+            if keys.contains_key(field) {
+                return;
+            }
+            let known = known_by_binding
+                .get(binding.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            errors.push(Located::new(
+                reference.prefix_location().clone(),
+                UpstreamFieldError {
+                    location: context.to_string(),
+                    binding: binding.to_string(),
+                    field: field.to_string(),
+                    suggestion: suggest_similar_name(field, known),
+                },
+            ));
+        }));
     };
     for occurrence in parsed.upstream_field_references() {
         if include_typed_consumers || !occurrence.typed_consumer() {
@@ -710,6 +714,9 @@ impl ForIterableBindingKind {
 
 impl UpstreamForIterableShapeError {
     pub fn diagnostic_message(&self) -> String {
+        if self.binding == "(secret)" {
+            return crate::resource::INSIDE_SECRET_MESSAGE.into();
+        }
         // Suggestion text depends on what the upstream actually exports,
         // not just on what the binding expected: a `for x in scalar` has
         // no valid binding form to suggest at all.
@@ -803,48 +810,49 @@ where
     for deferred in parsed.for_iterables() {
         let binding_kind = ForIterableBindingKind::from_for_binding(deferred.binding());
         for reference in deferred.result_references() {
-            let path = reference.path();
-            let Some(fields) = exports.get(path.binding_address()) else {
-                continue;
-            };
-            let Some(entry) = fields.get(path.attribute()) else {
-                continue;
-            };
-            let Some(export_type) = entry.static_type.declared_known() else {
-                continue;
-            };
-            let export_kind = match export_type {
-                TypeExpr::List(_) => Some(ForIterableBindingKind::List),
-                TypeExpr::Map(_) => Some(ForIterableBindingKind::Map),
-                TypeExpr::String
-                | TypeExpr::Bool
-                | TypeExpr::Int
-                | TypeExpr::Float
-                | TypeExpr::Duration
-                | TypeExpr::Simple(_)
-                | TypeExpr::UnloadedSchemaType(_)
-                | TypeExpr::Ref(_)
-                | TypeExpr::DottedUnresolved(_)
-                | TypeExpr::SchemaType { .. }
-                | TypeExpr::Struct { .. }
-                | TypeExpr::StringLiteral(_)
-                | TypeExpr::Union(_) => None,
-            };
-            // Scalars feeding a `for` are a different kind of bug; the
-            // shape-check fires on them too because no kind matches.
-            if export_kind == Some(binding_kind) {
-                continue;
-            }
-            errors.push(Located::new(
-                reference.prefix_location().clone(),
-                UpstreamForIterableShapeError {
-                    location: format!("for-expression `{}`", deferred.header()),
-                    binding: path.binding().to_string(),
-                    field: path.attribute().to_string(),
-                    export_type: export_type.clone(),
-                    binding_kind,
-                },
-            ));
+            errors.extend(reference.collect_diagnostics(|path, errors| {
+                let Some(fields) = exports.get(path.binding_address()) else {
+                    return;
+                };
+                let Some(entry) = fields.get(path.attribute()) else {
+                    return;
+                };
+                let Some(export_type) = entry.static_type.declared_known() else {
+                    return;
+                };
+                let export_kind = match export_type {
+                    TypeExpr::List(_) => Some(ForIterableBindingKind::List),
+                    TypeExpr::Map(_) => Some(ForIterableBindingKind::Map),
+                    TypeExpr::String
+                    | TypeExpr::Bool
+                    | TypeExpr::Int
+                    | TypeExpr::Float
+                    | TypeExpr::Duration
+                    | TypeExpr::Simple(_)
+                    | TypeExpr::UnloadedSchemaType(_)
+                    | TypeExpr::Ref(_)
+                    | TypeExpr::DottedUnresolved(_)
+                    | TypeExpr::SchemaType { .. }
+                    | TypeExpr::Struct { .. }
+                    | TypeExpr::StringLiteral(_)
+                    | TypeExpr::Union(_) => None,
+                };
+                // Scalars feeding a `for` are a different kind of bug; the
+                // shape-check fires on them too because no kind matches.
+                if export_kind == Some(binding_kind) {
+                    return;
+                }
+                errors.push(Located::new(
+                    reference.prefix_location().clone(),
+                    UpstreamForIterableShapeError {
+                        location: format!("for-expression `{}`", deferred.header()),
+                        binding: path.binding().to_string(),
+                        field: path.attribute().to_string(),
+                        export_type: export_type.clone(),
+                        binding_kind,
+                    },
+                ));
+            }));
         }
     }
     errors.sort_by(|a, b| {
@@ -896,6 +904,9 @@ pub struct UpstreamAttributeAccessShapeError {
 
 impl UpstreamAttributeAccessShapeError {
     pub fn diagnostic_message(&self) -> String {
+        if self.binding == "(secret)" {
+            return crate::resource::INSIDE_SECRET_MESSAGE.into();
+        }
         match &self.mismatched_at {
             TypeExpr::Struct { fields } => {
                 let known: Vec<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
@@ -1068,41 +1079,42 @@ fn visit_attribute_access<B: BindingAddress>(
     include_resolver_struct_errors: bool,
     errors: &mut Vec<Located<UpstreamAttributeAccessShapeError>>,
 ) {
-    let path = reference.path();
-    let leading: Vec<String> = path.leading_field_path();
-    if leading.is_empty() {
-        return;
-    }
-    let binding = path.binding_address();
-    let attribute = path.attribute();
-    let Some(fields) = exports.get(binding) else {
-        return;
-    };
-    let Some(entry) = fields.get(attribute) else {
-        return;
-    };
-    let Some(export_type) = entry.static_type.declared_known() else {
-        return;
-    };
-    let walk_result = walk_type_expr_fields(export_type, &leading);
-    if let Err((mismatched_at, bad_segment)) = walk_result {
-        if !include_resolver_struct_errors && matches!(mismatched_at, TypeExpr::Struct { .. }) {
+    errors.extend(reference.collect_diagnostics(|path, errors| {
+        let leading: Vec<String> = path.leading_field_path();
+        if leading.is_empty() {
             return;
         }
-        let mismatched_at = mismatched_at.clone();
-        let bad_segment = bad_segment.to_string();
-        errors.push(Located::new(
-            reference.prefix_location().clone(),
-            UpstreamAttributeAccessShapeError {
-                location: location.to_string(),
-                binding: binding.to_string(),
-                field: attribute.to_string(),
-                field_path: leading,
-                mismatched_at,
-                bad_segment,
-            },
-        ));
-    }
+        let binding = path.binding_address();
+        let attribute = path.attribute();
+        let Some(fields) = exports.get(binding) else {
+            return;
+        };
+        let Some(entry) = fields.get(attribute) else {
+            return;
+        };
+        let Some(export_type) = entry.static_type.declared_known() else {
+            return;
+        };
+        let walk_result = walk_type_expr_fields(export_type, &leading);
+        if let Err((mismatched_at, bad_segment)) = walk_result {
+            if !include_resolver_struct_errors && matches!(mismatched_at, TypeExpr::Struct { .. }) {
+                return;
+            }
+            let mismatched_at = mismatched_at.clone();
+            let bad_segment = bad_segment.to_string();
+            errors.push(Located::new(
+                reference.prefix_location().clone(),
+                UpstreamAttributeAccessShapeError {
+                    location: location.to_string(),
+                    binding: binding.to_string(),
+                    field: attribute.to_string(),
+                    field_path: leading,
+                    mismatched_at,
+                    bad_segment,
+                },
+            ));
+        }
+    }));
 }
 
 /// A `[index]` subscript reads an `upstream_state` export at a depth
@@ -1130,6 +1142,9 @@ pub struct UpstreamSubscriptShapeError {
 
 impl UpstreamSubscriptShapeError {
     pub fn diagnostic_message(&self) -> String {
+        if self.binding == "(secret)" {
+            return crate::resource::INSIDE_SECRET_MESSAGE.into();
+        }
         let mut access = format!("{}.{}", self.binding, self.field);
         for seg in &self.field_path {
             access.push('.');
@@ -1258,79 +1273,126 @@ fn visit_subscript_access<B: BindingAddress>(
     location: &str,
     errors: &mut Vec<Located<UpstreamSubscriptShapeError>>,
 ) {
-    let path = reference.path();
-    // Chained access (`cert.foo[0].bar`) is not yet exercised by
-    // this checker — see #3025 for the planned segments-driven
-    // walker. Skip the path here; the resolver still surfaces
-    // typos at apply time and the simple-shape paths remain
-    // covered.
-    if !path.is_simple_shape() {
-        return;
-    }
-    let subscripts = path.trailing_subscripts();
-    if subscripts.is_empty() {
-        return;
-    }
-    let binding = path.binding_address();
-    let attribute = path.attribute();
-    let Some(fields) = exports.get(binding) else {
-        return;
-    };
-    let Some(entry) = fields.get(attribute) else {
-        return;
-    };
-    let Some(export_type) = entry.static_type.declared_known() else {
-        return;
-    };
-    // If the field path itself doesn't resolve, the
-    // attribute-access check will already report it. Skip here so
-    // we don't double-fire.
-    let field_path: Vec<String> = path.leading_field_path();
-    let Ok(at_field_end) = walk_type_expr_fields(export_type, &field_path) else {
-        return;
-    };
-    // Step through each subscript, descending into the element
-    // type when it fits and emitting at the first kind mismatch.
-    let mut current = at_field_end;
-    for sub in &subscripts {
-        let next = match current {
-            TypeExpr::List(inner) => match sub {
-                Subscript::Int { .. } => Some(inner.as_ref()),
-                Subscript::Str { .. } => None,
-            },
-            TypeExpr::Map(inner) => match sub {
-                Subscript::Int { .. } => None,
-                Subscript::Str { .. } => Some(inner.as_ref()),
-            },
-            TypeExpr::String
-            | TypeExpr::Bool
-            | TypeExpr::Int
-            | TypeExpr::Float
-            | TypeExpr::Duration
-            | TypeExpr::Simple(_)
-            | TypeExpr::UnloadedSchemaType(_)
-            | TypeExpr::Ref(_)
-            | TypeExpr::DottedUnresolved(_)
-            | TypeExpr::SchemaType { .. }
-            | TypeExpr::Struct { .. }
-            | TypeExpr::StringLiteral(_)
-            | TypeExpr::Union(_) => None,
-        };
-        let Some(next) = next else {
-            errors.push(Located::new(
-                reference.prefix_location().clone(),
-                UpstreamSubscriptShapeError {
-                    location: location.to_string(),
-                    binding: binding.to_string(),
-                    field: attribute.to_string(),
-                    field_path: field_path.clone(),
-                    mismatched_at: current.clone(),
-                    bad_subscript: sub.clone(),
-                },
-            ));
+    errors.extend(reference.collect_diagnostics(|path, errors| {
+        // Chained access (`cert.foo[0].bar`) is not yet exercised by
+        // this checker — see #3025 for the planned segments-driven
+        // walker. Skip the path here; the resolver still surfaces
+        // typos at apply time and the simple-shape paths remain
+        // covered.
+        if !path.is_simple_shape() {
+            return;
+        }
+        let subscripts = path.trailing_subscripts();
+        if subscripts.is_empty() {
+            return;
+        }
+        let binding = path.binding_address();
+        let attribute = path.attribute();
+        let Some(fields) = exports.get(binding) else {
             return;
         };
-        current = next;
+        let Some(entry) = fields.get(attribute) else {
+            return;
+        };
+        let Some(export_type) = entry.static_type.declared_known() else {
+            return;
+        };
+        // If the field path itself doesn't resolve, the
+        // attribute-access check will already report it. Skip here so
+        // we don't double-fire.
+        let field_path: Vec<String> = path.leading_field_path();
+        let Ok(at_field_end) = walk_type_expr_fields(export_type, &field_path) else {
+            return;
+        };
+        // Step through each subscript, descending into the element
+        // type when it fits and emitting at the first kind mismatch.
+        let mut current = at_field_end;
+        for sub in &subscripts {
+            let next = match current {
+                TypeExpr::List(inner) => match sub {
+                    Subscript::Int { .. } => Some(inner.as_ref()),
+                    Subscript::Str { .. } => None,
+                },
+                TypeExpr::Map(inner) => match sub {
+                    Subscript::Int { .. } => None,
+                    Subscript::Str { .. } => Some(inner.as_ref()),
+                },
+                TypeExpr::String
+                | TypeExpr::Bool
+                | TypeExpr::Int
+                | TypeExpr::Float
+                | TypeExpr::Duration
+                | TypeExpr::Simple(_)
+                | TypeExpr::UnloadedSchemaType(_)
+                | TypeExpr::Ref(_)
+                | TypeExpr::DottedUnresolved(_)
+                | TypeExpr::SchemaType { .. }
+                | TypeExpr::Struct { .. }
+                | TypeExpr::StringLiteral(_)
+                | TypeExpr::Union(_) => None,
+            };
+            let Some(next) = next else {
+                errors.push(Located::new(
+                    reference.prefix_location().clone(),
+                    UpstreamSubscriptShapeError {
+                        location: location.to_string(),
+                        binding: binding.to_string(),
+                        field: attribute.to_string(),
+                        field_path: field_path.clone(),
+                        mismatched_at: current.clone(),
+                        bad_subscript: sub.clone(),
+                    },
+                ));
+                return;
+            };
+            current = next;
+        }
+    }));
+}
+
+impl crate::resource::InsideSecret for UpstreamFieldError {
+    fn inside_secret(mut self) -> Self {
+        self.location = "(secret)".into();
+        self.binding = "(secret)".into();
+        self.field = "(secret)".into();
+        self.suggestion = None;
+        self
+    }
+}
+
+impl crate::resource::InsideSecret for UpstreamForIterableShapeError {
+    fn inside_secret(mut self) -> Self {
+        self.location = "(secret)".into();
+        self.binding = "(secret)".into();
+        self.field = "(secret)".into();
+        self.export_type = TypeExpr::String;
+        self
+    }
+}
+
+impl crate::resource::InsideSecret for UpstreamAttributeAccessShapeError {
+    fn inside_secret(mut self) -> Self {
+        self.location = "(secret)".into();
+        self.binding = "(secret)".into();
+        self.field = "(secret)".into();
+        self.field_path.clear();
+        self.mismatched_at = TypeExpr::String;
+        self.bad_segment = "(secret)".into();
+        self
+    }
+}
+
+impl crate::resource::InsideSecret for UpstreamSubscriptShapeError {
+    fn inside_secret(mut self) -> Self {
+        self.location = "(secret)".into();
+        self.binding = "(secret)".into();
+        self.field = "(secret)".into();
+        self.field_path.clear();
+        self.mismatched_at = TypeExpr::String;
+        self.bad_subscript = Subscript::Str {
+            key: "(secret)".into(),
+        };
+        self
     }
 }
 
@@ -1465,6 +1527,24 @@ mod tests {
                 type_expr,
             ))),
             value: None,
+        }
+    }
+
+    #[test]
+    fn review3_secret_upstream_lookup_protects_findings() {
+        let parsed = parse_project(
+            r#"
+            let private_orgs = upstream_state { source = "../organizations" }
+            test.resource { name = secret(private_orgs.private_field) }
+        "#,
+        );
+        let exports = mk_exports(&[("private_orgs", &[])]);
+        let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+        let errors = check_upstream_state_field_references(&tree, &exports);
+        assert_eq!(errors.len(), 1);
+        for text in [errors[0].to_string(), format!("{:?}", errors[0])] {
+            assert!(!text.contains("private_orgs"), "{text}");
+            assert!(!text.contains("private_field"), "{text}");
         }
     }
 

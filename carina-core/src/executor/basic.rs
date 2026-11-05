@@ -417,7 +417,9 @@ fn assert_fully_resolved(
             UnresolvedSite::Ref {
                 path: path.to_dot_string(),
             },
-            Some(DiagnosticPath::Public(ReferencePath::Access(path.clone()))),
+            Some(
+                crate::resource::DiagnosticScope::Public.path(ReferencePath::Access(path.clone())),
+            ),
             bindings,
             value,
         )),
@@ -426,9 +428,10 @@ fn assert_fully_resolved(
             UnresolvedSite::Ref {
                 path: binding.to_string(),
             },
-            Some(DiagnosticPath::Public(ReferencePath::Binding(
-                binding.clone(),
-            ))),
+            Some(
+                crate::resource::DiagnosticScope::Public
+                    .path(ReferencePath::Binding(binding.clone())),
+            ),
             bindings,
             value,
         )),
@@ -547,21 +550,24 @@ fn unresolved_binding_message(
         ),
     };
 
-    let referenced_binding = match &referenced_path {
-        Some(DiagnosticPath::Protected) => {
-            return ReportedError::message(format!(
-                "{opener} {}",
-                crate::resource::INSIDE_SECRET_MESSAGE
-            ));
-        }
-        Some(DiagnosticPath::Public(path)) => path.as_ref().binding(),
-        None => "",
-    };
+    if referenced_path
+        .as_ref()
+        .is_some_and(DiagnosticPath::is_secret)
+    {
+        return ReportedError::message(format!(
+            "{opener} {}",
+            crate::resource::INSIDE_SECRET_MESSAGE
+        ));
+    }
+    let referenced_binding = referenced_path
+        .as_ref()
+        .map(|path| path.render(|path| path.as_ref().binding().to_string(), String::new))
+        .unwrap_or_default();
 
-    let partial = match bindings.completeness(referenced_binding) {
+    let partial = match bindings.completeness(&referenced_binding) {
         Some(BindingCompleteness::PartialReadBack(partial)) => {
             let mut references_missing_attribute = false;
-            referenced_value.visit_resource_refs(&mut |path| {
+            referenced_value.visit_resource_refs_with_scope(&mut |path, _usage, _scope| {
                 references_missing_attribute |= path.binding() == referenced_binding
                     && partial.attribute_is_missing(path.attribute());
             });
@@ -585,7 +591,7 @@ fn unresolved_binding_message(
             partial.operation().past_tense(),
             partial.reason(),
         ),
-        _ => match bindings.source(referenced_binding) {
+        _ => match bindings.source(&referenced_binding) {
             Some(crate::binding_index::BindingValueSource::Upstream) => format!(
                 "Binding `{referenced_binding}` comes from an `upstream_state` block, but the referenced export is not present in the upstream's saved state. \
                  Apply the upstream stack first, then re-run apply here. \

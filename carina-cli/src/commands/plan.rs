@@ -6586,10 +6586,11 @@ async fn load_provider_referenced_upstream_states<E>(
             provider: required_by.provider,
             attribute: required_by.attribute,
             error: Box::new(
-                if matches!(
-                    required_by.diagnostic_path,
-                    Some(carina_core::resource::DiagnosticPath::Protected)
-                ) {
+                if required_by
+                    .diagnostic_path
+                    .as_ref()
+                    .is_some_and(carina_core::resource::DiagnosticPath::is_secret)
+                {
                     AppError::Config(carina_core::resource::INSIDE_SECRET_MESSAGE.into())
                 } else {
                     error
@@ -6626,11 +6627,12 @@ fn provider_referenced_upstream_states<E>(
              scope: carina_core::resource::DiagnosticScope| {
                 let mut requirement = required_by.clone();
                 requirement.diagnostic_path = Some(
-                    if matches!(
-                        requirement.diagnostic_path,
-                        Some(carina_core::resource::DiagnosticPath::Protected)
-                    ) {
-                        carina_core::resource::DiagnosticPath::Protected
+                    if requirement
+                        .diagnostic_path
+                        .as_ref()
+                        .is_some_and(carina_core::resource::DiagnosticPath::is_secret)
+                    {
+                        carina_core::resource::DiagnosticScope::Secret.path(None)
                     } else {
                         scope.path(path)
                     },
@@ -6685,10 +6687,10 @@ fn provider_referenced_upstream_states<E>(
         if !visited.insert((
             binding.clone(),
             attribute.clone(),
-            matches!(
-                required_by.diagnostic_path,
-                Some(carina_core::resource::DiagnosticPath::Protected)
-            ),
+            required_by
+                .diagnostic_path
+                .as_ref()
+                .is_some_and(carina_core::resource::DiagnosticPath::is_secret),
         )) {
             continue;
         }
@@ -6696,12 +6698,13 @@ fn provider_referenced_upstream_states<E>(
             referenced_upstreams
                 .entry(binding)
                 .and_modify(|previous: &mut ProviderAttributeRequirement| {
-                    if matches!(
-                        required_by.diagnostic_path,
-                        Some(carina_core::resource::DiagnosticPath::Protected)
-                    ) {
+                    if required_by
+                        .diagnostic_path
+                        .as_ref()
+                        .is_some_and(carina_core::resource::DiagnosticPath::is_secret)
+                    {
                         previous.diagnostic_path =
-                            Some(carina_core::resource::DiagnosticPath::Protected);
+                            Some(carina_core::resource::DiagnosticScope::Secret.path(None));
                     }
                 })
                 .or_insert(required_by);

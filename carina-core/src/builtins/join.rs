@@ -90,10 +90,7 @@ fn join_scalar<B: BindingAddress>(
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
             let (text, _) = inner.try_inspect(join_scalar)?;
-            Ok((
-                ValueString::diagnostic_sensitive(text.into_plaintext()),
-                true,
-            ))
+            Ok((text, true))
         }
         other => Err(format!(
             "join() list elements must be scalar, got {}",

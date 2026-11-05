@@ -5562,7 +5562,7 @@ async fn wasm_normalize_desired_edits_known_leaves_in_mixed_containers() {
     );
     assert_eq!(names[0], string("www.example.com"));
     assert!(
-        matches!(&names[1], Value::Deferred(DeferredValue::Secret(inner)) if inner.expose_plaintext() == &string("private-leaf"))
+        matches!(&names[1], Value::Deferred(DeferredValue::Secret(inner)) if inner.plaintext_for_test() == &string("private-leaf"))
     );
     assert!(matches!(
         &names[2],
@@ -5673,7 +5673,7 @@ async fn http_wasm_normalize_desired_preserves_leaf_handles() {
         panic!()
     };
     assert_eq!(
-        inner.expose_plaintext(),
+        inner.plaintext_for_test(),
         &Value::Concrete(ConcreteValue::String("http-private".into()))
     );
     let Some(Value::Concrete(ConcreteValue::List(items))) = resources[0].get_attr("items") else {

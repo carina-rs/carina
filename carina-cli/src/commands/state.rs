@@ -7890,16 +7890,14 @@ mod tests {
         let resource: DataSource = DataSource::with_provider("mock", "iam.Roles", "roles", None);
         let warning = format_deferred_state_refresh_warning(
             &resource,
-            &[UnresolvedDataSourceInput {
-                attribute: "name_regex".to_string(),
-                paths: vec![
-                    carina_core::resource::AccessPath::new("target_role", "role_name")
+            &[UnresolvedDataSourceInput::collect(
+                "name_regex",
+                &Value::Deferred(carina_core::resource::DeferredValue::ResourceRef {
+                    path: carina_core::resource::AccessPath::new("target_role", "role_name")
                         .resolve_root_for_test(),
-                ],
-                bindings: Vec::new(),
-                unknowns: Vec::new(),
-                diagnostic_scope: carina_core::resource::DiagnosticScope::Public,
-            }],
+                }),
+            )
+            .unwrap()],
         );
 
         assert!(warning.contains("mock.iam.Roles.roles"));

@@ -80,9 +80,9 @@ where
     for resource in tree.resources() {
         for attribute in resource.located_attributes() {
             let (key, value) = attribute.detail();
-            value.visit_resource_refs(&mut |path| {
+            value.visit_resource_refs_with_scope(&mut |path, _usage, scope| {
                 check_ref(
-                    path,
+                    (path, scope),
                     key,
                     attribute.location(),
                     &by_binding,
@@ -97,7 +97,7 @@ where
 }
 
 fn check_ref<B: BindingAddress>(
-    path: &AccessPath<B>,
+    (path, scope): (&AccessPath<B>, crate::resource::DiagnosticScope),
     key: &str,
     location: &DeclarationLocation,
     bindings: &HashMap<B, (&String, &String)>,
@@ -119,9 +119,15 @@ fn check_ref<B: BindingAddress>(
         return;
     };
     if path_traverses_deferred(attribute, path.segments()) {
+        let diagnostic_path = scope
+            .path(crate::resource::ReferencePath::Access(path.clone()))
+            .to_dot_string();
+        let target = scope
+            .path(crate::resource::ReferencePath::Binding(target.clone()))
+            .to_dot_string();
         out.push(Located::new(location.clone(), DeferredPopulateDiagnostic {
-            message: format!("attribute `{key}` references `{}`, which is populated asynchronously by the provider after Create. Add a `wait {target} {{ until = ... }}` block in this directory before downstream resources read this attribute.", path.to_dot_string()),
-            attribute_key: key.to_string(), unresolved_path: path.to_dot_string(), target_binding: target.to_string(),
+            message: format!("attribute `{key}` references `{}`, which is populated asynchronously by the provider after Create. Add a `wait {target} {{ until = ... }}` block in this directory before downstream resources read this attribute.", diagnostic_path.clone()),
+            attribute_key: key.to_string(), unresolved_path: diagnostic_path.clone(), target_binding: target.to_string(),
         }));
     }
 }
@@ -194,6 +200,22 @@ fn path_traverses_deferred(top_attr: EffectiveAttribute<'_>, segments: &[PathSeg
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn review3_secret_deferred_populate_warning_masks_reference() {
+        let parsed = fixture(
+            "let private_cert = aws.acm.Certificate {}\nlet record = aws.route53.RecordSet { resource_records = [secret(private_cert.domain_validation_options[0].resource_record_value)] }\n",
+        );
+        let diags = validate_deferred_populate_refs(
+            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &registry_for_acm(),
+        );
+        assert_eq!(diags.len(), 1);
+        for text in [diags[0].to_string(), format!("{:?}", diags[0])] {
+            assert!(!text.contains("private_cert"), "{text}");
+            assert!(!text.contains("domain_validation_options"), "{text}");
+        }
+    }
+
     use crate::schema::{
         PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
     };

@@ -1666,11 +1666,20 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
     /// Every direct reference spelling that may contribute the iterable.
     pub fn reference_candidates(&self) -> std::collections::BTreeSet<String> {
         let mut candidates = std::collections::BTreeSet::new();
-        self.iterable.visit_resource_refs(&mut |path| {
-            candidates.insert(path.to_string());
-        });
-        self.iterable.visit_binding_refs(&mut |binding, _| {
-            candidates.insert(binding.to_string());
+        self.iterable
+            .visit_resource_refs_with_scope(&mut |path, _usage, scope| {
+                candidates.insert(
+                    scope
+                        .path(crate::resource::ReferencePath::Access(path.clone()))
+                        .to_dot_string(),
+                );
+            });
+        self.iterable.visit_binding_refs(&mut |binding, scope| {
+            candidates.insert(
+                scope
+                    .path(crate::resource::ReferencePath::Binding(binding.clone()))
+                    .to_dot_string(),
+            );
         });
         candidates
     }
@@ -1679,15 +1688,28 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
     /// The full iterable spelling remains available through `format_value` for
     /// unresolved expressions whose display should name the accessed value.
     pub fn binding_description(&self) -> String {
-        let roots = self.root_bindings();
+        let mut roots = std::collections::BTreeSet::new();
+        self.iterable
+            .visit_resource_refs_with_scope(&mut |path, _, scope| {
+                roots.insert(
+                    scope
+                        .path(crate::resource::ReferencePath::Binding(
+                            path.binding_address().clone(),
+                        ))
+                        .to_dot_string(),
+                );
+            });
+        self.iterable.visit_binding_refs(&mut |binding, scope| {
+            roots.insert(
+                scope
+                    .path(crate::resource::ReferencePath::Binding(binding.clone()))
+                    .to_dot_string(),
+            );
+        });
         if roots.is_empty() {
             crate::value::format_value(&self.iterable)
         } else {
-            roots
-                .into_iter()
-                .map(|binding| binding.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
+            roots.into_iter().collect::<Vec<_>>().join(", ")
         }
     }
 }

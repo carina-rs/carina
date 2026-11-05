@@ -3956,3 +3956,49 @@ fn review2_f2_repeated_secret_wrapping_has_no_phantom_state_diff() {
         crate::schema::empty_defs_for_schema_walks()
     ));
 }
+
+#[test]
+fn review3_payload_string_marking_preserves_diff_results() {
+    let plain = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "text".into(),
+            Value::Concrete(ConcreteValue::String("runtime".into())),
+        ),
+        (
+            "list".into(),
+            Value::Concrete(ConcreteValue::StringList(vec!["entry".into()])),
+        ),
+    ])));
+    let payload: crate::resource::SecretPayload<
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    > = Box::new(plain.clone()).into();
+    let marked = payload.expose_plaintext();
+    let desired = HashMap::from([("attr".into(), marked.clone())]);
+    let current = HashMap::from([("attr".into(), plain.clone())]);
+    assert!(type_aware_equal(
+        marked,
+        &plain,
+        None,
+        crate::schema::empty_defs_for_schema_walks()
+    ));
+    assert!(
+        find_changed_attributes(
+            &desired,
+            &current,
+            None,
+            &NestedWriteOnlyRecord::default(),
+            None,
+            None
+        )
+        .is_empty()
+    );
+    let secret = Value::Deferred(DeferredValue::Secret(payload));
+    let hashed = persisted_secret(&value_to_json(&secret).unwrap());
+    assert!(type_aware_equal(
+        &secret,
+        &hashed,
+        None,
+        crate::schema::empty_defs_for_schema_walks()
+    ));
+}

@@ -4506,7 +4506,7 @@ mod tests {
         let wit_v = core_to_wit_value(&original).unwrap();
         let back = wit_to_core_value(&wit_v).unwrap();
         match back {
-            CoreValue::Deferred(DeferredValue::Secret(inner)) => match inner.expose_plaintext() {
+            CoreValue::Deferred(DeferredValue::Secret(inner)) => match inner.plaintext_for_test() {
                 CoreValue::Concrete(ConcreteValue::String(s)) => assert_eq!(s, "hunter2"),
                 other => panic!("expected inner String, got: {other:?}"),
             },

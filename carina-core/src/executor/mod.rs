@@ -121,10 +121,11 @@ use crate::provider::{
     ResumeFailureKind, ResumeOutcome, SentAttributes, SentDesiredAttributes, UnknownCreateOutcome,
     UpdateRequest,
 };
+#[cfg(test)]
+use crate::resource::ApplyTimeUnknown;
 use crate::resource::{
-    ApplyTimeUnknown, ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart,
-    ModuleSource, ResolvedResource, Resource, ResourceId, ResourceIdentity, SavedModuleSource,
-    SnapshotState as State, Value,
+    Current, DataSource, ModuleSource, ResolvedResource, Resource, ResourceId, ResourceIdentity,
+    SavedModuleSource, SnapshotState as State,
 };
 use crate::wait::WaitObservation;
 
@@ -758,64 +759,6 @@ impl<S: Clone> ProviderCheckInputs<'_, S> {
     }
 }
 
-fn visit_unknowns(
-    value: &Value,
-    scope: crate::resource::DiagnosticScope,
-    f: &mut impl FnMut(&ApplyTimeUnknown, crate::resource::DiagnosticScope),
-) {
-    match value {
-        Value::Deferred(DeferredValue::Unknown(reason)) => f(reason, scope),
-        Value::Concrete(ConcreteValue::List(items)) => {
-            for item in items {
-                visit_unknowns(item, scope, f);
-            }
-        }
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            for item in map.values() {
-                visit_unknowns(item, scope, f);
-            }
-        }
-        Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            for part in parts {
-                if let InterpolationPart::Expr(value) = part {
-                    visit_unknowns(value, scope, f);
-                }
-            }
-        }
-        Value::Deferred(
-            DeferredValue::FunctionCall { args, .. }
-            | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
-        ) => {
-            for arg in args {
-                visit_unknowns(arg.walker_value(), scope, f);
-            }
-        }
-        Value::Deferred(DeferredValue::Access(access)) => visit_unknowns(access.base(), scope, f),
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            inner.visit_reference_inventory(|value, scope| visit_unknowns(value, scope, f))
-        }
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            visit_unknowns(value, scope, f);
-            visit_unknowns(default, scope, f);
-        }
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
-            deferred
-                .values()
-                .into_iter()
-                .for_each(|value| visit_unknowns(value, scope, f));
-        }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            visit_unknowns(expression.lhs(), scope, f);
-            visit_unknowns(expression.rhs(), scope, f);
-        }
-        Value::Concrete(_)
-        | Value::Deferred(DeferredValue::ResourceRef { .. })
-        | Value::Deferred(DeferredValue::BindingRef { .. }) => {}
-        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
-    }
-}
-
 pub fn unresolved_data_source_inputs<S, D>(
     resource: &DataSource<
         S,
@@ -827,43 +770,7 @@ pub fn unresolved_data_source_inputs<S, D>(
     resource
         .attributes
         .iter()
-        .filter_map(|(attribute, value)| {
-            let mut diagnostic_scope = crate::resource::DiagnosticScope::Public;
-            let mut paths = Vec::new();
-            let mut bindings = Vec::new();
-            let mut unknowns = Vec::new();
-            value.visit_resource_refs_with_scope(&mut |path, _, scope| {
-                if scope.is_secret() {
-                    diagnostic_scope = scope;
-                }
-                paths.push(path.clone());
-            });
-            value.visit_binding_refs(&mut |binding, scope| {
-                if scope.is_secret() {
-                    diagnostic_scope = scope;
-                }
-                bindings.push(binding.clone());
-            });
-            visit_unknowns(
-                value,
-                crate::resource::DiagnosticScope::Public,
-                &mut |reason, scope| {
-                    if scope.is_secret() {
-                        diagnostic_scope = scope;
-                    }
-                    unknowns.push(reason.clone());
-                },
-            );
-            (!paths.is_empty() || !bindings.is_empty() || !unknowns.is_empty()).then(|| {
-                UnresolvedDataSourceInput {
-                    attribute: attribute.clone(),
-                    paths,
-                    bindings,
-                    unknowns,
-                    diagnostic_scope,
-                }
-            })
-        })
+        .filter_map(|(attribute, value)| UnresolvedDataSourceInput::collect(attribute, value))
         .collect()
 }
 

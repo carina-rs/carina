@@ -1673,7 +1673,7 @@ impl DiagnosticRun<'_> {
             // independent export obligation, including removed attributes.
             let value = param.value()?;
             let mut removed_secret = false;
-            value.visit_resource_refs_with_usage(&mut |path, usage| {
+            value.visit_resource_refs_with_scope(&mut |path, usage, _scope| {
                 if usage == carina_core::resource::ResourceRefUsage::Required
                     && value_bindings
                         .removed_attribute_was_sensitive(path.binding(), path.attribute())
@@ -1802,21 +1802,25 @@ impl DiagnosticRun<'_> {
             .iter()
             .filter_map(|value| {
                 let reference = value.reference();
-                let identifier = reference.path().binding();
-                if defined_bindings.contains(identifier)
-                    || declared_providers.contains(identifier)
-                    || self.provider_names.iter().any(|name| name == identifier)
-                    || enum_namespaces.contains(identifier)
-                    || !emitted.insert(reference.location().clone())
+                if reference.binding_matches(|binding| {
+                    let identifier = binding.as_str();
+                    defined_bindings.contains(identifier)
+                        || declared_providers.contains(identifier)
+                        || self.provider_names.iter().any(|name| name == identifier)
+                        || enum_namespaces.contains(identifier)
+                }) || !emitted.insert(reference.location().clone())
                 {
                     return None;
                 }
                 let finding = carina_core::parser::Located::new(
                     reference.prefix_location().clone(),
-                    reference.diagnostic(format!(
-                        "Undefined resource: '{}'. Define it with 'let {} = aws...'",
-                        identifier, identifier
-                    )),
+                    reference.render(|path| {
+                        format!(
+                            "Undefined resource: '{}'. Define it with 'let {} = aws...'",
+                            path.binding(),
+                            path.binding()
+                        )
+                    }),
                 );
                 render_merged(
                     doc,
@@ -1844,7 +1848,7 @@ impl DiagnosticRun<'_> {
         let mut diagnostics = Vec::new();
         for resource in tree.resources() {
             for value in resource.attributes().values() {
-                value.visit_resource_refs_with_usage(&mut |path, usage| {
+                value.visit_resource_refs_with_scope(&mut |path, usage, _scope| {
                     let reference = tree.reference_for_path(path);
                     let mut location =
                         reference.attribute_location(path.binding(), path.attribute());

@@ -3362,11 +3362,11 @@ impl InsideSecret for CompositionRefError {
     fn inside_secret(mut self) -> Self {
         match &mut self {
             Self::ModuleCall(error) => {
-                error.path = DiagnosticPath::Protected;
+                error.path = crate::resource::DiagnosticScope::Secret.path(None);
                 error.kind = error.kind.clone().inside_secret();
             }
             Self::Attribute(error) => {
-                error.error.path = DiagnosticPath::Protected;
+                error.error.path = crate::resource::DiagnosticScope::Secret.path(None);
                 error.error.kind = error.error.kind.clone().inside_secret();
             }
         }
@@ -4630,7 +4630,7 @@ pub fn validate_composition_ref_types_with_bindings<P: PlaceholderKind>(
                         CompositionModuleCallRefError {
                             argument: argument_name.clone(),
                             origin: Box::new(origin),
-                            path: DiagnosticPath::Public(path.to_owned()),
+                            path: crate::resource::DiagnosticScope::Public.path(path.to_owned()),
                             kind,
                             call_path: call_path.clone(),
                             reference_position: current_position,
@@ -4676,7 +4676,8 @@ pub fn validate_composition_ref_types_with_bindings<P: PlaceholderKind>(
                         CompositionAttributeRefError {
                             error: AttributeParamRefError {
                                 attribute: attribute_name.clone(),
-                                path: DiagnosticPath::Public(path.to_owned()),
+                                path: crate::resource::DiagnosticScope::Public
+                                    .path(path.to_owned()),
                                 kind,
                             },
                             module_name: call.module_name.clone(),
@@ -5544,14 +5545,27 @@ where
         .iter()
         .filter(|deferred| deferred.checks_scope())
     {
-        for root in deferred.iterable().root_bindings() {
+        let mut roots = std::collections::BTreeMap::new();
+        let mut record = |binding: &B, scope: crate::resource::DiagnosticScope| {
+            let existing = roots.entry(binding.clone()).or_insert(scope);
+            if scope.is_secret() {
+                *existing = scope;
+            }
+        };
+        deferred
+            .iterable()
+            .visit_resource_refs_with_scope(&mut |path, _, scope| {
+                record(path.binding_address(), scope)
+            });
+        deferred.iterable().visit_binding_refs(&mut record);
+        for (root, scope) in roots {
             if tree.binding_names().contains(root.as_str()) {
                 continue;
             }
             let occurrences: Vec<_> = deferred
                 .references()
                 .iter()
-                .filter(|reference| reference.path().binding_address() == &root)
+                .filter(|reference| reference.binding_matches(|binding| binding == &root))
                 .map(|reference| reference.prefix_location())
                 .collect();
             let locations = if occurrences.is_empty() {
@@ -5563,7 +5577,9 @@ where
                 findings.push(crate::parser::Located::new(
                     location.clone(),
                     crate::parser::ParseError::undefined_identifier(
-                        root.to_string(),
+                        scope
+                            .path(ReferencePath::Binding(root.clone()))
+                            .to_dot_string(),
                         location.span().start_line(),
                         in_scope.clone(),
                     ),
@@ -9039,23 +9055,16 @@ impl ModuleCallChecker<'_> {
                 CompositionRefError::ModuleCall(error) => {
                     let root = error.call_path.root();
                     let immediate = error.call_path.immediate();
-                    let display_path = match &error.path {
-                        DiagnosticPath::Public(path) => {
-                            ModuleCallDiagnosticPath::Expanded(path.clone())
-                        }
-                        DiagnosticPath::Protected => ModuleCallDiagnosticPath::Protected,
-                    };
+                    let display_path = error.path.render(
+                        |path| ModuleCallDiagnosticPath::Expanded(path.clone()),
+                        || ModuleCallDiagnosticPath::Protected,
+                    );
                     self.push_finding(ModuleCallFinding::reference_type_with_display_path(
                         &immediate.display_label(),
                         ModuleCallReferenceIdentity {
                             call: immediate.id.clone(),
                             argument: error.argument,
-                            path: match error.path {
-                                DiagnosticPath::Public(path) => {
-                                    ModuleCallDiagnosticPath::Expanded(path)
-                                }
-                                DiagnosticPath::Protected => ModuleCallDiagnosticPath::Protected,
-                            },
+                            path: display_path.clone(),
                             reference_position: Some(error.reference_position),
                             binding_use: None,
                             kind: error.kind,
@@ -9562,7 +9571,7 @@ where
         let mut resolved_param = param.clone();
         if let Some(value) = param.value() {
             let mut references_removed_secret = false;
-            value.visit_resource_refs_with_usage(&mut |path, usage| {
+            value.visit_resource_refs_with_scope(&mut |path, usage, _scope| {
                 if usage == crate::resource::ResourceRefUsage::Required
                     && bindings.removed_attribute_was_sensitive(path.binding(), path.attribute())
                 {

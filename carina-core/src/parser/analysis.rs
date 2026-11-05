@@ -655,7 +655,12 @@ fn collect_value_references<P: ValueKind, B: BindingAddress>(
         None => {
             result = Err(AnalysisTreeError::new(
                 AnalysisTreeErrorKind::MissingSyntaxProvenance {
-                    element: format!("{context} reference {path}"),
+                    element: format!(
+                        "{context} reference {}",
+                        diagnostic_scope
+                            .path(crate::resource::ReferencePath::Access(path.clone()))
+                            .to_dot_string()
+                    ),
                 },
             ))
         }
@@ -804,8 +809,42 @@ impl<B: BindingAddress> AnalysisReference<B> {
         }
     }
 
-    pub fn path(&self) -> &crate::resource::AccessPath<B> {
-        &self.path
+    /// Diagnostic callers receive only the scoped spelling.
+    pub fn diagnostic_path(&self) -> crate::resource::DiagnosticPath<B> {
+        self.diagnostic_scope
+            .path(crate::resource::ReferencePath::Access(self.path.clone()))
+    }
+
+    /// Identity comparisons do not expose the matched binding.
+    pub fn binding_matches(&self, matches: impl FnOnce(&B) -> bool) -> bool {
+        matches(self.path.binding_address())
+    }
+
+    pub fn render<T>(
+        &self,
+        render: impl FnOnce(&crate::resource::AccessPath<B>) -> T,
+    ) -> crate::resource::SecretDiagnosticError<T> {
+        if self.diagnostic_scope.is_secret() {
+            crate::resource::SecretDiagnosticError::InsideSecret
+        } else {
+            crate::resource::SecretDiagnosticError::Public(render(&self.path))
+        }
+    }
+
+    /// Check lookup identity and protect each finding before it leaves this boundary.
+    pub(crate) fn collect_diagnostics<E: crate::resource::InsideSecret>(
+        &self,
+        check: impl FnOnce(&crate::resource::AccessPath<B>, &mut Vec<super::Located<E>>),
+    ) -> Vec<super::Located<E>> {
+        let mut findings = Vec::new();
+        check(&self.path, &mut findings);
+        findings
+            .into_iter()
+            .map(|finding| {
+                let (location, error) = finding.into_parts();
+                super::Located::new(location, self.diagnostic_scope.protect_error(error))
+            })
+            .collect()
     }
     pub fn location(&self) -> &DeclarationLocation {
         self.locations.occurrence()
@@ -850,21 +889,29 @@ fn append_reference_origins<B: BindingAddress>(
     dependencies: &super::UnexpandedDependencies<B>,
     declaration: &DeclarationLocation,
 ) -> Result<(), AnalysisTreeError> {
-    for path in dependencies.reference_origins() {
+    for (path, diagnostic_scope) in dependencies.reference_origins() {
         let locations = path.reference_locations_shared().ok_or_else(|| {
             AnalysisTreeError::new(AnalysisTreeErrorKind::MissingElementProvenance {
                 declaration: declaration.clone(),
-                element: format!("reference edge {path}"),
+                element: format!(
+                    "reference edge {}",
+                    diagnostic_scope
+                        .path(crate::resource::ReferencePath::Access(path.clone()))
+                        .to_dot_string()
+                ),
             })
         })?;
-        if !references
-            .iter()
-            .any(|existing| existing.path == *path && existing.location() == locations.occurrence())
-        {
+        if let Some(existing) = references.iter_mut().find(|existing| {
+            existing.path == *path && existing.location() == locations.occurrence()
+        }) {
+            if diagnostic_scope.is_secret() {
+                existing.diagnostic_scope = diagnostic_scope;
+            }
+        } else {
             references.push(AnalysisReference {
                 path: path.clone(),
                 locations: locations.clone(),
-                diagnostic_scope: crate::resource::DiagnosticScope::Public,
+                diagnostic_scope,
             });
         }
     }
@@ -937,7 +984,12 @@ fn attribute_provenance<'a, P: ValueKind, B: BindingAddress>(
                 result = Err(AnalysisTreeError::new(
                     AnalysisTreeErrorKind::MissingElementProvenance {
                         declaration: location.clone(),
-                        element: format!("reference {path}"),
+                        element: format!(
+                            "reference {}",
+                            diagnostic_scope
+                                .path(crate::resource::ReferencePath::Access(path.clone()))
+                                .to_dot_string()
+                        ),
                     },
                 ))
             }
@@ -980,7 +1032,7 @@ where
             )
         } else if let Some(reference) = references
             .iter()
-            .find(|reference| reference.path().binding_address() == &binding)
+            .find(|reference| reference.path.binding_address() == &binding)
         {
             (DependencyEdgeOrigin::ValueReference, reference.location())
         } else if let Some(origin) = managed
@@ -996,12 +1048,12 @@ where
             // deferred call's bare handle dependencies. Keep
             // the authored reference that performed that inline.
             file.iter_top_level_resources()
-                .find(|source| source.binding_address() == Some(reference.path().binding_address()))
+                .find(|source| source.binding_address() == Some(reference.path.binding_address()))
                 .is_some_and(|source| {
                     source.dependency_bindings().contains(&binding)
                         || source
                             .attributes()
-                            .get(reference.path().attribute())
+                            .get(reference.path.attribute())
                             .is_some_and(|value| {
                                 let mut found = false;
                                 value.visit_binding_refs(&mut |target, _| {
@@ -2441,8 +2493,8 @@ where
                     .flat_map(|resource| resource.references()),
             )
             .find(|reference| {
-                reference.path() == path
-                    && reference.path().reference_locations_shared()
+                &reference.path == path
+                    && reference.path.reference_locations_shared()
                         == path.reference_locations_shared()
             })
             .expect("reference validated at the analysis boundary")

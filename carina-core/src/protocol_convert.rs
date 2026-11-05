@@ -307,6 +307,21 @@ impl Error for ProtocolConvertError {
     }
 }
 
+impl crate::resource::InsideSecret for ProtocolConvertError {
+    fn inside_secret(self) -> Self {
+        let leaf = match self.into_leaf_error() {
+            error @ (Self::NonFiniteFloat
+            | Self::DurationOutOfRange
+            | Self::InvalidRedactedSecretDigest
+            | Self::NonWireValue { .. }
+            | Self::NonWireAttributeType { .. }
+            | Self::ValidatorWithoutIdentity { .. }) => error,
+            _ => Self::NonWireValue { variant: "Secret" },
+        };
+        leaf.at_value_path(WirePathSegment::Secret)
+    }
+}
+
 impl ProtocolConvertError {
     /// Structured container path, in outermost-to-innermost order.
     pub fn value_path(&self) -> Vec<WirePathSegment> {

@@ -200,7 +200,7 @@ impl PlanTreeDependencies {
         if let Some(attributes) = attributes {
             for value in attributes.values() {
                 // Display walks references without evaluating historical leaves.
-                value.visit_resource_refs(&mut |path| {
+                value.visit_resource_refs_with_scope(&mut |path, _usage, _scope| {
                     referenced_bindings.insert(path.binding_address().clone());
                 });
                 value.visit_binding_refs(&mut |binding, _| {

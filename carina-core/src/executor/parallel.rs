@@ -1495,7 +1495,7 @@ mod tests {
         let mut value_dependencies = crate::resource::ResolvedDependencies::default();
         let mut reads = crate::resource::ResolvedDependencyReads::default();
         for value in resource.attributes.values() {
-            value.visit_resource_refs(&mut |path| {
+            value.visit_resource_refs_with_scope(&mut |path, _usage, _scope| {
                 let id = fixture_id(path.binding());
                 value_dependencies.insert(id.clone());
                 reads.insert_known(id, path.attribute());
@@ -2412,7 +2412,10 @@ mod review2_inventory_tests {
         let inputs = super::super::unresolved_data_source_inputs(&resource);
         let rendered = format!("{} {inputs:?}", format_unresolved_read_inputs(&inputs));
         assert!(!rendered.contains("private_producer"), "{rendered}");
-        assert_eq!(inputs[0].bindings[0].as_str(), "private_producer");
+        assert_eq!(
+            serde_json::to_value(&inputs[0]).unwrap()["bindings"][0],
+            "private_producer"
+        );
         let encoded = serde_json::to_value(&inputs).unwrap();
         let decoded: Vec<crate::data_source_value::UnresolvedDataSourceInput> =
             serde_json::from_value(encoded).unwrap();

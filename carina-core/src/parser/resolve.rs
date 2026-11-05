@@ -1338,7 +1338,8 @@ fn find_let_binding_cycle(
         }
         if let Some(chain) = visit_let_binding(
             name,
-            DiagnosticPath::Public(ReferencePath::Binding(name.as_str().into())),
+            crate::resource::DiagnosticScope::Public
+                .path(ReferencePath::Binding(name.as_str().into())),
             variables,
             structural,
             &mut visited,
@@ -1368,11 +1369,8 @@ fn visit_let_binding(
             .map(|(_, path)| path.clone())
             .collect::<Vec<_>>();
         cycle.push(diagnostic_path);
-        if cycle
-            .iter()
-            .any(|path| matches!(path, DiagnosticPath::Protected))
-        {
-            cycle.fill(DiagnosticPath::Protected);
+        if cycle.iter().any(DiagnosticPath::is_secret) {
+            cycle.fill(crate::resource::DiagnosticScope::Secret.path(None));
         }
         return Some(cycle);
     }
@@ -1504,7 +1502,7 @@ fn push_root(
     if variables.contains_key(root) && !structural.contains(root) {
         if let Some((_, path)) = roots.iter_mut().find(|(name, _)| name == root) {
             if scope.is_secret() {
-                *path = DiagnosticPath::Protected;
+                *path = crate::resource::DiagnosticScope::Secret.path(None);
             }
         } else {
             roots.push((
@@ -1569,11 +1567,16 @@ fn accumulate_undefined_reference_errors(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let mut check = |value: &Value| {
-        value.visit_resource_refs(&mut |path| {
+        value.visit_resource_refs_with_scope(&mut |path, _usage, scope| {
             let root = path.binding();
             let root_ident = root.split(['[', ']']).next().unwrap_or(root);
             if !known.contains(root_ident) && seen.insert(root_ident.to_string()) {
-                errors.push(undefined_identifier_error(known, root_ident.to_string(), 0));
+                let name = scope
+                    .path(ReferencePath::<RelativeBindingName>::Binding(
+                        root_ident.into(),
+                    ))
+                    .to_dot_string();
+                errors.push(undefined_identifier_error(known, name, 0));
             }
         });
     };

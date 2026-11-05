@@ -1589,12 +1589,22 @@ fn resolve_directive_dependencies(
         })
     })?;
     let mut origins = Vec::new();
-    for path in dependencies.reference_origins() {
+    for (path, scope) in dependencies.reference_origins() {
         let value = resolve_plain_module_value(
             &Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
             resolver,
-        )?;
-        value.visit_resource_refs(&mut |path| origins.push(path.clone()));
+        )
+        .map_err(|error| scope.protect_error(error))?;
+        value.visit_resource_refs_with_scope(&mut |path, _usage, inner_scope| {
+            origins.push((
+                path.clone(),
+                if scope.is_secret() {
+                    scope
+                } else {
+                    inner_scope
+                },
+            ));
+        });
     }
     resolved.set_reference_origins(origins);
     let mut binding_origins = Vec::new();

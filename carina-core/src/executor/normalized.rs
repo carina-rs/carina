@@ -213,9 +213,7 @@ impl RestoredSecrets {
                     if wrap {
                         *value = value.clone().into_secret();
                     } else if let Value::Deferred(DeferredValue::Secret(payload)) = value {
-                        *value = payload
-                            .try_inspect(|inner| Ok::<_, std::convert::Infallible>(inner.clone()))
-                            .unwrap();
+                        *value = payload.expose_plaintext().clone();
                     }
                 }
                 Some((SecretSlot::Key(key), rest)) => {
@@ -247,9 +245,9 @@ impl RestoredSecrets {
 /// Main's dispatch projection, applied only after protected host checks.
 pub(super) fn unwrap_secret(value: Value) -> Value {
     match value {
-        Value::Deferred(DeferredValue::Secret(payload)) => payload
-            .try_inspect(|value| Ok::<_, std::convert::Infallible>(unwrap_secret(value.clone())))
-            .unwrap(),
+        Value::Deferred(DeferredValue::Secret(payload)) => {
+            unwrap_secret(payload.expose_plaintext().clone())
+        }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(unwrap_secret(*value)),

@@ -43,6 +43,20 @@ impl<B: BindingAddress> UnexpandedDependencyOperand<B> {
     }
 }
 
+#[derive(Clone)]
+struct ReferenceOrigin<B: BindingAddress> {
+    path: crate::resource::AccessPath<B>,
+    scope: crate::resource::DiagnosticScope,
+}
+
+impl<B: BindingAddress> std::fmt::Debug for ReferenceOrigin<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.scope
+            .path(crate::resource::ReferencePath::Access(self.path.clone()))
+            .fmt(f)
+    }
+}
+
 /// Authored operands never enter saved JSON:
 ///
 /// ```compile_fail,E0277
@@ -84,7 +98,7 @@ pub struct UnexpandedDependencies<B: BindingAddress = RelativeBindingName> {
     operands: Vec<super::Located<UnexpandedDependencyOperand<B>>>,
     // Value-reference origins survive eager value resolution alongside the
     // explicit operands. They do not contribute to len/is_empty or semantics.
-    reference_origins: Vec<crate::resource::AccessPath<B>>,
+    reference_origins: Vec<ReferenceOrigin<B>>,
     binding_reference_origins: Vec<super::Located<B>>,
 }
 
@@ -125,11 +139,29 @@ impl<B: BindingAddress> UnexpandedDependencies<B> {
         )
     }
 
-    pub(crate) fn reference_origins(&self) -> &[crate::resource::AccessPath<B>] {
-        &self.reference_origins
+    pub(crate) fn reference_origins(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &crate::resource::AccessPath<B>,
+            crate::resource::DiagnosticScope,
+        ),
+    > {
+        self.reference_origins
+            .iter()
+            .map(|origin| (&origin.path, origin.scope))
     }
-    pub(crate) fn set_reference_origins(&mut self, origins: Vec<crate::resource::AccessPath<B>>) {
-        self.reference_origins = origins;
+    pub(crate) fn set_reference_origins(
+        &mut self,
+        origins: Vec<(
+            crate::resource::AccessPath<B>,
+            crate::resource::DiagnosticScope,
+        )>,
+    ) {
+        self.reference_origins = origins
+            .into_iter()
+            .map(|(path, scope)| ReferenceOrigin { path, scope })
+            .collect();
     }
     pub(crate) fn binding_reference_origins(&self) -> &[super::Located<B>] {
         &self.binding_reference_origins
@@ -142,7 +174,12 @@ impl<B: BindingAddress> UnexpandedDependencies<B> {
         attributes: &indexmap::IndexMap<String, crate::resource::Value<P, B>>,
     ) {
         for value in attributes.values() {
-            value.visit_resource_refs(&mut |path| self.reference_origins.push(path.clone()));
+            value.visit_resource_refs_with_scope(&mut |path, _usage, scope| {
+                self.reference_origins.push(ReferenceOrigin {
+                    path: path.clone(),
+                    scope,
+                })
+            });
         }
     }
 
@@ -212,7 +249,10 @@ impl<B: BindingAddress> UnexpandedDependencies<B> {
             reference_origins: self
                 .reference_origins
                 .into_iter()
-                .map(|path| path.map_bindings(map))
+                .map(|origin| ReferenceOrigin {
+                    path: origin.path.map_bindings(map),
+                    scope: origin.scope,
+                })
                 .collect(),
             binding_reference_origins: self
                 .binding_reference_origins

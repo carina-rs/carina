@@ -124,7 +124,7 @@ fn assert_structure(left: &Value, right: &Value) {
         (
             Value::Deferred(DeferredValue::Secret(left)),
             Value::Deferred(DeferredValue::Secret(right)),
-        ) => assert_structure(left.expose_plaintext(), right.expose_plaintext()),
+        ) => assert_structure(left.plaintext_for_test(), right.plaintext_for_test()),
         (
             Value::Deferred(DeferredValue::Unknown(left)),
             Value::Deferred(DeferredValue::Unknown(right)),

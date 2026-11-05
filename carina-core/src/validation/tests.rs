@@ -10086,9 +10086,9 @@ fn attribute_reference_message_fixture(module_directory: &str) -> CompositionAtt
     CompositionAttributeRefError {
         error: AttributeParamRefError {
             attribute: "bad".to_string(),
-            path: DiagnosticPath::Public(crate::resource::ReferencePath::Binding(
-                RootScope::new().resolve("source".into()),
-            )),
+            path: crate::resource::DiagnosticScope::Public.path(
+                crate::resource::ReferencePath::Binding(RootScope::new().resolve("source".into())),
+            ),
             kind: ModuleCallRefErrorKind::TypeMismatch {
                 types: MismatchTypeNames::for_type_exprs(&TypeExpr::String, &TypeExpr::Int),
                 declared: None,

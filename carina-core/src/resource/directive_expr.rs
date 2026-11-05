@@ -1579,7 +1579,9 @@ mod tests {
         let mut references = Vec::new();
         expression
             .value
-            .visit_resource_refs(&mut |reference| references.push(reference.binding().to_string()));
+            .visit_resource_refs_with_scope(&mut |reference, _usage, _scope| {
+                references.push(reference.binding().to_string())
+            });
         assert!(references.is_empty());
     }
 

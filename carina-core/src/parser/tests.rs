@@ -17,6 +17,108 @@ use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
 #[test]
+fn review3_secret_deferred_iterable_diagnostics_mask_roots() {
+    let parsed = parse(
+        "for item in secret(private_iterable.names) { mock.test.Resource { name = item } }",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+    let errors = crate::validation::validate_for_iterable_bindings(&tree);
+    assert_eq!(errors.len(), 1);
+    for text in [errors[0].to_string(), format!("{:?}", errors[0])] {
+        assert!(!text.contains("private_iterable"), "{text}");
+    }
+}
+
+#[test]
+fn review3_secret_reference_inventory_debug_hides_paths() {
+    let parsed = parse(
+        "mock.test.Resource { attr = secret(private_typo.token) }",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let text = format!("{:?}", parsed.resources[0].dependencies);
+    assert!(!text.contains("private_typo"), "{text}");
+}
+
+#[test]
+fn review3_secret_undefined_reference_masks_identifier() {
+    let parsed = parse(
+        "mock.test.Resource { attr = secret(private_typo.token) }",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let errors = check_identifier_scope(&parsed);
+    assert_eq!(errors.len(), 1);
+    assert_eq!(
+        errors[0].to_string(),
+        "Undefined identifier `(secret)`: no bindings are in scope (let / upstream_state / read / module / function / for / fn / arguments)"
+    );
+    for text in [errors[0].to_string(), format!("{:?}", errors[0])] {
+        assert!(!text.contains("private_typo"), "{text}");
+    }
+    let public = parse(
+        "mock.test.Resource { attr = private_typo.token }",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    assert!(
+        check_identifier_scope(&public)[0]
+            .to_string()
+            .contains("private_typo")
+    );
+}
+
+#[test]
+fn review3_secret_reference_origins_retain_scope_after_attribute_removal() {
+    let mut parsed = parse(
+        "let private_source = mock.test.Resource {}\nmock.test.Resource { attr = secret(private_source.token) }",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).unwrap();
+    // Exercise both removed and unwrapped values: retained origins are the
+    // authority when normalization discarded an annotation.
+    let original = parsed.resources[1].attributes["attr"].clone();
+    let Value::Deferred(DeferredValue::Secret(payload)) = original else {
+        panic!("secret reference")
+    };
+    for normalized in [None, Some(payload.expose_plaintext().clone())] {
+        parsed.resources[1].attributes.clear();
+        if let Some(value) = normalized {
+            parsed.resources[1].attributes.insert("attr".into(), value);
+        }
+        let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+        let references = tree.resources().nth(1).unwrap().references();
+        assert_eq!(references.len(), 1);
+        assert!(!format!("{references:?}").contains("private_source"));
+    }
+}
+
+#[test]
+fn review3_secret_missing_syntax_provenance_masks_reference() {
+    let mut parsed = parse(
+        "mock.test.Resource {}",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    parsed.resources[0].attributes.insert(
+        "attr".into(),
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Deferred(DeferredValue::ResourceRef {
+                path: crate::resource::AccessPath::new("private_source", "token"),
+            }))
+            .into(),
+        )),
+    );
+    let error = AnalysisTree::try_from_file(&parsed)
+        .err()
+        .expect("missing reference provenance");
+    for text in [error.to_string(), format!("{error:?}")] {
+        assert!(!text.contains("private_source"), "{text}");
+    }
+}
+
+#[test]
 fn declaration_location_and_envelope_keep_parser_span() {
     let source = "// sibling declaration\nlet bucket = mock.test.Resource { name = '東京' }\n";
     let file = preprocess_file(source).unwrap();
@@ -16589,7 +16691,10 @@ fn reject_cyclic_let_bindings_detects_secret_value_cycle() {
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
-            assert_eq!(chain, vec![crate::resource::DiagnosticPath::Protected; 3]);
+            assert_eq!(
+                chain,
+                vec![crate::resource::DiagnosticScope::Secret.path(None); 3]
+            );
         }
         other => panic!("expected CyclicLetBinding, got {other:?}"),
     }

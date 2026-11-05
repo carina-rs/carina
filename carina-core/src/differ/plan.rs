@@ -646,9 +646,19 @@ fn cascade_ref_hint(value: &Value, target_binding: &str) -> Option<String> {
     let mut hit: Option<String> = None;
 
     // Multi-ref attributes report the first target-binding ref in list/IndexMap/source order.
-    value.visit_resource_refs(&mut |path| {
+    value.visit_resource_refs_with_scope(&mut |path, _usage, scope| {
         if hit.is_none() && path.binding() == target_binding {
-            hit = Some(format!("{}.{}", path.binding(), path.attribute()));
+            hit = Some(
+                scope
+                    .path(crate::resource::ReferencePath::Access(
+                        crate::resource::AccessPath::from_binding(
+                            path.binding_address().clone(),
+                            path.attribute(),
+                            Vec::new(),
+                        ),
+                    ))
+                    .to_dot_string(),
+            );
         }
     });
 
@@ -656,9 +666,13 @@ fn cascade_ref_hint(value: &Value, target_binding: &str) -> Option<String> {
         return hit;
     }
 
-    value.visit_binding_refs(&mut |binding, _| {
+    value.visit_binding_refs(&mut |binding, scope| {
         if hit.is_none() && binding.as_str() == target_binding {
-            hit = Some(binding.to_string());
+            hit = Some(
+                scope
+                    .path(crate::resource::ReferencePath::Binding(binding.clone()))
+                    .to_dot_string(),
+            );
         }
     });
 
@@ -2367,5 +2381,26 @@ mod typed_current_identifier_tests {
         .expect("present current state can be promoted");
 
         assert_eq!(pending.delete.identifier.as_str(), "typed-provider-id");
+    }
+}
+
+#[cfg(test)]
+mod review3_tests {
+    use super::*;
+
+    #[test]
+    fn review3_cascade_reference_hints_render_scope() {
+        let reference = Value::root_resource_ref("private_source", "token", vec!["field".into()]);
+        assert_eq!(
+            cascade_ref_hint(&reference, "private_source").as_deref(),
+            Some("private_source.token")
+        );
+        let secret = Value::Deferred(crate::resource::DeferredValue::Secret(
+            Box::new(reference).into(),
+        ));
+        assert_eq!(
+            cascade_ref_hint(&secret, "private_source").as_deref(),
+            Some("(secret)")
+        );
     }
 }

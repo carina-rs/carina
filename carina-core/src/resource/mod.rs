@@ -2898,7 +2898,7 @@ impl ValueString {
 
     /// Construct a string whose contents must never be included in a
     /// diagnostic. Kept crate-private so only trusted value producers (`env()`
-    /// and the builtin dispatcher while computing through `Secret`) can attach
+    /// and secret payload construction) can attach
     /// the provenance mark.
     pub(crate) fn diagnostic_sensitive(plaintext: impl Into<String>) -> Self {
         Self {
@@ -4130,19 +4130,32 @@ impl<P: ValueKind, B: BindingAddress> AccessExpr<P, B> {
     }
 }
 
-/// Peel top-level sensitivity metadata for computation. Callers must rewrap
-/// the result and protect errors whenever the returned depth is nonzero.
-pub(crate) fn peel_secrets<P: ValueKind, B: BindingAddress>(
-    mut value: Value<P, B>,
-) -> (Value<P, B>, usize) {
-    let mut depth = 0;
-    while let Value::Deferred(DeferredValue::Secret(payload)) = value {
-        value = payload
-            .try_inspect(|inner| Ok::<_, std::convert::Infallible>(inner.clone()))
-            .unwrap();
-        depth += 1;
-    }
-    (value, depth)
+/// Compute through top-level secret arguments while owning both boundary directions.
+/// Nested element annotations retain their ordinary collection semantics.
+pub(crate) fn with_secret_values<P: ValueKind, B: BindingAddress, E: InsideSecret>(
+    values: impl IntoIterator<Item = Value<P, B>>,
+    compute: impl FnOnce(Vec<Value<P, B>>) -> Result<Value<P, B>, E>,
+) -> Result<Value<P, B>, E> {
+    let mut scope = DiagnosticScope::Public;
+    let values = values
+        .into_iter()
+        .map(|mut value| {
+            while let Value::Deferred(DeferredValue::Secret(payload)) = value {
+                scope = DiagnosticScope::Secret;
+                value = payload.expose_plaintext().clone();
+            }
+            value
+        })
+        .collect();
+    compute(values)
+        .map(|value| {
+            if scope.is_secret() {
+                value.into_secret()
+            } else {
+                value
+            }
+        })
+        .map_err(|error| scope.protect_error(error))
 }
 
 impl<P: ValueKind, B: BindingAddress> Value<P, B> {
@@ -4189,7 +4202,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
     /// so dependency and diagnostic callers cannot drift.
     pub fn root_bindings(&self) -> std::collections::BTreeSet<B> {
         let mut roots = std::collections::BTreeSet::new();
-        self.visit_resource_refs(&mut |path| {
+        self.visit_resource_refs_with_scope(&mut |path, _usage, _scope| {
             roots.insert(path.binding_address().clone());
         });
         self.visit_binding_refs(&mut |binding, _| {
@@ -4206,7 +4219,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
         binding: &B,
     ) -> Option<(Option<std::path::PathBuf>, usize)> {
         let mut source = None;
-        self.visit_resource_refs(&mut |path| {
+        self.visit_resource_refs_with_scope(&mut |path, _usage, _scope| {
             if source.is_none() && path.binding_address() == binding {
                 source = path.diagnostic_source_owned();
             }
@@ -7377,7 +7390,7 @@ fn value_into_literal<P: ValueKind, B: BindingAddress>(
             let literal = payload
                 .try_inspect(|value| {
                     value_into_literal(value.clone())
-                        .map(|(text, _)| ValueString::diagnostic_sensitive(text.into_plaintext()))
+                        .map(|(text, _)| text)
                         .map_err(|_| ())
                 })
                 .ok();
@@ -7531,40 +7544,16 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
         }
     }
 
-    /// Recursively walk this value, invoking `f` on each `ResourceRef` access path.
-    ///
-    /// Companion: `visit_binding_refs` for bare `BindingRef` names. A consumer that
-    /// needs both must call both — drift is visible at the call site.
-    pub fn visit_resource_refs(&self, f: &mut impl FnMut(&AccessPath<B>)) {
-        self.visit_resource_refs_with_usage(&mut |path, _usage| f(path));
-    }
-
-    /// Recursively walk resource references while identifying references whose
-    /// existence is guarded by the left operand of `??`.
-    ///
-    /// The right operand normally starts a required context. When the whole
-    /// coalesce is itself a left operand, a direct-reference default remains
-    /// optional so `(a ?? b) ?? c` has the same existence semantics as
-    /// `a ?? (b ?? c)`. References nested in computations remain required.
-    pub fn visit_resource_refs_with_usage(
-        &self,
-        f: &mut impl FnMut(&AccessPath<B>, ResourceRefUsage),
-    ) {
-        self.visit_resource_refs_with_scope(&mut |path, usage, _scope| f(path, usage));
-    }
-
+    /// Walk references with both coalesce usage and diagnostic scope.
+    /// Every diagnostic consumer must render the identity through that scope.
     pub fn visit_resource_refs_with_scope(
         &self,
         f: &mut impl FnMut(&AccessPath<B>, ResourceRefUsage, DiagnosticScope),
     ) {
-        self.visit_resource_refs_with_usage_inner(
-            ResourceRefUsage::Required,
-            DiagnosticScope::Public,
-            f,
-        );
+        self.visit_resource_refs_in_scope(ResourceRefUsage::Required, DiagnosticScope::Public, f);
     }
 
-    fn visit_resource_refs_with_usage_inner(
+    fn visit_resource_refs_in_scope(
         &self,
         usage: ResourceRefUsage,
         scope: DiagnosticScope,
@@ -7573,18 +7562,18 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
         match self {
             Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
                 deferred.values().into_iter().for_each(|value| {
-                    value.visit_resource_refs_with_usage_inner(usage, scope, f);
+                    value.visit_resource_refs_in_scope(usage, scope, f);
                 });
             }
             Value::Deferred(DeferredValue::ResourceRef { path }) => f(path, usage, scope),
             Value::Concrete(ConcreteValue::List(items)) => {
                 for v in items {
-                    v.visit_resource_refs_with_usage_inner(usage, scope, f);
+                    v.visit_resource_refs_in_scope(usage, scope, f);
                 }
             }
             Value::Concrete(ConcreteValue::Map(map)) => {
                 for v in map.values() {
-                    v.visit_resource_refs_with_usage_inner(usage, scope, f);
+                    v.visit_resource_refs_in_scope(usage, scope, f);
                 }
             }
             Value::Deferred(DeferredValue::Interpolation(parts)) => {
@@ -7592,7 +7581,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                     match part {
                         InterpolationPart::Literal(_) => {}
                         InterpolationPart::Expr(v) => {
-                            v.visit_resource_refs_with_usage_inner(usage, scope, f)
+                            v.visit_resource_refs_in_scope(usage, scope, f)
                         }
                     }
                 }
@@ -7604,13 +7593,11 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
             ) => {
                 for arg in args {
                     arg.walker_value()
-                        .visit_resource_refs_with_usage_inner(usage, scope, f);
+                        .visit_resource_refs_in_scope(usage, scope, f);
                 }
             }
             Value::Deferred(DeferredValue::Access(access)) => {
-                access
-                    .base()
-                    .visit_resource_refs_with_usage_inner(usage, scope, f);
+                access.base().visit_resource_refs_in_scope(usage, scope, f);
             }
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 let value_usage = if value.is_coalesce_optional_operand() {
@@ -7625,20 +7612,20 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 } else {
                     ResourceRefUsage::Required
                 };
-                value.visit_resource_refs_with_usage_inner(value_usage, scope, f);
-                default.visit_resource_refs_with_usage_inner(default_usage, scope, f);
+                value.visit_resource_refs_in_scope(value_usage, scope, f);
+                default.visit_resource_refs_in_scope(default_usage, scope, f);
             }
             Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
                 expression
                     .lhs()
-                    .visit_resource_refs_with_usage_inner(usage, scope, f);
+                    .visit_resource_refs_in_scope(usage, scope, f);
                 expression
                     .rhs()
-                    .visit_resource_refs_with_usage_inner(usage, scope, f);
+                    .visit_resource_refs_in_scope(usage, scope, f);
             }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 inner.visit_reference_inventory(|value, scope| {
-                    value.visit_resource_refs_with_usage_inner(usage, scope, f)
+                    value.visit_resource_refs_in_scope(usage, scope, f)
                 })
             }
             Value::Concrete(ConcreteValue::String(_))
@@ -7766,7 +7753,7 @@ pub fn attrs_to_hashmap<P: ValueKind, B: BindingAddress>(
 /// Check if a Value contains any ResourceRef (possibly nested)
 pub fn contains_resource_ref<P: ValueKind, B: BindingAddress>(value: &Value<P, B>) -> bool {
     let mut found = false;
-    value.visit_resource_refs(&mut |_| found = true);
+    value.visit_resource_refs_with_scope(&mut |_, _usage, _scope| found = true);
     found
 }
 

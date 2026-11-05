@@ -14,22 +14,72 @@ use crate::resource::{
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct UnresolvedDataSourceInput {
     pub attribute: String,
-    pub paths: Vec<AccessPath>,
-    pub bindings: Vec<AbsoluteBindingAddress>,
-    pub unknowns: Vec<ApplyTimeUnknown>,
-    #[serde(
-        default,
-        skip_serializing_if = "crate::resource::DiagnosticScope::is_public"
-    )]
-    pub diagnostic_scope: crate::resource::DiagnosticScope,
+    paths: Vec<AccessPath>,
+    bindings: Vec<AbsoluteBindingAddress>,
+    unknowns: Vec<ApplyTimeUnknown>,
+    #[serde(default = "secret_scope")]
+    diagnostic_scope: crate::resource::DiagnosticScope,
+}
+
+fn secret_scope() -> crate::resource::DiagnosticScope {
+    crate::resource::DiagnosticScope::Secret
 }
 
 impl UnresolvedDataSourceInput {
+    /// Collect identities and their diagnostic protection in the same operation.
+    pub fn collect(attribute: impl Into<String>, value: &crate::resource::Value) -> Option<Self> {
+        use crate::resource::DiagnosticScope;
+        let mut input = Self {
+            attribute: attribute.into(),
+            paths: Vec::new(),
+            bindings: Vec::new(),
+            unknowns: Vec::new(),
+            diagnostic_scope: DiagnosticScope::Public,
+        };
+        value.visit_resource_refs_with_scope(&mut |path, _, scope| {
+            if scope.is_secret() {
+                input.diagnostic_scope = scope;
+            }
+            input.paths.push(path.clone());
+        });
+        value.visit_binding_refs(&mut |binding, scope| {
+            if scope.is_secret() {
+                input.diagnostic_scope = scope;
+            }
+            input.bindings.push(binding.clone());
+        });
+        visit_unknowns(value, DiagnosticScope::Public, &mut |reason, scope| {
+            if scope.is_secret() {
+                input.diagnostic_scope = scope;
+            }
+            input.unknowns.push(reason.clone());
+        });
+        (!input.paths.is_empty() || !input.bindings.is_empty() || !input.unknowns.is_empty())
+            .then_some(input)
+    }
+
+    /// Compare scheduler identities without returning raw diagnostic data.
+    pub fn any_binding_matches(
+        &self,
+        mut matches: impl FnMut(&AbsoluteBindingAddress) -> bool,
+    ) -> bool {
+        self.paths
+            .iter()
+            .map(AccessPath::binding_address)
+            .chain(&self.bindings)
+            .any(&mut matches)
+    }
+
+    pub fn has_unknowns(&self) -> bool {
+        !self.unknowns.is_empty()
+    }
+
     /// Render inventory findings without exposing identities collected inside secrets.
     pub fn diagnostic_references(&self) -> Vec<String> {
         if self.diagnostic_scope.is_secret() {
             return vec![
-                crate::resource::DiagnosticPath::<AbsoluteBindingAddress>::Protected
+                crate::resource::DiagnosticScope::Secret
+                    .path::<AbsoluteBindingAddress>(None)
                     .to_dot_string(),
             ];
         }
@@ -53,7 +103,7 @@ impl std::fmt::Debug for UnresolvedDataSourceInput {
         if self.diagnostic_scope.is_secret() {
             debug.field(
                 "references",
-                &crate::resource::DiagnosticPath::<AbsoluteBindingAddress>::Protected,
+                &crate::resource::DiagnosticScope::Secret.path::<AbsoluteBindingAddress>(None),
             );
         } else {
             debug
@@ -62,6 +112,65 @@ impl std::fmt::Debug for UnresolvedDataSourceInput {
                 .field("unknowns", &self.unknowns);
         }
         debug.finish()
+    }
+}
+
+fn visit_unknowns(
+    value: &crate::resource::Value,
+    scope: crate::resource::DiagnosticScope,
+    f: &mut impl FnMut(&ApplyTimeUnknown, crate::resource::DiagnosticScope),
+) {
+    use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
+    match value {
+        Value::Deferred(DeferredValue::Unknown(reason)) => f(reason, scope),
+        Value::Concrete(ConcreteValue::List(items)) => {
+            for item in items {
+                visit_unknowns(item, scope, f);
+            }
+        }
+        Value::Concrete(ConcreteValue::Map(map)) => {
+            for item in map.values() {
+                visit_unknowns(item, scope, f);
+            }
+        }
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            for part in parts {
+                if let InterpolationPart::Expr(value) = part {
+                    visit_unknowns(value, scope, f);
+                }
+            }
+        }
+        Value::Deferred(
+            DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::Unavailable { args, .. }
+            | DeferredValue::ResolvedFunctionCall { args, .. },
+        ) => {
+            for arg in args {
+                visit_unknowns(arg.walker_value(), scope, f);
+            }
+        }
+        Value::Deferred(DeferredValue::Access(access)) => visit_unknowns(access.base(), scope, f),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            inner.visit_reference_inventory(|value, scope| visit_unknowns(value, scope, f))
+        }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            visit_unknowns(value, scope, f);
+            visit_unknowns(default, scope, f);
+        }
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            deferred
+                .values()
+                .into_iter()
+                .for_each(|value| visit_unknowns(value, scope, f));
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            visit_unknowns(expression.lhs(), scope, f);
+            visit_unknowns(expression.rhs(), scope, f);
+        }
+        Value::Concrete(_)
+        | Value::Deferred(DeferredValue::ResourceRef { .. })
+        | Value::Deferred(DeferredValue::BindingRef { .. }) => {}
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 
@@ -377,6 +486,26 @@ mod tests {
         let mut data_source = DataSource::with_provider("mock", "iam.Roles", identity, None);
         data_source.binding = Some(absolute_binding(binding));
         data_source
+    }
+
+    #[test]
+    fn review3_unresolved_inventory_defaults_secret_and_round_trips_public_scope() {
+        let public = UnresolvedDataSourceInput::collect(
+            "query",
+            &crate::resource::Value::Deferred(crate::resource::DeferredValue::ResourceRef {
+                path: AccessPath::new("private_producer", "token").resolve_root(&RootScope::new()),
+            }),
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(&public).unwrap();
+        let decoded: UnresolvedDataSourceInput = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(public, decoded);
+        assert_eq!(decoded.diagnostic_references(), ["private_producer.token"]);
+        let mut legacy = encoded;
+        legacy.as_object_mut().unwrap().remove("diagnostic_scope");
+        let decoded: UnresolvedDataSourceInput = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.diagnostic_references(), ["(secret)"]);
+        assert!(!format!("{decoded:?}").contains("private_producer"));
     }
 
     #[test]

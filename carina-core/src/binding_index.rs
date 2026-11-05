@@ -2997,7 +2997,7 @@ impl ResolvedBindings {
 
     pub fn access_miss_policy_for_value(&self, value: &Value) -> crate::resource::AccessMissPolicy {
         let mut definitive = true;
-        value.visit_resource_refs(&mut |path| {
+        value.visit_resource_refs_with_scope(&mut |path, _usage, _scope| {
             definitive &= self.by_name.get(path.binding()).is_some_and(|binding| {
                 binding.attribute_snapshot_is_known(path.attribute())
                     && !binding.refreshable_attributes.contains(path.attribute())

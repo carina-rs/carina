@@ -3558,7 +3558,7 @@ fn visit_resource_refs_collects_from_all_nested_variants() {
     ]));
 
     let mut collected: Vec<String> = Vec::new();
-    value.visit_resource_refs(&mut |path| {
+    value.visit_resource_refs_with_scope(&mut |path, _usage, _scope| {
         collected.push(path.binding().to_string());
     });
     collected.sort();
@@ -3575,7 +3575,7 @@ fn resource_ref_usage_marks_only_the_coalesce_value_optional() {
         })),
     });
     let mut collected = Vec::new();
-    value.visit_resource_refs_with_usage(&mut |path, usage| {
+    value.visit_resource_refs_with_scope(&mut |path, usage, _scope| {
         collected.push((path.binding().to_string(), usage));
     });
 
@@ -3654,7 +3654,7 @@ fn visit_resource_refs_on_leaf_variants_calls_nothing() {
         Value::Concrete(ConcreteValue::Bool(true)),
     ] {
         let mut count = 0;
-        v.visit_resource_refs(&mut |_| count += 1);
+        v.visit_resource_refs_with_scope(&mut |_, _usage, _scope| count += 1);
         assert_eq!(count, 0);
     }
 }
@@ -4580,6 +4580,34 @@ fn review2_f8_binding_inventory_callbacks_keep_public_and_secret_scopes() {
         findings.push(scope.path(super::ReferencePath::Binding(binding.clone())))
     });
     assert_eq!(findings[0].to_dot_string(), "public");
-    assert_eq!(findings[1], super::DiagnosticPath::Protected);
+    assert_eq!(findings[1], super::DiagnosticScope::Secret.path(None));
     assert!(!format!("{findings:?}").contains("private_binding"));
+}
+
+#[test]
+fn review3_secret_combinator_protects_errors_and_rewraps_success() {
+    let plain = Value::Concrete(ConcreteValue::String("private-combinator".into()));
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(plain.clone()).into()));
+    let compute = |values: Vec<Value>| {
+        let Value::Concrete(ConcreteValue::String(text)) = &values[0] else {
+            panic!("peeled string")
+        };
+        Err::<Value, _>(format!("failed for {}", text.expose_plaintext()))
+    };
+    assert_eq!(
+        super::with_secret_values([plain.clone()], compute).unwrap_err(),
+        "failed for private-combinator"
+    );
+    let error = super::with_secret_values([secret.clone()], compute).unwrap_err();
+    assert_eq!(error, super::INSIDE_SECRET_MESSAGE);
+    assert!(!format!("{error:?}").contains("private-combinator"));
+    let result = super::with_secret_values([plain.clone(), secret], |values| {
+        assert_eq!(values, [plain.clone(), plain.clone()]);
+        Ok::<_, String>(plain.clone())
+    })
+    .unwrap();
+    assert_eq!(
+        result,
+        Value::Deferred(DeferredValue::Secret(Box::new(plain).into()))
+    );
 }

@@ -350,15 +350,18 @@ fn exports_consuming_sibling_let_keep_the_reference_owners_file() {
     .unwrap();
     let export = parsed.parsed().export_params[0].value.as_ref().unwrap();
     let mut count = 0;
-    export.value().unwrap().visit_resource_refs(&mut |path| {
-        let source = path.reference_locations().unwrap();
-        assert_eq!(
-            source.occurrence().file().path(),
-            directory.path().join("main.crn")
-        );
-        assert_eq!(slice(main, source.occurrence()), "target.items[0].name");
-        count += 1;
-    });
+    export
+        .value()
+        .unwrap()
+        .visit_resource_refs_with_scope(&mut |path, _usage, _scope| {
+            let source = path.reference_locations().unwrap();
+            assert_eq!(
+                source.occurrence().file().path(),
+                directory.path().join("main.crn")
+            );
+            assert_eq!(slice(main, source.occurrence()), "target.items[0].name");
+            count += 1;
+        });
     assert_eq!(count, 1);
 }
 

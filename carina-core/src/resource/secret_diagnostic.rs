@@ -53,11 +53,14 @@ impl<E: fmt::Display> fmt::Display for SecretDiagnosticError<E> {
     }
 }
 
-#[derive(
-    Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
-)]
+/// A diagnostic boundary is always explicit; persistence fallbacks use Secret.
+///
+/// ```compile_fail
+/// use carina_core::resource::DiagnosticScope;
+/// let _: DiagnosticScope = Default::default();
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum DiagnosticScope {
-    #[default]
     Public,
     Secret,
 }
@@ -71,11 +74,13 @@ impl DiagnosticScope {
     }
     pub fn path<B: super::BindingAddress>(
         self,
-        path: super::ReferencePath<B>,
+        path: impl Into<Option<super::ReferencePath<B>>>,
     ) -> DiagnosticPath<B> {
         match self {
-            Self::Public => DiagnosticPath::Public(path),
-            Self::Secret => DiagnosticPath::Protected,
+            Self::Public => DiagnosticPath {
+                public: path.into(),
+            },
+            Self::Secret => DiagnosticPath { public: None },
         }
     }
     pub fn protect<E>(self, error: E) -> SecretDiagnosticError<E> {
@@ -92,24 +97,43 @@ impl DiagnosticScope {
     }
 }
 
+/// A path whose raw identity is retained only when its scope permits rendering.
+/// Only [`DiagnosticScope::path`] can construct one.
+///
+/// ```compile_fail
+/// use carina_core::resource::{DiagnosticPath, ReferencePath, RelativeBindingName};
+/// let path: DiagnosticPath<RelativeBindingName> = DiagnosticPath::Public(ReferencePath::Binding("private".into()));
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum DiagnosticPath<B: super::BindingAddress = super::AbsoluteBindingAddress> {
-    Public(super::ReferencePath<B>),
-    Protected,
+pub struct DiagnosticPath<B: super::BindingAddress = super::AbsoluteBindingAddress> {
+    public: Option<super::ReferencePath<B>>,
 }
 
 impl<B: super::BindingAddress> InsideSecret for DiagnosticPath<B> {
     fn inside_secret(self) -> Self {
-        Self::Protected
+        DiagnosticScope::Secret.path(None)
     }
 }
 
 impl<B: super::BindingAddress> DiagnosticPath<B> {
-    pub fn to_dot_string(&self) -> String {
-        match self {
-            Self::Public(path) => path.to_dot_string(),
-            Self::Protected => "(secret)".into(),
+    pub fn is_secret(&self) -> bool {
+        self.public.is_none()
+    }
+
+    /// Render only a public identity; a protected identity was discarded at construction.
+    pub fn render<T>(
+        &self,
+        public: impl FnOnce(&super::ReferencePath<B>) -> T,
+        secret: impl FnOnce() -> T,
+    ) -> T {
+        match &self.public {
+            Some(path) => public(path),
+            None => secret(),
         }
+    }
+
+    pub fn to_dot_string(&self) -> String {
+        self.render(super::ReferencePath::to_dot_string, || "(secret)".into())
     }
 }
 
