@@ -14,8 +14,7 @@ workspace = true
 [features]
 async-io = ["tokio/fs", "tokio/rt"]
 test-shutdown = []
-test-support = []
-test-utils = ["dep:tempfile", "test-support"]
+test-utils = ["dep:tempfile"]
 
 [dependencies]
 carina-provider-protocol = { path = "../carina-provider-protocol" }

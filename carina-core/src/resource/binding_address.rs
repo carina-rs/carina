@@ -199,7 +199,7 @@ fn validate_absolute_binding_address(value: ValueString) -> Result<ValueString, 
 
 /// Construct an absolute address for a fixture that cannot practically be
 /// built through parse-and-expand.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-utils"))]
 pub fn absolute_binding_address_for_test(spelling: impl Into<String>) -> AbsoluteBindingAddress {
     AbsoluteBindingAddress(spelling.into().into())
 }

@@ -3232,7 +3232,7 @@ pub trait ResolveExportBindingPhase<P: ValueKind>:
         resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
     ) -> Self::Absolute;
 
-    #[cfg(feature = "test-support")]
+    #[cfg(feature = "test-utils")]
     fn resolve_root_for_test(self) -> Self::Absolute {
         let scope = RootScope::new();
         self.resolve_export_bindings(&mut |binding| scope.resolve(binding))
@@ -4378,7 +4378,7 @@ impl ModuleCallId {
         &self.expansion
     }
 
-    #[cfg(any(test, feature = "test-utils", feature = "test-support"))]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn test_dummy_in(source_file: impl Into<PathBuf>) -> Self {
         let file = super::preprocess_file("fixture {}").expect("module-call fixture");
         let pair = file
@@ -4784,7 +4784,7 @@ pub(crate) struct DeclarationSource {
     judgement: Result<super::retained::JudgedExpr, super::retained::MissingEvidence>,
 }
 
-#[cfg(any(test, feature = "test-utils", feature = "test-support"))]
+#[cfg(any(test, feature = "test-utils"))]
 impl Default for DeclarationSource {
     fn default() -> Self {
         let mut source = Self::authored(
@@ -5026,7 +5026,7 @@ impl SourceSpan {
         }
     }
 
-    #[cfg(any(test, feature = "test-utils", feature = "test-support"))]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) const fn dummy() -> Self {
         Self {
             start_byte: 0,
@@ -5723,7 +5723,7 @@ impl<B: BindingAddress> BackendConfig<ParserPlaceholder, B> {
 }
 
 impl<P: ValueKind> BackendConfig<P, RelativeBindingName> {
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn resolve_root(
         self,
         scope: &RootScope,
@@ -5748,7 +5748,7 @@ impl<P: ValueKind> BackendConfig<P, RelativeBindingName> {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn resolve_root_for_test(self) -> BackendConfig<P, AbsoluteBindingAddress> {
         self.resolve_root(&RootScope::new())
     }
@@ -5903,7 +5903,7 @@ impl<P: ValueKind, B: BindingAddress> InferredExportParam<P, B> {
             source: parameter.source.clone(),
         }
     }
-    #[cfg(any(test, feature = "test-utils", feature = "test-support"))]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn for_test(
         name: impl Into<String>,
         static_type: ExportStaticType,
@@ -6922,7 +6922,7 @@ where
         self.resolve_bindings(&mut |binding| scope.resolve(binding))
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(feature = "test-utils")]
     pub fn resolve_root_for_test(
         self,
     ) -> File<
