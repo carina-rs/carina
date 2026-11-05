@@ -377,7 +377,7 @@ impl<E> RootDirectoryParse<E> {
         self.parsed
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn from_parsed_for_test(mut parsed: File<E>) -> Self
     where
         E: crate::parser::ExportParamLike,

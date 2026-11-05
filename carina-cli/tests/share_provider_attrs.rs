@@ -31,7 +31,7 @@ fn share_provider_attrs_resolves_default_tags() {
     let runtime = carina_cli::test_support::TestCommandRuntime::new();
 
     // Run the CLI's full validate-and-resolve pipeline so module
-    // expansion + finalize happen. The test-support boundary still exercises
+    // expansion + finalize happen. The test helper boundary still exercises
     // the real command-scoped load; this source-less mock configuration uses
     // the built-in provider catalog.
     let parsed = carina_cli::commands::validate_and_resolve_with_provider_load_for_test(

@@ -1435,7 +1435,7 @@ pub use judgement::{
     CollectionKind, ExpressionAdmission, ExpressionCheckOwner, ExpressionReport, JudgedExpr,
     ProviderAuthorityUnavailable, admit_expression,
 };
-#[cfg(any(test, feature = "test-utils", feature = "test-support"))]
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn value_dependent_judgement_for_test() -> JudgedExpr {
     judgement::constraint_fixture()
 }
@@ -4312,7 +4312,7 @@ mod judgement {
             false,
         )
     }
-    #[cfg(any(test, feature = "test-utils", feature = "test-support"))]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(super) fn constraint_fixture() -> JudgedExpr {
         let mut result = value_dependent("constraint-check fixture");
         result.data_mut().judgement = ExprJudgement::ValueDependent {
