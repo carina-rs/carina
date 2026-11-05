@@ -1380,24 +1380,6 @@ impl DiagnosticRun<'_> {
                         } else {
                             authored_value
                         };
-                        // Keep both authored coalesce operands and arithmetic
-                        // operators. Other editor checks need the directory's
-                        // semantic value so sibling-backed access bases are
-                        // resolved before inference.
-                        let typecheck_value = if matches!(
-                            authored_value,
-                            Value::Deferred(
-                                DeferredValue::Coalesce { .. }
-                                    | DeferredValue::IntegerArithmetic(_)
-                            )
-                        ) {
-                            authored_value
-                        } else {
-                            semantic_resource_attributes
-                                .as_ref()
-                                .and_then(|attributes| attributes.get(attr_name))
-                                .unwrap_or(attr_value)
-                        };
                         // Binding authority has already checked these authored
                         // sinks. Preserve the deferred tokens rather than
                         // validating their substituted values a second time.
@@ -1406,12 +1388,19 @@ impl DiagnosticRun<'_> {
                             || matches!(
                                 authored_value,
                                 Value::Deferred(
-                                    DeferredValue::Coalesce { .. } | DeferredValue::ModuleIf(_)
+                                    DeferredValue::Coalesce { .. }
+                                        | DeferredValue::ModuleIf(_)
+                                        | DeferredValue::IntegerArithmetic(_)
                                 ) | Value::Concrete(ConcreteValue::List(_) | ConcreteValue::Map(_))
                             ) {
                             authored_value
                         } else {
-                            typecheck_value
+                            // Resolve sibling-backed access bases before the
+                            // remaining editor inference checks.
+                            semantic_resource_attributes
+                                .as_ref()
+                                .and_then(|attributes| attributes.get(attr_name))
+                                .unwrap_or(attr_value)
                         };
                         values.insert(attr_name.clone(), resource_value_evaluator.evaluate(value));
 

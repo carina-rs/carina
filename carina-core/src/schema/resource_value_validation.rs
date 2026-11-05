@@ -247,14 +247,8 @@ fn same_validation_rule(left: &TypeError, right: &TypeError) -> bool {
         } => matches!(right,
             StringLiteralExpectedEnum { attribute: rattr, type_name: rtype, expected: rexpected, .. }
                 if (attribute, type_name, expected) == (rattr, rtype, rexpected)),
-        DuplicateListElement {
-            index,
-            first_index,
-            attribute,
-            ..
-        } => matches!(right,
-            DuplicateListElement { index: rindex, first_index: rfirst, attribute: rattr, .. }
-                if (index, first_index, attribute) == (rindex, rfirst, rattr)),
+        DuplicateListElement { attribute, .. } => matches!(right,
+            DuplicateListElement { attribute: rattr, .. } if attribute == rattr),
         ValidationFailed { .. } => matches!(right, ValidationFailed { .. }),
         ResourceValidationFailed { attribute, .. } => matches!(right,
             ResourceValidationFailed { attribute: rattr, .. } if attribute == rattr),
@@ -1248,6 +1242,11 @@ fn apply_leaf_lookup(
     if checked.fit.is_none() {
         return;
     }
+    // Provider bridges have always covered Map values. Key lifting and native
+    // key validators run above, but a bridge must not add new key constraints.
+    let LeafInput::Value(input) = input else {
+        return;
+    };
     let Some(lookup) = walk.lookup else {
         return;
     };
@@ -1273,12 +1272,7 @@ fn apply_leaf_lookup(
         {
             (
                 binding.identity().expect("identified lookup"),
-                match input {
-                    LeafInput::Value(value) => value.clone(),
-                    LeafInput::MapKey(key) => {
-                        Value::Concrete(ConcreteValue::String(key.clone().into()))
-                    }
-                },
+                input.clone(),
             )
         }
         _ => return,
@@ -1600,6 +1594,7 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
             );
             let mut best_fit: Option<CheckedValue<'a>> = None;
             let mut best_failure: Option<BestUnionMemberFailures> = None;
+            let mut best_external: Option<Vec<PathFinding>> = None;
             for member in members.as_raw_slice() {
                 let mut checked =
                     check_value(member, value, defs, ancestry, path, walk, visited_refs);
@@ -1629,6 +1624,15 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                         break;
                     }
                 } else if let Some(error) = checked.primary {
+                    // Provider lookup has independent Union alternatives:
+                    // retain its smallest failure set even when every arm
+                    // also fails locally, without walking any arm again.
+                    if best_external
+                        .as_ref()
+                        .is_none_or(|best| checked.external.len() < best.len())
+                    {
+                        best_external = Some(checked.external);
+                    }
                     let judgement = union_member_judgement_on_path(
                         member,
                         concrete,
@@ -1636,28 +1640,7 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                         ancestry,
                         visited_refs,
                     );
-                    if !judgement.failure_rank.is_match() {
-                        continue;
-                    }
-                    let failure = UnionMemberFailure {
-                        error,
-                        diagnostic_identity: judgement.diagnostic_identity,
-                    };
-                    match &mut best_failure {
-                        Some(best) if judgement.failure_rank > best.failure_rank => {
-                            *best = BestUnionMemberFailures::new(judgement.failure_rank, failure)
-                        }
-                        Some(best) if judgement.failure_rank == best.failure_rank => {
-                            best.tied.push(failure)
-                        }
-                        Some(_) => {}
-                        None => {
-                            best_failure = Some(BestUnionMemberFailures::new(
-                                judgement.failure_rank,
-                                failure,
-                            ))
-                        }
-                    }
+                    BestUnionMemberFailures::record(&mut best_failure, judgement, error);
                 }
             }
             if let Some(checked) = best_fit {
@@ -1668,7 +1651,9 @@ fn check_resolved_value<'a, P: PlaceholderKind, B: BindingAddress>(
                     .unwrap_or_else(|| {
                         TypeError::value_type_mismatch(attr.type_name(), value.type_name())
                     });
-                CheckedValue::rejected(path, error)
+                let mut checked = CheckedValue::rejected(path, error);
+                checked.external = best_external.unwrap_or_default();
+                checked
             }
         }
         (AttrTypeKind::Enum { identity, .. }, _) => {

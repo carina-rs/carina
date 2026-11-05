@@ -2408,11 +2408,10 @@ impl<'a, B: BindingAddress> UnresolvedExpression<'a, B> {
                 .first()
                 .and_then(|arg| arg.value())
                 .and_then(|inner| Self::with_sensitivity(inner, true)),
-            GenericValue::Deferred(DeferredValue::Coalesce {
-                value: left,
-                default,
-            }) => (Self::new(left).is_some() || Self::new(default).is_some())
-                .then_some(Self { value, sensitive }),
+            // Even concrete operands need their coalesce compatibility checked.
+            GenericValue::Deferred(DeferredValue::Coalesce { .. }) => {
+                Some(Self { value, sensitive })
+            }
             GenericValue::Deferred(DeferredValue::ModuleIf(deferred)) => deferred.values()[1..]
                 .iter()
                 .any(|branch| Self::new(branch).is_some())
@@ -2494,6 +2493,24 @@ enum EditorExpressionFit {
     ValueReportFailure,
 }
 
+fn check_editor_operands<'a, B: BindingAddress + 'a>(
+    operands: impl IntoIterator<Item = &'a GenericValue<ParserPlaceholder, B>>,
+    expected: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
+    bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
+    schemas: &SchemaRegistry,
+    binding_index: &BindingIndex<'_, B>,
+) -> Result<EditorExpressionFit, DeferredAccessTypeError> {
+    let mut fit = EditorExpressionFit::FitsSink;
+    for operand in operands {
+        if check_editor_expression(operand, expected, bindings, schemas, binding_index)?
+            == EditorExpressionFit::ValueReportFailure
+        {
+            fit = EditorExpressionFit::ValueReportFailure;
+        }
+    }
+    Ok(fit)
+}
+
 fn check_editor_expression<B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     expected: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
@@ -2515,20 +2532,30 @@ fn check_editor_expression<B: BindingAddress>(
         _ => None,
     };
     if let Some(operands) = operands {
-        let mut fit = EditorExpressionFit::FitsSink;
-        for operand in operands {
-            if check_editor_expression(operand, expected, bindings, schemas, binding_index)?
-                == EditorExpressionFit::ValueReportFailure
-            {
-                fit = EditorExpressionFit::ValueReportFailure;
-            }
-        }
+        let fit = check_editor_operands(operands, expected, bindings, schemas, binding_index)?;
         // A concrete failure anywhere inside an operand belongs to the value
         // report. Retain that outcome through enclosing coalesces, while
         // preserving every inference error encountered above.
         if fit == EditorExpressionFit::ValueReportFailure
             || matches!(value, GenericValue::Deferred(DeferredValue::ModuleIf(_)))
         {
+            return Ok(fit);
+        }
+    }
+    // Check collection operands at their declared element sink before asking
+    // inference for one aggregate type. A concrete bad item belongs to the
+    // value report; an empty collection still retains its inference failure.
+    if let Some(element) = expected.collection_element() {
+        let fit = match value {
+            GenericValue::Concrete(crate::resource::ConcreteValue::List(items)) => {
+                check_editor_operands(items, element, bindings, schemas, binding_index)?
+            }
+            GenericValue::Concrete(crate::resource::ConcreteValue::Map(entries)) => {
+                check_editor_operands(entries.values(), element, bindings, schemas, binding_index)?
+            }
+            _ => EditorExpressionFit::FitsSink,
+        };
+        if fit == EditorExpressionFit::ValueReportFailure {
             return Ok(fit);
         }
     }

@@ -2,6 +2,83 @@ use super::*;
 use carina_core::schema::{AttributeSchema, AttributeType, ListElements, ResourceSchema};
 
 #[test]
+fn round6_expanded_unique_lists_share_the_authored_duplicate_rule() {
+    for (items, expected) in [
+        (r#"[["a", "a"], ["b", "c", "b"]]"#, 1),
+        (r#"[["a", "b", "a"], ["b", "c", "c"]]"#, 1),
+        (r#"[["a", "a", "a"], ["b", "c", "b"]]"#, 2),
+    ] {
+        let source = format!(
+            "let copies = for x in {items} {{\n  mock.test.Collection {{ params = x }}\n}}\n"
+        );
+        let diagnostics = round2_source_diagnostics(
+            AttributeType::refined_list(AttributeType::string(), true, None, ListElements::Unique),
+            &source,
+        );
+        assert_eq!(diagnostics.len(), expected, "{source}: {diagnostics:#?}");
+        for diagnostic in diagnostics {
+            assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+            assert!(
+                diagnostic.message.contains("Duplicate list element"),
+                "{diagnostic:#?}"
+            );
+            let column = source.lines().nth(1).unwrap().rfind('x').unwrap() as u32;
+            assert_eq!(
+                diagnostic.range,
+                Range::new(Position::new(1, column), Position::new(1, column + 1))
+            );
+        }
+    }
+}
+
+#[test]
+fn round6_evaluated_coalesce_preserves_operand_compatibility() {
+    let diagnostics = collection_diagnostics(
+        AttributeType::union(vec![AttributeType::int(), AttributeType::string()]),
+        r#"length(["a"]) ?? "fallback""#,
+    );
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+    assert!(
+        diagnostics[0].message.contains("expected Int, got String")
+            && diagnostics[0].message.contains("coalesce default"),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn round6_coalesce_concrete_item_failure_has_one_owner() {
+    for expression in [
+        r#"producer.items ?? [1, "ok"]"#,
+        r#"producer.items ?? (["ok"] ?? [1, "ok"])"#,
+    ] {
+        let diagnostics =
+            review_coalesce_diagnostics(AttributeType::list(AttributeType::string()), expression);
+        assert_eq!(diagnostics.len(), 1, "{expression}: {diagnostics:#?}");
+        assert_eq!(
+            diagnostics[0].severity,
+            Some(DiagnosticSeverity::ERROR),
+            "{expression}: {diagnostics:#?}"
+        );
+        assert!(diagnostics[0].message.contains("expected String, got Int"));
+    }
+}
+
+#[test]
+fn round6_coalesce_retains_empty_collection_inference_failures() {
+    let diagnostics = review_coalesce_diagnostics(
+        AttributeType::union(vec![
+            AttributeType::string(),
+            AttributeType::list(AttributeType::string()),
+        ]),
+        "producer.text ?? []",
+    );
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert!(diagnostics[0].message.contains("empty collection"));
+}
+
+#[test]
 fn round5_generated_list_indexes_share_the_authored_binding_path() {
     for (items, expected) in [
         ("[[1, \"ok\"], [\"ok\", 1]]", 1),

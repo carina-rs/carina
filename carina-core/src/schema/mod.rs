@@ -6317,6 +6317,26 @@ struct BestUnionMemberFailures {
 }
 
 impl BestUnionMemberFailures {
+    fn record(best: &mut Option<Self>, judgement: UnionMemberJudgement, error: TypeError) {
+        if !judgement.failure_rank.is_match() {
+            return;
+        }
+        let failure = UnionMemberFailure {
+            error,
+            diagnostic_identity: judgement.diagnostic_identity,
+        };
+        match best {
+            Some(current) if judgement.failure_rank > current.failure_rank => {
+                *current = Self::new(judgement.failure_rank, failure);
+            }
+            Some(current) if judgement.failure_rank == current.failure_rank => {
+                current.tied.push(failure);
+            }
+            Some(_) => {}
+            None => *best = Some(Self::new(judgement.failure_rank, failure)),
+        }
+    }
+
     fn new(failure_rank: UnionFailureRank, first: UnionMemberFailure) -> Self {
         Self {
             failure_rank,
@@ -6548,28 +6568,7 @@ pub(crate) fn select_union_member_on_path<'a, P: PlaceholderKind, B: BindingAddr
             continue;
         };
         let judgement = union_member_judgement_on_path(member, value, defs, ancestry, visited_refs);
-        if !judgement.failure_rank.is_match() {
-            continue;
-        }
-        let failure = UnionMemberFailure {
-            error,
-            diagnostic_identity: judgement.diagnostic_identity,
-        };
-        match &mut best_failure {
-            Some(current) if judgement.failure_rank > current.failure_rank => {
-                *current = BestUnionMemberFailures::new(judgement.failure_rank, failure);
-            }
-            Some(current) if judgement.failure_rank == current.failure_rank => {
-                current.tied.push(failure);
-            }
-            Some(_) => {}
-            None => {
-                best_failure = Some(BestUnionMemberFailures::new(
-                    judgement.failure_rank,
-                    failure,
-                ));
-            }
-        }
+        BestUnionMemberFailures::record(&mut best_failure, judgement, error);
     }
 
     Err(best_failure

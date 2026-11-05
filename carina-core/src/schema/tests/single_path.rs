@@ -1,9 +1,144 @@
 use crate::parser::{CustomTypeValidationError, CustomTypeValidationTarget};
-use crate::resource::{ConcreteValue, Value};
+use crate::resource::{ConcreteValue, RawEnumIdentifier, Value};
 use crate::schema::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[test]
+fn round6_map_key_bridges_preserve_value_only_coverage() {
+    let identity = TypeIdentity::new(Some("mock"), ["test"], "Key");
+    for (leaf, value) in [
+        (
+            AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            Value::Concrete(ConcreteValue::String("bad".into())),
+        ),
+        (
+            AttributeType::enum_(
+                identity.clone(),
+                Some(vec!["bad".into()]),
+                vec![],
+                None,
+                None,
+            ),
+            Value::Concrete(ConcreteValue::EnumIdentifier(RawEnumIdentifier::parse(
+                "bad",
+            ))),
+        ),
+    ] {
+        for key in [true, false] {
+            let calls = AtomicUsize::new(0);
+            let map = if key {
+                AttributeType::map_with_key(leaf.clone(), AttributeType::string())
+            } else {
+                AttributeType::map(leaf.clone())
+            };
+            let mut registry = SchemaRegistry::new();
+            registry.insert(
+                "mock",
+                ResourceSchema::new("test.Sink")
+                    .attribute(AttributeSchema::optional("params", map).build())
+                    .validate()
+                    .unwrap(),
+            );
+            let schema = registry
+                .get("mock", "test.Sink", SchemaKind::Resource)
+                .unwrap();
+            let values: HashMap<String, Value> = HashMap::from([(
+                "params".into(),
+                Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
+                    "bad".into() => if key {
+                        Value::Concrete(ConcreteValue::String("bad".into()))
+                    } else {
+                        value.clone()
+                    }
+                })),
+            )]);
+            let resolver = |_: CustomTypeValidationTarget<'_>, _: &Value| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(CustomTypeValidationError::Rejected {
+                    owner: "mock".into(),
+                    identity: identity.clone(),
+                    message: "rejected".into(),
+                })
+            };
+            let findings = schema.collect_validation_with_resolver(&values, &|_| false, &resolver);
+            assert_eq!(
+                findings.len(),
+                usize::from(!key),
+                "key={key}: {findings:#?}"
+            );
+            assert_eq!(calls.swap(0, Ordering::SeqCst), usize::from(!key));
+            assert_eq!(
+                schema
+                    .validate_with_resolver(&values, &|_| false, &resolver)
+                    .is_ok(),
+                key
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(!key));
+        }
+    }
+}
+
+#[test]
+fn round6_rejected_union_arms_keep_independent_provider_findings_once() {
+    let calls = AtomicUsize::new(0);
+    let identity = TypeIdentity::new(Some("mock"), ["test"], "VpcId");
+    let arm = |name| {
+        AttributeType::struct_(
+            name,
+            vec![
+                StructField::required("required", AttributeType::int()).build(),
+                StructField::optional(
+                    "id",
+                    AttributeType::refined_string(Some(identity.clone()), None, None, None),
+                )
+                .build(),
+            ],
+        )
+    };
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.Sink")
+            .attribute(
+                AttributeSchema::optional("params", AttributeType::union(vec![arm("A"), arm("B")]))
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let schema = registry
+        .get("mock", "test.Sink", SchemaKind::Resource)
+        .unwrap();
+    let values: HashMap<String, Value> = HashMap::from([(
+        "params".into(),
+        Value::Concrete(ConcreteValue::Map(indexmap::indexmap! {
+            "id".into() => Value::Concrete(ConcreteValue::String("bad".into()))
+        })),
+    )]);
+    let resolver = |_: CustomTypeValidationTarget<'_>, _: &Value| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Err(CustomTypeValidationError::Rejected {
+            owner: "mock".into(),
+            identity: identity.clone(),
+            message: "independent provider rejection".into(),
+        })
+    };
+    let findings = schema.collect_validation_with_resolver(&values, &|_| false, &resolver);
+    assert_eq!(calls.swap(0, Ordering::SeqCst), 1);
+    assert_eq!(findings.len(), 2, "{findings:#?}");
+    assert!(
+        findings
+            .iter()
+            .any(|finding| matches!(finding.error, TypeError::CustomTypeValidation { .. }))
+    );
+    let errors = schema
+        .validate_with_resolver(&values, &|_| false, &resolver)
+        .unwrap_err();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(errors.len(), 2, "{errors:#?}");
+}
 
 #[test]
 fn round5_open_enum_map_keys_recognize_only_the_declarations_namespace() {

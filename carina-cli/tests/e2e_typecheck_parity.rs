@@ -45,6 +45,117 @@ fn write_fixture(files: &[(&str, &str)]) -> TempDir {
     dir
 }
 
+fn round6_bridge_schema(field_type: AttributeType) -> ValidatedResourceSchema {
+    ResourceSchema::new("test.Sink")
+        .attribute(AttributeSchema::optional("params", field_type).build())
+        .validate()
+        .unwrap()
+}
+
+fn round6_bridge_factories(schema: &ValidatedResourceSchema) -> Vec<Box<dyn ProviderFactory>> {
+    vec![Box::new(WasmStyleProviderFactory {
+        name: "awsccmock".into(),
+        schemas: vec![schema.clone()],
+    })]
+}
+
+fn round6_cli_bridge_errors(schema: &ValidatedResourceSchema, fixture: &TempDir) -> Vec<String> {
+    let diagnostics = carina_cli::commands::validate::validate_diagnostics_with_factories(
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        carina_cli::wiring::LoadedProviderFactory::for_test(round6_bridge_factories(schema)),
+        HashMap::new(),
+    );
+    assert!(
+        diagnostics.warnings.is_empty(),
+        "{:?}",
+        diagnostics.warnings
+    );
+    diagnostics
+        .errors
+        .iter()
+        .map(|error| carina_cli::error::format_error_with_source_chain(error))
+        .collect()
+}
+
+#[test]
+fn round6_cli_map_key_bridge_coverage_matches_origin_main() {
+    let identity = carina_core::schema::TypeIdentity::bare("VpcId");
+    for key in [
+        AttributeType::refined_string(Some(identity.clone()), None, None, None),
+        AttributeType::enum_(identity, Some(vec!["bad".into()]), vec![], None, None),
+    ] {
+        let schema =
+            round6_bridge_schema(AttributeType::map_with_key(key, AttributeType::string()));
+        let fixture = write_fixture(&[
+            ("providers.crn", "provider awsccmock {}\n"),
+            (
+                "main.crn",
+                "awsccmock.test.Sink { params = { bad = \"ok\" } }\n",
+            ),
+        ]);
+        assert_eq!(
+            round6_cli_bridge_errors(&schema, &fixture),
+            Vec::<String>::new()
+        );
+    }
+}
+
+#[test]
+fn round6_cli_rejected_union_keeps_provider_errors_from_origin_main() {
+    let arm = |name| {
+        AttributeType::struct_(
+            name,
+            vec![
+                StructField::required("required", AttributeType::int()).build(),
+                StructField::optional(
+                    "id",
+                    AttributeType::refined_string(
+                        Some(carina_core::schema::TypeIdentity::bare("VpcId")),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            ],
+        )
+    };
+    let schema = round6_bridge_schema(AttributeType::union(vec![arm("A"), arm("B")]));
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider awsccmock {}\n"),
+        (
+            "main.crn",
+            "awsccmock.test.Sink { params = { id = \"bad\" } }\n",
+        ),
+    ]);
+    let errors = round6_cli_bridge_errors(&schema, &fixture);
+    // Complete CLI output captured from origin/main for this directory fixture.
+    assert_eq!(
+        errors,
+        [
+            "awsccmock.test.Sink.<pending>: Expected one of these forms: 'required' (`A`) or 'required' (`B`)",
+            "awsccmock.test.Sink.<pending>: awsccmock rejected `VpcId`: Invalid vpc_id 'bad': must start with 'vpc-'",
+        ]
+    );
+    let loaded = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(round6_bridge_factories(&schema)),
+        SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
+    );
+    let diagnostics = lsp_diagnostics(
+        &DiagnosticEngine::new(Arc::new(loaded), vec!["awsccmock".into()]),
+        &fixture,
+        "main.crn",
+    );
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("must start with 'vpc-'")),
+        "{diagnostics:#?}"
+    );
+}
+
 fn round5_arithmetic_fixture(expression: &str) -> (SchemaRegistry, TempDir) {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -81,24 +192,9 @@ fn round5_arithmetic_fixture(expression: &str) -> (SchemaRegistry, TempDir) {
 
 #[test]
 fn round5_lsp_arithmetic_result_has_one_owner_for_literals_and_references() {
-    for expression in ["length(producer.items) + 1", "length([\"a\"]) + 1"] {
-        let (schemas, fixture) = round5_arithmetic_fixture(expression);
-        let diagnostics = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
-        assert_eq!(diagnostics.len(), 1, "{expression}: {diagnostics:#?}");
-        assert_eq!(
-            diagnostics[0].severity,
-            Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
-        );
-        assert!(
-            diagnostics[0].message.contains("expected String, got Int"),
-            "{diagnostics:#?}"
-        );
-    }
-}
-
-#[test]
-fn round5_secret_arithmetic_result_has_one_owner() {
     for expression in [
+        "length(producer.items) + 1",
+        "length([\"a\"]) + 1",
         "secret(length([\"a\"])) + 1",
         "secret(length(producer.items)) + 1",
     ] {

@@ -36,15 +36,11 @@ impl ResourceValueReport {
     ) {
         let mut authored = Self::default();
         for finding in findings {
-            let replaceable = matches!(&finding.detail().target,
+            let (location, finding) = finding.into_parts();
+            let replaceable = matches!(&finding.target,
                 ResourceValueTarget::Attribute { anchor: ValueFindingAnchor::BindingToken(token), .. }
-                if token.replaceable_location() == Some(finding.location()));
-            authored.insert(
-                finding.location().clone(),
-                finding.detail().clone(),
-                None,
-                replaceable,
-            );
+                if token.replaceable_location() == Some(&location));
+            authored.insert(location, finding, None, replaceable);
         }
         self.merge(authored);
     }

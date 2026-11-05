@@ -142,10 +142,9 @@ pub(crate) fn parse_coalesce_expr_with_mode(
     mode: &ExpressionMode<'_>,
 ) -> Result<EvalValue, ParseError> {
     let line = pair.line_col().0;
-    let operands = pair.into_inner().collect::<Vec<_>>();
+    let operands = pair.into_inner();
     let count = operands.len();
     let mut values = operands
-        .into_iter()
         .enumerate()
         .map(|(index, pair)| {
             let mut operand = mode.clone();
