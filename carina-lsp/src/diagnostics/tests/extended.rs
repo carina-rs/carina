@@ -17444,6 +17444,79 @@ fn map_length_diagnostics_in_directory_configuration() {
 }
 
 #[test]
+fn map_and_list_length_diagnostics_keep_whole_resource_errors() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ListElements, ResourceSchema};
+    let length = Some((Some(1), Some(2)));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Request")
+            .attribute(
+                AttributeSchema::required(
+                    "params",
+                    AttributeType::refined_map(
+                        AttributeType::string(),
+                        AttributeType::string(),
+                        length,
+                    ),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::required(
+                    "items",
+                    AttributeType::refined_list(
+                        AttributeType::string(),
+                        true,
+                        length,
+                        ListElements::AllowDuplicates,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    for count in [0, 1, 2, 3] {
+        let entries = (0..count)
+            .map(|index| format!("key_{index} = 'value' "))
+            .collect::<String>();
+        let items = vec!["'value'"; count].join(", ");
+        let source =
+            format!("mock.Request {{\n  params = {{ {entries}}}\n  items = [{items}]\n}}\n");
+        let diagnostics = engine.analyze(&create_document(&source), None);
+        if (1..=2).contains(&count) {
+            assert!(diagnostics.is_empty(), "{count}: {diagnostics:#?}");
+            continue;
+        }
+        let severities_for = |attribute| {
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains(&format!("'{attribute}'")))
+                .map(|diagnostic| diagnostic.severity)
+                .collect::<Vec<_>>()
+        };
+        let map_severities = severities_for("params");
+        assert_eq!(map_severities, severities_for("items"), "{diagnostics:#?}");
+        assert_eq!(
+            map_severities
+                .iter()
+                .filter(|severity| **severity == Some(DiagnosticSeverity::ERROR))
+                .count(),
+            1,
+            "{count}: {diagnostics:#?}"
+        );
+        assert!(
+            diagnostics.iter().all(|diagnostic| diagnostic
+                .message
+                .contains(&format!("length {count} is outside allowed range [1, 2]"))),
+            "{count}: {diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
 fn non_string_interpolation_sinks_across_files() {
     let engine = coalesce_resource_engine();
     for source in [
