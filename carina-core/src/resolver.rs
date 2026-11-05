@@ -992,15 +992,16 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
                 )?;
             } else if argument.pending_parameter().is_none()
                 && let Some(value) = argument.value()
+                && let Some(resolved_constraints) =
+                    crate::validation::typecheck::ResolvedConstraintValue::new(value)
             {
                 crate::validation::typecheck::TypecheckProviderContext::for_session(
                     provider_config,
                 )
-                .check_at(
+                .check_resolved_constraints_at(
                     &resolved_parameter
                         .map_or_else(|| expected.clone(), |resolved| resolved.as_type_expr()),
-                    value,
-                    crate::validation::typecheck::TypecheckInference::Unavailable,
+                    &resolved_constraints,
                     function_annotation_site(
                         function,
                         crate::validation::TypeResolutionDeclarationKind::FunctionParameter,
@@ -1048,12 +1049,14 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
     let result = resolve_ref_value_inner(&substituted, bindings, RuntimeContext::Session(config))
         .map_err(|message| user_function_runtime_error(function.body.source_line, message))
         .map_err(|error| locate_user_function_error(function, error))?;
-    if let Some(expected) = &function.return_type {
+    if let Some(expected) = &function.return_type
+        && let Some(resolved_constraints) =
+            crate::validation::typecheck::ResolvedConstraintValue::new(&result)
+    {
         crate::validation::typecheck::TypecheckProviderContext::for_session(provider_config)
-            .check_at(
+            .check_resolved_constraints_at(
                 expected,
-                &result,
-                crate::validation::typecheck::TypecheckInference::Unavailable,
+                &resolved_constraints,
                 function_annotation_site(
                     function,
                     crate::validation::TypeResolutionDeclarationKind::FunctionReturn,

@@ -35,7 +35,10 @@ pub(in crate::parser) fn parse_backend_block(
             let value = parse_expression(
                 next_pair(&mut attr_inner, "attribute value", "backend block")?,
                 ctx,
-            )?;
+            )?
+            .projection()
+            .expect("materialized parser expression")
+            .clone();
             attribute_spans.insert(key.clone(), key_span);
             attributes.insert(key, value);
         }

@@ -416,7 +416,7 @@ impl PersistedValue {
         &self.encoded
     }
 
-    /// Borrow the encoded JSON in tests and test-support code.
+    /// Borrow the encoded JSON in tests and test utilities.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn as_json(&self) -> &serde_json::Value {
         &self.encoded
@@ -514,7 +514,7 @@ impl PersistedExportValue {
         &self.encoded
     }
 
-    /// Borrow the encoded JSON in tests and test-support code.
+    /// Borrow the encoded JSON in tests and test utilities.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn as_json(&self) -> &serde_json::Value {
         &self.encoded

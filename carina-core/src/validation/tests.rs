@@ -33,6 +33,468 @@ type RuntimeInferredExportParam =
     crate::parser::InferredExportParam<NoPlaceholder, AbsoluteBindingAddress>;
 type RelativeRuntimeValue = GenericValue<NoPlaceholder, RelativeBindingName>;
 
+#[test]
+fn export_inference_preserves_authored_failure() {
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    for rhs in [
+        "'present' ?? 42",
+        "length(['present' ?? 42])",
+        "\"${'present' ?? 42}\"",
+    ] {
+        let parsed =
+            crate::parser::parse_and_resolve(&format!("exports {{ result = {rhs} }}")).unwrap();
+        let inferred = inference::apply_inference(parsed, &SchemaRegistry::new(), &config);
+        assert!(
+            matches!(
+                &inferred.export_params[0].static_type,
+                crate::static_type::ExportStaticType::Inferred(
+                    crate::static_type::StaticType::Unchecked(
+                        crate::static_type::InferredUncheckedReason::InferenceFailed(
+                            inference::InferenceError::IncompatibleCoalesceTypes { .. }
+                        )
+                    )
+                )
+            ),
+            "{rhs}: {:?}",
+            inferred.export_params[0].static_type
+        );
+    }
+}
+
+#[test]
+fn module_instances_retain_substituted_judgements() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("child")).unwrap();
+    std::fs::write(
+        root.path().join("child/main.crn"),
+        "arguments { x: String }\nattributes { result = \"${x}\" }\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("main.crn"), "let source = mock.test.Source {}\nlet template = use { source = './child' }\nlet literal = template { x = 'present' }\nlet deferred = template { x = source.name }\n").unwrap();
+    let path = crate::paths::ResolvedPath::new(root.path()).unwrap();
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let directory = crate::config_loader::parse_directory(&path, &config).unwrap();
+    let graph = deferred_types::with_session_for_test(&config, |session| {
+        crate::module_resolver::resolve_modules_with_providerless_config(
+            directory,
+            &path,
+            session,
+            &SchemaRegistry::new(),
+        )
+    })
+    .unwrap();
+    let report = graph.expression_report();
+    let scope = RootScope::new();
+    let literal = report
+        .module_attribute(
+            &scope.resolve(RelativeBindingName::new("literal")),
+            "result",
+        )
+        .unwrap();
+    let deferred = report
+        .module_attribute(
+            &scope.resolve(RelativeBindingName::new("deferred")),
+            "result",
+        )
+        .unwrap();
+    assert_eq!(
+        crate::parser::retained::admit_expression(literal, &TypeExpr::String),
+        Ok(crate::parser::retained::ExpressionAdmission::ValueCheck)
+    );
+    assert_eq!(
+        crate::parser::retained::admit_expression(deferred, &TypeExpr::String),
+        Ok(crate::parser::retained::ExpressionAdmission::ValueCheck)
+    );
+}
+
+#[test]
+fn single_reference_integer_interpolation_checks_resolved_string_constraints() {
+    let identity = TypeIdentity::new(Some("mock"), ["test"], "Digits");
+    let schema = PatternResourceSchema::new("test.Source")
+        .attribute(PatternAttributeSchema::optional("port", PatternAttributeType::int()).build())
+        .attribute(
+            PatternAttributeSchema::optional(
+                "digits",
+                PatternAttributeType::refined_string(
+                    Some(identity.clone()),
+                    Some("^[0-9]+$".into()),
+                    Some((Some(2), Some(4))),
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let expected = TypeExpr::SchemaType {
+        owned: crate::parser::ResolvedSchemaType::from_schema_declaration(
+            "mock",
+            schema.as_schema().attributes["digits"].attr_type(),
+        )
+        .unwrap(),
+    };
+    let config = loaded_context_for_test(ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            HashSet::from([crate::parser::OwnedTypeIdentity::provider(
+                "mock",
+                identity,
+                crate::schema::RefinedScalarKind::String,
+            )]),
+            Box::new(|_, _| Ok(())),
+        ),
+        ..expression_validation_config()
+    });
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("mock", schema);
+    let parsed = crate::parser::parse_and_resolve(
+        "let src = mock.test.Source {}\nlet port = src.port\nlet result = \"${port}\"",
+    )
+    .unwrap();
+    let report = crate::parser::retained::judge_expressions(&parsed, &schemas, &config);
+    let expression = report.binding(&RelativeBindingName::new("result")).unwrap();
+    assert_eq!(
+        crate::parser::retained::admit_expression(expression, &expected),
+        Ok(crate::parser::retained::ExpressionAdmission::DeferredInterpolation)
+    );
+    let authored = parsed.variables["result"]
+        .clone()
+        .resolve_root(&RootScope::new())
+        .into_expanded()
+        .unwrap();
+    for (port, accepted) in [(1, false), (42, true), (12345, false), (-42, false)] {
+        let source = Resource::with_provider("mock", "test.Source", "src", None)
+            .with_binding("src")
+            .with_attribute("port", Value::Concrete(ConcreteValue::Int(port)))
+            .resolve_root(&RootScope::new())
+            .into_expanded(&schemas)
+            .unwrap();
+        let bindings = crate::binding_index::ResolvedBindings::pre_apply_live(
+            crate::binding_index::LivePreApplyInputs {
+                managed: &[source],
+                compositions: &[],
+                managed_current: &HashMap::new(),
+                data_source_values: &crate::data_source_value::DataSourceValues::empty(),
+                remote_bindings: &HashMap::new(),
+                wait_aliases: &[],
+            },
+        );
+        let resolved = deferred_types::with_session_for_test(&config, |session| {
+            crate::resolver::resolve_ref_value_with_config(&authored, &bindings, session)
+        })
+        .unwrap();
+        assert_eq!(
+            resolved,
+            RuntimeValue::Concrete(RuntimeConcreteValue::String(port.to_string().into()))
+        );
+        let checked = typecheck::check_type_expr_value(&expected, &resolved, &config, expression)
+            .require_provider_schemas();
+        assert_eq!(checked.is_ok(), accepted, "{port}: {checked:?}");
+    }
+    assert!(
+        !authored.is_fully_resolved(),
+        "checking must preserve the deferred source"
+    );
+}
+
+#[test]
+fn validation_views_borrow_the_produced_report() {
+    let parsed = crate::parser::parse_and_resolve("let unused = 'present' ?? 42").unwrap();
+    let schemas = SchemaRegistry::new();
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+    let judged = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config);
+    let first = ValidationTypeContext::new_providerless(judged.judged(), &config, &signatures);
+    let second = ValidationTypeContext::new_providerless(judged.judged(), &config, &signatures);
+    assert!(std::ptr::eq(
+        first.expression_report,
+        second.expression_report
+    ));
+    assert!(std::ptr::eq(
+        first.expression_report,
+        judged.judged().report()
+    ));
+    assert_eq!(first.expression_report.findings().len(), 1);
+}
+
+#[test]
+fn planning_resolution_requires_a_successful_judgement() {
+    let schemas = SchemaRegistry::new();
+    let provider = LoadedProviderContext::empty_for_test();
+    let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+    let unjudged = crate::parser::ModuleResolvedParsedFile::default();
+    assert!(matches!(
+        resolve_bare_binding_uses(unjudged, &schemas, &provider, &signatures),
+        Err(ResolveFileError::Unjudged(_))
+    ));
+    let parsed = crate::parser::parse_and_resolve("let unused = 'present' ?? 42")
+        .unwrap()
+        .resolve_root(&RootScope::new());
+    let (invalid, ()) = parsed.map_deferred_for_phase(|templates| {
+        assert!(templates.is_empty());
+        (Vec::new(), ())
+    });
+    assert!(matches!(
+        resolve_bare_binding_uses(invalid, &schemas, &provider, &signatures),
+        Err(ResolveFileError::Expression(_))
+    ));
+}
+
+#[test]
+fn deferred_directive_consumes_judged_iterable_type() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("main.crn"), "let source = mock.r.Typed { name = 'source' tags = { child = 'not-a-bool' } }\nlet children = for child, flag in source.tags { mock.r.Typed { name = child directives { prevent_destroy = flag } } }\n").unwrap();
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("r.Typed")
+            .attribute(
+                PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "tags",
+                    PatternAttributeType::map(PatternAttributeType::string()),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let path = crate::paths::ResolvedPath::new(root.path()).unwrap();
+    let loaded =
+        crate::config_loader::load_configuration_with_config(&path, &config, &schemas).unwrap();
+    let graph = deferred_types::with_session_for_test(&config, |session| {
+        crate::module_resolver::resolve_modules_with_providerless_config(
+            loaded.parsed,
+            &path,
+            session,
+            &schemas,
+        )
+    })
+    .unwrap();
+    let site = graph.deferred_for_sites().next().unwrap();
+    let expression = graph
+        .expression_report()
+        .expression(site.iterable_location.unwrap());
+    assert_eq!(
+        expression
+            .as_ref()
+            .ok()
+            .map(|expression| expression.static_type()),
+        Some(Ok(&TypeExpr::Map(Box::new(TypeExpr::String)))),
+        "{expression:?}"
+    );
+    let errors = graph
+        .directive_resolution_errors(
+            crate::parser::ParserPlaceholderBoundary::ExpandedFile,
+            &schemas,
+            &config,
+        )
+        .unwrap();
+    assert!(
+        !errors.is_empty(),
+        "loop String was admitted to a Bool directive"
+    );
+}
+
+#[test]
+fn authored_expression_judges_coalesce_before_enclosing_reduction() {
+    let mut missed = Vec::new();
+    for expression in [
+        "'present' ?? 42",
+        "length(['present' ?? 42])",
+        "['ok', ('present' ?? 42)][0]",
+        "\"${'present' ?? 42}\"",
+        "length({key = 'present' ?? 42})",
+        "secret('present' ?? 42)",
+        "['present' ?? 42]",
+        "{key = 'present' ?? 42}",
+    ] {
+        let parsed =
+            crate::parser::parse_and_resolve(&format!("let result = {expression}\n")).unwrap();
+        let report = crate::parser::retained::judge_expressions(
+            &parsed,
+            &SchemaRegistry::new(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
+        let result = report
+            .binding(&RelativeBindingName::new("result"))
+            .unwrap()
+            .static_type();
+        if !matches!(
+            result,
+            Err(crate::static_type::InferenceIssue::Failed(
+                inference::InferenceError::IncompatibleCoalesceTypes { .. }
+            ))
+        ) {
+            missed.push(format!("{expression}: {result:?}"));
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "unchecked authored operands were erased:\n{}",
+        missed.join("\n")
+    );
+}
+
+#[test]
+fn authored_expression_module_argument_substitution_cannot_erase_fallback() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("child")).unwrap();
+    std::fs::write(
+        root.path().join("child/main.crn"),
+        "arguments { x: String }\nlet unused = length([x ?? 42])\nattributes { result = 'ok' }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("main.crn"),
+        "let template = use { source = './child' }\nlet child = template { x = 'present' }\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("exports.crn"), "exports {}\n").unwrap();
+    std::fs::write(root.path().join("providers.crn"), "").unwrap();
+    std::fs::write(
+        root.path().join("backend.crn"),
+        "backend local { path = 'state.json' }\n",
+    )
+    .unwrap();
+    let path = crate::paths::ResolvedPath::new(root.path()).unwrap();
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let loaded = crate::config_loader::load_configuration_with_config(
+        &path,
+        &config,
+        &SchemaRegistry::new(),
+    )
+    .unwrap();
+    let result = deferred_types::with_session_for_test(&config, |session| {
+        crate::module_resolver::resolve_modules_with_providerless_config(
+            loaded.parsed,
+            &path,
+            session,
+            &SchemaRegistry::new(),
+        )
+    });
+    assert!(
+        result.is_err(),
+        "module argument substitution erased an invalid unused expression"
+    );
+}
+
+#[test]
+fn authored_expression_nested_operands_and_lexical_scopes_survive() {
+    let mut missed = Vec::new();
+    for source in [
+        "let result = ['ok'][0 ?? 'bad']",
+        "let result = 'present' ?? 'fallback' ?? 42",
+        "let result = length({ nested { value = 'present' ?? 42 } })",
+        "test.r.typed { let a = 'present' plain = length([a ?? 42]) }",
+        "for a in ['present'] { test.r.typed { plain = a ?? 42 } }",
+        "fn bad(a: String): String { let b = a b ?? 42 }",
+    ] {
+        let parsed = crate::parser::parse_and_resolve(source).unwrap();
+        let report = crate::parser::retained::judge_expressions(
+            &parsed,
+            &SchemaRegistry::new(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
+        if report.findings().is_empty() {
+            missed.push(source);
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "unchecked lexical/index operands: {missed:#?}"
+    );
+}
+
+#[test]
+fn authored_expression_judgement_does_not_evaluate_lazy_or_secret_values() {
+    const SECRET: &str = "expression-typing-secret-must-not-leak";
+    for source in [
+        "let result = 'present' ?? env('CARINA_UNSELECTED_I4255_MISSING')".to_string(),
+        format!("let result = 'present' ?? secret('{SECRET}')"),
+    ] {
+        let parsed = crate::parser::parse_and_resolve(&source).unwrap();
+        let report = crate::parser::retained::judge_expressions(
+            &parsed,
+            &SchemaRegistry::new(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
+        assert!(report.findings().is_empty(), "{:?}", report.findings());
+        assert_eq!(
+            parsed.variables["result"],
+            Value::Concrete(ConcreteValue::String("present".into()))
+        );
+        let judged = report.binding(&RelativeBindingName::new("result")).unwrap();
+        assert_eq!(judged.static_type().unwrap(), &TypeExpr::String);
+        assert!(!format!("{judged:?}").contains(SECRET));
+    }
+}
+
+#[test]
+fn authored_expression_reference_authority_is_lexical() {
+    for source in [
+        "let a = { field = [1] }\nlet result = a.field ?? 'bad'",
+        "arguments { cfg: struct { items: list(String) } }\nlet result = length(cfg.items ?? 42)",
+    ] {
+        let parsed = crate::parser::parse_and_resolve(source).unwrap();
+        let report = crate::parser::retained::judge_expressions(
+            &parsed,
+            &SchemaRegistry::new(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
+        assert_eq!(
+            report.findings().len(),
+            1,
+            "{source}: {:?}",
+            report.findings()
+        );
+    }
+}
+
+#[test]
+fn authored_expression_structural_consumers_keep_unselected_operands() {
+    for source in [
+        "provider mock { version = '1.0.0' ?? 42 }",
+        "provider mock { default_tags = { key = 'value' } ?? 42 }",
+        "backend local { path = 'state.json' ?? 42 }",
+        "if (true ?? 42) { mock.test.resource { name = 'selected' } }",
+        "for name in (['selected'] ?? 42) { mock.test.resource { name = name } }",
+    ] {
+        let parsed = crate::parser::parse_and_resolve(source).unwrap();
+        let report = crate::parser::retained::judge_expressions(
+            &parsed,
+            &SchemaRegistry::new(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
+        assert_eq!(
+            report.findings().len(),
+            1,
+            "{source}: {:?}",
+            report.findings()
+        );
+    }
+}
+
+#[test]
+fn authored_expression_union_sink_cannot_admit_incompatible_operands() {
+    let parsed = crate::parser::parse_and_resolve("let value = 'present' ?? 42").unwrap();
+    let report = crate::parser::retained::judge_expressions(
+        &parsed,
+        &SchemaRegistry::new(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
+    let expression = report.binding(&RelativeBindingName::new("value")).unwrap();
+    assert!(
+        crate::parser::retained::admit_expression(
+            expression,
+            &TypeExpr::Union(vec![TypeExpr::String, TypeExpr::Int])
+        )
+        .is_err()
+    );
+}
+
 fn local_type(type_expr: TypeExpr) -> TypeExpr {
     type_expr
 }
@@ -62,7 +524,7 @@ fn rendered_typecheck_result(
         type_expr,
         value,
         typecheck::TypecheckProviderContext::for_parser(config),
-        typecheck::TypecheckInference::Unavailable,
+        &crate::parser::retained::value_dependent_judgement_for_test(),
     )
     .require_provider_schemas()
     .err()
@@ -100,7 +562,12 @@ fn ref_validation_rejects_missing_provenance_without_panicking() {
                 let schemas = SchemaRegistry::new();
                 let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
                 let bindings = BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(&parsed, &schemas, None, &signatures, session);
-                validate_resource_ref_types(&parsed, &schemas, &HashSet::new(), &bindings)
+                let configuration = crate::config_loader::load_buffer_configuration(
+                    &parsed,
+                    &schemas,
+                    session.as_provider_context(),
+                );
+                validate_resource_ref_types(configuration.judged(), &HashSet::new(), &bindings)
             },
         )
     }));
@@ -344,10 +811,23 @@ fn module_call_findings_for_test(
     provider_context: &LoadedProviderContext,
 ) -> Vec<ModuleCallFinding> {
     let schemas = SchemaRegistry::new();
-    let binding_use_report = check_bare_binding_uses(
-        parsed,
-        &ValidationTypeContext::new(parsed, &schemas, provider_context, signatures),
+    let mut fixture = parsed.clone();
+    crate::parser::retained::judge_configuration(
+        &mut fixture,
+        &schemas,
+        provider_context.as_provider_context(),
     );
+    let parsed = &fixture;
+    let binding_use_report = check_bare_binding_uses(&ValidationTypeContext::new(
+        crate::config_loader::load_buffer_configuration(
+            parsed,
+            &schemas,
+            provider_context.as_provider_context(),
+        )
+        .judged(),
+        provider_context,
+        signatures,
+    ));
     let bindings = BindingIndex::from_parsed_with_module_signatures(
         parsed,
         &schemas,
@@ -402,11 +882,18 @@ fn ref_walker_does_not_inherit_function_result_sink_for_arguments() {
 }
 
 fn validate_resource_ref_types_for_test<
-    E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>,
+    E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName> + Clone,
 >(
     parsed: &crate::parser::File<E>,
     schemas: &SchemaRegistry,
 ) -> Result<(), String> {
+    let mut fixture = parsed.clone();
+    crate::parser::retained::judge_configuration(
+        &mut fixture,
+        schemas,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
+    let parsed = &fixture;
     crate::validation::deferred_types::with_session_for_test(
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
@@ -417,7 +904,12 @@ fn validate_resource_ref_types_for_test<
                 .iter()
                 .map(|argument| argument.name.clone())
                 .collect();
-            super::validate_resource_ref_types(parsed, schemas, &argument_names, &bindings)
+            let configuration = crate::config_loader::load_buffer_configuration(
+                parsed,
+                schemas,
+                session.as_provider_context(),
+            );
+            super::validate_resource_ref_types(configuration.judged(), &argument_names, &bindings)
                 .map_err(|error| error.to_string())
         },
     )
@@ -476,10 +968,19 @@ fn loaded_catalog_rejects_undeclared_bare_integer_operand_type() {
     let schemas = SchemaRegistry::new();
     let config = loaded_context_for_test(ProviderContext::new(crate::EnvironmentSnapshot::empty()));
     let index = BindingIndex::from_parsed(&parsed, &schemas, &config);
-    let bindings = inference::InferenceBindings::from([(
-        "count".into(),
-        inference::InferenceBinding::Argument { type_expr: unknown },
-    )]);
+    let authored = crate::parser::parse_and_resolve(
+        "arguments { count: UndeclaredCount }\nlet computed = count + 1",
+    )
+    .unwrap();
+    let report = crate::parser::retained::judge_expressions(
+        &authored,
+        &schemas,
+        config.as_provider_context(),
+    );
+    let expression = report
+        .binding(&RelativeBindingName::new("computed"))
+        .unwrap();
+    let _ = unknown;
     let value = evaluate_integer_values(
         Value::Deferred(DeferredValue::Placeholder(
             ParserPlaceholder::ModuleArgument {
@@ -499,7 +1000,7 @@ fn loaded_catalog_rejects_undeclared_bare_integer_operand_type() {
             crate::schema::assignment_catalog_without_edges_for_test(),
             crate::schema::SinkAuthority::Owner(&TEST_OWNER),
         ),
-        &bindings,
+        expression,
         &schemas,
         &index,
     )
@@ -1160,10 +1661,16 @@ fn refined_int_module_argument_report(annotation: &str, sink: TypeExpr) -> Bindi
             requires: Vec::new(),
         },
     )]);
-    check_bare_binding_uses(
-        &parsed,
-        &ValidationTypeContext::new(&parsed, &schemas, &provider_context, &signatures),
-    )
+    check_bare_binding_uses(&ValidationTypeContext::new(
+        crate::config_loader::load_buffer_configuration(
+            &parsed,
+            &schemas,
+            provider_context.as_provider_context(),
+        )
+        .judged(),
+        &provider_context,
+        &signatures,
+    ))
 }
 
 #[test]
@@ -1488,7 +1995,7 @@ fn unloaded_schema_nominals_defer_values_and_resolve_when_catalog_loads() {
         &ty,
         &value,
         typecheck::TypecheckProviderContext::for_parser(&context),
-        typecheck::TypecheckInference::Unavailable,
+        &crate::parser::retained::value_dependent_judgement_for_test(),
     )
     .require_provider_schemas()
     .unwrap_err();
@@ -2015,13 +2522,14 @@ fn binding_use_finding_display_is_context_only_and_error_is_its_source() {
     let schemas = SchemaRegistry::new();
     let provider_context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let module_signatures = crate::module_resolver::ResolvedModuleSignatures::new();
+    let judged_configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &provider_context);
     let context = ValidationTypeContext::new_providerless(
-        &parsed,
-        &schemas,
+        judged_configuration.judged(),
         &provider_context,
         &module_signatures,
     );
-    let report = check_bare_binding_uses(&parsed, &context);
+    let report = check_bare_binding_uses(&context);
     let finding = report.findings().first().expect("binding-use finding");
     let detail = finding.error.to_string();
 
@@ -2066,10 +2574,16 @@ fn binding_diagnostics_preserve_symlink_parent_source_spelling() {
             .unwrap();
     let schemas = function_ref_schema();
     let signatures = crate::module_resolver::ResolvedModuleSignatures::new();
-    let report = check_bare_binding_uses(
-        &parsed,
-        &ValidationTypeContext::new(&parsed, &schemas, &provider, &signatures),
-    );
+    let report = check_bare_binding_uses(&ValidationTypeContext::new(
+        crate::config_loader::load_buffer_configuration(
+            &parsed,
+            &schemas,
+            provider.as_provider_context(),
+        )
+        .judged(),
+        &provider,
+        &signatures,
+    ));
     assert_eq!(report.findings().len(), 1, "{report:?}");
     let finding = &report.findings()[0];
     assert_eq!(finding.use_site.source_file.path(), path);
@@ -2139,10 +2653,18 @@ let generated = for item in items {
     let schemas = function_ref_schema();
     let module_signatures = crate::module_resolver::ResolvedModuleSignatures::new();
     let provider_context = LoadedProviderContext::empty_for_test();
-    let context =
-        ValidationTypeContext::new(&parsed, &schemas, &provider_context, &module_signatures);
+    let judged_configuration = crate::config_loader::load_buffer_configuration(
+        &parsed,
+        &schemas,
+        provider_context.as_provider_context(),
+    );
+    let context = ValidationTypeContext::new(
+        judged_configuration.judged(),
+        &provider_context,
+        &module_signatures,
+    );
 
-    let report = check_bare_binding_uses(&parsed, &context);
+    let report = check_bare_binding_uses(&context);
     assert!(
         !report.is_ready(),
         "expected typed sink mismatch: {report:#?}"
@@ -3954,7 +4476,7 @@ fn bare_builtin_custom_types_report_scalar_kind_mismatches() {
             typecheck::TypecheckProviderContext::for_parser(&ProviderContext::new(
                 crate::EnvironmentSnapshot::empty(),
             )),
-            typecheck::TypecheckInference::Unavailable,
+            &crate::parser::retained::value_dependent_judgement_for_test(),
         )
         .require_provider_schemas()
         .expect_err("the declared scalar kind must be checked before its validator");
@@ -4849,10 +5371,11 @@ fn check_module_calls_providerless_defers_unloaded_bare_count_argument() {
         },
     )]);
     let schemas = SchemaRegistry::new();
-    let report = check_bare_binding_uses(
-        &parsed,
-        &ValidationTypeContext::new_providerless(&parsed, &schemas, &config, &signatures),
-    );
+    let report = check_bare_binding_uses(&ValidationTypeContext::new_providerless(
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config).judged(),
+        &config,
+        &signatures,
+    ));
     let bindings =
         BindingIndex::from_parsed_with_module_signatures(&parsed, &schemas, &signatures, &config);
     let findings = crate::validation::deferred_types::with_session_for_test(&config, |session| {
@@ -4878,20 +5401,10 @@ fn check_module_calls_rejects_custom_type() {
 
     let config = context_with_iam_policy_arn_validator();
 
-    let mut args = HashMap::new();
-    args.insert(
-        "managed_policy_arns".to_string(),
-        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::String("aaaa".into()),
-        )])),
-    );
-
-    let mut parsed = empty_parsed();
-    parsed.module_calls = vec![ModuleCall::test(
-        "github".to_string(),
-        None,
-        module_arguments(args),
-    )];
+    let parsed = crate::parser::parse_and_resolve(
+        "let github = use { source = './github' }\ngithub { managed_policy_arns = ['aaaa'] }",
+    )
+    .unwrap();
 
     let mut imported_modules = HashMap::new();
     imported_modules.insert(
@@ -4923,15 +5436,10 @@ fn check_module_calls_rejects_custom_type() {
 fn check_module_calls_rejects_literal_union_mismatch() {
     use crate::parser::ArgumentParameter;
 
-    let mut parsed = empty_parsed();
-    parsed.module_calls = vec![ModuleCall::test(
-        "web_tier".to_string(),
-        None,
-        module_arguments([(
-            "environment".to_string(),
-            Value::Concrete(ConcreteValue::String("production".into())),
-        )]),
-    )];
+    let parsed = crate::parser::parse_and_resolve(
+        "let web_tier = use { source = './web' }\nweb_tier { environment = 'production' }",
+    )
+    .unwrap();
     let imported_modules = HashMap::from([(
         "web_tier".to_string(),
         crate::module_resolver::ResolvedModuleSignature {
@@ -5089,10 +5597,16 @@ fn check_module_calls_reports_nested_file_type_resolution_errors() {
         &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
         &provider_context,
     );
-    let binding_use_report = check_bare_binding_uses(
-        &parsed,
-        &ValidationTypeContext::new(&parsed, &schemas, &provider_context, &signatures),
-    );
+    let binding_use_report = check_bare_binding_uses(&ValidationTypeContext::new(
+        crate::config_loader::load_buffer_configuration(
+            &parsed,
+            &schemas,
+            provider_context.as_provider_context(),
+        )
+        .judged(),
+        &provider_context,
+        &signatures,
+    ));
     let bindings = BindingIndex::from_parsed_with_module_signatures(
         &parsed,
         &schemas,
@@ -5369,15 +5883,16 @@ child { values = [vpc] }
         },
     )]);
     let schemas = SchemaRegistry::new();
-    let report = check_bare_binding_uses(
-        &parsed,
-        &ValidationTypeContext::new_providerless(
+    let report = check_bare_binding_uses(&ValidationTypeContext::new_providerless(
+        crate::config_loader::load_buffer_configuration(
             &parsed,
             &schemas,
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-            &signatures,
-        ),
-    );
+        )
+        .judged(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        &signatures,
+    ));
     assert!(!report.is_ready(), "fixture must produce a binding finding");
 
     let findings = check_expanded_module_calls::<crate::resource::ParserPlaceholder>(
@@ -5430,15 +5945,16 @@ let child = child_module { value = forwarded }
             requires: Vec::new(),
         },
     )]);
-    let report = check_bare_binding_uses(
-        &parsed,
-        &ValidationTypeContext::new_providerless(
+    let report = check_bare_binding_uses(&ValidationTypeContext::new_providerless(
+        crate::config_loader::load_buffer_configuration(
             &parsed,
             &schemas,
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-            &signatures,
-        ),
-    );
+        )
+        .judged(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        &signatures,
+    ));
     assert_eq!(report.findings().len(), 1, "unexpected report: {report:#?}");
     assert!(matches!(
         report.findings()[0].error,
@@ -5590,12 +6106,10 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
         ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     });
     let authored = || Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.dsl_value"));
-    let mut module_parsed = empty_parsed();
-    module_parsed.module_calls = vec![ModuleCall::test(
-        "child",
-        None,
-        HashMap::from([("mode".to_string(), ModuleArgument::new(authored()))]),
-    )];
+    let module_parsed = crate::parser::parse_and_resolve(
+        "let child = use { source = './child' }\nchild { mode = test.widget.Mode.dsl_value }",
+    )
+    .unwrap();
     let imported_modules = HashMap::from([(
         "child".to_string(),
         crate::module_resolver::ResolvedModuleSignature {
@@ -9718,7 +10232,7 @@ fn deferred_loop_placeholder_access_checks_after_materialization() {
     let schemas = SchemaRegistry::new();
     let provider = crate::parser::LoadedProviderContext::empty_for_test();
     let index = BindingIndex::from_parsed(&parsed, &schemas, &provider);
-    let inference = inference::bindings_from_parsed(&parsed);
+    let inference = crate::parser::retained::value_dependent_judgement_for_test();
     let expected = crate::schema::CompiledAttributeType::string();
     let field = PathSegment::Field {
         name: "action".into(),
@@ -9759,13 +10273,14 @@ fn deferred_loop_placeholder_access_checks_after_materialization() {
             AccessMissPolicy::Defer,
         )
         .unwrap();
-        let result = check_deferred_access_type(
-            &materialized,
+        let materialized = materialized.into_expanded().unwrap();
+        let result = check_runtime_value_type(
+            inference::RuntimeTypeInput::computed_for_test(&materialized),
             crate::schema::TypeInSchema::schemaless(&expected).with_authority(
                 crate::schema::assignment_catalog_without_edges_for_test(),
                 crate::schema::SinkAuthority::Owner(&TEST_OWNER),
             ),
-            &inference,
+            &inference::InferenceBindings::new(),
             &schemas,
             &index,
         );
@@ -9896,4 +10411,461 @@ fn parser_test_location(path: &std::path::Path) -> crate::parser::DeclarationLoc
     .declarations()[0]
         .location()
         .clone()
+}
+
+fn missing_inventory_fixture(
+    rhs: &str,
+) -> (ParsedFile, crate::module_resolver::ResolvedModuleSignatures) {
+    let provider = LoadedProviderContext::empty_for_test();
+    let mut parsed = crate::parser::parse_and_resolve(&format!("let src = mock.test.Source {{}}\nlet n = \"${{src.name}}\"\nlet template = use {{ source = './child' }}\nlet child = template {{ x = {rhs} }}")).unwrap();
+    *parsed.parser_binding_metadata.syntax.expressions_mut() =
+        crate::parser::retained::Expressions::default();
+    let signatures = HashMap::from([(
+        "template".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![crate::parser::ArgumentParameter {
+                name: "x".to_string(),
+                static_type: resolve_consumer_static_type_for_signature(
+                    &TypeExpr::Int,
+                    provider.as_provider_context(),
+                ),
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+    (parsed, signatures)
+}
+
+#[test]
+fn module_argument_fallback_requires_authored_evidence() {
+    let (parsed, signatures) = missing_inventory_fixture("\"${src.name}\"");
+    let findings = module_call_findings_for_test(
+        &parsed,
+        &signatures,
+        &LoadedProviderContext::empty_for_test(),
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.kind() == ModuleCallFindingKind::ValueType),
+        "an authored argument used pending evidence: {findings:?}"
+    );
+}
+
+#[test]
+fn bare_typeexpr_sink_requires_authored_evidence() {
+    let (parsed, signatures) = missing_inventory_fixture("n");
+    let provider = LoadedProviderContext::empty_for_test();
+    let schemas = SchemaRegistry::new();
+    let loaded = crate::config_loader::load_buffer_configuration(
+        &parsed,
+        &schemas,
+        provider.as_provider_context(),
+    );
+    let context = ValidationTypeContext::new(loaded.judged(), &provider, &signatures);
+    let report = check_bare_binding_uses(&context);
+    assert!(!report.is_ready(), "a TypeExpr sink used pending evidence");
+}
+
+#[test]
+fn bare_binding_precheck_preserves_rejection_after_constant_folding() {
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let schemas = SchemaRegistry::new();
+    for rhs in ["'present' ?? 42", "['present', ('present' ?? 42)][0]"] {
+        let parsed = crate::parser::parse_and_resolve(&format!(
+            "let bad = {rhs}\nlet template = use {{ source = './child' }}\nlet child = template {{ x = bad }}"
+        ))
+        .unwrap();
+        let loaded = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config);
+        let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+        let context =
+            ValidationTypeContext::new_providerless(loaded.judged(), &config, &signatures);
+        let record = parsed
+            .bare_binding_uses()
+            .records()
+            .iter()
+            .find(|record| record.authored.name == "bad")
+            .unwrap();
+        let crate::parser::BareBindingSource::Value {
+            value,
+            declared_type,
+        } = &record.source
+        else {
+            panic!("value binding expected");
+        };
+        assert!(value.is_fully_resolved(), "{rhs}: {value:?}");
+        let expected = TypeExpr::String;
+        let error = precheck_value_source(
+            &record.authored,
+            value,
+            declared_type.as_deref(),
+            RefSink::TypeExpr(&expected),
+            &context,
+            &|path| ModuleCallDiagnosticPath::Authored(path.to_owned()),
+        )
+        .expect("a folded value must not overturn rejected admission");
+        assert!(
+            matches!(error, BindingResolutionError::DeferredAccess(error)
+            if matches!(*error, DeferredAccessTypeError::InvalidAccess {
+                error: inference::InferenceError::IncompatibleCoalesceTypes { .. }
+            })),
+            "{rhs}"
+        );
+    }
+}
+
+fn expression_validation_config() -> ProviderContext {
+    ProviderContext::new(crate::EnvironmentSnapshot::empty())
+}
+
+fn expression_validation_directory(
+    source: &str,
+    sibling: &str,
+) -> (tempfile::TempDir, crate::paths::ResolvedPath) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.crn"), source).unwrap();
+    std::fs::write(dir.path().join("source.crn"), sibling).unwrap();
+    let path = crate::paths::ResolvedPath::new(dir.path()).unwrap();
+    (dir, path)
+}
+
+fn expression_validation_directory_file(source: &str) -> ParsedFile {
+    let (_dir, path) = expression_validation_directory(source, "let src = mock.test.Source {}\n");
+    crate::config_loader::parse_directory(&path, &expression_validation_config())
+        .unwrap()
+        .into_parsed()
+}
+
+#[test]
+fn function_argument_interpolation_is_checked_locally() {
+    let result = crate::parser::parse_and_resolve(
+        "fn f(n: Int): Int { n }\nlet src = mock.test.Source {}\nlet result = f(\"${src.name}-inline\")",
+    );
+    assert!(
+        result.is_err(),
+        "authored function argument bypassed the Int sink"
+    );
+}
+
+#[test]
+fn function_return_interpolation_is_checked_across_files() {
+    let (_dir, path) = expression_validation_directory(
+        "let src = mock.test.Source {}\nlet result = f(src.name)",
+        "fn f(n: String): Int { \"${n}-inline\" }",
+    );
+    let result = crate::config_loader::parse_directory(&path, &expression_validation_config());
+    assert!(
+        result.is_err(),
+        "sibling function return bypassed the Int sink"
+    );
+}
+
+#[test]
+fn function_return_interpolation_is_checked_locally() {
+    let result = crate::parser::parse_and_resolve(
+        "fn f(n: String): Int { \"${n}-inline\" }\nlet src = mock.test.Source {}\nlet result = f(src.name)",
+    );
+    assert!(
+        result.is_err(),
+        "authored function return bypassed the Int sink"
+    );
+}
+
+#[test]
+fn concrete_function_arguments_keep_literal_precision() {
+    let result = crate::parser::parse_and_resolve(
+        "fn f(n: 'dev' | 'prod'): String { n }\nlet result = f('prod')",
+    );
+    assert!(
+        result.is_ok(),
+        "a valid literal was widened before its constraint check: {result:?}"
+    );
+}
+
+#[test]
+fn folded_children_keep_every_failure() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        crate::schema::PatternResourceSchema::new("test.Source")
+            .attribute(
+                crate::schema::PatternAttributeSchema::optional(
+                    "name",
+                    crate::schema::PatternAttributeType::string(),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    for source in [
+        "let a = 'x'\nlet b = a ?? [1, 'y']",
+        "let r = mock.test.Source {}\nlet a = 'x'\nlet b = a ?? r.no_such_attr",
+        "let a = 'x'\nlet b = length([a ?? [1, 'y']])",
+    ] {
+        let parsed = crate::parser::parse_and_resolve(source).unwrap();
+        let loaded = crate::config_loader::load_buffer_configuration(
+            &parsed,
+            &schemas,
+            &expression_validation_config(),
+        );
+        let judged = loaded.judged();
+        assert_eq!(
+            judged.report().findings().len(),
+            1,
+            "{source}: {:?}",
+            judged.report().findings()
+        );
+        assert!(matches!(
+            judged
+                .report()
+                .binding(&RelativeBindingName::new("b"))
+                .unwrap()
+                .static_type(),
+            Err(crate::static_type::InferenceIssue::Failed(_))
+        ));
+    }
+}
+
+#[test]
+fn resource_sink_does_not_repeat_child_findings() {
+    let parsed = expression_validation_directory_file(
+        "let sink = mock.test.Source { name = \"${src.no_such_attr}\" }",
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        crate::schema::PatternResourceSchema::new("test.Source")
+            .attribute(
+                crate::schema::PatternAttributeSchema::optional(
+                    "name",
+                    crate::schema::PatternAttributeType::string(),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let loaded = crate::config_loader::load_buffer_configuration(
+        &parsed,
+        &schemas,
+        &expression_validation_config(),
+    );
+    let report = loaded.judged().report();
+    assert!(report.findings().is_empty(), "{:?}", report.findings());
+    let sink = report.binding(&RelativeBindingName::new("sink")).unwrap();
+    assert_eq!(
+        sink.check_owner(),
+        crate::parser::retained::ExpressionCheckOwner::BindingIndex
+    );
+    assert!(matches!(
+        sink.static_type(),
+        Err(crate::static_type::InferenceIssue::Failed(
+            inference::InferenceError::UnknownAttribute { .. }
+        ))
+    ));
+}
+
+#[test]
+fn deferred_loop_keys_and_indexes_are_not_concrete() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        crate::schema::PatternResourceSchema::new("test.Source")
+            .attribute(
+                crate::schema::PatternAttributeSchema::optional(
+                    "tags",
+                    crate::schema::PatternAttributeType::map(
+                        crate::schema::PatternAttributeType::string(),
+                    ),
+                )
+                .build(),
+            )
+            .attribute(
+                crate::schema::PatternAttributeSchema::optional(
+                    "names",
+                    crate::schema::PatternAttributeType::list(
+                        crate::schema::PatternAttributeType::string(),
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "mock",
+        crate::schema::PatternResourceSchema::new("test.Sink")
+            .attribute(
+                crate::schema::PatternAttributeSchema::optional(
+                    "name",
+                    crate::schema::PatternAttributeType::refined_string(
+                        Some(crate::schema::TypeIdentity::new(
+                            Some("mock"),
+                            ["test", "Sink"],
+                            "Name",
+                        )),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    for pattern in ["for k, v in src.tags", "for (i, v) in src.names"] {
+        let name = if pattern.contains("k,") { "k" } else { "i" };
+        let parsed = crate::parser::parse_and_resolve(&format!("let src = mock.test.Source {{}}\n{pattern} {{ mock.test.Sink {{ name = \"${{{name}}}-inline\" }} }}")).unwrap();
+        let loaded = crate::config_loader::load_buffer_configuration(
+            &parsed,
+            &schemas,
+            &expression_validation_config(),
+        );
+        let judged = loaded.judged();
+        assert!(
+            judged.report().findings().is_empty(),
+            "{pattern}: {:?}",
+            judged.report().findings()
+        );
+        let tree = crate::parser::AnalysisTree::try_from_file(loaded.parsed()).unwrap();
+        let resource = tree
+            .resources()
+            .find(|r| r.id().resource_type == "test.Sink")
+            .unwrap();
+        let expression = judged
+            .report()
+            .expression(resource.attribute_value_location("name", &crate::schema::FieldPath::new()))
+            .unwrap();
+        assert_eq!(
+            crate::parser::retained::admit_expression(expression, &TypeExpr::String),
+            Ok(crate::parser::retained::ExpressionAdmission::DeferredInterpolation),
+            "{pattern}: {expression:?}"
+        );
+    }
+}
+
+#[test]
+fn module_argument_interpolation_cannot_bypass_substitution() {
+    let (dir, path) = expression_validation_directory(
+        "let template = use { source = './child' }\nlet child = template { n = \"${src.name}-inline\" }",
+        "let src = mock.test.Source {}",
+    );
+    std::fs::create_dir(dir.path().join("child")).unwrap();
+    std::fs::write(
+        dir.path().join("child/main.crn"),
+        "arguments { n: Int }\nattributes { value = n }",
+    )
+    .unwrap();
+    let parsed =
+        crate::config_loader::parse_directory(&path, &expression_validation_config()).unwrap();
+    let result =
+        deferred_types::with_session_for_test(&expression_validation_config(), |session| {
+            crate::module_resolver::resolve_modules_with_providerless_config(
+                parsed,
+                &path,
+                session,
+                &SchemaRegistry::new(),
+            )
+        });
+    assert!(
+        result.is_err(),
+        "module argument interpolation bypassed substitution checks"
+    );
+}
+
+#[test]
+fn instances_retain_each_authored_location() {
+    let (dir, path) = expression_validation_directory(
+        "let template = use { source = './child' }\nlet a = template { value = 42 }\nlet b = template { value = 'text' }",
+        "",
+    );
+    std::fs::create_dir(dir.path().join("child")).unwrap();
+    std::fs::write(
+        dir.path().join("child/main.crn"),
+        "arguments { value: Int | String }\nattributes { result = value }",
+    )
+    .unwrap();
+    let parsed =
+        crate::config_loader::parse_directory(&path, &expression_validation_config()).unwrap();
+    let child = crate::parser::parse_file(
+        "arguments { value: Int | String }\nattributes { result = value }",
+        &dir.path().join("child/main.crn"),
+        &expression_validation_config(),
+    )
+    .unwrap();
+    let location = child.attribute_params[0].value_location().unwrap().clone();
+    let graph = deferred_types::with_session_for_test(&expression_validation_config(), |session| {
+        crate::module_resolver::resolve_modules_with_providerless_config(
+            parsed,
+            &path,
+            session,
+            &SchemaRegistry::new(),
+        )
+    })
+    .unwrap();
+    let types = graph.expression_report().types_at_for_test(&location);
+    assert_eq!(
+        types.len(),
+        2,
+        "one instance overwrote the other: {types:?}"
+    );
+    let declared = TypeExpr::Union(vec![TypeExpr::Int, TypeExpr::String]);
+    assert_eq!(types, vec![declared.clone(), declared]);
+}
+
+#[test]
+fn schema_bundle_replaces_findings_from_a_different_registry() {
+    fn schemas(ty: crate::schema::PatternAttributeType) -> SchemaRegistry {
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            crate::schema::PatternResourceSchema::new("test.Source")
+                .attribute(crate::schema::PatternAttributeSchema::optional("name", ty).build())
+                .validate()
+                .unwrap(),
+        );
+        schemas
+    }
+    let parsed = crate::parser::parse_and_resolve(
+        "let src = mock.test.Source {}\nlet value = src.name ?? 42",
+    )
+    .unwrap();
+    let strings = schemas(crate::schema::PatternAttributeType::string());
+    let integers = schemas(crate::schema::PatternAttributeType::int());
+    let first = crate::config_loader::load_buffer_configuration(
+        &parsed,
+        &strings,
+        &expression_validation_config(),
+    );
+    assert_eq!(first.judged().report().findings().len(), 1);
+    let second = crate::config_loader::load_buffer_configuration(
+        first.parsed(),
+        &integers,
+        &expression_validation_config(),
+    );
+    assert!(
+        second.judged().report().findings().is_empty(),
+        "{:?}",
+        second.judged().report().findings()
+    );
+    assert_eq!(
+        second
+            .judged()
+            .report()
+            .binding(&RelativeBindingName::new("value"))
+            .unwrap()
+            .static_type(),
+        Ok(&TypeExpr::Int)
+    );
+    assert_eq!(
+        first.judged().report().findings().len(),
+        1,
+        "the first bundle is immutable"
+    );
 }

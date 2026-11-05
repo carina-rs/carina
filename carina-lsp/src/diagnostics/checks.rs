@@ -18,7 +18,7 @@ use carina_core::resource::{
     Value as GenericValue,
 };
 use carina_core::schema::suggest_similar_name;
-use carina_core::validation::typecheck::{self, TypecheckInference};
+use carina_core::validation::typecheck;
 
 use super::{
     DiagnosticRun, ProviderValidationDeduplicator, render_analysis_invariant, render_merged,
@@ -805,10 +805,11 @@ impl DiagnosticRun<'_> {
         if let Some(name) = current_file_name {
             overrides.insert(name.to_string(), doc.text());
         }
-        let result = carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
+        let result = carina_core::config_loader::parse_directory_with_overrides_and_diagnostics_with_schemas(
             base_path,
             self.provider_context.catalog(),
             &overrides,
+            &self.schemas,
         )?;
         Ok(MergedParseResult {
             directory: std::sync::Arc::new(result),
@@ -1240,9 +1241,17 @@ impl DiagnosticRun<'_> {
         doc: &Document,
         tree: &carina_core::parser::AnalysisTree<'_>,
         binding_index: &BindingIndex<'_>,
+        report: &carina_core::parser::retained::ExpressionReport,
     ) -> Vec<Diagnostic> {
         carina_core::validation::user_function_reference_diagnostics(tree, binding_index)
             .iter()
+            .filter(|finding| match report.expression(finding.location()) {
+                Ok(expression) => {
+                    expression.check_owner()
+                        != carina_core::parser::retained::ExpressionCheckOwner::Reported
+                }
+                Err(_) => true,
+            })
             .filter_map(|finding| {
                 render_merged(
                     doc,
@@ -1331,7 +1340,7 @@ impl DiagnosticRun<'_> {
         semantic_view: &SemanticView<'_>,
         binding_index: &BindingIndex<'_>,
         known_bindings: &HashSet<String>,
-        inference_bindings: &carina_core::validation::inference::InferenceBindings<
+        _inference_bindings: &carina_core::validation::inference::InferenceBindings<
             ParserPlaceholder,
         >,
     ) -> Vec<Diagnostic> {
@@ -1366,7 +1375,10 @@ impl DiagnosticRun<'_> {
                 // Check for undefined binding references in parser-native shapes
                 // (`Value::Deferred(DeferredValue::ResourceRef)` for `name.attr`, `Value::Deferred(DeferredValue::BindingRef)`
                 // for bare `name`, since #2847).
-                let undefined_binding = match value {
+                let undefined_binding = match semantic_view
+                    .value_for_typecheck(attr_param)
+                    .unwrap_or(value)
+                {
                     Value::Deferred(DeferredValue::ResourceRef { path })
                         if !known_bindings.contains(path.binding()) =>
                     {
@@ -1421,15 +1433,32 @@ impl DiagnosticRun<'_> {
                         continue;
                     };
                     let type_expr = &resolved_type;
+                    let expression = semantic_view
+                        .lookup(attr_param)
+                        .unwrap_or(attr_param)
+                        .judgement();
+                    let expression = match expression {
+                        Ok(expression) => expression,
+                        Err(error) => {
+                            let finding = carina_core::parser::Located::new(
+                                attr_param.type_check_location().clone(),
+                                error,
+                            );
+                            diagnostics.extend(render_merged(
+                                doc,
+                                &finding,
+                                DiagnosticSeverity::ERROR,
+                                error.to_string(),
+                            ));
+                            continue;
+                        }
+                    };
                     let type_error = match self.provider_context.loaded_context() {
                         Some(provider_context) => typecheck::check_type_expr_value(
                             type_expr,
                             semantic_value,
                             provider_context,
-                            TypecheckInference::Available {
-                                bindings: inference_bindings,
-                                schemas: &self.schemas,
-                            },
+                            expression,
                         )
                         .require_provider_schemas()
                         .err(),
@@ -1437,10 +1466,7 @@ impl DiagnosticRun<'_> {
                             type_expr,
                             semantic_value,
                             self.provider_context.catalog(),
-                            TypecheckInference::Available {
-                                bindings: inference_bindings,
-                                schemas: &self.schemas,
-                            },
+                            expression,
                         )
                         .record_at(
                             self.provider_context,
@@ -1451,7 +1477,10 @@ impl DiagnosticRun<'_> {
                         )
                         .err(),
                     };
-                    if let Some(type_error) = type_error {
+                    if let Some(type_error) = type_error
+                        && expression.check_owner()
+                            == carina_core::parser::retained::ExpressionCheckOwner::Expression
+                    {
                         let finding = carina_core::parser::Located::new(
                             record_for(attr_param).location().clone(),
                             type_error,
@@ -1561,6 +1590,23 @@ impl DiagnosticRun<'_> {
         });
 
         for param in &parsed.export_params {
+            let judged_param = semantic_view.lookup(param).unwrap_or(param);
+            let expression = match judged_param.judgement() {
+                Ok(expression) => expression,
+                Err(error) => {
+                    let finding = carina_core::parser::Located::new(
+                        param.type_check_location().clone(),
+                        error,
+                    );
+                    diagnostics.extend(render_merged(
+                        doc,
+                        &finding,
+                        DiagnosticSeverity::ERROR,
+                        error.to_string(),
+                    ));
+                    continue;
+                }
+            };
             if param.static_type.as_ref().is_some_and(|ty| {
                 carina_core::validation::resolve_type_expr(ty, self.provider_context.catalog())
                     .is_err()
@@ -1595,7 +1641,10 @@ impl DiagnosticRun<'_> {
                     self.export_value_error(semantic_param, value_bindings)
                 }
             };
-            if let Some(message) = message {
+            if let Some(message) = message
+                && expression.check_owner()
+                    != carina_core::parser::retained::ExpressionCheckOwner::Reported
+            {
                 let finding = carina_core::parser::Located::new(name_location(param), message);
                 diagnostics.extend(render_merged(
                     doc,
@@ -1614,29 +1663,57 @@ impl DiagnosticRun<'_> {
         param: &ParsedExportParam<ParserPlaceholder, B>,
         value_bindings: &GenericResolvedBindings<ParserPlaceholder, B>,
     ) -> Option<String> {
-        carina_core::validation::check_export_values_pre_apply(
+        let error = carina_core::validation::check_export_values_pre_apply(
             std::slice::from_ref(param),
             value_bindings,
             self.provider_context,
         )
-        .err()
+        .err();
+        if param.judgement().is_ok_and(|expression| {
+            expression.check_owner()
+                == carina_core::parser::retained::ExpressionCheckOwner::BindingIndex
+        }) {
+            // BindingIndex owns reference type diagnostics. Secrecy is an
+            // independent export obligation, including removed attributes.
+            let value = param.value()?;
+            let mut removed_secret = false;
+            value.visit_resource_refs_with_usage(&mut |path, usage| {
+                if usage == carina_core::resource::ResourceRefUsage::Required
+                    && value_bindings
+                        .removed_attribute_was_sensitive(path.binding(), path.attribute())
+                {
+                    removed_secret = true;
+                }
+            });
+            let secret = match carina_core::resolver::resolve_ref_value_with_config(
+                value,
+                value_bindings,
+                self.provider_context,
+            ) {
+                Ok(resolved) => removed_secret || carina_core::value::contains_secret(&resolved),
+                Err(_) => removed_secret, // Reference validation owns resolution failures.
+            };
+            return secret.then(|| format!("export '{}' cannot hold a secret value", param.name));
+        }
+        error
     }
 
     pub(super) fn check_inferred_export_types<D, B: BindingAddress>(
         &self,
         doc: &Document,
-        inference_input: &carina_core::parser::File<
+        configuration: &carina_core::parser::retained::JudgedFile<
+            '_,
             ParsedExportParam<ParserPlaceholder, B>,
-            ParserPlaceholder,
-            ParserPlaceholder,
             D,
             B,
         >,
         tree: &carina_core::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
     ) -> Vec<Diagnostic>
     where
-        D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+        D: Clone
+            + carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
+        let inference_input = configuration.file();
         let mut diagnostics = Vec::new();
         let inferred_export_params = if let Some(loaded_providers) = &self.loaded_providers {
             let provider_inferred = carina_core::validation::inference::
@@ -1668,7 +1745,7 @@ impl DiagnosticRun<'_> {
             }
             provider_inferred.into_inferred_export_params()
         } else {
-            self.infer_export_params_without_loaded_provider_schemas(inference_input)
+            carina_core::validation::inference::infer_export_params(configuration)
         };
         let signatures = carina_core::module_resolver::ResolvedModuleSignatures::default();
         let export_bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
@@ -1704,26 +1781,6 @@ impl DiagnosticRun<'_> {
         }
 
         diagnostics
-    }
-
-    fn infer_export_params_without_loaded_provider_schemas<D, B: BindingAddress>(
-        &self,
-        parsed: &carina_core::parser::File<
-            ParsedExportParam<ParserPlaceholder, B>,
-            ParserPlaceholder,
-            ParserPlaceholder,
-            D,
-            B,
-        >,
-    ) -> carina_core::validation::inference::SchemaCheckedExportParams<B>
-    where
-        D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
-    {
-        carina_core::validation::inference::infer_export_params(
-            parsed,
-            &self.schemas,
-            self.provider_context.catalog(),
-        )
     }
 
     /// Check authored references against directory-wide binding authority.

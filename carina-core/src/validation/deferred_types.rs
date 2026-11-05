@@ -199,19 +199,31 @@ impl dyn ProviderTypeCheckContext + '_ {
 /// ```
 ///
 /// ```compile_fail
-/// use carina_core::{parser::{ProviderContext, TypeExpr}, resource::{AuthoredValue, AuthoredConcreteValue}, validation::{deferred_types::TypeCheckSession, typecheck::{check_type_expr_value_providerless, TypecheckInference}}};
+/// use carina_core::{parser::{ProviderContext, TypeExpr}, resource::{AuthoredValue, AuthoredConcreteValue}, validation::{deferred_types::TypeCheckSession, typecheck::check_type_expr_value_providerless}};
 /// let expected = TypeExpr::String;
 /// let value = AuthoredValue::Concrete(AuthoredConcreteValue::String("value".into()));
+/// let catalog = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+/// let parsed = carina_core::parser::parse_file("let value = 'value'", std::path::Path::new("test.crn"), &catalog).unwrap();
+/// let schemas = carina_core::schema::SchemaRegistry::new();
+/// let loaded = carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+/// let report = loaded.judged();
+/// let expression = report.report().binding(&carina_core::resource::RelativeBindingName::new("value")).unwrap();
 /// let escaped = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
-///     check_type_expr_value_providerless(&expected, &value, session.catalog(), TypecheckInference::Unavailable)
+///     check_type_expr_value_providerless(&expected, &value, session.catalog(), expression)
 /// });
 /// ```
 /// ```
-/// use carina_core::{parser::{ProviderContext, TypeExpr}, resource::{AuthoredValue, AuthoredConcreteValue}, validation::{deferred_types::TypeCheckSession, typecheck::{check_type_expr_value_providerless, TypecheckInference}}};
+/// use carina_core::{parser::{ProviderContext, TypeExpr}, resource::{AuthoredValue, AuthoredConcreteValue}, validation::{deferred_types::TypeCheckSession, typecheck::check_type_expr_value_providerless}};
 /// let expected = TypeExpr::String;
 /// let value = AuthoredValue::Concrete(AuthoredConcreteValue::String("value".into()));
+/// let catalog = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+/// let parsed = carina_core::parser::parse_file("let value = 'value'", std::path::Path::new("test.crn"), &catalog).unwrap();
+/// let schemas = carina_core::schema::SchemaRegistry::new();
+/// let loaded = carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+/// let report = loaded.judged();
+/// let expression = report.report().binding(&carina_core::resource::RelativeBindingName::new("value")).unwrap();
 /// let result = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
-///     check_type_expr_value_providerless(&expected, &value, session.catalog(), TypecheckInference::Unavailable)
+///     check_type_expr_value_providerless(&expected, &value, session.catalog(), expression)
 ///         .record_deferred(session).unwrap();
 /// });
 /// result.publish(&mut Vec::new());
@@ -819,7 +831,7 @@ mod tests {
                     &expected,
                     &value,
                     context.catalog(),
-                    super::super::typecheck::TypecheckInference::Unavailable,
+                    &crate::parser::retained::value_dependent_judgement_for_test(),
                 )
                 .record_at(
                     context,

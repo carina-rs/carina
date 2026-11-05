@@ -50,6 +50,20 @@ jobs:
       - uses: ./.github/actions/rust-cache
       - run: cargo check --all-targets --all-features
 
+  feature-isolation:
+    name: Feature Isolation
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-cache
+      - uses: taiki-e/install-action@cargo-hack
+      - run: cargo hack check --workspace --each-feature --no-dev-deps
+
   fmt:
     name: Format
     needs: changes

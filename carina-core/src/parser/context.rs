@@ -205,6 +205,32 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
         &self.diagnostic_source.path
     }
 
+    pub(super) fn evaluate_retained_expression(
+        &self,
+        pair: pest::iterators::Pair<'_, Rule>,
+        reduce: impl FnOnce() -> Result<Value, ParseError>,
+    ) -> Result<super::retained::ExprValue, ParseError> {
+        super::retained::evaluate(
+            pair,
+            &self.diagnostic_source.file,
+            &self.diagnostic_source.path,
+            reduce,
+        )
+    }
+
+    pub(super) fn evaluate_retained_sink(
+        &self,
+        pair: pest::iterators::Pair<'_, Rule>,
+        reduce: impl FnOnce() -> Result<crate::eval_value::ParsedSinkValue, ParseError>,
+    ) -> Result<super::retained::SinkExpression, ParseError> {
+        super::retained::evaluate_sink(
+            pair,
+            &self.diagnostic_source.file,
+            &self.diagnostic_source.path,
+            reduce,
+        )
+    }
+
     pub(super) fn access_locations(
         &self,
         pair: &pest::iterators::Pair<'_, Rule>,
@@ -778,6 +804,22 @@ impl<'a> ExpressionMode<'a> {
         token: &pest::iterators::Pair<'_, Rule>,
     ) -> Option<PendingValueSlot> {
         let sink = self.sink.as_ref()?;
+        self.record_bare_binding_at(
+            ctx,
+            name,
+            token,
+            super::DeclarationLocation::from_pair(token, sink.preprocessed_file, sink.source_file),
+        )
+    }
+
+    pub(super) fn record_bare_binding_at(
+        &self,
+        ctx: &ParseContext<'_>,
+        name: &str,
+        token: &pest::iterators::Pair<'_, Rule>,
+        location: super::DeclarationLocation,
+    ) -> Option<PendingValueSlot> {
+        let sink = self.sink.as_ref()?;
         let (binding, source) = match ctx.lookup_binding(name) {
             ParseBindingRef::Value {
                 value: EvalValue::DeferredForValue { .. },
@@ -820,11 +862,8 @@ impl<'a> ExpressionMode<'a> {
             ParseBindingRef::Unbound => return None,
         };
         let authored = BareBindingUse {
-            location: super::DeclarationLocation::from_pair(
-                token,
-                sink.preprocessed_file,
-                sink.source_file,
-            ),
+            expression_instance: super::retained::ExpressionInstance::Root,
+            location,
             source_file: SourceFileId::new(sink.source_file.to_path_buf()),
             scope: ctx
                 .binding_scope(name)

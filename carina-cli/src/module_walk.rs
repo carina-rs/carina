@@ -47,6 +47,7 @@ impl ModuleWalk {
         parsed: &carina_core::parser::File<E>,
         base_dir: &ResolvedPath,
         environment: &carina_core::EnvironmentSnapshot,
+        schemas: &carina_core::schema::SchemaRegistry,
     ) -> Self {
         let context = carina_core::parser::ProviderContext::new(environment.clone());
         let mut walk = Self::default();
@@ -63,6 +64,7 @@ impl ModuleWalk {
                 &mut visited,
                 &mut walk.modules,
                 &context,
+                schemas,
             );
         }
         walk
@@ -80,12 +82,15 @@ fn visit_module(
     visited: &mut HashSet<CanonicalPath>,
     modules: &mut Vec<LoadedModuleAtPath>,
     context: &carina_core::parser::ProviderContext,
+    schemas: &carina_core::schema::SchemaRegistry,
 ) {
     if !visited.insert(module_path.identity()) {
         return;
     }
 
-    let Some(loaded) = module_resolver::load_module_with_diagnostics(module_path, context) else {
+    let Some(loaded) =
+        module_resolver::load_module_with_diagnostics_and_schemas(module_path, context, schemas)
+    else {
         return;
     };
     let child_paths: Vec<_> = loaded
@@ -114,6 +119,7 @@ fn visit_module(
             visited,
             modules,
             context,
+            schemas,
         );
     }
 }
@@ -153,6 +159,7 @@ mod tests {
             &parsed,
             &ResolvedPath::new(&project).unwrap(),
             &carina_core::EnvironmentSnapshot::empty(),
+            &carina_core::schema::SchemaRegistry::new(),
         );
         assert_eq!(
             walk.iter()

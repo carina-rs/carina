@@ -4806,8 +4806,6 @@ async fn outcome_unknown_refresh_preserves_managed_and_orphan_rows_without_provi
     assert_eq!(provider.read_calls(), 0);
 }
 
-use carina_core::parser::ParsedFile;
-
 /// Verify that provider state normalization plus host schema lifting prevents
 /// false diffs for enum values in state.
 ///
@@ -11575,7 +11573,7 @@ fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums
 fn module_checker_and_provider_wrappers_accept_empty_input() {
     let ctx =
         WiringContext::new_for_test(&crate::test_support::TestCommandRuntime::new(), vec![], &[]);
-    let authored = ParsedFile::default();
+    let authored = crate::test_support::parsed_fixture("");
     let parsed = resolve_file_for_test(authored.clone());
     let provider_ctx = ctx.provider_context();
 
@@ -11583,11 +11581,14 @@ fn module_checker_and_provider_wrappers_accept_empty_input() {
     assert!(errors.is_empty(), "provider_region: got {errors:?}");
 
     let module_signatures = carina_core::module_resolver::ResolvedModuleSignatures::new();
-    let binding_use_report = carina_core::validation::check_bare_binding_uses(
+    let configuration = carina_core::config_loader::load_buffer_configuration(
         &authored,
+        ctx.schemas(),
+        provider_ctx.as_provider_context(),
+    );
+    let binding_use_report = carina_core::validation::check_bare_binding_uses(
         &carina_core::validation::ValidationTypeContext::new(
-            &authored,
-            ctx.schemas(),
+            configuration.judged(),
             provider_ctx,
             &module_signatures,
         ),
@@ -14353,9 +14354,10 @@ mod resolved_value_constraint_gate {
         }
     }
 
-    fn managed_resources(
+    fn managed_expression_resources(
         consumer_type: &str,
         producer_value: Value,
+        expression: Value,
     ) -> (OverrideAwareResources, Vec<Resource>) {
         let producer = Resource::with_provider("test", "source", "producer", None)
             .with_absolute_binding(absolute_binding("producer"))
@@ -14367,7 +14369,7 @@ mod resolved_value_constraint_gate {
         };
         let consumer = Resource::with_provider("test", consumer_type, "consumer", None)
             .with_absolute_binding(absolute_binding("consumer"))
-            .with_attribute(resolved_attribute, ref_value());
+            .with_attribute(resolved_attribute, expression);
         let source = vec![producer, consumer];
         let compositions = Vec::<LiveComposition>::new();
         let current_states = HashMap::new();
@@ -14395,13 +14397,23 @@ mod resolved_value_constraint_gate {
         producer_value: Value,
         normalizer: &RewritingNormalizer,
     ) -> Result<(), Vec<carina_core::plan::PlanError>> {
+        prepare_managed_expression(consumer_type, producer_value, ref_value(), normalizer).await
+    }
+
+    async fn prepare_managed_expression(
+        consumer_type: &str,
+        producer_value: Value,
+        expression: Value,
+        normalizer: &RewritingNormalizer,
+    ) -> Result<(), Vec<carina_core::plan::PlanError>> {
         let wiring = ValidatedWiring::from_factories_for_test(
             &crate::test_support::TestCommandRuntime::new(),
             vec![Box::new(ConstraintFactory)],
             &[],
         );
         let ctx = wiring.context();
-        let (mut resources, origins) = managed_resources(consumer_type, producer_value);
+        let (mut resources, origins) =
+            managed_expression_resources(consumer_type, producer_value, expression);
         let compositions = Vec::new();
         let module_gate =
             carina_core::executor::ModuleConstraintGate::from_live_compositions(&compositions);
@@ -14613,6 +14625,27 @@ mod resolved_value_constraint_gate {
 
         assert_resolved_error(&errors, "consumer.Custom", "target", "external id rejected");
         assert_eq!(normalizer.desired_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn authored_expression_resolved_invalid_interpolation_keeps_named_constraint_gate() {
+        for (source, suffix) in [("bad", ""), ("ba", "d")] {
+            let normalizer = RewritingNormalizer::default();
+            let expression = Value::Deferred(DeferredValue::Interpolation(vec![
+                InterpolationPart::Expr(ref_value()),
+                InterpolationPart::Literal(suffix.into()),
+            ]));
+            let errors = prepare_managed_expression(
+                "consumer.Custom",
+                text(source),
+                expression,
+                &normalizer,
+            )
+            .await
+            .expect_err("resolved interpolation must satisfy the named String constraint");
+            assert_resolved_error(&errors, "consumer.Custom", "target", "external id rejected");
+            assert_eq!(normalizer.desired_calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test]

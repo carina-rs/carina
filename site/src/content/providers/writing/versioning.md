@@ -23,8 +23,8 @@ Since v0.5.0, the first release that checks the version, every release has set t
 
 | Carina release | Protocol version | Oldest provider protocol it loads |
 |----------------|------------------|-----------------------------------|
-| Main after v0.10.0 (unreleased) | 22 | 22 |
-| Development snapshot after v0.10.0 (unreleased) | 21 | 21 |
+| Main after v0.11.0 (unreleased) | 22 | 22 |
+| v0.11.0 | 21 | 21 |
 | Development snapshot after v0.10.0 (unreleased) | 20 | 20 |
 | v0.10.0 | 19 | 19 |
 | Development snapshot after v0.9.0 (unreleased) | 18 | 18 |
@@ -39,9 +39,9 @@ Since v0.5.0, the first release that checks the version, every release has set t
 | v0.6.0 | 10 | 10 |
 | v0.5.0 | 10 | 10 |
 
-Protocol 22 is current on main; Carina v0.10.0 uses protocol 19. Protocol 22 adds an optional entry-count bound to map attribute types, the same `length` shape that list types use. Carina checks it during validation, planning, and LSP diagnostics. Providers built for protocol 21 or earlier must rebuild against the current SDK.
+Protocol 22 is current on main; Carina v0.11.0 uses protocol 21 and v0.10.0 uses protocol 19. Protocol 22 adds an optional entry-count bound to map attribute types, the same `length` shape that list types use. Carina checks it during validation, planning, and LSP diagnostics. Providers built for protocol 21 or earlier must rebuild against the current SDK.
 
-Protocol 21's schema envelope requires `assignability_edges`, even when empty, and SDK providers must implement `CarinaProvider::assignability_edges`. Both endpoints must be declared by that provider as scalar String, Int, or Float identities with the same scalar kind. Enum, Reference, and core built-in identities cannot be endpoints; self edges, duplicates, and cycles are rejected. Each provider's transitive closure is retained separately, so paths never combine different providers' declarations.
+The protocol 21 schema envelope requires `assignability_edges`, even when empty, and SDK providers must implement `CarinaProvider::assignability_edges`. Both endpoints must be declared by that provider as scalar String, Int, or Float identities with the same scalar kind. Enum, Reference, and core built-in identities cannot be endpoints; self edges, duplicates, and cycles are rejected. Each provider's transitive closure is retained separately, so paths never combine different providers' declarations.
 
 Assignment first checks structural identity. When identities differ, a provider attribute uses its sink owner's edges. Type annotations and module boundaries require a path declared by every owner of the sink identity. The existing length and range checks still apply, and sink validators still run on values during validation, planning, and apply.
 

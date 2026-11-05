@@ -922,8 +922,7 @@ pub(crate) type ValidationProviderCatalog<'a> =
 pub(crate) trait ValidationProviderCatalogExt {
     fn type_context<'a, E, D, B: BindingAddress>(
         &'a self,
-        file: &'a carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
-        schemas: &'a SchemaRegistry,
+        file: &'a carina_core::parser::retained::JudgedFile<'_, E, D, B>,
         signatures: &'a carina_core::module_resolver::ResolvedModuleSignatures,
     ) -> validation::ValidationTypeContext<'a, B>
     where
@@ -933,14 +932,13 @@ pub(crate) trait ValidationProviderCatalogExt {
 impl ValidationProviderCatalogExt for ValidationProviderCatalog<'_> {
     fn type_context<'a, E, D, B: BindingAddress>(
         &'a self,
-        file: &'a carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
-        schemas: &'a SchemaRegistry,
+        file: &'a carina_core::parser::retained::JudgedFile<'_, E, D, B>,
         signatures: &'a carina_core::module_resolver::ResolvedModuleSignatures,
     ) -> validation::ValidationTypeContext<'a, B>
     where
         D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        validation::ValidationTypeContext::in_session(file, schemas, self, signatures)
+        validation::ValidationTypeContext::in_session(file, self, signatures)
     }
 }
 
@@ -1275,6 +1273,12 @@ fn binding_use_report_error(report: carina_core::validation::BindingUseReport) -
 
 fn resolve_file_error(error: carina_core::validation::ResolveFileError) -> AppError {
     match error {
+        carina_core::validation::ResolveFileError::Unjudged(error) => {
+            AppError::Config(error.to_string())
+        }
+        carina_core::validation::ResolveFileError::Expression(finding) => {
+            AppError::ExpressionType(finding)
+        }
         carina_core::validation::ResolveFileError::BindingUse(report) => {
             binding_use_report_error(report)
         }
@@ -3091,16 +3095,16 @@ pub fn validate_resource_ref_types_with_ctx<
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     ctx: &WiringContext,
-    parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
     argument_names: &HashSet<String>,
 ) -> Vec<AppError> {
+    let parsed = judged.file();
     let bindings = carina_core::binding_index::BindingIndex::from_parsed(
         parsed,
         ctx.schemas(),
         ctx.provider_context().as_provider_context(),
     );
-    match validation::validate_resource_ref_types(parsed, ctx.schemas(), argument_names, &bindings)
-    {
+    match validation::validate_resource_ref_types(judged, argument_names, &bindings) {
         Ok(()) => Vec::new(),
         Err(validation::ResourceRefTypeValidationError::Validation(message)) => {
             split_validation_message(&message)
@@ -4510,6 +4514,19 @@ pub(crate) fn validate_module_internal_ref_types(
     for module in module_walk.iter() {
         let mut parsed = module.loaded().parsed.clone();
         let prefix = module.diagnostic_label();
+        let configuration = carina_core::config_loader::load_buffer_configuration(
+            &parsed,
+            ctx.schemas(),
+            config.catalog(),
+        );
+        let expression_report = configuration.judged().report();
+        errors.extend(
+            expression_report
+                .findings()
+                .iter()
+                .cloned()
+                .map(|finding| AppError::ExpressionType(Box::new(finding))),
+        );
         // Module expansion retains the established diagnostic for malformed
         // declarations. This pass only needs successful resolution so valid
         // dotted argument types can act as sources before expansion.
@@ -4528,12 +4545,6 @@ pub(crate) fn validate_module_internal_ref_types(
             continue;
         }
 
-        if let Err(joined) =
-            validation::validate_attribute_params_with_context(&parsed.attribute_params, config)
-        {
-            errors.extend(prefixed_validation_messages(&joined, &prefix));
-        }
-
         let imported = module_resolver::load_resolved_module_signatures(
             &parsed,
             module.module_path(),
@@ -4542,9 +4553,13 @@ pub(crate) fn validate_module_internal_ref_types(
         let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
             &parsed, ctx.schemas(), None, &imported, config,
         );
-        if let Err(joined) = validation::validate_resource_ref_types(
+        let configuration = carina_core::config_loader::load_buffer_configuration(
             &parsed,
             ctx.schemas(),
+            config.catalog(),
+        );
+        if let Err(joined) = validation::validate_resource_ref_types(
+            configuration.judged(),
             &HashSet::new(),
             &bindings,
         ) {
@@ -4557,11 +4572,16 @@ pub(crate) fn validate_module_internal_ref_types(
                 }
             }
         }
-        if let Err(joined) = validation::validate_attribute_param_ref_types_with_bindings(
-            &parsed.attribute_params,
-            &bindings,
-        ) {
-            errors.extend(prefixed_validation_messages(&joined, &prefix));
+        for parameter in &configuration.judged().file().attribute_params {
+            let parameters = std::slice::from_ref(parameter);
+            let values = validation::validate_attribute_params_with_context(parameters, config);
+            let references =
+                validation::validate_attribute_param_ref_types_with_bindings(parameters, &bindings);
+            // Both checks run. A reference rejection already enforces this
+            // boundary and supplies its precise origin and nested failures.
+            if let Err(joined) = references.and(values) {
+                errors.extend(prefixed_validation_messages(&joined, &prefix));
+            }
         }
     }
     errors

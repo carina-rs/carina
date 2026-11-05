@@ -725,13 +725,33 @@ fn module_loop_directive_functions_resolve_after_substitution() {
 }
 
 #[test]
+fn authored_expression_resource_loop_rejects_mismatched_map_default() {
+    let scenario = Scenario::new();
+    scenario.write(
+        "source.crn",
+        "let source = mock.test.resource { name = 'source' }\n",
+    );
+    scenario.write("children.crn", "let children = for child, flag in (source.tags ?? { child = true }) {\n  mock.test.resource { name = child directives { prevent_destroy = flag } }\n}\n");
+    scenario.success(&["init", "."]);
+    for command in ["validate", "plan"] {
+        let output = scenario.run(&[command, "."]);
+        let message = rendered(&output);
+        assert!(!output.status.success(), "{message}");
+        assert!(
+            message.contains("Map<String>") && message.contains("Map<Bool>"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
 fn resource_dependent_loop_directives_resolve_per_element() {
     let scenario = Scenario::new();
     scenario.write(
         "source.crn",
         "let source = mock.test.resource { name = 'source' }\n",
     );
-    scenario.write("children.crn", "let children = for child, flag in (source.tags ?? { child = true }) {\n  mock.test.resource { name = child directives { prevent_destroy = flag force_delete = flag create_before_destroy = flag } }\n}\n");
+    scenario.write("children.crn", "let children = for child, value in (source.tags ?? { child = 'enabled' }) {\n  let flag = lookup({ enabled = true }, value, false)\n  mock.test.resource { name = child directives { prevent_destroy = flag force_delete = flag create_before_destroy = flag } }\n}\n");
     scenario.success(&["init", "."]);
     scenario.success(&["validate", "."]);
     scenario.success(&["plan", ".", "--out", "loop.plan"]);

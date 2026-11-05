@@ -1275,6 +1275,9 @@ pub enum AppError {
     #[error(transparent)]
     AnalysisInvariant(#[from] carina_core::parser::AnalysisTreeError),
 
+    #[error("{} at line {}\n{}", .0.location().file().path().display(), .0.location().span().start_line(), .0.detail())]
+    ExpressionType(Box<carina_core::parser::Located<carina_core::static_type::InferenceError>>),
+
     #[error("{0}")]
     DependsOn(
         Box<carina_core::parser::Located<carina_core::validation::depends_on::DependsOnDiagnostic>>,
@@ -1996,13 +1999,17 @@ mod tests {
         let module_signatures = carina_core::module_resolver::ResolvedModuleSignatures::new();
         let provider_context =
             carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
-        let context = carina_core::validation::ValidationTypeContext::new_providerless(
+        let configuration = carina_core::config_loader::load_buffer_configuration(
             &parsed,
             &schemas,
             &provider_context,
+        );
+        let context = carina_core::validation::ValidationTypeContext::new_providerless(
+            configuration.judged(),
+            &provider_context,
             &module_signatures,
         );
-        let finding = carina_core::validation::check_bare_binding_uses(&parsed, &context)
+        let finding = carina_core::validation::check_bare_binding_uses(&context)
             .into_findings()
             .into_iter()
             .next()

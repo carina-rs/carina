@@ -426,9 +426,12 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
                     // inferable without schemas and must never be advertised
                     // as value-shaped upstream exports.
                     let inferred = crate::validation::inference::infer_export_params(
-                        &parsed,
-                        &empty_schemas,
-                        config.catalog(),
+                        crate::config_loader::load_buffer_configuration(
+                            &parsed,
+                            &empty_schemas,
+                            config.catalog(),
+                        )
+                        .judged(),
                     );
                     if let Err(boundary_errors) =
                         crate::validation::validate_export_handle_boundaries(inferred.parameters())
@@ -2489,9 +2492,13 @@ mod tests {
             |session| {
                 let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
                 let bindings = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(parsed, schemas, Some(exports), &signatures, session);
-                crate::validation::validate_resource_ref_types(
+                let configuration = crate::config_loader::load_buffer_configuration(
                     parsed,
                     schemas,
+                    session.as_provider_context(),
+                );
+                crate::validation::validate_resource_ref_types(
+                    configuration.judged(),
                     &std::collections::HashSet::new(),
                     &bindings,
                 )
@@ -2888,9 +2895,10 @@ mod tests {
         };
         let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
         let bindings = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures(&parsed, &schemas, &exports, &signatures, &catalog);
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
         let errs = crate::validation::validate_resource_ref_types(
-            &parsed,
-            &schemas,
+            configuration.judged(),
             &std::collections::HashSet::new(),
             &bindings,
         )
@@ -3217,6 +3225,55 @@ mod tests {
             errs.is_empty(),
             "narrowed AwsAccountId in String-shaped position must pass, got: {errs:?}"
         );
+    }
+
+    #[test]
+    fn type_check_interpolation_operands_accept_scalars_and_reject_collections() {
+        let schemas = schema_with_attr(
+            "tags",
+            PatternAttributeType::map(PatternAttributeType::string()),
+        );
+        for (ty, accepted) in [
+            (TypeExpr::String, true),
+            (TypeExpr::Int, true),
+            (TypeExpr::Float, true),
+            (TypeExpr::Bool, true),
+            (TypeExpr::Duration, true),
+            (TypeExpr::Map(Box::new(TypeExpr::String)), false),
+            (TypeExpr::List(Box::new(TypeExpr::String)), false),
+            (
+                TypeExpr::Struct {
+                    fields: vec![("name".into(), TypeExpr::String)],
+                },
+                false,
+            ),
+        ] {
+            let exports = mk_typed_exports(&[(
+                "orgs",
+                &[
+                    ("value", ty.clone()),
+                    ("values", TypeExpr::Map(Box::new(ty.clone()))),
+                ],
+            )]);
+            for reference in ["orgs.value", "orgs.values['k']"] {
+                for prefix in ["", "value: "] {
+                    let parsed = parse_project_with_provider(
+                        &format!(
+                            "let orgs = upstream_state {{ source = '../organizations' }}\n\
+                             test.r.res {{ tags = {{ Foo = \"{prefix}${{{reference}}}\" }} }}"
+                        ),
+                        "test",
+                    );
+                    let errors =
+                        check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
+                    assert_eq!(
+                        errors.len(),
+                        usize::from(!accepted),
+                        "{ty}: {prefix}${{{reference}}}: {errors:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

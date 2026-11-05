@@ -379,7 +379,7 @@ fn exact_schema_projections_keep_their_declaration_instead_of_sibling_constraint
         &exact,
         &text("A".repeat(80)),
         snapshot.provider_context(),
-        typecheck::TypecheckInference::Unavailable,
+        &crate::parser::retained::value_dependent_judgement_for_test(),
     )
     .require_provider_schemas()
     .expect("an exact source value must not inherit its narrower sibling's bound");
@@ -395,7 +395,7 @@ fn exact_schema_projections_keep_their_declaration_instead_of_sibling_constraint
         &restored,
         &text("A".repeat(80)),
         snapshot.provider_context(),
-        typecheck::TypecheckInference::Unavailable,
+        &crate::parser::retained::value_dependent_judgement_for_test(),
     )
     .require_provider_schemas()
     .expect("serde must retain the exact projection's validation scope");
@@ -433,7 +433,7 @@ fn exact_projection_value_validation_keeps_its_callback_without_sibling_callback
         &exact,
         &value,
         snapshot.provider_context(),
-        typecheck::TypecheckInference::Unavailable,
+        &crate::parser::retained::value_dependent_judgement_for_test(),
     )
     .require_provider_schemas()
     .expect("only the exact declaration's callback may validate this source");
@@ -442,7 +442,7 @@ fn exact_projection_value_validation_keeps_its_callback_without_sibling_callback
         &annotation(&snapshot),
         &value,
         snapshot.provider_context(),
-        typecheck::TypecheckInference::Unavailable,
+        &crate::parser::retained::value_dependent_judgement_for_test(),
     )
     .require_provider_schemas()
     .unwrap_err();
@@ -541,7 +541,7 @@ fn review_projection_serde_rebinds_exact_callbacks_and_enum_semantics() {
                     ty,
                     &text("INVALID"),
                     snapshot.provider_context(),
-                    typecheck::TypecheckInference::Unavailable,
+                    &crate::parser::retained::value_dependent_judgement_for_test(),
                 )
                 .require_provider_schemas()
                 .is_err(),
@@ -554,7 +554,7 @@ fn review_projection_serde_rebinds_exact_callbacks_and_enum_semantics() {
                 &restored,
                 &text("VALID"),
                 missing.provider_context(),
-                typecheck::TypecheckInference::Unavailable,
+                &crate::parser::retained::value_dependent_judgement_for_test(),
             )
             .require_provider_schemas()
             .is_err(),
@@ -616,7 +616,7 @@ fn review_projection_serde_keeps_reference_semantics_and_rejects_ambiguous_callb
         &restored,
         &text("VALID"),
         ambiguous.provider_context(),
-        typecheck::TypecheckInference::Unavailable,
+        &crate::parser::retained::value_dependent_judgement_for_test(),
     )
     .require_provider_schemas()
     .unwrap_err();
@@ -651,7 +651,7 @@ fn review_enum_witness_constraints_apply_to_canonical_api_spelling() {
             &ty,
             &value,
             snapshot.provider_context(),
-            typecheck::TypecheckInference::Unavailable,
+            &crate::parser::retained::value_dependent_judgement_for_test(),
         )
         .require_provider_schemas()
         .unwrap();
@@ -680,7 +680,7 @@ fn review_enum_values_validate_canonical_scalar_against_retained_witness() {
                     &ty,
                     &value,
                     lax.provider_context(),
-                    typecheck::TypecheckInference::Unavailable,
+                    &crate::parser::retained::value_dependent_judgement_for_test(),
                 )
                 .require_provider_schemas();
                 assert_eq!(result.is_ok(), accepted, "{value:?}: {result:?}");
@@ -715,7 +715,7 @@ fn assert_enum_witness_masks_env_value(base: DraftType, expected: &str) {
             &ty,
             value,
             &context,
-            typecheck::TypecheckInference::Unavailable,
+            &crate::parser::retained::value_dependent_judgement_for_test(),
         )
         .require_provider_schemas()
         .expect_err("the retained witness must reject the value");
@@ -853,10 +853,16 @@ fn call_findings(
         },
     )]);
     let schemas = caller.schema_registry();
-    let report = check_bare_binding_uses(
+    let configuration = crate::config_loader::load_buffer_configuration(
         &parsed,
-        &ValidationTypeContext::new(&parsed, schemas, context, &signatures),
+        schemas,
+        context.as_provider_context(),
     );
+    let report = check_bare_binding_uses(&ValidationTypeContext::new(
+        configuration.judged(),
+        context,
+        &signatures,
+    ));
     let bindings = BindingIndex::from_parsed_with_module_signatures(
         &parsed,
         schemas,
@@ -1037,13 +1043,16 @@ fn unbounded_annotation_constraints_admit_explicitly_unbounded_schema_declaratio
 #[test]
 fn computed_access_mismatch_keeps_inferred_constraints_and_nested_path() {
     let snapshot = snapshot(vec![("p", vec![string(1, 128, None), string(1, 64, None)])]);
-    let bindings = inference::InferenceBindings::from([(
-        "source".into(),
-        inference::InferenceBinding::Resource {
-            provider: "p".into(),
-            resource_type: "Values".into(),
-        },
-    )]);
+    let parsed = crate::parser::parse(
+        "let source = p.Values {}\nlet result = [([source.value0] ?? [source.value0])[0]]",
+        snapshot.provider_context().as_provider_context(),
+    )
+    .unwrap();
+    let report = crate::parser::retained::judge_expressions(
+        &parsed,
+        snapshot.schema_registry(),
+        snapshot.provider_context().as_provider_context(),
+    );
     let base = list(vec![Value::resource_ref("source", "value0", Vec::new())]);
     let access = crate::resource::apply_value_path_segment(
         Value::Deferred(crate::resource::DeferredValue::Coalesce {
@@ -1068,10 +1077,9 @@ fn computed_access_mismatch_keeps_inferred_constraints_and_nested_path() {
         &TypeExpr::List(Box::new(expected)),
         &list(vec![access]),
         snapshot.provider_context(),
-        typecheck::TypecheckInference::Available {
-            bindings: &bindings,
-            schemas: snapshot.schema_registry(),
-        },
+        report
+            .binding(&crate::resource::RelativeBindingName::new("result"))
+            .unwrap(),
     )
     .require_provider_schemas()
     .unwrap_err();
@@ -1114,8 +1122,12 @@ fn computed_access_rejects_heterogeneous_collection_in_validation() {
         .expect("computed access fixture must parse");
         let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
         let result = validate_resource_ref_types(
-            &parsed,
-            snapshot.schema_registry(),
+            crate::config_loader::load_buffer_configuration(
+                &parsed,
+                snapshot.schema_registry(),
+                context,
+            )
+            .judged(),
             &HashSet::new(),
             &bindings,
         );
@@ -1138,7 +1150,7 @@ fn computed_access_rejects_heterogeneous_collection_in_typecheck() {
         declaration(&snapshot, "p", 1),
         "p",
     ));
-    for (elements, expected_error) in [
+    for (index, (elements, expected_error)) in [
         (
             vec![narrow.clone(), wide],
             Some(
@@ -1150,7 +1162,14 @@ fn computed_access_rejects_heterogeneous_collection_in_typecheck() {
             Some("collection element types disagree: `String` vs `Int`"),
         ),
         (vec![narrow.clone(), narrow.clone()], None),
-    ] {
+    ].into_iter().enumerate() {
+        let fallback = ["[source.value0, source.value1]", "['ValidName', 1]", "[source.value0, source.value0]"][index];
+        let parsed = crate::parser::parse(
+            &format!("let source = p.Values {{}}\nlet result = ([source.value0, source.value0] ?? {fallback})[1]"),
+            snapshot.provider_context().as_provider_context(),
+        ).unwrap();
+        let report = crate::parser::retained::judge_expressions(
+            &parsed, snapshot.schema_registry(), snapshot.provider_context().as_provider_context());
         let access = crate::resource::apply_value_path_segment(
             Value::Deferred(crate::resource::DeferredValue::Coalesce {
                 value: Box::new(list(vec![narrow.clone(), narrow.clone()])),
@@ -1165,14 +1184,8 @@ fn computed_access_rejects_heterogeneous_collection_in_typecheck() {
         .unwrap()
         .into_value()
         .unwrap();
-        let bindings = inference::InferenceBindings::new();
-        for inference in [
-            typecheck::TypecheckInference::Available {
-                bindings: &bindings,
-                schemas: snapshot.schema_registry(),
-            },
-            typecheck::TypecheckInference::Unavailable,
-        ] {
+        {
+            let inference = report.binding(&crate::resource::RelativeBindingName::new("result")).unwrap();
             let result = typecheck::check_type_expr_value(
                 &expected,
                 &access,
@@ -1227,7 +1240,7 @@ fn coalesce_and_collection_inference_mismatches_distinguish_named_constraints() 
             "collection element types disagree: `aws.iam.Role.Name (length 1..=64)` vs `aws.iam.Role.Name (length 1..=128)`",
         ),
     ] {
-        let error = inference::infer_type_from_value(
+        let error = inference::infer_projected_type(
             &value,
             &bindings,
             snapshot.schema_registry(),
@@ -1298,15 +1311,16 @@ fn enum_resource_binding_mismatch_keeps_the_exact_enum_name() {
     )
     .unwrap();
     let signatures = HashMap::new();
-    let report = check_bare_binding_uses(
+    let configuration = crate::config_loader::load_buffer_configuration(
         &parsed,
-        &ValidationTypeContext::new(
-            &parsed,
-            snapshot.schema_registry(),
-            snapshot.provider_context(),
-            &signatures,
-        ),
+        snapshot.schema_registry(),
+        snapshot.provider_context().as_provider_context(),
     );
+    let report = check_bare_binding_uses(&ValidationTypeContext::new(
+        configuration.judged(),
+        snapshot.provider_context(),
+        &signatures,
+    ));
     assert!(
         report.findings().iter().any(|finding| finding
             .error
@@ -1338,7 +1352,7 @@ fn enum_resource_binding_mismatch_keeps_the_exact_enum_name() {
 }
 
 #[test]
-fn inference_without_bindings_retains_constraints_for_coalesce_collections_and_branches() {
+fn production_inference_retains_constraints_for_coalesce_collections_and_branches() {
     let snapshot = snapshot(vec![("p", vec![string(1, 64, None), string(1, 128, None)])]);
     let first = typed_function_result(inference::attribute_type_to_type_expr(
         declaration(&snapshot, "p", 0),
@@ -1376,7 +1390,13 @@ fn inference_without_bindings_retains_constraints_for_coalesce_collections_and_b
         ))),
     ];
     for value in values {
-        let error = inference::infer_type_from_value_without_bindings(&value).unwrap_err();
+        let error = inference::infer_projected_type(
+            &value,
+            &inference::InferenceBindings::new(),
+            snapshot.schema_registry(),
+            snapshot.provider_context().as_provider_context(),
+        )
+        .unwrap_err();
         let message = error.to_string();
         assert!(
             message.contains("aws.iam.Role.Name (length 1..=64)"),
@@ -1385,16 +1405,6 @@ fn inference_without_bindings_retains_constraints_for_coalesce_collections_and_b
         assert!(
             message.contains("aws.iam.Role.Name (length 1..=128)"),
             "{message}"
-        );
-        assert_eq!(
-            error,
-            inference::infer_type_from_value(
-                &value,
-                &inference::InferenceBindings::new(),
-                snapshot.schema_registry(),
-                snapshot.provider_context().as_provider_context(),
-            )
-            .unwrap_err(),
         );
     }
 }
@@ -1415,8 +1425,12 @@ fn reference_boundaries_retain_both_names_from_the_shared_formatter() {
     let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
     let messages = [
         validate_resource_ref_types(
-            &parsed,
-            snapshot.schema_registry(),
+            crate::config_loader::load_buffer_configuration(
+                &parsed,
+                snapshot.schema_registry(),
+                context,
+            )
+            .judged(),
             &HashSet::new(),
             &bindings,
         )
@@ -1468,6 +1482,13 @@ fn declared_function_result_and_deferred_coalesce_keep_the_formatted_pair() {
         value: Box::new(typed_function_result(narrow)),
         default: Box::new(typed_function_result(wide)),
     });
+    let evidence = crate::parser::parse(
+        "let source = p.Values {}\nlet result = source.value1 ?? source.value0",
+        context,
+    )
+    .unwrap();
+    let report =
+        crate::parser::retained::judge_expressions(&evidence, snapshot.schema_registry(), context);
     let error = check_deferred_access_type(
         &value,
         declaration(&snapshot, "p", 1)
@@ -1478,7 +1499,9 @@ fn declared_function_result_and_deferred_coalesce_keep_the_formatted_pair() {
                     "p".into(),
                 )),
             ),
-        &inference::InferenceBindings::new(),
+        report
+            .binding(&crate::resource::RelativeBindingName::new("result"))
+            .unwrap(),
         snapshot.schema_registry(),
         &bindings,
     )
@@ -1541,22 +1564,29 @@ fn integer_result_mismatches_share_names_in_value_and_resource_checkers() {
     let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
     let expected = "expected Int (range 1..=64), got Int (range unbounded)";
     let error = validate_resource_ref_types(
-        &parsed,
-        snapshot.schema_registry(),
+        crate::config_loader::load_buffer_configuration(
+            &parsed,
+            snapshot.schema_registry(),
+            context,
+        )
+        .judged(),
         &HashSet::new(),
         &bindings,
     )
     .unwrap_err();
     assert!(error.to_string().contains(expected), "{error}");
 
+    let evidence =
+        crate::parser::parse("arguments { x: Int }\nlet result = x + 1", context).unwrap();
+    let report =
+        crate::parser::retained::judge_expressions(&evidence, snapshot.schema_registry(), context);
     let error = typecheck::check_type_expr_value(
         &inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 0), "p"),
         &parsed.resources[0].attributes["value0"],
         snapshot.provider_context(),
-        typecheck::TypecheckInference::Available {
-            bindings: &inference::bindings_from_parsed(&parsed),
-            schemas: snapshot.schema_registry(),
-        },
+        report
+            .binding(&crate::resource::RelativeBindingName::new("result"))
+            .unwrap(),
     )
     .require_provider_schemas()
     .unwrap_err();
@@ -1580,7 +1610,7 @@ fn integer_operand_mismatches_do_not_hide_a_named_strings_constraints() {
         context,
     )
     .unwrap();
-    let error = inference::infer_type_from_value(
+    let error = inference::infer_projected_type(
         &parsed.variables["result"],
         &inference::bindings_from_parsed(&parsed),
         snapshot.schema_registry(),
@@ -1610,8 +1640,12 @@ fn integer_operand_mismatches_do_not_hide_a_named_strings_constraints() {
     parsed.variables.insert("result".into(), computed);
     let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
     let error = validate_resource_ref_types(
-        &parsed,
-        snapshot.schema_registry(),
+        crate::config_loader::load_buffer_configuration(
+            &parsed,
+            snapshot.schema_registry(),
+            context,
+        )
+        .judged(),
         &HashSet::new(),
         &bindings,
     )

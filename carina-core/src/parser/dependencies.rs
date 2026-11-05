@@ -184,13 +184,13 @@ impl<B: BindingAddress> UnexpandedDependencies<B> {
     pub fn len(&self) -> usize {
         self.operands.len()
     }
-    #[cfg(any(test, feature = "test-utils", feature = "test-support"))]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn binding_references(&self) -> Vec<B> {
         self.iter()
             .map(UnexpandedDependencyOperand::binding_reference)
             .collect()
     }
-    #[cfg(any(test, feature = "test-utils", feature = "test-support"))]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn diagnostic_references(&self) -> Vec<String> {
         self.iter()
             .map(UnexpandedDependencyOperand::diagnostic_reference)
