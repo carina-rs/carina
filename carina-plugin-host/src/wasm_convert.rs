@@ -7462,4 +7462,17 @@ mod tests {
         assert!(check_schema_only_protocol_version(info).is_ok());
         assert!(check_protocol_version(info).is_err());
     }
+
+    #[test]
+    #[ignore = "carina#4257: enable with the FiniteF64 swap"]
+    fn wit_decode_rejects_nan_float_attribute() {
+        // Currently FloatVal(NaN) is accepted as ConcreteValue::Float(NaN).
+        let attributes = [("ratio".to_string(), super::wit::Value::FloatVal(f64::NAN))];
+        let error = super::wit_to_core_value_map(&attributes)
+            .expect_err("the WIT decoder must reject the NaN attribute 'ratio'");
+        let message = error.to_string();
+        assert!(message.contains("ratio"), "{message}");
+        assert!(message.contains("float-val"), "{message}");
+        assert!(message.contains("NaN"), "{message}");
+    }
 }

@@ -1,8 +1,10 @@
+mod finite_f64;
 mod host_pattern;
 pub mod http_trace;
 pub mod normalization;
 pub mod types;
 
+pub use finite_f64::{FiniteF64, NonFiniteFloatError};
 pub use host_pattern::{HostPattern, HostPatternError};
 
 use std::future::Future;
