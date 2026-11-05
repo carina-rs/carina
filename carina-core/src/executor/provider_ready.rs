@@ -14,7 +14,7 @@ use indexmap::IndexMap;
 use thiserror::Error;
 
 use crate::binding_index::ResolvedBindings;
-use crate::executor::normalized::apply_desired_normalization;
+use crate::executor::normalized::{apply_dispatch_desired_normalization, unwrap_secret};
 pub use crate::module_resolver::ModuleConstraintFailure;
 use crate::module_resolver::{
     evaluate_live_pending_constraints, evaluate_saved_pending_constraints,
@@ -931,7 +931,7 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + D
             }
         }
     }
-    let normalized = apply_desired_normalization(
+    let (normalized, restored) = apply_dispatch_desired_normalization(
         value,
         context.provider_configs,
         context.normalizer,
@@ -942,6 +942,15 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + D
     crate::resource::assert_resource_fully_resolved(&resource)?;
     let resource =
         ResolvedResource::resolve_with_schemas(resource.into_provider_resource(), context.schemas)?;
+    // Conversion diagnostics still use the protected tree. Remove only the
+    // annotations restored around normalizer output once all host checks pass.
+    WireReady::try_new(
+        resource.clone(),
+        ProviderWireTarget::Resource(resource.id.clone()),
+    )?;
+    let mut resource = resource.into_inner();
+    restored.remove(&mut resource.attributes);
+    let resource = ResolvedResource::resolve_with_schemas(resource, context.schemas)?;
     let directives = context.schemas.resolve_directives(
         &resource.as_resource().id,
         SchemaKind::Resource,
@@ -1014,7 +1023,13 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S, D>(
     for value in value.attributes.values() {
         crate::resource::assert_value_fully_resolved(value)?;
     }
-    let value = ResolvedDataSource::new(value.into_provider_data_source());
+    let mut value = value.into_provider_data_source();
+    let protected = ResolvedDataSource::new(value.clone());
+    WireReady::try_new(protected, ProviderWireTarget::Resource(value.id.clone()))?;
+    for attribute in value.attributes.values_mut() {
+        *attribute = unwrap_secret(attribute.clone());
+    }
+    let value = ResolvedDataSource::new(value);
     let directives = context.schemas.resolve_directives(
         &value.as_inner().id,
         SchemaKind::DataSource,

@@ -47,14 +47,21 @@ use crate::shutdown::ShutdownToken;
 #[test]
 fn secret_origin_4275_round2_reported_error_keeps_safe_outer_context() {
     use crate::resource::InsideSecret;
-    let error = ReportedError::context(
-        "Attribute 'password': provider dispatch failed",
-        SerializationError::UnresolvedResourceRef {
-            path: "private_producer.private_attr".into(),
-            context: crate::value::SerializationContext::WasmBoundary,
-        },
-    )
-    .with_context("Creating test.widget.example")
+    let error = ReportedError::new(SerializationError::UnresolvedResourceRef {
+        path: "private_producer.private_attr".into(),
+        context: crate::value::SerializationContext::WasmBoundary,
+    })
+    .with_public_context(PublicReportContext::ProviderDispatchAttribute {
+        attribute: "password".into(),
+    })
+    .with_public_context(PublicReportContext::Creating {
+        resource: ResourceId::with_provider_identity(
+            "test",
+            "widget",
+            ResourceIdentity::new("example"),
+            None,
+        ),
+    })
     .inside_secret();
     let rendered = render_error_chain(error.as_error());
     assert!(
@@ -12790,4 +12797,18 @@ async fn deferred_create_reports_iterable_reference_when_binding_missing() {
         "events: {:?}",
         observer.events(),
     );
+}
+
+#[test]
+fn review2_context_error_drops_untyped_secret_context() {
+    use crate::resource::InsideSecret;
+    let error = ReportedError::context(
+        "private-context-value",
+        SerializationError::UnresolvedResourceRef {
+            path: "private-path".into(),
+            context: crate::value::SerializationContext::WasmBoundary,
+        },
+    )
+    .inside_secret();
+    assert!(!render_error_chain(error.as_error()).contains("private-"));
 }

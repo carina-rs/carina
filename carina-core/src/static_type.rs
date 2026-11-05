@@ -178,10 +178,16 @@ pub enum InferenceError {
     CyclicVirtualBinding { cycle: Vec<String> },
 }
 
-/// Remove source values, paths, names, and type literals at a secret boundary.
+/// Keep public type context and remove names, paths and value payloads.
 impl crate::resource::InsideSecret for InferenceError {
     fn inside_secret(self) -> Self {
-        Self::InsideSecret {}
+        match self {
+            error @ (Self::InsideSecret {}
+            | Self::HeterogeneousCollection { .. }
+            | Self::IncompatibleCoalesceTypes { .. }
+            | Self::InvalidIntegerArithmeticOperand { .. }) => error,
+            _ => Self::InsideSecret {},
+        }
     }
 }
 
@@ -300,7 +306,12 @@ impl ConsumerExportStaticType {
 
 impl crate::resource::InsideSecret for InferenceIssue {
     fn inside_secret(self) -> Self {
-        Self::Failed(InferenceError::InsideSecret {})
+        match self {
+            Self::Failed(error) => {
+                Self::Failed(crate::resource::InsideSecret::inside_secret(error))
+            }
+            Self::NotInferable(_) => Self::Failed(InferenceError::InsideSecret {}),
+        }
     }
 }
 

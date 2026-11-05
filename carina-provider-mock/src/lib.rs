@@ -645,40 +645,6 @@ impl scope::ScopeLock<'_> {
 }
 
 impl MockProvider {
-    /// Native transport unwraps annotations only after request checks. Retain
-    /// core scalar metadata such as canonical enum identity in the mock backend.
-    fn native_plaintext(value: &Value) -> Value {
-        match value {
-            Value::Deferred(carina_core::resource::DeferredValue::Secret(payload)) => payload
-                .try_inspect(|inner| {
-                    Ok::<_, std::convert::Infallible>(Self::native_plaintext(inner))
-                })
-                .unwrap(),
-            Value::Concrete(ConcreteValue::List(values)) => Value::Concrete(ConcreteValue::List(
-                values.iter().map(Self::native_plaintext).collect(),
-            )),
-            Value::Concrete(ConcreteValue::Map(values)) => Value::Concrete(ConcreteValue::Map(
-                values
-                    .iter()
-                    .map(|(key, value)| (key.clone(), Self::native_plaintext(value)))
-                    .collect(),
-            )),
-            value => value.clone(),
-        }
-    }
-
-    fn native_resource(
-        ready: &carina_core::provider::ProviderReadyResource,
-    ) -> carina_core::resource::ProviderResource {
-        let mut resource = ready.as_resource().clone();
-        resource.attributes = resource
-            .attributes
-            .iter()
-            .map(|(key, value)| (key.clone(), Self::native_plaintext(value)))
-            .collect();
-        resource
-    }
-
     fn resolve_reference_requests(
         &self,
         requests: Vec<carina_plugin_sdk::types::ReferenceRequest>,
@@ -874,8 +840,6 @@ impl MockProvider {
                     PatchOp::Remove { key } => ("remove", key, None),
                 };
                 let value = value
-                    .map(Self::native_plaintext)
-                    .as_ref()
                     .map(|value| PersistedValue::encode_provider_value(value, None))
                     .transpose()
                     .map_err(|error| {
@@ -1594,7 +1558,7 @@ impl Provider for MockProvider {
     ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
         let id = id.clone();
         Box::pin(async move {
-            let resource = Self::native_resource(request.resource());
+            let resource = request.resource().as_resource().clone();
             self.create_resource(id, resource, attempt).await
         })
     }
@@ -1653,7 +1617,7 @@ impl Provider for MockProvider {
             }
 
             let (resume, create_request) = request.into_parts();
-            let resource = Self::native_resource(create_request.resource());
+            let resource = create_request.resource().as_resource().clone();
             let fallback_identifier =
                 AppliedIdentifier::new("mock-id").expect("mock provider identifier is non-empty");
 
@@ -1753,8 +1717,7 @@ impl Provider for MockProvider {
                     PatchOp::Add { key, value }
                     | PatchOp::Replace { key, value }
                     | PatchOp::Reassert { key, value } => {
-                        let value = Self::native_plaintext(value);
-                        if !Self::merge_keyed_partial_update_list(&id, &mut attributes, key, &value)
+                        if !Self::merge_keyed_partial_update_list(&id, &mut attributes, key, value)
                         {
                             attributes.insert(key.clone(), value.to_snapshot());
                         }

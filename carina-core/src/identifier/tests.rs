@@ -10211,3 +10211,37 @@ fn identity_projection_evaluates_env_from_the_caller_snapshot() {
         assert_eq!(actual.value, concrete_string(expected));
     }
 }
+
+#[test]
+fn review2_f5_secret_reference_keeps_main_identity_completeness_and_exact_names() {
+    // Produced by origin/main 273a25203 in a scratch copy; see the review report.
+    for (identity, expected) in [
+        (true, "mock_test_resource_517f2dfb"),
+        (false, "mock_test_resource_df56857e"),
+    ] {
+        let mut registry = SchemaRegistry::new();
+        let attr =
+            PatternAttributeSchema::required("name", PatternAttributeType::string()).create_only();
+        let attr = if identity { attr.identity() } else { attr };
+        registry.insert(
+            "mock",
+            PatternResourceSchema::new("test.resource")
+                .attribute(attr.build())
+                .validate()
+                .unwrap(),
+        );
+        let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::root_resource_ref("source", "name", vec![])).into(),
+        ));
+        assert_eq!(
+            deterministic_value_string(&secret),
+            "FunctionCall(secret(ResourceRef(source.name)))"
+        );
+        resource.set_attr("name", secret);
+        let mut resources = vec![resource];
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| vec![])
+            .unwrap();
+        assert_eq!(resources[0].id.identity_str(), Some(expected));
+    }
+}

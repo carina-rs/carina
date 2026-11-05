@@ -5168,6 +5168,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn review2_f4_dispatch_uses_main_wit_variants_for_top_level_secrets() {
+        carina_core::validation::deferred_types::with_session_for_test_async(&carina_core::parser::LoadedProviderContext::empty_for_test(), async |type_checks| {
+            let secret = |value: CoreValue| CoreValue::Deferred(DeferredValue::Secret(Box::new(value).into()));
+            let resource = CoreResource::new("test", "secret-inputs")
+                .with_attribute("text", secret(CoreValue::Concrete(ConcreteValue::String("t".into()))))
+                .with_attribute("list", secret(CoreValue::Concrete(ConcreteValue::StringList(vec!["a".into(), "b".into()]))))
+                .with_attribute("map", secret(CoreValue::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([("key".into(), CoreValue::Concrete(ConcreteValue::String("value".into())))])))));
+            let bindings = carina_core::binding_index::ResolvedBindings::default();
+            let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+            let schemas = CoreSchemaRegistry::new();
+            let context = carina_core::executor::ProviderPreparationContext::new(&bindings, &gate, &[], &carina_core::provider::NoopNormalizer, &[], &schemas, type_checks);
+            let request = carina_core::executor::prepare_create_request(resource, &context).await.unwrap();
+            let wire = core_to_wit_create_request(&request).res;
+            let values: std::collections::HashMap<_, _> = wire.attributes.into_iter().collect();
+            assert!(matches!(&values["text"], wit::Value::StrVal(value) if value == "t"));
+            assert!(matches!(&values["list"], wit::Value::StringListVal(value) if value == r#"["a","b"]"#));
+            assert!(matches!(&values["map"], wit::Value::MapVal(value) if value == r#"{"key":"value"}"#));
+        }).await;
+    }
+
+    #[tokio::test]
     async fn create_and_update_wire_values_keep_plaintext_secrets() {
         carina_core::validation::deferred_types::with_session_for_test_async(
         &carina_core::parser::LoadedProviderContext::empty_for_test(),

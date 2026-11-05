@@ -102,7 +102,7 @@ pub(crate) fn collect_dependencies<P: crate::resource::ValueKind, B: BindingAddr
     value.visit_resource_refs(&mut |path| {
         deps.insert(path.binding_address().clone());
     });
-    value.visit_binding_refs(&mut |binding| {
+    value.visit_binding_refs(&mut |binding, _| {
         deps.insert(binding.clone());
     });
 }

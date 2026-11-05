@@ -631,12 +631,17 @@ impl ExpandedBindingIndex {
 
         for value in values {
             let mut paths = Vec::new();
-            value.visit_resource_refs(&mut |path| paths.push(path.clone()));
-            for path in paths {
+            value.visit_resource_refs_with_scope(&mut |path, _, scope| {
+                paths.push((path.clone(), scope))
+            });
+            for (path, scope) in paths {
                 let binding = path.binding_address();
                 let direct =
                     self.targets.contains_key(binding) || self.handle_outputs.contains_key(binding);
-                for id in self.resolve_implicit_binding(binding, owner)? {
+                for id in self
+                    .resolve_implicit_binding(binding, owner)
+                    .map_err(|error| scope.protect_error(error))?
+                {
                     dependencies.insert(id.clone());
                     if direct {
                         reads.insert_known(id, path.attribute());
@@ -647,9 +652,14 @@ impl ExpandedBindingIndex {
             }
 
             let mut bare_bindings = Vec::new();
-            value.visit_binding_refs(&mut |binding| bare_bindings.push(binding.clone()));
-            for binding in bare_bindings {
-                for id in self.resolve_implicit_binding(&binding, owner)? {
+            value.visit_binding_refs(&mut |binding, scope| {
+                bare_bindings.push((binding.clone(), scope))
+            });
+            for (binding, scope) in bare_bindings {
+                for id in self
+                    .resolve_implicit_binding(&binding, owner)
+                    .map_err(|error| scope.protect_error(error))?
+                {
                     dependencies.insert(id.clone());
                     reads.insert_unknown(id);
                 }
@@ -1634,6 +1644,27 @@ impl crate::resource::InsideSecret for ExpandedGraphResolutionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review2_f8_dependency_resolution_inventory_protects_secret_binding_errors() {
+        let index =
+            ExpandedBindingIndex::for_test_resources::<crate::resource::ModuleSource>(&[]).unwrap();
+        let reference: Value = Value::Deferred(DeferredValue::BindingRef {
+            binding: crate::resource::RootScope::new().resolve("private_producer".into()),
+        });
+        let error = index
+            .resolve_value_dependencies(std::iter::once(&reference), std::iter::empty(), "consumer")
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "consumer: dependency target 'private_producer' does not exist"
+        );
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(reference).into()));
+        let error = index
+            .resolve_value_dependencies(std::iter::once(&secret), std::iter::empty(), "consumer")
+            .unwrap_err();
+        assert!(!format!("{error} {error:?}").contains("private_producer"));
+    }
 
     #[test]
     fn value_access_error_retains_typed_cause_without_duplicate_source() {

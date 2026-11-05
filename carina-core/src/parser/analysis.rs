@@ -1004,7 +1004,9 @@ where
                             .get(reference.path().attribute())
                             .is_some_and(|value| {
                                 let mut found = false;
-                                value.visit_binding_refs(&mut |target| found |= target == &binding);
+                                value.visit_binding_refs(&mut |target, _| {
+                                    found |= target == &binding
+                                });
                                 found
                             })
                 })
@@ -1028,7 +1030,7 @@ where
                         }
                         super::BareBindingSource::Value { value, .. } => {
                             let mut found = false;
-                            value.visit_binding_refs(&mut |name| found |= name == &binding);
+                            value.visit_binding_refs(&mut |name, _| found |= name == &binding);
                             found
                         }
                     };

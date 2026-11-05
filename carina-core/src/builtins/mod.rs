@@ -23,7 +23,8 @@ mod upper_lower;
 use crate::eval_value::EvalValue;
 use crate::parser::ProviderContext;
 use crate::resource::{
-    BindingAddress, ConcreteValue, DeferredValue, InsideSecret, NoPlaceholder, Value,
+    BindingAddress, ConcreteValue, DeferredValue, InsideSecret, InterpolationPart, NoPlaceholder,
+    Value, ValueString,
 };
 
 /// Authored builtin syntax. Secret is an intrinsic value constructor and
@@ -108,6 +109,136 @@ impl Builtin {
     }
 }
 
+/// Mark every string exposed from a `Secret` argument as diagnostic-only.
+///
+/// Builtin handlers still receive the plaintext needed for computation, but
+/// any handler-owned diagnostic can only render these strings through the
+/// safe [`ValueString`] diagnostic API. Runtime equality, hashing, and
+/// serialization remain byte-for-byte identical to an ordinary string.
+fn mark_secret_input_strings<B: BindingAddress>(
+    value: Value<NoPlaceholder, B>,
+) -> Value<NoPlaceholder, B> {
+    match value {
+        Value::Concrete(ConcreteValue::String(value)) => Value::Concrete(ConcreteValue::String(
+            ValueString::diagnostic_sensitive(value.into_plaintext()),
+        )),
+        Value::Concrete(ConcreteValue::StringList(values)) => {
+            Value::Concrete(ConcreteValue::StringList(
+                values
+                    .into_iter()
+                    .map(|value| ValueString::diagnostic_sensitive(value.into_plaintext()))
+                    .collect(),
+            ))
+        }
+        Value::Concrete(ConcreteValue::List(values)) => Value::Concrete(ConcreteValue::List(
+            values.into_iter().map(mark_secret_input_strings).collect(),
+        )),
+        Value::Concrete(ConcreteValue::Map(values)) => Value::Concrete(ConcreteValue::Map(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, mark_secret_input_strings(value)))
+                .collect(),
+        )),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            Value::Deferred(DeferredValue::Interpolation(
+                parts
+                    .into_iter()
+                    .map(|part| match part {
+                        InterpolationPart::Literal(value) => InterpolationPart::Literal(
+                            ValueString::diagnostic_sensitive(value.into_plaintext()),
+                        ),
+                        InterpolationPart::Expr(value) => {
+                            InterpolationPart::Expr(mark_secret_input_strings(value))
+                        }
+                    })
+                    .collect(),
+            ))
+        }
+        Value::Deferred(DeferredValue::FunctionCall {
+            name,
+            args,
+            source_line,
+        }) => Value::Deferred(DeferredValue::FunctionCall {
+            name,
+            args: args
+                .iter()
+                .map(|argument| {
+                    argument
+                        .try_map_value(|value| {
+                            Ok::<_, std::convert::Infallible>(mark_secret_input_strings(
+                                value.clone(),
+                            ))
+                        })
+                        .expect("infallible function-argument rewrite")
+                })
+                .collect(),
+            source_line,
+        }),
+        Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions,
+            args,
+            source_line,
+        }) => Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions,
+            args: args
+                .iter()
+                .map(|argument| {
+                    argument
+                        .try_map_value(|value| {
+                            Ok::<_, std::convert::Infallible>(mark_secret_input_strings(
+                                value.clone(),
+                            ))
+                        })
+                        .expect("infallible function-argument rewrite")
+                })
+                .collect(),
+            source_line,
+        }),
+        Value::Deferred(DeferredValue::Access(access)) => {
+            let original = Value::Deferred(DeferredValue::Access(access.clone()));
+            let step = match access.step().clone() {
+                crate::resource::PathSegment::Subscript {
+                    index: crate::resource::Subscript::Str { key },
+                } => crate::resource::PathSegment::Subscript {
+                    index: crate::resource::Subscript::Str {
+                        key: ValueString::diagnostic_sensitive(key.into_plaintext()),
+                    },
+                },
+                other => other,
+            };
+            access
+                .rebuild(
+                    mark_secret_input_strings(access.base().clone()),
+                    step,
+                    crate::resource::AccessMissPolicy::Error,
+                )
+                .unwrap_or(original)
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
+            inner
+                .try_map(|value| {
+                    Ok::<_, std::convert::Infallible>(mark_secret_input_strings(value.clone()))
+                })
+                .unwrap(),
+        )),
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let deferred = deferred.map(|value| mark_secret_input_strings(value.clone()));
+            Value::Deferred(DeferredValue::ModuleIf(Box::new(deferred)))
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = mark_secret_input_strings(expression.lhs().clone());
+            let rhs = mark_secret_input_strings(expression.rhs().clone());
+            let original = Value::Deferred(DeferredValue::IntegerArithmetic(expression.clone()));
+            expression
+                .evaluate_with_operands(lhs, rhs)
+                .unwrap_or(original)
+        }
+        value => value,
+    }
+}
+
 /// Built-ins evaluate secret inputs through their plaintext inner values, but
 /// the result remains secret. This keeps the sensitivity tag attached across
 /// every transformation instead of making each handler remember to preserve
@@ -116,7 +247,9 @@ fn evaluate_secret_arguments<B: BindingAddress>(
     args: Vec<Value<NoPlaceholder, B>>,
     handler: impl FnOnce(&[Value<NoPlaceholder, B>]) -> Result<Value<NoPlaceholder, B>, String>,
 ) -> Result<EvalValue<B>, String> {
-    let contained_secret = args.iter().any(crate::value::contains_secret);
+    let contained_secret = args
+        .iter()
+        .any(|value| matches!(value, Value::Deferred(DeferredValue::Secret(_))));
     let lowered = args
         .into_iter()
         .map(lower_builtin_secret_argument)
@@ -136,9 +269,9 @@ fn lower_builtin_secret_argument<B: BindingAddress>(
     value: Value<NoPlaceholder, B>,
 ) -> Result<Value<NoPlaceholder, B>, String> {
     match value {
-        Value::Deferred(DeferredValue::Secret(payload)) => {
-            payload.try_inspect(|value| lower_builtin_secret_argument(value.clone()))
-        }
+        Value::Deferred(DeferredValue::Secret(payload)) => payload.try_inspect(|value| {
+            lower_builtin_secret_argument(mark_secret_input_strings(value.clone()))
+        }),
         value => Ok(value),
     }
 }
@@ -642,6 +775,118 @@ mod tests {
 
     fn assert_secret_inner(actual: Value, expected: Value) {
         assert_eq!(actual, secret(expected));
+    }
+
+    #[test]
+    fn review2_f1_nested_secrets_preserve_main_values_and_leaf_hashes() {
+        let list = Value::Concrete(ConcreteValue::List(vec![
+            string("public"),
+            secret(string("x")),
+        ]));
+        assert_eq!(
+            evaluate_builtin_to_value("length", std::slice::from_ref(&list)).unwrap(),
+            Value::Concrete(ConcreteValue::Int(2))
+        );
+        let map = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("a".into(), secret(string("x"))),
+            ("b".into(), string("y")),
+        ])));
+        assert_eq!(
+            evaluate_builtin_to_value("lookup", &[map, string("b"), string("")]).unwrap(),
+            string("y")
+        );
+        let result = evaluate_builtin_to_value(
+            "concat",
+            &[
+                Value::Concrete(ConcreteValue::List(vec![string("tail")])),
+                list.clone(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::List(vec![
+                string("public"),
+                secret(string("x")),
+                string("tail")
+            ]))
+        );
+        let json = crate::value::value_to_json(&result).unwrap();
+        assert_eq!(json[0], "public");
+        assert_eq!(json[2], "tail");
+        let hash = crate::resource::RedactedSecretHash::from_encoded_digest(
+            json[1]["$secret"].as_str().unwrap(),
+        )
+        .unwrap();
+        // origin/main canonical_secret_hash_material(String("x")) is JSON string bytes.
+        assert!(hash.verify(br#""x""#));
+    }
+
+    #[test]
+    fn review2_f6_nested_errors_preserve_public_reasons_and_hide_derived_strings() {
+        let nested = Value::Concrete(ConcreteValue::List(vec![secret(string("private-prefix"))]));
+        assert_eq!(
+            evaluate_builtin_to_value("join", &[string("-"), nested.clone(), string("extra")])
+                .unwrap_err(),
+            "join() expects 2 arguments (separator, list), got 3"
+        );
+        assert_eq!(
+            evaluate_builtin_to_value("join", &[Value::Concrete(ConcreteValue::Int(1)), nested])
+                .unwrap_err(),
+            "join() first argument must be a string, got Int"
+        );
+        let maps = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(IndexMap::from([("a".into(), secret(string("x")))])),
+        )]));
+        assert_eq!(
+            evaluate_builtin_to_value("map", &[string(".missing"), maps]).unwrap_err(),
+            "map(): field 'missing' not found in map element"
+        );
+        assert_eq!(
+            evaluate_builtin_to_value(
+                "cidr_subnet",
+                &[
+                    string("bad"),
+                    Value::Concrete(ConcreteValue::Int(1)),
+                    Value::Concrete(ConcreteValue::Int(0))
+                ]
+            )
+            .unwrap_err(),
+            "cidr_subnet() invalid CIDR format: 'bad' (expected 'address/prefix')"
+        );
+        // join's nested-secret handler marks its derived string; keep that protection
+        // even when a later handler sees only the derived (unwrapped) string.
+        let joined = evaluate_builtin_to_value(
+            "join",
+            &[
+                string(""),
+                Value::Concrete(ConcreteValue::List(vec![secret(string("private-prefix"))])),
+            ],
+        )
+        .unwrap();
+        let Value::Deferred(DeferredValue::Secret(payload)) = joined else {
+            panic!("join must be secret")
+        };
+        let error = payload
+            .try_inspect(|value| {
+                Ok::<_, std::convert::Infallible>(
+                    evaluate_builtin_to_value(
+                        "cidr_subnet",
+                        &[
+                            value.clone(),
+                            Value::Concrete(ConcreteValue::Int(1)),
+                            Value::Concrete(ConcreteValue::Int(0)),
+                        ],
+                    )
+                    .unwrap_err(),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            error,
+            "cidr_subnet() sensitive prefix is not a valid CIDR string"
+        );
+        assert!(!error.contains("private-prefix"));
     }
 
     #[test]

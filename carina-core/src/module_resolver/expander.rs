@@ -3360,7 +3360,7 @@ fn module_value_origin<B: BindingAddress, C: BindingAddress>(
     arguments: &HashMap<String, ResolvedArgument<C>>,
 ) -> crate::resource::ArgumentValueOrigin {
     let mut names = BTreeSet::new();
-    value.visit_placeholders(&mut |placeholder| {
+    value.visit_placeholders(&mut |placeholder, _| {
         if let Some(name) = placeholder.module_argument_name()
             && !names.contains(name)
         {
@@ -3416,22 +3416,24 @@ fn resolve_module_directives(
 {
     directives.try_map_expressions(|_, expression| {
         let mut sources = Vec::new();
-        expression.value().visit_placeholders(&mut |placeholder| {
-            if let ParserPlaceholder::ModuleArgument { name, .. } = placeholder
-                && let Some(argument) = resolver.arguments.arguments.get(name)
-                && let ArgumentOrigin::Authored { .. } = argument.origin
-            {
-                let location = resolver
-                    .call_path
-                    .immediate()
-                    .id
-                    .argument_value_location(name)
-                    .expect("authored argument provenance");
-                sources.push(crate::resource::DiagnosticSourceSpan::from_declaration(
-                    location.clone(),
-                ));
-            }
-        });
+        expression
+            .value()
+            .visit_placeholders(&mut |placeholder, _| {
+                if let ParserPlaceholder::ModuleArgument { name, .. } = placeholder
+                    && let Some(argument) = resolver.arguments.arguments.get(name)
+                    && let ArgumentOrigin::Authored { .. } = argument.origin
+                {
+                    let location = resolver
+                        .call_path
+                        .immediate()
+                        .id
+                        .argument_value_location(name)
+                        .expect("authored argument provenance");
+                    sources.push(crate::resource::DiagnosticSourceSpan::from_declaration(
+                        location.clone(),
+                    ));
+                }
+            });
         // Substitution and loop expansion may erase the original argument
         // slots. Every instantiated expression retains its caller anchors.
         for call in resolver.call_path.calls() {
@@ -5185,7 +5187,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn secret_origin_4275_module_walkers_preserve_secret_depth() {
+    fn secret_origin_4275_module_walkers_normalize_secret_depth() {
         use crate::resource::{DeferredValue, Value};
         let value: ModuleResolvedValue =
             crate::resource::Value::Deferred(crate::resource::DeferredValue::Secret(
@@ -5210,7 +5212,7 @@ mod tests {
             };
             assert!(matches!(
                 inner.expose_plaintext(),
-                Value::Deferred(DeferredValue::Secret(_))
+                Value::Concrete(ConcreteValue::String(_))
             ));
         }
     }

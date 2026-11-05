@@ -4130,6 +4130,21 @@ impl<P: ValueKind, B: BindingAddress> AccessExpr<P, B> {
     }
 }
 
+/// Peel top-level sensitivity metadata for computation. Callers must rewrap
+/// the result and protect errors whenever the returned depth is nonzero.
+pub(crate) fn peel_secrets<P: ValueKind, B: BindingAddress>(
+    mut value: Value<P, B>,
+) -> (Value<P, B>, usize) {
+    let mut depth = 0;
+    while let Value::Deferred(DeferredValue::Secret(payload)) = value {
+        value = payload
+            .try_inspect(|inner| Ok::<_, std::convert::Infallible>(inner.clone()))
+            .unwrap();
+        depth += 1;
+    }
+    (value, depth)
+}
+
 impl<P: ValueKind, B: BindingAddress> Value<P, B> {
     /// Preserve sensitivity while normalizing an intrinsic or evaluated wrapper.
     pub(crate) fn into_secret(self) -> Self {
@@ -4177,7 +4192,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
         self.visit_resource_refs(&mut |path| {
             roots.insert(path.binding_address().clone());
         });
-        self.visit_binding_refs(&mut |binding| {
+        self.visit_binding_refs(&mut |binding, _| {
             roots.insert(binding.clone());
         });
         roots
@@ -6541,36 +6556,44 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
 
     pub(crate) fn references_loop_slot(&self) -> bool {
         let mut found = false;
-        self.visit_placeholders(&mut |placeholder| found |= placeholder.loop_slot().is_some());
+        self.visit_placeholders(&mut |placeholder, _| found |= placeholder.loop_slot().is_some());
         found
     }
 
-    pub(crate) fn visit_placeholders(&self, visitor: &mut impl FnMut(&P)) {
+    pub(crate) fn visit_placeholders(&self, visitor: &mut impl FnMut(&P, DiagnosticScope)) {
+        self.visit_placeholders_in_scope(DiagnosticScope::Public, visitor);
+    }
+
+    fn visit_placeholders_in_scope(
+        &self,
+        scope: DiagnosticScope,
+        visitor: &mut impl FnMut(&P, DiagnosticScope),
+    ) {
         match self {
-            Value::Deferred(DeferredValue::Placeholder(placeholder)) => visitor(placeholder),
+            Value::Deferred(DeferredValue::Placeholder(placeholder)) => visitor(placeholder, scope),
             Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
                 for value in deferred.values() {
-                    value.visit_placeholders(visitor);
+                    value.visit_placeholders_in_scope(scope, visitor);
                 }
             }
             Value::Concrete(ConcreteValue::List(values)) => {
                 for value in values {
-                    value.visit_placeholders(visitor);
+                    value.visit_placeholders_in_scope(scope, visitor);
                 }
             }
             Value::Concrete(ConcreteValue::Map(values)) => {
                 for value in values.values() {
-                    value.visit_placeholders(visitor);
+                    value.visit_placeholders_in_scope(scope, visitor);
                 }
             }
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-                value.visit_placeholders(visitor);
-                default.visit_placeholders(visitor);
+                value.visit_placeholders_in_scope(scope, visitor);
+                default.visit_placeholders_in_scope(scope, visitor);
             }
             Value::Deferred(DeferredValue::Interpolation(parts)) => {
                 for part in parts {
                     if let InterpolationPart::Expr(value) = part {
-                        value.visit_placeholders(visitor);
+                        value.visit_placeholders_in_scope(scope, visitor);
                     }
                 }
             }
@@ -6581,19 +6604,21 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
             ) => {
                 for argument in args {
                     argument.operand.visit_values(&mut |value| {
-                        value.visit_placeholders(visitor);
+                        value.visit_placeholders_in_scope(scope, visitor);
                     });
                 }
             }
             Value::Deferred(DeferredValue::Access(access)) => {
-                access.base().visit_placeholders(visitor);
+                access.base().visit_placeholders_in_scope(scope, visitor);
             }
             Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-                expression.lhs().visit_placeholders(visitor);
-                expression.rhs().visit_placeholders(visitor);
+                expression.lhs().visit_placeholders_in_scope(scope, visitor);
+                expression.rhs().visit_placeholders_in_scope(scope, visitor);
             }
             Value::Deferred(DeferredValue::Secret(value)) => {
-                value.visit(|value| value.visit_placeholders(visitor));
+                value.visit_reference_inventory(|value, scope| {
+                    value.visit_placeholders_in_scope(scope, visitor)
+                });
             }
             Value::Concrete(
                 ConcreteValue::String(_)
@@ -6774,7 +6799,7 @@ impl<B: BindingAddress> Value<ParserPlaceholder, B> {
         policy: LeftoverPlaceholderPolicy,
         errors: &mut Vec<LeftoverPlaceholder>,
     ) {
-        self.visit_placeholders(&mut |placeholder| {
+        self.visit_placeholders(&mut |placeholder, scope| {
             let allowed = match placeholder {
                 ParserPlaceholder::Loop(_) => {
                     policy.loop_slots == LoopPlaceholderPolicy::AllowInDeferredTemplate
@@ -6789,10 +6814,10 @@ impl<B: BindingAddress> Value<ParserPlaceholder, B> {
             if allowed {
                 return;
             }
-            errors.push(LeftoverPlaceholder::new(
+            errors.push(scope.protect_error(LeftoverPlaceholder::new(
                 placeholder.clone(),
                 context.clone(),
-            ));
+            )));
         });
     }
 
@@ -7528,7 +7553,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
         self.visit_resource_refs_with_scope(&mut |path, usage, _scope| f(path, usage));
     }
 
-    pub(crate) fn visit_resource_refs_with_scope(
+    pub fn visit_resource_refs_with_scope(
         &self,
         f: &mut impl FnMut(&AccessPath<B>, ResourceRefUsage, DiagnosticScope),
     ) {
@@ -7639,30 +7664,38 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
     ///
     /// Companion: `visit_resource_refs` for `ResourceRef` access paths. A consumer
     /// that needs both must call both — drift is visible at the call site.
-    pub fn visit_binding_refs(&self, f: &mut impl FnMut(&B)) {
+    pub fn visit_binding_refs(&self, f: &mut impl FnMut(&B, DiagnosticScope)) {
+        self.visit_binding_refs_in_scope(DiagnosticScope::Public, f);
+    }
+
+    fn visit_binding_refs_in_scope(
+        &self,
+        scope: DiagnosticScope,
+        f: &mut impl FnMut(&B, DiagnosticScope),
+    ) {
         match self {
             Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
                 deferred
                     .values()
                     .into_iter()
-                    .for_each(|value| value.visit_binding_refs(f));
+                    .for_each(|value| value.visit_binding_refs_in_scope(scope, f));
             }
-            Value::Deferred(DeferredValue::BindingRef { binding }) => f(binding),
+            Value::Deferred(DeferredValue::BindingRef { binding }) => f(binding, scope),
             Value::Concrete(ConcreteValue::List(items)) => {
                 for v in items {
-                    v.visit_binding_refs(f);
+                    v.visit_binding_refs_in_scope(scope, f);
                 }
             }
             Value::Concrete(ConcreteValue::Map(map)) => {
                 for v in map.values() {
-                    v.visit_binding_refs(f);
+                    v.visit_binding_refs_in_scope(scope, f);
                 }
             }
             Value::Deferred(DeferredValue::Interpolation(parts)) => {
                 for part in parts {
                     match part {
                         InterpolationPart::Literal(_) => {}
-                        InterpolationPart::Expr(v) => v.visit_binding_refs(f),
+                        InterpolationPart::Expr(v) => v.visit_binding_refs_in_scope(scope, f),
                     }
                 }
             }
@@ -7672,22 +7705,24 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 | DeferredValue::ResolvedFunctionCall { args, .. },
             ) => {
                 for arg in args {
-                    arg.walker_value().visit_binding_refs(f);
+                    arg.walker_value().visit_binding_refs_in_scope(scope, f);
                 }
             }
             Value::Deferred(DeferredValue::Access(access)) => {
-                access.base().visit_binding_refs(f);
+                access.base().visit_binding_refs_in_scope(scope, f);
             }
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-                value.visit_binding_refs(f);
-                default.visit_binding_refs(f);
+                value.visit_binding_refs_in_scope(scope, f);
+                default.visit_binding_refs_in_scope(scope, f);
             }
             Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-                expression.lhs().visit_binding_refs(f);
-                expression.rhs().visit_binding_refs(f);
+                expression.lhs().visit_binding_refs_in_scope(scope, f);
+                expression.rhs().visit_binding_refs_in_scope(scope, f);
             }
             Value::Deferred(DeferredValue::Secret(inner)) => {
-                inner.visit(|value| value.visit_binding_refs(f))
+                inner.visit_reference_inventory(|value, scope| {
+                    value.visit_binding_refs_in_scope(scope, f)
+                })
             }
             Value::Concrete(ConcreteValue::String(_))
             | Value::Concrete(ConcreteValue::EnumIdentifier(_))

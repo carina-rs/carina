@@ -525,7 +525,7 @@ fn assert_secret_reference_context(reference: &str, expected: &str) {
 }
 
 #[test]
-fn secret_origin_4275_deserializer_preserves_secret_depth() {
+fn secret_origin_4275_deserializer_normalizes_secret_depth() {
     let wire = serde_json::json!({"Secret": {"Secret": {"String": "private-depth"}}});
     let value: ExpandedValue = serde_json::from_value(wire).unwrap();
     let ExpandedValue::Deferred(ExpandedDeferredValue::Secret(inner)) = value else {
@@ -533,7 +533,7 @@ fn secret_origin_4275_deserializer_preserves_secret_depth() {
     };
     assert!(matches!(
         inner.expose_plaintext(),
-        ExpandedValue::Deferred(ExpandedDeferredValue::Secret(_))
+        ExpandedValue::Concrete(crate::resource::ConcreteValue::String(_))
     ));
 }
 

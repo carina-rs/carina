@@ -3941,3 +3941,18 @@ fn find_changed_attributes_keeps_nested_legacy_unrecorded_list_element_in_desire
         "desired matching must reach nested ListElements records recursively: {changed:?}"
     );
 }
+
+#[test]
+fn review2_f2_repeated_secret_wrapping_has_no_phantom_state_diff() {
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("t".into()))).into(),
+    ));
+    let state = persisted_secret(&value_to_json(&secret).unwrap());
+    let resolved = Value::Deferred(DeferredValue::Secret(Box::new(secret).into()));
+    assert!(type_aware_equal(
+        &resolved,
+        &state,
+        None,
+        crate::schema::empty_defs_for_schema_walks()
+    ));
+}

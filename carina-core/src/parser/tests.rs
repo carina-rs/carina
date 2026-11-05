@@ -6243,7 +6243,7 @@ fn empty_interpolation_retains_authored_file_and_original_range() {
             .variables
             .get(name)
             .unwrap_or_else(|| panic!("missing variable {name}"))
-            .visit_placeholders(&mut |placeholder| {
+            .visit_placeholders(&mut |placeholder, _| {
                 if let ParserPlaceholder::EmptyInterpolation { source } = placeholder
                     && let Some((file, range)) = source.authored_location()
                 {
@@ -16201,7 +16201,13 @@ fn parse_rejects_self_referential_let_binding() {
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
-            assert_eq!(chain, vec!["X", "X"]);
+            assert_eq!(
+                chain
+                    .iter()
+                    .map(crate::resource::DiagnosticPath::to_dot_string)
+                    .collect::<Vec<_>>(),
+                vec!["X", "X"]
+            );
         }
         other => panic!("expected CyclicLetBinding, got {other:?}"),
     }
@@ -16227,7 +16233,13 @@ fn parse_directory_files_rejects_self_referential_let_binding() {
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
-            assert_eq!(chain, vec!["X", "X"]);
+            assert_eq!(
+                chain
+                    .iter()
+                    .map(crate::resource::DiagnosticPath::to_dot_string)
+                    .collect::<Vec<_>>(),
+                vec!["X", "X"]
+            );
         }
         other => panic!("expected CyclicLetBinding, got {other:?}"),
     }
@@ -16378,7 +16390,13 @@ fn parse_directory_files_rejects_cyclic_sibling_let_chain() {
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
-            assert_eq!(chain, vec!["A", "B", "A"]);
+            assert_eq!(
+                chain
+                    .iter()
+                    .map(crate::resource::DiagnosticPath::to_dot_string)
+                    .collect::<Vec<_>>(),
+                vec!["A", "B", "A"]
+            );
         }
         other => panic!("expected CyclicLetBinding, got {other:?}"),
     }
@@ -16405,7 +16423,13 @@ fn parse_directory_files_rejects_resource_ref_let_cycle() {
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
-            assert_eq!(chain, vec!["A", "B", "A"]);
+            assert_eq!(
+                chain
+                    .iter()
+                    .map(crate::resource::DiagnosticPath::to_dot_string)
+                    .collect::<Vec<_>>(),
+                vec!["A", "B", "A"]
+            );
         }
         other => panic!("expected CyclicLetBinding, got {other:?}"),
     }
@@ -16432,7 +16456,13 @@ fn parse_directory_files_rejects_function_call_let_cycle() {
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
-            assert_eq!(chain, vec!["A", "B", "A"]);
+            assert_eq!(
+                chain
+                    .iter()
+                    .map(crate::resource::DiagnosticPath::to_dot_string)
+                    .collect::<Vec<_>>(),
+                vec!["A", "B", "A"]
+            );
         }
         other => panic!("expected CyclicLetBinding, got {other:?}"),
     }
@@ -16459,7 +16489,13 @@ fn parse_directory_files_rejects_interpolation_let_cycle() {
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
-            assert_eq!(chain, vec!["A", "B", "A"]);
+            assert_eq!(
+                chain
+                    .iter()
+                    .map(crate::resource::DiagnosticPath::to_dot_string)
+                    .collect::<Vec<_>>(),
+                vec!["A", "B", "A"]
+            );
         }
         other => panic!("expected CyclicLetBinding, got {other:?}"),
     }
@@ -16480,7 +16516,13 @@ fn parse_directory_files_rejects_list_let_cycle() {
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
-            assert_eq!(chain, vec!["A", "B", "A"]);
+            assert_eq!(
+                chain
+                    .iter()
+                    .map(crate::resource::DiagnosticPath::to_dot_string)
+                    .collect::<Vec<_>>(),
+                vec!["A", "B", "A"]
+            );
         }
         other => panic!("expected CyclicLetBinding, got {other:?}"),
     }
@@ -16507,7 +16549,13 @@ fn parse_directory_files_rejects_map_let_cycle() {
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
-            assert_eq!(chain, vec!["A", "B", "A"]);
+            assert_eq!(
+                chain
+                    .iter()
+                    .map(crate::resource::DiagnosticPath::to_dot_string)
+                    .collect::<Vec<_>>(),
+                vec!["A", "B", "A"]
+            );
         }
         other => panic!("expected CyclicLetBinding, got {other:?}"),
     }
@@ -16541,7 +16589,7 @@ fn reject_cyclic_let_bindings_detects_secret_value_cycle() {
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
-            assert_eq!(chain, vec!["A", "B", "A"]);
+            assert_eq!(chain, vec![crate::resource::DiagnosticPath::Protected; 3]);
         }
         other => panic!("expected CyclicLetBinding, got {other:?}"),
     }

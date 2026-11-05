@@ -8,7 +8,10 @@ use crate::parser::{
     ParsedResource as Resource, ParsedValue as Value, ResourceTypePath, TypeExpr,
     display_double_quoted_literal_part, display_string_literal,
 };
-use crate::resource::{ConcreteValue, DeferredValue};
+use crate::resource::{
+    ConcreteValue, DeferredValue, DiagnosticPath, DiagnosticScope, ReferencePath,
+    RelativeBindingName,
+};
 use crate::static_type::{ConsumerStaticType, consumer_static_type_label};
 
 /// Dependency between resources
@@ -277,8 +280,10 @@ pub struct TypedAttributeParam {
 }
 
 /// Typed dependency representing a reference from one resource to another
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TypedDependency {
+    /// Rendering authority for the reference; target identity remains usable for graph edges.
+    pub diagnostic_path: DiagnosticPath<RelativeBindingName>,
     /// Target binding name (e.g., "vpc", "cidr_block")
     pub target: String,
     /// Target resource type (if known)
@@ -289,7 +294,29 @@ pub struct TypedDependency {
     pub used_in: String,
 }
 
-/// Typed dependency graph with resource type information
+impl std::fmt::Debug for TypedDependency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let protected = matches!(self.diagnostic_path, DiagnosticPath::Protected);
+        f.debug_struct("TypedDependency")
+            .field("target", &if protected { "(secret)" } else { &self.target })
+            .field("target_type", &self.target_type)
+            .field(
+                "attribute",
+                &if protected {
+                    "(secret)"
+                } else {
+                    &self.attribute
+                },
+            )
+            .field(
+                "used_in",
+                &if protected { "(secret)" } else { &self.used_in },
+            )
+            .finish()
+    }
+}
+
+/// Typed dependency graph with resource type information.
 #[derive(Debug, Clone, Default)]
 pub struct TypedDependencyGraph {
     /// Resource binding name -> list of typed dependencies
@@ -305,6 +332,22 @@ impl TypedDependencyGraph {
     /// Add a typed dependency edge
     pub fn add_edge(&mut self, from: String, dependency: TypedDependency) {
         self.edges.entry(from).or_default().push(dependency);
+    }
+
+    fn display_target<'a>(&self, target: &'a str) -> &'a str {
+        let mut protected = false;
+        for dependency in self
+            .edges
+            .values()
+            .flatten()
+            .filter(|dependency| dependency.target == target)
+        {
+            match &dependency.diagnostic_path {
+                DiagnosticPath::Public(_) => return target,
+                DiagnosticPath::Protected => protected = true,
+            }
+        }
+        if protected { "(secret)" } else { target }
     }
 
     /// Get dependencies for a resource
@@ -488,10 +531,35 @@ impl RootConfigSignature {
         graph: &mut TypedDependencyGraph,
         binding_types: &HashMap<String, ResourceTypePath>,
     ) {
+        Self::collect_typed_dependencies_in_scope(
+            from,
+            attr_key,
+            value,
+            graph,
+            binding_types,
+            DiagnosticScope::Public,
+        );
+    }
+
+    fn collect_typed_dependencies_in_scope(
+        from: &str,
+        attr_key: &str,
+        value: &Value,
+        graph: &mut TypedDependencyGraph,
+        binding_types: &HashMap<String, ResourceTypePath>,
+        scope: DiagnosticScope,
+    ) {
         match value {
             Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
                 for nested in deferred.values() {
-                    Self::collect_typed_dependencies(from, attr_key, nested, graph, binding_types);
+                    Self::collect_typed_dependencies_in_scope(
+                        from,
+                        attr_key,
+                        nested,
+                        graph,
+                        binding_types,
+                        scope,
+                    );
                 }
             }
             Value::Deferred(DeferredValue::ResourceRef { path }) => {
@@ -499,6 +567,7 @@ impl RootConfigSignature {
                 graph.add_edge(
                     from.to_string(),
                     TypedDependency {
+                        diagnostic_path: scope.path(ReferencePath::Access(path.clone())),
                         target: path.binding().to_string(),
                         target_type,
                         attribute: path.attribute().to_string(),
@@ -515,6 +584,7 @@ impl RootConfigSignature {
                 graph.add_edge(
                     from.to_string(),
                     TypedDependency {
+                        diagnostic_path: scope.path(ReferencePath::Binding(binding.clone())),
                         target: binding.to_string(),
                         target_type,
                         attribute: String::new(),
@@ -524,19 +594,40 @@ impl RootConfigSignature {
             }
             Value::Concrete(ConcreteValue::List(items)) => {
                 for item in items {
-                    Self::collect_typed_dependencies(from, attr_key, item, graph, binding_types);
+                    Self::collect_typed_dependencies_in_scope(
+                        from,
+                        attr_key,
+                        item,
+                        graph,
+                        binding_types,
+                        scope,
+                    );
                 }
             }
             Value::Concrete(ConcreteValue::Map(map)) => {
                 for (k, v) in map {
-                    Self::collect_typed_dependencies(from, k, v, graph, binding_types);
+                    Self::collect_typed_dependencies_in_scope(
+                        from,
+                        k,
+                        v,
+                        graph,
+                        binding_types,
+                        scope,
+                    );
                 }
             }
             Value::Deferred(DeferredValue::Interpolation(parts)) => {
                 use crate::resource::InterpolationPart;
                 for part in parts {
                     if let InterpolationPart::Expr(v) = part {
-                        Self::collect_typed_dependencies(from, attr_key, v, graph, binding_types);
+                        Self::collect_typed_dependencies_in_scope(
+                            from,
+                            attr_key,
+                            v,
+                            graph,
+                            binding_types,
+                            scope,
+                        );
                     }
                 }
             }
@@ -546,42 +637,60 @@ impl RootConfigSignature {
                 | DeferredValue::ResolvedFunctionCall { args, .. },
             ) => {
                 for arg in args {
-                    Self::collect_typed_dependencies(
+                    Self::collect_typed_dependencies_in_scope(
                         from,
                         attr_key,
                         arg.walker_value(),
                         graph,
                         binding_types,
+                        scope,
                     );
                 }
             }
             Value::Deferred(DeferredValue::Access(access)) => {
-                Self::collect_typed_dependencies(
+                Self::collect_typed_dependencies_in_scope(
                     from,
                     attr_key,
                     access.base(),
                     graph,
                     binding_types,
+                    scope,
                 );
             }
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-                Self::collect_typed_dependencies(from, attr_key, value, graph, binding_types);
-                Self::collect_typed_dependencies(from, attr_key, default, graph, binding_types);
+                Self::collect_typed_dependencies_in_scope(
+                    from,
+                    attr_key,
+                    value,
+                    graph,
+                    binding_types,
+                    scope,
+                );
+                Self::collect_typed_dependencies_in_scope(
+                    from,
+                    attr_key,
+                    default,
+                    graph,
+                    binding_types,
+                    scope,
+                );
             }
             Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-                Self::collect_typed_dependencies(
+                Self::collect_typed_dependencies_in_scope(
                     from,
                     attr_key,
                     expression.lhs(),
                     graph,
                     binding_types,
+                    scope,
                 );
-                Self::collect_typed_dependencies(
+                Self::collect_typed_dependencies_in_scope(
                     from,
                     attr_key,
                     expression.rhs(),
                     graph,
                     binding_types,
+                    scope,
                 );
             }
             Value::Concrete(
@@ -598,8 +707,15 @@ impl RootConfigSignature {
             }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 // Mirror deps::collect_dependencies for secret-wrapped values.
-                inner.visit(|value| {
-                    Self::collect_typed_dependencies(from, attr_key, value, graph, binding_types)
+                inner.visit_reference_inventory(|value, scope| {
+                    Self::collect_typed_dependencies_in_scope(
+                        from,
+                        attr_key,
+                        value,
+                        graph,
+                        binding_types,
+                        scope,
+                    )
                 });
             }
             Value::Deferred(DeferredValue::Unknown(_)) => {
@@ -742,7 +858,7 @@ impl RootConfigSignature {
                     c.white, r.binding_name, c.reset, c.yellow, r.resource_type, c.reset
                 )
             })
-            .unwrap_or_else(|| node.to_string());
+            .unwrap_or_else(|| self.dependency_graph.display_target(node).to_string());
 
         state
             .output
@@ -1056,16 +1172,37 @@ impl ModuleSignature {
         binding_types: &HashMap<String, ResourceTypePath>,
         argument_types: &HashMap<String, TypeExpr>,
     ) {
+        Self::collect_typed_dependencies_in_scope(
+            from,
+            attr_key,
+            value,
+            graph,
+            binding_types,
+            argument_types,
+            DiagnosticScope::Public,
+        );
+    }
+
+    fn collect_typed_dependencies_in_scope(
+        from: &str,
+        attr_key: &str,
+        value: &Value,
+        graph: &mut TypedDependencyGraph,
+        binding_types: &HashMap<String, ResourceTypePath>,
+        argument_types: &HashMap<String, TypeExpr>,
+        scope: DiagnosticScope,
+    ) {
         match value {
             Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
                 for nested in deferred.values() {
-                    Self::collect_typed_dependencies(
+                    Self::collect_typed_dependencies_in_scope(
                         from,
                         attr_key,
                         nested,
                         graph,
                         binding_types,
                         argument_types,
+                        scope,
                     );
                 }
             }
@@ -1081,6 +1218,7 @@ impl ModuleSignature {
                 graph.add_edge(
                     from.to_string(),
                     TypedDependency {
+                        diagnostic_path: scope.path(ReferencePath::Access(path.clone())),
                         target: binding_name.to_string(),
                         target_type,
                         attribute: path.attribute().to_string(),
@@ -1100,6 +1238,7 @@ impl ModuleSignature {
                 graph.add_edge(
                     from.to_string(),
                     TypedDependency {
+                        diagnostic_path: scope.path(ReferencePath::Binding(binding.clone())),
                         target: binding.to_string(),
                         target_type,
                         attribute: String::new(),
@@ -1109,25 +1248,27 @@ impl ModuleSignature {
             }
             Value::Concrete(ConcreteValue::List(items)) => {
                 for item in items {
-                    Self::collect_typed_dependencies(
+                    Self::collect_typed_dependencies_in_scope(
                         from,
                         attr_key,
                         item,
                         graph,
                         binding_types,
                         argument_types,
+                        scope,
                     );
                 }
             }
             Value::Concrete(ConcreteValue::Map(map)) => {
                 for (k, v) in map {
-                    Self::collect_typed_dependencies(
+                    Self::collect_typed_dependencies_in_scope(
                         from,
                         k,
                         v,
                         graph,
                         binding_types,
                         argument_types,
+                        scope,
                     );
                 }
             }
@@ -1135,13 +1276,14 @@ impl ModuleSignature {
                 use crate::resource::InterpolationPart;
                 for part in parts {
                     if let InterpolationPart::Expr(v) = part {
-                        Self::collect_typed_dependencies(
+                        Self::collect_typed_dependencies_in_scope(
                             from,
                             attr_key,
                             v,
                             graph,
                             binding_types,
                             argument_types,
+                            scope,
                         );
                     }
                 }
@@ -1152,60 +1294,66 @@ impl ModuleSignature {
                 | DeferredValue::ResolvedFunctionCall { args, .. },
             ) => {
                 for arg in args {
-                    Self::collect_typed_dependencies(
+                    Self::collect_typed_dependencies_in_scope(
                         from,
                         attr_key,
                         arg.walker_value(),
                         graph,
                         binding_types,
                         argument_types,
+                        scope,
                     );
                 }
             }
             Value::Deferred(DeferredValue::Access(access)) => {
-                Self::collect_typed_dependencies(
+                Self::collect_typed_dependencies_in_scope(
                     from,
                     attr_key,
                     access.base(),
                     graph,
                     binding_types,
                     argument_types,
+                    scope,
                 );
             }
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-                Self::collect_typed_dependencies(
+                Self::collect_typed_dependencies_in_scope(
                     from,
                     attr_key,
                     value,
                     graph,
                     binding_types,
                     argument_types,
+                    scope,
                 );
-                Self::collect_typed_dependencies(
+                Self::collect_typed_dependencies_in_scope(
                     from,
                     attr_key,
                     default,
                     graph,
                     binding_types,
                     argument_types,
+                    scope,
                 );
             }
             Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-                Self::collect_typed_dependencies(
+                Self::collect_typed_dependencies_in_scope(
                     from,
                     attr_key,
                     expression.lhs(),
                     graph,
                     binding_types,
                     argument_types,
+                    scope,
                 );
-                Self::collect_typed_dependencies(
+                Self::collect_typed_dependencies_in_scope(
                     from,
                     attr_key,
                     expression.rhs(),
                     graph,
                     binding_types,
                     argument_types,
+                    scope,
                 );
             }
             Value::Concrete(
@@ -1222,14 +1370,15 @@ impl ModuleSignature {
             }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 // Mirror deps::collect_dependencies for secret-wrapped values.
-                inner.visit(|value| {
-                    Self::collect_typed_dependencies(
+                inner.visit_reference_inventory(|value, scope| {
+                    Self::collect_typed_dependencies_in_scope(
                         from,
                         attr_key,
                         value,
                         graph,
                         binding_types,
                         argument_types,
+                        scope,
                     )
                 });
             }
@@ -1242,6 +1391,7 @@ impl ModuleSignature {
                 graph.add_edge(
                     from.to_string(),
                     TypedDependency {
+                        diagnostic_path: scope.path(ReferencePath::Binding(name.as_str().into())),
                         target: name.clone(),
                         target_type,
                         attribute: String::new(),
@@ -1467,7 +1617,7 @@ impl ModuleSignature {
             )
         } else {
             // Argument parameter name (lexically scoped)
-            node.to_string()
+            self.dependency_graph.display_target(node).to_string()
         };
 
         state
@@ -1557,6 +1707,79 @@ impl ModuleSignature {
 mod tests {
     use super::*;
     use crate::parser::TypeExpr;
+
+    #[test]
+    fn review2_f8_signature_display_hides_secret_only_dependency_targets() {
+        let value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::resource_ref(
+                "private_producer",
+                "private_attr",
+                vec![],
+            ))
+            .into(),
+        ));
+        let mut graph = TypedDependencyGraph::new();
+        RootConfigSignature::collect_typed_dependencies(
+            "consumer",
+            "password",
+            &value,
+            &mut graph,
+            &HashMap::new(),
+        );
+        let creation = ResourceCreation {
+            binding_name: "consumer".into(),
+            resource_type: ResourceTypePath::new("mock", "test.resource"),
+            dependencies: graph.dependencies_of("consumer").to_vec(),
+        };
+        let signature = RootConfigSignature {
+            name: "main.crn".into(),
+            imports: vec![],
+            resources: vec![creation],
+            module_calls: vec![],
+            dependency_graph: graph,
+        };
+        let rendered = signature.display_with_color(false);
+        assert!(!rendered.contains("private_"), "{rendered}");
+        assert!(rendered.contains("consumer"), "{rendered}");
+    }
+
+    #[test]
+    fn review2_f8_dependency_graph_keeps_edges_without_displaying_secret_paths() {
+        let value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::resource_ref(
+                "private_producer",
+                "private_attr",
+                vec![],
+            ))
+            .into(),
+        ));
+        let binding_types = HashMap::new();
+        let mut root = TypedDependencyGraph::new();
+        RootConfigSignature::collect_typed_dependencies(
+            "consumer",
+            "password",
+            &value,
+            &mut root,
+            &binding_types,
+        );
+        let mut module = TypedDependencyGraph::new();
+        ModuleSignature::collect_typed_dependencies(
+            "consumer",
+            "password",
+            &value,
+            &mut module,
+            &binding_types,
+            &HashMap::new(),
+        );
+        for graph in [root, module] {
+            assert_eq!(
+                graph.dependencies_of("consumer")[0].target,
+                "private_producer"
+            );
+            let rendered = format!("{:?}", graph.dependencies_of("consumer"));
+            assert!(!rendered.contains("private_"), "{rendered}");
+        }
+    }
 
     #[test]
     fn provider_text_module_type_display_sanitizes_metadata_before_styling() {
@@ -1892,6 +2115,7 @@ mod tests {
         graph.add_edge(
             "web_sg".to_string(),
             TypedDependency {
+                diagnostic_path: DiagnosticPath::Public(ReferencePath::Binding("vpc".into())),
                 target: "vpc".to_string(),
                 target_type: Some(ResourceTypePath::new("aws", "vpc")),
                 attribute: String::new(),

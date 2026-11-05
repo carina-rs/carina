@@ -91,15 +91,7 @@ fn format_deferred_state_refresh_warning(
 ) -> String {
     let mut refs = unresolved
         .iter()
-        .flat_map(|input| {
-            let paths = input.paths.iter().map(|path| path.to_dot_string());
-            let bindings = input.bindings.iter().map(ToString::to_string);
-            let unknowns = input
-                .unknowns
-                .iter()
-                .map(|reason| format!("unknown({reason})"));
-            paths.chain(bindings).chain(unknowns)
-        })
+        .flat_map(UnresolvedDataSourceInput::diagnostic_references)
         .collect::<Vec<_>>();
     if refs.is_empty() {
         refs.extend(
@@ -7906,6 +7898,7 @@ mod tests {
                 ],
                 bindings: Vec::new(),
                 unknowns: Vec::new(),
+                diagnostic_scope: carina_core::resource::DiagnosticScope::Public,
             }],
         );
 

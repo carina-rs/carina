@@ -333,7 +333,7 @@ fn authored_expression_judges_coalesce_before_enclosing_reduction() {
             matches!(
                 result,
                 Err(crate::static_type::InferenceIssue::Failed(
-                    inference::InferenceError::InsideSecret { .. }
+                    inference::InferenceError::IncompatibleCoalesceTypes { .. }
                 ))
             )
         } else {
@@ -10898,5 +10898,49 @@ fn schema_bundle_replaces_findings_from_a_different_registry() {
         first.judged().report().findings().len(),
         1,
         "the first bundle is immutable"
+    );
+}
+
+#[test]
+fn review2_f7_secret_coalesce_keeps_main_type_only_error() {
+    let parsed =
+        crate::parser::parse_and_resolve("let a = 'present'\nlet result = secret(a ?? 42)\n")
+            .unwrap();
+    let report = crate::parser::retained::judge_expressions(
+        &parsed,
+        &SchemaRegistry::new(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
+    let error = report
+        .binding(&RelativeBindingName::new("result"))
+        .unwrap()
+        .static_type()
+        .unwrap_err();
+    assert!(
+        matches!(&error, crate::static_type::InferenceIssue::Failed(inference::InferenceError::IncompatibleCoalesceTypes { types }) if types.expected() == "String" && types.actual() == "Int"),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "coalesce default type `Int` does not match left type `String`"
+    );
+}
+
+#[test]
+fn review2_resource_type_mismatch_preserves_main_origin_text() {
+    let finding = ReferenceFinding::new(
+        &ReferenceFindingLocation::Resource {
+            location: "mock.test.Resource.example".into(),
+            attribute: "name".into(),
+        },
+        ReferenceFindingKind::TypeMismatch {
+            types: MismatchTypeNames::for_type_exprs(&TypeExpr::String, &TypeExpr::Int),
+            path: SecretDiagnosticError::Public("source.value".into()),
+            origin: Some(SecretDiagnosticError::Public("from source.value".into())),
+        },
+    );
+    assert_eq!(
+        finding.to_string(),
+        "mock.test.Resource.example: cannot assign Int to 'name': expected String, got Int (from source.value)"
     );
 }

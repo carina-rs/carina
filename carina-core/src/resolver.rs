@@ -2530,9 +2530,27 @@ mod tests {
     }
 
     #[test]
+    fn review2_f2_resolving_secret_reference_matches_main_single_wrapper() {
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("t".into()))).into(),
+        ));
+        let bindings = bindings_from(vec![("a", vec![("token", secret.clone())])]);
+        let value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::root_resource_ref("a", "token", vec![])).into(),
+        ));
+        let resolved = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value(&value, &bindings, session),
+        )
+        .unwrap();
+        assert_eq!(resolved, secret);
+    }
+
+    #[test]
     fn test_resolve_subscript_descends_into_doubly_secret_wrapped_map() {
-        // Defensive: preexisting `Secret(Secret(Map))` layers survive navigation.
-        // Authored calls normalize separately; walkers retain their input depth.
+        // Main's defensive stacked-wrapper fixture tested peel/rewrap depth.
+        // SecretPayload now collapses those layers. Navigation, hash bytes,
+        // provider plaintext and display retain the same observable value.
         let map: indexmap::IndexMap<String, Value> = vec![(
             "k".to_string(),
             Value::Concrete(ConcreteValue::String("v".into())),
@@ -2566,11 +2584,13 @@ mod tests {
         assert_eq!(
             resolved,
             Value::Deferred(DeferredValue::Secret(
-                Box::new(Value::Deferred(DeferredValue::Secret(
-                    Box::new(Value::Concrete(ConcreteValue::String("v".into()))).into()
-                )))
-                .into()
+                Box::new(Value::Concrete(ConcreteValue::String("v".into()))).into()
             )),
+        );
+        assert_eq!(crate::value::format_value(&resolved), "(secret)");
+        assert_eq!(
+            crate::value::canonical_secret_hash_material(&resolved).unwrap(),
+            br#""v""#
         );
     }
 

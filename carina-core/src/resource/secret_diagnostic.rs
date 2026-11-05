@@ -53,15 +53,30 @@ impl<E: fmt::Display> fmt::Display for SecretDiagnosticError<E> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum DiagnosticScope {
+    #[default]
     Public,
     Secret,
 }
 
 impl DiagnosticScope {
+    pub fn is_public(&self) -> bool {
+        *self == Self::Public
+    }
     pub fn is_secret(self) -> bool {
         self == Self::Secret
+    }
+    pub fn path<B: super::BindingAddress>(
+        self,
+        path: super::ReferencePath<B>,
+    ) -> DiagnosticPath<B> {
+        match self {
+            Self::Public => DiagnosticPath::Public(path),
+            Self::Secret => DiagnosticPath::Protected,
+        }
     }
     pub fn protect<E>(self, error: E) -> SecretDiagnosticError<E> {
         match self {

@@ -275,7 +275,9 @@ pub enum ParseError {
     RecursiveFunction(String),
 
     #[error("{}", format_cyclic_let_binding(chain))]
-    CyclicLetBinding { chain: Vec<String> },
+    CyclicLetBinding {
+        chain: Vec<crate::resource::DiagnosticPath<crate::resource::RelativeBindingName>>,
+    },
 
     #[error("User-defined function error: {0}")]
     UserFunctionError(String),
@@ -287,8 +289,14 @@ impl From<pest::error::Error<Rule>> for ParseError {
     }
 }
 
-fn format_cyclic_let_binding(chain: &[String]) -> String {
-    let rendered = chain.join(" -> ");
+fn format_cyclic_let_binding(
+    chain: &[crate::resource::DiagnosticPath<crate::resource::RelativeBindingName>],
+) -> String {
+    let rendered = chain
+        .iter()
+        .map(crate::resource::DiagnosticPath::to_dot_string)
+        .collect::<Vec<_>>()
+        .join(" -> ");
     if chain.len() == 2 && chain[0] == chain[1] {
         format!(
             "Cyclic let binding detected: {rendered}; a `let` binding cannot reference itself; \

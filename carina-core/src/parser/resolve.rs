@@ -8,13 +8,13 @@ use super::entry::BindingSeed;
 use super::error::{ParseError, undefined_identifier_error};
 use super::static_eval::is_static_value;
 use super::{ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value};
-use crate::resource::DiagnosticScope;
 use crate::resource::{
     AbsoluteBindingAddress, AccessMissPolicy, BindingAddress, ConcreteValue,
     ConcreteValue as GenericConcreteValue, DeferredValue, DiagnosticSourceLine, InterpolationPart,
     LoopSlot, NoPlaceholder, ParserPlaceholder, RelativeBindingName, UnavailableCoalescePolicy,
     UnavailableReason, UnavailableSecretPolicy, Value as GenericValue, find_unavailable_evaluation,
 };
+use crate::resource::{DiagnosticPath, DiagnosticScope, ReferencePath};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -1328,7 +1328,7 @@ pub(crate) fn reject_cyclic_let_bindings_in_variables(
 fn find_let_binding_cycle(
     variables: &IndexMap<String, Value>,
     structural: &HashSet<&str>,
-) -> Option<Vec<String>> {
+) -> Option<Vec<DiagnosticPath<RelativeBindingName>>> {
     let mut visited = HashSet::new();
     let mut visiting = Vec::new();
 
@@ -1336,9 +1336,14 @@ fn find_let_binding_cycle(
         if structural.contains(name.as_str()) {
             continue;
         }
-        if let Some(chain) =
-            visit_let_binding(name, variables, structural, &mut visited, &mut visiting)
-        {
+        if let Some(chain) = visit_let_binding(
+            name,
+            DiagnosticPath::Public(ReferencePath::Binding(name.as_str().into())),
+            variables,
+            structural,
+            &mut visited,
+            &mut visiting,
+        ) {
             return Some(chain);
         }
     }
@@ -1348,26 +1353,38 @@ fn find_let_binding_cycle(
 
 fn visit_let_binding(
     name: &str,
+    diagnostic_path: DiagnosticPath<RelativeBindingName>,
     variables: &IndexMap<String, Value>,
     structural: &HashSet<&str>,
     visited: &mut HashSet<String>,
-    visiting: &mut Vec<String>,
-) -> Option<Vec<String>> {
+    visiting: &mut Vec<(String, DiagnosticPath<RelativeBindingName>)>,
+) -> Option<Vec<DiagnosticPath<RelativeBindingName>>> {
     if visited.contains(name) {
         return None;
     }
-    if let Some(pos) = visiting.iter().position(|candidate| candidate == name) {
-        let mut cycle = visiting[pos..].to_vec();
-        cycle.push(name.to_string());
+    if let Some(pos) = visiting.iter().position(|(candidate, _)| candidate == name) {
+        let mut cycle = visiting[pos..]
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect::<Vec<_>>();
+        cycle.push(diagnostic_path);
+        if cycle
+            .iter()
+            .any(|path| matches!(path, DiagnosticPath::Protected))
+        {
+            cycle.fill(DiagnosticPath::Protected);
+        }
         return Some(cycle);
     }
 
     let value = variables.get(name)?;
-    visiting.push(name.to_string());
+    visiting.push((name.to_string(), diagnostic_path));
 
     let roots = reference_roots_in_value(value, variables, structural);
-    for root in roots {
-        if let Some(chain) = visit_let_binding(&root, variables, structural, visited, visiting) {
+    for (root, path) in roots {
+        if let Some(chain) =
+            visit_let_binding(&root, path, variables, structural, visited, visiting)
+        {
             return Some(chain);
         }
     }
@@ -1381,9 +1398,15 @@ fn reference_roots_in_value(
     value: &Value,
     variables: &IndexMap<String, Value>,
     structural: &HashSet<&str>,
-) -> Vec<String> {
+) -> Vec<(String, DiagnosticPath<RelativeBindingName>)> {
     let mut roots = Vec::new();
-    collect_reference_roots(value, variables, structural, &mut roots);
+    collect_reference_roots(
+        value,
+        variables,
+        structural,
+        DiagnosticScope::Public,
+        &mut roots,
+    );
     roots
 }
 
@@ -1391,38 +1414,39 @@ fn collect_reference_roots(
     value: &Value,
     variables: &IndexMap<String, Value>,
     structural: &HashSet<&str>,
-    roots: &mut Vec<String>,
+    scope: DiagnosticScope,
+    roots: &mut Vec<(String, DiagnosticPath<RelativeBindingName>)>,
 ) {
     match value {
         GenericValue::Deferred(DeferredValue::ModuleIf(deferred)) => {
             for nested in deferred.values() {
-                collect_reference_roots(nested, variables, structural, roots);
+                collect_reference_roots(nested, variables, structural, scope, roots);
             }
         }
         Value::Concrete(ConcreteValue::EnumIdentifier(name)) => {
             // Bare-identifier fallback (`EnumIdentifier("B")`) and dotted-access
             // fallback (`EnumIdentifier("B.attr")`) both appear before the parser
             // classifies the RHS as a binding ref or resource ref.
-            push_root(name.as_str(), variables, structural, roots);
+            push_root(name.as_str(), variables, structural, scope, roots);
             if let Some((root, _)) = name.as_str().split_once('.') {
-                push_root(root, variables, structural, roots);
+                push_root(root, variables, structural, scope, roots);
             }
         }
         Value::Concrete(ConcreteValue::List(items)) => {
             for item in items {
-                collect_reference_roots(item, variables, structural, roots);
+                collect_reference_roots(item, variables, structural, scope, roots);
             }
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
             for item in map.values() {
-                collect_reference_roots(item, variables, structural, roots);
+                collect_reference_roots(item, variables, structural, scope, roots);
             }
         }
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            push_root(binding, variables, structural, roots);
+            push_root(binding, variables, structural, scope, roots);
         }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            push_root(path.binding(), variables, structural, roots);
+            push_root(path.binding(), variables, structural, scope, roots);
         }
         GenericValue::Deferred(
             DeferredValue::FunctionCall { args, .. }
@@ -1430,29 +1454,31 @@ fn collect_reference_roots(
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             for arg in args {
-                collect_reference_roots(arg.walker_value(), variables, structural, roots);
+                collect_reference_roots(arg.walker_value(), variables, structural, scope, roots);
             }
         }
         Value::Deferred(DeferredValue::Access(access)) => {
-            collect_reference_roots(access.base(), variables, structural, roots);
+            collect_reference_roots(access.base(), variables, structural, scope, roots);
         }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             for part in parts {
                 if let InterpolationPart::Expr(expr) = part {
-                    collect_reference_roots(expr, variables, structural, roots);
+                    collect_reference_roots(expr, variables, structural, scope, roots);
                 }
             }
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            inner.visit(|value| collect_reference_roots(value, variables, structural, roots));
+            inner.visit_reference_inventory(|value, scope| {
+                collect_reference_roots(value, variables, structural, scope, roots)
+            });
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            collect_reference_roots(value, variables, structural, roots);
-            collect_reference_roots(default, variables, structural, roots);
+            collect_reference_roots(value, variables, structural, scope, roots);
+            collect_reference_roots(default, variables, structural, scope, roots);
         }
         Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            collect_reference_roots(expression.lhs(), variables, structural, roots);
-            collect_reference_roots(expression.rhs(), variables, structural, roots);
+            collect_reference_roots(expression.lhs(), variables, structural, scope, roots);
+            collect_reference_roots(expression.rhs(), variables, structural, scope, roots);
         }
         Value::Concrete(
             ConcreteValue::Int(_)
@@ -1472,13 +1498,20 @@ fn push_root(
     root: &str,
     variables: &IndexMap<String, Value>,
     structural: &HashSet<&str>,
-    roots: &mut Vec<String>,
+    scope: DiagnosticScope,
+    roots: &mut Vec<(String, DiagnosticPath<RelativeBindingName>)>,
 ) {
-    if variables.contains_key(root)
-        && !structural.contains(root)
-        && !roots.iter().any(|existing| existing == root)
-    {
-        roots.push(root.to_string());
+    if variables.contains_key(root) && !structural.contains(root) {
+        if let Some((_, path)) = roots.iter_mut().find(|(name, _)| name == root) {
+            if scope.is_secret() {
+                *path = DiagnosticPath::Protected;
+            }
+        } else {
+            roots.push((
+                root.to_string(),
+                scope.path(ReferencePath::Binding(root.into())),
+            ));
+        }
     }
 }
 
@@ -2787,5 +2820,39 @@ for item in source.arn {
             template.attributes().get("comment"),
             Some(Value::Deferred(DeferredValue::Secret(_)))
         ));
+    }
+}
+
+#[cfg(test)]
+mod review2_cycle_tests {
+    use super::*;
+    #[test]
+    fn review2_f8_let_cycle_keeps_public_chain_and_protects_secret_roots() {
+        let reference = |name: &str| {
+            Value::Deferred(DeferredValue::BindingRef {
+                binding: name.into(),
+            })
+        };
+        let public = IndexMap::from([("a".into(), reference("b")), ("b".into(), reference("a"))]);
+        assert_eq!(
+            reject_cyclic_let_bindings_in_variables(&public, &HashSet::new())
+                .unwrap_err()
+                .to_string(),
+            "Cyclic let binding detected: a -> b -> a"
+        );
+        let private = IndexMap::from([
+            (
+                "public".into(),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(reference("private_root")).into(),
+                )),
+            ),
+            ("private_root".into(), reference("public")),
+        ]);
+        let error = reject_cyclic_let_bindings_in_variables(&private, &HashSet::new()).unwrap_err();
+        assert!(
+            !format!("{error} {error:?}").contains("private_root"),
+            "{error:?}"
+        );
     }
 }

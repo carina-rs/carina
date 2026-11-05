@@ -11,12 +11,58 @@ use crate::resource::{
 
 /// A data-source input attribute whose unresolved value shapes make the read
 /// apply-time dependent or unsafe to hand to a provider.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct UnresolvedDataSourceInput {
     pub attribute: String,
     pub paths: Vec<AccessPath>,
     pub bindings: Vec<AbsoluteBindingAddress>,
     pub unknowns: Vec<ApplyTimeUnknown>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::resource::DiagnosticScope::is_public"
+    )]
+    pub diagnostic_scope: crate::resource::DiagnosticScope,
+}
+
+impl UnresolvedDataSourceInput {
+    /// Render inventory findings without exposing identities collected inside secrets.
+    pub fn diagnostic_references(&self) -> Vec<String> {
+        if self.diagnostic_scope.is_secret() {
+            return vec![
+                crate::resource::DiagnosticPath::<AbsoluteBindingAddress>::Protected
+                    .to_dot_string(),
+            ];
+        }
+        self.paths
+            .iter()
+            .map(AccessPath::to_dot_string)
+            .chain(self.bindings.iter().map(ToString::to_string))
+            .chain(
+                self.unknowns
+                    .iter()
+                    .map(|reason| format!("unknown({reason})")),
+            )
+            .collect()
+    }
+}
+
+impl std::fmt::Debug for UnresolvedDataSourceInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("UnresolvedDataSourceInput");
+        debug.field("attribute", &self.attribute);
+        if self.diagnostic_scope.is_secret() {
+            debug.field(
+                "references",
+                &crate::resource::DiagnosticPath::<AbsoluteBindingAddress>::Protected,
+            );
+        } else {
+            debug
+                .field("paths", &self.paths)
+                .field("bindings", &self.bindings)
+                .field("unknowns", &self.unknowns);
+        }
+        debug.finish()
+    }
 }
 
 /// The value status of one configured data source after the pre-apply read
@@ -397,6 +443,7 @@ mod tests {
             paths: vec![AccessPath::new("producer", "name").resolve_root(&RootScope::new())],
             bindings: vec![absolute_binding("producer")],
             unknowns: Vec::new(),
+            diagnostic_scope: crate::resource::DiagnosticScope::Public,
         };
         let mut values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
             if data_source
@@ -471,6 +518,7 @@ mod tests {
             paths: vec![AccessPath::new("producer", "name").resolve_root(&RootScope::new())],
             bindings: vec![absolute_binding("producer")],
             unknowns: Vec::new(),
+            diagnostic_scope: crate::resource::DiagnosticScope::Public,
         };
         let values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
             if data_source.id == data_sources[0].id {

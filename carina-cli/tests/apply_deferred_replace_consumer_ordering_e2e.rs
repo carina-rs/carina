@@ -32,7 +32,7 @@ fn resolved(resource: Resource) -> ResolvedResource {
             value.visit_resource_refs(&mut |path| {
                 dependencies.insert(path.binding_address().clone());
             });
-            value.visit_binding_refs(&mut |binding| {
+            value.visit_binding_refs(&mut |binding, _| {
                 dependencies.insert(binding.clone());
             });
         }

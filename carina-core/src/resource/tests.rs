@@ -3637,7 +3637,7 @@ fn visit_binding_refs_collects_from_all_nested_variants() {
     ]));
 
     let mut collected = Vec::new();
-    value.visit_binding_refs(&mut |binding| {
+    value.visit_binding_refs(&mut |binding, _| {
         collected.push(binding.to_string());
     });
     collected.sort();
@@ -4538,4 +4538,48 @@ fn exact_pairing_preserves_hash_container_evidence() {
         super::match_equal_concrete_items(std::slice::from_ref(&item), std::slice::from_ref(&item));
     assert_eq!(pairs, vec![Some(0)]);
     assert_eq!(matched, vec![true]);
+}
+
+#[test]
+fn review2_f8_leftover_placeholder_inventory_protects_secret_names() {
+    let value: super::Value<super::ParserPlaceholder> =
+        super::Value::Deferred(super::DeferredValue::Secret(
+            Box::new(super::Value::Deferred(super::DeferredValue::Placeholder(
+                super::ParserPlaceholder::ModuleArgument {
+                    name: "private_argument".into(),
+                    diagnostic: Default::default(),
+                },
+            )))
+            .into(),
+        ));
+    let mut errors = vec![];
+    value.collect_leftover_placeholders(
+        super::LeftoverPlaceholderContext::Value,
+        super::LeftoverPlaceholderPolicy::REJECT_ALL,
+        &mut errors,
+    );
+    assert_eq!(errors.len(), 1);
+    assert!(!format!("{} {:?}", errors[0], errors[0]).contains("private_argument"));
+}
+
+#[test]
+fn review2_f8_binding_inventory_callbacks_keep_public_and_secret_scopes() {
+    let reference = |name: &str| {
+        Value::Deferred(DeferredValue::BindingRef {
+            binding: absolute_binding(name),
+        })
+    };
+    let value = Value::Concrete(ConcreteValue::List(vec![
+        reference("public"),
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(reference("private_binding")).into(),
+        )),
+    ]));
+    let mut findings = Vec::new();
+    value.visit_binding_refs(&mut |binding, scope| {
+        findings.push(scope.path(super::ReferencePath::Binding(binding.clone())))
+    });
+    assert_eq!(findings[0].to_dot_string(), "public");
+    assert_eq!(findings[1], super::DiagnosticPath::Protected);
+    assert!(!format!("{findings:?}").contains("private_binding"));
 }

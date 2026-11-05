@@ -221,19 +221,7 @@ fn format_unresolved_read_inputs(unresolved: &[super::UnresolvedDataSourceInput]
     unresolved
         .iter()
         .map(|input| {
-            let mut refs = input
-                .paths
-                .iter()
-                .map(|path| path.to_dot_string())
-                .collect::<Vec<_>>();
-            refs.extend(input.bindings.iter().map(ToString::to_string));
-            refs.extend(
-                input
-                    .unknowns
-                    .iter()
-                    .map(|reason| format!("unknown({reason})")),
-            );
-            let refs = refs.join(", ");
+            let refs = input.diagnostic_references().join(", ");
             format!("{} -> {}", input.attribute, refs)
         })
         .collect::<Vec<_>>()
@@ -1512,7 +1500,7 @@ mod tests {
                 value_dependencies.insert(id.clone());
                 reads.insert_known(id, path.attribute());
             });
-            value.visit_binding_refs(&mut |binding| {
+            value.visit_binding_refs(&mut |binding, _| {
                 let id = fixture_id(binding.as_str());
                 value_dependencies.insert(id.clone());
                 reads.insert_unknown(id);
@@ -2402,6 +2390,36 @@ mod tests {
             deps_of[&1].contains(&0),
             "RolePolicy (idx 1) must depend on Role (idx 0) via the bootstrap composition binding; got: {:?}",
             deps_of[&1],
+        );
+    }
+}
+
+#[cfg(test)]
+mod review2_inventory_tests {
+    use super::*;
+    use crate::resource::{DeferredValue, Value};
+    #[test]
+    fn review2_f8_deferred_read_inventory_does_not_render_secret_binding_names() {
+        let reference = Value::Deferred(DeferredValue::BindingRef {
+            binding: crate::resource::RootScope::new().resolve("private_producer".into()),
+        });
+        let resource: crate::resource::DataSource =
+            crate::resource::DataSource::with_provider("mock", "query", "read", None)
+                .with_attribute(
+                    "query",
+                    Value::Deferred(DeferredValue::Secret(Box::new(reference).into())),
+                );
+        let inputs = super::super::unresolved_data_source_inputs(&resource);
+        let rendered = format!("{} {inputs:?}", format_unresolved_read_inputs(&inputs));
+        assert!(!rendered.contains("private_producer"), "{rendered}");
+        assert_eq!(inputs[0].bindings[0].as_str(), "private_producer");
+        let encoded = serde_json::to_value(&inputs).unwrap();
+        let decoded: Vec<crate::data_source_value::UnresolvedDataSourceInput> =
+            serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, inputs);
+        assert!(
+            !format!("{} {decoded:?}", format_unresolved_read_inputs(&decoded))
+                .contains("private_producer")
         );
     }
 }

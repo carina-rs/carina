@@ -3003,7 +3003,7 @@ impl ResolvedBindings {
                     && !binding.refreshable_attributes.contains(path.attribute())
             });
         });
-        value.visit_binding_refs(&mut |name| {
+        value.visit_binding_refs(&mut |name, _| {
             definitive &= self.binding_is_fully_definitive(name.as_str());
         });
         if definitive {

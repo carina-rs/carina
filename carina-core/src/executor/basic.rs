@@ -25,8 +25,8 @@ use crate::resolver::resolve_ref_value;
 #[cfg(test)]
 use crate::resource::Resource;
 use crate::resource::{
-    AbsoluteBindingAddress, ConcreteValue, Current, DataSource, DeferredValue, ResourceId,
-    SnapshotState as State, Value,
+    AbsoluteBindingAddress, ConcreteValue, Current, DataSource, DeferredValue, DiagnosticPath,
+    DiagnosticScope, ReferencePath, ResourceId, SnapshotState as State, Value,
 };
 use crate::schema::SchemaKind;
 use crate::value::{SerializationContext, SerializationError};
@@ -402,10 +402,9 @@ fn assert_fully_resolved(
         Value::Deferred(DeferredValue::Secret(inner)) => inner
             .try_inspect(|value| assert_fully_resolved(value, attribute_key, bindings))
             .map_err(|error| {
-                error.with_context(format!(
-                    "Attribute '{attribute_key}': {}",
-                    crate::resource::INSIDE_SECRET_MESSAGE,
-                ))
+                error.with_public_context(super::PublicReportContext::SecretAttribute {
+                    attribute: attribute_key.to_string(),
+                })
             }),
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
         Value::Deferred(DeferredValue::ModuleIf(_)) => Err(ReportedError::message(format!(
@@ -418,7 +417,7 @@ fn assert_fully_resolved(
             UnresolvedSite::Ref {
                 path: path.to_dot_string(),
             },
-            path.binding(),
+            Some(DiagnosticPath::Public(ReferencePath::Access(path.clone()))),
             bindings,
             value,
         )),
@@ -427,7 +426,9 @@ fn assert_fully_resolved(
             UnresolvedSite::Ref {
                 path: binding.to_string(),
             },
-            binding.as_str(),
+            Some(DiagnosticPath::Public(ReferencePath::Binding(
+                binding.clone(),
+            ))),
             bindings,
             value,
         )),
@@ -443,7 +444,7 @@ fn assert_fully_resolved(
                 UnresolvedSite::IntegerArithmetic {
                     expression: crate::value::format_value(value),
                 },
-                leaf.unwrap_or(""),
+                leaf,
                 bindings,
                 value,
             ))
@@ -453,7 +454,7 @@ fn assert_fully_resolved(
             Err(unresolved_binding_message(
                 attribute_key,
                 UnresolvedSite::Interpolation,
-                leaf.unwrap_or(""),
+                leaf,
                 bindings,
                 value,
             ))
@@ -467,7 +468,7 @@ fn assert_fully_resolved(
                 UnresolvedSite::FunctionCall {
                     name: name.to_string(),
                 },
-                leaf.unwrap_or(""),
+                leaf,
                 bindings,
                 value,
             ))
@@ -479,7 +480,7 @@ fn assert_fully_resolved(
                 UnresolvedSite::FunctionCall {
                     name: function.name.clone(),
                 },
-                leaf.unwrap_or(""),
+                leaf,
                 bindings,
                 value,
             ))
@@ -491,7 +492,7 @@ fn assert_fully_resolved(
                 UnresolvedSite::Access {
                     expression: crate::value::format_value(value),
                 },
-                leaf.unwrap_or(""),
+                leaf,
                 bindings,
                 value,
             ))
@@ -524,7 +525,7 @@ enum UnresolvedSite {
 fn unresolved_binding_message(
     attribute_key: &str,
     site: UnresolvedSite,
-    referenced_binding: &str,
+    referenced_path: Option<DiagnosticPath>,
     bindings: &ResolvedBindings,
     referenced_value: &Value,
 ) -> ReportedError {
@@ -544,6 +545,17 @@ fn unresolved_binding_message(
         UnresolvedSite::Access { expression } => format!(
             "attribute `{attribute_key}` contains access expression `{expression}` that did not fully resolve at apply time."
         ),
+    };
+
+    let referenced_binding = match &referenced_path {
+        Some(DiagnosticPath::Protected) => {
+            return ReportedError::message(format!(
+                "{opener} {}",
+                crate::resource::INSIDE_SECRET_MESSAGE
+            ));
+        }
+        Some(DiagnosticPath::Public(path)) => path.as_ref().binding(),
+        None => "",
     };
 
     let partial = match bindings.completeness(referenced_binding) {
@@ -586,25 +598,37 @@ fn unresolved_binding_message(
     ReportedError::message(format!("{opener} {remediation}"))
 }
 
-fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+fn collect_unresolved_bindings<'a>(
+    value: &'a Value,
+    scope: DiagnosticScope,
+    out: &mut Vec<(&'a str, DiagnosticPath)>,
+) {
     use crate::resource::InterpolationPart;
     match value {
-        Value::Deferred(DeferredValue::ResourceRef { path }) => out.push(path.binding()),
-        Value::Deferred(DeferredValue::BindingRef { binding }) => out.push(binding.as_str()),
+        Value::Deferred(DeferredValue::ResourceRef { path }) => out.push((
+            path.binding(),
+            scope.path(ReferencePath::Access(path.clone())),
+        )),
+        Value::Deferred(DeferredValue::BindingRef { binding }) => out.push((
+            binding.as_str(),
+            scope.path(ReferencePath::Binding(binding.clone())),
+        )),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            inner.visit(|value| collect_unresolved_bindings(value, out))
+            inner.visit_reference_inventory(|value, scope| {
+                collect_unresolved_bindings(value, scope, out)
+            })
         }
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             deferred
                 .values()
                 .into_iter()
-                .for_each(|value| collect_unresolved_bindings(value, out));
+                .for_each(|value| collect_unresolved_bindings(value, scope, out));
         }
 
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             for p in parts {
                 if let InterpolationPart::Expr(v) = p {
-                    collect_unresolved_bindings(v, out);
+                    collect_unresolved_bindings(v, scope, out);
                 }
             }
         }
@@ -614,30 +638,30 @@ fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             for a in args {
-                collect_unresolved_bindings(a.walker_value(), out);
+                collect_unresolved_bindings(a.walker_value(), scope, out);
             }
         }
         Value::Deferred(DeferredValue::Access(access)) => {
-            collect_unresolved_bindings(access.base(), out)
+            collect_unresolved_bindings(access.base(), scope, out)
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            collect_unresolved_bindings(value, out);
-            collect_unresolved_bindings(default, out);
+            collect_unresolved_bindings(value, scope, out);
+            collect_unresolved_bindings(default, scope, out);
         }
         Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            collect_unresolved_bindings(expression.lhs(), out);
-            collect_unresolved_bindings(expression.rhs(), out);
+            collect_unresolved_bindings(expression.lhs(), scope, out);
+            collect_unresolved_bindings(expression.rhs(), scope, out);
         }
         Value::Deferred(DeferredValue::Unknown(_)) => {}
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
         Value::Concrete(ConcreteValue::List(items)) => {
             for v in items {
-                collect_unresolved_bindings(v, out);
+                collect_unresolved_bindings(v, scope, out);
             }
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
             for v in map.values() {
-                collect_unresolved_bindings(v, out);
+                collect_unresolved_bindings(v, scope, out);
             }
         }
         Value::Concrete(ConcreteValue::String(_))
@@ -651,22 +675,22 @@ fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
     }
 }
 
-fn pick_unresolved_binding_for_diagnostic<'a>(
-    value: &'a Value,
+fn pick_unresolved_binding_for_diagnostic(
+    value: &Value,
     bindings: &ResolvedBindings,
-) -> Option<&'a str> {
+) -> Option<DiagnosticPath> {
     let mut names = Vec::new();
-    collect_unresolved_bindings(value, &mut names);
+    collect_unresolved_bindings(value, DiagnosticScope::Public, &mut names);
     names
         .iter()
-        .copied()
-        .find(|name| {
+        .find(|(name, _)| {
             matches!(
                 bindings.source(name),
                 Some(crate::binding_index::BindingValueSource::Upstream)
             )
         })
-        .or_else(|| names.first().copied())
+        .or_else(|| names.first())
+        .map(|(_, path)| path.clone())
 }
 
 /// Process a `BasicEffectResult` by updating shared execution state.
@@ -1752,6 +1776,34 @@ mod assert_fully_resolved_tests {
 
     fn empty_bindings() -> ResolvedBindings {
         ResolvedBindings::default()
+    }
+
+    #[test]
+    fn review2_f8_nested_secret_unresolved_binding_does_not_name_private_producer() {
+        let value = Value::Deferred(DeferredValue::FunctionCall {
+            name: crate::builtins::BuiltinFunction::upper,
+            args: vec![
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::root_resource_ref(
+                        "private_producer",
+                        "private_attr",
+                        vec![],
+                    ))
+                    .into(),
+                ))
+                .into(),
+            ],
+            source_line: 0.into(),
+        });
+        let bindings = bindings_with("private_producer", BindingValueSource::Upstream);
+        let error = assert_fully_resolved(&value, "password", &bindings).unwrap_err();
+        let rendered = crate::executor::render_error_chain(error.as_error());
+        assert!(!rendered.contains("private_"), "{rendered}");
+        assert!(!format!("{error:?}").contains("private_"));
+        assert!(
+            rendered.contains("password") && rendered.contains("upper"),
+            "{rendered}"
+        );
     }
 
     #[test]

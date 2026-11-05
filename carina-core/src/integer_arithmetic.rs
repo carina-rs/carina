@@ -352,11 +352,19 @@ fn evaluate_integer_values_inner<P, B: BindingAddress>(
 where
     P: ValueKind + PlaceholderKind,
 {
-    let secret = matches!(lhs, Value::Deferred(DeferredValue::Secret(_)))
-        || matches!(rhs, Value::Deferred(DeferredValue::Secret(_)));
+    let (lhs, lhs_depth) = crate::resource::peel_secrets(lhs);
+    let (rhs, rhs_depth) = crate::resource::peel_secrets(rhs);
+    let secret = lhs_depth > 0 || rhs_depth > 0;
 
-    validate(&lhs, IntegerOperandSide::Left).map_err(IntegerExpressionError::Operand)?;
-    validate(&rhs, IntegerOperandSide::Right).map_err(IntegerExpressionError::Operand)?;
+    let protect = |error: IntegerOperandError| {
+        IntegerExpressionError::Operand(if secret {
+            crate::resource::InsideSecret::inside_secret(error)
+        } else {
+            error
+        })
+    };
+    validate(&lhs, IntegerOperandSide::Left).map_err(protect)?;
+    validate(&rhs, IntegerOperandSide::Right).map_err(protect)?;
 
     if concrete_integer(&rhs) == Some(0)
         && let Some(error) = zero_divisor_error(op)
@@ -586,6 +594,31 @@ mod tests {
         AbsoluteBindingAddress, AccessPath, ApplyTimeUnknown, NoPlaceholder, ParserPlaceholder,
         RelativeBindingName,
     };
+
+    #[test]
+    fn review2_f3_deferred_arithmetic_peels_secret_operands_like_main() {
+        let reference: Value<NoPlaceholder, RelativeBindingName> =
+            Value::Deferred(DeferredValue::ResourceRef {
+                path: AccessPath::new("p", "n"),
+            });
+        let result = evaluate_integer_values(
+            Value::Deferred(DeferredValue::Secret(Box::new(reference.clone()).into())),
+            IntegerOp::Subtract,
+            Value::Concrete(ConcreteValue::Int(1)),
+            IntegerOperatorSpan::synthetic(),
+        )
+        .unwrap();
+        let Value::Deferred(DeferredValue::Secret(payload)) = result else {
+            panic!("expected secret arithmetic")
+        };
+        let Value::Deferred(DeferredValue::IntegerArithmetic(expression)) =
+            payload.expose_plaintext()
+        else {
+            panic!("expected deferred arithmetic")
+        };
+        assert_eq!(expression.lhs(), &reference);
+        assert_eq!(expression.rhs(), &Value::Concrete(ConcreteValue::Int(1)));
+    }
 
     #[test]
     fn checked_evaluator_covers_zero_sign_and_overflow_edges() {

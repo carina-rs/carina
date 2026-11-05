@@ -293,17 +293,24 @@ fn value_has_authored_plan_time_expression<P: PlaceholderKind, B: BindingAddress
         Value::Deferred(DeferredValue::Access(access)) => {
             value_has_authored_plan_time_expression(access.base())
         }
-        // Declared identity is rendered into a public address suffix. Even a
-        // fully-authored secret leaf is therefore incomplete: hashing its
-        // deterministic spelling would disclose plaintext-derived material.
-        // The legacy create-only hash does not call this predicate.
-        Value::Deferred(DeferredValue::Secret(_)) => false,
+        // Main retained secret(<ref>) as a FunctionCall until resolution. Its
+        // authored reference expression was complete, while literal secrets
+        // remained opaque. Keep that addressing rule at the intrinsic arm.
+        Value::Deferred(DeferredValue::Secret(payload)) => payload.visit(|value| {
+            secret_has_reference_expression(value) && value_has_authored_plan_time_expression(value)
+        }),
         Value::Deferred(
             DeferredValue::Unavailable { .. }
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => false,
     }
+}
+
+fn secret_has_reference_expression<P: crate::resource::ValueKind, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> bool {
+    !value.root_bindings().is_empty()
 }
 
 enum IdentityPathInput<'a, P: PlaceholderKind, B: BindingAddress> {
@@ -1712,9 +1719,18 @@ fn deterministic_value_string<P: crate::resource::ValueKind, B: BindingAddress>(
             access.step().to_plaintext_dot_string()
         ),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            let mut material = String::from("Secret(");
-            inner.visit(|value| material.push_str(&deterministic_value_string(value)));
-            material.push(')');
+            let mut material = String::new();
+            inner.visit(|value| {
+                if secret_has_reference_expression(value) {
+                    material.push_str("FunctionCall(secret(");
+                    material.push_str(&deterministic_value_string(value));
+                    material.push_str("))");
+                } else {
+                    material.push_str("Secret(");
+                    material.push_str(&deterministic_value_string(value));
+                    material.push(')');
+                }
+            });
             material
         }
 

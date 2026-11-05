@@ -491,7 +491,7 @@ fn resolve_bool<P: PlaceholderKind, B: BindingAddress>(
                 Value::Deferred(_) => {
                     let mut module_arguments = false;
                     let mut loop_slots = false;
-                    value.visit_placeholders(&mut |placeholder| {
+                    value.visit_placeholders(&mut |placeholder, _| {
                         module_arguments |= placeholder.module_argument_name().is_some();
                         loop_slots |= placeholder.loop_slot().is_some();
                     });

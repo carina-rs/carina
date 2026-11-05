@@ -203,7 +203,7 @@ impl PlanTreeDependencies {
                 value.visit_resource_refs(&mut |path| {
                     referenced_bindings.insert(path.binding_address().clone());
                 });
-                value.visit_binding_refs(&mut |binding| {
+                value.visit_binding_refs(&mut |binding, _| {
                     referenced_bindings.insert(binding.clone());
                 });
             }

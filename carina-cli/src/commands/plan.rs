@@ -6550,6 +6550,7 @@ pub(crate) async fn load_and_resolve_provider_configs<E>(
 struct ProviderAttributeRequirement {
     provider: String,
     attribute: String,
+    diagnostic_path: Option<carina_core::resource::DiagnosticPath>,
 }
 
 #[derive(Clone, Debug)]
@@ -6584,7 +6585,16 @@ async fn load_provider_referenced_upstream_states<E>(
         .map_err(|error| AppError::ProviderReferencedUpstream {
             provider: required_by.provider,
             attribute: required_by.attribute,
-            error: Box::new(error),
+            error: Box::new(
+                if matches!(
+                    required_by.diagnostic_path,
+                    Some(carina_core::resource::DiagnosticPath::Protected)
+                ) {
+                    AppError::Config(carina_core::resource::INSIDE_SECRET_MESSAGE.into())
+                } else {
+                    error
+                },
+            ),
         })?;
         remote_bindings.extend(loaded);
     }
@@ -6611,15 +6621,41 @@ fn provider_referenced_upstream_states<E>(
             ProviderAttributeRequirement,
         )>,
     ) {
-        value.visit_resource_refs(&mut |path| {
+        let scoped_requirement =
+            |path: carina_core::resource::ReferencePath,
+             scope: carina_core::resource::DiagnosticScope| {
+                let mut requirement = required_by.clone();
+                requirement.diagnostic_path = Some(
+                    if matches!(
+                        requirement.diagnostic_path,
+                        Some(carina_core::resource::DiagnosticPath::Protected)
+                    ) {
+                        carina_core::resource::DiagnosticPath::Protected
+                    } else {
+                        scope.path(path)
+                    },
+                );
+                requirement
+            };
+        value.visit_resource_refs_with_scope(&mut |path, _, scope| {
             pending.push_back((
                 path.binding_address().clone(),
                 Some(path.attribute().to_string()),
-                required_by.clone(),
+                scoped_requirement(
+                    carina_core::resource::ReferencePath::Access(path.clone()),
+                    scope,
+                ),
             ));
         });
-        value.visit_binding_refs(&mut |binding| {
-            pending.push_back((binding.clone(), None, required_by.clone()));
+        value.visit_binding_refs(&mut |binding, scope| {
+            pending.push_back((
+                binding.clone(),
+                None,
+                scoped_requirement(
+                    carina_core::resource::ReferencePath::Binding(binding.clone()),
+                    scope,
+                ),
+            ));
         });
     }
 
@@ -6636,6 +6672,7 @@ fn provider_referenced_upstream_states<E>(
                 &ProviderAttributeRequirement {
                     provider: provider.name.clone(),
                     attribute: attribute.clone(),
+                    diagnostic_path: None,
                 },
                 &mut pending,
             );
@@ -6645,11 +6682,29 @@ fn provider_referenced_upstream_states<E>(
     let mut visited = HashSet::new();
     let mut referenced_upstreams = HashMap::new();
     while let Some((binding, attribute, required_by)) = pending.pop_front() {
-        if !visited.insert((binding.clone(), attribute.clone())) {
+        if !visited.insert((
+            binding.clone(),
+            attribute.clone(),
+            matches!(
+                required_by.diagnostic_path,
+                Some(carina_core::resource::DiagnosticPath::Protected)
+            ),
+        )) {
             continue;
         }
         if upstream_bindings.contains(&binding) {
-            referenced_upstreams.entry(binding).or_insert(required_by);
+            referenced_upstreams
+                .entry(binding)
+                .and_modify(|previous: &mut ProviderAttributeRequirement| {
+                    if matches!(
+                        required_by.diagnostic_path,
+                        Some(carina_core::resource::DiagnosticPath::Protected)
+                    ) {
+                        previous.diagnostic_path =
+                            Some(carina_core::resource::DiagnosticPath::Protected);
+                    }
+                })
+                .or_insert(required_by);
             continue;
         }
 
@@ -6934,6 +6989,44 @@ mod load_upstream_states_tests {
     use super::*;
     #[cfg(test)]
     use std::fs;
+
+    #[tokio::test]
+    async fn review2_f8_provider_upstream_inventory_masks_secret_reference_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+        parsed.upstream_states.push(UpstreamState {
+            binding: absolute_binding("private_upstream"),
+            source: PathBuf::from("private_source"),
+        });
+        parsed.providers.push(ProviderConfig {
+            name: "test".into(),
+            attributes: indexmap::IndexMap::from([(
+                "region".into(),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(root_resource_ref("private_upstream", "value")).into(),
+                )),
+            )]),
+            default_tags: Default::default(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: Default::default(),
+            binding: None,
+        });
+        let error = load_provider_referenced_upstream_states(
+            &crate::test_support::TestCommandRuntime::new(),
+            &parsed,
+            &ResolvedPath::new(dir.path()).unwrap(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            &mut HashSet::new(),
+            UpstreamMissingStatePolicy::Strict,
+        )
+        .await
+        .unwrap_err();
+        let rendered = format!("{error} {error:?}");
+        assert!(!rendered.contains("private_"), "{rendered}");
+        assert!(rendered.contains("region"), "{rendered}");
+    }
 
     fn write_state(dir: &Path, exports: &[(&str, serde_json::Value)]) {
         let mut state = StateFile::new();

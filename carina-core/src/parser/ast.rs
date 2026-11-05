@@ -1669,7 +1669,7 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
         self.iterable.visit_resource_refs(&mut |path| {
             candidates.insert(path.to_string());
         });
-        self.iterable.visit_binding_refs(&mut |binding| {
+        self.iterable.visit_binding_refs(&mut |binding, _| {
             candidates.insert(binding.to_string());
         });
         candidates

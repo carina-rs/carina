@@ -656,7 +656,7 @@ fn cascade_ref_hint(value: &Value, target_binding: &str) -> Option<String> {
         return hit;
     }
 
-    value.visit_binding_refs(&mut |binding| {
+    value.visit_binding_refs(&mut |binding, _| {
         if hit.is_none() && binding.as_str() == target_binding {
             hit = Some(binding.to_string());
         }

@@ -758,23 +758,27 @@ impl<S: Clone> ProviderCheckInputs<'_, S> {
     }
 }
 
-fn visit_unknowns(value: &Value, f: &mut impl FnMut(&ApplyTimeUnknown)) {
+fn visit_unknowns(
+    value: &Value,
+    scope: crate::resource::DiagnosticScope,
+    f: &mut impl FnMut(&ApplyTimeUnknown, crate::resource::DiagnosticScope),
+) {
     match value {
-        Value::Deferred(DeferredValue::Unknown(reason)) => f(reason),
+        Value::Deferred(DeferredValue::Unknown(reason)) => f(reason, scope),
         Value::Concrete(ConcreteValue::List(items)) => {
             for item in items {
-                visit_unknowns(item, f);
+                visit_unknowns(item, scope, f);
             }
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
             for item in map.values() {
-                visit_unknowns(item, f);
+                visit_unknowns(item, scope, f);
             }
         }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             for part in parts {
                 if let InterpolationPart::Expr(value) = part {
-                    visit_unknowns(value, f);
+                    visit_unknowns(value, scope, f);
                 }
             }
         }
@@ -784,26 +788,26 @@ fn visit_unknowns(value: &Value, f: &mut impl FnMut(&ApplyTimeUnknown)) {
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             for arg in args {
-                visit_unknowns(arg.walker_value(), f);
+                visit_unknowns(arg.walker_value(), scope, f);
             }
         }
-        Value::Deferred(DeferredValue::Access(access)) => visit_unknowns(access.base(), f),
+        Value::Deferred(DeferredValue::Access(access)) => visit_unknowns(access.base(), scope, f),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            inner.visit(|value| visit_unknowns(value, f))
+            inner.visit_reference_inventory(|value, scope| visit_unknowns(value, scope, f))
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            visit_unknowns(value, f);
-            visit_unknowns(default, f);
+            visit_unknowns(value, scope, f);
+            visit_unknowns(default, scope, f);
         }
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             deferred
                 .values()
                 .into_iter()
-                .for_each(|value| visit_unknowns(value, f));
+                .for_each(|value| visit_unknowns(value, scope, f));
         }
         Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            visit_unknowns(expression.lhs(), f);
-            visit_unknowns(expression.rhs(), f);
+            visit_unknowns(expression.lhs(), scope, f);
+            visit_unknowns(expression.rhs(), scope, f);
         }
         Value::Concrete(_)
         | Value::Deferred(DeferredValue::ResourceRef { .. })
@@ -824,18 +828,39 @@ pub fn unresolved_data_source_inputs<S, D>(
         .attributes
         .iter()
         .filter_map(|(attribute, value)| {
+            let mut diagnostic_scope = crate::resource::DiagnosticScope::Public;
             let mut paths = Vec::new();
             let mut bindings = Vec::new();
             let mut unknowns = Vec::new();
-            value.visit_resource_refs(&mut |path| paths.push(path.clone()));
-            value.visit_binding_refs(&mut |binding| bindings.push(binding.clone()));
-            visit_unknowns(value, &mut |reason| unknowns.push(reason.clone()));
+            value.visit_resource_refs_with_scope(&mut |path, _, scope| {
+                if scope.is_secret() {
+                    diagnostic_scope = scope;
+                }
+                paths.push(path.clone());
+            });
+            value.visit_binding_refs(&mut |binding, scope| {
+                if scope.is_secret() {
+                    diagnostic_scope = scope;
+                }
+                bindings.push(binding.clone());
+            });
+            visit_unknowns(
+                value,
+                crate::resource::DiagnosticScope::Public,
+                &mut |reason, scope| {
+                    if scope.is_secret() {
+                        diagnostic_scope = scope;
+                    }
+                    unknowns.push(reason.clone());
+                },
+            );
             (!paths.is_empty() || !bindings.is_empty() || !unknowns.is_empty()).then(|| {
                 UnresolvedDataSourceInput {
                     attribute: attribute.clone(),
                     paths,
                     bindings,
                     unknowns,
+                    diagnostic_scope,
                 }
             })
         })
@@ -914,6 +939,30 @@ impl<S> std::fmt::Debug for ExecutionCheckpointSink<S> {
     }
 }
 
+/// Public reporting context constructed from labels owned by the executor.
+#[derive(Debug, Clone)]
+pub enum PublicReportContext {
+    SecretAttribute { attribute: String },
+    ProviderDispatchAttribute { attribute: String },
+    Creating { resource: ResourceId },
+}
+
+impl std::fmt::Display for PublicReportContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::SecretAttribute { attribute } => format!(
+                "Attribute '{attribute}': {}",
+                crate::resource::INSIDE_SECRET_MESSAGE
+            ),
+            Self::ProviderDispatchAttribute { attribute } => {
+                format!("Attribute '{attribute}': provider dispatch failed")
+            }
+            Self::Creating { resource } => format!("Creating {resource}"),
+        };
+        crate::provider_text::ProviderText::new(message).fmt(f)
+    }
+}
+
 /// Cloneable ownership wrapper for a typed execution error.
 #[derive(Clone)]
 pub struct ReportedError {
@@ -941,8 +990,15 @@ impl ReportedError {
     }
 
     pub fn with_context(self, context: impl Into<String>) -> Self {
-        Self::new(ContextError {
+        Self::new(UntrustedContextError {
             context: crate::provider_text::ProviderText::new(context),
+            source: self,
+        })
+    }
+
+    pub fn with_public_context(self, context: PublicReportContext) -> Self {
+        Self::new(ContextError {
+            context,
             source: self,
         })
     }
@@ -959,7 +1015,10 @@ impl crate::resource::InsideSecret for ReportedError {
                 .source
                 .clone()
                 .inside_secret()
-                .with_context(error.context.to_string());
+                .with_public_context(error.context.clone());
+        }
+        if let Some(error) = self.as_error().downcast_ref::<UntrustedContextError>() {
+            return error.source.clone().inside_secret();
         }
         // Preserve typed, safe context through reporting wrappers. Each source
         // error owns its protection policy, including public upstream reasons.
@@ -1020,17 +1079,35 @@ impl std::error::Error for MessageError {}
 
 #[derive(Debug)]
 struct ContextError {
-    context: crate::provider_text::ProviderText,
+    context: PublicReportContext,
     source: ReportedError,
 }
 
 impl std::fmt::Display for ContextError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.context)
+        self.context.fmt(formatter)
     }
 }
 
 impl std::error::Error for ContextError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_error())
+    }
+}
+
+/// Arbitrary context remains useful outside secrets; it has no public-label
+/// authority and is discarded when the cause crosses a secret boundary.
+#[derive(Debug)]
+struct UntrustedContextError {
+    context: crate::provider_text::ProviderText,
+    source: ReportedError,
+}
+impl std::fmt::Display for UntrustedContextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.context.fmt(f)
+    }
+}
+impl std::error::Error for UntrustedContextError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.source.as_error())
     }

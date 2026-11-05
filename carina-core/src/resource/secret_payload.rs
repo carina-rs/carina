@@ -45,20 +45,23 @@ pub struct SecretPayload<P: ValueKind, B: BindingAddress> {
 
 impl<P: ValueKind, B: BindingAddress> From<Box<Value<P, B>>> for SecretPayload<P, B> {
     fn from(value: Box<Value<P, B>>) -> Self {
-        Self { value }
+        match *value {
+            Value::Deferred(super::DeferredValue::Secret(payload)) => payload,
+            value => Self {
+                value: Box::new(value),
+            },
+        }
     }
 }
 
 impl<P: ValueKind, B: BindingAddress> SecretPayload<P, B> {
-    /// Transform one layer, protecting errors and preserving the wrapper depth.
+    /// Transform the inner value, protecting errors and collapsing repeated wrappers.
     pub fn try_map<Q: ValueKind, C: BindingAddress, E: InsideSecret>(
         &self,
         map: impl FnOnce(&Value<P, B>) -> Result<Value<Q, C>, E>,
     ) -> Result<SecretPayload<Q, C>, E> {
         map(&self.value)
-            .map(|value| SecretPayload {
-                value: Box::new(value),
-            })
+            .map(|value| Box::new(value).into())
             .map_err(InsideSecret::inside_secret)
     }
 
@@ -139,7 +142,27 @@ mod tests {
     use super::*;
     use crate::resource::{AbsoluteBindingAddress, ConcreteValue, DeferredValue, NoPlaceholder};
     #[test]
-    fn secret_origin_4275_payload_protects_errors_and_preserves_depth() {
+    fn review2_f2_payload_collapses_constructor_and_mapping_secrets_with_main_hash_bytes() {
+        let value: Value = Value::Concrete(ConcreteValue::String("t".into()));
+        let payload: SecretPayload<NoPlaceholder, AbsoluteBindingAddress> =
+            Box::new(value.clone()).into();
+        let wrapped = Value::Deferred(DeferredValue::Secret(payload.clone()));
+        let constructed: SecretPayload<NoPlaceholder, AbsoluteBindingAddress> =
+            Box::new(wrapped.clone()).into();
+        assert_eq!(constructed.expose_plaintext(), &value);
+        let mapped = payload
+            .try_map(|_| Ok::<_, std::convert::Infallible>(wrapped))
+            .unwrap();
+        assert_eq!(mapped.expose_plaintext(), &value);
+        // origin/main hashes the canonical JSON string, without wrapper tags.
+        let hash = payload.hash(None).unwrap();
+        assert!(hash.verify(br#""t""#));
+        assert!(constructed.verify_hash(&hash).unwrap());
+        assert_eq!(mapped.hash(Some(&hash)).unwrap(), hash);
+    }
+
+    #[test]
+    fn secret_origin_4275_payload_protects_errors_and_normalizes_depth() {
         let value: Value = Value::Concrete(ConcreteValue::String("private-payload".into()));
         let inner = Value::Deferred(DeferredValue::Secret(Box::new(value).into()));
         let payload: SecretPayload<NoPlaceholder, AbsoluteBindingAddress> = Box::new(inner).into();
@@ -154,14 +177,14 @@ mod tests {
             .unwrap();
         assert!(matches!(
             mapped.expose_plaintext(),
-            Value::Deferred(DeferredValue::Secret(_))
+            Value::Concrete(ConcreteValue::String(_))
         ));
         payload.visit_reference_inventory(|_, scope| assert_eq!(scope, DiagnosticScope::Secret));
         let error = payload
             .try_inspect(|value| Err::<(), _>(format!("{value:?} private-error")))
             .unwrap_err();
         assert_eq!(error, crate::resource::INSIDE_SECRET_MESSAGE);
-        assert!(payload.visit(|value| matches!(value, Value::Deferred(DeferredValue::Secret(_)))));
+        assert!(payload.visit(|value| matches!(value, Value::Concrete(ConcreteValue::String(_)))));
         assert_eq!(payload.try_inspect(|_| Ok::<_, String>(42)).unwrap(), 42);
     }
 }

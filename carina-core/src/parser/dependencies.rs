@@ -237,7 +237,7 @@ impl UnexpandedDependencies<RelativeBindingName> {
         use crate::resource::{PathSegment, Subscript, binding_address};
         let mut bindings = std::collections::HashSet::new();
         for value in attributes.values() {
-            value.visit_binding_refs(&mut |binding| {
+            value.visit_binding_refs(&mut |binding, _| {
                 bindings.insert(binding.clone());
             });
         }
