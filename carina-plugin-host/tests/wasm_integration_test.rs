@@ -371,9 +371,9 @@ fn migrate_legacy_state_attribute(
 }
 
 fn redacted_secret_and_legacy_marker(plaintext: &str) -> (SnapshotValue, String) {
-    let secret: Value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String(plaintext.into()),
-    ))));
+    let secret: Value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(plaintext.into()))).into(),
+    ));
     let persisted = PersistedValue::encode_provider_value(&secret, None)
         .expect("test secret must be persistable");
     let encoded = persisted.as_json();
@@ -5512,7 +5512,9 @@ async fn wasm_normalize_desired_edits_known_leaves_in_mixed_containers() {
         .await
         .unwrap();
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(string("private-leaf"))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(string("private-leaf")).into(),
+    ));
     let reference = root_resource_ref("peer", "identifier");
     let resource = Resource::with_provider("mock", "test.normalize_leaf", "mixed", None)
         .with_attribute("domain_name", string("example.com"))
@@ -5560,7 +5562,7 @@ async fn wasm_normalize_desired_edits_known_leaves_in_mixed_containers() {
     );
     assert_eq!(names[0], string("www.example.com"));
     assert!(
-        matches!(&names[1], Value::Deferred(DeferredValue::Secret(inner)) if inner.as_ref() == &string("private-leaf"))
+        matches!(&names[1], Value::Deferred(DeferredValue::Secret(inner)) if inner.expose_plaintext() == &string("private-leaf"))
     );
     assert!(matches!(
         &names[2],
@@ -5644,9 +5646,12 @@ async fn http_wasm_normalize_desired_preserves_leaf_handles() {
         .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .unwrap();
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("http-private".into()),
-    ))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "http-private".into(),
+        )))
+        .into(),
+    ));
     let reference = root_resource_ref("peer", "identifier");
     let resource = Resource::with_provider("mock_http", "test.resource", "http-leaves", None)
         .with_attribute("secret", secret.clone())
@@ -5668,7 +5673,7 @@ async fn http_wasm_normalize_desired_preserves_leaf_handles() {
         panic!()
     };
     assert_eq!(
-        inner.as_ref(),
+        inner.expose_plaintext(),
         &Value::Concrete(ConcreteValue::String("http-private".into()))
     );
     let Some(Value::Concrete(ConcreteValue::List(items))) = resources[0].get_attr("items") else {
@@ -6075,9 +6080,12 @@ async fn test_wasm_hydrate_read_state_round_trips_structural_redacted_secret() {
         .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
-    let secret: Value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("wasm-wire-secret".into()),
-    ))));
+    let secret: Value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "wasm-wire-secret".into(),
+        )))
+        .into(),
+    ));
     let persisted = PersistedValue::encode_provider_value(&secret, None)
         .expect("serialize test secret")
         .as_json()
@@ -6251,9 +6259,9 @@ async fn test_wasm_hydrate_read_state_write_only_legacy_secret_plans_no_change()
 
     let desired = Resource::from_id(id.clone()).with_attribute(
         "__mock_write_only_secret__",
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String(plaintext.into()),
-        )))),
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(plaintext.into()))).into(),
+        )),
     );
     let diff = carina_core::differ::diff_for_test(
         &ResolvedResource::new(desired.into_value_snapshot()),
@@ -6720,9 +6728,12 @@ async fn test_wasm_normalize_desired_preserves_secret() {
         .await
         .expect("normalizer should initialize");
 
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("normalize-secret-plaintext".into()),
-    ))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "normalize-secret-plaintext".into(),
+        )))
+        .into(),
+    ));
     let mut resource = Resource::with_provider("mock", "test.resource", "secret-normalize", None);
     resource
         .attributes

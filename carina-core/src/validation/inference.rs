@@ -367,7 +367,15 @@ fn infer_projected_type_with_visiting<P: PlaceholderKind, B: BindingAddress>(
         Value::Concrete(ConcreteValue::Duration(_)) => Ok(TypeExpr::Duration),
         Value::Deferred(DeferredValue::Interpolation(_)) => Ok(TypeExpr::String),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            infer_projected_type_with_visiting(inner, bindings, context, visiting)
+            let mut result = None;
+            inner.visit(|secret_value, scope| {
+                let _ = scope;
+                result = Some(
+                    (infer_projected_type_with_visiting(secret_value, bindings, context, visiting))
+                        .map_err(|error| scope.protect_error(error)),
+                );
+            });
+            result.expect("secret visit")
         }
 
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -1836,9 +1844,9 @@ mod tests {
     #[test]
     fn secret_inferred_as_string() {
         let r = infer_projected_type(
-            &Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("hidden".into()),
-            )))),
+            &Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("hidden".into()))).into(),
+            )),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),

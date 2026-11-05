@@ -598,7 +598,9 @@ impl RootConfigSignature {
             }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 // Mirror deps::collect_dependencies for secret-wrapped values.
-                Self::collect_typed_dependencies(from, attr_key, inner, graph, binding_types);
+                inner.visit(|value, _scope| {
+                    Self::collect_typed_dependencies(from, attr_key, value, graph, binding_types)
+                });
             }
             Value::Deferred(DeferredValue::Unknown(_)) => {
                 // Unknown is upstream-deferred and carries no resource-binding edge.
@@ -1220,14 +1222,16 @@ impl ModuleSignature {
             }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 // Mirror deps::collect_dependencies for secret-wrapped values.
-                Self::collect_typed_dependencies(
-                    from,
-                    attr_key,
-                    inner,
-                    graph,
-                    binding_types,
-                    argument_types,
-                );
+                inner.visit(|value, _scope| {
+                    Self::collect_typed_dependencies(
+                        from,
+                        attr_key,
+                        value,
+                        graph,
+                        binding_types,
+                        argument_types,
+                    )
+                });
             }
             Value::Deferred(DeferredValue::Placeholder(
                 crate::resource::ParserPlaceholder::ModuleArgument { name, .. },

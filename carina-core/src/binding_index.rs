@@ -5233,9 +5233,9 @@ mod resolved_bindings_tests {
         let plaintext = Value::Concrete(ConcreteValue::String("sensitive".into()));
         let resource_attrs = HashMap::from([(
             "comment".to_string(),
-            Value::Deferred(crate::resource::DeferredValue::Secret(Box::new(
-                plaintext.clone(),
-            ))),
+            Value::Deferred(crate::resource::DeferredValue::Secret(
+                Box::new(plaintext.clone()).into(),
+            )),
         )]);
         let state = State {
             id: ResourceId::with_identity("test.resource", "secret"),
@@ -5258,8 +5258,10 @@ mod resolved_bindings_tests {
                 .get("secret")
                 .and_then(|attrs| attrs.get("comment")),
             Some(
-                &(Value::Deferred(crate::resource::DeferredValue::Secret(Box::new(plaintext))))
-                    .to_snapshot()
+                &(Value::Deferred(crate::resource::DeferredValue::Secret(
+                    Box::new(plaintext).into()
+                )))
+                .to_snapshot()
             )
         );
     }

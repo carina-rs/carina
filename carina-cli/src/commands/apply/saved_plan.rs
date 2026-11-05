@@ -1949,7 +1949,7 @@ mod tests {
             data_source.id.clone(),
             HashMap::from([(
                 "token".to_string(),
-                Value::Deferred(DeferredValue::Secret(Box::new(plaintext.clone()))),
+                Value::Deferred(DeferredValue::Secret(Box::new(plaintext.clone()).into())),
             )]),
         );
         let redacted = carina_core::value::redact_secrets_in_state(&state_with_secret)

@@ -383,11 +383,9 @@ mod tests {
     fn collect_dependencies_recurses_into_secret_inner_value() {
         // `Deferred(Secret(_))` is reachable after resolution wraps a value
         // (for example in parser/resolve.rs), so pin this walker arm directly.
-        let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::root_resource_ref(
-            "role",
-            "arn",
-            vec![],
-        ))));
+        let value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::root_resource_ref("role", "arn", vec![])).into(),
+        ));
         let mut deps = HashSet::new();
 
         collect_dependencies(&value, &mut deps);

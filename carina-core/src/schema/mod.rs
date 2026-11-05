@@ -199,6 +199,7 @@ pub use compiled_pattern::{
 };
 
 use crate::provider_text::{ProviderString, ProviderText};
+use crate::resource::InsideSecret;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -556,16 +557,19 @@ fn walk_custom_lookup_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
     // boundary must discard every user-derived value/message.
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
         let mut secret_errors = Vec::new();
-        walk_custom_lookup_on_path(
-            attr_type,
-            inner,
-            attr_name,
-            lookup,
-            defs,
-            &mut secret_errors,
-            visited_refs,
-        );
-        errors.extend(secret_errors.into_iter().map(TypeError::masked_for_secret));
+        inner.visit(|value, scope| {
+            walk_custom_lookup_on_path(
+                attr_type,
+                value,
+                attr_name,
+                lookup,
+                defs,
+                &mut secret_errors,
+                visited_refs,
+            );
+            secret_errors = scope.protect_error(std::mem::take(&mut secret_errors));
+        });
+        errors.extend(secret_errors);
         return;
     }
     if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
@@ -2385,19 +2389,21 @@ impl Schema {
     ) {
         if let Value::Deferred(DeferredValue::Secret(inner)) = value {
             let mut secret_errors = Vec::new();
-            Self::collect_attr_into_on_path(
-                attr,
-                defs,
-                path,
-                inner,
-                ancestry.inside_secret(),
-                &mut secret_errors,
-                visited_refs,
-            );
+            inner.visit(|value, _scope| {
+                Self::collect_attr_into_on_path(
+                    attr,
+                    defs,
+                    path,
+                    value,
+                    ancestry.inside_secret(),
+                    &mut secret_errors,
+                    visited_refs,
+                )
+            });
             out.extend(
                 secret_errors
                     .into_iter()
-                    .map(|(path, error)| (path, error.masked_for_secret())),
+                    .map(|(path, error)| (path, error.inside_secret())),
             );
             return;
         }
@@ -2758,14 +2764,21 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>
     visited_refs: &mut Vec<&'a str>,
 ) -> Result<(), TypeError> {
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        return validation_error_with_defs_on_path(
-            attr,
-            inner,
-            defs,
-            ancestry.inside_secret(),
-            visited_refs,
-        )
-        .map_err(TypeError::masked_for_secret);
+        return {
+            let mut result = None;
+            inner.visit(|secret_value, scope| {
+                let _ = scope;
+                result = Some(validation_error_with_defs_on_path(
+                    attr,
+                    secret_value,
+                    defs,
+                    ancestry.inside_secret(),
+                    visited_refs,
+                ));
+            });
+            result.expect("secret visit")
+        }
+        .map_err(TypeError::inside_secret);
     }
     if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
         validate_attr_with_defs_and_ancestry(attr, value, defs, ancestry)?;
@@ -3130,19 +3143,6 @@ impl FieldPath {
         steps.push(FieldPathStep::Index(index));
         steps.extend(self.steps.iter().cloned());
         Self { steps }
-    }
-
-    fn masked_for_secret(self) -> Self {
-        Self {
-            steps: self
-                .steps
-                .into_iter()
-                .map(|step| match step {
-                    FieldPathStep::Field(_) => FieldPathStep::Field(SECRET_VALUE_MASK.to_string()),
-                    FieldPathStep::Index(index) => FieldPathStep::Index(index),
-                })
-                .collect(),
-        }
     }
 }
 
@@ -4053,9 +4053,15 @@ impl PatternAttributeType<Compiled> {
         value: &Value<P, B>,
     ) -> Result<(), TypeError> {
         if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-            return self
-                .validate_leaf_value(inner)
-                .map_err(TypeError::masked_for_secret);
+            return {
+                let mut result = None;
+                inner.visit(|secret_value, scope| {
+                    let _ = scope;
+                    result = Some(self.validate_leaf_value(secret_value));
+                });
+                result.expect("secret visit")
+            }
+            .map_err(TypeError::inside_secret);
         }
         if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
             self.validate_leaf_value(value)?;
@@ -5707,14 +5713,18 @@ fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: Binding
         | AT::Ref(_) => {}
     }
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        let inner = inspect_value_structure_on_path(
-            attr,
-            inner,
-            defs,
-            ancestry.inside_secret(),
-            purpose,
-            visited_refs,
-        )?;
+        let mut fit = None;
+        inner.visit(|value, _scope| {
+            fit = inspect_value_structure_on_path(
+                attr,
+                value,
+                defs,
+                ancestry.inside_secret(),
+                purpose,
+                visited_refs,
+            )
+        });
+        let inner = fit?;
         let exactness = inner.exactness;
         return Some(Fit::with_kind(
             exactness,
@@ -7926,155 +7936,6 @@ impl TypeError {
             | TypeError::UnknownStructField { .. }
             | TypeError::UnionStructMismatch { .. } => None,
             TypeError::CustomTypeValidation { attribute, .. } => attribute.as_deref(),
-        }
-    }
-
-    /// Remove user-authored data from an error produced while validating the
-    /// contents of a [`DeferredValue::Secret`]. Structured schema context is
-    /// retained, while free-form validator messages are replaced wholesale
-    /// because providers and custom validators may echo the plaintext.
-    #[must_use]
-    pub(crate) fn masked_for_secret(self) -> Self {
-        const MASKED_MESSAGE: &str = "(secret) failed validation";
-
-        match self {
-            TypeError::InvalidEnumVariant {
-                value_kind,
-                attribute,
-                type_name,
-                expected,
-                ..
-            } => TypeError::InvalidEnumVariant {
-                value: DiagnosticValue::Masked,
-                value_kind,
-                attribute,
-                type_name,
-                expected,
-            },
-            TypeError::PatternMismatch {
-                pattern,
-                attribute,
-                type_name,
-                ..
-            } => TypeError::PatternMismatch {
-                value: DiagnosticValue::Masked,
-                pattern,
-                attribute,
-                type_name,
-            },
-            TypeError::LengthOutOfRange {
-                length,
-                min,
-                max,
-                attribute,
-                type_name,
-                ..
-            } => TypeError::LengthOutOfRange {
-                value: DiagnosticValue::Masked,
-                length,
-                min,
-                max,
-                attribute,
-                type_name,
-            },
-            TypeError::DuplicateListElement {
-                index,
-                first_index,
-                attribute,
-                value: _,
-            } => TypeError::DuplicateListElement {
-                value: DiagnosticValue::Masked,
-                index,
-                first_index,
-                attribute,
-            },
-            TypeError::StringLiteralExpectedEnum {
-                attribute,
-                type_name,
-                expected,
-                extra_message,
-                ..
-            } => TypeError::StringLiteralExpectedEnum {
-                user_typed: DiagnosticValue::Masked,
-                attribute,
-                type_name,
-                expected,
-                extra_message: extra_message.map(|_| MASKED_MESSAGE.into()),
-            },
-            TypeError::ValidationFailed { .. } => TypeError::ValidationFailed {
-                message: MASKED_MESSAGE.into(),
-            },
-            TypeError::CustomTypeValidation { error, attribute } => {
-                TypeError::CustomTypeValidation {
-                    error: Box::new((*error).masked_for_secret()),
-                    attribute,
-                }
-            }
-            TypeError::ResourceValidationFailed { attribute, .. } => {
-                TypeError::ResourceValidationFailed {
-                    message: MASKED_MESSAGE.into(),
-                    attribute,
-                }
-            }
-            TypeError::UnknownAttribute { .. } => TypeError::UnknownAttribute {
-                name: SECRET_VALUE_MASK.to_string(),
-                suggestion: None,
-            },
-            TypeError::UnknownStructField { struct_name, .. } => TypeError::UnknownStructField {
-                struct_name,
-                field: SECRET_VALUE_MASK.to_string(),
-                suggestion: None,
-            },
-            TypeError::UnionStructMismatch {
-                reason,
-                alternatives,
-                ..
-            } => TypeError::UnionStructMismatch {
-                reason: match reason {
-                    UnionStructMismatchReason::ConflictingAlternatives => {
-                        UnionStructMismatchReason::ConflictingAlternatives
-                    }
-                    UnionStructMismatchReason::NoAlternativeSatisfied { .. } => {
-                        UnionStructMismatchReason::NoAlternativeSatisfied {
-                            unrecognized_fields: vec![SECRET_VALUE_MASK.to_string()],
-                        }
-                    }
-                },
-                supplied_fields: Vec::new(),
-                alternatives,
-            },
-            TypeError::UnionAlternativesMismatch { failures } => {
-                let (first, rest) = failures.into_parts();
-                TypeError::from_union_arm_errors(
-                    first.masked_for_secret(),
-                    rest.into_iter().map(TypeError::masked_for_secret),
-                )
-            }
-            TypeError::ListItemError { index, inner } => TypeError::ListItemError {
-                index,
-                inner: Box::new(inner.masked_for_secret()),
-            },
-            TypeError::MapKeyError { inner, .. } => TypeError::MapKeyError {
-                key: SECRET_VALUE_MASK.to_string(),
-                inner: Box::new(inner.masked_for_secret()),
-            },
-            TypeError::MapValueError { inner, .. } => TypeError::MapValueError {
-                key: SECRET_VALUE_MASK.to_string(),
-                inner: Box::new(inner.masked_for_secret()),
-            },
-            TypeError::StructFieldError { inner, .. } => TypeError::StructFieldError {
-                field: SECRET_VALUE_MASK.to_string(),
-                inner: Box::new(inner.masked_for_secret()),
-            },
-            TypeError::FieldGroupViolation { path, group } => TypeError::FieldGroupViolation {
-                path: path.masked_for_secret(),
-                group,
-            },
-            TypeError::TypeMismatch { .. }
-            | TypeError::BindingShadowsEnumMember(_)
-            | TypeError::MissingRequired { .. }
-            | TypeError::ReadOnlyAttribute { .. }
-            | TypeError::BlockSyntaxNotAllowed { .. } => self,
         }
     }
 
@@ -11868,7 +11729,9 @@ fn project_write_only_leaves<'schema, R: PatternForm, P: crate::resource::ValueK
     leaves: &mut Vec<(LeafPath, Value<P>, &'schema PatternAttributeType<R>)>,
 ) {
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        project_write_only_leaves(attr_type, inner, defs, path, ref_chain, true, leaves);
+        inner.visit(|value, _scope| {
+            project_write_only_leaves(attr_type, value, defs, path, ref_chain, true, leaves)
+        });
         return;
     }
 
@@ -11944,7 +11807,7 @@ fn project_write_only_leaves<'schema, R: PatternForm, P: crate::resource::ValueK
                     let projected = if inherited_secret
                         && !matches!(field_value, Value::Deferred(DeferredValue::Secret(_)))
                     {
-                        Value::Deferred(DeferredValue::Secret(Box::new(field_value.clone())))
+                        Value::Deferred(DeferredValue::Secret(Box::new(field_value.clone()).into()))
                     } else {
                         field_value.clone()
                     };
@@ -11987,9 +11850,15 @@ fn strip_write_only_leaves_from_value<'schema, P: crate::resource::ValueKind>(
     ref_chain: &mut Vec<&'schema str>,
 ) -> Value<P> {
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        return Value::Deferred(DeferredValue::Secret(Box::new(
-            strip_write_only_leaves_from_value(attr_type, inner, defs, ref_chain),
-        )));
+        return Value::Deferred(DeferredValue::Secret(
+            inner
+                .try_map(|value| {
+                    Ok::<_, std::convert::Infallible>(strip_write_only_leaves_from_value(
+                        attr_type, value, defs, ref_chain,
+                    ))
+                })
+                .unwrap(),
+        ));
     }
 
     match &attr_type.kind {
@@ -12098,22 +11967,51 @@ pub const WAIT_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// for `aws_acm_certificate_validation`.
 pub const WAIT_DEFAULT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-fn reveal_secret_value_for_validation(value: &Value) -> Value {
+fn check_secret_validation_value<E: InsideSecret>(
+    value: &Value,
+    check: &mut dyn FnMut(&Value) -> Result<(), E>,
+) -> Result<(), E> {
     match value {
-        Value::Deferred(DeferredValue::Secret(inner)) => reveal_secret_value_for_validation(inner),
-        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
-            items
-                .iter()
-                .map(reveal_secret_value_for_validation)
-                .collect(),
-        )),
-        Value::Concrete(ConcreteValue::Map(map)) => Value::Concrete(ConcreteValue::Map(
-            map.iter()
-                .map(|(key, value)| (key.clone(), reveal_secret_value_for_validation(value)))
-                .collect(),
-        )),
-        other => other.clone(),
+        Value::Deferred(DeferredValue::Secret(payload)) => payload
+            .try_map(|value| {
+                check_secret_validation_value(value, check)?;
+                Ok(value.clone())
+            })
+            .map(|_| ()),
+        Value::Concrete(ConcreteValue::List(items)) => {
+            check_secret_validation_items(items, &mut |items| {
+                check(&Value::Concrete(ConcreteValue::List(items.to_vec())))
+            })
+        }
+        Value::Concrete(ConcreteValue::Map(entries)) => {
+            let items: Vec<_> = entries.values().cloned().collect();
+            check_secret_validation_items(&items, &mut |items| {
+                let entries = entries.keys().cloned().zip(items.iter().cloned()).collect();
+                check(&Value::Concrete(ConcreteValue::Map(entries)))
+            })
+        }
+        other => check(other),
     }
+}
+
+fn check_secret_validation_items<E: InsideSecret>(
+    items: &[Value],
+    check: &mut dyn FnMut(&[Value]) -> Result<(), E>,
+) -> Result<(), E> {
+    let Some(index) = items.iter().position(crate::value::contains_secret) else {
+        return check(items);
+    };
+    let (prefix, remaining) = items.split_at(index);
+    let (first, rest) = remaining.split_first().expect("secret item");
+    check_secret_validation_value(first, &mut |first| {
+        check_secret_validation_items(rest, &mut |rest| {
+            let mut values = Vec::with_capacity(prefix.len() + rest.len() + 1);
+            values.extend_from_slice(prefix);
+            values.push(first.clone());
+            values.extend_from_slice(rest);
+            check(&values)
+        })
+    })
 }
 
 fn run_resource_validator(
@@ -12121,15 +12019,22 @@ fn run_resource_validator(
     attributes: &HashMap<String, Value>,
 ) -> Result<(), Vec<TypeError>> {
     if attributes.values().any(crate::value::contains_secret) {
-        let revealed = attributes
-            .iter()
-            .map(|(name, value)| (name.clone(), reveal_secret_value_for_validation(value)))
-            .collect();
-        validator(&revealed).map_err(|errors| {
-            errors
-                .into_iter()
-                .map(TypeError::masked_for_secret)
-                .collect()
+        let input = Value::Concrete(ConcreteValue::Map(
+            attributes
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        ));
+        check_secret_validation_value(&input, &mut |value| {
+            let Value::Concrete(ConcreteValue::Map(entries)) = value else {
+                unreachable!("resource attributes are a map")
+            };
+            validator(
+                &entries
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+            )
         })
     } else {
         validator(attributes)
@@ -15652,4 +15557,165 @@ pub(crate) fn assignment_catalog_without_edges_for_test()
             )
         });
     &CATALOG
+}
+
+impl crate::resource::InsideSecret for FieldPath {
+    fn inside_secret(self) -> Self {
+        Self {
+            steps: self
+                .steps
+                .into_iter()
+                .map(|step| match step {
+                    FieldPathStep::Field(_) => FieldPathStep::Field(SECRET_VALUE_MASK.to_string()),
+                    FieldPathStep::Index(index) => FieldPathStep::Index(index),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl crate::resource::InsideSecret for TypeError {
+    fn inside_secret(self) -> Self {
+        const MASKED_MESSAGE: &str = "(secret) failed validation";
+
+        match self {
+            TypeError::InvalidEnumVariant {
+                value_kind,
+                attribute,
+                type_name,
+                expected,
+                ..
+            } => TypeError::InvalidEnumVariant {
+                value: DiagnosticValue::Masked,
+                value_kind,
+                attribute,
+                type_name,
+                expected,
+            },
+            TypeError::PatternMismatch {
+                pattern,
+                attribute,
+                type_name,
+                ..
+            } => TypeError::PatternMismatch {
+                value: DiagnosticValue::Masked,
+                pattern,
+                attribute,
+                type_name,
+            },
+            TypeError::LengthOutOfRange {
+                length,
+                min,
+                max,
+                attribute,
+                type_name,
+                ..
+            } => TypeError::LengthOutOfRange {
+                value: DiagnosticValue::Masked,
+                length,
+                min,
+                max,
+                attribute,
+                type_name,
+            },
+            TypeError::DuplicateListElement {
+                index,
+                first_index,
+                attribute,
+                value: _,
+            } => TypeError::DuplicateListElement {
+                value: DiagnosticValue::Masked,
+                index,
+                first_index,
+                attribute,
+            },
+            TypeError::StringLiteralExpectedEnum {
+                attribute,
+                type_name,
+                expected,
+                extra_message,
+                ..
+            } => TypeError::StringLiteralExpectedEnum {
+                user_typed: DiagnosticValue::Masked,
+                attribute,
+                type_name,
+                expected,
+                extra_message: extra_message.map(|_| MASKED_MESSAGE.into()),
+            },
+            TypeError::ValidationFailed { .. } => TypeError::ValidationFailed {
+                message: MASKED_MESSAGE.into(),
+            },
+            TypeError::CustomTypeValidation { error, attribute } => {
+                TypeError::CustomTypeValidation {
+                    error: Box::new((*error).inside_secret()),
+                    attribute,
+                }
+            }
+            TypeError::ResourceValidationFailed { attribute, .. } => {
+                TypeError::ResourceValidationFailed {
+                    message: MASKED_MESSAGE.into(),
+                    attribute,
+                }
+            }
+            TypeError::UnknownAttribute { .. } => TypeError::UnknownAttribute {
+                name: SECRET_VALUE_MASK.to_string(),
+                suggestion: None,
+            },
+            TypeError::UnknownStructField { struct_name, .. } => TypeError::UnknownStructField {
+                struct_name,
+                field: SECRET_VALUE_MASK.to_string(),
+                suggestion: None,
+            },
+            TypeError::UnionStructMismatch {
+                reason,
+                alternatives,
+                ..
+            } => TypeError::UnionStructMismatch {
+                reason: match reason {
+                    UnionStructMismatchReason::ConflictingAlternatives => {
+                        UnionStructMismatchReason::ConflictingAlternatives
+                    }
+                    UnionStructMismatchReason::NoAlternativeSatisfied { .. } => {
+                        UnionStructMismatchReason::NoAlternativeSatisfied {
+                            unrecognized_fields: vec![SECRET_VALUE_MASK.to_string()],
+                        }
+                    }
+                },
+                supplied_fields: Vec::new(),
+                alternatives,
+            },
+            TypeError::UnionAlternativesMismatch { failures } => {
+                let (first, rest) = failures.into_parts();
+                TypeError::from_union_arm_errors(
+                    first.inside_secret(),
+                    rest.into_iter().map(TypeError::inside_secret),
+                )
+            }
+            TypeError::ListItemError { index, inner } => TypeError::ListItemError {
+                index,
+                inner: Box::new((*inner).inside_secret()),
+            },
+            TypeError::MapKeyError { inner, .. } => TypeError::MapKeyError {
+                key: SECRET_VALUE_MASK.to_string(),
+                inner: Box::new((*inner).inside_secret()),
+            },
+            TypeError::MapValueError { inner, .. } => TypeError::MapValueError {
+                key: SECRET_VALUE_MASK.to_string(),
+                inner: Box::new((*inner).inside_secret()),
+            },
+            TypeError::StructFieldError { inner, .. } => TypeError::StructFieldError {
+                field: SECRET_VALUE_MASK.to_string(),
+                inner: Box::new((*inner).inside_secret()),
+            },
+            TypeError::FieldGroupViolation { path, group } => TypeError::FieldGroupViolation {
+                path: path.inside_secret(),
+                group,
+            },
+            TypeError::TypeMismatch { .. }
+            | TypeError::BindingShadowsEnumMember(_)
+            | TypeError::MissingRequired { .. }
+            | TypeError::ReadOnlyAttribute { .. }
+            | TypeError::BlockSyntaxNotAllowed { .. } => self,
+        }
+    }
 }

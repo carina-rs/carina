@@ -8,6 +8,7 @@ use super::entry::BindingSeed;
 use super::error::{ParseError, undefined_identifier_error};
 use super::static_eval::is_static_value;
 use super::{ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value};
+use crate::resource::DiagnosticScope;
 use crate::resource::{
     AbsoluteBindingAddress, AccessMissPolicy, BindingAddress, ConcreteValue,
     ConcreteValue as GenericConcreteValue, DeferredValue, DiagnosticSourceLine, InterpolationPart,
@@ -440,9 +441,12 @@ mod saved_provider_config_secret_tests {
     use crate::resource::DeferredValue as GenericDeferredValue;
 
     fn secret(value: &str) -> RuntimeValue {
-        GenericValue::Deferred(GenericDeferredValue::Secret(Box::new(
-            GenericValue::Concrete(GenericConcreteValue::String(value.into())),
-        )))
+        GenericValue::Deferred(GenericDeferredValue::Secret(
+            Box::new(GenericValue::Concrete(GenericConcreteValue::String(
+                value.into(),
+            )))
+            .into(),
+        ))
     }
 
     fn provider(token: &str) -> RuntimeProviderConfig {
@@ -1440,7 +1444,9 @@ fn collect_reference_roots(
             }
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            collect_reference_roots(inner, variables, structural, roots);
+            inner.visit(|value, _scope| {
+                collect_reference_roots(value, variables, structural, roots)
+            });
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             collect_reference_roots(value, variables, structural, roots);
@@ -1623,6 +1629,7 @@ fn resolve_value_with_config<B: ProviderAttributeBindingPhase>(
         session,
         defer_unknown_functions,
         preserve_failed_user_calls,
+        DiagnosticScope::Public,
     )
 }
 
@@ -1633,6 +1640,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     defer_unknown_functions: bool,
     preserve_failed_user_calls: bool,
+    scope: DiagnosticScope,
 ) -> Result<GenericValue<ParserPlaceholder, B>, ParseError> {
     match value {
         GenericValue::Deferred(DeferredValue::ModuleIf(deferred)) => {
@@ -1644,6 +1652,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                     session,
                     defer_unknown_functions,
                     preserve_failed_user_calls,
+                    scope,
                 )
             })?;
             Ok(GenericValue::Deferred(DeferredValue::ModuleIf(Box::new(
@@ -1661,6 +1670,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                 session,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
+                scope,
             )?;
             if matches!(left, GenericValue::Concrete(_)) {
                 Ok(left)
@@ -1675,6 +1685,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                     session,
                     true,
                     true,
+                    scope,
                 )?;
                 Ok(GenericValue::Deferred(DeferredValue::Coalesce {
                     value: Box::new(left),
@@ -1690,6 +1701,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                 session,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
+                scope,
             )?;
             let rhs = resolve_value_with_binding_lookup(
                 expression.rhs(),
@@ -1698,6 +1710,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                 session,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
+                scope,
             )?;
             let span = expression.operator_span();
             expression
@@ -1723,6 +1736,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                     session,
                     defer_unknown_functions,
                     preserve_failed_user_calls,
+                    scope,
                 ),
                 // A missing binding or attribute may become available later.
                 // The directory-wide scope check owns undefined identifiers.
@@ -1740,6 +1754,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                         session,
                         defer_unknown_functions,
                         preserve_failed_user_calls,
+                        scope,
                     )
                 })
                 .collect();
@@ -1757,6 +1772,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                         session,
                         defer_unknown_functions,
                         preserve_failed_user_calls,
+                        scope,
                     )?,
                 );
             }
@@ -1774,6 +1790,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                             session,
                             defer_unknown_functions,
                             preserve_failed_user_calls,
+                            scope,
                         )?))
                     }
                     other => Ok(other.clone()),
@@ -1813,6 +1830,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                             session,
                             defer_unknown_functions,
                             preserve_failed_user_calls,
+                            scope,
                         )
                     })
                 })
@@ -1847,6 +1865,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                             session,
                             defer_unknown_functions,
                             preserve_failed_user_calls,
+                            scope,
                         )
                     })
                 })
@@ -1868,7 +1887,11 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                 }),
                 Err(e) => {
                     if all_args_resolved {
-                        let reason = UnavailableReason::from_builtin_error(e);
+                        let reason = if scope.is_secret() {
+                            UnavailableReason::inside_secret()
+                        } else {
+                            UnavailableReason::from_builtin_error(e)
+                        };
                         if defer_unknown_functions {
                             Ok(GenericValue::Deferred(DeferredValue::Unavailable {
                                 name: *name,
@@ -1898,6 +1921,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                 session,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
+                scope,
             )?;
             access
                 .rebuild_with_base(resolved_base, AccessMissPolicy::Error)
@@ -1906,6 +1930,19 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                     message: error.to_string(),
                 })
         }
+        GenericValue::Deferred(DeferredValue::Secret(inner)) => inner
+            .try_map(|value| {
+                resolve_value_with_binding_lookup(
+                    value,
+                    binding_lookup,
+                    config,
+                    session,
+                    defer_unknown_functions,
+                    preserve_failed_user_calls,
+                    DiagnosticScope::Secret,
+                )
+            })
+            .map(|inner| GenericValue::Deferred(DeferredValue::Secret(inner))),
         GenericValue::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::EnumIdentifier(_)
@@ -1918,7 +1955,6 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
         )
         | GenericValue::Deferred(
             DeferredValue::BindingRef { .. }
-            | DeferredValue::Secret(_)
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => Ok(value.clone()),
@@ -2008,7 +2044,8 @@ fn resolve_function_calls_only<B: ProviderAttributeBindingPhase>(
             | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Access(_)
             | DeferredValue::Coalesce { .. }
-            | DeferredValue::IntegerArithmetic(_),
+            | DeferredValue::IntegerArithmetic(_)
+            | DeferredValue::Secret(_),
         ) => resolve_value_with_config(
             value,
             binding_map,
@@ -2084,7 +2121,6 @@ fn resolve_function_calls_only<B: ProviderAttributeBindingPhase>(
         | GenericValue::Deferred(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
-            | DeferredValue::Secret(_)
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => Ok(value.clone()),
@@ -2330,6 +2366,7 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
                     Some(config),
                     false,
                     false,
+                    DiagnosticScope::Public,
                 )?;
                 let expanded = parser_resolved.into_expanded().map_err(|error| {
                     ParseError::InvalidExpression {
@@ -2579,7 +2616,7 @@ let item = mock.test.resource {
         assert!(matches!(
             comment(&parsed),
             Value::Deferred(DeferredValue::Secret(inner))
-                if matches!(inner.as_ref(), Value::Deferred(DeferredValue::Unavailable {
+                if matches!(inner.expose_plaintext(), Value::Deferred(DeferredValue::Unavailable {
                     name: crate::builtins::BuiltinFunction::env,
                     ..
                 }))
@@ -2705,7 +2742,7 @@ for item in source.arn {
         };
         assert!(matches!(
             template.attributes().get("comment"),
-            Some(Value::Deferred(DeferredValue::FunctionCall { name, .. })) if name == "secret"
+            Some(Value::Deferred(DeferredValue::Secret(_)))
         ));
 
         resolve_resource_refs_with_config(

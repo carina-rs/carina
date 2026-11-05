@@ -1317,7 +1317,10 @@ impl ReferenceValidation<'_> {
             }));
         }
         if let Value::Deferred(crate::resource::DeferredValue::Secret(inner)) = value {
-            return self.walk(inner, ty, path, true, depth + 1, visit);
+            let mut result = Ok(());
+            inner
+                .visit(|value, _scope| result = self.walk(value, ty, path, true, depth + 1, visit));
+            return result;
         }
         match ty.shape() {
             Shape::Reference { identity, .. } => visit(value, identity, path, secret)?,

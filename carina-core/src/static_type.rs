@@ -144,6 +144,8 @@ pub enum NotInferableReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InferenceError {
+    #[error("{}", crate::resource::INSIDE_SECRET_MESSAGE)]
+    InsideSecret {},
     #[error(transparent)]
     MissingEvidence(#[from] crate::parser::retained::MissingEvidence),
     #[error("{reason}", reason = crate::provider_text::ProviderText::new(reason))]
@@ -174,6 +176,13 @@ pub enum InferenceError {
     },
     #[error("cyclic composition binding chain: {}", crate::provider_text::ProviderText::new(cycle.join(" -> ")))]
     CyclicVirtualBinding { cycle: Vec<String> },
+}
+
+/// Remove source values, paths, names, and type literals at a secret boundary.
+impl crate::resource::InsideSecret for InferenceError {
+    fn inside_secret(self) -> Self {
+        Self::InsideSecret {}
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -286,6 +295,12 @@ impl ConsumerExportStaticType {
                 ConsumerInferredUncheckedReason::UnnameableInConsumer(_reason),
             )) => None,
         }
+    }
+}
+
+impl crate::resource::InsideSecret for InferenceIssue {
+    fn inside_secret(self) -> Self {
+        Self::Failed(InferenceError::InsideSecret {})
     }
 }
 

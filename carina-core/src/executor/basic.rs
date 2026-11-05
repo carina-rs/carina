@@ -278,7 +278,14 @@ fn needs_apply_resolution(value: &Value) -> bool {
             | DeferredValue::Access(_)
             | DeferredValue::Unknown(_),
         ) => true,
-        Value::Deferred(DeferredValue::Secret(inner)) => needs_apply_resolution(inner),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            let mut result = None;
+            inner.visit(|secret_value, scope| {
+                let _ = scope;
+                result = Some(needs_apply_resolution(secret_value));
+            });
+            result.expect("secret visit")
+        }
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(needs_apply_resolution),
         Value::Concrete(ConcreteValue::Map(map)) => map.values().any(needs_apply_resolution),
         Value::Concrete(
@@ -400,7 +407,18 @@ fn assert_fully_resolved(
             Ok(())
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            assert_fully_resolved(inner, attribute_key, bindings)
+            let mut result = None;
+            inner.visit(|secret_value, scope| {
+                result = Some(
+                    assert_fully_resolved(secret_value, attribute_key, bindings).map_err(|error| {
+                        scope.protect_error(error).with_context(format!(
+                            "Attribute '{attribute_key}': {}",
+                            crate::resource::INSIDE_SECRET_MESSAGE
+                        ))
+                    }),
+                );
+            });
+            result.expect("secret visit")
         }
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
         Value::Deferred(DeferredValue::ModuleIf(_)) => Err(ReportedError::message(format!(
@@ -586,7 +604,9 @@ fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
     match value {
         Value::Deferred(DeferredValue::ResourceRef { path }) => out.push(path.binding()),
         Value::Deferred(DeferredValue::BindingRef { binding }) => out.push(binding.as_str()),
-        Value::Deferred(DeferredValue::Secret(inner)) => collect_unresolved_bindings(inner, out),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            inner.visit(|value, _scope| collect_unresolved_bindings(value, out))
+        }
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             deferred
                 .values()
@@ -1748,6 +1768,46 @@ mod assert_fully_resolved_tests {
     }
 
     #[test]
+    fn secret_origin_4275_provider_input_keeps_typed_upstream_reason() {
+        let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()])
+            .resolve_root_for_test();
+        let value: Value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Deferred(DeferredValue::Unknown(
+                ApplyTimeUnknown::UpstreamExport { path },
+            )))
+            .into(),
+        ));
+        let error = assert_fully_resolved(&value, "password", &empty_bindings()).unwrap_err();
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error.as_error());
+        let mut found = false;
+        while let Some(error) = cause {
+            if let Some(SerializationError::UnknownNotAllowed { reason, .. }) =
+                error.downcast_ref::<SerializationError>()
+            {
+                found = matches!(reason.as_ref(), ApplyTimeUnknown::UpstreamExport { path } if path.to_dot_string() == "network.vpc.vpc_id");
+            }
+            cause = error.source();
+        }
+        assert!(found, "typed upstream reason was discarded: {error:?}");
+    }
+
+    #[test]
+    fn secret_origin_4275_unresolved_provider_input_keeps_its_scope() {
+        let value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::root_resource_ref(
+                "private-producer",
+                "private-attribute",
+                Vec::new(),
+            ))
+            .into(),
+        ));
+        let error = assert_fully_resolved(&value, "password", &empty_bindings()).unwrap_err();
+        let diagnostic = format!("{error} {error:?}");
+        assert!(diagnostic.contains("password"), "{diagnostic}");
+        assert!(!diagnostic.contains("private-"), "{diagnostic}");
+    }
+
+    #[test]
     fn concrete_value_is_fully_resolved() {
         assert!(
             assert_fully_resolved(
@@ -1960,11 +2020,11 @@ mod assert_fully_resolved_tests {
         // `Secret(ResourceRef)` would otherwise sneak past — the
         // secret tag would survive but the ref would still be
         // unresolved at the WASM boundary.
-        let v = Value::Deferred(DeferredValue::Secret(Box::new(dvo_chained_ref())));
+        let v = Value::Deferred(DeferredValue::Secret(Box::new(dvo_chained_ref()).into()));
         let err = assert_fully_resolved(&v, "password", &empty_bindings())
             .expect_err("Secret wrapping does not exempt unresolved refs");
         assert!(
-            err.to_string().contains("resource_record_value"),
+            err.to_string().contains("password") && err.to_string().contains("secret(...)"),
             "got: {err}"
         );
     }

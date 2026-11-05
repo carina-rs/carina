@@ -35,7 +35,7 @@ pub(crate) fn builtin_env<B: BindingAddress>(
             }
         })?;
     Ok(if secret {
-        Value::Deferred(DeferredValue::Secret(Box::new(value)))
+        Value::Deferred(DeferredValue::Secret(Box::new(value).into()))
     } else {
         value
     })
@@ -56,7 +56,7 @@ fn parse_env_args<B: BindingAddress>(
     let mut argument = &args[0];
     let mut secret = false;
     while let Value::Deferred(DeferredValue::Secret(inner)) = argument {
-        argument = inner;
+        inner.visit(|value, _scope| argument = value);
         secret = true;
     }
     match argument {
@@ -190,10 +190,10 @@ mod tests {
             "SECRET_NAME".to_string(),
             "captured".into(),
         )]));
-        let secret = |value| {
-            Value::Deferred(crate::resource::ExpandedDeferredValue::Secret(Box::new(
-                value,
-            )))
+        let secret = |value: Value| {
+            Value::Deferred(crate::resource::ExpandedDeferredValue::Secret(
+                Box::new(value).into(),
+            ))
         };
         let name = Value::Concrete(ConcreteValue::String("SECRET_NAME".into()));
         let expected = secret(Value::Concrete(ConcreteValue::String("captured".into())));

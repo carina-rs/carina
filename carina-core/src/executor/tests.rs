@@ -1069,11 +1069,12 @@ fn resolved_resource_constructor_rejects_nested_deferred() {
     let mut map = indexmap::IndexMap::new();
     map.insert(
         "secret".to_string(),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-            DeferredValue::ResourceRef {
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::root("cert", "domain_validation_options"),
-            },
-        )))),
+            }))
+            .into(),
+        )),
     );
     let nested = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
         ConcreteValue::Map(map),
@@ -3506,9 +3507,12 @@ async fn invalid_secret_create_value_is_masked_and_never_reaches_provider() {
         "secret-source",
         HashMap::from([(
             "value".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String(plaintext.to_string().into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    plaintext.to_string().into(),
+                )))
+                .into(),
+            )),
         )]),
         BindingValueSource::Local,
     );
@@ -5666,7 +5670,7 @@ fn module_constraint_resolution_keeps_unavailable_secret_typed() {
     use crate::parser::ValidateExpr;
 
     let hash = crate::value::redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(
-        Box::new(Value::Concrete(ConcreteValue::String("private".into()))),
+        Box::new(Value::Concrete(ConcreteValue::String("private".into()))).into(),
     )))
     .unwrap();
     let mut bindings = ResolvedBindings::default();
@@ -7545,9 +7549,9 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
     to_resource.binding = Some(absolute_binding("a"));
     let rid = to_resource.id.clone();
 
-    let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("my-password".into()),
-    ))));
+    let secret_value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("my-password".into()))).into(),
+    ));
     to_resource.set_attr("master_password", secret_value.clone());
 
     let hash_json = crate::value::value_to_json(&secret_value).expect("secret hash must serialize");
@@ -7605,9 +7609,9 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
     to_resource.binding = Some(absolute_binding("a"));
     let rid = to_resource.id.clone();
 
-    let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("my-password".into()),
-    ))));
+    let secret_value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("my-password".into()))).into(),
+    ));
     to_resource.set_attr(
         "master_password",
         Value::Concrete(ConcreteValue::List(vec![

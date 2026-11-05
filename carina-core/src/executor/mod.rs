@@ -788,7 +788,9 @@ fn visit_unknowns(value: &Value, f: &mut impl FnMut(&ApplyTimeUnknown)) {
             }
         }
         Value::Deferred(DeferredValue::Access(access)) => visit_unknowns(access.base(), f),
-        Value::Deferred(DeferredValue::Secret(inner)) => visit_unknowns(inner, f),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            inner.visit(|value, _scope| visit_unknowns(value, f))
+        }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             visit_unknowns(value, f);
             visit_unknowns(default, f);
@@ -947,6 +949,27 @@ impl ReportedError {
 
     pub fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
         self.inner.as_ref()
+    }
+}
+
+impl crate::resource::InsideSecret for ReportedError {
+    fn inside_secret(self) -> Self {
+        // Preserve typed, safe context through reporting wrappers. Each source
+        // error owns its protection policy, including public upstream reasons.
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(self.as_error());
+        while let Some(error) = cause {
+            if let Some(error) = error.downcast_ref::<crate::value::SerializationError>() {
+                return Self::new(crate::resource::InsideSecret::inside_secret(error.clone()));
+            }
+            if let Some(error) = error.downcast_ref::<crate::resolver::ResolutionError>() {
+                return Self::new(crate::resource::InsideSecret::inside_secret(error.clone()));
+            }
+            if let Some(error) = error.downcast_ref::<crate::resource::UnavailableSecretError>() {
+                return Self::new(crate::resource::InsideSecret::inside_secret(error.clone()));
+            }
+            cause = error.source();
+        }
+        Self::message(crate::resource::INSIDE_SECRET_MESSAGE)
     }
 }
 

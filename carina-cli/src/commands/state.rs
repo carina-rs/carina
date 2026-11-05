@@ -6141,9 +6141,9 @@ mod tests {
         );
         let desired = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
             "password",
-            Value::Deferred(DeferredValue::Secret(Box::new(string_value(
-                "plain-secret",
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(string_value("plain-secret")).into(),
+            )),
         );
 
         refresh_deposed_generations_until_cancelled(
@@ -7650,9 +7650,9 @@ mod tests {
             Resource::with_provider("awscc", "db.Instance", "main", Some("east".to_string()))
                 .with_attribute(
                     "password",
-                    Value::Deferred(DeferredValue::Secret(Box::new(string_value(
-                        "plain-secret",
-                    )))),
+                    Value::Deferred(DeferredValue::Secret(
+                        Box::new(string_value("plain-secret")).into(),
+                    )),
                 );
         let right_instance =
             Resource::with_provider("awscc", "db.Instance", "main", Some("west".to_string()));

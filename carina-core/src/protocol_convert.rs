@@ -3819,9 +3819,9 @@ mod tests {
                 source_line: (0).into(),
             }),
             access,
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("secret".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("secret".into()))).into(),
+            )),
             Value::Deferred(DeferredValue::Unknown(
                 crate::resource::ApplyTimeUnknown::UpstreamAllExports {
                     binding: absolute_binding("upstream"),

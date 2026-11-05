@@ -868,10 +868,14 @@ fn ref_walker_does_not_inherit_function_result_sink_for_arguments() {
     let result_type = TypeExpr::String;
     let mut visited = Vec::new();
 
-    visit_refs_with_sink(
+    visit_refs_with_sink_inner(
         &value,
         Some(RefSink::TypeExpr(&result_type)),
-        &mut |path, sink, _usage, _candidate| visited.push((path.to_dot_string(), sink.is_none())),
+        crate::resource::ResourceRefUsage::Required,
+        DiagnosticScope::Public,
+        &mut |path, sink, _usage, _candidate, _scope| {
+            visited.push((path.to_dot_string(), sink.is_none()))
+        },
     );
 
     assert_eq!(
@@ -7639,7 +7643,7 @@ fn validate_export_params_rejects_decrypt_result_as_secret_export() {
 #[test]
 fn validate_export_params_rejects_every_secret_value_shape_uniformly() {
     fn secret(value: RuntimeValue) -> RuntimeValue {
-        RuntimeValue::Deferred(RuntimeDeferredValue::Secret(Box::new(value)))
+        RuntimeValue::Deferred(RuntimeDeferredValue::Secret(Box::new(value).into()))
     }
 
     let secret_string = || {
@@ -9695,19 +9699,23 @@ fn value_contains_unresolved_ref_detects_list_element() {
 fn value_contains_unresolved_ref_unwraps_secret() {
     use crate::resource::AccessPath;
 
-    let secret_with_ref = RuntimeValue::Deferred(RuntimeDeferredValue::Secret(Box::new(
-        RuntimeValue::Deferred(RuntimeDeferredValue::ResourceRef {
+    let secret_with_ref = RuntimeValue::Deferred(RuntimeDeferredValue::Secret(
+        Box::new(RuntimeValue::Deferred(RuntimeDeferredValue::ResourceRef {
             path: AccessPath::root("vault", "token"),
-        }),
-    )));
+        }))
+        .into(),
+    ));
     assert!(
         value_contains_unresolved_ref(&secret_with_ref),
         "Secret(ResourceRef) must propagate the unresolved signal",
     );
 
-    let secret_literal = RuntimeValue::Deferred(RuntimeDeferredValue::Secret(Box::new(
-        RuntimeValue::Concrete(RuntimeConcreteValue::String("plaintext".into())),
-    )));
+    let secret_literal = RuntimeValue::Deferred(RuntimeDeferredValue::Secret(
+        Box::new(RuntimeValue::Concrete(RuntimeConcreteValue::String(
+            "plaintext".into(),
+        )))
+        .into(),
+    ));
     assert!(
         !value_contains_unresolved_ref(&secret_literal),
         "Secret(literal) must not be flagged",
@@ -10055,9 +10063,9 @@ fn attribute_reference_message_fixture(module_directory: &str) -> CompositionAtt
     CompositionAttributeRefError {
         error: AttributeParamRefError {
             attribute: "bad".to_string(),
-            path: crate::resource::ReferencePath::Binding(
+            path: DiagnosticPath::Public(crate::resource::ReferencePath::Binding(
                 RootScope::new().resolve("source".into()),
-            ),
+            )),
             kind: ModuleCallRefErrorKind::TypeMismatch {
                 types: MismatchTypeNames::for_type_exprs(&TypeExpr::String, &TypeExpr::Int),
                 declared: None,

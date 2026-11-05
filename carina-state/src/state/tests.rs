@@ -1261,9 +1261,9 @@ fn structural_secret_digest(value: &serde_json::Value) -> &str {
 }
 
 fn valid_legacy_marker_shaped_string(plaintext: &str) -> String {
-    let secret: Value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String(plaintext.into()),
-    ))));
+    let secret: Value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(plaintext.into()))).into(),
+    ));
     let encoded = PersistedValue::encode_provider_value(&secret, None)
         .expect("test secret must be persistable");
     format!(
@@ -3126,9 +3126,12 @@ fn carried_list_with_secret_field_still_pairs_by_ordinary_identity_fields() {
         };
         fields.insert(
             "token".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String(token.to_string().into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    token.to_string().into(),
+                )))
+                .into(),
+            )),
         );
         Value::Concrete(ConcreteValue::Map(fields))
     };
@@ -7121,9 +7124,9 @@ fn desired_redacted_secret_is_rejected_consistently_when_provider_omits_attribut
     let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "a".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("x".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("x".into()))).into(),
+            )),
         ),
         ("b".to_string(), redacted),
     ])));
@@ -7151,9 +7154,9 @@ fn accepted_write_only_rejects_desired_redacted_secret() {
     let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "a".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("x".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("x".into()))).into(),
+            )),
         ),
         ("b".to_string(), redacted),
     ])));
@@ -7231,9 +7234,9 @@ fn accepted_write_only_does_not_overwrite_protected_provider_value() {
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     resource.set_attr(
         "some_attr".to_string(),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("desired".into()),
-        )))),
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("desired".into()))).into(),
+        )),
     );
 
     // Provider happens to return this attribute (unusual for write-only but possible)
@@ -7329,9 +7332,9 @@ fn test_from_provider_state_secret_stored_as_hash() {
     let mut resource = Resource::with_provider("awscc", "rds.db_instance", "my-db", None);
     resource.set_attr(
         "master_password".to_string(),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("my-password".into()),
-        )))),
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("my-password".into()))).into(),
+        )),
     );
 
     let provider_state: carina_core::resource::State = ProviderState {
@@ -7497,9 +7500,12 @@ fn with_attributes_from_state_reuses_matching_secret_digest() {
     use carina_core::resource::{ConcreteValue, DeferredValue, ResourceId, State, Value};
 
     let id = ResourceId::with_provider_identity("mock", "test.resource", "stable", None);
-    let secret: Value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("stable-secret".into()),
-    ))));
+    let secret: Value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "stable-secret".into(),
+        )))
+        .into(),
+    ));
     let provider_state = State::existing(id, HashMap::from([("comment".to_string(), secret)]));
     let first =
         ResourceState::from_provider_state("test.resource", "stable", "mock", &provider_state)
@@ -7613,9 +7619,9 @@ fn nested_write_only_state_fixture(
         ),
         (
             "client_secret".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String(secret.into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(secret.into()))).into(),
+            )),
         ),
     ])));
     let resource = Resource::with_provider("mock", "test.Resource", "nested", None)
@@ -7748,8 +7754,8 @@ fn nested_write_only_record_hashes_leaf_under_secret_wrapped_struct() {
         CompiledStructField as StructField,
     };
 
-    let config = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::Map(IndexMap::from([
+    let config = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "issuer".to_string(),
                 Value::Concrete(ConcreteValue::String("https://issuer.example.com".into())),
@@ -7758,8 +7764,9 @@ fn nested_write_only_record_hashes_leaf_under_secret_wrapped_struct() {
                 "client_secret".to_string(),
                 Value::Concrete(ConcreteValue::String("wrapped-secret".into())),
             ),
-        ])),
-    ))));
+        ]))))
+        .into(),
+    ));
     let resource = Resource::with_provider("mock", "test.Resource", "nested", None)
         .with_attribute("config", config);
     let schema = ResourceSchema::new("test.Resource").attribute(
@@ -8162,7 +8169,7 @@ fn identified_create_records_nested_leaf_from_desired_under_ancestor_secret_wrap
             )])),
         )]))
     };
-    let secret = |value| Value::Deferred(DeferredValue::Secret(Box::new(value)));
+    let secret = |value: Value| Value::Deferred(DeferredValue::Secret(Box::new(value).into()));
 
     for (persisted_envelope, wrap_default_actions) in
         [(false, false), (false, true), (true, false), (true, true)]
@@ -8830,9 +8837,12 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
     );
     tags_map.insert(
         "SecretTag".to_string(),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("super-secret-value".into()),
-        )))),
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "super-secret-value".into(),
+            )))
+            .into(),
+        )),
     );
     resource.set_attr(
         "tags".to_string(),
@@ -8905,9 +8915,12 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
     let mut tags_map = IndexMap::new();
     tags_map.insert(
         "SecretTag".to_string(),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("super-secret-value".into()),
-        )))),
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "super-secret-value".into(),
+            )))
+            .into(),
+        )),
     );
     resource.set_attr(
         "tags".to_string(),
@@ -8988,9 +9001,9 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
         "values".to_string(),
         Value::Concrete(ConcreteValue::List(vec![
             Value::Concrete(ConcreteValue::String("public".into())),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("secret-item".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("secret-item".into()))).into(),
+            )),
         ])),
     );
 

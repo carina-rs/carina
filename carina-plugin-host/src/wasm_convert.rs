@@ -1,5 +1,6 @@
 //! Conversions between carina-core types and Wasmtime-generated WIT types.
 
+use carina_core::resource::InsideSecret;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
@@ -403,7 +404,8 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
             })
         }
         CoreValue::Deferred(DeferredValue::Secret(inner)) => {
-            let json = core_value_to_json(inner).map_err(SerializationError::masked_for_secret)?;
+            let json = core_value_to_json(inner.expose_plaintext())
+                .map_err(SerializationError::inside_secret)?;
             let json_str =
                 serde_json::to_string(&json).expect("serde_json::Value -> String is infallible");
             Ok(wit::Value::SecretVal(json_str))
@@ -559,7 +561,9 @@ pub(crate) fn wit_to_core_value(v: &wit::Value) -> Result<CoreValue, WasmValueDe
                 )
             })?;
             let inner = json_to_core_value(&inner_json, WitValueVariant::Secret)?;
-            Ok(CoreValue::Deferred(DeferredValue::Secret(Box::new(inner))))
+            Ok(CoreValue::Deferred(DeferredValue::Secret(
+                Box::new(inner).into(),
+            )))
         }
     }
 }
@@ -785,7 +789,7 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
         // `secret-val` is the channel used to mark the *attribute* itself
         // as a secret.
         CoreValue::Deferred(DeferredValue::Secret(inner)) => {
-            core_value_to_json(inner).map_err(SerializationError::masked_for_secret)
+            core_value_to_json(inner.expose_plaintext()).map_err(SerializationError::inside_secret)
         }
         CoreValue::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
@@ -2816,9 +2820,9 @@ mod tests {
     impl std::error::Error for TestOperationError {}
 
     fn redacted_secret_and_digest(plaintext: &str) -> (CoreSnapshotValue, String) {
-        let secret: CoreValue = CoreValue::Deferred(DeferredValue::Secret(Box::new(
-            CoreValue::Concrete(ConcreteValue::String(plaintext.into())),
-        )));
+        let secret: CoreValue = CoreValue::Deferred(DeferredValue::Secret(
+            Box::new(CoreValue::Concrete(ConcreteValue::String(plaintext.into()))).into(),
+        ));
         let persisted = carina_core::value::PersistedValue::encode_provider_value(&secret, None)
             .expect("serialize test secret")
             .as_json()
@@ -3997,9 +4001,12 @@ mod tests {
     #[test]
     fn secret_enum_identifier_error_is_masked_by_scalar_wit_encoder() {
         let plaintext = "scalar-secret-plaintext-must-not-leak";
-        let value = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
-            ConcreteValue::enum_identifier(plaintext),
-        ))));
+        let value = CoreValue::Deferred(DeferredValue::Secret(
+            Box::new(CoreValue::Concrete(ConcreteValue::enum_identifier(
+                plaintext,
+            )))
+            .into(),
+        ));
 
         let error = core_to_wit_value(&value).expect_err("the unresolved enum must be rejected");
         let display = error.to_string();
@@ -4013,7 +4020,7 @@ mod tests {
         let value = CoreValue::Concrete(ConcreteValue::Map(indexmap::indexmap! {
             "items".to_string() => CoreValue::Deferred(DeferredValue::Secret(Box::new(
                 CoreValue::Concrete(ConcreteValue::enum_identifier(plaintext)),
-            ))),
+            ).into())),
         }));
 
         let error = core_value_to_json(&value).expect_err("the unresolved enum must be rejected");
@@ -4078,9 +4085,9 @@ mod tests {
     #[test]
     fn persisted_state_rejects_live_secret_without_exposing_plaintext() {
         let plaintext = "persisted-boundary-secret-must-not-leak";
-        let secret: CoreValue = CoreValue::Deferred(DeferredValue::Secret(Box::new(
-            CoreValue::Concrete(ConcreteValue::String(plaintext.into())),
-        )));
+        let secret: CoreValue = CoreValue::Deferred(DeferredValue::Secret(
+            Box::new(CoreValue::Concrete(ConcreteValue::String(plaintext.into()))).into(),
+        ));
         let nested = CoreValue::Concrete(ConcreteValue::Map(indexmap::indexmap! {
             "token".to_string() => secret.clone(),
         }));
@@ -4465,9 +4472,12 @@ mod tests {
     /// `format!("{v:?}")` debug string.
     #[test]
     fn secret_string_emits_secret_val_variant() {
-        let v = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
-            ConcreteValue::String("password".into()),
-        ))));
+        let v = CoreValue::Deferred(DeferredValue::Secret(
+            Box::new(CoreValue::Concrete(ConcreteValue::String(
+                "password".into(),
+            )))
+            .into(),
+        ));
         let wit_v = core_to_wit_value(&v).unwrap();
         match wit_v {
             wit::Value::SecretVal(json) => assert_eq!(json, "\"password\""),
@@ -4479,9 +4489,9 @@ mod tests {
     fn secret_int_emits_secret_val_variant() {
         // Audit (carina#2390 step 12) confirmed `secret()` accepts any
         // scalar; pin the wire format for non-string inner values too.
-        let v = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
-            ConcreteValue::Int(42),
-        ))));
+        let v = CoreValue::Deferred(DeferredValue::Secret(
+            Box::new(CoreValue::Concrete(ConcreteValue::Int(42))).into(),
+        ));
         let wit_v = core_to_wit_value(&v).unwrap();
         match wit_v {
             wit::Value::SecretVal(json) => assert_eq!(json, "42"),
@@ -4494,13 +4504,13 @@ mod tests {
         // Round-tripping through the WIT boundary preserves the
         // `Secret` wrapper so host-side machinery (state hashing, plan
         // redaction) keeps recognising it after a guest call returns.
-        let original = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
-            ConcreteValue::String("hunter2".into()),
-        ))));
+        let original = CoreValue::Deferred(DeferredValue::Secret(
+            Box::new(CoreValue::Concrete(ConcreteValue::String("hunter2".into()))).into(),
+        ));
         let wit_v = core_to_wit_value(&original).unwrap();
         let back = wit_to_core_value(&wit_v).unwrap();
         match back {
-            CoreValue::Deferred(DeferredValue::Secret(inner)) => match *inner {
+            CoreValue::Deferred(DeferredValue::Secret(inner)) => match inner.expose_plaintext() {
                 CoreValue::Concrete(ConcreteValue::String(s)) => assert_eq!(s, "hunter2"),
                 other => panic!("expected inner String, got: {other:?}"),
             },
@@ -4517,9 +4527,9 @@ mod tests {
         // *attribute*-level secret signal goes through `secret-val` via
         // `core_to_wit_value`, not this path.
         let v = CoreValue::Concrete(ConcreteValue::List(vec![CoreValue::Deferred(
-            DeferredValue::Secret(Box::new(CoreValue::Concrete(ConcreteValue::String(
-                "p".into(),
-            )))),
+            DeferredValue::Secret(
+                Box::new(CoreValue::Concrete(ConcreteValue::String("p".into()))).into(),
+            ),
         )]));
         let wit_v = core_to_wit_value(&v).unwrap();
         match wit_v {
@@ -5178,7 +5188,7 @@ mod tests {
                     let secret = |text: &str| {
                         CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
                             ConcreteValue::String(text.into()),
-                        ))))
+                        )).into()))
                     };
                     for resource in resources {
                         resource.set_attr("top", secret("top-plaintext"));

@@ -528,6 +528,14 @@ fn loop_expression_is_local<P: PlaceholderKind, B: BindingAddress>(value: &Value
             placeholder.loop_slot().is_some()
         }
         Value::Deferred(DeferredValue::Access(access)) => loop_expression_is_local(access.base()),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            let mut result = None;
+            inner.visit(|secret_value, scope| {
+                let _ = scope;
+                result = Some(loop_expression_is_local(secret_value));
+            });
+            result.expect("secret visit")
+        }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             parts.iter().all(|part| match part {
                 InterpolationPart::Literal(_) => true,
@@ -549,8 +557,7 @@ fn loop_expression_is_local<P: PlaceholderKind, B: BindingAddress>(value: &Value
             | DeferredValue::Unknown(_)
             | DeferredValue::Coalesce { .. }
             | DeferredValue::ModuleIf(_)
-            | DeferredValue::Unavailable { .. }
-            | DeferredValue::Secret(_),
+            | DeferredValue::Unavailable { .. },
         ) => false,
     }
 }

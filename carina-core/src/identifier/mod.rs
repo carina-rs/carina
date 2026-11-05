@@ -1712,7 +1712,10 @@ fn deterministic_value_string<P: crate::resource::ValueKind, B: BindingAddress>(
             access.step().to_plaintext_dot_string()
         ),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            format!("Secret({})", deterministic_value_string(inner))
+            format!(
+                "Secret({})",
+                deterministic_value_string(inner.expose_plaintext())
+            )
         }
 
         Value::Deferred(DeferredValue::Unknown(reason)) => {
@@ -3506,7 +3509,10 @@ fn resolve_deferred_create_only_value(
         Ok(
             crate::resolver::ValueResolution::Absent | crate::resolver::ValueResolution::Unknown(_),
         )
-        | Err(crate::resolver::ResolutionError::Message(_)) => Ok(None),
+        | Err(
+            crate::resolver::ResolutionError::Message(_)
+            | crate::resolver::ResolutionError::InsideSecret { .. },
+        ) => Ok(None),
         Err(crate::resolver::ResolutionError::UnavailableSecret(error)) => Err(error),
     }
 }

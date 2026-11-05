@@ -593,7 +593,7 @@ mod tests {
             Value::Concrete(ConcreteValue::List(vec![
                 Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
                     ConcreteValue::String("never-in-wire".into()),
-                )))),
+                )).into())),
                 Value::Concrete(ConcreteValue::String("known".into())),
             ])),
         )]
@@ -1216,12 +1216,13 @@ mod tests {
 
     #[test]
     fn secret_containers_and_other_deferred_expressions_remain_single_opaque_leaves() {
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::Map(IndexMap::from([(
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                 "private-key".into(),
                 Value::Concrete(ConcreteValue::String("private-content".into())),
-            )])),
-        ))));
+            )]))))
+            .into(),
+        ));
         let expression = Value::Deferred(DeferredValue::Coalesce {
             value: Box::new(Value::Concrete(ConcreteValue::String(
                 "private-expression".into(),

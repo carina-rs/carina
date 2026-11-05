@@ -128,7 +128,7 @@ fn state_block_import_propagates_unavailable_historical_secret() {
     let target: Resource = Resource::with_provider("mock", "test.resource", "target", None);
     let historical =
         carina_core::value::redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(
-            Box::new(Value::Concrete(ConcreteValue::String("secret-id".into()))),
+            Box::new(Value::Concrete(ConcreteValue::String("secret-id".into()))).into(),
         )))
         .expect("capture historical secret");
     let state = carina_core::resource::SnapshotState::existing(
@@ -2560,9 +2560,12 @@ fn tied_union_error_ignores_failures_without_an_attribute() {
 
 #[tokio::test]
 async fn shared_desired_pipeline_runs_host_default_tag_normalization() {
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("test-only-default-tag-secret".into()),
-    ))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "test-only-default-tag-secret".into(),
+        )))
+        .into(),
+    ));
     let provider_config: carina_core::parser::ExpandedProviderConfig = ProviderConfig {
         name: BUILTIN_PROVIDER_NAME.to_string(),
         attributes: IndexMap::new(),
@@ -14584,7 +14587,7 @@ mod resolved_value_constraint_gate {
     async fn resolved_secret_reference_constraint_fails_masked_before_normalization() {
         let plaintext = "plan-time-plaintext";
         let normalizer = RewritingNormalizer::default();
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(text(plaintext))));
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(text(plaintext)).into()));
 
         let errors = prepare_managed("consumer.Pattern", secret, &normalizer)
             .await
@@ -15072,7 +15075,7 @@ exports { team_prefix: String = "x" }"#,
             message: "value must not be bad".to_string(),
         };
         let mut composition = pending_composition(vec![("value", ref_value())], constraint);
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(text("bad"))));
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(text("bad")).into()));
 
         let errors = prepare_composition(vec![("value", secret)], &mut composition)
             .await

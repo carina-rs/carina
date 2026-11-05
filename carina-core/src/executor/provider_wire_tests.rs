@@ -486,9 +486,12 @@ async fn checked_projection_preserves_native_scalars_and_late_secret_provenance(
                         Value::Concrete(ConcreteValue::CanonicalEnum(mode)),
                     ])),
                 );
-            let configs = [config(Value::Deferred(DeferredValue::Secret(Box::new(
-                Value::Concrete(ConcreteValue::String("private-late-tag".into())),
-            ))))];
+            let configs = [config(Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "private-late-tag".into(),
+                )))
+                .into(),
+            )))];
             let bindings = ResolvedBindings::default();
             let gate = ModuleConstraintGate::from_live_compositions(&[]);
             let schemas = schemas();

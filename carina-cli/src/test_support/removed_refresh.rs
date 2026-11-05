@@ -239,13 +239,14 @@ async fn removed_no_refresh_saved_plan_apply() {
             std::collections::HashMap::from([(
                 "token".into(),
                 carina_core::resource::Value::Deferred(
-                    carina_core::resource::DeferredValue::Secret(Box::new(
-                        carina_core::resource::Value::Concrete(
+                    carina_core::resource::DeferredValue::Secret(
+                        Box::new(carina_core::resource::Value::Concrete(
                             carina_core::resource::ConcreteValue::String(
                                 "historical-secret".into(),
                             ),
-                        ),
-                    )),
+                        ))
+                        .into(),
+                    ),
                 ),
             )]),
         );

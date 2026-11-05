@@ -65,7 +65,9 @@ pub(crate) fn builtin_join<B: BindingAddress>(
         ValueString::derived_from(joined, std::iter::once(separator).chain(rendered.iter()));
     let value = Value::Concrete(ConcreteValue::String(joined));
     if contains_secret {
-        Ok(Value::Deferred(DeferredValue::Secret(Box::new(value))))
+        Ok(Value::Deferred(DeferredValue::Secret(
+            Box::new(value).into(),
+        )))
     } else {
         Ok(value)
     }
@@ -87,7 +89,16 @@ fn join_scalar<B: BindingAddress>(
             Ok((crate::value::render_duration(*value).into(), false))
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            let (text, _) = join_scalar(inner)?;
+            let (text, _) = {
+                let mut result = None;
+                inner.visit(|secret_value, scope| {
+                    let _ = scope;
+                    result = Some(
+                        (join_scalar(secret_value)).map_err(|error| scope.protect_error(error)),
+                    );
+                });
+                result.expect("secret visit")
+            }?;
             Ok((
                 ValueString::diagnostic_sensitive(text.into_plaintext()),
                 true,
@@ -188,9 +199,12 @@ mod tests {
             Value::Concrete(ConcreteValue::String("-".into())),
             Value::Concrete(ConcreteValue::List(vec![
                 Value::Concrete(ConcreteValue::String("prefix".into())),
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::String("hunter2SECRET".into()),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String(
+                        "hunter2SECRET".into(),
+                    )))
+                    .into(),
+                )),
             ])),
         ];
 
@@ -198,9 +212,12 @@ mod tests {
 
         assert_eq!(
             result,
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("prefix-hunter2SECRET".into()),
-            ))))
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "prefix-hunter2SECRET".into()
+                ),))
+                .into()
+            ))
         );
         assert_eq!(format_value(&result), "(secret)");
         assert_eq!(ValueDescription::of(&result).to_string(), "secret");

@@ -2380,9 +2380,9 @@ mod tests {
     }
 
     fn valid_legacy_marker_shaped_string(plaintext: &str) -> String {
-        let secret = Value::Deferred(carina_core::resource::DeferredValue::Secret(Box::new(
-            string_value(plaintext),
-        )));
+        let secret = Value::Deferred(carina_core::resource::DeferredValue::Secret(
+            Box::new(string_value(plaintext)).into(),
+        ));
         let encoded = PersistedValue::encode_provider_value(&secret, None)
             .expect("test secret must be persistable");
         let encoded = serde_json::to_value(encoded).expect("serialize persisted test secret");

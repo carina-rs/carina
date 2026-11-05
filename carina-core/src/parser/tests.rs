@@ -394,15 +394,15 @@ fn secret_integer_arithmetic_taints_plain_and_interpolated_results() {
 
     assert_eq!(
         parsed.variables.get("plain"),
-        Some(&Value::Deferred(DeferredValue::Secret(Box::new(
-            Value::Concrete(ConcreteValue::Int(2)),
-        ))))
+        Some(&Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::Int(2)),).into()
+        )))
     );
     assert_eq!(
         parsed.variables.get("text"),
-        Some(&Value::Deferred(DeferredValue::Secret(Box::new(
-            Value::Concrete(ConcreteValue::String("minutes=2".into())),
-        ))))
+        Some(&Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("minutes=2".into())),).into()
+        )))
     );
 }
 
@@ -12272,9 +12272,12 @@ fn parse_decrypt_uses_config_decryptor() {
     let secret_val = parsed.resources[0].get_attr("secret").unwrap();
     assert_eq!(
         *secret_val,
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("decrypted:AQICAHh".into())
-        ))))
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "decrypted:AQICAHh".into()
+            )))
+            .into()
+        ))
     );
     let wrapped_val = parsed.resources[0].get_attr("wrapped").unwrap();
     assert_eq!(
@@ -12310,9 +12313,12 @@ fn decrypt_inside_interpolation_resolves_to_a_secret_string() {
 
     assert_eq!(
         value,
-        &Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("prefix-decrypted:ciphertext-suffix".into()),
-        ))))
+        &Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "prefix-decrypted:ciphertext-suffix".into()
+            ),))
+            .into()
+        ))
     );
     assert_eq!(crate::value::format_value(value), "(secret)");
     let state_value = crate::value::value_to_json(&expanded_value(value)).unwrap();
@@ -12488,9 +12494,12 @@ fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
             identity,
             crate::schema::RefinedScalarKind::String,
         ),
-        &ExpandedValue::Deferred(ExpandedDeferredValue::Secret(Box::new(
-            ExpandedValue::Concrete(ExpandedConcreteValue::String("do-not-leak".into())),
-        ))),
+        &ExpandedValue::Deferred(ExpandedDeferredValue::Secret(
+            Box::new(ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                "do-not-leak".into(),
+            )))
+            .into(),
+        )),
         &config,
     )
     .expect("a secret value defers custom-type validation");
@@ -16508,19 +16517,21 @@ fn reject_cyclic_let_bindings_detects_secret_value_cycle() {
     let mut variables = IndexMap::new();
     variables.insert(
         "A".to_string(),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-            DeferredValue::BindingRef {
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Deferred(DeferredValue::BindingRef {
                 binding: "B".into(),
-            },
-        )))),
+            }))
+            .into(),
+        )),
     );
     variables.insert(
         "B".to_string(),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-            DeferredValue::BindingRef {
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Deferred(DeferredValue::BindingRef {
                 binding: "A".into(),
-            },
-        )))),
+            }))
+            .into(),
+        )),
     );
     let structural: HashSet<&str> = HashSet::new();
 

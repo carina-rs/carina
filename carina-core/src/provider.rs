@@ -5674,7 +5674,8 @@ pub fn merge_default_tags<S, D>(
                 | SerializationError::NullProviderSecret
                 | SerializationError::UnresolvedEnumIdentifier { .. }
                 | SerializationError::UnexpandedModuleIf { .. }
-                | SerializationError::UnavailableSecret(_)),
+                | SerializationError::UnavailableSecret(_)
+                | SerializationError::InsideSecret { .. }),
             ) => {
                 return Err(ProviderError::invalid_input_caused_by(
                     "failed to encode default tag",
@@ -9889,9 +9890,12 @@ mod tests {
             ),
             ("$enum".to_string(), enum_shaped_user_map),
         ])));
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("guest-secret".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "guest-secret".into(),
+            )))
+            .into(),
+        ));
 
         let persisted = PersistedAttributes::from_persisted_values(HashMap::from([
             (
@@ -10004,9 +10008,12 @@ mod tests {
 
     #[test]
     fn saved_plan_hash_inventory_ignores_non_placeholder_siblings() {
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("SAVED_PLAN_SECRET".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "SAVED_PLAN_SECRET".into(),
+            )))
+            .into(),
+        ));
         let placeholder =
             crate::value::redact_secrets_in_value(&secret).expect("redact saved-plan secret");
         let attributes = HashMap::from([
@@ -10063,9 +10070,12 @@ mod tests {
 
     #[test]
     fn persistence_merges_propagate_typed_unavailable_secret() {
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("previous secret".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "previous secret".into(),
+            )))
+            .into(),
+        ));
         let previous = PersistedValue::encode_desired_value(&secret, None).unwrap();
         let opaque = previous.decode().unwrap();
         let provider = PersistedValue::encode_provider_value(
@@ -12009,9 +12019,9 @@ mod tests {
                     ),
                     (
                         "client_secret".to_string(),
-                        Value::Deferred(DeferredValue::Secret(Box::new(patch_test_value(
-                            "client-secret",
-                        )))),
+                        Value::Deferred(DeferredValue::Secret(
+                            Box::new(patch_test_value("client-secret")).into(),
+                        )),
                     ),
                 ]))),
             )])),
@@ -12066,9 +12076,9 @@ mod tests {
                 ),
                 (
                     "client_secret".to_string(),
-                    Value::Deferred(DeferredValue::Secret(Box::new(patch_test_value(
-                        "client-secret",
-                    )))),
+                    Value::Deferred(DeferredValue::Secret(
+                        Box::new(patch_test_value("client-secret")).into(),
+                    )),
                 ),
             ]))),
         )])));

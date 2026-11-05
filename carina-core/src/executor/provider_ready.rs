@@ -1108,7 +1108,9 @@ fn validate_selected_provider_values(
 
 fn unwrap_secret(value: Value) -> Value {
     match value {
-        Value::Deferred(DeferredValue::Secret(inner)) => unwrap_secret(*inner),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            unwrap_secret(inner.expose_plaintext().clone())
+        }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(unwrap_secret(*value)),
@@ -2548,9 +2550,9 @@ mod provider_config_tests {
     fn prepare_provider_ready_config_masks_plugin_errors_for_secrets() {
         let plaintext = "plaintext-must-not-leak";
         let factory = ConfigFactory::failing(plaintext);
-        let attributes = config(Value::Deferred(DeferredValue::Secret(Box::new(
-            Value::Concrete(ConcreteValue::String("good-secret".into())),
-        ))));
+        let attributes = config(Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("good-secret".into()))).into(),
+        )));
         let resolved = resolved_configs(attributes);
 
         let error = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
@@ -2566,9 +2568,9 @@ mod provider_config_tests {
     fn secret_error_redaction_preserves_provider_error_kind() {
         let plaintext = "plaintext-timeout-must-not-leak";
         let factory = ConfigFactory::timing_out(plaintext);
-        let attributes = config(Value::Deferred(DeferredValue::Secret(Box::new(
-            Value::Concrete(ConcreteValue::String("good-secret".into())),
-        ))));
+        let attributes = config(Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("good-secret".into()))).into(),
+        )));
         let resolved = resolved_configs(attributes);
 
         let error = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
@@ -2590,9 +2592,12 @@ mod provider_config_tests {
 
     #[test]
     fn provider_boundary_unwraps_secret_builtin_results_to_plaintext() {
-        let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("prefix-decrypted:ciphertext-suffix".into()),
-        ))));
+        let value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "prefix-decrypted:ciphertext-suffix".into(),
+            )))
+            .into(),
+        ));
 
         assert_eq!(
             unwrap_secret(value),
@@ -2605,9 +2610,9 @@ mod provider_config_tests {
     #[test]
     fn provider_boundary_unwraps_secrets_in_both_coalesce_operands() {
         let secret = |value: &str| {
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String(value.into()),
-            ))))
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(value.into()))).into(),
+            ))
         };
         let value = Value::Deferred(DeferredValue::Coalesce {
             value: Box::new(secret("left")),

@@ -790,9 +790,9 @@ fn secret_declared_identity_is_incomplete_and_suggests_a_let_binding() {
     let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
     resource.set_attr(
         "name",
-        Value::Deferred(DeferredValue::Secret(Box::new(concrete_string(
-            "must-not-reach-the-address-hash",
-        )))),
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(concrete_string("must-not-reach-the-address-hash")).into(),
+        )),
     );
     let mut resources = vec![resource];
 
@@ -834,9 +834,9 @@ fn legacy_create_only_secret_remains_a_stable_identity_input() {
     let mut resource = Resource::pending_with_provider("mock", "test.legacy_secret", None);
     resource.set_attr(
         "name",
-        Value::Deferred(DeferredValue::Secret(Box::new(concrete_string(
-            "legacy-hash-material",
-        )))),
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(concrete_string("legacy-hash-material")).into(),
+        )),
     );
     let mut resources = vec![resource];
 
@@ -4841,7 +4841,9 @@ fn create_only_snapshot_container_verifies_secret_leaves() {
         Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "token".into(),
-                Value::Deferred(DeferredValue::Secret(Box::new(concrete_string(token)))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(concrete_string(token)).into(),
+                )),
             ),
             ("name".into(), concrete_string(name)),
         ])))

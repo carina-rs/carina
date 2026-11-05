@@ -874,10 +874,10 @@ fn type_aware_equal_on_path<'a, R: ReferenceEquality>(
     // Secret comparison: compare the desired secret with the typed hash
     // decoded from state. Desired carries `DeferredValue::Secret(inner)`.
     if let Value::Deferred(DeferredValue::Secret(inner)) = a {
-        return context.secret_matches_state(inner, b);
+        return context.secret_matches_state(inner.expose_plaintext(), b);
     }
     if let Value::Deferred(DeferredValue::Secret(inner)) = b {
-        return context.secret_matches_state(inner, a);
+        return context.secret_matches_state(inner.expose_plaintext(), a);
     }
 
     // Retain top-level Ref names across non-consuming Union recursion. Each
@@ -1418,7 +1418,14 @@ fn contains_pending_reread(value: &Value) -> bool {
             .iter()
             .any(|argument| contains_pending_reread(argument.walker_value())),
         Value::Deferred(DeferredValue::Access(access)) => contains_pending_reread(access.base()),
-        Value::Deferred(DeferredValue::Secret(inner)) => contains_pending_reread(inner),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            let mut result = None;
+            inner.visit(|secret_value, scope| {
+                let _ = scope;
+                result = Some(contains_pending_reread(secret_value));
+            });
+            result.expect("secret visit")
+        }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             contains_pending_reread(value) || contains_pending_reread(default)
         }
@@ -1665,7 +1672,14 @@ fn has_observable_content(value: &Value) -> bool {
         }
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(has_observable_content),
         Value::Concrete(ConcreteValue::StringList(items)) => !items.is_empty(),
-        Value::Deferred(DeferredValue::Secret(inner)) => has_observable_content(inner),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            let mut result = None;
+            inner.visit(|secret_value, scope| {
+                let _ = scope;
+                result = Some(has_observable_content(secret_value));
+            });
+            result.expect("secret visit")
+        }
         Value::Deferred(DeferredValue::ModuleIf(_)) => true,
         Value::Concrete(ConcreteValue::String(_))
         | Value::Concrete(ConcreteValue::EnumIdentifier(_))
@@ -2205,7 +2219,7 @@ mod tests {
         );
         let hash =
             crate::value::redact_secrets_in_value(&crate::resource::ExpandedValue::Deferred(
-                crate::resource::ExpandedDeferredValue::Secret(Box::new(plaintext)),
+                crate::resource::ExpandedDeferredValue::Secret(Box::new(plaintext).into()),
             ))
             .unwrap();
         let material = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
@@ -2219,7 +2233,7 @@ mod tests {
             if error.path() == "comparison.secret.opaque")
         );
 
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(material)));
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(material).into()));
         let schema = crate::differ::exact_comparison_schema_for_tests();
         let witnesses = crate::references::prepare_empty_for_tests();
         let resource = crate::resource::ResourceId::with_identity("test.Resource", "example");

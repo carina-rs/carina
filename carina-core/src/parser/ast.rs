@@ -1778,6 +1778,11 @@ impl DeferredForExpansionError {
                 expression,
                 message,
             },
+            error @ crate::resolver::ResolutionError::InsideSecret { .. } => Self::Resolution {
+                line,
+                expression,
+                message: error.to_string(),
+            },
         }
     }
 }
@@ -9195,7 +9200,11 @@ fn normalize_substituted_value<B: BindingAddress>(
                 })?;
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            normalize_substituted_value(inner, miss_policy)?;
+            *inner = inner.try_map(|value| {
+                let mut value = value.clone();
+                normalize_substituted_value(&mut value, miss_policy)?;
+                Ok::<_, PlaceholderAccessError>(value)
+            })?;
         }
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
         Value::Concrete(
@@ -9296,7 +9305,11 @@ fn normalize_substituted_lazily<B: BindingAddress>(
                 })?;
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            normalize_substituted_lazily(inner)?;
+            *inner = inner.try_map(|value| {
+                let mut value = value.clone();
+                normalize_substituted_lazily(&mut value)?;
+                Ok::<_, PlaceholderAccessError>(value)
+            })?;
         }
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
         Value::Concrete(
@@ -10877,5 +10890,12 @@ impl<P: ValueKind, B: BindingAddress> ValidateExpr<P, B> {
             }
             None
         })
+    }
+}
+
+impl crate::resource::InsideSecret for PlaceholderAccessError {
+    fn inside_secret(mut self) -> Self {
+        self.message = crate::resource::INSIDE_SECRET_MESSAGE.into();
+        self
     }
 }

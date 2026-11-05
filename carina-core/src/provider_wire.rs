@@ -281,7 +281,7 @@ impl<T: ProviderWirePayload> fmt::Debug for WireReady<T> {
 // opaque-leaf views. Nested annotations are transparent inside WIT JSON.
 fn plaintext(value: &Value) -> Value {
     match value {
-        Value::Deferred(DeferredValue::Secret(inner)) => plaintext(inner),
+        Value::Deferred(DeferredValue::Secret(inner)) => plaintext(inner.expose_plaintext()),
         Value::Concrete(ConcreteValue::List(values)) => {
             Value::Concrete(ConcreteValue::List(values.iter().map(plaintext).collect()))
         }
@@ -491,12 +491,13 @@ mod tests {
     fn provider_text_wire_path_preserves_map_lookup_and_hides_secret_paths() {
         let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "\x1b[2J".into(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::Map(IndexMap::from([(
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                     "private.key".into(),
                     Value::Concrete(ConcreteValue::Float(f64::NAN)),
-                )])),
-            )))),
+                )]))))
+                .into(),
+            )),
         )])));
         let error = WireReady::try_new(
             IndexMap::from([("attr".into(), value)]),
@@ -515,12 +516,13 @@ mod tests {
     #[test]
     fn wire_errors_do_not_reveal_paths_inside_secrets() {
         let secret = || {
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::Map(IndexMap::from([(
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                     "private.secret.key".into(),
                     Value::Concrete(ConcreteValue::Float(f64::NAN)),
-                )])),
-            ))))
+                )]))))
+                .into(),
+            ))
         };
         for (value, expected_path) in [
             (secret(), "attr(secret)"),

@@ -59,7 +59,7 @@ fn desired_leaf_deferral_keeps_containers_structural() {
         },
     ));
     let known = Value::Concrete(ConcreteValue::String("known".into()));
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(known.clone())));
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(known.clone()).into()));
     for value in [reference, unknown, secret] {
         assert!(is_deferred_desired_leaf(&value));
         let list = Value::Concrete(ConcreteValue::List(vec![known.clone(), value]));
@@ -111,7 +111,7 @@ fn into_expanded_rejects_leftover_function_parameter() {
 
     assert!(matches!(
         error.placeholder(),
-        ParserPlaceholder::FnParam { name } if name == "input"
+        Some(ParserPlaceholder::FnParam { name }) if name == "input"
     ));
 }
 
@@ -129,7 +129,7 @@ fn into_expanded_rejects_leftover_function_local() {
 
     assert!(matches!(
         error.placeholder(),
-        ParserPlaceholder::FnLocal { name } if name == "local"
+        Some(ParserPlaceholder::FnLocal { name }) if name == "local"
     ));
 }
 
@@ -153,7 +153,7 @@ fn into_expanded_rejects_leftover_module_argument() {
     );
     assert!(matches!(
         error.placeholder(),
-        ParserPlaceholder::ModuleArgument { name, .. } if name == "region"
+        Some(ParserPlaceholder::ModuleArgument { name, .. }) if name == "region"
     ));
 }
 
@@ -637,9 +637,12 @@ fn diagnostic_sensitive_string_is_runtime_equivalent_but_formatting_safe() {
 
 #[test]
 fn secret_debug_never_formats_the_inner_plaintext() {
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("hunter2SECRET".into()),
-    ))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "hunter2SECRET".into(),
+        )))
+        .into(),
+    ));
 
     let rendered = format!("{secret:?}");
 
@@ -2142,7 +2145,8 @@ fn list_element_pairing_marks_a_sole_positive_best_match_as_unique() {
 #[test]
 fn pair_list_elements_handles_secrets_in_both_paths() {
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
-    let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
+    let secret =
+        |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value)).into()));
     let record = |id: i64, secret_value: &str| {
         Value::Concrete(ConcreteValue::Map(IndexMap::from([
             ("id".to_string(), Value::Concrete(ConcreteValue::Int(id))),
@@ -2184,7 +2188,8 @@ fn pair_list_elements_handles_secrets_in_both_paths() {
 #[test]
 fn pair_list_elements_secret_plaintext_pairing_is_threshold_independent() {
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
-    let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
+    let secret =
+        |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value)).into()));
     let attr_type = AttributeType::string();
     let defs = crate::schema::empty_defs_for_schema_walks();
 
@@ -2209,7 +2214,8 @@ fn pair_list_elements_secret_plaintext_pairing_is_threshold_independent() {
 #[test]
 fn pair_list_elements_struct_secret_field_pairing_is_threshold_independent() {
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
-    let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
+    let secret =
+        |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value)).into()));
     let record = |credential: Value, label: &str| {
         Value::Concrete(ConcreteValue::Map(IndexMap::from([
             ("credential".to_string(), credential),
@@ -2251,7 +2257,8 @@ fn pair_list_elements_struct_secret_field_pairing_is_threshold_independent() {
 fn pair_list_elements_secret_hash_pairing_is_threshold_independent() {
     use crate::resource::{ConcreteValue, DeferredValue, SnapshotValue as Value};
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
-    let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
+    let secret =
+        |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value)).into()));
     let serialized = serde_json::to_string("p").expect("string serialization must succeed");
     let state_hash = RedactedSecretHash::generate(serialized.as_bytes());
     let persisted_secret = || {
@@ -2285,7 +2292,7 @@ fn pair_list_elements_secret_hash_pairing_is_threshold_independent() {
 fn list_element_with_persisted_secret_hash_pairs_uniquely() {
     use crate::resource::{ConcreteValue, DeferredValue, SnapshotValue as Value};
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
-    let desired_secret = Value::Deferred(DeferredValue::Secret(Box::new(string("p"))));
+    let desired_secret = Value::Deferred(DeferredValue::Secret(Box::new(string("p")).into()));
     let serialized = serde_json::to_string("p").expect("string serialization must succeed");
     let state_hash = RedactedSecretHash::generate(serialized.as_bytes());
     let persisted_secret = serde_json::from_value::<Value>(serde_json::json!({
@@ -3504,11 +3511,9 @@ fn visit_resource_refs_collects_from_all_nested_variants() {
             args: vec![Value::root_resource_ref("d", "id", vec![]).into()],
             source_line: (0).into(),
         }),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::root_resource_ref(
-            "e",
-            "id",
-            vec![],
-        )))),
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::root_resource_ref("e", "id", vec![])).into(),
+        )),
         Value::Deferred(DeferredValue::Coalesce {
             value: Box::new(Value::root_resource_ref("f", "id", vec![])),
             default: Box::new(Value::root_resource_ref("g", "id", vec![])),
@@ -3579,11 +3584,12 @@ fn visit_binding_refs_collects_from_all_nested_variants() {
             ],
             source_line: (0).into(),
         }),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-            DeferredValue::BindingRef {
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Deferred(DeferredValue::BindingRef {
                 binding: absolute_binding("e"),
-            },
-        )))),
+            }))
+            .into(),
+        )),
         Value::Deferred(DeferredValue::Coalesce {
             value: Box::new(Value::Deferred(DeferredValue::BindingRef {
                 binding: absolute_binding("f"),
@@ -3775,14 +3781,17 @@ fn canonicalize_recurses_into_function_call_args() {
 
 #[test]
 fn canonicalize_recurses_into_secret() {
-    let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-        DeferredValue::Interpolation(vec![InterpolationPart::Literal("hidden".into())]),
-    ))));
+    let v = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Literal("hidden".into()),
+        ])))
+        .into(),
+    ));
     assert_eq!(
         v.canonicalize(),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("hidden".into())
-        ))))
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("hidden".into()))).into()
+        ))
     );
 }
 
@@ -3806,18 +3815,18 @@ fn canonicalize_collapses_nested_interpolation() {
 fn canonicalize_resolves_secret_interpolation_to_a_secret_string() {
     // A `Secret(_)` inside an interpolation participates in ordinary string
     // evaluation, but the completed string must retain the Secret wrapper.
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("password".into()),
-    ))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("password".into()))).into(),
+    ));
     let v = Value::Deferred(DeferredValue::Interpolation(vec![
         InterpolationPart::Literal("db-".into()),
         InterpolationPart::Expr(secret.clone()),
     ]));
     assert_eq!(
         v.canonicalize(),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("db-password".into()),
-        )))),
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("db-password".into()),)).into()
+        )),
     );
 
     // A sole Secret expression is normalized the same way, without nesting
@@ -3850,9 +3859,12 @@ fn canonicalize_is_idempotent() {
         )])),
         // Secret-wrapped Interpolation: canonicalize recurses through
         // Secret at the Value level but keeps Secret(Expr) wrapped.
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-            DeferredValue::Interpolation(vec![InterpolationPart::Literal("hidden".into())]),
-        )))),
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Deferred(DeferredValue::Interpolation(vec![
+                InterpolationPart::Literal("hidden".into()),
+            ])))
+            .into(),
+        )),
         // List, Map, FunctionCall — recursion shapes.
         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::String("x".into()),
@@ -4197,9 +4209,9 @@ fn as_deferred_returns_projection_for_deferred_variants() {
             "FunctionCall",
         ),
         (
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("inner".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("inner".into()))).into(),
+            )),
             "Secret",
         ),
         (
@@ -4400,12 +4412,14 @@ mod navigate_value_path_tests {
         // the Secret so the tag survives end-to-end (#2439 parity).
         let root = map(&[(
             "tok",
-            Value::Deferred(DeferredValue::Secret(Box::new(s("s")))),
+            Value::Deferred(DeferredValue::Secret(Box::new(s("s")).into())),
         )]);
         let path = AccessPath::root("o", "tok");
         assert_eq!(
             navigate_value_path(&root, &path),
-            Some(Value::Deferred(DeferredValue::Secret(Box::new(s("s")))))
+            Some(Value::Deferred(DeferredValue::Secret(
+                Box::new(s("s")).into()
+            )))
         );
     }
 
@@ -4416,12 +4430,14 @@ mod navigate_value_path_tests {
         let inner = map(&[("name", s("n"))]);
         let root = map(&[(
             "rr",
-            Value::Deferred(DeferredValue::Secret(Box::new(inner))),
+            Value::Deferred(DeferredValue::Secret(Box::new(inner).into())),
         )]);
         let path = AccessPath::root_with_fields("o", "rr", vec!["name".into()]);
         assert_eq!(
             navigate_value_path(&root, &path),
-            Some(Value::Deferred(DeferredValue::Secret(Box::new(s("n")))))
+            Some(Value::Deferred(DeferredValue::Secret(
+                Box::new(s("n")).into()
+            )))
         );
     }
 }
@@ -4474,9 +4490,9 @@ fn provider_normalization_boundary_strips_then_restores_host_dependencies() {
 
 #[test]
 fn exact_pairing_preserves_hash_container_evidence() {
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("private".into()),
-    ))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("private".into()))).into(),
+    ));
     let hash = crate::value::redact_secrets_in_value(&secret).unwrap();
     let item = SnapshotValue::Concrete(super::ConcreteValue::Map(IndexMap::from([(
         "token".into(),

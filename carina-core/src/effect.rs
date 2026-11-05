@@ -2635,7 +2635,9 @@ pub fn resolve_import_identifier(
     match identifier {
         Value::Concrete(ConcreteValue::String(s)) => Ok(s.expose_plaintext()),
         Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Ok(s.as_str()),
-        Value::Deferred(DeferredValue::Secret(inner)) => resolve_import_identifier(inner),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            resolve_import_identifier(inner.expose_plaintext())
+        }
         other => Err(ImportIdentifierError {
             got: crate::value::format_value_with_key(other, Some("id")),
         }),
@@ -3018,7 +3020,7 @@ mod tests {
         use crate::resource::{ConcreteValue, DeferredValue, Value};
         let v = Value::Concrete(ConcreteValue::String("vpc-0abc".into()));
         assert_eq!(resolve_import_identifier(&v).unwrap(), "vpc-0abc");
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(v)));
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(v).into()));
         assert_eq!(resolve_import_identifier(&secret).unwrap(), "vpc-0abc");
     }
 

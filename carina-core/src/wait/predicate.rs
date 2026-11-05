@@ -102,7 +102,9 @@ impl TryFrom<AttrPathSerde> for AttrPath {
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WaitPredicateError {
     #[error("unresolved enum identifier `{identifier}`")]
-    UnresolvedEnumIdentifier { identifier: String },
+    UnresolvedEnumIdentifier {
+        identifier: crate::resource::SecretDiagnosticError<String>,
+    },
 }
 
 /// Context-rich failure produced while resolving and sealing a parsed wait
@@ -139,14 +141,21 @@ pub enum WaitResolutionError {
     UnresolvedEnumIdentifier {
         target: String,
         attribute: String,
-        identifier: String,
+        identifier: crate::resource::SecretDiagnosticError<String>,
     },
 }
 
 impl WaitResolutionError {
     pub fn rhs_anchor(&self) -> Option<&str> {
         match self {
-            Self::UnresolvedEnumIdentifier { identifier, .. } => Some(identifier),
+            Self::UnresolvedEnumIdentifier {
+                identifier: crate::resource::SecretDiagnosticError::Public(identifier),
+                ..
+            } => Some(identifier),
+            Self::UnresolvedEnumIdentifier {
+                identifier: crate::resource::SecretDiagnosticError::InsideSecret,
+                ..
+            } => Some("(secret)"),
             Self::InvalidPath(_)
             | Self::UnknownAttribute { .. }
             | Self::UnknownStructField { .. }
@@ -275,7 +284,7 @@ pub(crate) fn validate_wait_predicate<B: BindingAddress>(
                 return Err(WaitResolutionError::UnresolvedEnumIdentifier {
                     target: target.to_string(),
                     attribute,
-                    identifier: identifier.to_string(),
+                    identifier,
                 });
             }
             return Ok(());
@@ -286,7 +295,7 @@ pub(crate) fn validate_wait_predicate<B: BindingAddress>(
         return Err(WaitResolutionError::UnresolvedEnumIdentifier {
             target: target.to_string(),
             attribute,
-            identifier: identifier.to_string(),
+            identifier,
         });
     }
     Ok(())
@@ -312,9 +321,7 @@ impl<B: BindingAddress> TryFrom<Value<NoPlaceholder, B>> for WaitPredicateValue<
 
     fn try_from(value: Value<NoPlaceholder, B>) -> Result<Self, Self::Error> {
         if let Some(identifier) = unresolved_enum_identifier(&value) {
-            return Err(WaitPredicateError::UnresolvedEnumIdentifier {
-                identifier: identifier.to_string(),
-            });
+            return Err(WaitPredicateError::UnresolvedEnumIdentifier { identifier });
         }
         Ok(Self(value))
     }
@@ -330,13 +337,17 @@ where
     }
 }
 
-fn unresolved_enum_identifier<B: BindingAddress>(value: &Value<NoPlaceholder, B>) -> Option<&str> {
+fn unresolved_enum_identifier<B: BindingAddress>(
+    value: &Value<NoPlaceholder, B>,
+) -> Option<crate::resource::SecretDiagnosticError<String>> {
     match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
             .values()
             .into_iter()
             .find_map(unresolved_enum_identifier),
-        Value::Concrete(ConcreteValue::EnumIdentifier(identifier)) => Some(identifier.as_str()),
+        Value::Concrete(ConcreteValue::EnumIdentifier(identifier)) => Some(
+            crate::resource::SecretDiagnosticError::Public(identifier.as_str().into()),
+        ),
         Value::Concrete(ConcreteValue::List(items)) => {
             items.iter().find_map(unresolved_enum_identifier)
         }
@@ -358,7 +369,16 @@ fn unresolved_enum_identifier<B: BindingAddress>(value: &Value<NoPlaceholder, B>
             .iter()
             .find_map(|argument| unresolved_enum_identifier(argument.walker_value())),
         Value::Deferred(DeferredValue::Access(access)) => unresolved_enum_identifier(access.base()),
-        Value::Deferred(DeferredValue::Secret(inner)) => unresolved_enum_identifier(inner),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            let mut result = None;
+            inner.visit(|secret_value, scope| {
+                result = Some(
+                    unresolved_enum_identifier(secret_value)
+                        .map(|finding| scope.protect_error(finding)),
+                );
+            });
+            result.expect("secret visit")
+        }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             unresolved_enum_identifier(value).or_else(|| unresolved_enum_identifier(default))
         }
@@ -463,6 +483,18 @@ mod tests {
     use crate::resource::ExpandedConcreteValue as ConcreteValue;
     type Value = crate::resource::ExpandedValue;
     use std::collections::HashMap;
+
+    #[test]
+    fn secret_origin_4275_wait_enum_identifier_keeps_its_scope() {
+        let value: Value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::enum_identifier(
+                "private-enum",
+            )))
+            .into(),
+        ));
+        let error = WaitPredicateValue::try_from(value).unwrap_err();
+        assert!(!format!("{error} {error:?}").contains("private-enum"));
+    }
 
     #[test]
     fn equals_watched_attrs_returns_the_predicate_attr() {

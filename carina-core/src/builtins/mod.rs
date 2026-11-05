@@ -24,8 +24,90 @@ use crate::eval_value::EvalValue;
 use crate::parser::ProviderContext;
 use crate::resource::{
     BindingAddress, ConcreteValue, DeferredValue, InterpolationPart, NoPlaceholder, Value,
-    ValueString, peel_secrets,
+    ValueString,
 };
+
+/// Authored builtin syntax. Secret is an intrinsic value constructor and
+/// cannot inhabit the ordinary deferred-call identity (`BuiltinFunction`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Builtin {
+    Secret,
+    Function(BuiltinFunction),
+}
+
+impl Builtin {
+    /// Dispatch both intrinsic construction and ordinary builtin handling here.
+    fn dispatch<
+        P: crate::resource::ValueKind,
+        B: BindingAddress,
+        R,
+        E: crate::resource::InsideSecret,
+    >(
+        self,
+        args: Vec<crate::resource::FunctionArgument<P, B>>,
+        prepare_secret: impl FnOnce(Value<P, B>) -> Result<Value<P, B>, E>,
+        wrap: impl FnOnce(Value<P, B>) -> R,
+        function: impl FnOnce(
+            BuiltinFunction,
+            Vec<crate::resource::FunctionArgument<P, B>>,
+        ) -> Result<R, E>,
+        invalid: impl Fn(String) -> E,
+    ) -> Result<R, E> {
+        match self {
+            Self::Secret => {
+                if args.len() != 1 {
+                    return Err(invalid(format!(
+                        "secret() expects 1 argument, got {}",
+                        args.len()
+                    )));
+                }
+                let argument = args.into_iter().next().expect("one argument");
+                let value = argument
+                    .into_value()
+                    .ok_or_else(|| invalid("secret() expects a value argument".to_string()))?;
+                let value =
+                    prepare_secret(value).map_err(crate::resource::InsideSecret::inside_secret)?;
+                Ok(wrap(value.into_secret()))
+            }
+            Self::Function(name) => function(name, args),
+        }
+    }
+
+    pub(crate) fn call<P: crate::resource::ValueKind, B: BindingAddress>(
+        self,
+        args: Vec<crate::resource::FunctionArgument<P, B>>,
+        source_line: crate::resource::DiagnosticSourceLine,
+        prepare_secret: impl FnOnce(Value<P, B>) -> Result<Value<P, B>, crate::parser::ParseError>,
+    ) -> Result<Value<P, B>, crate::parser::ParseError> {
+        self.dispatch(
+            args,
+            prepare_secret,
+            |value| value,
+            |name, args| {
+                Ok(Value::Deferred(DeferredValue::FunctionCall {
+                    name,
+                    args,
+                    source_line,
+                }))
+            },
+            |message| crate::parser::ParseError::InvalidExpression {
+                line: source_line.get().unwrap_or(0),
+                message,
+            },
+        )
+    }
+
+    pub(crate) fn protect_parse_error(
+        self,
+        error: crate::parser::ParseError,
+        line: usize,
+    ) -> crate::parser::ParseError {
+        match self {
+            Self::Secret => error.inside_secret_at(line),
+            Self::Function(_) => error,
+        }
+    }
+}
 
 /// Mark every string exposed from a `Secret` argument as diagnostic-only.
 ///
@@ -135,7 +217,11 @@ fn mark_secret_input_strings<B: BindingAddress>(
                 .unwrap_or(original)
         }
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
-            Box::new(mark_secret_input_strings(*inner)),
+            inner
+                .try_map(|value| {
+                    Ok::<_, std::convert::Infallible>(mark_secret_input_strings(value.clone()))
+                })
+                .unwrap(),
         )),
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             let deferred = deferred.map(|value| mark_secret_input_strings(value.clone()));
@@ -163,17 +249,29 @@ fn peel_secret_arguments<B: BindingAddress>(
     let mut contained_secret = false;
     let args = args
         .into_iter()
-        .map(|value| {
-            let (value, depth) = peel_secrets(value);
-            contained_secret |= depth > 0;
-            if depth > 0 {
-                mark_secret_input_strings(value)
-            } else {
-                value
-            }
-        })
+        .map(|value| lower_builtin_secret_argument(value, &mut contained_secret))
         .collect();
     (args, contained_secret)
+}
+
+fn lower_builtin_secret_argument<B: BindingAddress>(
+    value: Value<NoPlaceholder, B>,
+    contained_secret: &mut bool,
+) -> Value<NoPlaceholder, B> {
+    match value {
+        Value::Deferred(DeferredValue::Secret(payload)) => {
+            *contained_secret = true;
+            let mut lowered = None;
+            payload.visit(|value, _scope| {
+                lowered = Some(lower_builtin_secret_argument(
+                    mark_secret_input_strings(value.clone()),
+                    contained_secret,
+                ))
+            });
+            lowered.expect("secret visit")
+        }
+        value => value,
+    }
 }
 
 fn propagate_secret<B: BindingAddress>(
@@ -183,7 +281,7 @@ fn propagate_secret<B: BindingAddress>(
     if !contained_secret || matches!(value, Value::Deferred(DeferredValue::Secret(_))) {
         value
     } else {
-        Value::Deferred(DeferredValue::Secret(Box::new(value)))
+        Value::Deferred(DeferredValue::Secret(Box::new(value).into()))
     }
 }
 
@@ -252,20 +350,37 @@ macro_rules! register_builtins {
             EvalValue::from_expanded_value(propagate_secret(value, contained_secret))
         })
     }};
-    (
-        $(
-            $name:ident ( $handler:expr, arity: $arity:expr ) {
-                signature: $sig:expr,
-                description: $desc:expr,
-                return_type: $ret:expr,
-            }
-        ),* $(,)?
+    (@collect [$($info:tt)*] [$($functions:tt)*]) => {
+        register_builtins!(@generate [$($info)*] [$($functions)*]);
+    };
+    (@collect [$($info:tt)*] [$($functions:tt)*]
+        intrinsic $name:ident($variant:ident, arity: $arity:expr) {
+            signature: $sig:expr, description: $desc:expr, return_type: $ret:expr,
+        }, $($rest:tt)*
     ) => {
+        register_builtins!(@collect [ $($info)* $name { kind: Builtin::$variant, arity: $arity, signature: $sig, description: $desc, return_type: $ret, } ] [$($functions)*] $($rest)*);
+    };
+    (@collect [$($info:tt)*] [$($functions:tt)*]
+        $name:ident($handler:expr, arity: $arity:expr) {
+            signature: $sig:expr, description: $desc:expr, return_type: $ret:expr,
+        }, $($rest:tt)*
+    ) => {
+        register_builtins!(@collect [ $($info)* $name { kind: Builtin::Function(BuiltinFunction::$name), arity: $arity, signature: $sig, description: $desc, return_type: $ret, } ] [$($functions)* $name($handler, arity: $arity),] $($rest)*);
+    };
+    (@generate [$( $info_name:ident { kind: $kind:expr, arity: $info_arity:expr, signature: $sig:expr, description: $desc:expr, return_type: $ret:expr, } )*]
+        [$( $name:ident($handler:expr, arity: $arity:expr), )*]
+    ) => {
+        impl Builtin {
+            pub fn from_name(name: &str) -> Option<Self> {
+                match name { $( stringify!($info_name) => Some($kind), )* _ => None }
+            }
+        }
         /// Stable, typed identity for a registered built-in function.
         ///
         /// Deferred built-in calls store this value rather than a free-form
         /// string, so a user-function or unknown name cannot enter the
-        /// built-in-only runtime path.
+        /// built-in-only runtime path. Intrinsic constructors such as
+        /// `secret(...)` have their own value nodes and cannot be named here.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         #[allow(non_camel_case_types)]
         pub enum BuiltinFunction {
@@ -330,7 +445,7 @@ macro_rules! register_builtins {
             static FUNCTIONS: &[BuiltinFunctionInfo] = &[
                 $(
                     BuiltinFunctionInfo {
-                        name: stringify!($name),
+                        name: stringify!($info_name),
                         signature: $sig,
                         description: $desc,
                         return_type: $ret,
@@ -344,7 +459,10 @@ macro_rules! register_builtins {
         ///
         /// Returns `None` if the function is unknown.
         pub fn builtin_arity(name: &str) -> Option<usize> {
-            BuiltinFunction::from_name(name).map(BuiltinFunction::arity)
+            match name {
+                $( stringify!($info_name) => Some($info_arity), )*
+                _ => None,
+            }
         }
 
         /// Evaluate a built-in function using the caller's runtime inputs.
@@ -358,36 +476,20 @@ macro_rules! register_builtins {
             args: &[EvalValue<B>],
             config: &ProviderContext,
         ) -> Result<EvalValue<B>, String> {
-            let function = BuiltinFunction::from_name(name)
-                .ok_or_else(|| format!("Unknown built-in function: {name}"))?;
-            match function {
-                $(
-                    BuiltinFunction::$name => {
-                        let arity: usize = $arity;
-                        if !args.is_empty() && args.len() < arity {
-                            return Ok(EvalValue::closure(
-                                name,
-                                args.to_vec(),
-                                arity - args.len(),
-                            ));
-                        }
-                        // Lower each argument to a `Value` for the
-                        // handler. Handlers expect fully-reduced inputs,
-                        // so a closure here is a usage error: the caller
-                        // tried to pass a partially-applied function as a
-                        // data argument.
-                        let lowered: Result<Vec<Value<NoPlaceholder, B>>, String> = args
-                            .iter()
-                            .cloned()
-                            .map(|arg| {
-                                arg.into_expanded_value()
-                                    .map_err(|error| format!("{name}: {error}"))
-                            })
-                            .collect();
-                        register_builtins!(@evaluate $name, $handler, lowered?, config)
-                    }
-                )*
+            let builtin = Builtin::from_name(name).ok_or_else(|| format!("Unknown built-in function: {name}"))?;
+            let arity = builtin_arity(name).expect("registered builtin");
+            if !args.is_empty() && args.len() < arity {
+                return Ok(EvalValue::closure(name, args.to_vec(), arity - args.len()));
             }
+            let lowered = args.iter().cloned().map(|arg| arg.into_expanded_value()
+                .map(crate::resource::FunctionArgument::from_value)
+                .map_err(|error| format!("{name}: {error}"))).collect::<Result<Vec<_>, _>>()?;
+            builtin.dispatch(lowered, Ok::<_, String>, EvalValue::from_expanded_value, |function, args| {
+                let lowered = args.into_iter().map(|arg| arg.into_value().ok_or_else(|| format!("{name}: expected a value argument"))).collect::<Result<Vec<_>, _>>()?;
+                match function {
+                    $( BuiltinFunction::$name => register_builtins!(@evaluate $name, $handler, lowered, config), )*
+                }
+            }, |message| message)
         }
 
         /// Public alias that lowers an `EvalValue` result to a `Value`
@@ -408,6 +510,7 @@ macro_rules! register_builtins {
             result.into_expanded_value()
         }
     };
+    ($($entry:tt)*) => { register_builtins!(@collect [] [] $($entry)*); };
 }
 
 register_builtins! {
@@ -481,7 +584,7 @@ register_builtins! {
         description: "Replaces all occurrences of a search string. Data-last: String |> replace(search, replacement).",
         return_type: BuiltinReturnType::String,
     },
-    secret(secret::builtin_secret, arity: 1) {
+    intrinsic secret(Secret, arity: 1) {
         signature: "secret(value: Any) -> Secret",
         description: "Marks a value as secret. The value is sent to the provider but stored only as an Argon2id hash in state.",
         return_type: BuiltinReturnType::Argument(0),
@@ -572,7 +675,7 @@ pub(crate) fn apply_closure_with_config<B: BindingAddress>(
 
 /// Check if a function name is a known built-in function.
 pub fn is_known_builtin(name: &str) -> bool {
-    BuiltinFunction::from_name(name).is_some()
+    Builtin::from_name(name).is_some()
 }
 
 /// Test-only helper: dispatch a built-in by lifting `&[Value]` to
@@ -671,7 +774,7 @@ mod tests {
     }
 
     fn secret(value: Value) -> Value {
-        Value::Deferred(DeferredValue::Secret(Box::new(value)))
+        Value::Deferred(DeferredValue::Secret(Box::new(value).into()))
     }
 
     fn assert_secret_inner(actual: Value, expected: Value) {

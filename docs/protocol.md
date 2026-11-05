@@ -474,6 +474,11 @@ The source locator is stored as an absolute path without resolving its symlinks,
 so apply can reload the source from another working directory and reject
 symlinks retargeted since planning. Format 39 and older plans must be regenerated.
 
+Saved-plan format 41 represents `secret(...)` only with a typed `Secret` node.
+Format 40 plans from v0.11.0 may contain ordinary `FunctionCall` nodes named
+`secret`. Format 40 and older plans fail the version gate before payload
+decoding and must be regenerated with `carina plan --out`.
+
 State format 21 stores current and deposed dependencies and persisted
 `depends_on` directives as complete managed resource addresses. Pre-v21 state
 must pass configuration-aware legacy classification, warning reporting, and

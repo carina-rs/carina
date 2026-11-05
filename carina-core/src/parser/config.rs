@@ -809,46 +809,6 @@ impl CustomTypeValidationError {
             _ => None,
         }
     }
-
-    pub(crate) fn masked_for_secret(self) -> Self {
-        const MASKED_MESSAGE: &str = "(secret) failed validation";
-
-        match self {
-            Self::Rejected {
-                owner,
-                identity,
-                message: _message,
-            } => Self::Rejected {
-                owner,
-                identity,
-                message: MASKED_MESSAGE.into(),
-            },
-            Self::ProviderRejected {
-                owner,
-                identity,
-                error,
-                masked: _masked,
-            } => Self::ProviderRejected {
-                owner,
-                identity,
-                error,
-                masked: true,
-            },
-            Self::InvalidDeclarationValue {
-                owner,
-                identity,
-                error,
-            } => Self::InvalidDeclarationValue {
-                owner,
-                identity,
-                error: Box::new(error.masked_for_secret()),
-            },
-            error @ (Self::ProvidersNotLoaded
-            | Self::MissingDeclaration { .. }
-            | Self::ConflictingEnumDefinitions { .. }
-            | Self::ConflictingEnumSpelling { .. }) => error,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1612,4 +1572,46 @@ pub fn unavailable_provider_kinds<
         })
         .map(|provider| provider.name.clone())
         .collect()
+}
+
+impl crate::resource::InsideSecret for CustomTypeValidationError {
+    fn inside_secret(self) -> Self {
+        const MASKED_MESSAGE: &str = "(secret) failed validation";
+
+        match self {
+            Self::Rejected {
+                owner,
+                identity,
+                message: _message,
+            } => Self::Rejected {
+                owner,
+                identity,
+                message: MASKED_MESSAGE.into(),
+            },
+            Self::ProviderRejected {
+                owner,
+                identity,
+                error,
+                masked: _masked,
+            } => Self::ProviderRejected {
+                owner,
+                identity,
+                error,
+                masked: true,
+            },
+            Self::InvalidDeclarationValue {
+                owner,
+                identity,
+                error,
+            } => Self::InvalidDeclarationValue {
+                owner,
+                identity,
+                error: Box::new((*error).inside_secret()),
+            },
+            error @ (Self::ProvidersNotLoaded
+            | Self::MissingDeclaration { .. }
+            | Self::ConflictingEnumDefinitions { .. }
+            | Self::ConflictingEnumSpelling { .. }) => error,
+        }
+    }
 }

@@ -93,9 +93,9 @@ fn ignore_path(parts: &[&str]) -> crate::resource::ParsedIgnorePath {
 
 fn plan_with_historical_secret(desired_secret: &str) -> crate::plan::Plan {
     let secret = |value: &str| {
-        Value::Deferred(crate::resource::DeferredValue::Secret(Box::new(
-            Value::Concrete(ConcreteValue::String(value.into())),
-        )))
+        Value::Deferred(crate::resource::DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(value.into()))).into(),
+        ))
     };
     let desired = Resource::with_provider("mock", "Widget", "example", None)
         .with_attribute("password", secret(desired_secret));
@@ -188,9 +188,9 @@ fn plan_rejects_historical_hash_needed_by_ignored_readable_patch() {
             .unwrap(),
     );
     let hash = crate::value::redact_secrets_in_value(&Value::Deferred(
-        crate::resource::DeferredValue::Secret(Box::new(Value::Concrete(ConcreteValue::String(
-            "old".into(),
-        )))),
+        crate::resource::DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("old".into()))).into(),
+        ),
     ))
     .unwrap();
     let state = crate::resource::SnapshotState::existing(

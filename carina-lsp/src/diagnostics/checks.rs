@@ -7,7 +7,7 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
 use crate::document::Document;
 use carina_core::binding_index::{
-    BindingIndex, RefTargetKind, RefType, RefTypeError, ResolvedBindings as GenericResolvedBindings,
+    BindingIndex, RefTargetKind, RefTypeError, ResolvedBindings as GenericResolvedBindings,
 };
 use carina_core::config_loader::{DirectoryParseResult, DuplicateDeclaration};
 use carina_core::parser::{
@@ -152,7 +152,16 @@ fn value_depends_on_module_output(
             visiting_variables,
         ),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            value_depends_on_module_output(inner, module_bindings, variables, visiting_variables)
+            let mut found = false;
+            inner.visit(|value, _scope| {
+                found = value_depends_on_module_output(
+                    value,
+                    module_bindings,
+                    variables,
+                    visiting_variables,
+                )
+            });
+            found
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
@@ -290,7 +299,7 @@ impl<'a> ContextFreeValue<'a> {
                     matches!(part, carina_core::resource::InterpolationPart::Literal(_))
                         || matches!(part, carina_core::resource::InterpolationPart::Expr(value) if is_context_free(value))
                 }),
-                Value::Deferred(DeferredValue::Secret(inner)) => is_context_free(inner),
+                Value::Deferred(DeferredValue::Secret(inner)) => { let mut found = false; inner.visit(|value, _scope| found = is_context_free(value)); found },
                 Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                     is_context_free(value) && is_context_free(default)
                 }
@@ -415,7 +424,11 @@ fn contains_matching_function_call(value: &Value, matches_name: &impl Fn(&str) -
             )
         }),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            contains_matching_function_call(inner, matches_name)
+            let mut found = false;
+            inner.visit(|value, _scope| {
+                found = contains_matching_function_call(value, matches_name)
+            });
+            found
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             contains_matching_function_call(value, matches_name)
@@ -1813,16 +1826,16 @@ impl DiagnosticRun<'_> {
                 }
                 let finding = carina_core::parser::Located::new(
                     reference.prefix_location().clone(),
-                    format!(
+                    reference.diagnostic(format!(
                         "Undefined resource: '{}'. Define it with 'let {} = aws...'",
                         identifier, identifier
-                    ),
+                    )),
                 );
                 render_merged(
                     doc,
                     &finding,
                     DiagnosticSeverity::ERROR,
-                    finding.detail().clone(),
+                    finding.detail().to_string(),
                 )
             })
             .collect()
@@ -1848,20 +1861,18 @@ impl DiagnosticRun<'_> {
                     let reference = tree.reference_for_path(path);
                     let mut location =
                         reference.attribute_location(path.binding(), path.attribute());
-                    let message = match binding_index.ref_type(path) {
-                        RefType::UnknownAttribute(error)
-                            if carina_core::validation::suppress_coalesce_existence_error(
-                                &error, usage,
-                            ) =>
-                        {
-                            return;
-                        }
-                        RefType::UnknownAttribute(RefTypeError::UnknownAttribute {
-                            binding,
-                            attribute,
-                            known_attributes,
-                            target: RefTargetKind::Schema { resource_type },
-                        }) => {
+                    let Some(error) = reference.attribute_error(binding_index, usage) else {
+                        return;
+                    };
+                    let message = match error {
+                        carina_core::resource::SecretDiagnosticError::Public(
+                            RefTypeError::UnknownAttribute {
+                                binding,
+                                attribute,
+                                known_attributes,
+                                target: RefTargetKind::Schema { resource_type },
+                            },
+                        ) => {
                             let diagnostic_binding = binding;
                             let diagnostic_attribute = attribute;
                             location = reference
@@ -1877,12 +1888,14 @@ impl DiagnosticRun<'_> {
                                 diagnostic_attribute, diagnostic_binding, resource_type, suggestion,
                             )
                         }
-                        RefType::UnknownAttribute(RefTypeError::UnknownAttribute {
-                            binding,
-                            attribute,
-                            known_attributes,
-                            target: RefTargetKind::LiveComposition,
-                        }) => {
+                        carina_core::resource::SecretDiagnosticError::Public(
+                            RefTypeError::UnknownAttribute {
+                                binding,
+                                attribute,
+                                known_attributes,
+                                target: RefTargetKind::LiveComposition,
+                            },
+                        ) => {
                             let diagnostic_binding = binding;
                             let diagnostic_attribute = attribute;
                             location = reference
@@ -1897,10 +1910,7 @@ impl DiagnosticRun<'_> {
                                 diagnostic_attribute, diagnostic_binding, suffix,
                             )
                         }
-                        RefType::UnknownAttribute(error) => error.to_string(),
-                        RefType::Typed(_) | RefType::Unchecked | RefType::UnknownBinding { .. } => {
-                            return;
-                        }
+                        error => error.to_string(),
                     };
 
                     let finding = carina_core::parser::Located::new(location.clone(), message);
@@ -1933,7 +1943,10 @@ impl DiagnosticRun<'_> {
             .into_errors()
             .into_iter()
             .filter_map(|error| {
-                if !scope.includes(error.placeholder()) {
+                if error
+                    .placeholder()
+                    .is_some_and(|placeholder| !scope.includes(placeholder))
+                {
                     return None;
                 }
                 let finding = error

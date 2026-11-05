@@ -525,10 +525,24 @@ enum AnalysisIterableRef<'a, P: ValueKind, B: BindingAddress> {
 }
 
 /// A reference whose occurrence and prefix provenance were validated at the boundary.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AnalysisReference<B: BindingAddress = RelativeBindingName> {
     path: crate::resource::AccessPath<B>,
     locations: Arc<super::ReferenceLocations>,
+    diagnostic_scope: crate::resource::DiagnosticScope,
+}
+
+impl<B: BindingAddress> std::fmt::Debug for AnalysisReference<B> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.diagnostic_scope.is_secret() {
+            return formatter.write_str("(secret reference)");
+        }
+        formatter
+            .debug_struct("AnalysisReference")
+            .field("path", &self.path)
+            .field("locations", &self.locations)
+            .finish()
+    }
 }
 
 /// An authored reference occurrence in a value, with its consumer context.
@@ -617,26 +631,27 @@ fn collect_value_references<P: ValueKind, B: BindingAddress>(
 ) -> Result<(), AnalysisTreeError> {
     require_integer_operator_provenance(value, context)?;
     let mut result = Ok(());
-    value.visit_resource_refs_with_usage(
-        &mut |path, usage| match path.reference_locations_shared() {
-            Some(locations) => references.push(AnalysisValueReference {
-                reference: AnalysisReference {
-                    path: path.clone(),
-                    locations: locations.clone(),
+    value.visit_resource_refs_with_scope(&mut |path, usage, diagnostic_scope| match path
+        .reference_locations_shared()
+    {
+        Some(locations) => references.push(AnalysisValueReference {
+            reference: AnalysisReference {
+                path: path.clone(),
+                locations: locations.clone(),
+                diagnostic_scope,
+            },
+            context: context.to_string(),
+            usage,
+            scope,
+        }),
+        None => {
+            result = Err(AnalysisTreeError::new(
+                AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                    element: format!("{context} reference {path}"),
                 },
-                context: context.to_string(),
-                usage,
-                scope,
-            }),
-            None => {
-                result = Err(AnalysisTreeError::new(
-                    AnalysisTreeErrorKind::MissingSyntaxProvenance {
-                        element: format!("{context} reference {path}"),
-                    },
-                ))
-            }
-        },
-    );
+            ))
+        }
+    });
     result
 }
 
@@ -691,7 +706,14 @@ fn require_integer_operator_provenance<P: ValueKind, B: BindingAddress>(
                 check(argument.walker_value())?;
             }
         }
-        Value::Deferred(DeferredValue::Secret(value)) => check(value)?,
+        Value::Deferred(DeferredValue::Secret(value)) => {
+            let mut result = None;
+            value.visit(|secret_value, scope| {
+                let _ = scope;
+                result = Some(check(secret_value));
+            });
+            result.expect("secret visit")
+        }?,
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             check(value)?;
             check(default)?;
@@ -734,7 +756,22 @@ where
             collect_iterable_result_references(expression.rhs(), context, references)?;
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            collect_iterable_result_references(inner, context, references)?
+            let first = references.len();
+            {
+                let mut result = None;
+                inner.visit(|secret_value, scope| {
+                    let _ = scope;
+                    result = Some(collect_iterable_result_references(
+                        secret_value,
+                        context,
+                        references,
+                    ));
+                });
+                result.expect("secret visit")
+            }?;
+            for reference in &mut references[first..] {
+                reference.reference.diagnostic_scope = crate::resource::DiagnosticScope::Secret;
+            }
         }
         // References inside a function argument constrain that argument,
         // not the function result used as the iterable.
@@ -754,6 +791,27 @@ where
 }
 
 impl<B: BindingAddress> AnalysisReference<B> {
+    /// Protect a finding before any frontend formats or stores its payload.
+    pub fn diagnostic<E>(&self, error: E) -> crate::resource::SecretDiagnosticError<E> {
+        self.diagnostic_scope.protect(error)
+    }
+
+    /// Reference lookup errors cross their enclosing intrinsic boundary here.
+    pub fn attribute_error(
+        &self,
+        bindings: &crate::binding_index::BindingIndex<'_, B>,
+        usage: crate::resource::ResourceRefUsage,
+    ) -> Option<crate::resource::SecretDiagnosticError<crate::binding_index::RefTypeError>> {
+        match bindings.ref_type(&self.path) {
+            crate::binding_index::RefType::UnknownAttribute(error)
+                if !crate::validation::suppress_coalesce_existence_error(&error, usage) =>
+            {
+                Some(self.diagnostic(error))
+            }
+            _ => None,
+        }
+    }
+
     pub fn path(&self) -> &crate::resource::AccessPath<B> {
         &self.path
     }
@@ -814,6 +872,7 @@ fn append_reference_origins<B: BindingAddress>(
             references.push(AnalysisReference {
                 path: path.clone(),
                 locations: locations.clone(),
+                diagnostic_scope: crate::resource::DiagnosticScope::Public,
             });
         }
     }
@@ -874,10 +933,13 @@ fn attribute_provenance<'a, P: ValueKind, B: BindingAddress>(
         }
         keys.insert(key.clone(), key_location);
         let mut result = Ok(());
-        value.visit_resource_refs(&mut |path| match path.reference_locations_shared() {
+        value.visit_resource_refs_with_scope(&mut |path, _usage, diagnostic_scope| match path
+            .reference_locations_shared()
+        {
             Some(locations) => references.push(AnalysisReference {
                 path: path.clone(),
                 locations: locations.clone(),
+                diagnostic_scope,
             }),
             None => {
                 result = Err(AnalysisTreeError::new(

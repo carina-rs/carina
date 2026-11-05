@@ -352,14 +352,13 @@ fn evaluate_integer_values_inner<P, B: BindingAddress>(
 where
     P: ValueKind + PlaceholderKind,
 {
-    let (lhs, lhs_secret_depth) = crate::resource::peel_secrets(lhs);
-    let (rhs, rhs_secret_depth) = crate::resource::peel_secrets(rhs);
-    let secret = lhs_secret_depth > 0 || rhs_secret_depth > 0;
+    let secret = matches!(lhs, Value::Deferred(DeferredValue::Secret(_)))
+        || matches!(rhs, Value::Deferred(DeferredValue::Secret(_)));
 
     validate(&lhs, IntegerOperandSide::Left).map_err(IntegerExpressionError::Operand)?;
     validate(&rhs, IntegerOperandSide::Right).map_err(IntegerExpressionError::Operand)?;
 
-    if matches!(&rhs, Value::Concrete(ConcreteValue::Int(0)))
+    if concrete_integer(&rhs) == Some(0)
         && let Some(error) = zero_divisor_error(op)
     {
         return Err(if secret {
@@ -369,18 +368,16 @@ where
         });
     }
 
-    let value = match (&lhs, &rhs) {
-        (Value::Concrete(ConcreteValue::Int(lhs)), Value::Concrete(ConcreteValue::Int(rhs))) => {
-            Value::Concrete(ConcreteValue::Int(
-                evaluate_checked_integer(*lhs, op, *rhs).map_err(|error| {
-                    if secret {
-                        IntegerExpressionError::SecretEvaluation(error)
-                    } else {
-                        IntegerExpressionError::Evaluation(error)
-                    }
-                })?,
-            ))
-        }
+    let value = match (concrete_integer(&lhs), concrete_integer(&rhs)) {
+        (Some(lhs), Some(rhs)) => Value::Concrete(ConcreteValue::Int(
+            evaluate_checked_integer(lhs, op, rhs).map_err(|error| {
+                if secret {
+                    IntegerExpressionError::SecretEvaluation(error)
+                } else {
+                    IntegerExpressionError::Evaluation(error)
+                }
+            })?,
+        )),
         _ => Value::Deferred(DeferredValue::IntegerArithmetic(ValidatedIntegerExpr {
             lhs: Box::new(lhs),
             op,
@@ -389,10 +386,22 @@ where
         })),
     };
     Ok(if secret {
-        Value::Deferred(DeferredValue::Secret(Box::new(value)))
+        Value::Deferred(DeferredValue::Secret(Box::new(value).into()))
     } else {
         value
     })
+}
+
+fn concrete_integer<P: ValueKind, B: BindingAddress>(value: &Value<P, B>) -> Option<i64> {
+    match value {
+        Value::Concrete(ConcreteValue::Int(value)) => Some(*value),
+        Value::Deferred(DeferredValue::Secret(payload)) => {
+            let mut number = None;
+            payload.visit(|value, _scope| number = concrete_integer(value));
+            number
+        }
+        _ => None,
+    }
 }
 
 fn validate_post_validation_operand_shape<P: ValueKind, B: BindingAddress>(
@@ -431,7 +440,15 @@ fn validate_operand_shape_at_stage<P: ValueKind, B: BindingAddress>(
     match value {
         Value::Concrete(ConcreteValue::Int(_)) => Ok(()),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            validate_operand_shape_at_stage(inner, side, admission)
+            let mut result = None;
+            inner.visit(|secret_value, scope| {
+                let _ = scope;
+                result = Some(
+                    (validate_operand_shape_at_stage(secret_value, side, admission))
+                        .map_err(|error| scope.protect_error(error)),
+                );
+            });
+            result.expect("secret visit")
         }
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             validate_operand_shape_at_stage(deferred.then_value(), side, admission)?;
@@ -560,6 +577,20 @@ where
         .map_err(serde::de::Error::custom)
     }
 }
+impl crate::resource::InsideSecret for IntegerOperandError {
+    fn inside_secret(self) -> Self {
+        self
+    } // only static type names and operand sides
+}
+impl crate::resource::InsideSecret for IntegerExpressionError {
+    fn inside_secret(self) -> Self {
+        match self {
+            Self::Evaluation(error) => Self::SecretEvaluation(error),
+            error => error,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,7 +681,7 @@ mod tests {
             [RelativeBindingName::new("source")].into()
         );
 
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(reference)));
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(reference).into()));
         let result = evaluate_integer_values(
             secret,
             IntegerOp::Subtract,
@@ -661,7 +692,7 @@ mod tests {
         assert!(matches!(
             result,
             Value::Deferred(DeferredValue::Secret(inner))
-                if matches!(*inner, Value::Deferred(DeferredValue::IntegerArithmetic(_)))
+                if matches!(inner.expose_plaintext(), Value::Deferred(DeferredValue::IntegerArithmetic(_)))
         ));
     }
 
@@ -836,9 +867,9 @@ mod tests {
             ),
         ] {
             let error = evaluate_integer_values::<NoPlaceholder, AbsoluteBindingAddress>(
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::Int(lhs),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::Int(lhs))).into(),
+                )),
                 op,
                 Value::Concrete(ConcreteValue::Int(rhs)),
                 IntegerOperatorSpan::synthetic(),

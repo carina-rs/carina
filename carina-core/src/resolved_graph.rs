@@ -22,6 +22,8 @@ use crate::wait::{ManagedWaitTarget, ResolvedWaitBinding};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ExpandedGraphResolutionError {
+    #[error("{}", crate::resource::INSIDE_SECRET_MESSAGE)]
+    InsideSecret,
     #[error("expanded binding '{binding}' resolves to more than one graph address")]
     AmbiguousBinding { binding: String },
     #[error("{owner}: dependency target '{reference}' does not exist")]
@@ -387,9 +389,11 @@ fn rewrite_handle_output_refs<P: PlaceholderKind>(
                 default: Box::new(rewrite_handle_output_refs(default, outputs, owner)?),
             }))
         }
-        Value::Deferred(DeferredValue::Secret(inner)) => Ok(Value::Deferred(
-            DeferredValue::Secret(Box::new(rewrite_handle_output_refs(inner, outputs, owner)?)),
-        )),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            Ok(Value::Deferred(DeferredValue::Secret(inner.try_map(
+                |value| rewrite_handle_output_refs(value, outputs, owner),
+            )?)))
+        }
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             Ok(Value::Deferred(DeferredValue::ModuleIf(Box::new(
                 deferred.try_map(|value| rewrite_handle_output_refs(value, outputs, owner))?,
@@ -1618,6 +1622,12 @@ impl ExpandedBindingIndex {
                 .collect(),
         );
         resolve_expanded_graph(configuration.into()).map(|graph| graph.into_parts().1)
+    }
+}
+
+impl crate::resource::InsideSecret for ExpandedGraphResolutionError {
+    fn inside_secret(self) -> Self {
+        Self::InsideSecret
     }
 }
 

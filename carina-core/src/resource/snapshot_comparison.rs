@@ -42,7 +42,14 @@ pub(crate) fn contains_comparison_expression(value: &Value) -> bool {
             | ConcreteValue::Duration(_)
             | ConcreteValue::StringList(_),
         ) => false,
-        Value::Deferred(DeferredValue::Secret(inner)) => contains_comparison_expression(inner),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            let mut result = None;
+            inner.visit(|secret_value, scope| {
+                let _ = scope;
+                result = Some(contains_comparison_expression(secret_value));
+            });
+            result.expect("secret visit")
+        }
         Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { .. })) => false,
         Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::Expression(never))) => {
             match *never {}
@@ -891,7 +898,12 @@ pub(super) fn pairing_hashes<R: ReferenceEquality>(
             // hashes cover plaintext (including schema normalizations); the
             // fixed tag deliberately admits every state-secret spelling for
             // exact verification by `similarity_score`.
-            hashes.extend(pairing_hashes(inner, attr_type, defs, context));
+            hashes.extend(pairing_hashes(
+                inner.expose_plaintext(),
+                attr_type,
+                defs,
+                context,
+            ));
             hashes.push(secret_state_pairing_hash());
         }
         // Arithmetic has its own canonical hash above. A nested Secret is

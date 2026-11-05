@@ -707,6 +707,7 @@ pub struct PlanFileContents<S = ModuleSource, P = SnapshotPlan<S>, V: PlanValueK
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
+    /// Plan format 41 encodes secret(...) only as a typed Secret node.
     /// Plan format 40 requires an absolute source locator and its planned
     /// canonical identity so a retargeted symlink requires replanning.
     /// Plan format 39 stores complete dependency addresses and legacy migration
@@ -1129,7 +1130,8 @@ impl PlanFile {
 /// fields introduced by format 35 remain mandatory. Format 39's optional
 /// classification field is mandatory in the wire shape and is never
 /// defaulted. Format 40 requires the absolute source locator and canonical
-/// source identity captured at plan time.
+/// source identity captured at plan time. Format 41 removes the ordinary
+/// secret FunctionCall identity in favor of typed Secret nodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanFileWire {
     version: u32,
@@ -2175,7 +2177,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 40;
+    pub const CURRENT_VERSION: u32 = 41;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
@@ -3805,9 +3807,9 @@ mod historical_display_tests {
         let to = resolved(
             Resource::new("mock.test.resource", "masked-update").with_attribute(
                 "comment",
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::String("rotated".into()),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String("rotated".into()))).into(),
+                )),
             ),
         );
 
@@ -5245,6 +5247,8 @@ fn build_plan_file_contents<E>(
         .collect();
 
     let contents = PlanFileContents {
+        // carina#4275: bumped 40→41 — secret(...) has no ordinary FunctionCall
+        // identity; older saved plans must be regenerated before decoding.
         // carina#4202: bumped 39→40 — require the absolute source locator and
         // canonical identity separately, rejecting retargeted source symlinks.
         // Format 39 already records typed dependency handles (carina#3803).
@@ -7864,9 +7868,12 @@ mod run_plan_out_tests {
         )
         .with_attribute(
             "comment",
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String(plaintext.to_string().into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    plaintext.to_string().into(),
+                )))
+                .into(),
+            )),
         )
     }
 
@@ -8600,9 +8607,12 @@ mod run_plan_out_tests {
         let path = tmp.path().join("main.crn");
         fs::write(&path, "provider mock {}\n").unwrap();
         let parsed = carina_core::parser::ExpandedParsedFile::default();
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            carina_core::resource::ConcreteValue::String("upstream-secret".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(
+                carina_core::resource::ConcreteValue::String("upstream-secret".into()),
+            ))
+            .into(),
+        ));
         let ctx = crate::wiring::PlanContext {
             legacy_dependency_classification: None,
             migrated_legacy_state: None,
@@ -8904,9 +8914,12 @@ mod export_diff_tests {
             .with_absolute_binding(absolute_binding("vpc"))
             .with_attribute(
                 "password",
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::String("topsecretXYZ".into()),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String(
+                        "topsecretXYZ".into(),
+                    )))
+                    .into(),
+                )),
             );
         let bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
             carina_core::binding_index::LivePreApplyInputs {
@@ -8953,20 +8966,46 @@ mod plan_serialization_error_tests {
     }
 
     #[test]
+    fn secret_origin_4275_unknown_secret_keeps_upstream_guidance() {
+        use carina_core::resource::InsideSecret;
+        let error = PersistedValue::encode_provider_value(&upstream_unknown(), None)
+            .unwrap_err()
+            .inside_secret();
+        assert!(
+            matches!(&error, SerializationError::UnknownNotAllowed { reason, .. }
+            if matches!(reason.as_ref(), ApplyTimeUnknown::UpstreamExport { .. })),
+            "{error:?}"
+        );
+        let error = super::map_plan_save_error(error.into(), "--out");
+        let message = error.to_string();
+        assert!(
+            message.contains("Apply the upstream module(s) first"),
+            "{message}"
+        );
+        assert!(message.contains("network.vpc.vpc_id"), "{message}");
+    }
+
+    #[test]
     fn plan_save_serialization_preserves_unavailable_secret_at_cli_boundary() {
         use crate::error::AppError;
         use carina_core::resource::SnapshotValue;
         use carina_core::value::{redact_plaintext_using_secret_shape, redact_secrets_in_value};
 
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("private-token".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "private-token".into(),
+            )))
+            .into(),
+        ));
         let historical = SnapshotValue::Concrete(carina_core::resource::ConcreteValue::Map(
             indexmap::IndexMap::from([("token".into(), redact_secrets_in_value(&secret).unwrap())]),
         ));
-        let whole_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::Map(indexmap::IndexMap::from([("token".into(), secret)])),
-        ))));
+        let whole_secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::Map(
+                indexmap::IndexMap::from([("token".into(), secret)]),
+            )))
+            .into(),
+        ));
         for flag in [None, Some("--out"), Some("--json")] {
             let error = redact_plaintext_using_secret_shape(&historical, &whole_secret)
                 .expect_err("whole-container redaction cannot recover a nested historical hash");

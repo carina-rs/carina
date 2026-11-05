@@ -672,10 +672,19 @@ fn parse_primary_eval_with_mode_inner(
             let func_name = next_pair(&mut fc_inner, "function name", "function call")?
                 .as_str()
                 .to_string();
+            let builtin = (!matches!(
+                ctx.get_variable(&func_name),
+                Some(EvalValue::Closure { .. })
+            ))
+            .then(|| crate::builtins::Builtin::from_name(&func_name))
+            .flatten();
             let eval_args: Result<Vec<EvalValue>, ParseError> = fc_inner
                 .map(|arg| parse_expression_eval(arg, ctx))
                 .collect();
-            let eval_args = eval_args?;
+            let eval_args = eval_args.map_err(|error| match builtin {
+                Some(builtin) => builtin.protect_parse_error(error, line),
+                None => error,
+            })?;
 
             // Check if the name refers to a Closure variable (direct call on closure).
             // The shared helper preserves the underlying typed builtin when
@@ -696,7 +705,6 @@ fn parse_primary_eval_with_mode_inner(
                 );
             }
 
-            let builtin = crate::builtins::BuiltinFunction::from_name(&func_name);
             if builtin.is_some() {
                 reject_builtin_handle_arguments(&eval_args, line)?;
             }
@@ -758,20 +766,13 @@ fn parse_primary_eval_with_mode_inner(
                 });
             }
 
-            let args = crate::parser::functions::lower_function_arguments(eval_args, line)?;
             let builtin = builtin.ok_or(ParseError::UnknownFunction {
                 name: func_name,
                 line,
                 column,
             })?;
 
-            Ok(EvalValue::from_value(Value::Deferred(
-                DeferredValue::FunctionCall {
-                    name: builtin,
-                    args,
-                    source_line: (line).into(),
-                },
-            )))
+            crate::parser::functions::construct_builtin_call(builtin, eval_args, ctx, line)
         }
         Rule::variable_ref => {
             // variable_ref = { identifier ~ (field_access | index_access)* }

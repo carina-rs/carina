@@ -20,10 +20,21 @@ use crate::resource::{
 /// Failure to evaluate a reference after selecting its historical input.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ResolutionError {
+    #[error("{}", crate::resource::INSIDE_SECRET_MESSAGE)]
+    InsideSecret {},
     #[error(transparent)]
     UnavailableSecret(#[from] crate::resource::UnavailableSecretError),
     #[error("{0}")]
     Message(String),
+}
+
+impl crate::resource::InsideSecret for ResolutionError {
+    fn inside_secret(self) -> Self {
+        match self {
+            Self::UnavailableSecret(error) => Self::UnavailableSecret(error.inside_secret()),
+            _ => Self::InsideSecret {},
+        }
+    }
 }
 
 impl From<String> for ResolutionError {
@@ -36,9 +47,12 @@ impl From<crate::parser::ParseError> for ResolutionError {
     fn from(error: crate::parser::ParseError) -> Self {
         match error {
             crate::parser::ParseError::UnavailableSecret(error) => Self::UnavailableSecret(error),
+            crate::parser::ParseError::InsideSecret { .. } => Self::InsideSecret {},
             crate::parser::ParseError::Located { path, error } => match Self::from(*error) {
                 Self::Message(message) => Self::Message(format!("{}: {message}", path.display())),
-                unavailable @ Self::UnavailableSecret(_) => unavailable,
+                unavailable @ (Self::UnavailableSecret(_) | Self::InsideSecret { .. }) => {
+                    unavailable
+                }
             },
             crate::parser::ParseError::AtElement(finding) => {
                 let (location, error) = (*finding).into_parts();
@@ -46,7 +60,9 @@ impl From<crate::parser::ParseError> for ResolutionError {
                     Self::Message(message) => {
                         Self::Message(crate::parser::Located::new(location, message).to_string())
                     }
-                    unavailable @ Self::UnavailableSecret(_) => unavailable,
+                    unavailable @ (Self::UnavailableSecret(_) | Self::InsideSecret { .. }) => {
+                        unavailable
+                    }
                 }
             }
             error => Self::Message(error.to_string()),
@@ -487,9 +503,11 @@ fn stamp_unresolved_upstream(
                 )
                 .unwrap_or(original)
         }
-        Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
-            Box::new(stamp_unresolved_upstream(*inner, upstream_binding_names)?),
-        )),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            Value::Deferred(DeferredValue::Secret(inner.try_map(|value| {
+                stamp_unresolved_upstream(value.clone(), upstream_binding_names)
+            })?))
+        }
         // Already-stamped or non-reference leaves pass through unchanged.
         value @ Value::Concrete(
             ConcreteValue::String(_)
@@ -535,7 +553,7 @@ pub fn resolve_value_for_plan(
     let resolved = match resolve_ref_value(value, bindings, config) {
         Ok(value) => value,
         Err(error @ ResolutionError::UnavailableSecret(_)) => return Err(error),
-        Err(ResolutionError::Message(_)) => value.clone(),
+        Err(ResolutionError::Message(_) | ResolutionError::InsideSecret { .. }) => value.clone(),
     };
     Ok(if unresolved_upstream_bindings.is_empty() {
         resolved
@@ -897,6 +915,7 @@ fn user_function_runtime_error(
         ResolutionError::Message(message) => {
             crate::parser::ParseError::InvalidExpression { line, message }
         }
+        ResolutionError::InsideSecret { .. } => crate::parser::ParseError::InsideSecret { line },
     }
 }
 
@@ -1347,12 +1366,9 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                     })
                 })
         }
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            let resolved_inner = resolve_ref_value_inner(inner, bindings, config)?;
-            Ok(Value::Deferred(DeferredValue::Secret(Box::new(
-                resolved_inner,
-            ))))
-        }
+        Value::Deferred(DeferredValue::Secret(inner)) => inner
+            .try_map(|value| resolve_ref_value_inner(value, bindings, config))
+            .map(|inner| Value::Deferred(DeferredValue::Secret(inner))),
         // `Value::Unknown` is the result of stamping a previously-
         // unresolved upstream ref; it cannot be resolved further.
         Value::Deferred(DeferredValue::Unknown(_)) => Ok(value.clone()),
@@ -1547,9 +1563,9 @@ mod tests {
         .expect("resource operands are valid deferred Ints");
         let expression = expression
             .rebuild(
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::Int(1),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::Int(1))).into(),
+                )),
                 Value::Concrete(ConcreteValue::Int(0)),
             )
             .expect("post-validation operand shapes remain valid");
@@ -1567,12 +1583,14 @@ mod tests {
 
     #[test]
     fn user_function_errors_preserve_unavailable_secret_through_parser_context() {
-        let snapshot = crate::value::redact_secrets_in_value(&Value::Deferred(
-            DeferredValue::Secret(Box::new(Value::Concrete(ConcreteValue::String(
-                "historical secret".into(),
-            )))),
-        ))
-        .unwrap();
+        let snapshot =
+            crate::value::redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "historical secret".into(),
+                )))
+                .into(),
+            )))
+            .unwrap();
         let unavailable = snapshot.to_value_at("state.credentials.token").unwrap_err();
         let located =
             user_function_runtime_error(8, ResolutionError::UnavailableSecret(unavailable.clone()))
@@ -1606,12 +1624,14 @@ mod tests {
         .remove(1)
         .1
         .into_inner();
-        let snapshot = crate::value::redact_secrets_in_value(&Value::Deferred(
-            DeferredValue::Secret(Box::new(Value::Concrete(ConcreteValue::String(
-                "historical secret".into(),
-            )))),
-        ))
-        .unwrap();
+        let snapshot =
+            crate::value::redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "historical secret".into(),
+                )))
+                .into(),
+            )))
+            .unwrap();
         let unavailable = snapshot.to_value_at("state.credentials.token").unwrap_err();
         let error = crate::parser::ParseError::AtElement(Box::new(crate::parser::Located::new(
             parsed.user_functions["identity"].body.location.clone(),
@@ -2403,9 +2423,9 @@ mod tests {
             "creds_binding",
             vec![(
                 "creds",
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::Map(map),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::Map(map))).into(),
+                )),
             )],
         )]);
         let path = crate::resource::AccessPath::root_with_fields_and_subscripts(
@@ -2424,9 +2444,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             resolved,
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("hunter2".into())
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("hunter2".into()))).into()
+            )),
             "subscript on Secret(Map) must project the entry and re-wrap as Secret(String)"
         );
     }
@@ -2440,12 +2460,13 @@ mod tests {
             "secret_holder",
             vec![(
                 "tokens",
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::List(vec![
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::List(vec![
                         Value::Concrete(ConcreteValue::String("alpha".into())),
                         Value::Concrete(ConcreteValue::String("beta".into())),
-                    ]),
-                )))),
+                    ])))
+                    .into(),
+                )),
             )],
         )]);
         let path = crate::resource::AccessPath::root_with_fields_and_subscripts(
@@ -2462,9 +2483,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             resolved,
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("beta".into())
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("beta".into()))).into()
+            )),
         );
     }
 
@@ -2484,9 +2505,9 @@ mod tests {
             "creds_binding",
             vec![(
                 "creds",
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::Map(map),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::Map(map))).into(),
+                )),
             )],
         )]);
         let path = crate::resource::AccessPath::root_with_fields(
@@ -2502,17 +2523,16 @@ mod tests {
         .unwrap();
         assert_eq!(
             resolved,
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("hunter2".into())
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("hunter2".into()))).into()
+            )),
         );
     }
 
     #[test]
     fn test_resolve_subscript_descends_into_doubly_secret_wrapped_map() {
-        // Defensive: stacked `Secret(Secret(Map))` (parser-rejected in
-        // practice, but `peel_secrets` literally exists to handle it).
-        // Re-wrap depth must match peel depth — pin the contract.
+        // Defensive: preexisting `Secret(Secret(Map))` layers survive navigation.
+        // Authored calls normalize separately; walkers retain their input depth.
         let map: indexmap::IndexMap<String, Value> = vec![(
             "k".to_string(),
             Value::Concrete(ConcreteValue::String("v".into())),
@@ -2523,9 +2543,12 @@ mod tests {
             "b",
             vec![(
                 "creds",
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-                    DeferredValue::Secret(Box::new(Value::Concrete(ConcreteValue::Map(map)))),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Deferred(DeferredValue::Secret(
+                        Box::new(Value::Concrete(ConcreteValue::Map(map))).into(),
+                    )))
+                    .into(),
+                )),
             )],
         )]);
         let path = crate::resource::AccessPath::root_with_fields_and_subscripts(
@@ -2542,9 +2565,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             resolved,
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-                DeferredValue::Secret(Box::new(Value::Concrete(ConcreteValue::String("v".into()))))
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String("v".into()))).into()
+                )))
+                .into()
+            )),
         );
     }
 
@@ -2559,11 +2585,12 @@ mod tests {
             "h",
             vec![(
                 "tokens",
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::List(vec![Value::Concrete(ConcreteValue::String(
-                        "only".into(),
-                    ))]),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                        ConcreteValue::String("only".into()),
+                    )])))
+                    .into(),
+                )),
             )],
         )]);
         let path = crate::resource::AccessPath::root_with_fields_and_subscripts(
@@ -2597,9 +2624,9 @@ mod tests {
             "h",
             vec![(
                 "creds",
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::Map(map),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::Map(map))).into(),
+                )),
             )],
         )]);
         let path = crate::resource::AccessPath::root_with_fields_and_subscripts(
@@ -2633,21 +2660,21 @@ mod tests {
         let map: indexmap::IndexMap<String, Value> = vec![
             (
                 "db_pwd".to_string(),
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::String("v".into()),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String("v".into()))).into(),
+                )),
             ),
             (
                 "api_key".to_string(),
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::String("v".into()),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String("v".into()))).into(),
+                )),
             ),
             (
                 "slack_token".to_string(),
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::String("v".into()),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String("v".into()))).into(),
+                )),
             ),
         ]
         .into_iter()
@@ -2655,9 +2682,9 @@ mod tests {
         let mut attrs = HashMap::new();
         attrs.insert(
             "creds".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::Map(map),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::Map(map))).into(),
+            )),
         );
         let mut bindings = ResolvedBindings::default();
         bindings.set("h", attrs, BindingValueSource::Upstream);
@@ -2698,15 +2725,15 @@ mod tests {
         let map: indexmap::IndexMap<String, Value> = vec![
             (
                 "db_pwd".to_string(),
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::String("v".into()),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String("v".into()))).into(),
+                )),
             ),
             (
                 "api_key".to_string(),
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::String("v".into()),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String("v".into()))).into(),
+                )),
             ),
         ]
         .into_iter()
@@ -2714,9 +2741,9 @@ mod tests {
         let mut attrs = HashMap::new();
         attrs.insert(
             "creds".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::Map(map),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::Map(map))).into(),
+            )),
         );
         let mut bindings = ResolvedBindings::default();
         bindings.set("h", attrs, BindingValueSource::Upstream);
@@ -2755,9 +2782,12 @@ mod tests {
         let mut attrs = HashMap::new();
         attrs.insert(
             "creds".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::Map(indexmap::IndexMap::new()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::Map(
+                    indexmap::IndexMap::new(),
+                )))
+                .into(),
+            )),
         );
         let mut bindings = ResolvedBindings::default();
         bindings.set("h", attrs, BindingValueSource::Upstream);
@@ -2793,11 +2823,14 @@ mod tests {
         let mut h_attrs: HashMap<String, Value> = HashMap::new();
         h_attrs.insert(
             "creds".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::root_resource_ref(
-                "missing".to_string(),
-                "x".to_string(),
-                vec![],
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::root_resource_ref(
+                    "missing".to_string(),
+                    "x".to_string(),
+                    vec![],
+                ))
+                .into(),
+            )),
         );
         let mut bindings = crate::binding_index::ResolvedBindings::default();
         bindings.set(
@@ -2830,14 +2863,13 @@ mod tests {
         let hash = crate::value::redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(
             Box::new(Value::Concrete(ConcreteValue::String(
                 "unrelated secret".into(),
-            ))),
+            )))
+            .into(),
         )))
         .unwrap();
-        let pending = Value::Deferred(DeferredValue::Secret(Box::new(Value::root_resource_ref(
-            "missing",
-            "x",
-            vec![],
-        ))));
+        let pending = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::root_resource_ref("missing", "x", vec![])).into(),
+        ));
         let historical = SnapshotValue::Concrete(crate::resource::ConcreteValue::Map(
             indexmap::IndexMap::from([
                 ("hash".into(), hash),

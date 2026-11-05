@@ -130,7 +130,16 @@ fn value_contains_module_if_inner<P: ModuleIfAuditPlaceholder, B: BindingAddress
             value_contains_module_if_inner(access.base(), functions, function_scopes)
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            value_contains_module_if_inner(inner, functions, function_scopes)
+            let mut result = None;
+            inner.visit(|secret_value, scope| {
+                let _ = scope;
+                result = Some(value_contains_module_if_inner(
+                    secret_value,
+                    functions,
+                    function_scopes,
+                ));
+            });
+            result.expect("secret visit")
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             value_contains_module_if_inner(value, functions, function_scopes)
